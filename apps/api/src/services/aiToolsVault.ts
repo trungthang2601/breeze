@@ -1,0 +1,461 @@
+/**
+ * AI Local Vault Tools
+ *
+ * 4 local vault tools for listing vaults, reviewing vault sync health,
+ * dispatching sync operations, and creating or updating vault configs.
+ * Each tool wraps existing DB schema with org-scoped isolation.
+ */
+
+import { db } from '../db';
+import { devices, localVaults } from '../db/schema';
+import { eq, and, desc, inArray, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { CommandTypes } from './commandQueue';
+import { aiQueueCommandForExecution } from './aiDispatch';
+import {
+  deviceScopeCondition,
+  deviceSiteDenied,
+  deviceIdSiteDenied,
+  resolveSiteAllowedDeviceIds,
+  runFrozenDeviceIds,
+} from './aiToolsSiteScope';
+
+type VaultHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
+
+// ============================================
+// Helpers
+// ============================================
+
+function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof eq> | any): SQL | undefined {
+  return auth.orgCondition(orgIdCol) ?? undefined;
+}
+
+/** Wrap handler in try-catch so DB/runtime errors return JSON instead of crashing */
+function safeHandler(toolName: string, fn: VaultHandler): VaultHandler {
+  return async (input, auth) => {
+    try {
+      return await fn(input, auth);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal error';
+      console.error(`[vault:${toolName}] ${err?.constructor?.name ?? 'Error'}:`, message, err);
+      return JSON.stringify({ error: 'Operation failed. Check server logs for details.' });
+    }
+  };
+}
+
+function clampLimit(value: unknown, fallback = 25, max = 100): number {
+  return Math.min(Math.max(1, Number(value) || fallback), max);
+}
+
+function getOrgId(auth: AuthContext): string | null {
+  return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+// ============================================
+// Register all vault tools into the aiTools Map
+// ============================================
+
+export function registerVaultTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+  // ============================================
+  // 1. query_vaults — List local vaults
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'backup',
+    searchHint: 'local backup vault inventory, configuration and synchronization status',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'query_vaults',
+      description: 'List local vault configurations and sync status for the accessible organization scope.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'Filter to a specific device UUID' },
+          isActive: { type: 'boolean', description: 'Filter active or inactive vaults' },
+          lastSyncStatus: { type: 'string', description: 'Filter by last sync status' },
+          limit: { type: 'number', description: 'Max results (default 25, max 100)' },
+        },
+        required: [],
+      },
+    },
+    handler: safeHandler('query_vaults', async (input, auth) => {
+      const conditions: SQL[] = [];
+      const oc = orgWhere(auth, localVaults.orgId);
+      if (oc) conditions.push(oc);
+      if (typeof input.deviceId === 'string') conditions.push(eq(localVaults.deviceId, input.deviceId));
+      if (typeof input.isActive === 'boolean') conditions.push(eq(localVaults.isActive, input.isActive));
+      if (typeof input.lastSyncStatus === 'string') conditions.push(eq(localVaults.lastSyncStatus, input.lastSyncStatus));
+
+      // Site axis: a site-restricted caller may only see vaults for devices in
+      // their allowed sites (RLS does NOT enforce site). Narrow to that set.
+      const orgId = getOrgId(auth);
+      if (auth.allowedSiteIds && orgId) {
+        const allowed = await resolveSiteAllowedDeviceIds(orgId, auth);
+        if (!allowed || allowed.length === 0) {
+          return JSON.stringify({ vaults: [], showing: 0 });
+        }
+        if (typeof input.deviceId === 'string' && !allowed.includes(input.deviceId)) {
+          return JSON.stringify({ vaults: [], showing: 0 });
+        }
+        conditions.push(inArray(localVaults.deviceId, allowed));
+      }
+
+      // Exact-device axis, applied independently of the site axis: a device-LESS
+      // analysis run carries `allowedDeviceIds` with NO `allowedSiteIds`, so the
+      // branch above no-ops for it and the tool read the whole org (#6086).
+      const frozenDeviceIds = runFrozenDeviceIds(auth);
+      if (frozenDeviceIds && typeof input.deviceId === 'string' && !frozenDeviceIds.includes(input.deviceId)) {
+        return JSON.stringify({ vaults: [], showing: 0 });
+      }
+      const vaultDeviceCondition = deviceScopeCondition(auth, localVaults.deviceId);
+      if (vaultDeviceCondition) conditions.push(vaultDeviceCondition);
+
+      const limit = clampLimit(input.limit);
+      const rows = await db
+        .select({
+          id: localVaults.id,
+          deviceId: localVaults.deviceId,
+          hostname: devices.hostname,
+          deviceStatus: devices.status,
+          vaultPath: localVaults.vaultPath,
+          vaultType: localVaults.vaultType,
+          isActive: localVaults.isActive,
+          retentionCount: localVaults.retentionCount,
+          lastSyncAt: localVaults.lastSyncAt,
+          lastSyncStatus: localVaults.lastSyncStatus,
+          lastSyncSnapshotId: localVaults.lastSyncSnapshotId,
+          syncSizeBytes: localVaults.syncSizeBytes,
+          createdAt: localVaults.createdAt,
+          updatedAt: localVaults.updatedAt,
+        })
+        .from(localVaults)
+        .leftJoin(devices, eq(localVaults.deviceId, devices.id))
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(localVaults.updatedAt))
+        .limit(limit);
+
+      return JSON.stringify({ vaults: rows, showing: rows.length });
+    }),
+  });
+
+  // ============================================
+  // 2. get_vault_status — Detailed health for a device
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'backup',
+    searchHint: 'local backup vault details and synchronization summaries for one device',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'get_vault_status',
+      description: 'Get detailed vault status for a specific device, including all configured vaults and sync summaries.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'Device UUID (required)' },
+        },
+        required: ['deviceId'],
+      },
+    },
+    handler: safeHandler('get_vault_status', async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      if (!deviceId) return JSON.stringify({ error: 'deviceId is required' });
+
+      const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+      const dc = orgWhere(auth, devices.orgId);
+      if (dc) deviceConditions.push(dc);
+      const [device] = await db
+        .select({
+          id: devices.id,
+          hostname: devices.hostname,
+          status: devices.status,
+          siteId: devices.siteId,
+        })
+        .from(devices)
+        .where(and(...deviceConditions))
+        .limit(1);
+
+      if (!device) return JSON.stringify({ error: 'Device not found or access denied' });
+      // Site axis (app-layer only; RLS does NOT enforce it): deny vault/secret
+      // reads for devices outside a site-restricted caller's allowlist.
+      if (deviceSiteDenied(auth, device.siteId, device.id)) {
+        return JSON.stringify({ error: 'Device not found or access denied' });
+      }
+
+      const vaultConditions: SQL[] = [eq(localVaults.deviceId, deviceId)];
+      const vc = orgWhere(auth, localVaults.orgId);
+      if (vc) vaultConditions.push(vc);
+
+      const vaults = await db
+        .select({
+          id: localVaults.id,
+          vaultPath: localVaults.vaultPath,
+          vaultType: localVaults.vaultType,
+          isActive: localVaults.isActive,
+          retentionCount: localVaults.retentionCount,
+          lastSyncAt: localVaults.lastSyncAt,
+          lastSyncStatus: localVaults.lastSyncStatus,
+          lastSyncSnapshotId: localVaults.lastSyncSnapshotId,
+          syncSizeBytes: localVaults.syncSizeBytes,
+          createdAt: localVaults.createdAt,
+          updatedAt: localVaults.updatedAt,
+        })
+        .from(localVaults)
+        .where(and(...vaultConditions))
+        .orderBy(desc(localVaults.updatedAt));
+
+      const activeVaults = vaults.filter((vault) => vault.isActive).length;
+      const failedSyncs = vaults.filter((vault) => vault.lastSyncStatus === 'failed').length;
+      const pendingSyncs = vaults.filter((vault) => vault.lastSyncStatus === 'pending').length;
+      const totalSyncBytes = vaults.reduce((sum, vault) => sum + Number(vault.syncSizeBytes ?? 0), 0);
+      const latestSyncAt = vaults
+        .map((vault) => vault.lastSyncAt)
+        .filter((value): value is Date => value instanceof Date)
+        .sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
+
+      return JSON.stringify({
+        deviceId: device.id,
+        hostname: device.hostname,
+        deviceStatus: device.status,
+        totalVaults: vaults.length,
+        activeVaults,
+        pendingSyncs,
+        failedSyncs,
+        totalSyncBytes,
+        latestSyncAt,
+        vaults,
+      });
+    }),
+  });
+
+  // ============================================
+  // 3. trigger_vault_sync — Queue sync command
+  // ============================================
+
+  registerTool({
+    tier: 2,
+    domain: 'backup',
+    searchHint: 'local backup vault synchronization for a vault or selected snapshot',
+    definition: {
+      name: 'trigger_vault_sync',
+      description: 'Dispatch a vault sync command for a specific local vault.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          vaultId: { type: 'string', description: 'Local vault UUID (required)' },
+          snapshotId: { type: 'string', description: 'Optional backup snapshot identifier to sync' },
+        },
+        required: ['vaultId'],
+      },
+    },
+    handler: safeHandler('trigger_vault_sync', async (input, auth) => {
+      const vaultId = input.vaultId as string;
+      if (!vaultId) return JSON.stringify({ error: 'vaultId is required' });
+
+      const vaultConditions: SQL[] = [eq(localVaults.id, vaultId)];
+      const vc = orgWhere(auth, localVaults.orgId);
+      if (vc) vaultConditions.push(vc);
+      const [vault] = await db
+        .select({
+          id: localVaults.id,
+          orgId: localVaults.orgId,
+          deviceId: localVaults.deviceId,
+          isActive: localVaults.isActive,
+        })
+        .from(localVaults)
+        .where(and(...vaultConditions))
+        .limit(1);
+
+      if (!vault) return JSON.stringify({ error: 'Vault not found or access denied' });
+      if (!vault.isActive) return JSON.stringify({ error: 'Vault is inactive' });
+      // Site axis: the vault is org-scoped, but the device it syncs may be in a
+      // site outside a restricted caller's allowlist — deny before dispatch.
+      if (await deviceIdSiteDenied(auth, vault.deviceId)) {
+        return JSON.stringify({ error: 'Vault not found or access denied' });
+      }
+
+      // Repeat the tenant and device axes the checks above authorized: the
+      // vault was read in a separate statement, so `id` alone would leave a
+      // check-then-act window.
+      await db
+        .update(localVaults)
+        .set({
+          lastSyncStatus: 'pending',
+          lastSyncSnapshotId: typeof input.snapshotId === 'string' ? input.snapshotId : null,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(localVaults.id, vault.id),
+          eq(localVaults.orgId, vault.orgId),
+          eq(localVaults.deviceId, vault.deviceId),
+        ));
+
+      const { command, error } = await aiQueueCommandForExecution(
+        auth,
+        'trigger_vault_sync',
+        vault.deviceId,
+        CommandTypes.VAULT_SYNC,
+        {
+          vaultId: vault.id,
+          snapshotId: typeof input.snapshotId === 'string' ? input.snapshotId : undefined,
+        },
+        { userId: auth.user?.id, expectedOrgId: vault.orgId }
+      );
+
+      if (error) {
+        await db
+          .update(localVaults)
+          .set({
+            lastSyncStatus: 'failed',
+            updatedAt: new Date(),
+          })
+          .where(and(
+            eq(localVaults.id, vault.id),
+            eq(localVaults.orgId, vault.orgId),
+            eq(localVaults.deviceId, vault.deviceId),
+          ));
+        return JSON.stringify({ error });
+      }
+
+      return JSON.stringify({
+        success: true,
+        vaultId: vault.id,
+        deviceId: vault.deviceId,
+        commandId: command?.id,
+        status: command?.status,
+      });
+    }),
+  });
+
+  // ============================================
+  // 4. configure_vault — Create or update vault
+  // ============================================
+
+  registerTool({
+    tier: 2,
+    domain: 'backup',
+    searchHint: 'local backup vault configuration: create, update path, storage type and retention',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'configure_vault',
+      description: 'Create or update a local vault configuration. Actions: create, update.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['create', 'update'],
+            description: 'The vault configuration action to perform',
+          },
+          vaultId: { type: 'string', description: 'Local vault UUID for updates' },
+          deviceId: { type: 'string', description: 'Device UUID for new vaults' },
+          vaultPath: { type: 'string', description: 'Vault path' },
+          vaultType: {
+            type: 'string',
+            enum: ['local', 'smb', 'usb'],
+            description: 'Vault storage type',
+          },
+          retentionCount: { type: 'number', description: 'Retention count to keep in the vault' },
+          isActive: { type: 'boolean', description: 'Whether the vault should be active' },
+        },
+        required: ['action'],
+      },
+    },
+    handler: safeHandler('configure_vault', async (input, auth) => {
+      const action = input.action as string;
+
+      if (action === 'create') {
+        const deviceId = input.deviceId as string;
+        const vaultPath = input.vaultPath as string;
+        if (!deviceId || !vaultPath) {
+          return JSON.stringify({ error: 'deviceId and vaultPath are required for create' });
+        }
+
+        const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+        const dc = orgWhere(auth, devices.orgId);
+        if (dc) deviceConditions.push(dc);
+        const [device] = await db
+          .select({
+            id: devices.id,
+            orgId: devices.orgId,
+            siteId: devices.siteId,
+          })
+          .from(devices)
+          .where(and(...deviceConditions))
+          .limit(1);
+
+        if (!device) return JSON.stringify({ error: 'Device not found or access denied' });
+        // Site axis: deny creating a vault on a device outside the caller's sites.
+        if (deviceSiteDenied(auth, device.siteId, device.id)) {
+          return JSON.stringify({ error: 'Device not found or access denied' });
+        }
+
+        const now = new Date();
+        const [vault] = await db
+          .insert(localVaults)
+          .values({
+            orgId: device.orgId,
+            deviceId,
+            vaultPath,
+            vaultType: (input.vaultType as string) ?? 'local',
+            retentionCount: Number(input.retentionCount) || 3,
+            isActive: typeof input.isActive === 'boolean' ? input.isActive : true,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+
+        return JSON.stringify({ success: true, vault });
+      }
+
+      if (action === 'update') {
+        const vaultId = input.vaultId as string;
+        if (!vaultId) return JSON.stringify({ error: 'vaultId is required for update' });
+
+        const vaultConditions: SQL[] = [eq(localVaults.id, vaultId)];
+        const vc = orgWhere(auth, localVaults.orgId);
+        if (vc) vaultConditions.push(vc);
+        const [existing] = await db
+          .select({ id: localVaults.id, orgId: localVaults.orgId, deviceId: localVaults.deviceId })
+          .from(localVaults)
+          .where(and(...vaultConditions))
+          .limit(1);
+
+        if (!existing) return JSON.stringify({ error: 'Vault not found or access denied' });
+        // Site axis: deny editing a vault whose device is outside the caller's sites.
+        if (await deviceIdSiteDenied(auth, existing.deviceId)) {
+          return JSON.stringify({ error: 'Vault not found or access denied' });
+        }
+
+        const updateData: Record<string, unknown> = { updatedAt: new Date() };
+        if (typeof input.vaultPath === 'string') updateData.vaultPath = input.vaultPath;
+        if (typeof input.vaultType === 'string') updateData.vaultType = input.vaultType;
+        if (input.retentionCount !== undefined) updateData.retentionCount = Number(input.retentionCount);
+        if (typeof input.isActive === 'boolean') updateData.isActive = input.isActive;
+
+        const [vault] = await db
+          .update(localVaults)
+          .set(updateData)
+          .where(and(
+            eq(localVaults.id, vaultId),
+            eq(localVaults.orgId, existing.orgId),
+            eq(localVaults.deviceId, existing.deviceId),
+          ))
+          .returning();
+
+        return JSON.stringify({ success: true, vault });
+      }
+
+      const orgId = getOrgId(auth);
+      if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+      return JSON.stringify({ error: `Unknown action: ${action}` });
+    }),
+  });
+}

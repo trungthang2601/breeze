@@ -1,0 +1,3347 @@
+import { Fragment, useMemo, useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
+import {
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  ChevronDown,
+  ArrowUpDown,
+  CornerDownRight,
+  MoreHorizontal,
+  MoreVertical,
+  Filter,
+  Terminal,
+  FileCode,
+  RotateCcw,
+  Settings,
+  Shield,
+  Trash2,
+  Zap,
+  Columns3,
+  Network,
+  Package,
+  Cpu,
+  Battery,
+  BatteryCharging,
+  BatteryWarning,
+  Plug,
+  Link2,
+} from "lucide-react";
+import type {
+  BatteryStatus,
+  DesktopAccessState,
+  RemoteAccessPolicy,
+  VpnPresence,
+  FilterConditionGroup,
+} from "@breeze/shared";
+import {
+  matchesMergedListFilters,
+  sortByDisplayName,
+} from "./mergedListFilter";
+import ConnectDesktopButton from "../remote/ConnectDesktopButton";
+// Single source of truth for "can this device still accept a queued command?".
+// Hoisted out of this file (#2465): the bulk bar in DevicesPage needs the SAME
+// rule, and re-deriving it per surface is exactly how the false "must be online"
+// premise got copied three times (DeviceActions -> row menu -> bulk bar). The
+// verified API contract lives next to it — read that before changing this.
+import {
+  actionGateHint,
+  classifyBulkSelection,
+  isCommandQueueable,
+  notOnlineTitle,
+  notQueueableTitle,
+} from "./bulkActionGating";
+import { widthPercentClass, formatUptime } from "@/lib/utils";
+import { formatLastSeen } from "@/lib/formatTime";
+import { formatNumber } from "@/lib/i18n/format";
+import {
+  getDeviceRoleLabel,
+  getDeviceRoleIcon,
+  type DeviceRole,
+} from "@/lib/deviceRoles";
+import {
+  activeVpnList,
+  vpnList,
+  getVpnProviderIcon,
+  getVpnProviderLabel,
+  getVpnBadgeClass,
+  formatVpnTooltip,
+} from "@/lib/vpnProviders";
+import {
+  PAGE_SIZE_OPTIONS,
+  readPageSizePreference,
+  writePageSizePreference,
+} from "./pageSizePreference";
+import {
+  COLUMN_IDS,
+  COLUMN_LABELS,
+  readColumnOrder,
+  readColumnVisibility,
+  resetColumns,
+  writeColumnOrder,
+  writeColumnVisibility,
+  type ColumnId,
+} from "./columnVisibility";
+import {
+  densityTableClasses,
+  readDensity,
+  subscribeDensity,
+  type Density,
+} from "@/lib/density";
+import {
+  readLinkedProfileCollapsePreference,
+  subscribeLinkedProfileCollapse,
+  writeLinkedProfileCollapsePreference,
+  type LinkedProfileCollapsePreference,
+} from "@/lib/appearance";
+import { groupLinkedDevices } from "./linkedDevices";
+import { useOrgStore } from "@/stores/orgStore";
+import DecommissionedHiddenHint from "./DecommissionedHiddenHint";
+
+// DeviceCompare's selection limit (see DeviceCompare.tsx). Kept here so the
+// bulk menu can explain the cap instead of silently dropping the item.
+const COMPARE_MAX_DEVICES = 4;
+import { OSIcon } from "./osIcons";
+import { formatDeviceOsVersion } from "./osDisplay";
+import { type ListFilters, DEFAULT_LIST_FILTERS } from "./deviceListFilters";
+import { getAgentVersionRelation } from "./agentVersionRelation";
+import { useTranslation } from "react-i18next";
+import "../../lib/i18n";
+
+export type DeviceStatus =
+  | "online"
+  | "offline"
+  | "maintenance"
+  | "decommissioned"
+  | "quarantined"
+  | "updating"
+  | "pending"
+  /**
+   * No reachability claim at all. Produced two ways: a manual asset (#4622
+   * W04) that was hand-typed and never probed, and a manual network asset
+   * (#5213) that no scan has ever reached. Distinct from 'offline', which is
+   * a reachability claim (a probe ran and failed). Rendered as its own
+   * neutral "Unknown" chip; claiming "offline" for a printer that was never
+   * online is the kind of small lie that makes an inventory list
+   * untrustworthy.
+   */
+  | "unknown";
+export type OSType = "windows" | "macos" | "linux";
+
+/**
+ * Presentation-level discriminator for the unified Devices list (#1322, #4622).
+ * `agent` = an enrolled endpoint running the Go agent (devices table).
+ * `network` = a discovered network device (printer/router/switch/…) from
+ * discovered_assets that is approved and not linked to an agent. Agent-only
+ * columns (CPU/RAM, agent version, OS build) render blank for `network` rows.
+ * `manual` = a hand-entered, non-networked inventory row (manual_assets) — a
+ * spare laptop, a desk phone, a non-networked printer. Carries no network
+ * identity and no reachability at all (see the `unknown` DeviceStatus above).
+ */
+export type DeviceClass = "agent" | "network" | "manual";
+
+export type Device = {
+  id: string;
+  /** Defaults to 'agent' when absent (older API / agent-only rows). */
+  deviceClass?: DeviceClass;
+  /** discovered_asset_type for network devices; reuses the deviceRole value space. */
+  assetType?: DeviceRole;
+  /** Network-device fields — null/undefined for agent rows. */
+  manufacturer?: string | null;
+  model?: string | null;
+  responseTimeMs?: number | null;
+  /** Whether SNMP/network monitoring is configured for a network device. */
+  monitoringEnabled?: boolean;
+  /**
+   * Manual-asset-only fields (#4622 W04) — null/undefined for agent and
+   * network rows. `serialNumber` doubles as the warranty key and is also
+   * surfaced (read-only) for agent rows via `hardware` in a future column;
+   * `assetTag` and `location` are manual-only.
+   */
+  serialNumber?: string | null;
+  assetTag?: string | null;
+  /** Hardware Lifecycle: YYYY-MM-DD, with who set it ('manual' operator entry
+   *  or 'vendor' ship date from a warranty lookup). */
+  purchaseDate?: string | null;
+  purchaseDateSource?: 'manual' | 'vendor' | null;
+  location?: string | null;
+  /** An org `contacts` row id — the person holding this manual asset. */
+  assignedContactId?: string | null;
+  /**
+   * Reversible promotion links (#4622 W04, manual assets only): set when an
+   * agent was later installed on this physical asset, or a scan later found
+   * it. A linked manual asset drops out of `GET /devices/manual`, so these
+   * never appear on a manual row rendered from the list fetch — only on the
+   * row passed into the edit modal, which fetches the asset directly.
+   */
+  linkedDeviceId?: string | null;
+  linkedDiscoveredAssetId?: string | null;
+  /** Free-text notes (manual assets only, #4622 W04). */
+  notes?: string | null;
+  hostname: string;
+  os: OSType;
+  osVersion: string;
+  osBuild?: string;
+  architecture?: string;
+  status: DeviceStatus;
+  cpuPercent: number;
+  ramPercent: number;
+  lastSeen: string;
+  orgId: string;
+  orgName: string;
+  siteId: string;
+  siteName: string;
+  agentVersion: string;
+  watchdogVersion?: string | null;
+  /**
+   * Control-plane URL the agent last heartbeated to (devices.agent_server_url,
+   * #2288). The opt-in Server column renders only its hostname. Any current
+   * agent reports it on every heartbeat (failover or not); absent only on
+   * responses from older API versions or agents too old to send it.
+   */
+  agentServerUrl?: string | null;
+  /**
+   * Public address the control plane last saw the agent connect from
+   * (devices.last_seen_ip, #2503). Agent rows only — null until the device
+   * has made one authenticated request, and always null for network rows.
+   */
+  wanIp?: string | null;
+  /**
+   * Best current local address for the device (#2503). For agent rows the API
+   * picks one interface from device_network (primary > IPv4 > routable);
+   * for network-discovered rows it is the discovered asset's own IP.
+   */
+  lanIp?: string | null;
+  // Discovered assets carry a MAC; agent rows leave it unset.
+  macAddress?: string | null;
+  /**
+   * RMM-QA-176 manual maintenance lease end (ISO). `maintenanceUntil > now` —
+   * not `status` — is the truth of "a technician put this device into
+   * maintenance": the heartbeat overwrites `status` on every beat, so a device
+   * with a live lease can read back as `online`. Use `isInMaintenance`.
+   */
+  maintenanceUntil?: string | null;
+  tags: string[];
+  lastUser?: string;
+  uptimeSeconds?: number;
+  enrolledAt?: string;
+  deviceRole?: DeviceRole;
+  deviceRoleSource?: string;
+  displayName?: string;
+  isHeadless?: boolean;
+  /**
+   * OS-level pending-reboot flag persisted from the agent heartbeat
+   * (devices.pending_reboot). True when Windows registry / Linux
+   * reboot-required markers say a reboot is outstanding. Absent on
+   * responses from older API versions.
+   */
+  pendingReboot?: boolean;
+  /**
+   * Scheduled end-user restart, denormalized from the agent heartbeat
+   * (#3207 W5, `devices.reboot_scheduled_at` and friends).
+   *
+   * Distinct from `pendingReboot` above: that is the OS saying a restart is
+   * required at some point; these say one is BOOKED for a specific instant and
+   * how much of the deferral budget the end user has spent on it.
+   *
+   * Absent on responses from older API versions, and null on every device that
+   * has no restart scheduled — including devices running an agent that
+   * predates reboot-status reporting. `rebootMaxDeferrals` is the one field
+   * where 0 and null differ meaningfully: 0 means this restart cannot be
+   * postponed, null means the agent never told us.
+   */
+  rebootScheduledAt?: string | null;
+  rebootDeadline?: string | null;
+  rebootSource?: string | null;
+  rebootDeferralsUsed?: number | null;
+  rebootMaxDeferrals?: number | null;
+  /**
+   * Set when this row was created by a hostname-collision enrollment and may
+   * be replacing an earlier device record (#2764,
+   * `devices.possible_replacement_of_device_id`). Null/absent on every
+   * ordinary device — a non-null value is a prompt for a human to review the
+   * old row and retire it. Drives the list badge and the review banner on the
+   * device page.
+   */
+  possibleReplacementOfDeviceId?: string | null;
+  /**
+   * What became of the agent-uninstall this device's Remove queued (#3987).
+   *
+   * Present ONLY on the `GET /devices/:id` detail payload, and only ever
+   * non-null for a `decommissioned` device. The three-way distinction is
+   * load-bearing for `UninstallStateBadge`:
+   *
+   *   undefined → this payload does not carry the field (a list row) — say
+   *               nothing, because we do not know.
+   *   null      → the Remove deliberately left the agent installed.
+   *   object    → an uninstall was queued; `state` says how far it got.
+   *
+   * `state: 'sent'` means the agent's handler acked the command, NOT that the
+   * teardown is confirmed — only `'completed'` claims that.
+   */
+  uninstall?: {
+    state: string;
+    queuedAt?: string | null;
+    sentAt: string | null;
+    completedAt?: string | null;
+    expiresAt: string | null;
+  } | null;
+  desktopAccess?: DesktopAccessState | null;
+  remoteAccessPolicy?: RemoteAccessPolicy | null;
+  /**
+   * Server-detected asymmetry: timestamp at which the API stopped
+   * receiving main-agent heartbeats while the watchdog is still
+   * reporting in. Set by the heartbeat handler (#851 / Layer C).
+   * Null when the agent is heartbeating normally or has fully gone
+   * silent (watchdog included).
+   */
+  mainAgentSilentSince?: string | null;
+  /**
+   * Watchdog reachability as last reported. 'connected' = normal,
+   * 'failover' = watchdog took over because main-agent stopped,
+   * 'offline' = we haven't heard from the watchdog either (in which
+   * case `status === 'offline'` is the load-bearing signal).
+   */
+  watchdogStatus?: "connected" | "failover" | "offline" | null;
+  hardware?: {
+    cpuModel?: string;
+    cpuCores?: number;
+    ramTotalMb?: number;
+    diskTotalGb?: number;
+    /**
+     * device_hardware.serial_number, when the API sends it. Read by the
+     * opt-in Serial column (#4622 W04) so an agent row's serial can sit
+     * beside a manual asset's `serialNumber` in the same column.
+     */
+    serialNumber?: string;
+  };
+  /**
+   * Headline device reliability score (0-100) from the existing
+   * device_reliability subsystem (#1720). Null/undefined when no score has
+   * been computed yet (newly enrolled, or before the reliability worker runs)
+   * — the Reliability column renders a dash and sorts those rows last.
+   */
+  reliabilityScore?: number | null;
+  /** Reliability trend from the same subsystem; drives the small arrow indicator. */
+  reliabilityTrend?: "improving" | "stable" | "degrading" | null;
+  /**
+   * Current-state power/battery snapshot (#2142). null/undefined = no data
+   * reported yet (old agent or network device) → the Power column renders a
+   * dash. { present: false } = a real no-battery desktop → also a dash.
+   */
+  batteryStatus?: BatteryStatus | null;
+  /**
+   * Active-VPN-client presence snapshot (#2139). null/undefined = no data
+   * reported yet (old agent or network device) → the VPN column renders a
+   * dash. [] = reported with no active VPN → also a dash. Rendered purely
+   * from cached inventory — the list never fans out live commands.
+   */
+  activeVpns?: VpnPresence[] | null;
+  /**
+   * Linked multi-boot profiles (#2138). `linkGroupId` comes straight from the
+   * devices list API (null/undefined = unlinked). The grouping presentation
+   * (inactive strips / left-edge group bar) is computed client-side per page by
+   * groupLinkedDevices in linkedDevices.ts.
+   */
+  linkGroupId?: string | null;
+  /**
+   * vm_host link groups (#2308). 'host' = this record is the host server of a
+   * vm_host group; 'guest' = a guest VM nested under that host. null/undefined
+   * for unlinked devices and multiboot members (peers). A non-null role
+   * implies the group's kind is 'vm_host' — no group fetch needed.
+   */
+  linkGroupRole?: 'host' | 'guest' | null;
+  /**
+   * RDS per-session helper mode reported by the agent heartbeat
+   * (devices.helper_lifecycle_mode). 'on-demand' gates Tasks 13/14's session
+   * pickers (RD connect, script dialog). null/undefined = not reported
+   * (non-RDS host, or an agent predating the per-session helper plan).
+   * This is a UI hint, not an auth gate — see the truthy-guard comment in
+   * apps/api/src/routes/agents/heartbeat.ts.
+   */
+  helperLifecycleMode?: 'always-on' | 'on-demand' | null;
+  /**
+   * Who created a network row (#5213): 'scan' (discovery worker), 'unifi'
+   * (controller sync), or 'manual' (operator-entered via
+   * POST /devices/network). undefined/null for agent rows, which have no
+   * concept of discovery provenance.
+   */
+  source?: 'scan' | 'unifi' | 'manual' | null;
+  /** Website/SaaS endpoint identity for an IP-less manual asset (#5213). */
+  url?: string | null;
+};
+
+// Columns that only make sense for a non-agent row (#1322, #4622): the class
+// discriminator itself and its asset type. Hidden entirely when the network
+// arm's flag is off AND no manual asset is present — the manual arm has no
+// flag (it's independent of PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST), so these
+// columns must not stay gated on the network-only flag once a manual row
+// exists. Module-level so it isn't reallocated each render.
+const NON_AGENT_COLUMNS: ReadonlySet<ColumnId> = new Set<ColumnId>([
+  "class",
+  "type",
+  // #5213 — provenance (scan | unifi | manual). Agent rows have no source.
+  "source",
+]);
+// Columns meaningful only for a hand-entered manual asset (#4622 W04) — no
+// analogue on an agent or a discovered network device.
+const MANUAL_ONLY_COLUMNS: ReadonlySet<ColumnId> = new Set<ColumnId>([
+  "assetTag",
+  "location",
+]);
+// `serial` is opt-in for BOTH agent (device_hardware.serial_number) and
+// manual rows, but meaningless for a discovered network device (discovered_assets
+// has no serial column by design — see the design spec). It steps aside only
+// when the visible fleet is purely network, mirroring AGENT_ONLY_COLUMNS'
+// dash-avoidance rule below rather than joining either fixed set.
+const NETWORK_EXCLUDED_COLUMNS: ReadonlySet<ColumnId> = new Set<ColumnId>([
+  "serial",
+]);
+// Columns that only ever carry data for agent-managed endpoints. When the rows
+// on screen are all network devices (Network facet, or a network-only fleet)
+// these would render as solid columns of dashes, so they step aside — the
+// same rule that keeps `type` opt-in for agent-only fleets, applied the other
+// way round. The user's column choices are untouched; only rendering adapts.
+const AGENT_ONLY_COLUMNS: ReadonlySet<ColumnId> = new Set<ColumnId>([
+  "os",
+  "osVersion",
+  "osBuild",
+  "architecture",
+  "role",
+  "isHeadless",
+  "pendingReboot",
+  "cpu",
+  "ram",
+  "power",
+  "cpuModel",
+  "cores",
+  "ramTotal",
+  "diskTotal",
+  "agentVersion",
+  "watchdogVersion",
+  "serverUrl",
+  "wanIp",
+  "lastUser",
+  "uptime",
+  "enrolled",
+  "desktopAccess",
+  "reliability",
+  "vpn",
+]);
+
+type DeviceListProps = {
+  devices: Device[];
+  orgs?: { id: string; name: string }[];
+  sites?: { id: string; name: string }[];
+  groups?: {
+    id: string;
+    name: string;
+    type: "static" | "dynamic";
+    deviceCount: number;
+  }[];
+  // Still accepted by callers, but the device-group filter now lives in the
+  // chip bar (server-resolved), so DeviceList no longer filters by membership.
+  groupMembershipMap?: Map<string, Set<string>>;
+  onCreateGroup?: () => void;
+  autoSelectGroupId?: string | null;
+  onAutoSelectConsumed?: () => void;
+  timezone?: string;
+  onSelect?: (device: Device) => void;
+  onAction?: (action: string, device: Device) => void;
+  onBulkAction?: (action: string, devices: Device[]) => void;
+  // Controlled inline filter state — now just the device search box, owned by
+  // DevicesPage and shared with DeviceFilterToolbar. Every other structured
+  // filter lives in the server-resolved group (serverFilterIds). Defaults keep
+  // DeviceList usable on its own (tests render it standalone).
+  // The toolbar owns the search input; DeviceList only writes the VPN facet
+  // through `onListFiltersChange` so the page's counts can see it.
+  listFilters?: ListFilters;
+  onListFiltersChange?: (next: ListFilters) => void;
+  // Initial page size if the user has no stored preference for this browser.
+  // Once the component mounts, the live page size comes from localStorage
+  // (see pageSizePreference.ts); subsequent changes to this prop are ignored.
+  pageSize?: number;
+  // Pre-resolved advanced-filter id set (null = no advanced filter active).
+  // Resolution lives in DevicesPage via useAdvancedFilterIds so the list and
+  // grid views filter against the same complete, uncapped id set.
+  serverFilterIds?: Set<string> | null;
+  // The condition group behind serverFilterIds — network rows are evaluated
+  // against it client-side (see mergedListFilter.ts).
+  advancedFilter?: FilterConditionGroup | null;
+  serverFilterLoading?: boolean;
+  // True when the last /filters/preview resolution failed (403 on a pinned
+  // orgId the caller can't access, 500, network error, …). `serverFilterIds`
+  // is an EMPTY set in this case (never null — see useAdvancedFilterIds), so
+  // the table already renders zero rows; this only drives the inline error
+  // message that explains why (#4732).
+  serverFilterError?: boolean;
+  onRetryServerFilter?: () => void;
+  // When false (default), decommissioned devices are hidden — matching the old
+  // default view (status='all' implicitly excluded them). DevicesPage sets this
+  // true only when the active filter group explicitly targets the
+  // 'decommissioned' status, so filtering FOR decommissioned still shows them.
+  includeDecommissioned?: boolean;
+  /**
+   * Offered only while the rows are visible via the page-level showRemoved
+   * flag (not via an explicit Decommissioned status filter, where hiding
+   * would be a no-op) — renders the "N removed shown — hide" line (#5023).
+   */
+  onHideDecommissioned?: () => void;
+  // Applies the Decommissioned status filter upstream (#2251) — the existing
+  // unhide mechanism. Wired by DevicesPage; when absent (standalone renders /
+  // tests) the "N decommissioned hidden — show" hint is not rendered.
+  onShowDecommissioned?: () => void;
+  // Unified-list network arm (#1322). Off by default behind a build-time flag
+  // (PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST); when false the Class/Type columns
+  // and the All/Agent/Network facet are hidden entirely so the list is the
+  // agent-only view. DevicesPage passes ENABLE_NETWORK_DEVICES_IN_LIST.
+  networkDevicesEnabled?: boolean;
+  // The organization record's Devices tab (#5075 W02): every row already
+  // belongs to the SAME org (the record's), so the Organization column would
+  // repeat that org's name on every row, same as single-org scope does. Forces
+  // fleet-view OFF regardless of the OrgSwitcher's ambient scope — a partner
+  // could be viewing this org's record while the switcher points at "All
+  // organizations" or a different org entirely.
+  forceSingleOrg?: boolean;
+  // Issue #5285: each visible org's effective agent-version target (its
+  // agentVersionPins.agent pin, or the globally promoted version when
+  // unpinned), resolved ONCE per page load by the caller (DevicesPage) — not
+  // per row, since the list is hot. Keyed by orgId; a missing/null entry
+  // means "not resolved yet" and the column renders unchanged (plain dash
+  // stays plain, no tint).
+  effectiveAgentVersionByOrgId?: Record<string, string | null | undefined>;
+};
+
+// Agent Version column tint (#5285). No new colours: reuses the same
+// success/info/warning tokens statusColors already draws on, just without the
+// border (this is a text pill inside a plain cell, not a status chip).
+const agentVersionRelationColors: Record<"equal" | "ahead" | "behind", string> = {
+  equal: "bg-success/15 text-success",
+  ahead: "bg-info/15 text-info",
+  behind: "bg-warning/15 text-warning",
+};
+
+const statusColors: Record<DeviceStatus, string> = {
+  online: "bg-success/15 text-success border-success/30",
+  offline: "bg-destructive/15 text-destructive border-destructive/30",
+  maintenance: "bg-warning/15 text-warning border-warning/30",
+  decommissioned: "bg-muted text-muted-foreground border-border",
+  quarantined: "bg-warning/15 text-warning border-warning/30",
+  updating: "bg-info/15 text-info border-info/30",
+  pending: "bg-muted text-muted-foreground border-border",
+  unknown: "bg-muted text-muted-foreground border-border",
+};
+
+const statusFullLabelKeys: Record<DeviceStatus, string> = {
+  online: "deviceList.statuses.full.online",
+  offline: "deviceList.statuses.full.offline",
+  maintenance: "deviceList.statuses.full.maintenance",
+  decommissioned: "deviceList.statuses.full.decommissioned",
+  quarantined: "deviceList.statuses.full.quarantined",
+  updating: "deviceList.statuses.full.updating",
+  pending: "deviceList.statuses.full.pending",
+  unknown: "deviceList.statuses.full.unknown",
+};
+
+// Row-menu action gating (#2426). Two categories, and conflating them is the
+// bug this fixes. In THIS menu the members are:
+//
+//   LIVE SESSION — Remote Terminal. Hands off a socket, so it needs an
+//   actively-connected agent. `terminalWs` (and its desktop/tunnel siblings)
+//   reject anything but `online` with "Device is not online".
+//   → gate on `status !== 'online'`.
+//
+//   QUEUED COMMAND — Run Script, Reboot. Inserted as a `device_commands` row
+//   with `status:'pending'` (no TTL) and claimed on the agent's NEXT
+//   poll/heartbeat. The only status the API refuses is `decommissioned`:
+//   `routes/devices/commands.ts` (:89, :157, :268, :437) and the shared
+//   `executeScriptOnDevices` service (`services/scriptExecution.ts:118`, which
+//   drops `status === 'decommissioned'` devices from the target set and returns
+//   `status:'queued'` for the rest). Running a script against an OFFLINE device
+//   is a working, intentional feature: it executes on reconnect. Gating a
+//   queued command on `!== 'online'` does not prevent a doomed request, it
+//   REMOVES that capability.
+//   → gate on `status === 'decommissioned'` (an agent-less machine that can
+//     never claim the command).
+//
+// Reboot is a queued command like Run Script, so it uses `isCommandQueueable`
+// too: rebooting an offline box on reconnect is a working feature, not a doomed
+// request.
+//
+// NOT yet aligned: DeviceActions.tsx (device detail page) still gates Reboot on
+// `!== 'online'`, so the detail page remains stricter than this menu.
+//
+// The tooltip helpers live in bulkActionGating.ts beside `isCommandQueueable`,
+// so the row menu and the grid card render the same reason for the same status.
+
+// Cap visible tag chips per row; the rest collapse into a +N chip, with the
+// full comma-joined list on the cell's title attribute (same overflow trick
+// as the status pill). Keeps row height and column width bounded.
+const TAG_CHIP_CAP = 3;
+
+/**
+ * "Agent silent (watchdog OK)" amber badge. Fires when the server-side
+ * asymmetry detector (#851 / Layer C) has marked `mainAgentSilentSince`
+ * AND the watchdog is still reporting in (`watchdogStatus !== 'offline'`).
+ * That state means the main agent has wedged but the box is alive — a
+ * different failure mode from a fully-offline device, and the distinction
+ * is the whole point of #800.
+ *
+ * Returns null when no asymmetry is present so the cell stays clean.
+ */
+function shouldShowAgentSilentBadge(
+  device: Pick<Device, "mainAgentSilentSince" | "watchdogStatus">,
+): boolean {
+  return (
+    Boolean(device.mainAgentSilentSince) && device.watchdogStatus !== "offline"
+  );
+}
+
+function formatSilentDuration(silentSince: string): string {
+  const minutes = Math.max(
+    1,
+    Math.floor((Date.now() - new Date(silentSince).getTime()) / 60_000),
+  );
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+const osLabels: Record<OSType, string> = {
+  windows: "Windows",
+  macos: "macOS",
+  linux: "Linux",
+};
+
+type SortField = ColumnId | null;
+type SortDirection = "asc" | "desc";
+
+// Meaningful ordering for the Status sort. Raw enum alphabetics would put
+// "decommissioned" before "online"; rank by operational severity instead.
+const statusSortRank: Record<DeviceStatus, number> = {
+  online: 0,
+  updating: 1,
+  pending: 2,
+  maintenance: 3,
+  quarantined: 4,
+  offline: 5,
+  decommissioned: 6,
+  // "No probe has ever run" is not a worse operational state than offline —
+  // it's a different axis entirely (#4622 W04, #5213). Sorts last, after
+  // decommissioned.
+  unknown: 7,
+};
+
+// Single shared collator for every string sort in this list. `numeric` keeps
+// host-2 < host-10 and agent 0.9.x < 0.10.x; `base` sensitivity folds case and
+// accents so they don't fragment the order. Hoisted to module scope on purpose:
+// constructing an Intl.Collator per comparison is measurably costly on the
+// default landing view at the ~40k-row cap, where the sort runs over the whole
+// union on every render.
+const nameCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
+
+// Hostname of the agent's active control-plane URL (#2288); null on
+// missing/malformed values so the cell falls back to the dash.
+function serverHost(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    return new URL(raw).hostname;
+  } catch {
+    return null;
+  }
+}
+
+// One comparable value per column, mirroring what the cell displays.
+// `null` means "renders as a dash" — those rows sort last in BOTH
+// directions so blanks never bury the real data. Strings compare with
+// numeric collation (host-2 < host-10, agent 0.9.x < 0.10.x).
+const sortValue: Record<ColumnId, (d: Device) => string | number | null> = {
+  hostname: (d) => d.displayName || d.hostname,
+  // Unified-list columns (#1322, #4622): sort by the same value the cell
+  // renders so header sort stays consistent with every other column (#1284
+  // invariant). Three-way now — a two-branch ternary here would silently
+  // fold manual rows into whichever branch is the `else`.
+  class: (d) => {
+    const cls = d.deviceClass ?? "agent";
+    return cls === "manual" ? "Manual" : cls === "network" ? "Network" : "Agent";
+  },
+  // Type renders for any non-agent row (network or manual, #1386, #4622);
+  // agent rows show a dash, so they sort as blanks-last (null) to match the
+  // cell — the #1284 invariant.
+  type: (d) =>
+    (d.deviceClass ?? "agent") === "agent"
+      ? null
+      : getDeviceRoleLabel(d.assetType ?? "unknown"),
+  organization: (d) => d.orgName || null,
+  site: (d) => d.siteName || null,
+  // A network row has no OS (the cell renders a dash), so it must sort as a
+  // blank, not as the string "undefined" wedged between macOS and Windows.
+  os: (d) => osLabels[d.os] ?? null,
+  osVersion: (d) => formatDeviceOsVersion(d.os, d.osVersion) || null,
+  osBuild: (d) => d.osBuild || null,
+  architecture: (d) => d.architecture || null,
+  // Role renders only for agent rows now (#1386, #4622); network AND manual
+  // rows show a dash and sort blanks-last (null) to match the cell — the
+  // #1284 invariant. `!== "agent"`, not `=== "network"`: a two-branch ternary
+  // here would silently fold manual into the "has a role" branch.
+  role: (d) =>
+    (d.deviceClass ?? "agent") !== "agent"
+      ? null
+      : getDeviceRoleLabel(d.deviceRole ?? "unknown"),
+  isHeadless: (d) =>
+    typeof d.isHeadless === "boolean" ? (d.isHeadless ? 1 : 0) : null,
+  status: (d) => statusSortRank[d.status],
+  // false/absent renders as a dash (see the cell), so it maps to null like
+  // isHeadless — keeping the blanks-last invariant consistent for booleans.
+  pendingReboot: (d) => (d.pendingReboot ? 1 : null),
+  // Network/manual rows carry a placeholder 0 but render a dash — sort them
+  // as blanks so a CPU/RAM sort actually moves the agent rows.
+  cpu: (d) =>
+    (d.deviceClass ?? "agent") !== "agent"
+      ? null
+      : d.status === "online"
+        ? d.cpuPercent
+        : null,
+  ram: (d) =>
+    (d.deviceClass ?? "agent") !== "agent"
+      ? null
+      : d.status === "online"
+        ? d.ramPercent
+        : null,
+  // Sort by charge for devices with a battery; no-battery/unknown rows sort as
+  // blanks-last null to match the dash the cell renders (#1284 invariant).
+  power: (d) =>
+    d.batteryStatus?.present && typeof d.batteryStatus.percent === "number"
+      ? d.batteryStatus.percent
+      : null,
+  cpuModel: (d) => d.hardware?.cpuModel || null,
+  cores: (d) =>
+    typeof d.hardware?.cpuCores === "number" ? d.hardware.cpuCores : null,
+  ramTotal: (d) =>
+    typeof d.hardware?.ramTotalMb === "number" ? d.hardware.ramTotalMb : null,
+  diskTotal: (d) =>
+    typeof d.hardware?.diskTotalGb === "number" ? d.hardware.diskTotalGb : null,
+  lastSeen: (d) => new Date(d.lastSeen).getTime() || null,
+  agentVersion: (d) => d.agentVersion || null,
+  watchdogVersion: (d) => d.watchdogVersion?.trim() || null,
+  // IP columns (#2503) sort as strings through the shared numeric collator,
+  // which happens to give correct dotted-quad ordering: it compares digit runs
+  // numerically, so 192.168.1.9 < 192.168.1.10 and 10.x < 192.x. Missing
+  // values sort blanks-last (null) to match the dash the cell renders (#1284).
+  wanIp: (d) => d.wanIp || null,
+  lanIp: (d) => d.lanIp || null,
+  serverUrl: (d) => serverHost(d.agentServerUrl),
+  tags: (d) => (d.tags && d.tags.length > 0 ? d.tags.join(", ") : null),
+  lastUser: (d) => d.lastUser || null,
+  uptime: (d) =>
+    d.status === "online" && d.uptimeSeconds != null ? d.uptimeSeconds : null,
+  enrolled: (d) =>
+    d.enrolledAt ? new Date(d.enrolledAt).getTime() || null : null,
+  desktopAccess: (d) => d.desktopAccess?.mode || null,
+  // No computed score yet (newly enrolled / pre-worker, or a network device)
+  // sorts as a blank-last null to match the dash the cell renders (#1284).
+  reliability: (d) =>
+    typeof d.reliabilityScore === "number" ? d.reliabilityScore : null,
+  // Sort by the first badge's provider label — active VPNs sort ahead of
+  // running-but-disconnected ones because vpnList orders them first. Devices
+  // with no VPN at all sort blanks-last (null) to match the dash the cell
+  // renders (#1284).
+  vpn: (d) => {
+    const vpns = vpnList(d.activeVpns);
+    return vpns.length > 0 ? getVpnProviderLabel(vpns[0].provider) : null;
+  },
+  // Manual-asset inventory columns (#4622 W04); mirrors the cells above.
+  serial: (d) => {
+    const cls = d.deviceClass ?? "agent";
+    return (cls === "manual" ? d.serialNumber : cls === "agent" ? d.hardware?.serialNumber : null) || null;
+  },
+  assetTag: (d) => ((d.deviceClass ?? "agent") === "manual" ? d.assetTag || null : null),
+  location: (d) => ((d.deviceClass ?? "agent") === "manual" ? d.location || null : null),
+  // #5213 — network-only, like class/type above; agent rows sort blanks-last.
+  source: (d) =>
+    (d.deviceClass ?? "agent") === "network" ? (d.source ?? null) : null,
+};
+
+export default function DeviceList({
+  devices,
+  groups = [],
+  autoSelectGroupId,
+  onAutoSelectConsumed,
+  timezone,
+  onSelect,
+  onAction,
+  onBulkAction,
+  pageSize = 10,
+  includeDecommissioned = false,
+  onHideDecommissioned,
+  onShowDecommissioned,
+  serverFilterIds = null,
+  advancedFilter,
+  serverFilterLoading = false,
+  serverFilterError = false,
+  onRetryServerFilter,
+  networkDevicesEnabled = false,
+  listFilters,
+  onListFiltersChange,
+  forceSingleOrg = false,
+  effectiveAgentVersionByOrgId,
+}: DeviceListProps) {
+  const { t } = useTranslation("devices");
+  // Use provided timezone or browser default
+  const effectiveTimezone =
+    timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  // The only inline (instant, client-side) filter is device search,
+  // owned by DevicesPage and shared with DeviceFilterToolbar. Every other
+  // structured filter (status/os/role/org/site/group/…) now lives in the
+  // server-resolved group and arrives pre-resolved as `serverFilterIds`. When
+  // rendered standalone (tests), fall back to the default so search is a no-op.
+  const filters = listFilters ?? DEFAULT_LIST_FILTERS;
+  const { search: query } = filters;
+  // Client-side VPN facet (#2139): 'all' | 'any' (any active VPN) | a provider
+  // id. Operates on already-loaded cached inventory, mirroring the class facet
+  // — no server round-trip, no live command fan-out.
+  // The VPN facet lives in listFilters (page-owned) so DevicesPage's class
+  // counts and hidden-network notice see it; a standalone render (no
+  // onListFiltersChange) keeps it local.
+  const [localVpnFilter, setLocalVpnFilter] = useState<string>("all");
+  const vpnFilter: string = onListFiltersChange
+    ? (filters.vpn ?? "all")
+    : localVpnFilter;
+  const setVpnFilter = (next: string) => {
+    if (onListFiltersChange) onListFiltersChange({ ...filters, vpn: next });
+    else setLocalVpnFilter(next);
+  };
+  const [currentPage, setCurrentPage] = useState(1);
+  // Live, user-controllable page size. Initialized from localStorage; the
+  // pageSize prop is just the fallback when no preference is stored.
+  const [effectivePageSize, setEffectivePageSize] = useState<number>(() =>
+    readPageSizePreference(pageSize),
+  );
+  // Checkbox + Actions are always-on first/last; the rest live in
+  // COLUMN_IDS and the order in columnOrder controls render sequence.
+  const [visibleColumns, setVisibleColumns] = useState<Set<ColumnId>>(
+    () => new Set(readColumnVisibility()),
+  );
+  const [columnOrder, setColumnOrder] = useState<ColumnId[]>(() =>
+    readColumnOrder(),
+  );
+  const [columnsMenuOpen, setColumnsMenuOpen] = useState(false);
+  const columnsMenuRef = useRef<HTMLDivElement>(null);
+  // Table density reflects the account-wide preference (breeze.density),
+  // which is now set from the top-bar theme/display menu. Subscribe so the
+  // table re-renders when it changes, without a reload.
+  const [density, setDensity] = useState<Density>(() => readDensity());
+  useEffect(() => subscribeDensity(setDensity), []);
+  // Linked multi-boot profiles (#2138): per-user "Collapse linked inactive
+  // profiles" presentation toggle, persisted via the appearance module
+  // (localStorage — NOT a query param / URL hash). Default on.
+  const [linkedCollapse, setLinkedCollapse] =
+    useState<LinkedProfileCollapsePreference>(() =>
+      readLinkedProfileCollapsePreference(),
+    );
+  useEffect(() => subscribeLinkedProfileCollapse(setLinkedCollapse), []);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // vm_host nesting (#2308): link-group ids whose guest rows are collapsed
+  // beneath their host. Transient per-visit presentation state (default:
+  // expanded, guests visible) — deliberately NOT persisted/hash-encoded.
+  const [collapsedVmGroups, setCollapsedVmGroups] = useState<Set<string>>(new Set());
+  const [bulkMenuOpen, setBulkMenuOpen] = useState(false);
+  const [rowMenuOpenId, setRowMenuOpenId] = useState<string | null>(null);
+  // Flip the row dropdown direction when the click happens close to the
+  // viewport bottom — the menu has ~7 items × ~36px, so any row whose
+  // kebab sits <300px from the viewport bottom would otherwise render
+  // its dropdown into the area below the table and get clipped.
+  const [rowMenuFlipUp, setRowMenuFlipUp] = useState(false);
+  // Viewport-relative anchor for the portaled row menu. The menu is rendered into
+  // document.body (not inside the overflow-x-auto table wrapper, which would clip it),
+  // so it positions itself with `fixed` coordinates derived from the kebab button.
+  const [rowMenuAnchor, setRowMenuAnchor] = useState<{
+    top: number;
+    bottom: number;
+    right: number;
+  } | null>(null);
+  const rowMenuRef = useRef<HTMLDivElement>(null);
+  const rowMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [sortField, setSortField] = useState<SortField>(null);
+  const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+
+  // Close row action menu on outside click
+  useEffect(() => {
+    if (!rowMenuOpenId) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as Node;
+      // The menu is portaled outside the trigger, so check both the menu and the button.
+      if (
+        rowMenuRef.current?.contains(target) ||
+        rowMenuButtonRef.current?.contains(target)
+      )
+        return;
+      setRowMenuOpenId(null);
+    };
+    // The menu is fixed-positioned from a captured anchor; scrolling would detach it, so close instead.
+    const handleScroll = () => setRowMenuOpenId(null);
+    document.addEventListener("mousedown", handleClickOutside);
+    window.addEventListener("scroll", handleScroll, true);
+    window.addEventListener("resize", handleScroll);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      window.removeEventListener("scroll", handleScroll, true);
+      window.removeEventListener("resize", handleScroll);
+    };
+  }, [rowMenuOpenId]);
+
+  // Close columns visibility menu on outside click
+  useEffect(() => {
+    if (!columnsMenuOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        columnsMenuRef.current &&
+        !columnsMenuRef.current.contains(e.target as Node)
+      ) {
+        setColumnsMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [columnsMenuOpen]);
+
+  // Hiding does not change columnOrder, so re-showing restores the slot.
+  const toggleColumn = (id: ColumnId) => {
+    setVisibleColumns((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      writeColumnVisibility(next);
+      return next;
+    });
+  };
+
+  // Neighbor is the visible column above/below; hidden columns in
+  // columnOrder are skipped so the swap matches what the user sees.
+  const moveColumn = (id: ColumnId, direction: -1 | 1) => {
+    setColumnOrder((prev) => {
+      const visibleIds = prev.filter((c) => visibleColumns.has(c));
+      const visibleIdx = visibleIds.indexOf(id);
+      if (visibleIdx === -1) return prev;
+      const targetVisibleIdx = visibleIdx + direction;
+      if (targetVisibleIdx < 0 || targetVisibleIdx >= visibleIds.length)
+        return prev;
+      const swapWith = visibleIds[targetVisibleIdx];
+      const a = prev.indexOf(id);
+      const b = prev.indexOf(swapWith);
+      const next = [...prev];
+      next[a] = swapWith;
+      next[b] = id;
+      writeColumnOrder(next);
+      return next;
+    });
+  };
+
+  // Restores both visibility and order to the catalog defaults.
+  const resetColumnsToDefault = () => {
+    const cols = resetColumns();
+    setColumnOrder(cols.map((c) => c.id));
+    setVisibleColumns(new Set(cols.filter((c) => c.visible).map((c) => c.id)));
+  };
+
+  // Notify the parent that a freshly-created group has been handled. The group
+  // filter itself now lives in the chip bar (server-resolved), so there is no
+  // local group selection to toggle here — just consume the one-shot signal.
+  useEffect(() => {
+    if (autoSelectGroupId && groups.some((g) => g.id === autoSelectGroupId)) {
+      onAutoSelectConsumed?.();
+    }
+  }, [autoSelectGroupId, groups, onAutoSelectConsumed]);
+
+  // Reset to page 1 whenever a list-local narrowing changes (device search,
+  // the VPN facet, the server-resolved id set). The page-level class segment
+  // hands in a new `devices` array instead; a data refresh does too, and must
+  // NOT yank the user back to page 1, so `devices` is deliberately not a dep.
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [query, vpnFilter, serverFilterIds]);
+
+  // Every filter EXCEPT the hidden-by-default decommissioned rule. Split out
+  // so the removed-hint counts (#2251/#5023) can be taken from the rows the
+  // tech's filters would actually let through — a decommissioned device the
+  // server filter or search already excludes is not "hidden by default" and
+  // must not be counted as showable.
+  const filterBlocked = serverFilterLoading || serverFilterError;
+  const matchingDevices = useMemo(() => {
+    if (filterBlocked) return [];
+    const normalizedQuery = query.trim().toLowerCase();
+
+    return devices.filter((device) => {
+      // The server-resolved id set (agent rows), the client-side evaluator
+      // (network rows), the VPN facet and search all live in one shared
+      // predicate so the page-level class counts and the grid can never
+      // disagree with the rows rendered here.
+      if (
+        !matchesMergedListFilters(device, {
+          serverFilterIds,
+          advancedFilter,
+          // The decommissioned rule is applied one step later (filteredDevices)
+          // so decommissionedCount can see what "show" would reveal (#5023).
+          includeDecommissioned: true,
+          query: normalizedQuery,
+          vpn: vpnFilter,
+        })
+      ) {
+        return false;
+      }
+
+      return true;
+    });
+  }, [
+    devices,
+    query,
+    vpnFilter,
+    serverFilterIds,
+    advancedFilter,
+    filterBlocked,
+  ]);
+
+  // Hide decommissioned by default — preserves the old list's hygiene
+  // (status='all' implicitly excluded them). Filtering FOR decommissioned via
+  // a status chip, or "show" on the hint, flips includeDecommissioned upstream.
+  const filteredDevices = useMemo(
+    () =>
+      includeDecommissioned
+        ? matchingDevices
+        : matchingDevices.filter((d) => d.status !== "decommissioned"),
+    [matchingDevices, includeDecommissioned]
+  );
+
+  // Removed devices the current filters would let through (#2251/#5023) —
+  // the ones "show" can actually reveal / "hide" actually removes. Zero on
+  // the hidden side once they're visible (and vice versa) so the hint and
+  // the count line stay consistent with what the table actually shows.
+  const decommissionedCount = useMemo(
+    () => matchingDevices.filter((d) => d.status === "decommissioned").length,
+    [matchingDevices]
+  );
+  const hiddenDecommissionedCount = includeDecommissioned ? 0 : decommissionedCount;
+  // Count-line denominator: the fleet minus every decommissioned row while
+  // they're hidden (regardless of whether the filters would admit them).
+  const countLineTotal = useMemo(
+    () =>
+      includeDecommissioned
+        ? devices.length
+        : devices.filter((d) => d.status !== "decommissioned").length,
+    [devices, includeDecommissioned]
+  );
+
+  // Providers present across the loaded set — drives the VPN facet options so
+  // techs only see providers that actually exist in their fleet.
+  const availableVpnProviders = useMemo(() => {
+    const set = new Set<string>();
+    for (const device of devices) {
+      for (const vpn of activeVpnList(device.activeVpns)) set.add(vpn.provider);
+    }
+    return Array.from(set).sort((a, b) =>
+      getVpnProviderLabel(a).localeCompare(getVpnProviderLabel(b)),
+    );
+  }, [devices]);
+
+  // Reset a by-provider VPN filter back to 'all' if that provider drops out of
+  // the loaded set (e.g. the device went offline) so the facet never gets stuck
+  // on an option that matches nothing.
+  useEffect(() => {
+    if (
+      vpnFilter !== "all" &&
+      vpnFilter !== "any" &&
+      !availableVpnProviders.includes(vpnFilter)
+    ) {
+      setVpnFilter("all");
+    }
+  }, [vpnFilter, availableVpnProviders]);
+
+  const handleSort = (field: ColumnId) => {
+    if (sortField === field) {
+      setSortDirection((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortField(field);
+      setSortDirection("asc");
+    }
+  };
+
+  const sortedDevices = useMemo(() => {
+    // Default ordering for the merged list (#1424, deferred item 1). With no
+    // column actively selected, agent rows arrive hostname-sorted from the
+    // cursor API while network rows arrive last-seen-sorted from the offset
+    // API, and DevicesPage concatenates them as `[...agents, ...network]`. The
+    // raw concatenation therefore renders as two differently-ordered blocks —
+    // the "merged list visibly alternates sort order" defect. Apply one unified
+    // key across the whole union: the same `displayName || hostname` the Device
+    // column sorts on, with `id` as a stable tiebreaker so client-side
+    // pagination is deterministic (a row can't hop pages between renders).
+    if (!sortField) return sortByDisplayName(filteredDevices);
+
+    const value = sortValue[sortField];
+    const dir = sortDirection === "desc" ? -1 : 1;
+
+    return [...filteredDevices].sort((a, b) => {
+      const av = value(a);
+      const bv = value(b);
+      // Dash cells sort last regardless of direction. `== null` on purpose:
+      // an undefined key (a column the row simply lacks) is a blank too.
+      if (av == null || bv == null)
+        return av == bv ? 0 : av == null ? 1 : -1;
+      const cmp =
+        typeof av === "number" && typeof bv === "number"
+          ? av - bv
+          : nameCollator.compare(String(av), String(bv));
+      return dir * cmp;
+    });
+  }, [filteredDevices, sortField, sortDirection]);
+
+  const totalPages = Math.ceil(sortedDevices.length / effectivePageSize);
+
+  // Adjust currentPage during render when filters/search shrink the result
+  // set below it. Setting state during render is React's documented way to
+  // correct derived state without a flash of stale UI — React discards the
+  // in-progress render and re-runs with the corrected value.
+  if (totalPages > 0 && currentPage > totalPages) {
+    setCurrentPage(1);
+  }
+
+  const startIndex = (currentPage - 1) * effectivePageSize;
+  const paginatedDevices = sortedDevices.slice(
+    startIndex,
+    startIndex + effectivePageSize,
+  );
+
+  // Linked-device presentation, computed client-side WITHIN the current page.
+  // Multiboot (#2138): exactly one online member → offline siblings render as
+  // thin strips beneath it; all offline → full rows with a left-edge group
+  // bar; 2+ online → all normal rows. The collapse toggle gates ONLY these
+  // multiboot heuristics (off → flat multiboot rows). vm_host nesting (#2308)
+  // is hierarchical organization, not offline-noise suppression, so guests
+  // nest under their host regardless of the toggle.
+  const displayRows = useMemo(
+    () => groupLinkedDevices(paginatedDevices, linkedCollapse === "on"),
+    [paginatedDevices, linkedCollapse],
+  );
+  // vm_host nesting (#2308): drop guest rows whose group is collapsed. The
+  // host row renders a "N guests hidden" strip in their place.
+  const visibleRows = useMemo(
+    () => displayRows.filter(r => !(r.vmRole === 'guest' && r.vmGroupId && collapsedVmGroups.has(r.vmGroupId))),
+    [displayRows, collapsedVmGroups]
+  );
+  // Strips are NOT selectable rows — bulk selection only sees real full rows.
+  // Collapsed (hidden) vm_host guests are likewise excluded: select-all must
+  // never silently pick up rows the user cannot see.
+  const selectablePageDevices = useMemo(
+    () => visibleRows.map((r) => r.device),
+    [visibleRows],
+  );
+  // Only offer the collapse toggle when the fleet actually has MULTIBOOT
+  // linked profiles — it doesn't govern vm_host nesting (#2308), so a fleet
+  // with only vm_host groups gets no dead toggle.
+  const hasLinkedDevices = useMemo(
+    () => devices.some((d) => d.linkGroupId && !d.linkGroupRole),
+    [devices],
+  );
+
+  const handlePageSizeChange = (newSize: number) => {
+    setEffectivePageSize(newSize);
+    writePageSizePreference(newSize);
+    // Reset to page 1 so the user doesn't land out-of-range when shrinking
+    // the page (and gets a coherent first-page view when growing it).
+    setCurrentPage(1);
+  };
+
+  // Selection must never outlive the rows it points at: when a class change,
+  // a search/VPN/advanced filter, or a refresh drops a selected device out of
+  // the visible set (filteredDevices — every narrowing, before paging), drop
+  // it from the selection too. Otherwise the bar reads "4 selected" over an
+  // empty table and a bulk action can hit a device nobody can see.
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const present = new Set(filteredDevices.map((d) => d.id));
+      const next = new Set<string>();
+      prev.forEach((id) => {
+        if (present.has(id)) next.add(id);
+      });
+      return next.size === prev.size ? prev : next;
+    });
+  }, [filteredDevices]);
+
+  const selectedDevices = useMemo(
+    () => filteredDevices.filter((d) => selectedIds.has(d.id)),
+    [filteredDevices, selectedIds],
+  );
+  const selectedAgentCount = useMemo(
+    () => selectedDevices.filter((d) => (d.deviceClass ?? "agent") === "agent").length,
+    [selectedDevices],
+  );
+  // Per-class tally (#4622 W04) so the composition line below can say "N
+  // agent, N network, N manual" honestly instead of folding manual selections
+  // into a "network" bucket that no longer means only network.
+  const selectedNetworkCount = useMemo(
+    () => selectedDevices.filter((d) => (d.deviceClass ?? "agent") === "network").length,
+    [selectedDevices],
+  );
+  const selectedManualCount = useMemo(
+    () => selectedDevices.filter((d) => (d.deviceClass ?? "agent") === "manual").length,
+    [selectedDevices],
+  );
+  const selectedNonAgentCount = selectedNetworkCount + selectedManualCount;
+  // Agent-only bulk actions: disabled outright when no agent is selected,
+  // annotated with the eligible count on a mixed selection — the request
+  // funnel in DevicesPage still refuses network/manual rows, this just says
+  // so before the click instead of after.
+  const agentOnlyDisabled = filterBlocked || selectedAgentCount === 0;
+  const agentOnlyTitle = agentOnlyDisabled
+    ? t("deviceList.agentOnlyBulkAction")
+    : undefined;
+  const agentOnlySuffix =
+    selectedNonAgentCount > 0 && selectedAgentCount > 0 ? (
+      <span className="ml-1 text-xs text-muted-foreground">
+        ({t("deviceList.eligibleOfSelected", { count: selectedAgentCount, total: selectedIds.size })})
+      </span>
+    ) : null;
+  // Manual-only bulk action (Delete, #4622 W04): the mirror image of the
+  // agent-only gating above — disabled with zero manual rows selected,
+  // annotated with the eligible count on a mixed selection.
+  const manualOnlyDisabled = selectedManualCount === 0;
+  const manualOnlyTitle = manualOnlyDisabled
+    ? t("deviceList.manualOnlyBulkAction")
+    : undefined;
+  const manualOnlySuffix =
+    selectedManualCount > 0 && selectedManualCount < selectedIds.size ? (
+      <span className="ml-1 text-xs text-muted-foreground">
+        ({t("deviceList.eligibleOfSelected", { count: selectedManualCount, total: selectedIds.size })})
+      </span>
+    ) : null;
+
+  const handleSelectAll = (checked: boolean) => {
+    if (filterBlocked) return;
+    if (checked) {
+      setSelectedIds(new Set(selectablePageDevices.map((d) => d.id)));
+    } else {
+      setSelectedIds(new Set());
+    }
+  };
+
+  const handleSelectOne = (id: string, checked: boolean) => {
+    if (filterBlocked) return;
+    const newSet = new Set(selectedIds);
+    if (checked) {
+      newSet.add(id);
+    } else {
+      newSet.delete(id);
+    }
+    setSelectedIds(newSet);
+  };
+
+  const handleBulkAction = (action: string) => {
+    if (filterBlocked) return;
+    if (selectedDevices.length) onBulkAction?.(action, selectedDevices);
+    setBulkMenuOpen(false);
+    setSelectedIds(new Set());
+  };
+
+  /**
+   * #2787 — the bulk bar is SELECTION-AWARE. A selection of only removed
+   * devices gets Restore / Delete permanently and nothing else; every other
+   * selection (including a mixed one) gets the ordinary menu.
+   *
+   * Not merely cosmetic: the removed-only actions call APIs that require
+   * `status = 'decommissioned'`, so offering them for a mixed selection would
+   * reject every active device in the batch. The ordinary actions, by contrast,
+   * already SKIP removed devices via DECOMMISSION_BLOCKED_BULK_ACTIONS, so the
+   * mixed case degrades gracefully on the active menu and badly on the other.
+   */
+  const selectionKind = classifyBulkSelection(
+    devices.filter((d) => selectedIds.has(d.id)).map((d) => d.status),
+  );
+
+  const allSelected =
+    selectablePageDevices.length > 0 &&
+    selectablePageDevices.every((d) => selectedIds.has(d.id));
+  const someSelected = selectablePageDevices.some((d) => selectedIds.has(d.id));
+
+  // Fleet (All-organizations) view: only then does the Organization column
+  // carry information — in single-org scope it would repeat the header's org
+  // on every row, so it disappears from the table and the column picker.
+  // The hook call stays UNCONDITIONAL even when `forceSingleOrg` already
+  // decides the answer — hooks must run in the same order on every render,
+  // so gating this call behind an `if (!forceSingleOrg)` would violate the
+  // rules of hooks regardless of whether the prop's value ever changes.
+  const fleetFromStore = useOrgStore((s) => !s.currentOrgId && s.allOrgs);
+  const isFleetView = !forceSingleOrg && fleetFromStore;
+
+  // Which classes are actually on screen — drives the class-adaptive column
+  // set below (a Network-only view has no use for OS/CPU/RAM; an agent-only
+  // view has no use for Class/Type). The manual arm carries no feature flag
+  // (independent of PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST), so `hasManualRows`
+  // is never gated on `networkDevicesEnabled`.
+  const hasAgentRows = useMemo(
+    () =>
+      (!networkDevicesEnabled && !devices.some((d) => (d.deviceClass ?? "agent") === "manual")) ||
+      devices.some((d) => (d.deviceClass ?? "agent") === "agent"),
+    [networkDevicesEnabled, devices],
+  );
+  const hasNetworkRows = useMemo(
+    () =>
+      networkDevicesEnabled &&
+      devices.some((d) => (d.deviceClass ?? "agent") === "network"),
+    [networkDevicesEnabled, devices],
+  );
+  const hasManualRows = useMemo(
+    () => devices.some((d) => (d.deviceClass ?? "agent") === "manual"),
+    [devices],
+  );
+
+  // The Class/Type columns belong to the non-agent arms (#1322, #4622); hide
+  // them entirely only when NEITHER the network flag is on NOR a manual row
+  // exists, so the list can be a pure agent-only view.
+  const isColumnAvailable = (id: ColumnId) =>
+    (networkDevicesEnabled || hasManualRows || !NON_AGENT_COLUMNS.has(id)) &&
+    (id !== "organization" || isFleetView);
+
+  // The VPN facet is agent-only; never leave it narrowing an all-network view
+  // after its control has gone (the critique's "unmounted filter" dead end).
+  useEffect(() => {
+    if (!hasAgentRows && vpnFilter !== "all") setVpnFilter("all");
+  }, [hasAgentRows, vpnFilter]);
+
+  const classAllowsColumn = (id: ColumnId) =>
+    (hasAgentRows || !AGENT_ONLY_COLUMNS.has(id)) &&
+    (hasNetworkRows || hasManualRows || !NON_AGENT_COLUMNS.has(id)) &&
+    (hasManualRows || !MANUAL_ONLY_COLUMNS.has(id)) &&
+    (hasAgentRows || hasManualRows || !NETWORK_EXCLUDED_COLUMNS.has(id));
+
+  // Effective render sequence: user-chosen order, filtered to visible.
+  // Checkbox and Actions are rendered separately as the first/last cells.
+  const renderedColumns = columnOrder.filter(
+    (id) =>
+      visibleColumns.has(id) && isColumnAvailable(id) && classAllowsColumn(id),
+  );
+
+  // sortHeader factors out the repeated header pattern for sortable
+  // columns to keep the column-defs table below readable. The column id
+  // doubles as the sort key.
+  const sortHeader = (
+    id: ColumnId,
+    label: string,
+    hint: string,
+    alignRight = false,
+  ) => (
+    <th
+      key={id}
+      scope="col"
+      className={`px-3 py-3 select-none${alignRight ? " text-right" : ""}`}
+      aria-sort={
+        sortField === id
+          ? sortDirection === "asc"
+            ? "ascending"
+            : "descending"
+          : "none"
+      }
+    >
+      {/* A real button so sorting is reachable by keyboard; aria-sort stays on
+          the header cell where assistive tech expects it. */}
+      <button
+        type="button"
+        aria-label={hint}
+        title={hint}
+        onClick={() => handleSort(id)}
+        className="inline-flex items-center gap-1 rounded-sm hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        {label}
+        {sortField === id ? (
+          sortDirection === "asc" ? (
+            <ChevronUp aria-hidden="true" className="h-3 w-3" />
+          ) : (
+            <ChevronDown aria-hidden="true" className="h-3 w-3" />
+          )
+        ) : (
+          <ArrowUpDown aria-hidden="true" className="h-3 w-3 opacity-30" />
+        )}
+      </button>
+    </th>
+  );
+
+  // metricBar renders the CPU/RAM percent bar with em-dash fallback for
+  // non-online devices. Extracted so the cpu and ram column cells stay small.
+  //
+  // Color intent: green/red are reserved for *device status* (the Up/Down
+  // pills), so a calm brand fill carries normal utilization here — a 45%-RAM
+  // bar shouldn't read as "healthy green" and visually rhyme with an Up pill.
+  // We still escalate amber → red at genuine pressure (≥75% / ≥90%) because a
+  // pegged box is exactly what a tech must catch at a glance; the bar width
+  // and the trailing number carry the exact value at every level.
+  const metricBar = (percent: number, online: boolean) =>
+    online ? (
+      <div className="flex items-center gap-2">
+        <div className="h-2 w-16 overflow-hidden rounded-full bg-muted">
+          <div
+            className={`h-full rounded-full ${percent >= 90 ? "bg-destructive" : percent >= 75 ? "bg-warning" : "bg-primary/70"} ${widthPercentClass(percent)}`}
+          />
+        </div>
+        <span className="w-10 text-right tabular-nums">{percent}%</span>
+      </div>
+    ) : (
+      <span className="text-muted-foreground">{t("deviceList.text")}</span>
+    );
+
+  // Format helpers for hardware columns. RAM is reported in MB; convert
+  // to GB rounded to one decimal. Disk is already reported in GB.
+  const fmtRamGb = (mb: number | undefined) =>
+    typeof mb === "number"
+      ? `${formatNumber(mb / 1024, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} GB`
+      : null;
+  const fmtDiskGb = (gb: number | undefined) =>
+    typeof gb === "number" ? `${gb} GB` : null;
+  const fmtDate = (iso: string | undefined) => {
+    if (!iso) return null;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString();
+  };
+  const fmtWatchdogVersion = (raw: string | null | undefined) => {
+    const version = raw?.trim();
+    return version ? version : t("deviceList.nA");
+  };
+
+  // Reliability score band → badge classes. Thresholds mirror
+  // DeviceReliabilityPanel.tsx (scoreClass): ≤50 critical, ≤70 warning,
+  // ≤85 info, else healthy — keep the two in sync so the list badge and the
+  // drill-down panel tell the same story (#1720).
+  const reliabilityBandClass = (score: number): string => {
+    if (score <= 50)
+      return "bg-destructive/15 text-destructive border-destructive/30";
+    if (score <= 70) return "bg-warning/15 text-warning border-warning/30";
+    if (score <= 85) return "bg-info/15 text-info border-info/30";
+    return "bg-success/15 text-success border-success/30";
+  };
+  const reliabilityTrendGlyph: Record<
+    NonNullable<Device["reliabilityTrend"]>,
+    { glyph: string; label: string }
+  > = {
+    improving: { glyph: "↑", label: t("deviceList.improving") },
+    stable: { glyph: "→", label: t("deviceList.stable") },
+    degrading: { glyph: "↓", label: t("deviceList.degrading") },
+  };
+
+  // Power/battery cell helpers (#2142).
+  const fmtBatteryDuration = (minutes: number): string => {
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+    return `${m}m`;
+  };
+  const batteryStateLabel: Record<
+    NonNullable<BatteryStatus["chargingState"]>,
+    string
+  > = {
+    charging: "Charging",
+    discharging: "On battery",
+    full: "Full",
+    not_charging: "Not charging",
+    unknown: "Unknown",
+  };
+  const formatBatteryTooltip = (b: BatteryStatus): string => {
+    const parts: string[] = [];
+    if (typeof b.percent === "number") parts.push(`${Math.round(b.percent)}%`);
+    if (b.chargingState)
+      parts.push(batteryStateLabel[b.chargingState] ?? b.chargingState);
+    if (b.pluggedIn !== undefined)
+      parts.push(
+        b.pluggedIn
+          ? t("deviceList.pluggedInAc")
+          : t("deviceList.onBatteryPower"),
+      );
+    if (typeof b.timeRemainingMinutes === "number")
+      parts.push(`~${fmtBatteryDuration(b.timeRemainingMinutes)} remaining`);
+    if (typeof b.timeToFullMinutes === "number")
+      parts.push(`~${fmtBatteryDuration(b.timeToFullMinutes)} to full`);
+    if (b.reportedAt)
+      parts.push(`reported ${formatLastSeen(b.reportedAt, effectiveTimezone)}`);
+    return parts.join(" • ");
+  };
+
+  // columnDefs is the single source of truth for each toggleable column's
+  // header and per-row cell. The thead and tbody iterate `renderedColumns`
+  // and pick from this table, so adding a new column means adding one
+  // entry here plus the corresponding id to COLUMN_IDS / COLUMN_LABELS.
+  // A dash reads as "not applicable" to sighted users; give assistive tech
+  // the same information instead of a bare U+2014.
+  const dash = (
+    <>
+      <span className="text-muted-foreground" aria-hidden="true">
+        {t("deviceList.text")}
+      </span>
+      <span className="sr-only">{t("deviceList.notApplicable")}</span>
+    </>
+  );
+  // Agent-only columns render "—" for network AND manual rows (#1322, #4622):
+  // the attribute doesn't exist for a printer/router or a hand-entered asset,
+  // so don't imply 0/blank.
+  const agentCell = (device: Device, node: React.ReactNode): React.ReactNode =>
+    (device.deviceClass ?? "agent") !== "agent" ? dash : node;
+  const columnDefs: Record<
+    ColumnId,
+    { header: () => React.ReactNode; cell: (device: Device) => React.ReactNode }
+  > = {
+    hostname: {
+      header: () => sortHeader("hostname", t("deviceList.tableColumns.device"), t("deviceList.sortBy.device")),
+      cell: (device) => {
+        const hasDisplayName =
+          !!device.displayName && device.displayName !== device.hostname;
+        const primaryName = device.displayName || device.hostname;
+        return (
+          <td key="hostname" className="max-w-[220px] px-3 py-3 text-sm">
+            <div className="min-w-0">
+              <span className="block truncate font-medium" title={primaryName}>
+                {primaryName}
+              </span>
+              {hasDisplayName && (
+                <span
+                  className="block truncate text-xs text-muted-foreground"
+                  title={device.hostname}
+                >
+                  {device.hostname}
+                </span>
+              )}
+            </div>
+          </td>
+        );
+      },
+    },
+    class: {
+      header: () => sortHeader("class", t("deviceList.tableColumns.class"), t("deviceList.sortBy.class")),
+      cell: (device) => {
+        const deviceClass = device.deviceClass ?? "agent";
+        const isNetwork = deviceClass === "network";
+        const isManual = deviceClass === "manual";
+        const badgeClass = isManual
+          ? "bg-warning/15 text-warning border-warning/30"
+          : isNetwork
+            ? "bg-info/15 text-info border-info/30"
+            : "bg-primary/10 text-primary border-primary/30";
+        const title = isManual
+          ? t("deviceList.manualAsset")
+          : isNetwork
+            ? t("deviceList.networkDiscoveredDevice")
+            : t("deviceList.agentManagedEndpoint");
+        const label = isManual ? t("deviceList.manual") : isNetwork ? t("deviceList.network") : t("deviceList.agent");
+        return (
+          <td key="class" className="px-3 py-3 text-sm">
+            <span
+              data-testid={`device-${device.id}-class-badge`}
+              title={title}
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium ${badgeClass}`}
+            >
+              {isManual ? (
+                <Package className="h-3 w-3" />
+              ) : isNetwork ? (
+                <Network className="h-3 w-3" />
+              ) : (
+                <Cpu className="h-3 w-3" />
+              )}
+              {label}
+            </span>
+          </td>
+        );
+      },
+    },
+    type: {
+      header: () => sortHeader("type", t("deviceList.tableColumns.type"), t("deviceList.sortBy.type")),
+      cell: (device) => {
+        // Type is the asset_type of a *non-agent* row (printer, switch, NAS…
+        // for network; the same discovered_asset_type enum for a manual
+        // asset). For agent rows the equivalent question — what kind of
+        // endpoint is this — is answered by the Role column, so Type renders a
+        // dash rather than echoing deviceRole and duplicating Role side by
+        // side (#1386). Role and Type are complementary axes, one per class.
+        if ((device.deviceClass ?? "agent") === "agent") {
+          return (
+            <td key="type" className="px-3 py-3 text-sm whitespace-nowrap">
+              {dash}
+            </td>
+          );
+        }
+        const typeValue = device.assetType ?? "unknown";
+        const TypeIcon = getDeviceRoleIcon(typeValue);
+        const typeLabel = getDeviceRoleLabel(typeValue);
+        return (
+          <td
+            key="type"
+            className="px-3 py-3 text-sm whitespace-nowrap"
+            data-testid={`device-${device.id}-type`}
+          >
+            <span
+              className="inline-flex items-center gap-1.5 text-muted-foreground"
+              title={typeLabel}
+            >
+              <TypeIcon className="h-3.5 w-3.5" />
+              <span className="truncate">{typeLabel}</span>
+            </span>
+          </td>
+        );
+      },
+    },
+    source: {
+      header: () => sortHeader("source", t("deviceList.tableColumns.source"), t("deviceList.sortBy.source")),
+      cell: (device) => {
+        // Network-only (#5213); agent rows have no discovery provenance.
+        if ((device.deviceClass ?? "agent") !== "network" || !device.source) {
+          return (
+            <td key="source" className="px-3 py-3 text-sm whitespace-nowrap">
+              {dash}
+            </td>
+          );
+        }
+        const sourceLabel = t(/* i18n-dynamic */ `deviceList.source.${device.source}`);
+        return (
+          <td
+            key="source"
+            className="px-3 py-3 text-sm whitespace-nowrap"
+            data-testid={`device-${device.id}-source`}
+          >
+            {device.source === "manual" ? (
+              <span className="inline-flex items-center rounded-full border border-info/30 bg-info/15 px-2 py-0.5 text-[10px] font-medium text-info">
+                {sourceLabel}
+              </span>
+            ) : (
+              <span className="text-muted-foreground">{sourceLabel}</span>
+            )}
+          </td>
+        );
+      },
+    },
+    organization: {
+      header: () =>
+        sortHeader("organization", t("deviceList.tableColumns.organization"), t("deviceList.sortBy.organization")),
+      cell: (device) => (
+        <td
+          key="organization"
+          className="max-w-[160px] px-3 py-3 text-sm text-muted-foreground"
+        >
+          <span className="block truncate" title={device.orgName}>
+            {device.orgName}
+          </span>
+        </td>
+      ),
+    },
+    site: {
+      header: () => sortHeader("site", t("deviceList.tableColumns.site"), t("deviceList.sortBy.site")),
+      cell: (device) => (
+        <td
+          key="site"
+          className="max-w-[160px] px-3 py-3 text-sm text-muted-foreground"
+        >
+          <span className="block truncate" title={device.siteName}>
+            {device.siteName}
+          </span>
+        </td>
+      ),
+    },
+    os: {
+      header: () => sortHeader("os", t("deviceList.tableColumns.os"), t("deviceList.sortBy.os")),
+      cell: (device) => (
+        <td key="os" className="px-3 py-3 text-sm">
+          {agentCell(
+            device,
+            <OSIcon os={device.os} className="h-4 w-4 text-muted-foreground" />,
+          )}
+        </td>
+      ),
+    },
+    osVersion: {
+      header: () => sortHeader("osVersion", "OS Version", "Sort by OS version"),
+      cell: (device) => (
+        <td
+          key="osVersion"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+        >
+          {formatDeviceOsVersion(device.os, device.osVersion) || dash}
+        </td>
+      ),
+    },
+    osBuild: {
+      header: () => sortHeader("osBuild", "OS Build", "Sort by OS build"),
+      cell: (device) => (
+        <td
+          key="osBuild"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+        >
+          {device.osBuild || dash}
+        </td>
+      ),
+    },
+    architecture: {
+      header: () => sortHeader("architecture", "Arch", "Sort by architecture"),
+      cell: (device) => (
+        <td
+          key="architecture"
+          className="px-3 py-3 text-sm text-muted-foreground"
+        >
+          {device.architecture || dash}
+        </td>
+      ),
+    },
+    role: {
+      header: () => sortHeader("role", t("deviceList.tableColumns.role"), t("deviceList.sortBy.role")),
+      cell: (device) => {
+        // Role is the function of an *agent-managed* endpoint and drives
+        // config-policy targeting; it's meaningless for a network-discovered
+        // asset (a printer has no agent role), so network rows render a dash —
+        // the inverse of the Type column above (#1386, #1322 dash convention).
+        const role = device.deviceRole ?? "unknown";
+        const RoleIcon = getDeviceRoleIcon(role);
+        const roleLabel = t(/* i18n-dynamic */ `deviceList.roles.${role}`, {
+          defaultValue: getDeviceRoleLabel(role),
+        });
+        return (
+          <td
+            key="role"
+            className="px-3 py-3 text-sm"
+            data-testid={`device-${device.id}-role`}
+          >
+            {agentCell(
+              device,
+              <span
+                className="inline-flex items-center justify-center rounded-full border bg-muted/50 p-1.5"
+                title={roleLabel}
+                aria-label={roleLabel}
+              >
+                <RoleIcon className="h-3.5 w-3.5" />
+              </span>,
+            )}
+          </td>
+        );
+      },
+    },
+    isHeadless: {
+      header: () =>
+        sortHeader("isHeadless", "Headless", "Sort by headless flag"),
+      cell: (device) => (
+        <td
+          key="isHeadless"
+          className="px-3 py-3 text-sm text-muted-foreground"
+        >
+          {typeof device.isHeadless === "boolean"
+            ? device.isHeadless
+              ? t("deviceList.yes")
+              : t("deviceList.no")
+            : dash}
+        </td>
+      ),
+    },
+    status: {
+      header: () => sortHeader("status", t("deviceList.tableColumns.status"), t("deviceList.sortBy.status")),
+      cell: (device) => (
+        <td key="status" className="px-3 py-3 text-sm">
+          <div className="flex items-center gap-1">
+            <span
+              className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${statusColors[device.status]}`}
+              title={t(/* i18n-dynamic */ statusFullLabelKeys[device.status])}
+            >
+              {t(/* i18n-dynamic */ statusFullLabelKeys[device.status])}
+            </span>
+            {shouldShowAgentSilentBadge(device) && (
+              <span
+                data-testid={`device-${device.id}-agent-silent-badge`}
+                title={`Main agent has been silent for ${formatSilentDuration(device.mainAgentSilentSince!)}. Watchdog is still reporting in, so the box is alive but the agent has wedged.`}
+                className="inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-medium bg-warning/15 text-warning border-warning/30"
+              >
+                {t("deviceList.agentSilent")}{" "}
+                {formatSilentDuration(device.mainAgentSilentSince!)}
+              </span>
+            )}
+            {/* Collision enrollment (#2764): this row may be replacing an
+                earlier device with the same hostname. Unlike pending-reboot
+                below it is NOT suppressed on an offline row — the duplicate
+                still needs a human decision, and an offline collider is the
+                likeliest one to be the stale record. */}
+            {device.possibleReplacementOfDeviceId && (
+              <span
+                data-testid={`device-${device.id}-possible-duplicate-badge`}
+                title={t("deviceList.possibleDuplicateTitle")}
+                className="inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-medium bg-warning/15 text-warning border-warning/30"
+              >
+                {t("deviceList.possibleDuplicate")}
+              </span>
+            )}
+            {/* Pending-reboot is only actionable while the box is reachable. On an
+                offline device the flag is stale and unactionable, so suppress the
+                dot rather than wrap it under the wider "Down" pill. */}
+            {device.pendingReboot && device.status !== "offline" && (
+              <span
+                data-testid={`device-${device.id}-pending-reboot-badge`}
+                title={t("deviceList.theOsReportsAPendingReboot")}
+                aria-label={t("deviceList.rebootPending")}
+                role="img"
+                className="inline-block h-2 w-2 shrink-0 rounded-full bg-warning"
+              />
+            )}
+          </div>
+        </td>
+      ),
+    },
+    pendingReboot: {
+      header: () =>
+        sortHeader("pendingReboot", "Pending Reboot", "Sort by pending reboot"),
+      cell: (device) => (
+        <td key="pendingReboot" className="px-3 py-3 text-sm whitespace-nowrap">
+          {device.pendingReboot ? (
+            <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium bg-warning/15 text-warning border-warning/30">
+              {t("deviceList.rebootPending")}{" "}
+            </span>
+          ) : (
+            dash
+          )}
+        </td>
+      ),
+    },
+    cpu: {
+      header: () => sortHeader("cpu", t("deviceList.tableColumns.cpu"), t("deviceList.sortBy.cpu")),
+      cell: (device) => (
+        <td key="cpu" className="px-3 py-3 text-sm">
+          {agentCell(
+            device,
+            metricBar(device.cpuPercent, device.status === "online"),
+          )}
+        </td>
+      ),
+    },
+    ram: {
+      header: () => sortHeader("ram", t("deviceList.tableColumns.ram"), t("deviceList.sortBy.ram")),
+      cell: (device) => (
+        <td key="ram" className="px-3 py-3 text-sm">
+          {agentCell(
+            device,
+            metricBar(device.ramPercent, device.status === "online"),
+          )}
+        </td>
+      ),
+    },
+    power: {
+      header: () => sortHeader("power", "Power", "Sort by battery charge"),
+      cell: (device) => {
+        const b = device.batteryStatus;
+        // No battery data, or a real no-battery desktop → dash.
+        if (!b || !b.present) {
+          return (
+            <td
+              key="power"
+              className="px-3 py-3 text-sm"
+              data-testid={`device-${device.id}-power`}
+            >
+              {agentCell(device, dash)}
+            </td>
+          );
+        }
+        const pct =
+          typeof b.percent === "number" ? Math.round(b.percent) : null;
+        const charging = b.chargingState === "charging";
+        // "Low" only when actually running the battery down — plugged-in or
+        // charging at a low charge isn't an alert state.
+        const low =
+          pct !== null &&
+          pct <= 20 &&
+          b.pluggedIn !== true &&
+          !charging &&
+          b.chargingState !== "full";
+        const Icon = charging
+          ? BatteryCharging
+          : b.pluggedIn
+            ? Plug
+            : low
+              ? BatteryWarning
+              : Battery;
+        const colorClass = low
+          ? "text-destructive"
+          : charging
+            ? "text-success"
+            : "text-muted-foreground";
+        return (
+          <td
+            key="power"
+            className="px-3 py-3 text-sm whitespace-nowrap"
+            title={formatBatteryTooltip(b)}
+            data-testid={`device-${device.id}-power`}
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <Icon
+                className={`h-4 w-4 shrink-0 ${colorClass}`}
+                aria-hidden="true"
+              />
+              <span
+                className={
+                  low
+                    ? "font-medium text-destructive tabular-nums"
+                    : "tabular-nums"
+                }
+              >
+                {pct !== null
+                  ? `${pct}%`
+                  : batteryStateLabel[b.chargingState ?? "unknown"]}
+              </span>
+            </span>
+          </td>
+        );
+      },
+    },
+    cpuModel: {
+      header: () => sortHeader("cpuModel", "CPU Model", "Sort by CPU model"),
+      cell: (device) => (
+        <td
+          key="cpuModel"
+          className="max-w-[220px] px-3 py-3 text-sm text-muted-foreground"
+        >
+          <span
+            className="block truncate"
+            title={device.hardware?.cpuModel ?? ""}
+          >
+            {device.hardware?.cpuModel || dash}
+          </span>
+        </td>
+      ),
+    },
+    cores: {
+      header: () => sortHeader("cores", "Cores", "Sort by core count", true),
+      cell: (device) => (
+        <td key="cores" className="px-3 py-3 text-right text-sm tabular-nums">
+          {typeof device.hardware?.cpuCores === "number"
+            ? device.hardware.cpuCores
+            : dash}
+        </td>
+      ),
+    },
+    ramTotal: {
+      header: () => sortHeader("ramTotal", "RAM", "Sort by total RAM", true),
+      cell: (device) => (
+        <td
+          key="ramTotal"
+          className="px-3 py-3 text-right text-sm tabular-nums"
+        >
+          {fmtRamGb(device.hardware?.ramTotalMb) ?? dash}
+        </td>
+      ),
+    },
+    diskTotal: {
+      header: () => sortHeader("diskTotal", "Disk", "Sort by total disk", true),
+      cell: (device) => (
+        <td
+          key="diskTotal"
+          className="px-3 py-3 text-right text-sm tabular-nums"
+        >
+          {fmtDiskGb(device.hardware?.diskTotalGb) ?? dash}
+        </td>
+      ),
+    },
+    lastSeen: {
+      header: () =>
+        sortHeader("lastSeen", t("deviceList.tableColumns.lastSeen"), t("deviceList.sortBy.lastSeen")),
+      cell: (device) => (
+        <td
+          key="lastSeen"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+        >
+          {formatLastSeen(device.lastSeen, effectiveTimezone)}
+        </td>
+      ),
+    },
+    agentVersion: {
+      header: () =>
+        sortHeader("agentVersion", "Agent Version", "Sort by agent version"),
+      cell: (device) => {
+        // Issue #5285: colour by relation to the org's effective agent-
+        // version pin/promoted version. Unresolved effective version (org not
+        // in the map yet), a missing device version (network/manual rows,
+        // never heartbeat'd), or an unparseable string on either side all
+        // classify as "unknown" — render the plain dash exactly as before.
+        const effectiveVersion =
+          effectiveAgentVersionByOrgId?.[device.orgId] ?? null;
+        const relation = getAgentVersionRelation(
+          device.agentVersion,
+          effectiveVersion,
+        );
+        if (relation === "unknown") {
+          return (
+            <td
+              key="agentVersion"
+              data-testid={`device-${device.id}-agent-version`}
+              className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+            >
+              {device.agentVersion || dash}
+            </td>
+          );
+        }
+        const tooltipKey =
+          relation === "equal"
+            ? "deviceList.agentVersionRelation.equalTooltip"
+            : relation === "ahead"
+              ? "deviceList.agentVersionRelation.aheadTooltip"
+              : "deviceList.agentVersionRelation.behindTooltip";
+        return (
+          <td
+            key="agentVersion"
+            data-testid={`device-${device.id}-agent-version`}
+            className="px-3 py-3 text-sm whitespace-nowrap"
+          >
+            <span
+              data-agent-version-relation={relation}
+              title={t(/* i18n-dynamic */ tooltipKey, { version: effectiveVersion })}
+              className={`rounded px-1.5 py-0.5 text-xs font-medium ${agentVersionRelationColors[relation]}`}
+            >
+              {device.agentVersion}
+            </span>
+          </td>
+        );
+      },
+    },
+    watchdogVersion: {
+      header: () =>
+        sortHeader(
+          "watchdogVersion",
+          "Watchdog Version",
+          "Sort by watchdog version",
+        ),
+      cell: (device) => (
+        <td
+          key="watchdogVersion"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+        >
+          {agentCell(device, fmtWatchdogVersion(device.watchdogVersion))}
+        </td>
+      ),
+    },
+    serverUrl: {
+      header: () =>
+        sortHeader(
+          "serverUrl",
+          t("deviceList.roles.server"),
+          t("deviceList.sortBy.device"),
+        ),
+      cell: (device) => (
+        <td
+          key="serverUrl"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+          title={device.agentServerUrl ?? undefined}
+          data-testid={`device-${device.id}-server-url`}
+        >
+          {serverHost(device.agentServerUrl) || dash}
+        </td>
+      ),
+    },
+    // WAN/LAN IP columns (#2503). Both are opt-in and default-hidden. Header
+    // labels stay literal English here, matching every other opt-in column in
+    // this table (osVersion, power, vpn, …); only the ten default-visible
+    // columns are translated today.
+    wanIp: {
+      header: () => sortHeader("wanIp", "WAN IP", "Sort by WAN IP"),
+      // Agent-only: a discovered printer/switch never authenticates to the
+      // control plane, so there is no source address to report for it.
+      cell: (device) => (
+        <td
+          key="wanIp"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap font-mono"
+          title={device.wanIp ?? undefined}
+          data-testid={`device-${device.id}-wan-ip`}
+        >
+          {agentCell(device, device.wanIp || dash)}
+        </td>
+      ),
+    },
+    lanIp: {
+      header: () => sortHeader("lanIp", "LAN IP", "Sort by LAN IP"),
+      // Populated for BOTH arms: agent rows get the interface the API picked
+      // out of device_network, network rows their own discovered address.
+      cell: (device) => (
+        <td
+          key="lanIp"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap font-mono"
+          title={device.lanIp ?? undefined}
+          data-testid={`device-${device.id}-lan-ip`}
+        >
+          {device.lanIp || dash}
+        </td>
+      ),
+    },
+    tags: {
+      header: () => sortHeader("tags", "Tags", "Sort by tags"),
+      cell: (device) => (
+        <td
+          key="tags"
+          className="max-w-[220px] px-3 py-3 text-sm text-muted-foreground"
+        >
+          {device.tags && device.tags.length > 0 ? (
+            <div
+              className="flex flex-wrap items-center gap-1"
+              title={device.tags.join(", ")}
+            >
+              {device.tags.slice(0, TAG_CHIP_CAP).map((tag) => (
+                <span
+                  key={tag}
+                  className="inline-flex items-center rounded-full border border-border bg-muted/50 px-2 py-0.5 text-xs font-medium text-foreground"
+                >
+                  {tag}
+                </span>
+              ))}
+              {device.tags.length > TAG_CHIP_CAP && (
+                <span className="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                  {t("deviceList.text2")}
+                  {device.tags.length - TAG_CHIP_CAP}
+                </span>
+              )}
+            </div>
+          ) : (
+            dash
+          )}
+        </td>
+      ),
+    },
+    lastUser: {
+      header: () => sortHeader("lastUser", "Last User", "Sort by last user"),
+      cell: (device) => (
+        <td
+          key="lastUser"
+          className="max-w-[160px] px-3 py-3 text-sm text-muted-foreground"
+        >
+          <span className="block truncate" title={device.lastUser ?? ""}>
+            {device.lastUser || dash}
+          </span>
+        </td>
+      ),
+    },
+    uptime: {
+      header: () => sortHeader("uptime", "Uptime", "Sort by uptime"),
+      cell: (device) => (
+        <td
+          key="uptime"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+        >
+          {device.status === "online" && device.uptimeSeconds != null
+            ? formatUptime(device.uptimeSeconds)
+            : dash}
+        </td>
+      ),
+    },
+    enrolled: {
+      header: () =>
+        sortHeader("enrolled", "Enrolled", "Sort by enrollment date"),
+      cell: (device) => (
+        <td
+          key="enrolled"
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+        >
+          {fmtDate(device.enrolledAt) ?? dash}
+        </td>
+      ),
+    },
+    desktopAccess: {
+      header: () =>
+        sortHeader("desktopAccess", "Desktop Access", "Sort by desktop access"),
+      cell: (device) => {
+        const da = device.desktopAccess;
+        if (!da)
+          return (
+            <td
+              key="desktopAccess"
+              className="px-3 py-3 text-sm text-muted-foreground"
+            >
+              {dash}
+            </td>
+          );
+        return (
+          <td
+            key="desktopAccess"
+            className="px-3 py-3 text-sm text-muted-foreground"
+          >
+            <span
+              className="inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium"
+              title={`mode=${da.mode}; loginUi=${da.loginUiReachable}; virtualDisplay=${da.virtualDisplayReady}`}
+            >
+              {da.mode}
+            </span>
+          </td>
+        );
+      },
+    },
+    reliability: {
+      header: () =>
+        sortHeader(
+          "reliability",
+          "Reliability",
+          "Sort by reliability score",
+          true,
+        ),
+      cell: (device) => {
+        const score = device.reliabilityScore;
+        if (typeof score !== "number") {
+          // No score computed yet (newly enrolled, pre-worker) or a network
+          // device — render a dash; sortValue maps these to null so they sort
+          // last in both directions (#1284 dash convention).
+          return (
+            <td
+              key="reliability"
+              className="px-3 py-3 text-right text-sm tabular-nums"
+              data-testid={`device-${device.id}-reliability`}
+            >
+              {dash}
+            </td>
+          );
+        }
+        const trend = device.reliabilityTrend
+          ? reliabilityTrendGlyph[device.reliabilityTrend]
+          : null;
+        return (
+          <td
+            key="reliability"
+            className="px-3 py-3 text-right text-sm"
+            data-testid={`device-${device.id}-reliability`}
+          >
+            <span
+              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium tabular-nums ${reliabilityBandClass(score)}`}
+              title={
+                trend
+                  ? `Reliability ${score}/100 · ${trend.label}`
+                  : `Reliability ${score}/100`
+              }
+            >
+              {score}
+              {trend && (
+                <span aria-label={trend.label} className="opacity-80">
+                  {trend.glyph}
+                </span>
+              )}
+            </span>
+          </td>
+        );
+      },
+    },
+    vpn: {
+      header: () => sortHeader("vpn", "VPN", "Sort by VPN provider"),
+      cell: (device) => {
+        // Rendered ONLY from cached inventory (device.activeVpns) — never a
+        // live command fan-out from the table (#2139). Connected VPNs come
+        // first and keep their provider colors; a client that is running with
+        // no tunnel up renders as a muted badge so on/off state is visible
+        // rather than the VPN silently disappearing.
+        const active = vpnList(device.activeVpns);
+        if (active.length === 0) {
+          return (
+            <td
+              key="vpn"
+              className="px-3 py-3 text-sm text-muted-foreground"
+              data-testid={`device-${device.id}-vpn`}
+            >
+              {dash}
+            </td>
+          );
+        }
+        const VPN_CHIP_CAP = 2;
+        const shown = active.slice(0, VPN_CHIP_CAP);
+        const overflow = active.length - shown.length;
+        const stateLabel = (vpn: (typeof active)[number]) =>
+          vpn.active ? undefined : t("deviceList.vpnDisconnected");
+        // Full list on the cell title so hover reveals every provider/IP/DNS.
+        const fullTitle = active
+          .map((vpn) => formatVpnTooltip(vpn, stateLabel(vpn)))
+          .join("\n");
+        return (
+          <td
+            key="vpn"
+            className="px-3 py-3 text-sm whitespace-nowrap"
+            data-testid={`device-${device.id}-vpn`}
+          >
+            <span className="inline-flex items-center gap-1" title={fullTitle}>
+              {shown.map((vpn) => {
+                const Icon = getVpnProviderIcon(vpn.provider);
+                return (
+                  <span
+                    key={`${vpn.provider}:${vpn.interfaceName}`}
+                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium ${getVpnBadgeClass(vpn)}`}
+                    title={formatVpnTooltip(vpn, stateLabel(vpn))}
+                    data-vpn-active={vpn.active ? "true" : "false"}
+                    data-testid={`device-${device.id}-vpn-badge-${vpn.provider}`}
+                  >
+                    <Icon className="h-3 w-3 shrink-0" aria-hidden="true" />
+                    {getVpnProviderLabel(vpn.provider)}
+                  </span>
+                );
+              })}
+              {overflow > 0 && (
+                <span
+                  className="inline-flex items-center rounded-full border border-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground"
+                  data-testid={`device-${device.id}-vpn-overflow`}
+                >
+                  {t("deviceList.text2")}
+                  {overflow}
+                </span>
+              )}
+            </span>
+          </td>
+        );
+      },
+    },
+    // Manual-asset inventory columns (#4622 W04). `serial` is shared with
+    // agent rows (device_hardware.serial_number, once the API sends it);
+    // `assetTag`/`location` exist only for a manual asset.
+    serial: {
+      header: () => sortHeader("serial", t("deviceList.tableColumns.serial"), t("deviceList.sortBy.serial")),
+      cell: (device) => {
+        const cls = device.deviceClass ?? "agent";
+        const value = cls === "manual" ? device.serialNumber : cls === "agent" ? device.hardware?.serialNumber : null;
+        return (
+          <td key="serial" className="px-3 py-3 text-sm text-muted-foreground" data-testid={`device-${device.id}-serial`}>
+            {value ? <span className="truncate" title={value}>{value}</span> : dash}
+          </td>
+        );
+      },
+    },
+    assetTag: {
+      header: () => sortHeader("assetTag", t("deviceList.tableColumns.assetTag"), t("deviceList.sortBy.assetTag")),
+      cell: (device) => {
+        const value = (device.deviceClass ?? "agent") === "manual" ? device.assetTag : null;
+        return (
+          <td key="assetTag" className="px-3 py-3 text-sm text-muted-foreground" data-testid={`device-${device.id}-asset-tag`}>
+            {value ? <span className="truncate" title={value}>{value}</span> : dash}
+          </td>
+        );
+      },
+    },
+    location: {
+      header: () => sortHeader("location", t("deviceList.tableColumns.location"), t("deviceList.sortBy.location")),
+      cell: (device) => {
+        const value = (device.deviceClass ?? "agent") === "manual" ? device.location : null;
+        return (
+          <td key="location" className="max-w-[160px] px-3 py-3 text-sm text-muted-foreground" data-testid={`device-${device.id}-location`}>
+            {value ? <span className="block truncate" title={value}>{value}</span> : dash}
+          </td>
+        );
+      },
+    },
+  };
+
+  // Bulk-menu Compare item. DeviceCompare accepts at most COMPARE_MAX_DEVICES,
+  // so above that the item renders disabled with the cap as its label + title
+  // instead of disappearing (#5023 paper cut). Shared by the active and the
+  // all-removed branches of the menu.
+  const renderCompareItem = () => {
+    // Only agents can be compared, so the cap counts agents, not rows.
+    const overCap = selectedAgentCount > COMPARE_MAX_DEVICES;
+    const capLabel = t("deviceList.compareMaxDevices", { count: COMPARE_MAX_DEVICES });
+    return (
+      <button
+        type="button"
+        data-testid="bulk-compare"
+        disabled={overCap}
+        title={overCap ? capLabel : undefined}
+        onClick={() => handleBulkAction("compare")}
+        className="w-full px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
+      >
+        {overCap ? capLabel : t("deviceList.compareSelected")}
+      </button>
+    );
+  };
+
+  return (
+    <div>
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-sm text-muted-foreground">
+            {filteredDevices.length} {t("deviceList.of")}{" "}
+            {countLineTotal}{" "}
+            {t("deviceList.devices")}{" "}
+            {serverFilterError ? (
+              <span
+                className="ml-2 inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-xs font-medium text-destructive"
+                data-testid="device-filter-error"
+                role="alert"
+              >
+                <Filter className="h-3 w-3" />
+                {t("deviceList.advancedFilterFailed")}
+                {onRetryServerFilter && <button type="button" onClick={onRetryServerFilter}>{t('common:actions.retry')}</button>}
+              </span>
+            ) : (
+              serverFilterIds !== null && (
+                <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                  <Filter className="h-3 w-3" />
+                  {t("deviceList.advancedFilterActive")}{" "}
+                  {serverFilterLoading && (
+                    <span className="ml-1 animate-pulse">...</span>
+                  )}
+                </span>
+              )
+            )}
+            {onShowDecommissioned && hiddenDecommissionedCount > 0 && (
+              <span className="ml-2">
+                <DecommissionedHiddenHint
+                  count={hiddenDecommissionedCount}
+                  onShow={onShowDecommissioned}
+                />
+              </span>
+            )}
+            {onHideDecommissioned && includeDecommissioned && decommissionedCount > 0 && (
+              <span className="ml-2">
+                <DecommissionedHiddenHint
+                  mode="shown"
+                  count={decommissionedCount}
+                  onHide={onHideDecommissioned}
+                />
+              </span>
+            )}
+          </p>
+          {/* Search / Status / OS / quick chips / More / Advanced live in
+              DeviceFilterToolbar and the class segment in DevicesPage. What
+              stays next to the count is list-local: the VPN facet, the
+              "Collapse linked" toggle and the Columns menu. */}
+          <div className="flex flex-wrap items-center gap-2">
+            {visibleColumns.has("vpn") && hasAgentRows && (
+              <select
+                aria-label={t("deviceList.filterByVpn")}
+                data-testid="device-vpn-filter"
+                value={vpnFilter}
+                onChange={(e) => setVpnFilter(e.target.value)}
+                className="h-10 rounded-md border bg-background px-2 text-sm text-muted-foreground"
+              >
+                <option value="all">{t("deviceList.allVpn")}</option>
+                <option value="any">{t("deviceList.anyActiveVpn")}</option>
+                {availableVpnProviders.map((provider) => (
+                  <option key={provider} value={provider}>
+                    {getVpnProviderLabel(provider)}
+                  </option>
+                ))}
+              </select>
+            )}
+            {hasLinkedDevices && (
+              <button
+                type="button"
+                data-testid="collapse-linked-toggle"
+                aria-pressed={linkedCollapse === "on"}
+                onClick={() =>
+                  writeLinkedProfileCollapsePreference(
+                    linkedCollapse === "on" ? "off" : "on",
+                  )
+                }
+                title={t("deviceList.multiBootMachinesTuckExpectedOffline")}
+                className={`flex h-10 items-center gap-1.5 whitespace-nowrap rounded-md border px-3 text-sm font-medium ${
+                  linkedCollapse === "on"
+                    ? "border-primary/40 bg-primary/10 text-primary"
+                    : "text-muted-foreground hover:bg-muted"
+                }`}
+              >
+                <Link2 className="h-3.5 w-3.5" />
+                {t("deviceList.collapseLinkedInactiveProfiles")}{" "}
+              </button>
+            )}
+            {/* Interface density is now an account-wide control in the
+                top-bar theme/display menu (Header.tsx). The table still
+                reflects the saved preference via densityTableClasses +
+                subscribeDensity below. */}
+            <div className="relative" ref={columnsMenuRef}>
+              <button
+                type="button"
+                onClick={() => setColumnsMenuOpen((o) => !o)}
+                aria-haspopup="true"
+                aria-expanded={columnsMenuOpen}
+                className="h-10 whitespace-nowrap rounded-md border px-3 text-sm font-medium hover:bg-muted flex items-center gap-1.5"
+              >
+                <Columns3 className="h-3.5 w-3.5" />
+                {t("deviceList.columns")}{" "}
+              </button>
+              {columnsMenuOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 z-20 mt-1 max-h-96 w-72 overflow-y-auto rounded-md border bg-card p-1 shadow-md"
+                >
+                  <p className="px-2 pt-1 pb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    {t("deviceList.visibleInOrder")}{" "}
+                  </p>
+                  {columnOrder
+                    .filter(
+                      (id) => visibleColumns.has(id) && isColumnAvailable(id),
+                    )
+                    .map((id, idx, arr) => (
+                      <div
+                        key={id}
+                        className="flex items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted"
+                      >
+                        <input
+                          type="checkbox"
+                          checked
+                          onChange={() => toggleColumn(id)}
+                          className="h-4 w-4 rounded border-border"
+                          aria-label={`Hide ${COLUMN_LABELS[id]}`}
+                        />
+                        <span className="flex-1 cursor-default">
+                          {COLUMN_LABELS[id]}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={idx === 0}
+                          onClick={() => moveColumn(id, -1)}
+                          className="rounded p-0.5 hover:bg-background disabled:cursor-not-allowed disabled:opacity-30"
+                          aria-label={`Move ${COLUMN_LABELS[id]} up`}
+                          title={t("deviceList.moveUp")}
+                        >
+                          <ChevronUp className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={idx === arr.length - 1}
+                          onClick={() => moveColumn(id, 1)}
+                          className="rounded p-0.5 hover:bg-background disabled:cursor-not-allowed disabled:opacity-30"
+                          aria-label={`Move ${COLUMN_LABELS[id]} down`}
+                          title={t("deviceList.moveDown")}
+                        >
+                          <ChevronDown className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  <hr className="my-1" />
+                  <p className="px-2 pt-0.5 pb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    {t("deviceList.hidden")}{" "}
+                  </p>
+                  {columnOrder
+                    .filter(
+                      (id) => !visibleColumns.has(id) && isColumnAvailable(id),
+                    )
+                    .map((id) => (
+                      <label
+                        key={id}
+                        className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={false}
+                          onChange={() => toggleColumn(id)}
+                          className="h-4 w-4 rounded border-border"
+                        />
+                        <span>{COLUMN_LABELS[id]}</span>
+                      </label>
+                    ))}
+                  <hr className="my-1" />
+                  <button
+                    type="button"
+                    onClick={resetColumnsToDefault}
+                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    {t("deviceList.resetToDefaults")}{" "}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {selectedIds.size > 0 && (
+        <div className="mt-4 flex items-center gap-3 rounded-md border bg-muted/40 px-4 py-2">
+          <span className="text-sm font-medium" data-testid="bulk-selection-summary">
+            {selectedIds.size} {t("deviceList.selected")}
+            {selectedNonAgentCount > 0 && (
+              <span className="font-normal text-muted-foreground">
+                {" · "}
+                {selectedManualCount > 0
+                  ? t("deviceList.selectedCompositionManual", {
+                      agent: selectedAgentCount,
+                      network: selectedNetworkCount,
+                      manual: selectedManualCount,
+                    })
+                  : t("deviceList.selectedComposition", { agent: selectedAgentCount, network: selectedNetworkCount })}
+              </span>
+            )}
+          </span>
+          <div className="relative">
+            <button
+              type="button"
+              disabled={filterBlocked}
+              onClick={() => setBulkMenuOpen(!bulkMenuOpen)}
+              className="flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-muted"
+            >
+              {t("deviceList.bulkActions")}{" "}
+              <MoreHorizontal className="h-4 w-4" />
+            </button>
+            {bulkMenuOpen && !filterBlocked && (
+              <div
+                data-testid="bulk-actions-menu"
+                className="absolute left-0 top-full z-10 mt-1 w-48 rounded-md border bg-card shadow-lg"
+              >
+                {selectionKind !== "removed" && (
+                  <>
+                <button
+                  type="button"
+                  onClick={() => handleBulkAction("reboot")}
+                  disabled={agentOnlyDisabled}
+                  title={agentOnlyTitle}
+                  className="w-full px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t("deviceList.rebootSelected")}
+                  {agentOnlySuffix}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBulkAction("run-script")}
+                  disabled={agentOnlyDisabled}
+                  title={agentOnlyTitle}
+                  className="w-full px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t("deviceList.runScript")}
+                  {agentOnlySuffix}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBulkAction("deploy-software")}
+                  disabled={agentOnlyDisabled}
+                  title={agentOnlyTitle}
+                  className="w-full px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t("deviceList.deploySoftware")}
+                  {agentOnlySuffix}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBulkAction("maintenance-on")}
+                  disabled={agentOnlyDisabled}
+                  title={agentOnlyTitle}
+                  className="w-full px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t("deviceList.enableMaintenance")}
+                  {agentOnlySuffix}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleBulkAction("maintenance-off")}
+                  disabled={agentOnlyDisabled}
+                  title={agentOnlyTitle}
+                  className="w-full px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t("deviceList.disableMaintenance")}
+                  {agentOnlySuffix}
+                </button>
+                <hr className="my-1" />
+                <button
+                  type="button"
+                  onClick={() => handleBulkAction("wake")}
+                  disabled={agentOnlyDisabled}
+                  title={agentOnlyTitle}
+                  className="w-full px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t("deviceList.wakeSelected")}
+                  {agentOnlySuffix}
+                </button>
+                {/* Compare caps at 4 devices (DeviceCompare's selection limit).
+                    Above the cap the item stays put but disabled with the cap
+                    spelled out — it used to vanish silently (#5023). */}
+                {selectedAgentCount >= 2 && renderCompareItem()}
+                {selectedAgentCount >= 2 && (
+                  <button
+                    type="button"
+                    data-testid="bulk-link-multiboot"
+                    onClick={() => handleBulkAction("link-multiboot")}
+                    className="w-full px-4 py-2 text-left text-sm hover:bg-muted"
+                  >
+                    {t("deviceList.linkAsMultiBoot")}{" "}
+                  </button>
+                )}
+                {selectedAgentCount >= 2 && (
+                  <button
+                    type="button"
+                    data-testid="bulk-link-vm-host"
+                    onClick={() => handleBulkAction('link-vm-host')}
+                    className="w-full px-4 py-2 text-left text-sm hover:bg-muted"
+                  >
+                    {t("deviceList.linkAsVmHost")}
+                  </button>
+                )}
+                <hr className="my-1" />
+                <button
+                  type="button"
+                  data-testid="bulk-decommission"
+                  onClick={() => handleBulkAction("decommission")}
+                  disabled={agentOnlyDisabled}
+                  title={agentOnlyTitle}
+                  className="w-full px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t("deviceList.decommissionSelected")}
+                  {agentOnlySuffix}
+                </button>
+                {/* Manual assets (#4622 W04): Delete is the ONLY bulk action
+                    they're eligible for in v1. Disabled outright with no
+                    manual row selected; annotated on a mixed selection so a
+                    non-manual row is visibly skipped, never silently. */}
+                <button
+                  type="button"
+                  data-testid="bulk-delete-manual"
+                  onClick={() => handleBulkAction("delete-manual")}
+                  disabled={manualOnlyDisabled}
+                  title={manualOnlyTitle}
+                  className="w-full px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t("deviceList.deleteManualSelected")}
+                  {manualOnlySuffix}
+                </button>
+                  </>
+                )}
+                {selectionKind === "removed" && (
+                  <>
+                    <button
+                      type="button"
+                      data-testid="bulk-restore"
+                      onClick={() => handleBulkAction("restore")}
+                      className="w-full px-4 py-2 text-left text-sm text-success hover:bg-success/10"
+                    >
+                      {t("deviceList.restoreSelected")}
+                    </button>
+                    {/* Same 2-4 cap as the active branch — DeviceCompare's own
+                        selection limit. A removed device is a legitimate (if
+                        approximate) comparison subject. */}
+                    {selectedAgentCount >= 2 && renderCompareItem()}
+                    <hr className="my-1" />
+                    <button
+                      type="button"
+                      data-testid="bulk-permanent-delete"
+                      onClick={() => handleBulkAction("permanent-delete")}
+                      className="w-full px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+                    >
+                      {t("deviceList.permanentDeleteSelected")}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setSelectedIds(new Set())}
+            className="text-sm text-muted-foreground hover:text-foreground"
+          >
+            {t("deviceList.clearSelection")}{" "}
+          </button>
+        </div>
+      )}
+
+      <div className="mt-6 overflow-x-auto rounded-md border">
+        <table className={`w-full divide-y ${densityTableClasses(density)}`}>
+          <thead className="bg-muted/40">
+            <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              <th className="px-3 py-3">
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  disabled={filterBlocked}
+                  aria-label={t("deviceList.selectAllDevicesOnThisPage")}
+                  ref={(el) => {
+                    if (el) el.indeterminate = someSelected && !allSelected;
+                  }}
+                  onChange={(e) => handleSelectAll(e.target.checked)}
+                  className="h-4 w-4 rounded border-border"
+                />
+              </th>
+              {renderedColumns.map((id) => columnDefs[id].header())}
+              <th className="px-3 py-3 text-right">
+                {t("deviceList.actions")}
+              </th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {paginatedDevices.length === 0 ? (
+              <tr>
+                <td
+                  colSpan={
+                    renderedColumns.length +
+                    2 /* checkbox + Actions; renderedColumns already drops flag-gated columns */
+                  }
+                  className="px-3 py-6 text-center text-sm text-muted-foreground"
+                >
+                  {t("deviceList.noDevicesFoundTryAdjustingYour")}{" "}
+                </td>
+              </tr>
+            ) : (
+              visibleRows.map(({ device, inactiveSiblings, offlineGroup, vmRole, vmGroupId, vmGuestCount }) => (
+                <Fragment key={device.id}>
+                  <tr
+                    onClick={() => onSelect?.(device)}
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        onSelect?.(device);
+                      }
+                    }}
+                    className="cursor-pointer transition hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                  >
+                    <td
+                      className={`px-3 py-3 ${offlineGroup || vmRole ? "border-l-2 border-l-primary/40" : ""}`}
+                      {...(offlineGroup
+                        ? {
+                            "data-testid": `device-${device.id}-group-bar`,
+                            title: t(
+                              "deviceList.linkedMultiBootProfileAllBoot",
+                            ),
+                          }
+                        : {})}
+                    >
+                      <div className="flex items-center gap-1">
+                        {/* vm_host (#2308): expand/collapse toggle on the host row. */}
+                        {vmRole === "host" && vmGroupId && (
+                          <button
+                            type="button"
+                            data-testid={`device-${device.id}-vm-toggle`}
+                            aria-label={
+                              collapsedVmGroups.has(vmGroupId)
+                                ? `Show ${vmGuestCount ?? 0} guest VMs of ${device.hostname}`
+                                : `Hide guest VMs of ${device.hostname}`
+                            }
+                            aria-expanded={!collapsedVmGroups.has(vmGroupId)}
+                            title={`VM host — ${vmGuestCount ?? 0} guest VM${vmGuestCount === 1 ? "" : "s"} on this page`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const collapsing =
+                                !collapsedVmGroups.has(vmGroupId);
+                              if (collapsing) {
+                                // Deselect the guests being hidden — a checked
+                                // row must never stay a bulk-action target while
+                                // invisible.
+                                const hiddenIds = displayRows
+                                  .filter(
+                                    (r) =>
+                                      r.vmRole === "guest" &&
+                                      r.vmGroupId === vmGroupId,
+                                  )
+                                  .map((r) => r.device.id);
+                                if (hiddenIds.some((id) => selectedIds.has(id))) {
+                                  setSelectedIds((prev) => {
+                                    const next = new Set(prev);
+                                    for (const id of hiddenIds) next.delete(id);
+                                    return next;
+                                  });
+                                }
+                              }
+                              setCollapsedVmGroups((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(vmGroupId)) next.delete(vmGroupId);
+                                else next.add(vmGroupId);
+                                return next;
+                              });
+                            }}
+                            className="-ml-1 flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                          >
+                            {collapsedVmGroups.has(vmGroupId) ? (
+                              <ChevronRight className="h-3.5 w-3.5" />
+                            ) : (
+                              <ChevronDown className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+                        )}
+                        {/* vm_host (#2308): nesting glyph on guest rows. */}
+                        {vmRole === "guest" && (
+                          <CornerDownRight
+                            data-testid={`device-${device.id}-vm-guest-glyph`}
+                            aria-hidden
+                            className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+                          />
+                        )}
+                        <input
+                          type="checkbox"
+                          disabled={filterBlocked}
+                          checked={selectedIds.has(device.id)}
+                          aria-label={t("deviceList.selectDevice", { hostname: device.hostname })}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) =>
+                            handleSelectOne(device.id, e.target.checked)
+                          }
+                          className="h-4 w-4 rounded border-border"
+                        />
+                      </div>
+                    </td>
+                    {renderedColumns.map((id) => columnDefs[id].cell(device))}
+                    <td
+                      className="px-3 py-3 text-sm"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {(device.deviceClass ?? "agent") === "manual" ? (
+                        // A manual asset has no agent and no detail page in v1
+                        // (spec: per-asset detail pages are #1424's territory).
+                        // Edit opens the same add/edit modal via onSelect;
+                        // Delete is the one bulk-eligible action for this
+                        // class, offered per-row too.
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            data-testid={`device-${device.id}-edit-manual`}
+                            aria-label={t("deviceList.editManualAsset", {
+                              name: device.displayName || device.hostname,
+                            })}
+                            onClick={() => onSelect?.(device)}
+                            className="rounded-md border px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            {t("deviceList.edit")}
+                          </button>
+                          <button
+                            type="button"
+                            data-testid={`device-${device.id}-delete-manual`}
+                            aria-label={t("deviceList.deleteManualAsset", {
+                              name: device.displayName || device.hostname,
+                            })}
+                            onClick={() => onAction?.("delete-manual", device)}
+                            className="rounded-md border px-2.5 py-1 text-xs font-medium text-destructive hover:bg-destructive/10 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            {t("deviceList.delete")}
+                          </button>
+                        </div>
+                      ) : (device.deviceClass ?? "agent") === "network" ? (
+                        // Network devices have no agent — none of the remote
+                        // actions (desktop/terminal/scripts/reboot) apply.
+                        // View opens the network device page (/devices/network/:id).
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            data-testid={`device-${device.id}-open-network`}
+                            aria-label={t("deviceList.viewDevice", {
+                              name: device.displayName || device.hostname,
+                            })}
+                            onClick={() => onSelect?.(device)}
+                            className="rounded-md border px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            {t("deviceList.view")}
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center justify-end gap-1">
+                          <ConnectDesktopButton
+                            deviceId={device.id}
+                            iconOnly
+                            disabled={device.status !== "online"}
+                            isHeadless={device.isHeadless}
+                            desktopAccess={device.desktopAccess}
+                            remoteAccessPolicy={device.remoteAccessPolicy}
+                            helperLifecycleMode={device.helperLifecycleMode}
+                          />
+                          <div className="relative">
+                            <button
+                              type="button"
+                              aria-label={t("deviceList.deviceActions")}
+                              data-testid={`device-${device.id}-actions-menu`}
+                              ref={
+                                rowMenuOpenId === device.id
+                                  ? rowMenuButtonRef
+                                  : undefined
+                              }
+                              onClick={(e) => {
+                                if (rowMenuOpenId !== device.id) {
+                                  const rect =
+                                    e.currentTarget.getBoundingClientRect();
+                                  // ~320px dropdown height (8 items × ~36px + padding/divider).
+                                  // Flip up when the space below the button is less than that.
+                                  setRowMenuFlipUp(
+                                    window.innerHeight - rect.bottom < 340,
+                                  );
+                                  setRowMenuAnchor({
+                                    top: rect.top,
+                                    bottom: rect.bottom,
+                                    right: rect.right,
+                                  });
+                                }
+                                setRowMenuOpenId(
+                                  rowMenuOpenId === device.id
+                                    ? null
+                                    : device.id,
+                                );
+                              }}
+                              className="flex h-8 w-8 items-center justify-center rounded-md transition hover:bg-muted"
+                            >
+                              <MoreVertical className="h-4 w-4" />
+                            </button>
+                            {rowMenuOpenId === device.id &&
+                              rowMenuAnchor &&
+                              createPortal(
+                                <div
+                                  ref={rowMenuRef}
+                                  style={{
+                                    position: "fixed",
+                                    right:
+                                      window.innerWidth - rowMenuAnchor.right,
+                                    ...(rowMenuFlipUp
+                                      ? {
+                                          bottom:
+                                            window.innerHeight -
+                                            rowMenuAnchor.top +
+                                            4,
+                                        }
+                                      : { top: rowMenuAnchor.bottom + 4 }),
+                                  }}
+                                  className="z-50 w-48 rounded-md border bg-card shadow-lg"
+                                >
+                                  {/* Live session — needs a connected agent. */}
+                                  <button
+                                    type="button"
+                                    disabled={device.status !== "online"}
+                                    title={notOnlineTitle(
+                                      device.status,
+                                      t,
+                                    )}
+                                    aria-describedby={
+                                      device.status !== "online"
+                                        ? `device-${device.id}-action-gate-hint`
+                                        : undefined
+                                    }
+                                    onClick={() => {
+                                      onAction?.("terminal", device);
+                                      setRowMenuOpenId(null);
+                                    }}
+                                    className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    <Terminal className="h-4 w-4" />
+                                    {t("deviceList.remoteTerminal")}{" "}
+                                  </button>
+                                  {/* Queued command — an offline device runs it
+                                      on reconnect, so only a decommissioned
+                                      (agent-less) device is refused. */}
+                                  <button
+                                    type="button"
+                                    disabled={!isCommandQueueable(device.status)}
+                                    title={notQueueableTitle(
+                                      device.status,
+                                      t,
+                                    )}
+                                    aria-describedby={
+                                      !isCommandQueueable(device.status)
+                                        ? `device-${device.id}-action-gate-hint`
+                                        : undefined
+                                    }
+                                    onClick={() => {
+                                      onAction?.("run-script", device);
+                                      setRowMenuOpenId(null);
+                                    }}
+                                    className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    <FileCode className="h-4 w-4" />
+                                    {t("deviceList.runScript")}{" "}
+                                  </button>
+                                  {/* Reboot is ALSO a queued command, so it is
+                                      gated like Run Script: the API refuses only
+                                      decommissioned, and an offline box reboots
+                                      on reconnect. */}
+                                  <button
+                                    type="button"
+                                    disabled={!isCommandQueueable(device.status)}
+                                    title={notQueueableTitle(
+                                      device.status,
+                                      t,
+                                    )}
+                                    aria-describedby={
+                                      !isCommandQueueable(device.status)
+                                        ? `device-${device.id}-action-gate-hint`
+                                        : undefined
+                                    }
+                                    onClick={() => {
+                                      onAction?.("reboot", device);
+                                      setRowMenuOpenId(null);
+                                    }}
+                                    className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    <RotateCcw className="h-4 w-4" />
+                                    {t("deviceList.reboot")}{" "}
+                                  </button>
+                                  {device.status === "offline" && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        onAction?.("wake", device);
+                                        setRowMenuOpenId(null);
+                                      }}
+                                      className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                                      title={t(
+                                        "deviceList.sendAWakeOnLanPacket",
+                                      )}
+                                    >
+                                      <Zap className="h-4 w-4" />
+                                      {t("deviceList.wake")}{" "}
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      onAction?.("settings", device);
+                                      setRowMenuOpenId(null);
+                                    }}
+                                    className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+                                  >
+                                    <Settings className="h-4 w-4" />
+                                    {t("deviceList.settings")}{" "}
+                                  </button>
+                                  {/* #4936: maintenance mode was reachable only
+                                      through Bulk Actions, so acting on ONE
+                                      device meant ticking its checkbox and
+                                      opening a bulk menu. This dispatches the
+                                      same `maintenance` action the page already
+                                      handled — a per-device POST for one id.
+
+                                      Gating: maintenance is a DB flag, not an
+                                      agent command, so it is NOT gated on
+                                      `online` (bulkActionGating.ts lists
+                                      `maintenance-*` as intentionally ungated) —
+                                      suppressing monitoring on a box that has
+                                      already gone dark is the point of it. The
+                                      API does refuse a REMOVED device
+                                      (commands.ts: "Cannot change maintenance
+                                      mode for a decommissioned device"), which
+                                      is exactly the set `isCommandQueueable`
+                                      excludes, so the shared predicate and its
+                                      tooltip are correct here rather than
+                                      borrowed (#3994: no surface should offer an
+                                      action the API rejects). */}
+                                  <button
+                                    type="button"
+                                    data-testid={`device-${device.id}-action-maintenance`}
+                                    disabled={!isCommandQueueable(device.status)}
+                                    title={notQueueableTitle(device.status, t)}
+                                    aria-describedby={
+                                      !isCommandQueueable(device.status)
+                                        ? `device-${device.id}-action-gate-hint`
+                                        : undefined
+                                    }
+                                    onClick={() => {
+                                      onAction?.("maintenance", device);
+                                      setRowMenuOpenId(null);
+                                    }}
+                                    className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    <Shield className="h-4 w-4" />
+                                    {device.status === "maintenance"
+                                      ? t("deviceList.exitMaintenance")
+                                      : t("deviceList.enterMaintenance")}{" "}
+                                  </button>
+                                  <hr className="my-1" />
+                                  {device.status === "decommissioned" ? (
+                                    <>
+                                      <button
+                                        type="button"
+                                        data-testid={`device-${device.id}-action-restore`}
+                                        onClick={() => {
+                                          onAction?.("restore", device);
+                                          setRowMenuOpenId(null);
+                                        }}
+                                        className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-success hover:bg-success/10"
+                                      >
+                                        <RotateCcw className="h-4 w-4" />
+                                        {t("deviceList.restore")}{" "}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        data-testid={`device-${device.id}-action-permanent-delete`}
+                                        onClick={() => {
+                                          onAction?.("permanent-delete", device);
+                                          setRowMenuOpenId(null);
+                                        }}
+                                        className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+                                      >
+                                        <Trash2 className="h-4 w-4" />
+                                        {t("deviceList.permanentlyDelete")}
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      data-testid={`device-${device.id}-action-remove`}
+                                      onClick={() => {
+                                        onAction?.("decommission", device);
+                                        setRowMenuOpenId(null);
+                                      }}
+                                      className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                      {t("deviceList.decommission")}{" "}
+                                    </button>
+                                  )}
+                                  {actionGateHint(device.status, t) && (
+                                    /* Visible reason: `title` never renders on
+                                       touch, and a disabled button cannot be
+                                       focused, so AT has no other way to reach
+                                       it. Pattern: QuoteActions (#1975). */
+                                    <>
+                                      <hr className="my-1" />
+                                      <p
+                                        id={`device-${device.id}-action-gate-hint`}
+                                        data-testid={`device-${device.id}-action-gate-hint`}
+                                        className="px-4 py-2 text-xs text-muted-foreground"
+                                      >
+                                        {actionGateHint(device.status, t)}
+                                      </p>
+                                    </>
+                                  )}
+                                </div>,
+                                document.body,
+                              )}
+                          </div>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                  {/* vm_host (#2308): when a host's guests are collapsed, a thin
+                      strip stands in for them — click to expand. */}
+                  {vmRole === "host" &&
+                    vmGroupId &&
+                    collapsedVmGroups.has(vmGroupId) && (
+                      <tr
+                        data-testid={`device-${device.id}-vm-collapsed-strip`}
+                        onClick={() =>
+                          setCollapsedVmGroups((prev) => {
+                            const next = new Set(prev);
+                            next.delete(vmGroupId);
+                            return next;
+                          })
+                        }
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            setCollapsedVmGroups((prev) => {
+                              const next = new Set(prev);
+                              next.delete(vmGroupId);
+                              return next;
+                            });
+                          }
+                        }}
+                        className="cursor-pointer bg-muted/30 transition hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:outline-hidden"
+                      >
+                        <td
+                          colSpan={
+                            renderedColumns.length + 2 /* checkbox + Actions */
+                          }
+                          className="border-l-2 border-l-primary/40 px-3 py-1.5"
+                        >
+                          <div className="flex items-center gap-1.5 pl-7 text-xs text-muted-foreground">
+                            <CornerDownRight className="h-3.5 w-3.5" aria-hidden />
+                            <span>
+                              {vmGuestCount} guest VM{vmGuestCount === 1 ? "" : "s"} hidden — click to expand
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  {/* Linked multi-boot: expected-offline boot profiles tucked
+                    beneath their online sibling as thin muted strips (#2138).
+                    Clickable through to the device's own detail page; NOT
+                    selectable for bulk actions. */}
+                  {inactiveSiblings.map((sib) => (
+                    <tr
+                      key={sib.id}
+                      data-testid={`device-${sib.id}-inactive-strip`}
+                      onClick={() => onSelect?.(sib)}
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onSelect?.(sib);
+                        }
+                      }}
+                      className="cursor-pointer bg-muted/30 transition hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:outline-hidden"
+                    >
+                      <td
+                        colSpan={
+                          renderedColumns.length + 2 /* checkbox + Actions */
+                        }
+                        className="px-3 py-1.5"
+                      >
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 pl-7 text-xs text-muted-foreground">
+                          <span className="inline-flex items-center gap-1.5">
+                            <OSIcon os={sib.os} className="h-3.5 w-3.5" />
+                            <span className="font-medium">
+                              {formatDeviceOsVersion(sib.os, sib.osVersion) ||
+                                sib.hostname}
+                            </span>
+                            <span>{t("deviceList.inactive")}</span>
+                          </span>
+                          <span className="inline-flex items-center whitespace-nowrap rounded-full border px-1.5 py-px text-[10px] font-medium">
+                            {t("deviceList.expectedOffline")}{" "}
+                          </span>
+                          <span>
+                            {t("deviceList.lastSeen")}{" "}
+                            {formatLastSeen(sib.lastSeen, effectiveTimezone)}
+                          </span>
+                          {sib.agentVersion && (
+                            <span>
+                              {t("deviceList.agentV")}
+                              {sib.agentVersion}
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </Fragment>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {sortedDevices.length > 0 && (
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-3">
+            <p className="text-sm text-muted-foreground">
+              {t("deviceList.showing")} {startIndex + 1} {t("deviceList.to")}{" "}
+              {Math.min(startIndex + effectivePageSize, sortedDevices.length)}{" "}
+              {t("deviceList.of")} {sortedDevices.length}
+            </p>
+            <div className="flex items-center gap-2">
+              <label
+                htmlFor="device-page-size"
+                className="text-sm text-muted-foreground"
+              >
+                {t("deviceList.perPage")}{" "}
+              </label>
+              <select
+                id="device-page-size"
+                value={effectivePageSize}
+                aria-label={t("deviceList.devicesPerPage")}
+                onChange={(event) =>
+                  handlePageSizeChange(Number(event.target.value))
+                }
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-32"
+              >
+                {PAGE_SIZE_OPTIONS.map((opt) => (
+                  <option key={opt} value={opt}>
+                    {opt}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          {totalPages > 1 && (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                disabled={currentPage === 1}
+                className="flex h-9 w-9 items-center justify-center rounded-md border hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+              <span className="text-sm">
+                {t("deviceList.page")} {currentPage} {t("deviceList.of")}{" "}
+                {totalPages}
+              </span>
+              <button
+                type="button"
+                onClick={() =>
+                  setCurrentPage((p) => Math.min(totalPages, p + 1))
+                }
+                disabled={currentPage === totalPages}
+                className="flex h-9 w-9 items-center justify-center rounded-md border hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

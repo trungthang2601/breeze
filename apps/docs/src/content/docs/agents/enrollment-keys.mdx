@@ -1,0 +1,496 @@
+---
+title: Enrollment Keys
+description: Create, scope, rotate, and manage enrollment keys for onboarding Breeze agents, covering TTL, usage limits, site pinning, and per-key secrets.
+sidebar:
+  order: 6
+  label: Enrollment Keys
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Enrollment keys are short-lived, usage-limited tokens that authorize new agents to register with the Breeze API. Each key is scoped to an organization and optionally pinned to a specific site, ensuring that agents land in the correct place in the multi-tenant hierarchy without exposing long-lived credentials.
+
+---
+
+## Key Concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Enrollment key** | A 64-character hex string (32 random bytes) presented by the agent during the `POST /api/v1/agents/enroll` call. |
+| **SHA-256 + pepper** | The raw key is never stored. It is hashed with a server-side pepper before being written to the database. |
+| **TTL (`expiresAt`)** | Time-to-live. After this timestamp the key is rejected. Default: 30 days from creation (see `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES`). |
+| **Max usage (`maxUsage`)** | Maximum number of successful enrollments allowed. Default: 1. Range: 1 -- 100,000. |
+| **Usage count (`usageCount`)** | Incremented atomically on each successful enrollment. Once it reaches `maxUsage`, the key is exhausted. |
+| **Site pinning (`siteId`)** | When set, every agent that enrolls with this key is placed into the specified site. The enrollment endpoint requires a `siteId` to be present on the key. |
+| **Enrollment secret** | A separate, static secret (`AGENT_ENROLLMENT_SECRET` environment variable) that gates the enrollment endpoint in production. This is independent of the enrollment key itself. |
+
+<Aside type="tip">
+  Enrollment keys and the enrollment secret serve complementary roles. The **enrollment secret** is a static gate that controls _whether_ the enrollment endpoint accepts requests at all. The **enrollment key** controls _where_ the agent lands (org, site) and _how many_ agents can enroll.
+</Aside>
+
+---
+
+## Per-Key Enrollment Secrets
+
+Each enrollment key can optionally have its own **enrollment secret**, separate from the global `AGENT_ENROLLMENT_SECRET` environment variable. When a per-key secret is set, it takes priority over the global secret during enrollment.
+
+This is useful when you want to restrict enrollment to specific keys with unique credentials -- for example, giving each customer site its own secret so that a leaked key from one site cannot be used with another site's installer.
+
+Per-key secrets are set when creating or rotating a key. If no per-key secret is set, the global `AGENT_ENROLLMENT_SECRET` is used as usual.
+
+<Aside type="tip">
+  Per-key secrets and the global enrollment secret serve the same gating purpose. The per-key secret simply lets you scope that gate to individual keys rather than sharing one secret across all enrollments.
+</Aside>
+
+---
+
+## Installer Downloads
+
+Each enrollment key can generate a pre-configured Windows MSI installer, and — for macOS — a zip containing the **Breeze Installer.app** GUI bundle (see [macOS GUI Installer](/agents/installation/#macos-gui-installer)). Both are pre-loaded with the enrollment key and site assignment, so agents enroll automatically when the installer runs. macOS falls back to the legacy PKG + `install.sh` zip bundle (see [Advanced Install Methods](/agents/advanced-install/#zip-bundle-msi--enrollmentjson--installbat)) when the app-bundle asset isn't available or the server runs on a nonstandard host/port.
+
+When MSI signing is configured on the server, Windows installer downloads are automatically code-signed before delivery — Windows SmartScreen and antivirus tools will recognize them as trusted. See [Code Signing](/deploy/code-signing/) for setup details.
+
+<Aside type="note">
+  **Windows MSI filename token.** The Windows MSI embeds the enrollment token directly in its filename as a `(TOKEN@HOST)` block — for example `Breeze Agent (ABCD1234XY@breeze.example.com).msi`. You can rename the file freely **as long as the `(TOKEN@HOST)` block is preserved**. A browser-added dedup suffix like `(1)` is harmless. If the block is removed entirely (e.g. the file is fully renamed without it), the installer falls back to requiring the enrollment key and server URL entered manually during setup. (Older downloads used square brackets, `[TOKEN@HOST]`; the installer still recognizes that legacy form.)
+</Aside>
+
+### Downloading from the Dashboard
+
+From the enrollment key list or detail view, click **Download Installer** and choose the platform (Windows or macOS). The installer is generated on the fly and downloaded to your browser.
+
+The Enrollment Keys list shows each key's **installer capacity** — how many of the installer's enrollment slots have been used (for example `2 / 7` after downloading an installer for seven devices and enrolling two). The figure and the key's status badge are derived from the installer's **live** (unexpired) enrollment slots, so a fully expired installer shows as expired rather than as unused capacity, and the **Hide expired** filter agrees with the badge.
+
+### Downloading via API
+
+```bash
+# Download a pre-configured installer for a specific key
+curl -OJ https://breeze.yourdomain.com/api/v1/enrollment-keys/KEY_UUID/installer/windows \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -OJ https://breeze.yourdomain.com/api/v1/enrollment-keys/KEY_UUID/installer/macos \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Public Download Links
+
+You can generate a shareable, token-authenticated URL so that site contacts can download the installer without needing dashboard access.
+
+```bash
+# Generate a public download link
+curl -X POST https://breeze.yourdomain.com/api/v1/enrollment-keys/KEY_UUID/installer-link \
+  -H "Authorization: Bearer $TOKEN"
+
+# The response includes a URL like:
+# /api/v1/enrollment-keys/public-download/windows?token=...
+```
+
+Share the resulting URL with on-site contacts. Public download links are rate-limited to prevent abuse.
+
+### Short Codes (`/s/<code>`)
+
+Public installer links are also issued with a short, human-friendly URL of the form `https://breeze.yourdomain.com/s/<code>`. The short URL automatically detects the requester's platform and serves the correct installer (Windows MSI or macOS PKG), and increments the enrollment key's `usageCount` atomically — so the same `maxUsage` limit applies whether the installer is downloaded via the long-form link or the short link.
+
+Short codes are convenient for sharing in email, chat, or printed runbooks. The platform is selected per-request from the User-Agent and can be overridden with a `?platform=windows` or `?platform=macos` query parameter.
+
+In the dashboard, the enrollment key list shows each key's short code in a **Short code** column with a copy-to-clipboard button — this replaces the previous always-masked KEY column, which never revealed anything useful. A **Hide expired** toggle above the list filters out keys that have already expired.
+
+### Installer Bootstrap Tokens
+
+Every installer download, installer-link generation, or short-code redemption mints an `installer_bootstrap_tokens` row: a single-use-by-default token embedded in the installer that authenticates its first-run `/bootstrap` call, independent of the interactive enrollment key that produced it.
+
+<Aside type="tip" title="A bootstrap token now outlives its parent enrollment key (#2775)">
+  Previously, an installer's usable life was capped to its parent enrollment key's *remaining* life, and redemption returned `404` once the parent expired — so a 30-day installer link minted from the Add Device modal's transient ~60-minute parent key died in under an hour. As of this release, the bootstrap token's own `expiresAt` is the sole authority on whether an installer can still enroll a device; the parent key's expiry is no longer checked at redemption time. Revocation still works exactly as before: deleting the parent enrollment key cascade-deletes (`ON DELETE CASCADE`) every outstanding bootstrap token immediately, so a deliberate delete remains an effective kill switch.
+</Aside>
+
+The token's TTL defaults to `INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES` (30 days) or the admin's chosen link expiry, clamped to the partner's `maxEnrollmentLinkTtlMinutes` cap if one is set — see [Partner & Organization Enrollment Defaults](#partner--organization-enrollment-defaults). The daily purge sweep also will not delete a parent enrollment key while it still has a live, unexhausted bootstrap token outstanding, even past the key's own grace period — see [Automatic Purge of Expired Keys](#automatic-purge-of-expired-keys).
+
+---
+
+## Enrollment Key Lifecycle
+
+### Creating a Key
+
+<Steps>
+1. Authenticate with a user session that has the `organizations:write` permission and has completed MFA.
+2. Send a `POST` request to `/api/v1/enrollment-keys` with the desired scope.
+3. Copy the `key` field from the 201 response. This is the only time the raw key is returned.
+4. Embed the key in your agent installer, deployment script, or MDM payload.
+</Steps>
+
+```bash
+curl -X POST https://breeze.yourdomain.com/api/v1/enrollment-keys \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "orgId": "ORG_UUID",
+    "siteId": "SITE_UUID",
+    "name": "Chicago Office Q1 Deploy",
+    "maxUsage": 50,
+    "expiresAt": "2026-04-01T00:00:00Z"
+  }'
+```
+
+**Request body:**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `orgId` | `uuid` | Depends | Inferred for org-scoped users | Target organization. Required for partner and system scopes. |
+| `siteId` | `uuid` | No | `null` | Pin enrolled agents to a specific site. The enrollment endpoint will reject keys without a `siteId`. |
+| `name` | `string` | Yes | -- | Human-readable label (1--255 characters). |
+| `maxUsage` | `integer` | No | `1` | Maximum enrollments allowed (1--100,000). |
+| `expiresAt` | `datetime` | No | Now + TTL | ISO 8601 absolute expiration. Mutually exclusive with `ttlMinutes`. |
+| `ttlMinutes` | `integer` | No | Now + TTL | Lifetime in minutes from creation (1 to 525600, i.e. up to 365 days). Mutually exclusive with `expiresAt`. |
+
+When neither `expiresAt` nor `ttlMinutes` is supplied, the key expires after `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` (default 43200 — 30 days). Supplying both is rejected so the resolved expiry is unambiguous.
+
+`POST /enrollment-keys` and `POST /enrollment-keys/:id/rotate` reject any field that isn't in the table above — there is no `PATCH` method on enrollment keys; use `rotate` to change `maxUsage`/`expiresAt` on an existing key. A typo like `maxUses` (instead of `maxUsage`) now returns `400 Bad Request` with a precise field-name error rather than silently dropping the value — useful when scripting key creation against earlier API examples that used different field names.
+
+<Aside>
+  The default TTL is configurable via the `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` environment variable. If unset, keys expire 30 days after creation.
+
+  Every path now shares that fallback, including keys minted through the partner-provisioning API and installer child keys. `CHILD_ENROLLMENT_KEY_TTL_MINUTES` remains available to give installer child keys a shorter life than the shared default; leave it unset and they inherit the same 30 days.
+</Aside>
+
+<Aside type="tip">
+  In the dashboard, the **Add Device** modal has a **Link expires in** picker that sets the per-link lifetime (for example 1 hour, 24 hours, 7 days, up to 1 year) without changing the server's environment default. The picker sends `ttlMinutes`.
+</Aside>
+
+<Aside type="note">
+  In the dashboard, the **Create key** form now includes a required **Site** selector (plus an **Organization** selector when the caller can see more than one org), so keys created in the UI are always correctly site-bound and pass the enrollment endpoint's `siteId` requirement.
+</Aside>
+
+**Response (201):**
+
+```json
+{
+  "id": "a1b2c3d4-...",
+  "orgId": "ORG_UUID",
+  "siteId": "SITE_UUID",
+  "name": "Chicago Office Q1 Deploy",
+  "usageCount": 0,
+  "maxUsage": 50,
+  "expiresAt": "2026-04-01T00:00:00.000Z",
+  "createdBy": "USER_UUID",
+  "createdAt": "2026-03-02T12:00:00.000Z",
+  "key": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+}
+```
+
+<Aside type="caution">
+  The `key` field is only included in the response when a key is created or rotated. It is stripped from all other responses. Store it immediately in a secure location.
+</Aside>
+
+---
+
+### Listing Keys
+
+```bash
+# All non-expired keys for the authenticated org
+curl https://breeze.yourdomain.com/api/v1/enrollment-keys?expired=false \
+  -H "Authorization: Bearer $TOKEN"
+
+# Filter by org (partner/system scope)
+curl "https://breeze.yourdomain.com/api/v1/enrollment-keys?orgId=ORG_UUID&page=1&limit=25" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Query parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `page` | `string` | Page number (default `1`). |
+| `limit` | `string` | Results per page (default `50`, max `100`). |
+| `orgId` | `uuid` | Filter by organization. |
+| `expired` | `true` or `false` | Filter by expiration status. |
+
+The response includes a `pagination` object with `page`, `limit`, and `total` fields.
+
+---
+
+### Rotating a Key
+
+Rotation generates new key material for an existing record while resetting `usageCount` to zero. Use it to extend a deployment window or reissue a compromised key without changing the key ID.
+
+```bash
+curl -X POST https://breeze.yourdomain.com/api/v1/enrollment-keys/KEY_UUID/rotate \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "maxUsage": 100,
+    "expiresAt": "2026-06-01T00:00:00Z"
+  }'
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `maxUsage` | `integer` or `null` | No | New limit. Pass `null` for unlimited. Omit to keep the current value. |
+| `expiresAt` | `datetime` | No | New expiration. Omit to keep the current value. |
+
+The old key value is immediately invalidated. The response includes the new `key` field.
+
+<Aside type="danger" title="Shortening expiry via rotate no longer revokes outstanding installers">
+  Rotating a key to an earlier `expiresAt` used to also kill any installer bootstrap tokens issued from it, via a `parent_already_expired` check enforced at redemption time. That check has been removed (#2775) now that a bootstrap token's own expiry is authoritative — see [Installer Bootstrap Tokens](#installer-bootstrap-tokens). **If you were relying on shortening a key's expiry as a kill switch for installers already in the field, it no longer works** — this is a genuine loss of capability, not a bug. Outstanding installers keep working until their own bootstrap token expires. To revoke them immediately, delete the enrollment key instead: cascade-delete removes its bootstrap tokens right away.
+</Aside>
+
+---
+
+### Deleting a Key
+
+Enrollment keys are **hard deleted** from the database. This is irreversible.
+
+```bash
+curl -X DELETE https://breeze.yourdomain.com/api/v1/enrollment-keys/KEY_UUID \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Automatic Purge of Expired Keys
+
+Expired enrollment keys are hard-deleted automatically by a daily sweep that runs at **04:00 UTC**. A key is only purged once it has been expired for a grace period of `ENROLLMENT_KEY_PURGE_AFTER_DAYS` days (default **7**), so a recently expired key remains visible long enough to audit or rotate. Keys with no expiration date are never auto-purged. Set `ENROLLMENT_KEY_CLEANUP_ENABLED=false` to disable the sweep entirely.
+
+A key is also skipped by the sweep — even past its grace period — while it still has a live, unexhausted [installer bootstrap token](#installer-bootstrap-tokens) outstanding, so a long-lived installer link (30 days, 1 year) cannot be purged out from under itself before its own token expires or is fully consumed.
+
+Installer bootstrap tokens and deployment invites that reference a purged key are cascade-deleted along with it.
+
+### Bulk-Deleting Expired Keys
+
+You can also delete all expired keys on demand, without waiting for the grace period:
+
+```bash
+curl -X POST https://breeze.yourdomain.com/api/v1/enrollment-keys/purge-expired \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+The endpoint requires the same `organizations:write` permission + MFA as single-key deletion, deletes every expired key in the caller's scope (the caller's org, all accessible orgs for partner scope, or all orgs for system scope), and returns `{ "success": true, "deletedCount": N }`. Keys without an expiration are never matched.
+
+In the dashboard, this is surfaced as a **Delete expired** button above the key list, with a confirmation dialog before anything is removed.
+
+---
+
+## How Agent Enrollment Uses the Key
+
+When an agent starts for the first time, it presents the enrollment key to the API. The full flow is:
+
+<Steps>
+1. The agent sends `POST /api/v1/agents/enroll` with the raw enrollment key, hostname, OS type, architecture, and agent version.
+2. In production, the API first validates the static **enrollment secret** (from the `AGENT_ENROLLMENT_SECRET` env var or `x-agent-enrollment-secret` header).
+3. The API hashes the enrollment key with SHA-256 + pepper and looks up the matching record.
+4. The API checks that the key has not expired (`expiresAt > NOW()`) and has remaining usage (`usageCount < maxUsage`).
+5. `usageCount` is atomically incremented.
+6. The API verifies the key has a `siteId`. If not, the enrollment is rejected and the usage increment is rolled back.
+7. A device record is created (or updated if the hostname already exists in the same org + site) with a new `agentId` and `agentTokenHash`.
+8. Hardware and network inventory from the enrollment payload is stored.
+9. An mTLS certificate is issued if Cloudflare mTLS is configured for the organization.
+10. The API returns the `agentId`, `deviceId`, `authToken` (a `brz_`-prefixed bearer token), `orgId`, `siteId`, and heartbeat configuration.
+</Steps>
+
+```json
+// Successful enrollment response (201)
+{
+  "agentId": "hex-agent-id",
+  "deviceId": "uuid",
+  "authToken": "brz_a1b2c3d4...",
+  "orgId": "uuid",
+  "siteId": "uuid",
+  "config": {
+    "heartbeatIntervalSeconds": 60,
+    "metricsCollectionIntervalSeconds": 30
+  },
+  "mtls": null
+}
+```
+
+<Aside type="caution">
+  The `authToken` is only returned once. The agent stores it in `secrets.yaml` (`/etc/breeze/secrets.yaml` on Linux, `/Library/Application Support/Breeze/secrets.yaml` on macOS, `C:\ProgramData\Breeze\secrets.yaml` on Windows) with `0600` permissions. The main config (`agent.yaml`) uses `0644` so the Helper can read it. The API stores only the SHA-256 hash.
+</Aside>
+
+---
+
+## Security Model
+
+### Peppered Hashing
+
+Enrollment keys are hashed using SHA-256 with a server-side pepper before storage. `ENROLLMENT_KEY_PEPPER` itself is required in production — the server refuses to start unless it is set, at least 32 characters, and not a known placeholder/insecure value. New keys are always hashed with `ENROLLMENT_KEY_PEPPER`; there is no acceptable substitute.
+
+`APP_ENCRYPTION_KEY`, `SSO_ENCRYPTION_KEY`, `SECRET_ENCRYPTION_KEY`, `JWT_SECRET`, and `SESSION_SECRET` are consulted only as legacy fallbacks on the *read* path, so enrollment keys hashed before `ENROLLMENT_KEY_PEPPER` became mandatory still match after an upgrade — they are never used to hash a newly created or rotated key.
+
+The hash is computed as:
+
+```
+SHA-256( pepper + ":" + rawKey )
+```
+
+This means that even if the database is compromised, the raw enrollment keys cannot be recovered without knowledge of the pepper.
+
+### Dual Gate: Secret + Key
+
+The enrollment endpoint uses two layers of protection:
+
+| Layer | Purpose | Scope |
+|-------|---------|-------|
+| **Enrollment secret** (`AGENT_ENROLLMENT_SECRET`) | Static gating token validated at the start of the request. Required in production if set. | Global -- same for all enrollments. |
+| **Enrollment key** | Per-deployment token that determines org, site, and usage limits. | Per-key -- each deployment batch gets its own key. |
+
+The enrollment secret can be passed as the `enrollmentSecret` field in the request body or via the `x-agent-enrollment-secret` header.
+
+### Re-enrollment
+
+If an agent with the same hostname already exists in the same org and site, the enrollment endpoint updates the existing device record rather than creating a duplicate. This supports scenarios like OS reinstalls or agent upgrades. If the existing device has been **decommissioned**, re-enrollment is still allowed — the API creates a *fresh* device record (new id, new tokens) rather than reviving the decommissioned row, so the old row's audit history stays intact and the new agent is treated as a distinct asset. The only case that's blocked is when the decommissioned row's token was also suspended for a security reason (for example, a cross-tenant access probe) — that returns a `409 Conflict` until an administrator clears the suspension. See [Reusing a hostname for a decommissioned device](/agents/enrollment/#reusing-a-hostname-for-a-decommissioned-device) for the full behavior.
+
+### Audit Trail
+
+Every enrollment key operation is recorded in the audit log:
+
+| Action | Trigger |
+|--------|---------|
+| `enrollment_key.create` | New key created. |
+| `enrollment_key.rotate` | Key material regenerated. Includes previous and new `maxUsage`, `expiresAt`, and `usageCount`. |
+| `enrollment_key.delete` | Key permanently deleted. |
+| `enrollment_key.purge_expired` | Bulk deletion of expired keys. Includes the `deletedCount`. |
+| `enrollment_key.bootstrap_token_issued` | A single-use bootstrap token was minted from this key (dashboard "generate installer" flows). |
+| `enrollment_key.installer_link_created` | A public installer link or short link was generated for this key. |
+| `enrollment_key.installer_download` | A pre-configured installer (Windows MSI or macOS zip) was built and downloaded from the dashboard for this key. |
+| `enrollment_key.installer_build_failed` | Installer build failed after usage was already reserved; logged so the failure is traceable. |
+| `enrollment_key.public_download` | An anonymous download via a public or short installer link. Logged with the requester's IP and a sentinel anonymous actor id (no logged-in user). |
+| `agent.enroll` | Agent successfully enrolls using a key. Logged with `actorType: agent`. |
+
+---
+
+## Multi-Tenant Access Control
+
+Enrollment key management respects the Breeze multi-tenant hierarchy:
+
+| User Scope | Behavior |
+|------------|----------|
+| **Organization** | Can only manage keys for their own organization. `orgId` is inferred automatically. |
+| **Partner** | Can manage keys for any organization they have access to. Must provide `orgId` when managing multiple orgs. If the partner has exactly one org, `orgId` is inferred. |
+| **System** | Can manage keys for any organization. Must provide `orgId`. |
+
+All management endpoints require `organizations:read` for listing/viewing and `organizations:write` + MFA for creating, rotating, and deleting.
+
+---
+
+## Partner & Organization Enrollment Defaults
+
+Partners and organizations can configure three settings that shape enrollment link and installer TTLs without touching environment variables per-deployment. All three live under `settings.defaults` on the partner or organization record.
+
+| Setting | Scope | Behavior |
+|---|---|---|
+| `defaultEnrollmentTtlMinutes` | Partner default, **inherit-with-override** by org | Pre-selects the link/installer expiry in the **Add Device** dialog. A partner sets a house default; an individual organization may override it with its own default. The product fallback when neither is set is 30 days. |
+| `defaultEnrollmentDeviceCount` | Partner default, **inherit-with-override** by org | Same inherit-with-override pattern, for the default device count on a new link. The product fallback when neither is set is 50 devices. |
+| `maxEnrollmentLinkTtlMinutes` | **Partner only** | A hard ceiling on enrollment key/installer lifetime for every organization under that partner. An organization cannot raise it — there is no org-level equivalent field. |
+
+Partners configure all three from their partner settings page (`PATCH /partners/me`); organizations override the first two from their own org settings page (`PATCH /orgs/organizations/:id`). See [Partner Management](/reference/partner-management/#updating-partner-settings-self-service) for the general settings-PATCH mechanics.
+
+<Aside type="caution" title="The cap is a ceiling on key lifetime, not just on requests">
+  `maxEnrollmentLinkTtlMinutes` bounds how long any key or token minted under that partner may remain usable — it is not merely a limit on what an admin is allowed to type into a form. If a partner sets a one-hour cap, **nothing** minted under any of that partner's organizations — an explicit `ttlMinutes` from an admin, a redemption-time child key, an installer bootstrap token, or an MCP-generated deployment invite — stays valid for longer than an hour, regardless of which code path created it.
+</Aside>
+
+### Rejected vs. clamped
+
+The cap is enforced two different ways, depending on whether there's an interactive caller present to show an error to:
+
+- **An explicit request above the cap is REJECTED with 400, not silently reduced.** `POST /enrollment-keys`, `POST /enrollment-keys/:id/rotate`, the installer / installer-link download routes, and the device onboarding-token route all validate an explicit `ttlMinutes` (or `expiresAt`) against the partner's cap before doing anything else. A caller asking for more than the cap allows gets `400` with `{ "error": "ttlMinutes exceeds the partner maximum of <N> minutes" }` — the key is never created with a shorter TTL as a fallback.
+- **A system-picked TTL is CLAMPED to the cap instead of rejected**, because there is no request to reject and no user to show an error to. This applies to:
+  - the fresh child enrollment key minted when an installer is redeemed (`/s/:code`, `/bootstrap`),
+  - the child enrollment key embedded in an installer download or installer link when the admin didn't pass an explicit `ttlMinutes` (`GET /enrollment-keys/:id/installer/:platform`, `POST /enrollment-keys/:id/installer-link`) — it falls back to the deployment default, which is then clamped,
+  - the base TTL of a freshly-issued [installer bootstrap token](#installer-bootstrap-tokens) when the admin didn't choose an explicit expiry, and
+  - deployment invites generated by the AI/MCP `send_deployment_invites` tool.
+
+  In the dashboard, the **Link expires in** picker in the Add Device modal also hides any preset longer than the effective cap (for example, a 24-hour cap removes the 7-day/30-day/90-day/1-year options), so most admins never hit the 400 path at all — it exists for direct API/script callers and forged requests.
+
+### The practical consequence: this also shortens the completion window, not just the download window
+
+A short cap doesn't just limit how long an installer link is downloadable. After an installer is run, it redeems its embedded bootstrap token and is issued a brand-new, single-use child enrollment key — and that child key's TTL is *also* clamped to the same partner cap. So a one-hour cap gives a machine **one hour from redemption** to complete the actual `POST /api/v1/agents/enroll` call, on top of however long the bootstrap token itself was valid for download.
+
+In normal operation that gap is seconds. It stops being seconds — and starts producing "invalid or expired enrollment key" support tickets — whenever something delays the agent's first enrollment call after the installer runs: disk-imaging pipelines, a reboot baked into the install sequence, MDM-staged rollouts, or a machine that sits offline for a while right after setup. If enrollment fails on a machine that "was definitely installed within the download window," check whether a partner cap is also clamping the post-redemption completion window.
+
+### "Never expires" is not offered
+
+There is no option to mint a key or installer link that never expires, by design. `installer_bootstrap_tokens.expires_at` is `NOT NULL` with a `CHECK (expires_at > created_at)` constraint at the database level — supporting "never" would need a migration to make the column nullable, plus null-handling added through issuance, the `/bootstrap` consume path, the daily purge sweep, and the expiry countdown in the dashboard UI. That is tracked as a follow-up, not implemented here.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` | `43200` | Default time-to-live for new enrollment keys when `expiresAt` is not specified. |
+| `CHILD_ENROLLMENT_KEY_TTL_MINUTES` | `43200` | Fresh TTL (minutes) given to a "child" enrollment key minted at installer-download, installer-link, or short-code redemption time, measured from mint time rather than the parent key's remaining lifetime. Clamped to the partner's `maxEnrollmentLinkTtlMinutes` cap. |
+| `INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES` | `43200` | Base TTL (minutes) for a freshly-issued [installer bootstrap token](#installer-bootstrap-tokens) when no explicit `ttlMinutes` is supplied. The token's own expiry, not the parent enrollment key's, governs how long an installer has to complete enrollment. |
+| `INSTALLER_PARENT_MIN_REMAINING_SECONDS` | `60` | Minimum remaining lifetime (seconds) a parent enrollment key must have to be used as an installer source. Guards against building an installer from a parent that expires before the download reaches the target machine. |
+| `ENROLLMENT_KEY_PEPPER` | -- | Pepper used for SHA-256 hashing of enrollment keys. **Required in production** (at least 32 characters, not a placeholder value) — the server refuses to start without it. `APP_ENCRYPTION_KEY`, `SSO_ENCRYPTION_KEY`, `SECRET_ENCRYPTION_KEY`, `JWT_SECRET`, and `SESSION_SECRET` are only consulted as legacy fallbacks when matching keys hashed before this requirement took effect. |
+| `AGENT_ENROLLMENT_SECRET` | -- | Static secret that gates the enrollment endpoint in production. If empty or unset, the gate is skipped in non-production environments. |
+| `ENROLLMENT_KEY_CLEANUP_ENABLED` | `true` | Set to `false` to disable the daily sweep that purges expired keys. |
+| `ENROLLMENT_KEY_PURGE_AFTER_DAYS` | `7` | Grace period (in days past expiry) before the daily sweep hard-deletes an expired key. |
+
+---
+
+## API Reference
+
+All routes are prefixed with `/api/v1/enrollment-keys` and require JWT authentication.
+
+| Method | Path | Permission | Description |
+|--------|------|------------|-------------|
+| `GET` | `/enrollment-keys` | `organizations:read` | List enrollment keys with pagination and filters. |
+| `POST` | `/enrollment-keys` | `organizations:write` + MFA | Create a new enrollment key. Returns the raw key once. |
+| `GET` | `/enrollment-keys/:id` | `organizations:read` | Get metadata for a single enrollment key (raw key not included). |
+| `POST` | `/enrollment-keys/:id/rotate` | `organizations:write` + MFA | Regenerate key material, reset usage count. Returns the new raw key. |
+| `DELETE` | `/enrollment-keys/:id` | `organizations:write` + MFA | Permanently delete an enrollment key. |
+| `POST` | `/enrollment-keys/purge-expired` | `organizations:write` + MFA | Delete all expired enrollment keys in the caller's scope. Returns the number of keys deleted. |
+| `GET` | `/enrollment-keys/:id/installer/:platform` | `organizations:read` | Download a pre-configured MSI or PKG installer. |
+| `POST` | `/enrollment-keys/:id/installer-link` | `organizations:write` | Generate a public download link for an installer. |
+| `GET` | `/enrollment-keys/public-download/:platform` | Token (public) | Download an installer via a public link token. |
+| `GET` | `/s/:code` | Public (short code) | Auto-detects platform and redirects to the matching installer download. Increments enrollment-key usage atomically. |
+
+The agent enrollment endpoint is separate:
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/api/v1/agents/enroll` | Enrollment secret + enrollment key | Register a new agent. No JWT required. |
+
+---
+
+## Troubleshooting
+
+### Enrollment key rejected (401)
+
+All enrollment-key rejections share the `401` status code, but each carries a distinct `reason` field and error message so you can tell them apart without guessing:
+
+| `reason` | Error message | Cause |
+|---|---|---|
+| `enrollment_key_not_found` | "Enrollment key not recognized" | The SHA-256 hash of the provided key did not match any record — the key was rotated (an old value is still baked into an installer) or mistyped. This is also what you'll see if the server pepper changed since the key was created. |
+| `enrollment_key_expired` | "Enrollment key has expired — regenerate the key or installer link and retry" | The `expiresAt` timestamp has passed. The default TTL is 30 days. |
+| `enrollment_key_exhausted` | "Enrollment key has reached its maximum usage count — regenerate a fresh key or installer link" | `usageCount` has reached `maxUsage`. Check the key details via `GET /enrollment-keys/:id`. |
+| `enrollment_key_race_lost` | "Enrollment key was just exhausted or expired — regenerate a fresh key or installer link" | Two agents enrolled with the same key at the same instant and this request lost the race for the last remaining use. |
+
+All four stay on HTTP `401` (rather than `404`/`410`/`409`) for backward compatibility with older agents that don't parse the `reason` field.
+
+### "Enrollment secret required" (403)
+
+The `AGENT_ENROLLMENT_SECRET` environment variable is set in production but the agent did not provide it. Pass the secret via the `enrollmentSecret` field in the JSON body or the `x-agent-enrollment-secret` HTTP header.
+
+### "Invalid enrollment secret" (403)
+
+The provided enrollment secret does not match the configured `AGENT_ENROLLMENT_SECRET`. The comparison uses timing-safe equality to prevent timing attacks. Verify the secret value in your deployment configuration.
+
+### "Enrollment key must be associated with a site" (400)
+
+The enrollment key was created without a `siteId`. The enrollment endpoint requires every key to specify which site agents should be placed into. Delete this key and create a new one with a `siteId`.
+
+### "Device has been decommissioned" (403)
+
+This is not an enrollment-key error. Enrolling a new agent on a hostname whose prior device row was decommissioned now succeeds and creates a fresh device record — see [Re-enrollment](#re-enrollment). You'll see this 403 instead if an *already-enrolled* agent tries to connect (WebSocket, heartbeat, or Helper) using a token for a device that has since been decommissioned. Re-run `breeze-agent enroll` with a valid enrollment key to get a new device record and token.
+
+### "Organization context required" (403)
+
+An organization-scoped user attempted a key management operation without a valid `orgId` in their session. This usually indicates a misconfigured user account.
+
+### "No enrollment key pepper configured" (server startup)
+
+`ENROLLMENT_KEY_PEPPER` must be set in production — at least 32 characters and not a known placeholder/insecure value — or the server refuses to start. The legacy fallback variables (`APP_ENCRYPTION_KEY`, `SSO_ENCRYPTION_KEY`, `SECRET_ENCRYPTION_KEY`, `JWT_SECRET`, `SESSION_SECRET`) are only used to verify keys hashed before this requirement took effect; they do not satisfy the startup check. Without `ENROLLMENT_KEY_PEPPER`, enrollment key hashes would be vulnerable to rainbow table attacks.
+
+### Key appears valid but agent fails to connect after enrollment
+
+- Verify the `authToken` returned by enrollment is stored correctly in the agent config file.
+- Check that `secrets.yaml` permissions are `0600` (owner read/write only) and `agent.yaml` is `0644`.
+- Ensure the agent is connecting to the correct WebSocket URL (`/api/v1/agents/:id/ws`) with the `Authorization: Bearer brz_...` header.

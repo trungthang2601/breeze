@@ -1,0 +1,647 @@
+//go:build darwin
+
+package agentapp
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+
+	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/launchdplist"
+	"github.com/breeze-rmm/agent/internal/macosuninstall"
+	"github.com/breeze-rmm/agent/internal/sessionbroker"
+	"github.com/spf13/cobra"
+)
+
+const (
+	darwinBinaryPath                 = "/usr/local/bin/breeze-agent"
+	darwinDesktopHelperBinaryPath    = "/usr/local/bin/breeze-desktop-helper"
+	darwinPlistDst                   = "/Library/LaunchDaemons/com.breeze.agent.plist"
+	darwinDesktopUserPlistDst        = "/Library/LaunchAgents/com.breeze.desktop-helper-user.plist"
+	darwinDesktopLoginWindowPlistDst = "/Library/LaunchAgents/com.breeze.desktop-helper-loginwindow.plist"
+	darwinLogDir                     = "/Library/Logs/Breeze"
+	darwinConfigDir                  = "/Library/Application Support/Breeze"
+	darwinLabel                      = "com.breeze.agent"
+	darwinWatchdogBinaryPath         = "/usr/local/bin/breeze-watchdog"
+	darwinWatchdogPlistDst           = "/Library/LaunchDaemons/com.breeze.watchdog.plist"
+	darwinWatchdogLabel              = "com.breeze.watchdog"
+)
+
+// Embedded plist — matches agent/service/launchd/com.breeze.agent.plist
+const darwinPlist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.breeze.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/breeze-agent</string>
+        <string>run</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>WorkingDirectory</key>
+    <string>/Library/Application Support/Breeze</string>
+
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/Breeze/agent.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/Breeze/agent.err</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+</dict>
+</plist>
+`
+
+// darwinDesktopUserPlist and darwinDesktopLoginWindowPlist are rendered by
+// internal/launchdplist — the single source of truth for these plists (#4379).
+var (
+	darwinDesktopUserPlist        = launchdplist.DesktopHelperUser
+	darwinDesktopLoginWindowPlist = launchdplist.DesktopHelperLoginWindow
+)
+
+var serviceCmd = &cobra.Command{
+	Use:   "service",
+	Short: "Manage the Breeze Agent system service (launchd)",
+}
+
+var withUserHelper bool
+var noWatchdog bool
+
+func init() {
+	rootCmd.AddCommand(serviceCmd)
+	serviceCmd.AddCommand(serviceInstallCmd)
+	serviceCmd.AddCommand(serviceUninstallCmd)
+	serviceCmd.AddCommand(serviceStartCmd)
+	serviceCmd.AddCommand(serviceStopCmd)
+	serviceCmd.AddCommand(serviceStatusCmd)
+	serviceInstallCmd.Flags().BoolVar(&withUserHelper, "with-user-helper", false, "Also install the per-user desktop helper LaunchAgent")
+	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation")
+	// A failed start returns an error from RunE; usage text would bury it.
+	serviceInstallCmd.SilenceUsage = true
+}
+
+var serviceInstallCmd = &cobra.Command{
+	Use:   "install",
+	Short: "Install the agent as a launchd service",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("must run as root (sudo breeze-agent service install)")
+		}
+
+		// Create directories
+		for _, dir := range []string{darwinConfigDir, darwinLogDir} {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return fmt.Errorf("failed to create %s: %w", dir, err)
+			}
+		}
+		// Config dir starts restrictive (0700). Note: FixConfigPermissions() loosens this
+		// to 0755 on startup so the Helper can read agent.yaml.
+		if err := os.Chmod(darwinConfigDir, 0700); err != nil {
+			return fmt.Errorf("failed to set permissions on %s: %w", darwinConfigDir, err)
+		}
+
+		// Stop existing service before replacing binary (safe for upgrades).
+		//
+		// Whether it was RUNNING is sampled BEFORE the unload, because this
+		// command then decides whether to bootstrap it again — asking
+		// afterwards only reports the state this unload produced. That
+		// inversion is what stranded Linux hosts in #5252; macOS had the same
+		// shape (unload, never bootstrap).
+		wasRunning := false
+		if _, err := os.Stat(darwinPlistDst); err == nil {
+			wasRunning = isSystemServiceRunning()
+			if stopErr := exec.Command("launchctl", "unload", darwinPlistDst).Run(); stopErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to stop existing service: %v\n", stopErr)
+			} else {
+				fmt.Println("Stopped existing Breeze Agent service.")
+			}
+		}
+
+		// Copy current binary to /usr/local/bin/
+		exePath, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("failed to determine executable path: %w", err)
+		}
+		exePath, err = filepath.EvalSymlinks(exePath)
+		if err != nil {
+			return fmt.Errorf("failed to resolve executable path: %w", err)
+		}
+
+		if exePath != darwinBinaryPath {
+			data, err := os.ReadFile(exePath)
+			if err != nil {
+				return fmt.Errorf("failed to read binary: %w", err)
+			}
+			if err := os.WriteFile(darwinBinaryPath, data, 0755); err != nil {
+				return fmt.Errorf("failed to copy binary to %s: %w", darwinBinaryPath, err)
+			}
+			fmt.Printf("Binary installed to %s\n", darwinBinaryPath)
+		}
+
+		// Write launchd plist
+		if err := os.WriteFile(darwinPlistDst, []byte(darwinPlist), 0644); err != nil {
+			return fmt.Errorf("failed to write plist: %w", err)
+		}
+		fmt.Printf("LaunchDaemon plist installed to %s\n", darwinPlistDst)
+
+		// Stage the REAL desktop helper — sibling binary first, matching-version
+		// signed release asset second. It must never be substituted with the
+		// agent binary: see stageDesktopHelper for why (#3457). A failure here
+		// is a warning, not a fatal error, so an offline or air-gapped install
+		// still gets a working agent service (same policy as the watchdog).
+		helperServerURL := persistedServerURLForInstall()
+		stageHelperErr := stageDesktopHelper(desktopHelperStageOptions{
+			agentPath: exePath,
+			destPath:  darwinDesktopHelperBinaryPath,
+			version:   version,
+			goos:      runtime.GOOS,
+			goarch:    runtime.GOARCH,
+			serverURL: helperServerURL,
+		})
+		if stageHelperErr != nil {
+			fmt.Fprint(os.Stderr, desktopHelperUnavailableWarning(stageHelperErr, version, runtime.GOOS, runtime.GOARCH, helperServerURL))
+		} else {
+			fmt.Printf("Desktop helper installed to %s\n", darwinDesktopHelperBinaryPath)
+		}
+
+		// Only register the helper's LaunchAgents when a helper binary is
+		// actually there — see desktopHelperLaunchAgentsWanted.
+		helperLaunchAgents := desktopHelperLaunchAgentsWanted(stageHelperErr, darwinDesktopHelperBinaryPath)
+		if helperLaunchAgents {
+			if err := os.WriteFile(darwinDesktopUserPlistDst, []byte(darwinDesktopUserPlist), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write desktop-helper user plist: %v\n", err)
+			} else {
+				fmt.Printf("LaunchAgent plist installed to %s\n", darwinDesktopUserPlistDst)
+			}
+			if err := os.WriteFile(darwinDesktopLoginWindowPlistDst, []byte(darwinDesktopLoginWindowPlist), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write desktop-helper loginwindow plist: %v\n", err)
+			} else {
+				fmt.Printf("LaunchAgent plist installed to %s\n", darwinDesktopLoginWindowPlistDst)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"Skipping desktop-helper LaunchAgent setup: no helper binary at %s.\n"+
+					"  launchd would otherwise retry a missing program indefinitely.\n",
+				darwinDesktopHelperBinaryPath)
+		}
+
+		// Create the breeze group, put the logged-in console users in it, and only
+		// THEN bootstrap the helper LaunchAgents so the desktop helper connects
+		// right away rather than waiting for the first heartbeat. A helper
+		// inherits its group list when it starts, so a helper bootstrapped first
+		// would not be in the group that owns the IPC socket and would be denied
+		// (#3133/#3134/#3137). This ordering was previously reversed; it is
+		// pinned by TestInstallIPCPrereqsThenHelpersOrdering.
+		// The breeze group is set up regardless — the agent's own IPC socket
+		// belongs to it — but the helper bootstrap is skipped when there is no
+		// helper binary to bootstrap.
+		bootstrapHelpers := bootstrapDesktopHelperPlists
+		if !helperLaunchAgents {
+			bootstrapHelpers = func() {}
+		}
+		if err := installIPCPrereqsThenHelpers(
+			ensureDarwinBreezeGroup,
+			ensureDarwinBreezeGroupConsoleMembers,
+			bootstrapHelpers,
+		); err != nil {
+			return err
+		}
+
+		// Start the daemon back up, so `service install` really is the upgrade
+		// path the docs describe (#5252). Runs after the breeze group and the
+		// helper LaunchAgents above: the agent inherits its group list at
+		// startup and opens its IPC socket immediately.
+		existingCfg, _ := config.Load(cfgFile)
+		enrolled := existingCfg != nil && existingCfg.AgentID != ""
+		plan := planServiceStart(wasRunning, enrolled)
+		started, startErr := applyLaunchdJob(
+			execCommandRunner, darwinLabel, darwinPlistDst, isLaunchdLoaded(darwinLabel), plan)
+
+		fmt.Println()
+		switch {
+		case started:
+			fmt.Printf("Breeze Agent service installed and started (%s).\n", plan.Reason)
+		case startErr != nil:
+			fmt.Fprintf(os.Stderr,
+				"ERROR: the Breeze Agent daemon was stopped for this install and could NOT be started again: %v\n"+
+					"       This host is not being managed until it starts. Recover with:\n"+
+					"         sudo launchctl bootstrap system %s\n"+
+					"         tail -n 100 %s/agent.err\n",
+				startErr, darwinPlistDst, darwinLogDir)
+		default:
+			fmt.Println("Breeze Agent service installed (not started: " + plan.Reason + ").")
+		}
+
+		if started {
+			fmt.Printf("  Logs:    tail -f %s/agent.log\n", darwinLogDir)
+		} else if enrolled {
+			fmt.Println()
+			fmt.Println("Next steps:")
+			fmt.Printf("  1. Start:   sudo breeze-agent service start\n")
+			fmt.Printf("  2. Status:  sudo breeze-agent service status\n")
+			fmt.Printf("  3. Logs:    tail -f %s/agent.log\n", darwinLogDir)
+		} else {
+			fmt.Println()
+			fmt.Println("Next steps:")
+			fmt.Printf("  1. Enroll:  sudo breeze-agent enroll <key> --server https://your-server\n")
+			fmt.Printf("  2. Start:   sudo breeze-agent service start\n")
+			fmt.Printf("  3. Status:  sudo breeze-agent service status\n")
+			fmt.Printf("  4. Logs:    tail -f %s/agent.log\n", darwinLogDir)
+		}
+		if !noWatchdog {
+			// Describe the service state we actually left behind. This line
+			// used to assert "installed and running" unconditionally, which
+			// before #5252 was never true on this platform and is still not
+			// true for a fresh un-enrolled host or a failed start.
+			agentStateLine := "The agent service is installed but is NOT running."
+			if started {
+				agentStateLine = "The agent service is installed and running."
+			}
+			serverURL := persistedServerURLForInstall()
+			err := bootstrapWatchdog(bootstrapOptions{
+				agentPath: exePath,
+				version:   version,
+				goos:      runtime.GOOS,
+				goarch:    runtime.GOARCH,
+				serverURL: serverURL,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr,
+					"Warning: watchdog bootstrap failed: %v\n"+
+						"%s The watchdog is NOT installed.\n"+
+						"To retry, choose one of:\n"+
+						"  1. Re-run `sudo breeze-agent service install` (will retry the download).\n"+
+						"  2. Download %s manually, place it next to breeze-agent,\n"+
+						"     then run `sudo breeze-watchdog service install`.\n"+
+						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n",
+					err, agentStateLine, watchdogManualDownloadURL(version, runtime.GOOS, runtime.GOARCH, serverURL))
+			}
+		}
+
+		// Reported last so the watchdog still gets bootstrapped, but reported:
+		// a silent exit 0 on a host whose agent is down is exactly how #5252
+		// went unnoticed until the device showed Offline.
+		return startErr
+	},
+}
+
+var serviceUninstallCmd = &cobra.Command{
+	Use:   "uninstall",
+	Short: "Uninstall the agent launchd service",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("must run as root (sudo breeze-agent service uninstall)")
+		}
+		if err := uninstallDarwinService(func(name string, args ...string) ([]byte, error) {
+			return exec.Command(name, args...).CombinedOutput()
+		}); err != nil {
+			return err
+		}
+		fmt.Println("Breeze Agent service uninstalled.")
+		fmt.Printf("Config at %s was preserved.\n", darwinConfigDir)
+		fmt.Printf("To remove config: sudo rm -rf '%s'\n", darwinConfigDir)
+		return nil
+	},
+}
+
+func uninstallDarwinService(run func(string, ...string) ([]byte, error)) error {
+	out, err := run("/bin/sh", "-c", macosuninstall.Script())
+	if err != nil {
+		return fmt.Errorf("uninstall package artifacts: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+var serviceStartCmd = &cobra.Command{
+	Use:   "start",
+	Short: "Start the agent service",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("must run as root (sudo breeze-agent service start)")
+		}
+
+		if !fileExists(darwinPlistDst) {
+			return fmt.Errorf("service not installed — run 'sudo breeze-agent service install' first")
+		}
+
+		// Use bootstrap (modern) with fallback to load (legacy)
+		if isLaunchdLoaded(darwinLabel) {
+			// Already loaded, just kick it
+			out, err := exec.Command("launchctl", "kickstart", "system/"+darwinLabel).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("failed to start service: %s", strings.TrimSpace(string(out)))
+			}
+		} else {
+			out, err := exec.Command("launchctl", "bootstrap", "system", darwinPlistDst).CombinedOutput()
+			if err != nil {
+				// Fallback to legacy load
+				out2, err2 := exec.Command("launchctl", "load", darwinPlistDst).CombinedOutput()
+				if err2 != nil {
+					return fmt.Errorf("failed to load service: %s / %s",
+						strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
+				}
+			}
+		}
+
+		fmt.Println("Breeze Agent service started.")
+		fmt.Printf("Logs: tail -f %s/agent.log\n", darwinLogDir)
+
+		// Bootstrap the desktop helper LaunchAgents so remote desktop connects promptly.
+		if _, err := os.Stat(darwinDesktopUserPlistDst); err == nil {
+			bootstrapDesktopHelperPlists()
+		}
+		return nil
+	},
+}
+
+var serviceStopCmd = &cobra.Command{
+	Use:   "stop",
+	Short: "Stop the agent service",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if os.Geteuid() != 0 {
+			return fmt.Errorf("must run as root (sudo breeze-agent service stop)")
+		}
+
+		if !isLaunchdLoaded(darwinLabel) {
+			fmt.Println("Service is not running.")
+			return nil
+		}
+
+		out, err := exec.Command("launchctl", "bootout", "system/"+darwinLabel).CombinedOutput()
+		if err != nil {
+			// Fallback to legacy unload
+			out2, err2 := exec.Command("launchctl", "unload", darwinPlistDst).CombinedOutput()
+			if err2 != nil {
+				return fmt.Errorf("failed to stop service: %s / %s",
+					strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
+			}
+		}
+
+		fmt.Println("Breeze Agent service stopped.")
+		return nil
+	},
+}
+
+var serviceStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show agent service status",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if !fileExists(darwinPlistDst) {
+			fmt.Println("Service: not installed")
+			return nil
+		}
+
+		if !isLaunchdLoaded(darwinLabel) {
+			fmt.Println("Service: installed but not loaded")
+			return nil
+		}
+
+		// Get detailed info from launchctl print
+		out, err := exec.Command("launchctl", "print", "system/"+darwinLabel).CombinedOutput()
+		if err != nil {
+			// Fallback: can't get details but the job is loaded
+			fmt.Println("Service: loaded (unable to retrieve details)")
+			return nil
+		}
+
+		// Parse PID and state from output
+		lines := strings.Split(string(out), "\n")
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "pid = ") || strings.HasPrefix(trimmed, "state = ") {
+				fmt.Println(trimmed)
+			}
+		}
+
+		fmt.Printf("Logs: %s/agent.log\n", darwinLogDir)
+		return nil
+	},
+}
+
+// reconcileServiceUnitIfNeeded is the darwin implementation: it self-heals
+// launchd plists from older installs.
+func reconcileServiceUnitIfNeeded() {
+	healLaunchdPlists()
+	ensureDesktopHelpersLoaded()
+}
+
+// healLaunchdPlists checks the installed plists for the old SuccessfulExit
+// KeepAlive config and replaces them with KeepAlive=true. This runs on daemon
+// startup so existing installs self-heal after a binary-only auto-update.
+func healLaunchdPlists() {
+	if os.Geteuid() != 0 {
+		return // only root can write to /Library/LaunchDaemons
+	}
+	for _, entry := range []struct {
+		path    string
+		content string
+		label   string
+		domain  string // launchd domain for reload
+	}{
+		{darwinPlistDst, darwinPlist, darwinLabel, "system"},
+		{darwinDesktopUserPlistDst, darwinDesktopUserPlist, "com.breeze.desktop-helper-user", ""},
+		{darwinDesktopLoginWindowPlistDst, darwinDesktopLoginWindowPlist, "com.breeze.desktop-helper-loginwindow", "loginwindow"},
+	} {
+		data, err := os.ReadFile(entry.path)
+		if err != nil {
+			continue // plist doesn't exist, nothing to heal
+		}
+		if !strings.Contains(string(data), "SuccessfulExit") {
+			continue // already has KeepAlive=true
+		}
+		if err := os.WriteFile(entry.path, []byte(entry.content), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to heal plist %s: %v\n", entry.path, err)
+			continue
+		}
+		fmt.Printf("Healed launchd plist %s (KeepAlive=true)\n", entry.path)
+	}
+}
+
+// isLaunchdLoaded checks if the given label is loaded in launchd.
+func isLaunchdLoaded(label string) bool {
+	err := exec.Command("launchctl", "print", "system/"+label).Run()
+	return err == nil
+}
+
+// ensureDesktopHelpersLoaded bootstraps the desktop helper LaunchAgents on
+// daemon startup if they aren't already loaded. Covers the case where an
+// existing install was upgraded via binary-only auto-update and thus never
+// re-ran "service install" to load the helper plists into launchd.
+func ensureDesktopHelpersLoaded() {
+	if os.Geteuid() != 0 {
+		return
+	}
+
+	if fileExists(darwinDesktopUserPlistDst) {
+		if uid := consoleUserUID(); uid != "" {
+			domain := "gui/" + uid
+			label := domain + "/com.breeze.desktop-helper-user"
+			if exec.Command("launchctl", "print", label).Run() != nil {
+				out, err := exec.Command("launchctl", "bootstrap", domain, darwinDesktopUserPlistDst).CombinedOutput()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Note: could not bootstrap desktop helper for console user %s: %s\n",
+						uid, strings.TrimSpace(string(out)))
+				} else {
+					fmt.Printf("Desktop helper bootstrapped for console user uid %s\n", uid)
+				}
+			}
+		}
+	}
+
+	if fileExists(darwinDesktopLoginWindowPlistDst) {
+		lwLabel := "loginwindow/com.breeze.desktop-helper-loginwindow"
+		if exec.Command("launchctl", "print", lwLabel).Run() != nil {
+			out, err := exec.Command("launchctl", "bootstrap", "loginwindow", darwinDesktopLoginWindowPlistDst).CombinedOutput()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Note: could not bootstrap login-window desktop helper: %s\n",
+					strings.TrimSpace(string(out)))
+			} else {
+				fmt.Println("Login-window desktop helper bootstrapped.")
+			}
+		}
+	}
+}
+
+// consoleUserUID returns the UID of the user logged into the macOS console,
+// or empty string if no one is logged in (e.g., the login window is showing,
+// where /dev/console is owned by root).
+func consoleUserUID() string {
+	out, err := exec.Command("stat", "-f", "%u", "/dev/console").Output()
+	if err != nil {
+		return ""
+	}
+	uid := strings.TrimSpace(string(out))
+	if uid == "" || uid == "0" {
+		return ""
+	}
+	return uid
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// bootstrapDesktopHelperPlists immediately loads the desktop helper LaunchAgents
+// into launchd for the installing user's GUI session (via SUDO_UID) and the
+// loginwindow domain. Called from service install and service start so the
+// helper connects right away rather than waiting for the first heartbeat.
+func bootstrapDesktopHelperPlists() {
+	// When run via sudo, SUDO_UID holds the real user's UID. Bootstrap the helper
+	// into that user's GUI session so it can access the display immediately.
+	if uid := os.Getenv("SUDO_UID"); uid != "" {
+		domain := "gui/" + uid
+		out, err := exec.Command("launchctl", "bootstrap", domain, darwinDesktopUserPlistDst).CombinedOutput()
+		if err != nil {
+			// Not fatal — kickstart will retry on next heartbeat.
+			fmt.Fprintf(os.Stderr, "Note: could not bootstrap desktop helper for user %s (will retry on heartbeat): %s\n",
+				uid, strings.TrimSpace(string(out)))
+		} else {
+			fmt.Printf("Desktop helper bootstrapped for GUI session (uid %s)\n", uid)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "Note: SUDO_UID not set; desktop helper GUI session bootstrap skipped (will retry on heartbeat).")
+	}
+
+	// Bootstrap the login-window helper (covers login screen remote access).
+	// Use kickstart first (stable interface), fall back to bootstrap.
+	const loginWindowLabel = "loginwindow/com.breeze.desktop-helper-loginwindow"
+	if err := exec.Command("launchctl", "kickstart", "-k", loginWindowLabel).Run(); err == nil {
+		fmt.Println("Login-window desktop helper kickstarted.")
+	} else {
+		out, err2 := exec.Command("launchctl", "bootstrap", "loginwindow", darwinDesktopLoginWindowPlistDst).CombinedOutput()
+		if err2 != nil {
+			fmt.Fprintf(os.Stderr, "Note: could not start login-window desktop helper: %s\n",
+				strings.TrimSpace(string(out)))
+		} else {
+			fmt.Println("Login-window desktop helper bootstrapped.")
+		}
+	}
+}
+
+// ensureDarwinBreezeGroup creates the breeze group that owns the agent's IPC
+// socket. It delegates to sessionbroker so the daemon (which re-ensures the
+// group on every start, in setupSocket) and this install path cannot drift.
+func ensureDarwinBreezeGroup() error {
+	if err := sessionbroker.EnsureIPCGroup(); err != nil {
+		return fmt.Errorf("failed to ensure %s group: %w", sessionbroker.IPCGroupName, err)
+	}
+	return nil
+}
+
+// ensureDarwinBreezeGroupConsoleMembers adds every logged-in GUI user to the
+// breeze group so their desktop helper can dial the 0660 root:breeze IPC socket.
+//
+// Non-fatal by design: failing the whole install because one console user could
+// not be resolved would be worse than an install that works for everyone else,
+// and the daemon retries this on every helper (re)start anyway.
+func ensureDarwinBreezeGroupConsoleMembers() {
+	for _, username := range darwinConsoleUsernames() {
+		added, err := sessionbroker.EnsureIPCGroupMember(username)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not add %s to the %s group (%v); that user's desktop helper will be denied the agent socket\n",
+				username, sessionbroker.IPCGroupName, err)
+			continue
+		}
+		if added {
+			fmt.Printf("Added %s to the %s group for desktop-helper socket access\n", username, sessionbroker.IPCGroupName)
+		}
+	}
+}
+
+// darwinConsoleUsernames lists the usernames with a GUI (loginwindow) session,
+// excluding root and system/service accounts.
+func darwinConsoleUsernames() []string {
+	out, err := exec.Command("ps", "-axo", "uid=,comm=").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not enumerate GUI sessions for %s group membership: %v\n",
+			sessionbroker.IPCGroupName, err)
+		return nil
+	}
+	var names []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(fields[len(fields)-1]), "loginwindow") {
+			continue
+		}
+		uid, err := strconv.Atoi(fields[0])
+		// macOS assigns human accounts UIDs from 500 up; below that are system
+		// and service accounts, which never run a Breeze desktop helper.
+		if err != nil || uid < 500 {
+			continue
+		}
+		u, err := user.LookupId(fields[0])
+		if err != nil || seen[u.Username] {
+			continue
+		}
+		seen[u.Username] = true
+		names = append(names, u.Username)
+	}
+	return names
+}

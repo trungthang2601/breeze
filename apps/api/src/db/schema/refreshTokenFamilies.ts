@@ -1,0 +1,65 @@
+import { sql } from 'drizzle-orm';
+import { check, pgTable, uuid, varchar, timestamp, index, unique } from 'drizzle-orm/pg-core';
+import { users } from './users';
+
+/**
+ * Refresh-token families — OAuth 2.1 token-reuse detection (RFC 9700).
+ *
+ * Each /login mints a fresh familyId and embeds it in the refresh token's
+ * `fam` claim. Every subsequent /refresh inherits the same family on the
+ * newly-minted refresh token, forming a chain rooted at the original login.
+ *
+ * If a revoked refresh-token JTI is presented again (token reuse), the
+ * entire family is revoked: a `revoked_at` timestamp is set on the DB row
+ * AND a Redis sentinel is flipped (`refresh-fam-revoked:<familyId>`). Every
+ * subsequent /refresh against ANY descendant of that family returns 401
+ * regardless of which side of the race held the most-recent valid token.
+ *
+ * Without this, an attacker who steals a refresh cookie and races the
+ * legitimate user wins the race outright: rotation only invalidates the
+ * *previous* jti, so whichever side refreshes second gets one rejection
+ * while the other holds a fully-valid parallel session.
+ *
+ * RLS: Shape 6 (user-id scoped) — see migration
+ * `2026-05-25-e-refresh-token-families.sql`. Policy predicate is
+ * `user_id = breeze_current_user_id()`. System-initiated revocation paths
+ * (the reuse-detection branch in `/refresh`) use `withSystemDbAccessContext`
+ * to bypass; user-driven rotation paths already pass under the user scope.
+ */
+export const refreshTokenFamilies = pgTable(
+  'refresh_token_families',
+  {
+    familyId: uuid('family_id').primaryKey(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }).notNull().defaultNow(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    revokedReason: varchar('revoked_reason', { length: 64 }),
+    // Absolute wall-clock cap on the family. Rotation never extends this;
+    // /refresh rejects a family past it. Set at mint time.
+    absoluteExpiresAt: timestamp('absolute_expires_at', { withTimezone: true }).notNull(),
+    // Nullable only during the staged W07 rollout. New guarded issuers write a
+    // domain-separated digest and rotations compare/swap it under row lock.
+    currentRefreshJtiDigest: varchar('current_refresh_jti_digest', { length: 64 }),
+    // Signed mobile installation binding copied from the token identity at
+    // family creation. Nullable for web/SSO families and pre-migration rows.
+    // Deliberately no FK: login can precede mobile_devices registration.
+    mobileDeviceId: varchar('mobile_device_id', { length: 255 }),
+  },
+  (t) => ({
+    userIdx: index('refresh_token_families_user_idx').on(t.userId),
+    userMobileDeviceIdx: index('refresh_token_families_user_mobile_device_idx')
+      .on(t.userId, t.mobileDeviceId)
+      .where(sql`${t.mobileDeviceId} IS NOT NULL`),
+    familyUserUnique: unique('refresh_token_families_family_user_unique').on(t.familyId, t.userId),
+    currentRefreshJtiDigestCheck: check(
+      'refresh_token_families_current_refresh_jti_digest_chk',
+      sql`${t.currentRefreshJtiDigest} IS NULL OR ${t.currentRefreshJtiDigest} ~ '^[0-9a-f]{64}$'`,
+    ),
+  })
+);
+
+export type RefreshTokenFamily = typeof refreshTokenFamilies.$inferSelect;
+export type NewRefreshTokenFamily = typeof refreshTokenFamilies.$inferInsert;

@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import ConfigPolicyCreatePage from '../../components/configurationPolicies/ConfigPolicyCreatePage';
+---
+
+<DashboardLayout titleKey="titles.configurationPoliciesNew">
+  <ConfigPolicyCreatePage client:load />
+</DashboardLayout>

@@ -1,0 +1,513 @@
+---
+title: Maintenance Windows
+description: Schedule maintenance windows that suppress alerts, patching, automations, and scripts for targeted devices via policies or standalone windows.
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Maintenance Windows let you define scheduled time periods during which alerts, patching, automations, and script execution are selectively suppressed for targeted devices. This prevents false-positive alerts and unwanted automated actions during planned work such as server reboots, firmware upgrades, or infrastructure migrations.
+
+The system supports two sources for maintenance settings. **Configuration Policies** are the primary mechanism, resolved through the multi-tenant hierarchy (partner, organization, site, device group, device). **Standalone maintenance windows** are the legacy approach that targets devices by explicit ID lists, site IDs, or group IDs. When both exist, configuration policy settings are checked first; standalone windows serve as a backward-compatible fallback.
+
+All maintenance window operations are audit-logged, and every create, update, cancel, and delete action records the actor, resource, and change details.
+
+A standalone maintenance window can also be created **partner-wide** so it applies to devices across every organization the partner manages -- see [Partner-wide Windows](#partner-wide-windows-all-organizations) below.
+
+---
+
+## Key Concepts
+
+### Window Statuses
+
+| Status | Meaning |
+|--------|---------|
+| **`scheduled`** | The window is defined but its start time has not yet been reached |
+| **`active`** | The window is currently in effect; suppression rules are being enforced |
+| **`completed`** | The window's end time has passed and normal operations have resumed |
+| **`cancelled`** | The window was manually cancelled before or during execution |
+
+### Recurrence Types
+
+| Recurrence | Behavior |
+|------------|----------|
+| **`once`** | Runs a single time between the specified start and end times |
+| **`daily`** | Repeats every N days (default interval: 1) |
+| **`weekly`** | Repeats every N weeks, optionally on specific days of the week |
+| **`monthly`** | Repeats every N months, optionally pinned to a specific day of the month |
+| **`custom`** | Uses a custom interval; defaults to weekly cadence if no specific rule is provided |
+
+### Suppression Flags
+
+Each maintenance window controls four independent suppression toggles:
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| **`suppressAlerts`** | `true` | Skips alert evaluation for devices in the window. Alerts that would otherwise fire are silently dropped. |
+| **`suppressPatching`** | `true` (standalone) / `false` (config policy) | Prevents patch jobs from being created or dispatched to affected devices. |
+| **`suppressAutomations`** | `false` | Blocks both scheduled and event-triggered automations from running on affected devices. |
+| **`suppressScripts`** | `false` | Prevents ad-hoc script execution on affected devices. |
+
+<Aside type="tip">
+You can enable alert suppression while leaving patching active, or any other combination. Each flag operates independently, so you can tailor the window to exactly the type of work being performed.
+</Aside>
+
+### Target Types
+
+Standalone maintenance windows use a `targetType` field to determine which devices are affected:
+
+| Target Type | Scope |
+|-------------|-------|
+| **`all`** | Every device in the organization |
+| **`site`** | Devices belonging to one or more specified sites (via `siteIds`) |
+| **`group`** | Devices belonging to one or more specified device groups (via `groupIds`) |
+| **`device`** | Specific devices by ID (via `deviceIds`) |
+
+---
+
+## Manual Maintenance Mode
+
+Distinct from the scheduled windows the rest of this page describes, a technician can put a **single device** into maintenance mode by hand -- from the device page, or several devices at once from the device list. This is a per-device action with its own gate and its own record. It is not a maintenance window, it is not resolved through the configuration policy hierarchy, and it does not appear in `GET /maintenance/active`.
+
+### What entering requires
+
+<Steps>
+1. **A signed-in technician.** API keys, MCP tools, and other machine principals cannot enter, extend, or exit maintenance mode on a device. The route requires an interactive user session, and that requirement holds whether or not two-factor authentication is enabled for the deployment.
+
+2. **A fresh second factor, on entry *and* on extension.** An assured session is not enough on its own -- the technician re-verifies at the moment of the action. The console verifies with an authenticator app code or a passkey, so a technician whose only second factor is SMS must add an authenticator app or a passkey before they can use maintenance mode. Exiting needs no factor.
+
+3. **A reason and a duration.** Both are required. The reason is 3--500 characters; the duration is a whole number of hours from 1 to 168 (one week). Both are stored on the device record alongside who started the window and when, and both are written to the audit trail.
+</Steps>
+
+### Extending means "N hours from now"
+
+Submitting maintenance for a device that is already in a manual window **replaces** the window rather than adding to it. Choosing 4 hours always means "until four hours from now," whether the device had three hours left or three minutes. Submitting repeatedly cannot compound a window into a longer one.
+
+The original start time and the technician who started it are preserved across extensions; only the end time and the reason change. An extension is audited as `device.maintenance.extend` rather than `device.maintenance.enable`.
+
+### Exiting
+
+Exit is not gated by a second factor. If the device still has a `maintenance` status, exit recomputes it from when its agent was last seen, so a device that dropped off the network returns as `offline`. Other statuses remain unchanged.
+
+Exiting a device that was not in a manual window succeeds, changes nothing, and writes no audit event.
+
+### Which devices can enter
+
+A device must be `online`, `offline`, or already in `maintenance`. A device that is `quarantined`, `pending`, or `updating` is refused with a `409` (`MAINTENANCE_STATE_CONFLICT`) until it settles, and a `decommissioned` device is refused with a `400`.
+
+### Several devices at once
+
+`POST /devices/bulk/maintenance` takes a list of device IDs with one reason and one duration, and costs a **single** second-factor prompt for the whole batch. It covers entry and extension only -- exiting stays per-device. The response reports `succeeded` and `failed` separately, so a call in which every selected device was ineligible still returns `200` with an empty `succeeded` list.
+
+<Aside type="caution">
+**What manual maintenance mode does not do yet.** Entering manual maintenance mode records and audits a window on the device. It does not by itself change which alerts fire, which patches install, or which automations and scripts run. Suppression is still governed by the configuration policy maintenance feature and by the scheduled windows documented above.
+</Aside>
+
+---
+
+## Creating a Maintenance Window
+
+### Via Configuration Policy (Recommended)
+
+Configuration policies attach maintenance settings through the standard policy hierarchy. A `maintenance` feature link on a configuration policy carries a single settings row that defines the recurrence, duration, timezone, and suppression flags.
+
+The configuration policy approach inherits from the hierarchy resolution system: a maintenance setting assigned at the device level overrides one at the device group level, which overrides site, organization, and partner levels. The closest (most specific) assignment wins.
+
+The `config_policy_maintenance_settings` table stores:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `recurrence` | `varchar(20)` | One of `once`, `daily`, `weekly`, `monthly` |
+| `durationHours` | `integer` | How long the window lasts from its computed start time |
+| `timezone` | `varchar(100)` | IANA timezone identifier (e.g., `America/New_York`). Defaults to `UTC`. |
+| `windowStart` | `varchar(30)` | For `once` recurrence, the ISO-8601 datetime the window runs at (e.g., `2026-03-15T02:00:00`). For `daily`, `weekly` and `monthly`, its time-of-day sets when each window opens; when empty, the window opens at midnight. |
+| `suppressAlerts` | `boolean` | Default: `true` |
+| `suppressPatching` | `boolean` | Default: `false` |
+| `suppressAutomations` | `boolean` | Default: `false` |
+| `suppressScripts` | `boolean` | Default: `false` |
+| `rebootIfPending` | `boolean` | Reboot devices that already have a reboot outstanding once the window opens. Default: `false`. See [Rebooting Devices with a Pending Reboot](#rebooting-devices-with-a-pending-reboot) below. |
+| `notifyBeforeMinutes` | `integer` | Minutes before the window opens to send a notification. Default: `15`. |
+| `notifyOnStart` | `boolean` | Send a notification when the window becomes active. Default: `true`. |
+| `notifyOnEnd` | `boolean` | Send a notification when the window closes. Default: `true`. |
+
+### Via Standalone API (Legacy)
+
+<Aside type="caution">
+The standalone maintenance window routes (`POST /maintenance/windows`, `PATCH /maintenance/windows/:id`, etc.) are deprecated. New deployments should use configuration policies. These routes remain available for backward compatibility.
+</Aside>
+
+<Steps>
+1. **Choose your targets.** Decide whether the window applies to `all` devices, specific `site` IDs, `group` IDs, or individual `device` IDs.
+
+2. **Define the schedule.** Set the `startTime` and `endTime` as ISO-8601 datetimes. The `endTime` must be after `startTime` (enforced by validation). Specify a `timezone` string and a `recurrence` type.
+
+3. **Configure suppression.** Set `suppressAlerts`, `suppressPatches`, and `suppressAutomations` to control which actions are paused.
+
+4. **Submit the request.** POST to `/maintenance/windows`. The system creates the window and auto-generates up to 10 upcoming occurrences based on the recurrence rule.
+</Steps>
+
+```bash
+POST /maintenance/windows
+{
+  "orgId": "uuid",
+  "name": "Weekend Server Maintenance",
+  "description": "Routine weekend patching window",
+  "startTime": "2026-03-01T02:00:00Z",
+  "endTime": "2026-03-01T06:00:00Z",
+  "timezone": "America/Chicago",
+  "recurrence": "weekly",
+  "recurrenceRule": {
+    "interval": 1,
+    "daysOfWeek": [0, 6]
+  },
+  "targetType": "site",
+  "siteIds": ["site-uuid-1", "site-uuid-2"],
+  "suppressAlerts": true,
+  "suppressPatches": true,
+  "suppressAutomations": false
+}
+```
+
+The response returns the created window object with a `201` status code.
+
+<Aside type="note">
+The standalone routes previously accepted `notifyBefore`, `notifyOnStart`, and `notifyOnEnd`. Nothing ever consumed them -- no notification was sent -- so they were removed from the request schema. Sending them is harmless (they are ignored), but they no longer appear in the documented surface. End-user notification for maintenance windows is tracked separately.
+</Aside>
+
+### Partner-wide Windows (All organizations)
+
+A standalone maintenance window is normally owned by a single organization (`orgId`). A partner-scoped user with access to every organization can instead create it as **partner-wide**, so the same window suppresses alerts, patching, automations, and scripts for devices in *every* organization under the partner -- useful for MSP-wide work like a shared patch-management provider outage window.
+
+To create a partner-wide window, submit `"ownerScope": "partner"` instead of `orgId` in the create request. Ownership is set at creation time only -- it cannot be changed on update. Creating, updating, cancelling, or deleting a partner-wide window (and modifying its occurrences) requires partner-wide management access.
+
+<Aside type="note">
+Partner-wide windows are also recognized by the primary Configuration Policy path: create the config policy itself as partner-wide and attach a `maintenance` feature link, and the resulting maintenance settings apply hierarchy-wide across every org the partner manages. See [Configuration Policies](/features/configuration-policies/).
+</Aside>
+
+---
+
+## Scheduling: One-Time vs Recurring
+
+### One-Time Windows
+
+Set `recurrence` to `once`. The window runs exactly once between `startTime` and `endTime`. A single occurrence record is generated.
+
+For configuration policy maintenance settings, set the `windowStart` field to the desired ISO-8601 datetime. The window lasts for `durationHours` from that point.
+
+### Recurring Windows
+
+For recurring windows, the system generates occurrence records automatically. Standalone windows pre-generate up to 10 upcoming occurrences at creation time, bounded by the optional `maxOccurrences` and `endDate` fields in the recurrence rule.
+
+**Recurrence rule fields (standalone windows):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `interval` | `integer` | Number of periods between occurrences. Default: `1`. |
+| `daysOfWeek` | `integer[]` | For `weekly` recurrence: array of day numbers (0=Sunday through 6=Saturday). |
+| `dayOfMonth` | `integer` | For `monthly` recurrence: day of the month (1-31). Clamped to the last day if the month is shorter. |
+| `endDate` | `ISO-8601 string` | Stop generating occurrences after this date. |
+| `maxOccurrences` | `integer` | Maximum number of occurrences to generate. |
+
+**Configuration policy recurrence** works differently. The recurrence type determines when the window starts relative to the current time in the configured timezone:
+
+| Recurrence | Window Start |
+|------------|--------------|
+| `daily` | The configured start time, in the configured timezone, every day |
+| `weekly` | The configured start time on the most recent Sunday in the configured timezone |
+| `monthly` | The configured start time on the 1st of the current month in the configured timezone |
+
+Set **Start time** on the policy's Maintenance tab to choose the time of day each window opens, in the selected timezone. A policy that has no start time stored — including every recurring policy saved before this was configurable — falls back to **midnight (00:00)**, which is how those windows have always behaved.
+
+The window remains active for `durationHours` from its computed start time.
+
+---
+
+## Timezone Handling
+
+Both standalone windows and configuration policy settings store a `timezone` field as an IANA timezone identifier (e.g., `America/New_York`, `Europe/London`, `Asia/Tokyo`). The default is `UTC`.
+
+For configuration policy maintenance, the system converts the current UTC time to the configured timezone using `Intl.DateTimeFormat` before computing whether the window is active. This means a `daily` window with timezone `America/Chicago`, `durationHours: 4` and no start time set is active from midnight to 04:00 Central time, regardless of the server's timezone. Give it a start time of `02:00` and the same window runs from 02:00 to 06:00 Central instead.
+
+<Aside type="note">
+If an invalid timezone string is provided, the system logs a warning and falls back to UTC. This prevents a misconfigured timezone from permanently disabling maintenance windows.
+</Aside>
+
+For standalone windows, `startTime` and `endTime` are stored as UTC timestamps. The `timezone` field is stored for display and informational purposes; the actual window boundaries are determined by the UTC timestamps.
+
+---
+
+## Alert Suppression Behavior
+
+When a device is in an active maintenance window with `suppressAlerts` set to `true`, alert evaluation is skipped entirely for that device. This applies to both alert sources:
+
+- **Configuration policy alert rules** (`evaluateDeviceAlertsFromPolicy`): Before evaluating any alert rules, the system resolves the device's maintenance configuration. If a maintenance window is active with `suppressAlerts: true`, the function returns immediately without creating any alerts.
+
+- **Standalone alert rules**: The `isDeviceInMaintenance` service function is called during alert processing. If it returns `active: true` with `suppressAlerts: true`, alerts are not generated.
+
+Alerts that occur during the maintenance window are not queued or deferred -- they are silently dropped. If the underlying condition persists after the window closes, the next evaluation cycle will detect it and create the alert at that time.
+
+<Aside type="caution">
+The `allowedAlertSeverities` field on standalone maintenance windows can be used to permit certain severity levels to pass through even when `suppressAlerts` is enabled. For example, you might suppress `low` and `medium` alerts during patching while still allowing `critical` alerts to fire.
+</Aside>
+
+---
+
+## Automation and Patching Suppression
+
+### Automations
+
+The automation worker checks maintenance status before executing any automation on a device. This check applies to both scheduled (cron-based) and event-triggered automations:
+
+- For **scheduled automations**, the worker resolves maintenance config for each target device. Devices with an active window where `suppressAutomations` is `true` are excluded from the run. If all target devices are in maintenance, the job returns `{ skipped: 'all_devices_in_maintenance' }`.
+
+- For **event-triggered automations**, each device is checked individually before queuing the automation. If the device is in an active maintenance window with automation suppression, the event-triggered automation is silently skipped for that device.
+
+The maintenance check follows a **fail-closed** policy: if the maintenance status lookup fails for a device (e.g., due to a database error), the device is excluded from the automation run rather than risk executing during an unverifiable maintenance window.
+
+### Patching
+
+The patch job service checks `checkDeviceMaintenanceWindow()` before creating a patch job for a device. If the device is in an active maintenance window with `suppressPatching: true`, the function returns `null` and no patch job is created.
+
+---
+
+## Rebooting Devices with a Pending Reboot
+
+Some changes -- a patch install, an application update, an OS feature update -- leave a device with a reboot outstanding until someone (or something) restarts it. Maintenance windows can close that gap automatically: enable **Reboot if a reboot is pending** on a configuration policy's Maintenance settings (under **Actions During Window**), and Breeze reboots any qualifying device that's sitting with a pending reboot once its window opens.
+
+<Aside type="note">
+This is a **configuration policy** feature only -- the underlying `rebootIfPending` setting lives on `config_policy_maintenance_settings`. It has no equivalent on legacy standalone maintenance windows.
+</Aside>
+
+### How it works
+
+A periodic check runs every 10 minutes, independent of any individual window's start time. On each pass it looks for devices that are:
+
+- Reporting a **pending reboot** -- the device already needs a restart, regardless of what caused it (a patch, an app install, a policy change, etc.), and
+- Currently **online**, and
+- Inside a maintenance window whose configuration policy has **Reboot if a reboot is pending** enabled
+
+Matching devices are rebooted right away -- Breeze doesn't wait for the window to close first.
+
+### Platform behavior
+
+<Tabs>
+<TabItem label="Windows">
+Breeze issues a scheduled reboot with a grace period pulled from the device's effective patch Configuration Policy — the same [`rebootDelayMinutes`](/features/patch-management/#patch-settings-fields) setting used after a patch job installs updates (default 15 minutes; 15 is also the fallback if the policy can't be resolved). The signed-in user is warned as soon as the reboot is scheduled, with a reminder ladder counting down to the reboot.
+</TabItem>
+<TabItem label="Linux">
+Breeze schedules the reboot using the same effective-policy grace period (equivalent to running `shutdown -r +N`), which also warns any logged-in users.
+</TabItem>
+<TabItem label="macOS">
+Not supported. Breeze cannot detect a pending-reboot state on macOS, so macOS devices are never rebooted by this feature -- reboot them manually or through a script instead.
+</TabItem>
+</Tabs>
+
+### Avoiding repeat reboots
+
+Once a reboot has been issued to a device, that device is skipped for **60 minutes**, even if it still shows a pending reboot on a later check. This keeps a single outstanding reboot from being re-triggered several times in a row while the device works through it or while the window remains open.
+
+<Aside type="caution">
+**Don't confuse this with the `rebootPolicy` patch setting.** [`rebootPolicy`](/features/patch-management/#patch-settings-fields) (under patch management) controls whether a device reboots *immediately after a patch job installs updates* -- `never`, `if_required`, `always`, or `maintenance_window`. **Reboot if a reboot is pending** is a separate, ongoing check that isn't tied to patch jobs at all: it periodically looks for devices that already have a reboot outstanding, from any source, and clears it during the window. The two settings are independent and can be used on their own or together -- for example, set `rebootPolicy: never` so patching never reboots a device on its own, and rely on **Reboot if a reboot is pending** to clear any outstanding reboots the next time a maintenance window opens.
+</Aside>
+
+---
+
+## Active Window Detection
+
+### Per-Device Status Check
+
+Query the resolved maintenance status for a specific device:
+
+```bash
+GET /maintenance/device/:deviceId/status
+```
+
+This endpoint resolves maintenance status using the unified `isDeviceInMaintenance` function, which checks in order:
+
+<Steps>
+1. **Configuration Policy path**: Resolves the device's maintenance settings through the hierarchy (device > device group > site > organization > partner). If an active configuration policy maintenance window is found, its suppression flags are returned with `source: "config_policy"`.
+
+2. **Standalone window fallback**: Queries the `maintenance_windows` table for any window that is `scheduled` or `active`, whose time range includes the current moment, and whose target (by `targetType`, `deviceIds`, `siteIds`, or `groupIds`) includes the device. This match includes both windows owned by the device's own organization and any partner-wide window owned by that organization's partner. Returns with `source: "standalone"`.
+
+3. **No active window**: Returns `active: false` with `source: "none"` and all suppression flags set to `false`.
+</Steps>
+
+<Aside>
+Partner-wide windows are matched against every enforcement check that consults maintenance status -- alert evaluation, patch job creation, and automation execution -- not just the device status endpoint. A partner-wide window suppresses alerts/patching/automations/scripts for devices in all of the partner's organizations, the same as if that window had been created individually in each one.
+</Aside>
+
+**Response:**
+
+```json
+{
+  "data": {
+    "deviceId": "uuid",
+    "active": true,
+    "source": "config_policy",
+    "suppressAlerts": true,
+    "suppressPatching": false,
+    "suppressAutomations": false,
+    "suppressScripts": false
+  }
+}
+```
+
+### Active Windows Query
+
+List all currently active maintenance windows for an organization, optionally filtered by a specific device, site, or group:
+
+```bash
+GET /maintenance/active?orgId=uuid&deviceId=uuid
+```
+
+Query parameters are all optional (except `orgId` for partner/system scope):
+
+| Parameter | Description |
+|-----------|-------------|
+| `orgId` | Organization to query (required for partner and system scopes) |
+| `deviceId` | Filter to windows affecting this specific device |
+| `siteId` | Filter to windows affecting this specific site |
+| `groupId` | Filter to windows affecting this specific device group |
+
+The endpoint finds occurrences that are either explicitly `active` or `scheduled` with their time range encompassing the current moment. Results include the parent window's suppression flags.
+
+---
+
+## Occurrences
+
+Standalone maintenance windows generate **occurrence** records that represent individual instances of the window. Each occurrence tracks its own status, actual start/end times, and optional overrides or notes.
+
+### Listing Occurrences
+
+**For a specific window:**
+
+```bash
+GET /maintenance/windows/:id/occurrences
+```
+
+Returns all occurrences for the window, ordered by start time ascending.
+
+**Across all windows (calendar view):**
+
+```bash
+GET /maintenance/occurrences?orgId=uuid&from=2026-03-01T00:00:00Z&to=2026-03-31T23:59:59Z
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `orgId` | Organization to query |
+| `status` | Filter by occurrence status (`scheduled`, `active`, `completed`, `cancelled`) |
+| `from` | Return occurrences starting at or after this time |
+| `to` | Return occurrences ending at or before this time |
+
+Each occurrence in the response includes its parent window's `id`, `name`, and `targetType`.
+
+### Modifying an Occurrence
+
+Individual occurrences can be adjusted without changing the parent window:
+
+```bash
+PATCH /maintenance/occurrences/:id
+{
+  "startTime": "2026-03-01T03:00:00Z",
+  "endTime": "2026-03-01T07:00:00Z",
+  "notes": "Delayed by 1 hour due to vendor schedule"
+}
+```
+
+Time changes are stored as `overrides` on the occurrence record, preserving the original schedule from the parent window.
+
+### Manual Start and End
+
+Start an occurrence early or end one before its scheduled time:
+
+```bash
+POST /maintenance/occurrences/:id/start
+```
+
+Sets the occurrence status to `active` and records the `actualStartTime`. The occurrence must be in `scheduled` status.
+
+```bash
+POST /maintenance/occurrences/:id/end
+```
+
+Sets the occurrence status to `completed` and records the `actualEndTime`. The occurrence must be in `active` status.
+
+---
+
+## API Reference
+
+All routes are mounted under `/maintenance` and require authentication. Scope requirements are `organization`, `partner`, or `system`.
+
+### Maintenance Windows
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/maintenance/windows` | List windows for an organization. Supports `status` and `targetType` query filters. |
+| `POST` | `/maintenance/windows` | Create a new maintenance window with occurrences. Set `ownerScope: "partner"` (instead of `orgId`) for a partner-wide window. *(Deprecated -- use configuration policies.)* |
+| `GET` | `/maintenance/windows/:id` | Get window details including the next 10 upcoming occurrences. |
+| `PATCH` | `/maintenance/windows/:id` | Update window properties. *(Deprecated.)* |
+| `DELETE` | `/maintenance/windows/:id` | Delete a window. Future occurrences are removed; past occurrences are preserved for audit. *(Deprecated.)* |
+| `POST` | `/maintenance/windows/:id/cancel` | Cancel a window and all its future occurrences. Already-cancelled windows return a `400` error. *(Deprecated.)* |
+
+### Occurrences
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/maintenance/windows/:id/occurrences` | List all occurrences for a specific window. |
+| `GET` | `/maintenance/occurrences` | List occurrences across all windows with date range and status filters. |
+| `PATCH` | `/maintenance/occurrences/:id` | Update an occurrence's start time, end time, or notes. *(Deprecated.)* |
+| `POST` | `/maintenance/occurrences/:id/start` | Manually start a scheduled occurrence early. *(Deprecated.)* |
+| `POST` | `/maintenance/occurrences/:id/end` | Manually end an active occurrence early. *(Deprecated.)* |
+
+### Device Status
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/maintenance/device/:deviceId/status` | Resolve the current maintenance status for a device (checks config policy first, then standalone windows). |
+| `GET` | `/maintenance/active` | List currently active maintenance windows, optionally filtered by device, site, or group. |
+| `POST` | `/devices/:id/maintenance` | Enter, extend, or exit [manual maintenance mode](#manual-maintenance-mode) on one device. Entry and extension require an interactive session and a fresh second factor. |
+| `POST` | `/devices/bulk/maintenance` | Enter or extend manual maintenance mode on many devices, with one second-factor prompt for the batch. |
+
+---
+
+## Troubleshooting
+
+### Device shows as not in maintenance despite an active window
+
+1. **Check the source.** Call `GET /maintenance/device/:deviceId/status` to see which source is being evaluated. If `source` is `"none"`, neither configuration policy nor standalone windows matched.
+
+2. **Verify the target.** For standalone windows, confirm the device's ID is in the window's `deviceIds` array, or its site ID is in `siteIds`, or one of its group memberships is in `groupIds`. Windows with `targetType: "all"` affect every device in the organization.
+
+3. **Check the timezone.** For configuration policy maintenance settings, the active window is computed in the configured timezone. A window set to `America/New_York` with `daily` recurrence and `durationHours: 4` is active from midnight to 04:00 ET, not UTC.
+
+4. **Check hierarchy resolution.** Configuration policy settings follow the standard hierarchy. A device-level assignment overrides site-level settings. Use the device status endpoint to see which policy won.
+
+### Alerts still firing during a maintenance window
+
+- Confirm `suppressAlerts` is set to `true` on the maintenance window or configuration policy maintenance settings.
+- The `allowedAlertSeverities` field on standalone windows can let certain severity levels pass through even when suppression is enabled.
+- Alert suppression only applies to new alerts evaluated during the window. Alerts that were already open before the window started are not retroactively suppressed or resolved.
+
+### Automations running during maintenance
+
+- Verify `suppressAutomations` is `true`. This flag defaults to `false`, so it must be explicitly enabled.
+- The automation worker uses a fail-closed policy: if the maintenance check itself fails (database error, etc.), the device is excluded from the run. Check logs for `Maintenance check failed for device` warnings.
+
+### Patches deploying during maintenance
+
+- Verify `suppressPatching` is `true` on the effective maintenance settings.
+- In configuration policies, `suppressPatching` defaults to `false`. It must be explicitly set.
+- In standalone windows, the field is named `suppressPatches` in the API request body and maps to `suppressPatching` in the database.
+
+### Invalid timezone fallback
+
+If the `timezone` field contains an invalid IANA timezone string, the system logs a warning (`Invalid timezone "...", falling back to UTC`) and evaluates the window in UTC. Correct the timezone in the maintenance settings to restore intended behavior.
+
+### Device with a pending reboot isn't rebooting during the window
+
+- Confirm **Reboot if a reboot is pending** is enabled on the configuration policy's Maintenance settings -- it defaults to off.
+- This feature only applies to configuration-policy maintenance windows. Legacy standalone maintenance windows don't support it.
+- The device must be **online** and reporting a pending reboot at the time of a check. Checks run roughly every 10 minutes, so allow a few minutes after the window opens.
+- macOS devices are never rebooted by this feature -- see [Rebooting Devices with a Pending Reboot](#rebooting-devices-with-a-pending-reboot).
+- If a reboot was already issued to the device in the last 60 minutes, it's skipped to avoid re-triggering -- check the device's command history for a recent reboot command before assuming the feature isn't working.
+- This is unrelated to the patch management `rebootPolicy` setting -- see the callout above for how the two differ.

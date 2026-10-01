@@ -1,0 +1,709 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+
+vi.mock('../db', () => ({
+  runOutsideDbContext: vi.fn((fn) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  db: {
+    select: vi.fn(),
+    insert: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn(),
+  },
+}));
+
+vi.mock('../db/schema', () => ({
+  devices: {
+    id: 'devices.id',
+    orgId: 'devices.orgId',
+    siteId: 'devices.siteId',
+  },
+  deviceSoftware: {},
+  deviceChangeLog: {
+    deviceId: 'deviceChangeLog.deviceId',
+    orgId: 'deviceChangeLog.orgId',
+    changeType: 'deviceChangeLog.changeType',
+    subject: 'deviceChangeLog.subject',
+  },
+  discoveredAssets: {
+    id: 'discoveredAssets.id',
+    orgId: 'discoveredAssets.orgId',
+    siteId: 'discoveredAssets.siteId',
+    hostname: 'discoveredAssets.hostname',
+    ipAddress: 'discoveredAssets.ipAddress',
+    assetType: 'discoveredAssets.assetType',
+    approvalStatus: 'discoveredAssets.approvalStatus',
+    isOnline: 'discoveredAssets.isOnline',
+    lastSeenAt: 'discoveredAssets.lastSeenAt',
+    createdAt: 'discoveredAssets.createdAt',
+    updatedAt: 'discoveredAssets.updatedAt',
+  },
+  networkMonitors: {
+    assetId: 'networkMonitors.assetId',
+    orgId: 'networkMonitors.orgId',
+    isActive: 'networkMonitors.isActive',
+    id: 'networkMonitors.id',
+    updatedAt: 'networkMonitors.updatedAt',
+  },
+  snmpDevices: {
+    id: 'snmpDevices.id',
+    orgId: 'snmpDevices.orgId',
+    assetId: 'snmpDevices.assetId',
+    snmpVersion: 'snmpDevices.snmpVersion',
+    templateId: 'snmpDevices.templateId',
+    pollingInterval: 'snmpDevices.pollingInterval',
+    port: 'snmpDevices.port',
+    isActive: 'snmpDevices.isActive',
+    lastPolled: 'snmpDevices.lastPolled',
+    lastStatus: 'snmpDevices.lastStatus',
+    createdAt: 'snmpDevices.createdAt',
+    community: 'snmpDevices.community',
+    username: 'snmpDevices.username',
+  },
+  snmpMetrics: {
+    id: 'snmpMetrics.id',
+    deviceId: 'snmpMetrics.deviceId',
+    oid: 'snmpMetrics.oid',
+    name: 'snmpMetrics.name',
+    value: 'snmpMetrics.value',
+    valueType: 'snmpMetrics.valueType',
+    timestamp: 'snmpMetrics.timestamp',
+  },
+  serviceProcessCheckResults: {
+    id: 'serviceProcessCheckResults.id',
+    orgId: 'serviceProcessCheckResults.orgId',
+    deviceId: 'serviceProcessCheckResults.deviceId',
+    watchType: 'serviceProcessCheckResults.watchType',
+    name: 'serviceProcessCheckResults.name',
+    status: 'serviceProcessCheckResults.status',
+    cpuPercent: 'serviceProcessCheckResults.cpuPercent',
+    memoryMb: 'serviceProcessCheckResults.memoryMb',
+    pid: 'serviceProcessCheckResults.pid',
+    details: 'serviceProcessCheckResults.details',
+    autoRestartAttempted: 'serviceProcessCheckResults.autoRestartAttempted',
+    autoRestartSucceeded: 'serviceProcessCheckResults.autoRestartSucceeded',
+    timestamp: 'serviceProcessCheckResults.timestamp',
+  },
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    const allowedSiteIds = c.req.header('x-restrict-site')
+      ?.split(',')
+      .map((id: string) => id.trim())
+      .filter(Boolean);
+    c.set('auth', {
+      user: { id: 'user-1', email: 'test@example.com', name: 'Test User' },
+      scope: 'organization',
+      partnerId: null,
+      orgId: 'org-111',
+      accessibleOrgIds: ['org-111'],
+      orgCondition: () => undefined,
+      canAccessOrg: (id: string) => id === 'org-111',
+    });
+    if (allowedSiteIds) c.set('permissions', { allowedSiteIds });
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+}));
+
+vi.mock('../services/auditEvents', () => ({
+  writeRouteAudit: vi.fn(),
+}));
+
+vi.mock('../services/redis', () => ({
+  isRedisAvailable: vi.fn(() => true),
+}));
+
+vi.mock('../services/permissions', () => ({
+  PERMISSIONS: {
+    DEVICES_READ: { resource: 'devices', action: 'read' },
+    DEVICES_WRITE: { resource: 'devices', action: 'write' },
+  },
+  canAccessSite: (perms: any, siteId: string) =>
+    !perms?.allowedSiteIds || perms.allowedSiteIds.includes(siteId),
+}));
+
+import { monitoringRoutes } from './monitoring';
+import { db } from '../db';
+import { devices } from '../db/schema';
+import { PgDialect } from 'drizzle-orm/pg-core';
+
+const ORG_ID = 'org-111';
+const ASSET_ID = '11111111-1111-1111-1111-111111111111';
+const DEVICE_ID = '22222222-2222-2222-2222-222222222222';
+const SNMP_DEVICE_ID = '33333333-3333-3333-3333-333333333333';
+const DEVICE_DENIED_ID = '44444444-4444-4444-4444-444444444444';
+const SITE_ALLOWED = 'aaaaaaaa-0000-0000-0000-000000000001';
+const SITE_DENIED = 'bbbbbbbb-0000-0000-0000-000000000002';
+
+
+describe('monitoring routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.select).mockReset();
+    vi.mocked(db.insert).mockReset();
+    vi.mocked(db.update).mockReset();
+    vi.mocked(db.delete).mockReset();
+    app = new Hono();
+    app.route('/monitoring', monitoringRoutes);
+  });
+
+  // ============================================
+  // GET /results
+  // ============================================
+  describe('GET /monitoring/results', () => {
+    it('returns 403 for a site-restricted caller requesting an out-of-scope deviceId', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: DEVICE_DENIED_ID, siteId: SITE_DENIED }]),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/results?deviceId=${DEVICE_DENIED_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token', 'x-restrict-site': SITE_ALLOWED },
+      });
+
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.error).toBe('Device not found or access denied');
+    });
+
+    it('narrows site-restricted result lists to devices in allowed sites', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          innerJoin: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([{
+                  id: 'result-allowed',
+                  deviceId: DEVICE_ID,
+                  watchType: 'service',
+                  name: 'nginx',
+                  status: 'running',
+                  cpuPercent: 2.5,
+                  memoryMb: 128,
+                  pid: 1234,
+                  details: null,
+                  autoRestartAttempted: false,
+                  autoRestartSucceeded: false,
+                  timestamp: new Date(),
+                }]),
+              }),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request('/monitoring/results', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token', 'x-restrict-site': SITE_ALLOWED },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].deviceId).toBe(DEVICE_ID);
+    });
+
+    it('does not join devices for unrestricted result callers', async () => {
+      const from = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          orderBy: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([
+              {
+                id: 'result-allowed',
+                deviceId: DEVICE_ID,
+                watchType: 'service',
+                name: 'nginx',
+                status: 'running',
+                cpuPercent: 2.5,
+                memoryMb: 128,
+                pid: 1234,
+                details: null,
+                autoRestartAttempted: false,
+                autoRestartSucceeded: false,
+                timestamp: new Date(),
+              },
+              {
+                id: 'result-denied',
+                deviceId: DEVICE_DENIED_ID,
+                watchType: 'service',
+                name: 'redis',
+                status: 'running',
+                cpuPercent: 1,
+                memoryMb: 64,
+                pid: 5678,
+                details: null,
+                autoRestartAttempted: false,
+                autoRestartSucceeded: false,
+                timestamp: new Date(),
+              },
+            ]),
+          }),
+        }),
+      });
+      vi.mocked(db.select).mockReturnValueOnce({ from } as any);
+
+      const res = await app.request('/monitoring/results', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.map((result: any) => result.deviceId)).toEqual([DEVICE_ID, DEVICE_DENIED_ID]);
+      expect(from).toHaveBeenCalledWith(expect.anything());
+    });
+
+    it('returns check results with filters', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{
+                id: 'result-1',
+                deviceId: DEVICE_ID,
+                watchType: 'service',
+                name: 'nginx',
+                status: 'running',
+                cpuPercent: 2.5,
+                memoryMb: 128,
+                pid: 1234,
+                details: null,
+                autoRestartAttempted: false,
+                autoRestartSucceeded: false,
+                timestamp: new Date(),
+              }]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/results?deviceId=${DEVICE_ID}&watchType=service`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].name).toBe('nginx');
+      expect(body.data[0].status).toBe('running');
+    });
+  });
+
+  // ============================================
+  // GET /results/:deviceId/summary
+  // ============================================
+  describe('GET /monitoring/results/:deviceId/summary', () => {
+    it('returns per-device latest check results', async () => {
+      // Device lookup
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ orgId: ORG_ID }]),
+          }),
+        }),
+      } as any);
+      // Check results
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { id: 'r1', deviceId: DEVICE_ID, watchType: 'service', name: 'nginx', status: 'running', cpuPercent: 2.5, memoryMb: 128, pid: 1234, details: null, autoRestartAttempted: false, autoRestartSucceeded: false, timestamp: new Date() },
+                { id: 'r2', deviceId: DEVICE_ID, watchType: 'process', name: 'node', status: 'running', cpuPercent: 5.0, memoryMb: 256, pid: 5678, details: null, autoRestartAttempted: false, autoRestartSucceeded: false, timestamp: new Date() },
+              ]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/results/${DEVICE_ID}/summary`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(2);
+    });
+
+    it('returns 404 for nonexistent device', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/results/${DEVICE_ID}/summary`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('returns 403 for device in another org', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ orgId: 'other-org' }]),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/results/${DEVICE_ID}/summary`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('returns an opaque 404 (matching a missing device) for a site-restricted caller outside the device\'s site (#5777)', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ orgId: ORG_ID, siteId: SITE_DENIED }]),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/results/${DEVICE_ID}/summary`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token', 'x-restrict-site': SITE_ALLOWED },
+      });
+
+      // Same status AND body as the "returns 404 for nonexistent device" test
+      // above — an out-of-ceiling device must be indistinguishable from a
+      // missing one (existence oracle, #5777).
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error).toBe('Device not found');
+    });
+  });
+
+  // ============================================
+  // GET /status/:deviceId
+  // ============================================
+  describe('GET /monitoring/status/:deviceId', () => {
+    it('returns healthy status when all services are running', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ orgId: ORG_ID }]),
+          }),
+        }),
+      } as any);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { watchType: 'service', name: 'nginx', status: 'running' },
+                { watchType: 'service', name: 'redis', status: 'running' },
+              ]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/status/${DEVICE_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.healthStatus).toBe('healthy');
+      expect(body.runningCount).toBe(2);
+      expect(body.notRunningCount).toBe(0);
+    });
+
+    it('returns critical status when all services are down', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ orgId: ORG_ID }]),
+          }),
+        }),
+      } as any);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { watchType: 'service', name: 'nginx', status: 'stopped' },
+                { watchType: 'service', name: 'redis', status: 'stopped' },
+              ]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/status/${DEVICE_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.healthStatus).toBe('critical');
+      expect(body.runningCount).toBe(0);
+      expect(body.notRunningCount).toBe(2);
+    });
+
+    it('returns degraded status when some services are down', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ orgId: ORG_ID }]),
+          }),
+        }),
+      } as any);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { watchType: 'service', name: 'nginx', status: 'running' },
+                { watchType: 'service', name: 'redis', status: 'stopped' },
+              ]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/status/${DEVICE_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.healthStatus).toBe('degraded');
+      expect(body.runningCount).toBe(1);
+      expect(body.notRunningCount).toBe(1);
+    });
+
+    it('returns unknown status when no check results', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ orgId: ORG_ID }]),
+          }),
+        }),
+      } as any);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/status/${DEVICE_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.healthStatus).toBe('unknown');
+      expect(body.totalCount).toBe(0);
+    });
+
+    it('returns 404 for nonexistent device', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/status/${DEVICE_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('returns an opaque 404 (matching a missing device) for a site-restricted caller outside the device\'s site (#5777)', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ orgId: ORG_ID, siteId: SITE_DENIED }]),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request(`/monitoring/status/${DEVICE_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token', 'x-restrict-site': SITE_ALLOWED },
+      });
+
+      // Same status AND body as the "returns 404 for nonexistent device" test
+      // above — an out-of-ceiling device must be indistinguishable from a
+      // missing one (existence oracle, #5777).
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error).toBe('Device not found');
+    });
+  });
+
+  // ============================================
+  // GET /known-services
+  // ============================================
+  describe('GET /monitoring/known-services', () => {
+    it('joins both name sources to current devices inside the selected-site ceiling', async () => {
+      const changeWhere = vi.fn().mockReturnValue({
+        groupBy: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{ subject: 'allowed-service' }]),
+        }),
+      });
+      const changeJoin = vi.fn().mockReturnValue({ where: changeWhere });
+      const checkWhere = vi.fn().mockReturnValue({
+        groupBy: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{ name: 'allowed-process', watchType: 'process' }]),
+        }),
+      });
+      const checkJoin = vi.fn().mockReturnValue({ where: checkWhere });
+
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({ innerJoin: changeJoin }),
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({ innerJoin: checkJoin }),
+        } as any);
+
+      const res = await app.request('/monitoring/known-services', {
+        headers: { Authorization: 'Bearer token', 'x-restrict-site': SITE_ALLOWED },
+      });
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).data.map((row: { name: string }) => row.name)).toEqual([
+        'allowed-process',
+        'allowed-service',
+      ]);
+      expect(changeJoin).toHaveBeenCalledWith(devices, expect.anything());
+      expect(checkJoin).toHaveBeenCalledWith(devices, expect.anything());
+
+      // Compile the WHERE and assert on the BOUND PARAMETERS, not a
+      // JSON.stringify deep-search of the mock call graph. A deep-search
+      // matches any string anywhere in the object tree — including schema-stub
+      // values and drizzle-internal metadata — so it can report success for a
+      // site id that never became a bound predicate.
+      const dialect = new PgDialect();
+      const changeQuery = dialect.sqlToQuery(changeWhere.mock.calls[0]![0]);
+      const checkQuery = dialect.sqlToQuery(checkWhere.mock.calls[0]![0]);
+      expect(changeQuery.params).toContain(SITE_ALLOWED);
+      expect(checkQuery.params).toContain(SITE_ALLOWED);
+      expect(changeQuery.params).not.toContain(SITE_DENIED);
+      expect(checkQuery.params).not.toContain(SITE_DENIED);
+    });
+
+    it('returns an empty autocomplete without database access for an empty site ceiling', async () => {
+      const res = await app.request('/monitoring/known-services', {
+        headers: { Authorization: 'Bearer token', 'x-restrict-site': ',' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ data: [] });
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    it('returns deduplicated service names', async () => {
+      // Change log query
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            groupBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { subject: 'nginx' },
+                { subject: 'redis-server' },
+              ]),
+            }),
+          }),
+        }),
+      } as any);
+      // Check results query
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            groupBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { name: 'nginx', watchType: 'service' },
+                { name: 'node', watchType: 'process' },
+              ]),
+            }),
+          }),
+        }),
+      } as any);
+
+      const res = await app.request('/monitoring/known-services', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.length).toBeGreaterThanOrEqual(2);
+      // nginx should be deduplicated
+      const names = body.data.map((r: any) => r.name);
+      expect(new Set(names).size).toBe(names.length); // all unique
+    });
+
+    it('filters by search term', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([
+                  { subject: 'nginx' },
+                  { subject: 'redis-server' },
+                ]),
+              }),
+            }),
+          }),
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue([]),
+              }),
+            }),
+          }),
+        } as any);
+
+      const res = await app.request('/monitoring/known-services?search=ngin', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].name).toBe('nginx');
+    });
+  });
+
+});

@@ -1,0 +1,1873 @@
+/**
+ * PAM admin control plane (#1163).
+ *
+ * The /api/v1/pam/* REST surface behind the /pam admin UI (#1159):
+ *   - GET    /elevation-requests          list/filter (Requests + Audit tabs)
+ *   - POST   /elevation-requests/:id/respond   approve / deny (CAS on pending)
+ *   - POST   /elevation-requests/:id/revoke    revoke mid-window
+ *   - GET    /active                      currently-active elevations
+ *   - GET/POST/PATCH/DELETE /rules        pam_rules CRUD (Rules tab)
+ *
+ * Tenancy: org isolation is enforced by RLS (every handler runs inside the
+ * request's withDbAccessContext); site narrowing for site-restricted techs
+ * is applied in-query via permissions.allowedSiteIds. Mutations are
+ * additionally gated app-layer with auth.canAccessOrg / site checks —
+ * defense in depth, same posture as routes/devices/actuateElevation.ts.
+ *
+ * Agent-side revoke commands (tech_jit_admin group-flip undo) are #1150
+ * scope: revoke/expiry here transitions state + audits + emits only. The
+ * #960 admin actuate route remains the path that issues agent commands.
+ */
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { SQL, and, desc, eq, gt, gte, inArray, isNull, lte, or, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
+import { z } from 'zod';
+
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import {
+  approvalRequests,
+  authenticatorDevices,
+  devices,
+  elevationAudit,
+  elevationRequests,
+  normalizeSignerGroupEntries,
+  PAM_RULE_NEGATE_KEYS,
+  pamOrgConfig,
+  pamRules,
+  pamSignerGroups,
+  type SignerGroupEntry,
+  type StoredSignerEntry,
+  sites,
+  softwarePolicies,
+  users,
+} from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
+import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import { writeAuditEvent } from '../services/auditEvents';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
+import { publishEvent, type EventType } from '../services/eventBus';
+import { mirrorElevationDecisionToExecution } from '../services/pamToolActionGovernance';
+import { evaluatePamRules, type PamRuleCandidate } from '../services/pamRuleEngine';
+import {
+  describePamRuleTierDrift,
+  PAM_RULE_TIER_UNREACHABLE_CODE,
+} from '../services/pamRuleTierDrift';
+import { assertApprovalAssurance, StepUpRequiredError, ReauthRequiredError } from '../services/authenticatorAssurance';
+import { generateApprovalAssertionOptions } from '../services/approverWebAuthn';
+import { requireCurrentPasswordStepUp, requireFreshMfaStepUp } from './auth/helpers';
+import {
+  assertionProofSchema,
+  mobileHwKeyProofSchema,
+  elevationRiskTierToName,
+} from '@breeze/shared';
+import { resolveOrgIdForWrite } from './softwarePolicies';
+import {
+  createPamDecisionIntent,
+  requestPamCleanup,
+  type PamActuationRef,
+} from '../services/pamActuationLifecycle';
+
+/**
+ * Thrown inside the respond transaction when an ai_tool_action elevation is
+ * decided but its linked ai_tool_executions row is no longer pending (the
+ * SDK gate's 5-minute wait already timed out and rejected it). Approving
+ * the elevation anyway would be a lie — the throw rolls the whole
+ * transaction back and the handler returns 409.
+ */
+class StaleExecutionError extends Error {
+  constructor() {
+    super('Linked tool execution is no longer pending');
+  }
+}
+
+/**
+ * Thrown inside the respond transaction when a presented WebAuthn assertion
+ * proof fails verification (device not registered/disabled, or the assertion
+ * doesn't verify). A presented-but-bad proof is an error → 401, NOT a silent
+ * downgrade to an L1 session-tap approval.
+ */
+class AssertionFailedError extends Error {
+  constructor() {
+    super('assertion verification failed');
+  }
+}
+
+const requirePamRead = requirePermission(
+  PERMISSIONS.DEVICES_READ.resource,
+  PERMISSIONS.DEVICES_READ.action,
+);
+// Dedicated PAM permissions (security review wave 7, SR1-13/SR1-14),
+// replacing the generic devices:write/devices:execute grants these used to
+// ride on. An ordinary technician holding devices:write/execute for routine
+// device work must not thereby be able to approve elevations or author the
+// rules that decide who gets standing admin automatically.
+const requirePamApprove = requirePermission(
+  PERMISSIONS.PAM_APPROVE.resource,
+  PERMISSIONS.PAM_APPROVE.action,
+);
+const requirePamManagePolicy = requirePermission(
+  PERMISSIONS.PAM_MANAGE_POLICY.resource,
+  PERMISSIONS.PAM_MANAGE_POLICY.action,
+);
+
+// Bounds for approval windows. Default matches ingest's auto-approval
+// default in routes/agents/elevationRequests.ts.
+const DEFAULT_APPROVAL_DURATION_MINUTES = 15;
+const MAX_APPROVAL_DURATION_MINUTES = 24 * 60;
+
+// Bounds for the rule preview endpoint.
+const PREVIEW_MAX_WINDOW_DAYS = 90;
+const PREVIEW_DEFAULT_WINDOW_DAYS = 30;
+const PREVIEW_SCAN_CAP = 5000; // rows pulled into JS — totalScanned/truncated keep this honest
+const PREVIEW_SAMPLE_CAP = 10;
+
+const ACTIVE_STATUSES = ['approved', 'auto_approved', 'actuating'] as const;
+
+type PamRouteTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+async function cleanupPamRuleActuations(
+  tx: PamRouteTx,
+  input: { ruleId: string; orgId: string },
+): Promise<number> {
+  const result = await tx.execute<Record<string, unknown> & { id: string }>(sql`
+    SELECT id
+    FROM elevation_requests
+    WHERE org_id = ${input.orgId}
+      AND status IN ('approved', 'auto_approved', 'actuating')
+      AND metadata ->> 'pam_rule_id' = ${input.ruleId}
+    ORDER BY id
+    FOR UPDATE
+  `);
+  const rows = ((result as { rows?: Array<{ id: string }> }).rows ?? result) as Array<{ id: string }>;
+  for (const row of rows) {
+    await tx
+      .update(elevationRequests)
+      .set({ status: 'revoked', revokedAt: new Date(), revokedReason: 'PAM rule removed', updatedAt: new Date() })
+      .where(and(eq(elevationRequests.id, row.id), inArray(elevationRequests.status, [...ACTIVE_STATUSES])));
+    await requestPamCleanup(tx, { elevationRequestId: row.id, cause: 'policy_removed' });
+  }
+  return rows.length;
+}
+
+// Aliased user joins for the three decider columns (left joins — all three
+// ids are nullable). Reads run under the request's RLS context: a decider the
+// caller's users-policy can't see simply yields a null name (the UI falls
+// back to the user id).
+const approvedByUser = alias(users, 'approved_by_user');
+const deniedByUser = alias(users, 'denied_by_user');
+const revokedByUser = alias(users, 'revoked_by_user');
+
+const pamEnforcementProjection = {
+  enforcementStatus: sql<string | null>`(
+    SELECT a.observed_state FROM pam_actuations a
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+    ORDER BY a.request_revision DESC LIMIT 1
+  )`,
+  enforcementGeneration: sql<number | null>`(
+    SELECT a.generation FROM pam_actuations a
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+    ORDER BY a.request_revision DESC LIMIT 1
+  )`,
+  enforcementReason: sql<string | null>`(
+    SELECT a.failure_code FROM pam_actuations a
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+    ORDER BY a.request_revision DESC LIMIT 1
+  )`,
+  endpointObservedAt: sql<Date | null>`(
+    SELECT r.observed_at
+    FROM pam_actuation_results r
+    JOIN pam_actuations a ON a.id = r.actuation_id AND a.generation = r.generation
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+    ORDER BY r.received_at DESC, r.id DESC LIMIT 1
+  )`,
+  cleanupReceivedAt: sql<Date | null>`(
+    SELECT r.received_at
+    FROM pam_actuation_results r
+    JOIN pam_actuations a ON a.id = r.actuation_id AND a.generation = r.generation
+    WHERE a.elevation_request_id = ${elevationRequests.id}
+      AND a.desired_state = 'cleanup' AND r.result_kind = 'received'
+    ORDER BY r.received_at DESC, r.id DESC LIMIT 1
+  )`,
+};
+
+function enforcementResponse(row: {
+  enforcementStatus?: string | null;
+  enforcementGeneration?: number | null;
+  enforcementReason?: string | null;
+  endpointObservedAt?: Date | null;
+  cleanupReceivedAt?: Date | null;
+}) {
+  return {
+    enforcementStatus: row.enforcementStatus ?? null,
+    enforcementGeneration: row.enforcementGeneration ?? null,
+    enforcementReason: row.enforcementReason ?? null,
+    endpointObservedAt: row.endpointObservedAt ?? null,
+    cleanupReceivedAt: row.cleanupReceivedAt ?? null,
+    manualRemediationDisposition: row.enforcementStatus === 'legacy_untracked'
+      ? 'blocked_manual_remediation'
+      : null,
+  };
+}
+
+export const pamRoutes = new Hono();
+pamRoutes.use('*', authMiddleware);
+pamRoutes.use('*', requireScope('organization', 'partner', 'system'));
+
+/** Event emission is best-effort post-commit; never fail the request. */
+async function safePublish(
+  type: EventType,
+  orgId: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await publishEvent(type, orgId, payload, 'pam-admin');
+  } catch (err) {
+    console.error(`[PAM] event publish failed (${type}):`, err);
+  }
+}
+
+/** Site narrowing for site-restricted technicians (allowedSiteIds). */
+function siteScopeCondition(perms: UserPermissions | undefined): SQL | undefined {
+  if (!perms?.allowedSiteIds) return undefined;
+  if (perms.allowedSiteIds.length === 0) {
+    // Restricted to zero sites — match nothing.
+    return sql`false`;
+  }
+  return inArray(elevationRequests.siteId, perms.allowedSiteIds);
+}
+
+function getPagination(query: { page?: string; limit?: string }) {
+  const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(query.limit ?? '50', 10) || 50));
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+// ============================================================
+// Elevation requests — list
+// ============================================================
+
+const listQuerySchema = z.object({
+  status: z
+    .enum(['pending', 'approved', 'auto_approved', 'denied', 'expired', 'revoked', 'actuating'])
+    .optional(),
+  flowType: z.enum(['uac_intercept', 'tech_jit_admin', 'ai_tool_action']).optional(),
+  deviceId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
+  from: z.string().datetime({ offset: true }).optional(),
+  to: z.string().datetime({ offset: true }).optional(),
+  page: z.string().optional(),
+  limit: z.string().optional(),
+});
+
+pamRoutes.get('/elevation-requests', requirePamRead, zValidator('query', listQuerySchema), async (c) => {
+  const auth = c.get('auth');
+  const perms = c.get('permissions') as UserPermissions | undefined;
+  const q = c.req.valid('query');
+  const { page, limit, offset } = getPagination(q);
+
+  const conditions: (SQL | undefined)[] = [
+    auth.orgCondition(elevationRequests.orgId),
+    siteScopeCondition(perms),
+  ];
+  if (q.status) conditions.push(eq(elevationRequests.status, q.status));
+  if (q.flowType) conditions.push(eq(elevationRequests.flowType, q.flowType));
+  if (q.deviceId) conditions.push(eq(elevationRequests.deviceId, q.deviceId));
+  if (q.siteId) {
+    if (perms && !canAccessSite(perms, q.siteId)) {
+      return c.json({ error: 'Site access denied' }, 403);
+    }
+    conditions.push(eq(elevationRequests.siteId, q.siteId));
+  }
+  if (q.from) conditions.push(gte(elevationRequests.requestedAt, new Date(q.from)));
+  if (q.to) conditions.push(lte(elevationRequests.requestedAt, new Date(q.to)));
+
+  const where = and(...conditions.filter((cond): cond is SQL => cond !== undefined));
+
+  const [rows, countRows] = await Promise.all([
+    db
+      .select({
+        request: elevationRequests,
+        deviceHostname: devices.hostname,
+        siteName: sites.name,
+        approvedByName: approvedByUser.name,
+        deniedByName: deniedByUser.name,
+        revokedByName: revokedByUser.name,
+        matchedPolicyName: softwarePolicies.name,
+        ...pamEnforcementProjection,
+      })
+      .from(elevationRequests)
+      .leftJoin(devices, eq(elevationRequests.deviceId, devices.id))
+      .leftJoin(sites, eq(elevationRequests.siteId, sites.id))
+      .leftJoin(approvedByUser, eq(elevationRequests.approvedByUserId, approvedByUser.id))
+      .leftJoin(deniedByUser, eq(elevationRequests.deniedByUserId, deniedByUser.id))
+      .leftJoin(revokedByUser, eq(elevationRequests.revokedByUserId, revokedByUser.id))
+      .leftJoin(softwarePolicies, eq(elevationRequests.softwarePolicyMatchId, softwarePolicies.id))
+      .where(where)
+      .orderBy(desc(elevationRequests.requestedAt), desc(elevationRequests.id))
+      .limit(limit)
+      .offset(offset),
+    db
+      .select({ total: sql<number>`count(*)::int` })
+      .from(elevationRequests)
+      .where(where),
+  ]);
+
+  return c.json({
+    success: true,
+    requests: rows.map((r) => {
+      const meta = (r.request.metadata ?? {}) as Record<string, unknown>;
+      const pamRuleId = typeof meta.pam_rule_id === 'string' ? meta.pam_rule_id : null;
+      const pamRuleName = typeof meta.pam_rule_name === 'string' ? meta.pam_rule_name : null;
+      // Note: revokedByUserId also maps to 'human' — for auto-decided-then-revoked rows the
+      // ORIGINAL decision source is policy/rule (still reflected via softwarePolicyMatchId/metadata);
+      // the web layer prefers the revoker for display.
+      const decisionSource = r.request.softwarePolicyMatchId
+        ? ('software_policy' as const)
+        : pamRuleId
+          ? ('pam_rule' as const)
+          : r.request.approvedByUserId || r.request.deniedByUserId || r.request.revokedByUserId
+            ? ('human' as const)
+            : null;
+      return {
+        ...r.request,
+        deviceHostname: r.deviceHostname,
+        siteName: r.siteName,
+        approvedByName: r.approvedByName,
+        deniedByName: r.deniedByName,
+        revokedByName: r.revokedByName,
+        matchedPolicyName: r.matchedPolicyName,
+        pamRuleId,
+        pamRuleName,
+        decisionSource,
+        ...enforcementResponse(r),
+        // Surfaced from metadata so "Create rule from this request" can seed a
+        // command-line / parent-image criterion (uac_intercept captures both).
+        commandLine: typeof meta.command_line === 'string' ? meta.command_line : null,
+        parentImage: typeof meta.parent_image === 'string' ? meta.parent_image : null,
+      };
+    }),
+    pagination: { page, limit, total: countRows[0]?.total ?? 0 },
+  });
+});
+
+// ============================================================
+// Elevation requests — active
+// ============================================================
+
+pamRoutes.get('/active', requirePamRead, async (c) => {
+  const auth = c.get('auth');
+  const perms = c.get('permissions') as UserPermissions | undefined;
+
+  const where = and(
+    ...[
+      auth.orgCondition(elevationRequests.orgId),
+      siteScopeCondition(perms),
+      inArray(elevationRequests.status, [...ACTIVE_STATUSES]),
+      or(isNull(elevationRequests.expiresAt), gt(elevationRequests.expiresAt, new Date())),
+    ].filter((cond): cond is SQL => cond !== undefined),
+  );
+
+  const rows = await db
+    .select({
+      request: elevationRequests,
+      deviceHostname: devices.hostname,
+      siteName: sites.name,
+      approvedByName: approvedByUser.name,
+      deniedByName: deniedByUser.name,
+      revokedByName: revokedByUser.name,
+      ...pamEnforcementProjection,
+    })
+    .from(elevationRequests)
+    .leftJoin(devices, eq(elevationRequests.deviceId, devices.id))
+    .leftJoin(sites, eq(elevationRequests.siteId, sites.id))
+    .leftJoin(approvedByUser, eq(elevationRequests.approvedByUserId, approvedByUser.id))
+    .leftJoin(deniedByUser, eq(elevationRequests.deniedByUserId, deniedByUser.id))
+    .leftJoin(revokedByUser, eq(elevationRequests.revokedByUserId, revokedByUser.id))
+    .where(where)
+    .orderBy(desc(elevationRequests.approvedAt))
+    .limit(500);
+
+  return c.json({
+    success: true,
+    active: rows.map((r) => ({
+      ...r.request,
+      deviceHostname: r.deviceHostname,
+      siteName: r.siteName,
+      approvedByName: r.approvedByName,
+      deniedByName: r.deniedByName,
+      revokedByName: r.revokedByName,
+      ...enforcementResponse(r),
+    })),
+  });
+});
+
+// ============================================================
+// Elevation requests — respond (approve / deny)
+// ============================================================
+
+const respondSchema = z.object({
+  decision: z.enum(['approve', 'deny']),
+  reason: z.string().max(2000).optional(),
+  durationMinutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_APPROVAL_DURATION_MINUTES)
+    .optional(),
+  // Optional assertion proof — EITHER the back-compat WebAuthn proof (no `type`
+  // on the wire → defaulted) OR the mobile_hw_key proof. Absent → L1 session tap.
+  // Present-but-invalid → 401 (NOT a silent downgrade). When the partner policy
+  // enforces, an under-assured APPROVE is rejected (403); a deny is never blocked.
+  proof: z.union([mobileHwKeyProofSchema, assertionProofSchema]).optional(),
+  // L4 (critical) re-auth: a fresh account password the technician re-enters to
+  // satisfy the critical-tier re-authentication factor (spec §5). Verified
+  // server-side; absent → reauthVerified=false (only a critical approve needs it).
+  reauthPassword: z.string().min(1).max(256).optional(),
+  // Login-MFA (TOTP) fallback for SSO-only / passwordless accounts that can't
+  // satisfy the password re-auth above (spec §5). Verified server-side.
+  reauthMfaCode: z.string().min(1).max(16).optional(),
+});
+
+// Phase 2: issue a short-lived (120s) WebAuthn assertion challenge bound to
+// {elevationId,userId} so the technician can satisfy a Windows-Hello / Touch-ID
+// step-up before approving. allowCredentials is the caller's active platform
+// approver devices; with none registered the options carry no allowCredentials
+// and the console falls back to an L1 (session-tap) approval — P2 is opt-in.
+pamRoutes.post(
+  '/elevation-requests/:id/assertion-challenge',
+  requirePamApprove,
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const id = c.req.param('id');
+    if (!id || !z.string().guid().safeParse(id).success) {
+      return c.json({ error: 'Invalid elevation request id' }, 400);
+    }
+
+    const [row] = await db
+      .select({
+        id: elevationRequests.id,
+        orgId: elevationRequests.orgId,
+        siteId: elevationRequests.siteId,
+        status: elevationRequests.status,
+      })
+      .from(elevationRequests)
+      .where(and(eq(elevationRequests.id, id), eq(elevationRequests.status, 'pending')))
+      .limit(1);
+
+    // RLS already scopes the read to the caller's org; canAccessOrg / site
+    // checks are defense-in-depth (same posture as respond). A row outside the
+    // caller's reach is reported as not-found so we don't leak its existence.
+    if (!row || !auth.canAccessOrg(row.orgId)) {
+      return c.json({ error: 'Elevation request not found' }, 404);
+    }
+    if (perms && row.siteId && !canAccessSite(perms, row.siteId)) {
+      return c.json({ error: 'Site access denied' }, 403);
+    }
+
+    // Caller's active platform approver devices (RLS scopes to the user; the
+    // userId predicate is defense-in-depth — see reference memory: admin-list IDOR).
+    const approverDevices = await db
+      .select()
+      .from(authenticatorDevices)
+      .where(
+        and(
+          eq(authenticatorDevices.userId, auth.user.id),
+          eq(authenticatorDevices.kind, 'webauthn_platform'),
+          isNull(authenticatorDevices.disabledAt),
+        ),
+      );
+
+    const options = await generateApprovalAssertionOptions({
+      approvalId: id,
+      userId: auth.user.id,
+      devices: approverDevices
+        .filter((d) => d.credentialId)
+        .map((d) => ({ credentialId: d.credentialId!, transports: d.transports })),
+    });
+
+    return c.json({ options });
+  },
+);
+
+pamRoutes.post(
+  '/elevation-requests/:id/respond',
+  requirePamApprove,
+  requireMfa(),
+  zValidator('json', respondSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const id = c.req.param('id');
+    const body = c.req.valid('json');
+    if (!z.string().guid().safeParse(id).success) {
+      return c.json({ error: 'Invalid elevation request id' }, 400);
+    }
+
+    const now = new Date();
+    const approve = body.decision === 'approve';
+    const durationMinutes = body.durationMinutes ?? DEFAULT_APPROVAL_DURATION_MINUTES;
+
+    // L4 (critical) re-auth: verify the fresh password BEFORE opening the
+    // transaction (it does its own DB/Redis work; we don't want it holding the
+    // txn open). A bad/rate-limited password short-circuits with the helper's
+    // own 401/429/503; absent → reauthVerified=false (only a critical approve
+    // needs it, which then 401s 'reauth_required' so the client can retry).
+    let reauthVerified = false;
+    if (body.reauthPassword) {
+      const reauthError = await requireCurrentPasswordStepUp(
+        c,
+        auth.user.id,
+        body.reauthPassword,
+        'pam:reauth'
+      );
+      if (reauthError) return reauthError;
+      reauthVerified = true;
+    } else if (body.reauthMfaCode) {
+      // Login-MFA (TOTP) fallback for SSO-only / passwordless accounts.
+      const reauthError = await requireFreshMfaStepUp(
+        c,
+        auth.user.id,
+        body.reauthMfaCode,
+        'pam:reauth-mfa'
+      );
+      if (reauthError) return reauthError;
+      reauthVerified = true;
+    }
+
+    let result:
+      | { kind: 'not_found' }
+      | { kind: 'forbidden' }
+      | { kind: 'self_approval' }
+      | { kind: 'conflict'; currentStatus: string }
+      | {
+          kind: 'ok';
+          row: { id: string; orgId: string; deviceId: string; flowType: string };
+          newStatus: string;
+          actuation: PamActuationRef;
+        };
+    try {
+      result = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .select({
+            id: elevationRequests.id,
+            orgId: elevationRequests.orgId,
+            siteId: elevationRequests.siteId,
+            deviceId: elevationRequests.deviceId,
+            flowType: elevationRequests.flowType,
+            status: elevationRequests.status,
+            executionId: elevationRequests.executionId,
+            riskTier: elevationRequests.riskTier,
+            subjectUserId: elevationRequests.subjectUserId,
+            subjectUsername: elevationRequests.subjectUsername,
+            targetExecutablePath: elevationRequests.targetExecutablePath,
+            targetExecutableHash: elevationRequests.targetExecutableHash,
+            revision: elevationRequests.revision,
+          })
+          .from(elevationRequests)
+          .where(eq(elevationRequests.id, id))
+          .limit(1);
+
+        if (!row) return { kind: 'not_found' as const };
+        if (!auth.canAccessOrg(row.orgId)) return { kind: 'not_found' as const };
+        if (perms && row.siteId && !canAccessSite(perms, row.siteId)) {
+          return { kind: 'forbidden' as const };
+        }
+
+        // Separation-of-duties (maker/checker): the subject who requested the
+        // elevation cannot APPROVE their own request. tech_jit_admin sets
+        // subjectUserId to the requesting technician, so without this they could
+        // self-grant JIT admin. Mirrors the auditBaselines apply-approval and
+        // cisHardening remediation guards: only APPROVE is blocked — a self-DENY
+        // grants nothing and stays allowed. uac_intercept rows have a NULL
+        // subjectUserId (end-user OS account), so the guard never fires there.
+        if (approve && row.subjectUserId && row.subjectUserId === auth.user.id) {
+          return { kind: 'self_approval' as const };
+        }
+
+        // Phase 2/3: verify an optional assertion proof. No proof → L1 session
+        // tap. A presented-but-invalid proof throws → 401 (NOT a silent
+        // downgrade). The L3 recency clock is derived server-side from the
+        // consumed challenge (no param); `reauthVerified` is the only
+        // decide-surface factor (verified above; required for critical/L4).
+        // Phase 4: an ENFORCING partner policy may reject an under-assured
+        // APPROVE (StepUpRequiredError → 403); the deny path passes
+        // decision:'denied' so it is never blocked.
+        let assurance;
+        try {
+          assurance = await assertApprovalAssurance({
+            approvalId: id,
+            userId: auth.user.id,
+            riskTier: elevationRiskTierToName(row.riskTier),
+            proof: body.proof,
+            partnerId: auth.partnerId ?? null,
+            decision: body.decision === 'approve' ? 'approved' : 'denied',
+            reauthVerified,
+          });
+        } catch (err) {
+          if (err instanceof StepUpRequiredError) throw err; // → 403 at the outer catch
+          if (err instanceof ReauthRequiredError) throw err; // → 401 reauth_required at the outer catch
+          console.error('[PAM] assertion verification failed:', err);
+          throw new AssertionFailedError();
+        }
+
+        // CAS: only a pending row can be decided. The WHERE clause re-checks
+        // status so a concurrent respond/reaper loses cleanly (0 rows).
+        const updated = await tx
+          .update(elevationRequests)
+          .set(
+            approve
+              ? {
+                  status: 'approved',
+                  approvedByUserId: auth.user.id,
+                  approvedAt: now,
+                  expiresAt: new Date(now.getTime() + durationMinutes * 60_000),
+                  updatedAt: now,
+                  decidedAssuranceLevel: assurance.decidedAssuranceLevel,
+                  decidedVia: assurance.decidedVia,
+                  authenticatorDeviceId: assurance.authenticatorDeviceId,
+                }
+              : {
+                  status: 'denied',
+                  deniedByUserId: auth.user.id,
+                  denialReason: body.reason ?? null,
+                  updatedAt: now,
+                  decidedAssuranceLevel: assurance.decidedAssuranceLevel,
+                  decidedVia: assurance.decidedVia,
+                  authenticatorDeviceId: assurance.authenticatorDeviceId,
+                },
+          )
+          .where(and(eq(elevationRequests.id, id), eq(elevationRequests.status, 'pending')))
+          .returning({ id: elevationRequests.id, status: elevationRequests.status });
+
+        if (updated.length === 0) {
+          return { kind: 'conflict' as const, currentStatus: row.status };
+        }
+
+        await tx.insert(elevationAudit).values({
+          orgId: row.orgId,
+          elevationRequestId: row.id,
+          eventType: approve ? 'approved' : 'denied',
+          actor: 'technician',
+          actorUserId: auth.user.id,
+          details: {
+            reason: body.reason,
+            ...(approve ? { duration_minutes: durationMinutes } : {}),
+            assurance_level: assurance.decidedAssuranceLevel,
+            factor: assurance.decidedVia,
+          },
+          occurredAt: now,
+        });
+
+        const expiresAt = approve
+          ? new Date(now.getTime() + durationMinutes * 60_000)
+          : null;
+        const actuation = await createPamDecisionIntent(tx, {
+          request: {
+            id: row.id,
+            orgId: row.orgId,
+            deviceId: row.deviceId,
+            targetExecutablePath: row.targetExecutablePath ?? '',
+            targetExecutableHash: row.targetExecutableHash,
+            subjectUsername: row.subjectUsername,
+          },
+          requestRevision: row.revision,
+          decision: approve ? 'approved' : 'denied',
+          expiresAt,
+        });
+
+        // ai_tool_action rows: mirror the decision onto the linked
+        // ai_tool_executions row the SDK gate is polling — in the SAME
+        // transaction (Phase 1, security finding A). If the execution is no
+        // longer pending, roll everything back and 409.
+        if (row.flowType === 'ai_tool_action' && row.executionId) {
+          const flipped = await mirrorElevationDecisionToExecution(
+            tx,
+            row.executionId,
+            approve,
+            approve ? auth.user.id : null,
+          );
+          if (!flipped) {
+            throw new StaleExecutionError();
+          }
+        }
+
+        return { kind: 'ok' as const, row, newStatus: updated[0]!.status, actuation };
+      });
+    } catch (err) {
+      if (err instanceof StepUpRequiredError) {
+        // Phase 4: an enforcing policy requires a higher assurance than this
+        // approve achieved. Only ever thrown for an approve — a deny is exempt.
+        return c.json({ success: false, error: 'step_up_required', requiredLevel: err.requiredLevel }, 403);
+      }
+      if (err instanceof ReauthRequiredError) {
+        // Critical (L4) approve with a valid signature but no fresh re-auth —
+        // tell the client to re-collect the password and retry (not a generic
+        // failure). Only ever thrown for an approve.
+        return c.json({ success: false, error: 'reauth_required' }, 401);
+      }
+      if (err instanceof AssertionFailedError) {
+        // Presented-but-bad proof — fail closed (401), never downgrade to L1.
+        return c.json({ success: false, error: 'assertion_failed' }, 401);
+      }
+      if (err instanceof StaleExecutionError) {
+        return c.json(
+          {
+            success: false,
+            error: 'Linked tool execution is no longer pending (it likely timed out)',
+          },
+          409,
+        );
+      }
+      throw err;
+    }
+
+    if (result.kind === 'not_found') {
+      return c.json({ error: 'Elevation request not found' }, 404);
+    }
+    if (result.kind === 'forbidden') {
+      return c.json({ error: 'Site access denied' }, 403);
+    }
+    if (result.kind === 'self_approval') {
+      return c.json(
+        { success: false, error: 'Requester cannot approve their own elevation request' },
+        403,
+      );
+    }
+    if (result.kind === 'conflict') {
+      return c.json(
+        {
+          success: false,
+          error: `Request is not pending (current status: ${result.currentStatus})`,
+        },
+        409,
+      );
+    }
+
+    writeAuditEvent(c, {
+      orgId: result.row.orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      action: approve ? 'pam.elevation_request.approve' : 'pam.elevation_request.deny',
+      resourceType: 'elevation_request',
+      resourceId: result.row.id,
+      details: { reason: body.reason, duration_minutes: approve ? durationMinutes : undefined },
+    });
+
+    // #1254: a uac_intercept elevation may also have been fanned out to the
+    // mobile approval surface. This web decision is authoritative, so expire any
+    // still-pending mobile approval_requests rows linked to this elevation —
+    // they vanish from approvers' phones. MUST run in system scope:
+    // approval_requests is Shape-6 (user-id-scoped), so those rows belong to the
+    // fanned-out approvers and are invisible to THIS user's request context — a
+    // bare context-scoped UPDATE would silently match zero rows. Best-effort,
+    // post-commit; only uac_intercept fans out.
+    if (result.row.flowType === 'uac_intercept') {
+      try {
+        await runOutsideDbContext(() =>
+          withSystemDbAccessContext(async () => {
+            await db
+              .update(approvalRequests)
+              .set({ status: 'expired' })
+              .where(
+                and(
+                  eq(approvalRequests.elevationRequestId, result.row.id),
+                  eq(approvalRequests.status, 'pending'),
+                ),
+              );
+          }),
+        );
+      } catch (err) {
+        console.error('[pam] Failed to expire sibling mobile approvals:', err);
+      }
+    }
+
+    await safePublish(
+      approve ? 'elevation.approved' : 'elevation.denied',
+      result.row.orgId,
+      {
+        elevationRequestId: result.row.id,
+        deviceId: result.row.deviceId,
+        flowType: result.row.flowType,
+        status: result.newStatus,
+        decidedByUserId: auth.user.id,
+      },
+    );
+
+    // NOTE: actuation of approved uac_intercept rows stays on the existing
+    // admin actuate route (#960) until #1150 makes the agent the credential
+    // authority — approving here does not enqueue an agent command.
+    return c.json({
+      success: true,
+      id: result.row.id,
+      status: result.newStatus,
+      enforcementStatus: result.actuation.desiredState === 'active'
+        ? 'pending_dispatch'
+        : 'cleanup_pending',
+    });
+  },
+);
+
+// ============================================================
+// Elevation requests — revoke
+// ============================================================
+
+const revokeSchema = z.object({
+  reason: z.string().min(1).max(2000),
+});
+
+pamRoutes.post(
+  '/elevation-requests/:id/revoke',
+  requirePamApprove,
+  requireMfa(),
+  zValidator('json', revokeSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const id = c.req.param('id');
+    const body = c.req.valid('json');
+    if (!z.string().guid().safeParse(id).success) {
+      return c.json({ error: 'Invalid elevation request id' }, 400);
+    }
+
+    const now = new Date();
+    const result = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .select({
+          id: elevationRequests.id,
+          orgId: elevationRequests.orgId,
+          siteId: elevationRequests.siteId,
+          deviceId: elevationRequests.deviceId,
+          flowType: elevationRequests.flowType,
+          status: elevationRequests.status,
+        })
+        .from(elevationRequests)
+        .where(eq(elevationRequests.id, id))
+        .limit(1);
+
+      if (!row) return { kind: 'not_found' as const };
+      if (!auth.canAccessOrg(row.orgId)) return { kind: 'not_found' as const };
+      if (perms && row.siteId && !canAccessSite(perms, row.siteId)) {
+        return { kind: 'forbidden' as const };
+      }
+
+      const updated = await tx
+        .update(elevationRequests)
+        .set({
+          status: 'revoked',
+          revokedAt: now,
+          revokedByUserId: auth.user.id,
+          revokedReason: body.reason,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(elevationRequests.id, id),
+            inArray(elevationRequests.status, [...ACTIVE_STATUSES]),
+          ),
+        )
+        .returning({ id: elevationRequests.id });
+
+      if (updated.length === 0) {
+        return { kind: 'conflict' as const, currentStatus: row.status };
+      }
+
+      await tx.insert(elevationAudit).values({
+        orgId: row.orgId,
+        elevationRequestId: row.id,
+        eventType: 'revoked',
+        actor: 'technician',
+        actorUserId: auth.user.id,
+        details: { reason: body.reason },
+        occurredAt: now,
+      });
+
+      const actuation = await requestPamCleanup(tx, {
+        elevationRequestId: row.id,
+        cause: 'revoked',
+      });
+
+      return { kind: 'ok' as const, row, actuation };
+    });
+
+    if (result.kind === 'not_found') {
+      return c.json({ error: 'Elevation request not found' }, 404);
+    }
+    if (result.kind === 'forbidden') {
+      return c.json({ error: 'Site access denied' }, 403);
+    }
+    if (result.kind === 'conflict') {
+      return c.json(
+        {
+          success: false,
+          error: `Request is not active (current status: ${result.currentStatus})`,
+        },
+        409,
+      );
+    }
+
+    writeAuditEvent(c, {
+      orgId: result.row.orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      action: 'pam.elevation_request.revoke',
+      resourceType: 'elevation_request',
+      resourceId: result.row.id,
+      details: { reason: body.reason },
+    });
+
+    await safePublish('elevation.revoked', result.row.orgId, {
+      elevationRequestId: result.row.id,
+      deviceId: result.row.deviceId,
+      flowType: result.row.flowType,
+      status: 'revoked',
+      revokedByUserId: auth.user.id,
+    });
+
+    // NOTE: for tech_jit_admin the agent-side group-flip undo command is
+    // #1150 scope; until it lands, revoke is a server-side state change
+    // (the expiry enforcer provides the time-bound safety net).
+    return c.json({
+      success: true,
+      id: result.row.id,
+      status: 'revoked',
+      enforcementStatus: 'cleanup_pending',
+    });
+  },
+);
+
+// ============================================================
+// Rules CRUD
+// ============================================================
+
+const ruleCriteriaFields = [
+  'matchSigner',
+  'matchSignerThumbprint',
+  'matchSignerGroupId',
+  'matchHash',
+  'matchPathGlob',
+  'matchParentImage',
+  'matchCommandLine',
+  'matchUser',
+  'matchAdGroup',
+] as const;
+
+const timeWindowSchema = z.object({
+  start: z.string().regex(/^\d{1,2}:\d{2}$/),
+  end: z.string().regex(/^\d{1,2}:\d{2}$/),
+  days: z.array(z.number().int().min(0).max(6)).max(7).optional(),
+  timezone: z.string().max(64).optional(),
+});
+
+// Criteria fields shared verbatim between ruleBaseSchema and previewRuleSchema.
+// Spread into both z.object calls so any validator change applies to both.
+const ruleCriteriaValidators = {
+  siteId: z.string().guid().nullable().optional(),
+  matchSigner: z.string().min(1).max(255).nullable().optional(),
+  matchSignerThumbprint: z
+    .string()
+    .trim()
+    .regex(/^[0-9a-fA-F]{64}$/, 'must be a sha256 hex thumbprint')
+    .nullable()
+    .optional(),
+  matchSignerGroupId: z.string().guid().nullable().optional(),
+  matchHash: z
+    .string()
+    .regex(/^[0-9a-fA-F]{64}$/, 'must be a sha256 hex digest')
+    .nullable()
+    .optional(),
+  matchPathGlob: z.string().min(1).max(4096).nullable().optional(),
+  matchParentImage: z.string().min(1).max(4096).nullable().optional(),
+  matchCommandLine: z.string().min(1).max(4096).nullable().optional(),
+  matchUser: z.string().min(1).max(255).nullable().optional(),
+  matchAdGroup: z.string().min(1).max(255).nullable().optional(),
+  matchToolName: z.string().min(1).max(100).nullable().optional(),
+  matchRiskTier: z.number().int().min(0).max(4).nullable().optional(),
+  matchNegate: z.array(z.enum(PAM_RULE_NEGATE_KEYS)).max(PAM_RULE_NEGATE_KEYS.length).nullable().optional(),
+  timeWindow: timeWindowSchema.nullable().optional(),
+};
+
+const ruleBaseSchema = z.object({
+  orgId: z.string().guid().optional(),
+  ...ruleCriteriaValidators,
+  name: z.string().min(1).max(255),
+  description: z.string().max(2000).nullable().optional(),
+  enabled: z.boolean().optional(),
+  priority: z.number().int().min(0).max(100000).optional(),
+  verdict: z.enum(['auto_approve', 'auto_deny', 'require_approval', 'ignore']),
+  approvalDurationMinutes: z
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_APPROVAL_DURATION_MINUTES)
+    .nullable()
+    .optional(),
+});
+
+type RuleCriteriaShape = {
+  matchSigner?: string | null;
+  matchSignerThumbprint?: string | null;
+  matchSignerGroupId?: string | null;
+  matchHash?: string | null;
+  matchPathGlob?: string | null;
+  matchParentImage?: string | null;
+  matchCommandLine?: string | null;
+  matchUser?: string | null;
+  matchAdGroup?: string | null;
+  matchToolName?: string | null;
+  matchRiskTier?: number | null;
+  verdict?: 'auto_approve' | 'auto_deny' | 'require_approval' | 'ignore';
+};
+
+// A rule must carry at least one identifying criterion. A rule scoped only
+// by time window (or nothing) must never exist — it would match every
+// elevation in the org (catastrophic for verdict=auto_approve).
+function hasAnyCriterion(rule: RuleCriteriaShape): boolean {
+  return ruleCriteriaFields.some((f) => Boolean(rule[f])) || hasToolActionCriteria(rule);
+}
+
+// Binary-identifying criteria — what makes a rule executable-shaped (user/
+// group/time only narrow; they don't identify a binary).
+const executableCriteriaFields = [
+  'matchSigner',
+  'matchSignerThumbprint',
+  'matchSignerGroupId',
+  'matchHash',
+  'matchPathGlob',
+  'matchParentImage',
+  'matchCommandLine',
+] as const;
+
+function hasToolActionCriteria(rule: RuleCriteriaShape): boolean {
+  return Boolean(rule.matchToolName) || rule.matchRiskTier != null;
+}
+
+function hasExecutableShapeCriteria(rule: RuleCriteriaShape): boolean {
+  return executableCriteriaFields.some((f) => Boolean(rule[f]));
+}
+
+/**
+ * A rule is either executable-shaped or tool-action-shaped (Phase 1 helper
+ * governance) — mixing the two is rejected because no single candidate
+ * carries both kinds of field, so a mixed rule could never match anything.
+ * Returns an error string, or null when the rule shape is valid.
+ */
+function validateRuleShape(rule: RuleCriteriaShape): string | null {
+  if (!hasAnyCriterion(rule)) {
+    return 'At least one match criterion (signer/hash/path/parent/user/group/tool/tier) is required';
+  }
+  if (hasExecutableShapeCriteria(rule) && hasToolActionCriteria(rule)) {
+    return 'A rule cannot mix executable criteria with tool-action criteria';
+  }
+  if ((rule.matchSigner || rule.matchSignerThumbprint) && rule.matchSignerGroupId) {
+    return 'A rule cannot combine matchSignerGroupId with matchSigner/matchSignerThumbprint — use a group or a direct signer match, not both';
+  }
+  if (hasToolActionCriteria(rule) && rule.verdict === 'ignore') {
+    return "verdict 'ignore' is not valid for tool-action rules — a tool action must be decided";
+  }
+  return null;
+}
+
+/**
+ * #3128: reject a tool-action rule pinned to a risk tier its tool selector can
+ * no longer resolve to. Tool tiers are static code that ships with the API, so
+ * a re-classification (#3105 moved three read-only execute_command
+ * commandTypes from Tier 3 to Tier 2) can leave a stored rule permanently
+ * unmatchable — and the engine's exact-equality match makes that silent.
+ *
+ * Deliberately NOT folded into validateRuleShape: that one feeds a Zod
+ * superRefine on create, which would emit the generic validation-failure body.
+ * Calling this from both handlers gives create and update the SAME
+ * machine-readable 400, and keeps the check off the preview endpoint — a
+ * dry-run must stay able to demonstrate that a stale rule matches nothing.
+ *
+ * Fails OPEN for an unrecognised tool name (see describePamRuleTierDrift).
+ */
+function tierDriftResponse(
+  rule: RuleCriteriaShape & { matchNegate?: readonly string[] | null },
+): { error: string; code: string; validTiers: number[] } | null {
+  const drift = describePamRuleTierDrift(rule);
+  if (!drift) return null;
+  return {
+    error: drift.message,
+    code: PAM_RULE_TIER_UNREACHABLE_CODE,
+    validTiers: drift.validTiers,
+  };
+}
+
+const createRuleSchema = ruleBaseSchema.superRefine((rule, ctx) => {
+  const err = validateRuleShape(rule);
+  if (err) ctx.addIssue({ code: z.ZodIssueCode.custom, message: err });
+});
+
+// Preview schema: subset of criteria fields (no name/verdict/priority — those
+// are irrelevant to matching), plus windowDays/flowType overrides.
+// Hand-rolled (not .pick) to avoid Zod inference issues with superRefine on
+// a picked object; criteria validators are structurally shared via ruleCriteriaValidators.
+const previewRuleSchema = z
+  .object({
+    ...ruleCriteriaValidators,
+    windowDays: z.number().int().min(1).max(PREVIEW_MAX_WINDOW_DAYS).optional(),
+    flowType: z.enum(['uac_intercept', 'tech_jit_admin', 'ai_tool_action']).optional(),
+  })
+  .superRefine((rule, ctx) => {
+    // Same shape rules as create (≥1 criterion, no executable/tool mixing).
+    // validateRuleShape rejects tool-action rules with verdict 'ignore'; inject any
+    // non-'ignore' verdict so that create-only constraint can't fire on previews.
+    const err = validateRuleShape({ ...rule, verdict: 'require_approval' });
+    if (err) ctx.addIssue({ code: z.ZodIssueCode.custom, message: err });
+  });
+
+pamRoutes.get('/rules', requirePamRead, async (c) => {
+  const auth = c.get('auth');
+  const perms = c.get('permissions') as UserPermissions | undefined;
+
+  // Site narrowing for site-restricted technicians (pam_rules is RLS Shape-1
+  // org-only, so the site axis is app-layer-only). Mirrors siteScopeCondition,
+  // bound to pamRules.siteId. Org-wide rules (siteId IS NULL) are hidden from a
+  // restricted caller since they govern every site, including ones it can't reach.
+  const where = and(
+    ...[
+      auth.orgCondition(pamRules.orgId),
+      !perms?.allowedSiteIds
+        ? undefined
+        : perms.allowedSiteIds.length === 0
+          ? sql`false`
+          : inArray(pamRules.siteId, perms.allowedSiteIds),
+    ].filter((cond): cond is SQL => cond !== undefined),
+  );
+
+  const rows = await db
+    .select()
+    .from(pamRules)
+    .where(where)
+    .orderBy(pamRules.priority, pamRules.createdAt);
+  // #3128: surface tier drift so the UI can badge a rule that can no longer
+  // match. Computed per response rather than stored — the tool tier tables are
+  // code, so the answer changes on deploy, not on write.
+  const rules = rows.map((row) => {
+    const drift = describePamRuleTierDrift(row);
+    return {
+      ...row,
+      matchRiskTierStale: drift != null,
+      matchRiskTierValidTiers: drift?.validTiers ?? null,
+    };
+  });
+  return c.json({ success: true, rules });
+});
+
+pamRoutes.post('/rules', requirePamManagePolicy, requireMfa(), zValidator('json', createRuleSchema), async (c) => {
+  const auth = c.get('auth');
+  const perms = c.get('permissions') as UserPermissions | undefined;
+  const payload = c.req.valid('json');
+
+  const resolvedOrg = resolveOrgIdForWrite(auth, payload.orgId ?? c.req.query('orgId') ?? undefined);
+  if (!resolvedOrg.orgId) {
+    return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
+  }
+
+  // Site axis is app-layer-only for pam_rules (RLS Shape-1 org-only). A
+  // site-restricted tech must not author org-wide (siteId null → '') or
+  // other-site rules. Unrestricted callers (no allowedSiteIds) keep org-wide
+  // ability. Mirrors the canAccessSite gate on the elevation handlers.
+  if (perms?.allowedSiteIds && !canAccessSite(perms, payload.siteId ?? '')) {
+    return c.json({ error: 'Site access denied' }, 403);
+  }
+
+  const tierDrift = tierDriftResponse(payload);
+  if (tierDrift) {
+    return c.json(tierDrift, 400);
+  }
+
+  const [created] = await db
+    .insert(pamRules)
+    .values({
+      orgId: resolvedOrg.orgId,
+      siteId: payload.siteId ?? null,
+      name: payload.name,
+      description: payload.description ?? null,
+      enabled: payload.enabled ?? true,
+      priority: payload.priority ?? 100,
+      matchSigner: payload.matchSigner ?? null,
+      matchSignerThumbprint: payload.matchSignerThumbprint
+        ? payload.matchSignerThumbprint.toLowerCase()
+        : null,
+      matchSignerGroupId: payload.matchSignerGroupId ?? null,
+      matchHash: payload.matchHash ? payload.matchHash.toLowerCase() : null,
+      matchPathGlob: payload.matchPathGlob ?? null,
+      matchParentImage: payload.matchParentImage ?? null,
+      matchCommandLine: payload.matchCommandLine ?? null,
+      matchUser: payload.matchUser ?? null,
+      matchAdGroup: payload.matchAdGroup ?? null,
+      matchToolName: payload.matchToolName ?? null,
+      matchRiskTier: payload.matchRiskTier ?? null,
+      matchNegate: payload.matchNegate ?? null,
+      timeWindow: payload.timeWindow ?? null,
+      verdict: payload.verdict,
+      approvalDurationMinutes: payload.approvalDurationMinutes ?? null,
+      createdByUserId: auth.user.id,
+    })
+    .returning();
+
+  if (!created) {
+    return c.json({ error: 'Rule insert returned no row' }, 500);
+  }
+
+  writeAuditEvent(c, {
+    orgId: resolvedOrg.orgId,
+    actorType: 'user',
+    actorId: auth.user.id,
+    action: 'pam.rule.create',
+    resourceType: 'pam_rule',
+    resourceId: created.id,
+    details: { name: created.name, verdict: created.verdict, priority: created.priority },
+  });
+
+  return c.json({ success: true, rule: created }, 201);
+});
+
+// ============================================================
+// Rules — preview (dry-run draft criteria against history)
+// ============================================================
+// Pure per-rule matching: "would these criteria match these historical
+// requests". NOT a chain replay (no priority shadowing, no software-policy
+// bridge) — that variant is future work. Known limitation: historical rows
+// don't store AD groups, so ANY draft containing matchAdGroup reports 0 matches
+// (criteria are ANDed) — including tech_jit_admin rows where groups matched live
+// but weren't persisted.
+pamRoutes.post(
+  '/rules/preview',
+  requirePamManagePolicy,
+  zValidator('json', previewRuleSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const body = c.req.valid('json');
+
+    const windowDays = body.windowDays ?? PREVIEW_DEFAULT_WINDOW_DAYS;
+    const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+
+    const conditions: (SQL | undefined)[] = [
+      auth.orgCondition(elevationRequests.orgId),
+      siteScopeCondition(perms),
+      gte(elevationRequests.requestedAt, since),
+    ];
+    if (body.flowType) conditions.push(eq(elevationRequests.flowType, body.flowType));
+    if (body.siteId) {
+      if (perms && !canAccessSite(perms, body.siteId)) {
+        return c.json({ error: 'Site access denied' }, 403);
+      }
+      conditions.push(eq(elevationRequests.siteId, body.siteId));
+    }
+
+    const rows = await db
+      .select({
+        id: elevationRequests.id,
+        requestedAt: elevationRequests.requestedAt,
+        flowType: elevationRequests.flowType,
+        status: elevationRequests.status,
+        subjectUsername: elevationRequests.subjectUsername,
+        targetExecutablePath: elevationRequests.targetExecutablePath,
+        targetExecutableHash: elevationRequests.targetExecutableHash,
+        targetExecutableSigner: elevationRequests.targetExecutableSigner,
+        toolName: elevationRequests.toolName,
+        riskTier: elevationRequests.riskTier,
+        metadata: elevationRequests.metadata,
+      })
+      .from(elevationRequests)
+      .where(and(...conditions.filter((cn): cn is SQL => cn !== undefined)))
+      .orderBy(desc(elevationRequests.requestedAt))
+      .limit(PREVIEW_SCAN_CAP);
+
+    // Engine-shaped draft rule; matching reads match*/timeWindow/enabled only.
+    const draftRule = {
+      id: 'preview',
+      orgId: auth.orgId ?? '',
+      siteId: body.siteId ?? null,
+      name: 'preview',
+      description: null,
+      enabled: true,
+      priority: 0,
+      verdict: 'require_approval' as const,
+      approvalDurationMinutes: null,
+      suspendedVerdict: null,
+      reapprovedAt: null,
+      reapprovedByUserId: null,
+      createdByUserId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      matchSigner: body.matchSigner ?? null,
+      matchSignerThumbprint: body.matchSignerThumbprint
+        ? body.matchSignerThumbprint.toLowerCase()
+        : null,
+      matchSignerGroupId: body.matchSignerGroupId ?? null,
+      matchHash: body.matchHash ? body.matchHash.toLowerCase() : null,
+      matchPathGlob: body.matchPathGlob ?? null,
+      matchParentImage: body.matchParentImage ?? null,
+      matchCommandLine: body.matchCommandLine ?? null,
+      matchUser: body.matchUser ?? null,
+      matchAdGroup: body.matchAdGroup ?? null,
+      matchToolName: body.matchToolName ?? null,
+      matchRiskTier: body.matchRiskTier ?? null,
+      matchNegate: body.matchNegate ?? null,
+      timeWindow: body.timeWindow ?? null,
+    };
+
+    // Resolve the draft's signer group (if any) so the preview can match it.
+    // Org-scoped by RLS — a group the caller can't see yields no resolution
+    // and the draft's group criterion fails closed.
+    // NOTE: historical elevation_requests rows do not store a signer
+    // thumbprint, so a draft pinning a thumbprint (direct or via a group entry)
+    // reports 0 matches in preview — the candidate below carries no thumbprint.
+    // Same known limitation as matchAdGroup (criteria are ANDed / present-gated).
+    let previewSignerGroups: Map<string, SignerGroupEntry[]> | undefined;
+    if (draftRule.matchSignerGroupId) {
+      const [grp] = await db
+        .select({ id: pamSignerGroups.id, signers: pamSignerGroups.signers })
+        .from(pamSignerGroups)
+        .where(eq(pamSignerGroups.id, draftRule.matchSignerGroupId))
+        .limit(1);
+      if (grp) previewSignerGroups = new Map([[grp.id, normalizeSignerGroupEntries(grp.signers)]]);
+    }
+
+    let totalMatched = 0;
+    const statusBreakdown: Record<string, number> = {
+      pending: 0,
+      approved: 0,
+      auto_approved: 0,
+      denied: 0,
+      expired: 0,
+      revoked: 0,
+      actuating: 0,
+    };
+    const sample: Array<Record<string, unknown>> = [];
+
+    for (const r of rows) {
+      const meta = (r.metadata ?? {}) as Record<string, unknown>;
+      const candidate: PamRuleCandidate = {
+        targetExecutablePath: r.targetExecutablePath ?? undefined,
+        targetExecutableHash: r.targetExecutableHash ?? undefined,
+        targetExecutableSigner: r.targetExecutableSigner ?? undefined,
+        subjectUsername: r.subjectUsername,
+        parentImage: typeof meta.parent_image === 'string' ? meta.parent_image : undefined,
+        commandLine: typeof meta.command_line === 'string' ? meta.command_line : undefined,
+        toolName: r.toolName ?? undefined,
+        riskTier: r.riskTier ?? undefined,
+        at: r.requestedAt,
+      };
+      if (evaluatePamRules([draftRule], candidate, previewSignerGroups)) {
+        totalMatched++;
+        statusBreakdown[r.status] = (statusBreakdown[r.status] ?? 0) + 1;
+        if (sample.length < PREVIEW_SAMPLE_CAP) {
+          sample.push({
+            id: r.id,
+            requestedAt: r.requestedAt,
+            flowType: r.flowType,
+            subjectUsername: r.subjectUsername,
+            targetExecutablePath: r.targetExecutablePath ?? null,
+            toolName: r.toolName ?? null,
+            status: r.status,
+          });
+        }
+      }
+    }
+
+    return c.json({
+      success: true,
+      totalMatched,
+      totalScanned: rows.length,
+      windowDays,
+      truncated: rows.length === PREVIEW_SCAN_CAP,
+      statusBreakdown,
+      sample,
+    });
+  },
+);
+
+const updateRuleSchema = ruleBaseSchema
+  .partial()
+  .omit({ orgId: true })
+  .extend({
+    // §6B re-approval: restores `verdict` from `suspended_verdict` (set by
+    // the 2026-10-15-150200 migration's auto_approve quarantine) and clears
+    // it. A body combining `reapprove: true` with an explicit `verdict` is
+    // ambiguous intent and is rejected below rather than guessing which wins.
+    reapprove: z.boolean().optional(),
+  });
+
+pamRoutes.patch('/rules/:id', requirePamManagePolicy, requireMfa(), zValidator('json', updateRuleSchema), async (c) => {
+  const auth = c.get('auth');
+  const perms = c.get('permissions') as UserPermissions | undefined;
+  const id = c.req.param('id');
+  const payload = c.req.valid('json');
+  if (!z.string().guid().safeParse(id).success) {
+    return c.json({ error: 'Invalid rule id' }, 400);
+  }
+
+  const [existing] = await db.select().from(pamRules).where(eq(pamRules.id, id!)).limit(1);
+  if (!existing || !auth.canAccessOrg(existing.orgId)) {
+    return c.json({ error: 'Rule not found' }, 404);
+  }
+
+  // §6B re-approval of a legacy auto_approve rule quarantined by the
+  // 2026-10-15-150200 migration (verdict forced to require_approval,
+  // original verdict preserved in suspendedVerdict). `reapprove: true` is a
+  // dedicated action, not an ordinary field patch — reject combining it with
+  // an explicit `verdict` in the same body rather than silently picking one.
+  if (payload.reapprove) {
+    if (!existing.suspendedVerdict) {
+      return c.json({ error: 'Rule is not suspended pending re-approval' }, 400);
+    }
+    if (payload.verdict !== undefined) {
+      return c.json({ error: 'Cannot combine reapprove with an explicit verdict change' }, 400);
+    }
+  }
+
+  // Site axis is app-layer-only (pam_rules RLS Shape-1 org-only). A site-restricted
+  // tech must be able to reach BOTH the existing rule's site and any new target
+  // site (org-wide null → '' which a restricted caller never holds). Unrestricted
+  // callers keep org-wide ability. Mirrors canAccessSite on the elevation handlers.
+  if (perms?.allowedSiteIds) {
+    if (!canAccessSite(perms, existing.siteId ?? '')) {
+      return c.json({ error: 'Site access denied' }, 403);
+    }
+    if (payload.siteId !== undefined && !canAccessSite(perms, payload.siteId ?? '')) {
+      return c.json({ error: 'Site access denied' }, 403);
+    }
+  }
+
+  // The merged result must still be a valid rule shape (criterion present,
+  // no executable/tool-action mixing, no ignore on tool-action rules). A
+  // reapprove restores the original (pre-suspension) verdict for shape
+  // validation purposes, even though it isn't itself in `payload`.
+  const merged = {
+    ...existing,
+    ...payload,
+    // Guarded above: payload.reapprove is only true once we've already
+    // checked existing.suspendedVerdict is non-null, so the `?? undefined`
+    // here is type-narrowing only, not a real fallback.
+    ...(payload.reapprove ? { verdict: existing.suspendedVerdict ?? undefined } : {}),
+  };
+  const shapeError = validateRuleShape(merged);
+  if (shapeError) {
+    return c.json({ error: shapeError }, 400);
+  }
+
+  // Validate the MERGED tier selector: a PATCH that only moves matchRiskTier
+  // must be checked against the rule's STORED matchToolName (and vice versa).
+  const mergedTierDrift = tierDriftResponse(merged);
+  if (mergedTierDrift) {
+    return c.json(mergedTierDrift, 400);
+  }
+
+  const [updated] = await db.transaction(async (tx) => {
+    const result = await tx.update(pamRules).set({
+      ...(payload.siteId !== undefined ? { siteId: payload.siteId } : {}),
+      ...(payload.name !== undefined ? { name: payload.name } : {}),
+      ...(payload.description !== undefined ? { description: payload.description } : {}),
+      ...(payload.enabled !== undefined ? { enabled: payload.enabled } : {}),
+      ...(payload.priority !== undefined ? { priority: payload.priority } : {}),
+      ...(payload.matchSigner !== undefined ? { matchSigner: payload.matchSigner } : {}),
+      ...(payload.matchSignerThumbprint !== undefined
+        ? {
+            matchSignerThumbprint: payload.matchSignerThumbprint
+              ? payload.matchSignerThumbprint.toLowerCase()
+              : null,
+          }
+        : {}),
+      ...(payload.matchSignerGroupId !== undefined
+        ? { matchSignerGroupId: payload.matchSignerGroupId }
+        : {}),
+      ...(payload.matchHash !== undefined
+        ? { matchHash: payload.matchHash ? payload.matchHash.toLowerCase() : null }
+        : {}),
+      ...(payload.matchPathGlob !== undefined ? { matchPathGlob: payload.matchPathGlob } : {}),
+      ...(payload.matchParentImage !== undefined
+        ? { matchParentImage: payload.matchParentImage }
+        : {}),
+      ...(payload.matchCommandLine !== undefined
+        ? { matchCommandLine: payload.matchCommandLine }
+        : {}),
+      ...(payload.matchUser !== undefined ? { matchUser: payload.matchUser } : {}),
+      ...(payload.matchAdGroup !== undefined ? { matchAdGroup: payload.matchAdGroup } : {}),
+      ...(payload.matchToolName !== undefined ? { matchToolName: payload.matchToolName } : {}),
+      ...(payload.matchRiskTier !== undefined ? { matchRiskTier: payload.matchRiskTier } : {}),
+      ...(payload.matchNegate !== undefined ? { matchNegate: payload.matchNegate } : {}),
+      ...(payload.timeWindow !== undefined ? { timeWindow: payload.timeWindow } : {}),
+      ...(payload.verdict !== undefined ? { verdict: payload.verdict } : {}),
+      // An explicit verdict edit supersedes any pending quarantine: without
+      // this, a later plain Re-approve click (payload.reapprove) would
+      // restore the STALE pre-suspension verdict from suspendedVerdict and
+      // silently overwrite the admin's fresh edit. payload.verdict and
+      // payload.reapprove are mutually exclusive (rejected together above),
+      // so this never fights the reapprove branch below.
+      ...(payload.verdict !== undefined && existing.suspendedVerdict !== null
+        ? { suspendedVerdict: null }
+        : {}),
+      ...(payload.approvalDurationMinutes !== undefined
+        ? { approvalDurationMinutes: payload.approvalDurationMinutes }
+        : {}),
+      // §6B re-approval: restore the pre-suspension verdict and clear the
+      // quarantine marker, stamped with who/when. Mutually exclusive with the
+      // `payload.verdict` branch above (rejected together earlier).
+      ...(payload.reapprove
+        ? {
+            verdict: existing.suspendedVerdict!,
+            suspendedVerdict: null,
+            reapprovedAt: new Date(),
+            reapprovedByUserId: auth.user.id,
+          }
+        : {}),
+      updatedAt: new Date(),
+    })
+      .where(eq(pamRules.id, id!))
+      .returning();
+    if (payload.enabled === false && existing.enabled) {
+      await cleanupPamRuleActuations(tx, { ruleId: id!, orgId: existing.orgId });
+    }
+    return result;
+  });
+
+  writeAuditEvent(c, {
+    orgId: existing.orgId,
+    actorType: 'user',
+    actorId: auth.user.id,
+    action: 'pam.rule.update',
+    resourceType: 'pam_rule',
+    resourceId: id,
+    details: { changed: Object.keys(payload) },
+  });
+
+  return c.json({ success: true, rule: updated });
+});
+
+pamRoutes.delete('/rules/:id', requirePamManagePolicy, requireMfa(), async (c) => {
+  const auth = c.get('auth');
+  const perms = c.get('permissions') as UserPermissions | undefined;
+  const id = c.req.param('id');
+  if (!z.string().guid().safeParse(id).success) {
+    return c.json({ error: 'Invalid rule id' }, 400);
+  }
+
+  const [existing] = await db.select().from(pamRules).where(eq(pamRules.id, id!)).limit(1);
+  if (!existing || !auth.canAccessOrg(existing.orgId)) {
+    return c.json({ error: 'Rule not found' }, 404);
+  }
+
+  // Site axis is app-layer-only (pam_rules RLS Shape-1 org-only). A site-restricted
+  // tech must reach the target rule's site (org-wide null → '' which a restricted
+  // caller never holds). Unrestricted callers keep org-wide ability.
+  if (perms?.allowedSiteIds && !canAccessSite(perms, existing.siteId ?? '')) {
+    return c.json({ error: 'Site access denied' }, 403);
+  }
+
+  await db.transaction(async (tx) => {
+    await cleanupPamRuleActuations(tx, { ruleId: id!, orgId: existing.orgId });
+    await tx.delete(pamRules).where(eq(pamRules.id, id!));
+  });
+
+  writeAuditEvent(c, {
+    orgId: existing.orgId,
+    actorType: 'user',
+    actorId: auth.user.id,
+    action: 'pam.rule.delete',
+    resourceType: 'pam_rule',
+    resourceId: id,
+    details: { name: existing.name },
+  });
+
+  return c.json({ success: true });
+});
+
+// ============================================================
+// Org config — default verdict for unmatched elevations
+// ============================================================
+// When an elevation matches no software policy and no PAM rule, the org's
+// configured default applies. Absent a row, the default is require_approval
+// (the historical behavior — the request waits for a human).
+const updateConfigSchema = z.object({
+  orgId: z.string().guid().optional(),
+  defaultUnmatchedVerdict: z.enum(['require_approval', 'auto_deny']),
+});
+
+pamRoutes.get('/config', requirePamRead, async (c) => {
+  const auth = c.get('auth');
+  const resolvedOrg = resolveOrgIdForWrite(auth, c.req.query('orgId') ?? undefined);
+  if (!resolvedOrg.orgId) {
+    return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
+  }
+  const [cfg] = await db
+    .select()
+    .from(pamOrgConfig)
+    .where(eq(pamOrgConfig.orgId, resolvedOrg.orgId))
+    .limit(1);
+  return c.json({
+    success: true,
+    config: {
+      orgId: resolvedOrg.orgId,
+      defaultUnmatchedVerdict: cfg?.defaultUnmatchedVerdict ?? 'require_approval',
+    },
+  });
+});
+
+pamRoutes.put(
+  '/config',
+  requirePamManagePolicy,
+  requireMfa(),
+  zValidator('json', updateConfigSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const payload = c.req.valid('json');
+    const resolvedOrg = resolveOrgIdForWrite(
+      auth,
+      payload.orgId ?? c.req.query('orgId') ?? undefined,
+    );
+    if (!resolvedOrg.orgId) {
+      return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
+    }
+    const [saved] = await db
+      .insert(pamOrgConfig)
+      .values({
+        orgId: resolvedOrg.orgId,
+        defaultUnmatchedVerdict: payload.defaultUnmatchedVerdict,
+        updatedByUserId: auth.user.id,
+      })
+      .onConflictDoUpdate({
+        target: pamOrgConfig.orgId,
+        set: {
+          defaultUnmatchedVerdict: payload.defaultUnmatchedVerdict,
+          updatedByUserId: auth.user.id,
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
+
+    writeAuditEvent(c, {
+      orgId: resolvedOrg.orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      action: 'pam.config.update',
+      resourceType: 'pam_org_config',
+      resourceId: saved?.id ?? resolvedOrg.orgId,
+      details: { defaultUnmatchedVerdict: payload.defaultUnmatchedVerdict },
+    });
+
+    return c.json({ success: true, config: saved });
+  },
+);
+
+// ============================================================
+// Signer groups — reusable trusted-publisher catalog
+// ============================================================
+// A named, org-scoped set of signer (subject CN) patterns referenced from
+// rules via matchSignerGroupId. Manage vendors once, reference everywhere.
+// A signer-group entry is EITHER a bare subject-CN string (legacy / weak tier,
+// stored as-is for backward-compatibility) OR an object pinning a SHA-256
+// thumbprint (strong tier) and/or a CN (#1776). At least one field is required
+// on the object form. Stored shape stays read-compatible with the legacy
+// string[] — see normalizeSignerGroupEntries / StoredSignerEntry.
+const signerEntryObjectSchema = z
+  .object({
+    subjectCn: z.string().trim().min(1).max(255).optional(),
+    thumbprint: z
+      .string()
+      .trim()
+      .regex(/^[0-9a-fA-F]{64}$/, 'must be a sha256 hex thumbprint')
+      .optional(),
+  })
+  .refine((e) => Boolean(e.subjectCn) || Boolean(e.thumbprint), {
+    message: 'each signer entry needs a subjectCn or a thumbprint',
+  });
+
+const signerListSchema = z
+  .array(z.union([z.string().trim().min(1).max(255), signerEntryObjectSchema]))
+  .max(500)
+  // Normalize to the stored form (bare CN strings stay strings; pins become
+  // objects with a lowercased thumbprint) and de-duplicate, preserving the
+  // first spelling.
+  .transform((arr) => {
+    const seen = new Set<string>();
+    const out: StoredSignerEntry[] = [];
+    for (const el of arr) {
+      if (typeof el === 'string') {
+        const cn = el.trim();
+        const key = `cn:${cn.toLowerCase()}`;
+        if (cn && !seen.has(key)) {
+          seen.add(key);
+          out.push(cn);
+        }
+        continue;
+      }
+      const cn = el.subjectCn?.trim();
+      const thumbprint = el.thumbprint?.trim().toLowerCase();
+      const key = `obj:${cn?.toLowerCase() ?? ''}|${thumbprint ?? ''}`;
+      if ((cn || thumbprint) && !seen.has(key)) {
+        seen.add(key);
+        const entry: { subjectCn?: string; thumbprint?: string } = {};
+        if (cn) entry.subjectCn = cn;
+        if (thumbprint) entry.thumbprint = thumbprint;
+        out.push(entry);
+      }
+    }
+    return out;
+  });
+
+const createSignerGroupSchema = z.object({
+  orgId: z.string().guid().optional(),
+  name: z.string().trim().min(1).max(255),
+  description: z.string().max(2000).nullable().optional(),
+  signers: signerListSchema.optional(),
+});
+
+const updateSignerGroupSchema = z.object({
+  name: z.string().trim().min(1).max(255).optional(),
+  description: z.string().max(2000).nullable().optional(),
+  signers: signerListSchema.optional(),
+});
+
+pamRoutes.get('/signer-groups', requirePamRead, async (c) => {
+  const auth = c.get('auth');
+  const rows = await db
+    .select()
+    .from(pamSignerGroups)
+    .where(auth.orgCondition(pamSignerGroups.orgId))
+    .orderBy(pamSignerGroups.name);
+  return c.json({ success: true, signerGroups: rows });
+});
+
+pamRoutes.post(
+  '/signer-groups',
+  requirePamManagePolicy,
+  requireMfa(),
+  zValidator('json', createSignerGroupSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const payload = c.req.valid('json');
+    const resolvedOrg = resolveOrgIdForWrite(
+      auth,
+      payload.orgId ?? c.req.query('orgId') ?? undefined,
+    );
+    if (!resolvedOrg.orgId) {
+      return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
+    }
+    const [created] = await db
+      .insert(pamSignerGroups)
+      .values({
+        orgId: resolvedOrg.orgId,
+        name: payload.name,
+        description: payload.description ?? null,
+        signers: payload.signers ?? [],
+        createdByUserId: auth.user.id,
+      })
+      .returning();
+    if (!created) {
+      return c.json({ error: 'Signer group insert returned no row' }, 500);
+    }
+    writeAuditEvent(c, {
+      orgId: resolvedOrg.orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      action: 'pam.signer_group.create',
+      resourceType: 'pam_signer_group',
+      resourceId: created.id,
+      details: { name: created.name, signerCount: created.signers.length },
+    });
+    return c.json({ success: true, signerGroup: created }, 201);
+  },
+);
+
+pamRoutes.patch(
+  '/signer-groups/:id',
+  requirePamManagePolicy,
+  requireMfa(),
+  zValidator('json', updateSignerGroupSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const id = c.req.param('id');
+    const payload = c.req.valid('json');
+    if (!z.string().guid().safeParse(id).success) {
+      return c.json({ error: 'Invalid signer group id' }, 400);
+    }
+    const [existing] = await db
+      .select()
+      .from(pamSignerGroups)
+      .where(eq(pamSignerGroups.id, id!))
+      .limit(1);
+    if (!existing || !auth.canAccessOrg(existing.orgId)) {
+      return c.json({ error: 'Signer group not found' }, 404);
+    }
+    const [updated] = await db
+      .update(pamSignerGroups)
+      .set({
+        ...(payload.name !== undefined ? { name: payload.name } : {}),
+        ...(payload.description !== undefined ? { description: payload.description } : {}),
+        ...(payload.signers !== undefined ? { signers: payload.signers } : {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(pamSignerGroups.id, id!))
+      .returning();
+    writeAuditEvent(c, {
+      orgId: existing.orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      action: 'pam.signer_group.update',
+      resourceType: 'pam_signer_group',
+      resourceId: id,
+      details: { changed: Object.keys(payload) },
+    });
+    return c.json({ success: true, signerGroup: updated });
+  },
+);
+
+pamRoutes.delete('/signer-groups/:id', requirePamManagePolicy, requireMfa(), async (c) => {
+  const auth = c.get('auth');
+  if (!canMutateOrgWideGovernance(auth)) {
+    return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+  }
+  const id = c.req.param('id');
+  if (!z.string().guid().safeParse(id).success) {
+    return c.json({ error: 'Invalid signer group id' }, 400);
+  }
+  const [existing] = await db
+    .select()
+    .from(pamSignerGroups)
+    .where(eq(pamSignerGroups.id, id!))
+    .limit(1);
+  if (!existing || !auth.canAccessOrg(existing.orgId)) {
+    return c.json({ error: 'Signer group not found' }, 404);
+  }
+  // A group referenced by any rule cannot be deleted (would orphan the rule's
+  // only signer criterion). Surface a clean 409 instead of an FK error.
+  const refsRows = await db
+    .select({ refs: sql<number>`count(*)::int` })
+    .from(pamRules)
+    .where(eq(pamRules.matchSignerGroupId, id!));
+  const refs = refsRows[0]?.refs ?? 0;
+  if (refs > 0) {
+    return c.json(
+      { error: `Signer group is used by ${refs} rule(s); remove those references first` },
+      409,
+    );
+  }
+  await db.delete(pamSignerGroups).where(eq(pamSignerGroups.id, id!));
+  writeAuditEvent(c, {
+    orgId: existing.orgId,
+    actorType: 'user',
+    actorId: auth.user.id,
+    action: 'pam.signer_group.delete',
+    resourceType: 'pam_signer_group',
+    resourceId: id,
+    details: { name: existing.name },
+  });
+  return c.json({ success: true });
+});

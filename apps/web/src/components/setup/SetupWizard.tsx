@@ -1,0 +1,206 @@
+import { useEffect, useState } from 'react';
+import { Loader2 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import SetupStepper from './SetupStepper';
+import AccountSetupStep from './AccountSetupStep';
+import OrganizationSetupStep from './OrganizationSetupStep';
+import RegionalSetupStep from './RegionalSetupStep';
+import EnrollDeviceStep from './EnrollDeviceStep';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+const STORAGE_KEY = 'breeze-setup-step';
+const SETUP_ORG_KEY = 'breeze-setup-org';
+const SETUP_SITE_KEY = 'breeze-setup-site';
+const SETUP_STEP_COUNT = 4;
+
+export default function SetupWizard() {
+  const { t } = useTranslation('auth');
+  const steps = [
+    { label: t('setup.steps.account') },
+    { label: t('setup.steps.organization') },
+    { label: t('setup.steps.regional') },
+    { label: t('setup.steps.installAgent') },
+  ];
+  const [currentStep, setCurrentStep] = useState(0);
+  const [checkingAuth, setCheckingAuth] = useState(true);
+  const [isHydrated, setIsHydrated] = useState(false);
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const isLoading = useAuthStore((s) => s.isLoading);
+
+  // Created org/site IDs passed from step 1 to step 2 (persisted to localStorage)
+  const [orgId, setOrgId] = useState<string | null>(() => {
+    try { return localStorage.getItem(SETUP_ORG_KEY); } catch { return null; }
+  });
+  const [siteId, setSiteId] = useState<string | null>(() => {
+    try { return localStorage.getItem(SETUP_SITE_KEY); } catch { return null; }
+  });
+
+  // Names for completion screen
+  const [orgName, setOrgName] = useState('');
+  const [siteName, setSiteName] = useState('');
+
+  // Wait for zustand to rehydrate from localStorage before checking auth
+  useEffect(() => {
+    const timer = setTimeout(() => setIsHydrated(true), 100);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // Restore step from localStorage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const step = parseInt(saved, 10);
+        if (step >= 0 && step < SETUP_STEP_COUNT) {
+          setCurrentStep(step);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // Persist step to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, String(currentStep));
+    } catch {
+      // ignore
+    }
+  }, [currentStep]);
+
+  // Auth guard: redirect non-setup users away
+  useEffect(() => {
+    if (!isHydrated || isLoading) return;
+
+    if (!isAuthenticated) {
+      window.location.href = '/login';
+      return;
+    }
+
+    // Check if this user actually needs setup
+    const checkSetup = async () => {
+      try {
+        const res = await fetchWithAuth('/users/me');
+        if (res.ok) {
+          const data = await res.json();
+          if (!data.requiresSetup) {
+            window.location.href = '/';
+            return;
+          }
+        }
+      } catch {
+        // API check failed — redirect to home rather than allowing unauthorized wizard access
+        window.location.href = '/';
+        return;
+      }
+      setCheckingAuth(false);
+    };
+
+    checkSetup();
+  }, [isHydrated, isLoading, isAuthenticated]);
+
+  const handleAccountStepComplete = () => {
+    setCurrentStep(1);
+  };
+
+  const handleOrgStepComplete = (createdOrgId: string, createdSiteId: string, createdOrgName: string, createdSiteName: string) => {
+    setOrgId(createdOrgId);
+    setSiteId(createdSiteId);
+    setOrgName(createdOrgName);
+    setSiteName(createdSiteName);
+    try { localStorage.setItem(SETUP_ORG_KEY, createdOrgId); } catch { /* ignore */ }
+    try { localStorage.setItem(SETUP_SITE_KEY, createdSiteId); } catch { /* ignore */ }
+    setCurrentStep(2);
+  };
+
+  const handleRegionalStepComplete = () => {
+    setCurrentStep(3);
+  };
+
+  const handleStepClick = (step: number) => {
+    setCurrentStep(step);
+  };
+
+  const handleBackToOrg = () => {
+    setCurrentStep(1);
+  };
+
+  const handleBackToRegional = () => {
+    setCurrentStep(2);
+  };
+
+  const handleSkipAll = async () => {
+    try {
+      await fetchWithAuth('/system/setup-complete', { method: 'POST' });
+    } catch (err) {
+      console.warn('[SetupWizard] Failed to mark setup complete:', err);
+    }
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(SETUP_ORG_KEY);
+      localStorage.removeItem(SETUP_SITE_KEY);
+    } catch (err) {
+      console.warn('[SetupWizard] Failed to clear localStorage:', err);
+    }
+    window.location.href = '/';
+  };
+
+  const handleEnrollFinish = () => {
+    // EnrollDeviceStep handles setup-complete and redirect internally
+  };
+
+  if (checkingAuth) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-3 py-12">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        <p className="text-sm text-muted-foreground">{t('setup.wizard.checkingAccount')}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-8">
+      <SetupStepper steps={steps} currentStep={currentStep} onStepClick={handleStepClick} />
+
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        {currentStep === 0 && (
+          <AccountSetupStep onNext={handleAccountStepComplete} />
+        )}
+        {currentStep === 1 && (
+          <OrganizationSetupStep onNext={handleOrgStepComplete} />
+        )}
+        {currentStep === 2 && (
+          <RegionalSetupStep
+            siteId={siteId}
+            onNext={handleRegionalStepComplete}
+            onBack={handleBackToOrg}
+          />
+        )}
+        {currentStep === 3 && orgId && siteId && (
+          <EnrollDeviceStep
+            orgId={orgId}
+            siteId={siteId}
+            onBack={handleBackToRegional}
+            onFinish={handleEnrollFinish}
+          />
+        )}
+      </div>
+
+      {currentStep === 0 && (
+        <div className="text-center">
+          <button
+            onClick={handleSkipAll}
+            className="text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+          >
+            {t('setup.wizard.skipSetup')}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

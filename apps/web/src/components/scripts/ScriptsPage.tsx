@@ -1,0 +1,649 @@
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { extractApiError } from '@/lib/apiError';
+import { Plus, Download, Search, Upload, X, Loader2, Check, FileCode, ArrowRight } from 'lucide-react';
+import ScriptList, { type Script, type ScriptLanguage, type OSType } from './ScriptList';
+import { ScriptBundleExportModal, ScriptBundleImportModal } from './ScriptBundleImport';
+import ScriptExecutionModal, { type Site } from './ScriptExecutionModal';
+import ExecutionDetails from './ExecutionDetails';
+import type { ScriptExecution } from './ExecutionHistory';
+import type { ScriptParameter } from './ScriptForm';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { fetchAllScripts } from '@/lib/scriptsFetch';
+import { useJwtClaims } from '@/lib/authScope';
+import { useOrgStore } from '../../stores/orgStore';
+import { showToast } from '../shared/Toast';
+import { cn } from '@/lib/utils';
+import { navigateTo } from '@/lib/navigation';
+import { asList } from '@/lib/asList';
+import { runAction, handleActionError } from '@/lib/runAction';
+import { cloneScript } from '@/lib/api/scripts';
+import { deviceScriptsHref, scriptExecutionsHref } from '@/lib/deviceScriptsLink';
+import type { ScriptAdmissionResult } from '@breeze/shared';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+type ModalMode =
+  | 'closed'
+  | 'execute'
+  | 'delete'
+  | 'execution-details'
+  | 'import-library'
+  | 'bundle-export'
+  | 'bundle-import';
+
+type ScriptWithDetails = Script & {
+  parameters?: ScriptParameter[];
+  content?: string;
+};
+
+type SystemScript = {
+  id: string;
+  name: string;
+  description?: string;
+  language: ScriptLanguage;
+  category: string;
+  osTypes: OSType[];
+};
+
+export default function ScriptsPage() {
+  const { t } = useTranslation('scripts');
+  const [scripts, setScripts] = useState<ScriptWithDetails[]>([]);
+  const [sites, setSites] = useState<Site[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [modalMode, setModalMode] = useState<ModalMode>('closed');
+  const [selectedScript, setSelectedScript] = useState<ScriptWithDetails | null>(null);
+  const [selectedExecution, setSelectedExecution] = useState<ScriptExecution | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [systemScripts, setSystemScripts] = useState<SystemScript[]>([]);
+  const [loadingLibrary, setLoadingLibrary] = useState(false);
+  const [importingId, setImportingId] = useState<string | null>(null);
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
+  const [libraryQuery, setLibraryQuery] = useState('');
+  const [libraryCategoryFilter, setLibraryCategoryFilter] = useState<string>('all');
+
+  const { organizations, currentOrgId } = useOrgStore();
+  const claims = useJwtClaims();
+  const isPartner = claims.status === 'resolved' && claims.claims.scope === 'partner';
+  const canManagePartnerWide = useAuthStore(s => s.user?.canManagePartnerWide ?? true);
+  const [importTarget, setImportTarget] = useState('');
+  const [completedImports, setCompletedImports] = useState<Set<string>>(new Set());
+  const targetOrgId = isPartner ? (importTarget === 'partner' ? null : importTarget) : currentOrgId;
+  const targetKey = isPartner ? importTarget : (currentOrgId ?? 'organization');
+  const currentOrg = organizations.find(o => o.id === currentOrgId) ?? null;
+
+  const fetchScripts = useCallback(async (opts: { silent?: boolean } = {}) => {
+    try {
+      // `silent` skips the full-page loading state for a background refetch
+      // (e.g. the list refresh after a bundle import) — flipping `loading`
+      // true unmounts the whole page body, including any open modal, which
+      // discards that modal's own state (#6005: the bundle-import success
+      // screen reset to the blank picker because its parent's own refetch
+      // tore it down mid-flight).
+      if (!opts.silent) setLoading(true);
+      setError(undefined);
+      // #3301 — walk every page. A bare `/scripts` returns only the first 50,
+      // and this page has no pagination controls, so script 51+ was simply
+      // unreachable here.
+      const { data } = await fetchAllScripts<ScriptWithDetails>();
+      setScripts(data);
+    } catch (err) {
+      // fetchAllScripts throws the failed Response (not an Error), so the 401
+      // redirect has to be checked on that shape — an `instanceof Error` test
+      // alone would drop the logout and show a generic message instead.
+      if (err instanceof Response) {
+        if (err.status === 401) {
+          void navigateTo('/login', { replace: true });
+          return;
+        }
+        if (!opts.silent) setError(t('scriptsPage.errors.fetch'));
+        return;
+      }
+      // A silent (background) refetch must not swap the page for the error
+      // branch either — that would unmount the open import modal (#6005).
+      if (!opts.silent) setError(err instanceof Error ? err.message : t('scriptsPage.errors.generic'));
+    } finally {
+      if (!opts.silent) setLoading(false);
+    }
+  }, [t]);
+
+  const fetchSites = useCallback(async () => {
+    try {
+      const response = await fetchWithAuth('/orgs/sites');
+      if (response.ok) {
+        const data = await response.json();
+        setSites(asList(data, 'sites'));
+      }
+    } catch {
+      // Silently fail - sites will be empty
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchScripts();
+    fetchSites();
+  }, [fetchScripts, fetchSites]);
+
+  const handleRun = async (script: Script) => {
+    // Fetch full script details including parameters
+    try {
+      const response = await fetchWithAuth(`/scripts/${script.id}`);
+      if (response.ok) {
+        const data = await response.json();
+        setSelectedScript(data.script ?? data);
+      } else {
+        setSelectedScript(script);
+      }
+    } catch {
+      setSelectedScript(script);
+    }
+    setModalMode('execute');
+  };
+
+  const handleEdit = (script: Script) => {
+    void navigateTo(`/scripts/${script.id}`);
+  };
+
+  // #4887: one-click same-scope duplicate from the list row. Landing on the
+  // new draft (rather than refreshing the list in place) is the point of
+  // duplicating — the user is about to edit it.
+  const handleDuplicate = async (script: Script) => {
+    if (duplicatingId) return;
+    setDuplicatingId(script.id);
+    try {
+      const cloned = await runAction<{ id: string }>({
+        request: () => cloneScript(script.id),
+        errorFallback: t('scriptsPage.errors.duplicate'),
+        onUnauthorized: () => void navigateTo('/login', { replace: true }),
+      });
+      if (cloned?.id) void navigateTo(`/scripts/${cloned.id}`);
+      else await fetchScripts();
+    } catch (err) {
+      handleActionError(err, t('scriptsPage.errors.duplicate'));
+    } finally {
+      setDuplicatingId(null);
+    }
+  };
+
+  const handleDelete = (script: Script) => {
+    setSelectedScript(script);
+    setModalMode('delete');
+  };
+
+  const handleCloseModal = () => {
+    setModalMode('closed');
+    setSelectedScript(null);
+    setSelectedExecution(null);
+  };
+
+  const handleExecute = async (
+    scriptId: string,
+    deviceIds: string[],
+    parameters: Record<string, string | number | boolean>,
+    runAs: 'system' | 'user'
+  ) => {
+    const response = await fetchWithAuth(`/scripts/${scriptId}/execute`, {
+      method: 'POST',
+      body: JSON.stringify({ deviceIds, parameters, runAs })
+    });
+
+    const data = await response.json().catch(() => ({})) as ScriptAdmissionResult & { error?: string };
+
+    if (!response.ok) {
+      throw new Error(extractApiError(data, t('scriptsPage.errors.execute')));
+    }
+
+    const admittedTargets = data.targets.filter(target => target.admission === 'admitted');
+    if (admittedTargets.length > 0) {
+      await fetchScripts();
+      // #4886 — a library run left the operator stranded on this (now stale)
+      // list with no way to see the result land. A single-device run goes to
+      // that device's Scripts tab (same hash-highlight convention DeviceDetails
+      // already uses for anomalies), where the new execution is expanded live;
+      // a multi-device run has no single "the" device, so it goes to the
+      // script's execution-history list instead.
+      // Keep partial admission results visible so the operator can inspect
+      // blocked or suppressed targets before leaving the execute flow.
+      if (admittedTargets.length !== data.targets.length) return data;
+      if (deviceIds.length === 1) {
+        void navigateTo(deviceScriptsHref(deviceIds[0]!, admittedTargets[0]?.executionId));
+      } else {
+        void navigateTo(scriptExecutionsHref(scriptId));
+      }
+    }
+    return data;
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!selectedScript) return;
+
+    const scriptToDelete = selectedScript;
+    handleCloseModal();
+
+    // Deferred execution with undo — gives the user 5 seconds to cancel
+    let cancelled = false;
+    showToast({
+      type: 'undo',
+      message: t('scriptsPage.toast.deleting', { name: scriptToDelete.name }),
+      duration: 5000,
+      onUndo: () => {
+        cancelled = true;
+        showToast({ type: 'success', message: t('scriptsPage.toast.deleteCancelled'), duration: 2000 });
+      }
+    });
+
+    setTimeout(async () => {
+      if (cancelled) return;
+      try {
+        const response = await fetchWithAuth(`/scripts/${scriptToDelete.id}`, {
+          method: 'DELETE'
+        });
+
+        if (!response.ok) {
+          throw new Error(t('scriptsPage.errors.delete'));
+        }
+
+        showToast({ type: 'success', message: t('scriptsPage.toast.deleted', { name: scriptToDelete.name }) });
+        await fetchScripts();
+      } catch (err) {
+        showToast({ type: 'error', message: err instanceof Error ? err.message : t('scriptsPage.errors.deleteTryAgain') });
+      }
+    }, 5000);
+  };
+
+  const handleOpenLibrary = async () => {
+    setImportTarget(currentOrgId ?? (isPartner && canManagePartnerWide ? 'partner' : organizations.length === 1 ? organizations[0].id : ''));
+    setModalMode('import-library');
+    setLibraryQuery('');
+    setLibraryCategoryFilter('all');
+    setLoadingLibrary(true);
+    try {
+      const response = await fetchWithAuth('/scripts/system-library');
+      if (response.ok) {
+        const data = await response.json();
+        setSystemScripts(data.data ?? []);
+      }
+    } catch {
+      // handled inline
+    } finally {
+      setLoadingLibrary(false);
+    }
+  };
+
+  const handleImport = async (systemScript: SystemScript) => {
+    if (isPartner && !importTarget) return;
+    setImportingId(systemScript.id);
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/scripts/import/${systemScript.id}`, {
+          method: 'POST',
+          body: JSON.stringify(isPartner && importTarget === 'partner'
+            ? { ownerScope: 'partner' }
+            : { ownerScope: 'organization', ...(targetOrgId ? { orgId: targetOrgId } : {}) })
+        }),
+        errorFallback: t('scriptsPage.errors.import'),
+        successMessage: t('scriptsPage.library.importSuccess', { name: systemScript.name }),
+        friendly: code => code === 'PARTNER_WIDE_FORBIDDEN'
+          ? t('scriptsPage.library.partnerPermission') : undefined,
+      });
+      setCompletedImports(prev => new Set(prev).add(`${targetKey}:${systemScript.name}`));
+      await fetchScripts();
+    } catch (err) {
+      handleActionError(err, t('scriptsPage.errors.import'));
+    } finally {
+      setImportingId(null);
+    }
+  };
+
+  // A same-name script in another target does not block this import.
+  const importedNames = useMemo(() => new Set(scripts.filter(script =>
+    isPartner && importTarget === 'partner'
+      ? !script.orgId && script.partnerId === (claims.status === 'resolved' ? claims.claims.partnerId : null)
+      : !!targetOrgId && script.orgId === targetOrgId
+  ).map(script => script.name)), [scripts, isPartner, importTarget, targetOrgId, claims]);
+
+  const filteredSystemScripts = useMemo(() => {
+    const q = libraryQuery.trim().toLowerCase();
+    return systemScripts.filter(s => {
+      const matchesQuery = q.length === 0
+        || s.name.toLowerCase().includes(q)
+        || s.description?.toLowerCase().includes(q);
+      const matchesCategory = libraryCategoryFilter === 'all' || s.category === libraryCategoryFilter;
+      return matchesQuery && matchesCategory;
+    });
+  }, [systemScripts, libraryQuery, libraryCategoryFilter]);
+
+  const libraryCategories = useMemo(() => {
+    const cats = new Set(systemScripts.map(s => s.category));
+    return Array.from(cats).sort();
+  }, [systemScripts]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('scriptsPage.loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && scripts.length === 0) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        <button
+          type="button"
+          onClick={() => void fetchScripts()}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+        >
+          {t('common:actions.retry')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6" data-testid="scripts-page">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight" data-testid="scripts-heading">{t('scriptsPage.title')}</h1>
+          <p className="text-muted-foreground">{t('scriptsPage.description')}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setModalMode('bundle-import')}
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
+            data-testid="bundle-import-open"
+          >
+            <Upload className="h-4 w-4" />
+            {t('bundle.importButton')}
+          </button>
+          <button
+            type="button"
+            onClick={() => setModalMode('bundle-export')}
+            disabled={scripts.length === 0}
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+            data-testid="bundle-export-open"
+          >
+            <Download className="h-4 w-4" />
+            {t('bundle.exportButton')}
+          </button>
+          <button
+            type="button"
+            onClick={handleOpenLibrary}
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
+          >
+            <Download className="h-4 w-4" />
+            {t('scriptsPage.actions.importFromLibrary')}
+          </button>
+          <a
+            href="/scripts/new"
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:bg-primary/90"
+          >
+            <Plus className="h-4 w-4" />
+            {t('scriptsPage.actions.newScript')}
+          </a>
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      {scripts.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <div className="rounded-full bg-primary/10 p-4 mb-4">
+            <FileCode className="h-8 w-8 text-primary" />
+          </div>
+          <h2 className="text-lg font-semibold text-foreground mb-1">{t('scriptsPage.empty.title')}</h2>
+          <p className="text-sm text-muted-foreground max-w-md mb-6">
+            {t('scriptsPage.empty.description')}
+          </p>
+          <a href="/scripts/new" className="inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
+            {t('scriptsPage.actions.createScript')}
+            <ArrowRight className="h-4 w-4" />
+          </a>
+        </div>
+      ) : (
+        <ScriptList
+          scripts={scripts}
+          onRun={handleRun}
+          onEdit={handleEdit}
+          onDuplicate={(script) => void handleDuplicate(script)}
+          onDelete={handleDelete}
+          onOpenLibrary={() => void handleOpenLibrary()}
+          organizations={organizations}
+        />
+      )}
+
+      {/* Execute Modal */}
+      {modalMode === 'execute' && selectedScript && (
+        <ScriptExecutionModal
+          script={selectedScript}
+          sites={sites}
+          isOpen={true}
+          onClose={handleCloseModal}
+          onExecute={handleExecute}
+        />
+      )}
+
+      {/* Execution Details Modal */}
+      {modalMode === 'execution-details' && selectedExecution && (
+        <ExecutionDetails
+          execution={selectedExecution}
+          isOpen={true}
+          onClose={handleCloseModal}
+        />
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {modalMode === 'delete' && selectedScript && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
+          <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-xs">
+            <h2 className="text-lg font-semibold">{t('scriptsPage.deleteDialog.title')}</h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t('scriptsPage.deleteDialog.confirmPrefix')}{' '}
+              <span className="font-medium">{selectedScript.name}</span>?{' '}
+              {t('scriptsPage.deleteDialog.confirmSuffix')}
+            </p>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={handleCloseModal}
+                className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+              >
+                {t('common:actions.cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                disabled={submitting}
+                className="inline-flex h-10 items-center justify-center rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground transition hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {submitting ? t('scriptsPage.actions.deleting') : t('common:actions.delete')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bundle export/import (#3245) */}
+      {modalMode === 'bundle-export' && (
+        <ScriptBundleExportModal isOpen={true} onClose={handleCloseModal} />
+      )}
+      {modalMode === 'bundle-import' && (
+        <ScriptBundleImportModal
+          isOpen={true}
+          onClose={handleCloseModal}
+          onImported={() => void fetchScripts({ silent: true })}
+        />
+      )}
+
+      {/* Import from Library Modal */}
+      {modalMode === 'import-library' && (
+        <div data-testid="scripts-library-dialog" className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
+          <div className="w-full max-w-2xl max-h-[80vh] overflow-hidden rounded-lg border bg-card shadow-lg flex flex-col">
+            <div className="flex items-center justify-between border-b px-6 py-4">
+              <div>
+                <h2 className="text-lg font-semibold">{t('scriptsPage.library.title')}</h2>
+                <p className="text-sm text-muted-foreground">{t('scriptsPage.library.description')}</p>
+              </div>
+              <button
+                type="button"
+                onClick={handleCloseModal}
+                data-testid="scripts-library-close"
+                className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {isPartner && (
+              <div className="space-y-2 border-b px-6 py-3">
+                <label htmlFor="scripts-library-target" className="block text-sm font-medium">
+                  {t('scriptsPage.library.target')}
+                </label>
+                <select
+                  id="scripts-library-target"
+                  data-testid="scripts-library-target"
+                  value={importTarget}
+                  onChange={event => setImportTarget(event.target.value)}
+                  disabled={importingId !== null}
+                  aria-describedby={!canManagePartnerWide ? 'scripts-library-target-help' : undefined}
+                  className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring disabled:opacity-60"
+                >
+                  {canManagePartnerWide && <option value="partner">{t('scriptsPage.library.allOrgs')}</option>}
+                  <option value="" disabled>{t('scriptsPage.library.chooseOrg')}</option>
+                  {organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}
+                </select>
+                {!canManagePartnerWide && (
+                  <p id="scripts-library-target-help" data-testid="scripts-library-target-help" className="text-sm text-muted-foreground">
+                    {t('scriptsPage.library.partnerPermission')}
+                  </p>
+                )}
+              </div>
+            )}
+
+            <div className="border-b px-6 py-3">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <div className="relative flex-1">
+                  <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <input
+                    type="search"
+                    placeholder={t('scriptsPage.library.searchPlaceholder')}
+                    value={libraryQuery}
+                    onChange={e => setLibraryQuery(e.target.value)}
+                    className="h-9 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+                {libraryCategories.length > 0 && (
+                  <select
+                    value={libraryCategoryFilter}
+                    onChange={e => setLibraryCategoryFilter(e.target.value)}
+                    className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  >
+                    <option value="all">{t('scriptList.filters.allCategories')}</option>
+                    {libraryCategories.map(cat => (
+                      <option key={cat} value={cat}>{cat}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-4">
+              {loadingLibrary ? (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                </div>
+              ) : filteredSystemScripts.length === 0 ? (
+                <div className="py-12 text-center text-sm text-muted-foreground">
+                  {systemScripts.length === 0 ? t('scriptsPage.library.empty') : t('scriptsPage.library.noMatches')}
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {filteredSystemScripts.map(script => {
+                    const alreadyImported = importedNames.has(script.name) || completedImports.has(`${targetKey}:${script.name}`);
+                    const isImporting = importingId === script.id;
+                    return (
+                      <div
+                        key={script.id}
+                        className="flex items-start gap-3 rounded-lg border p-4"
+                      >
+                        <div className={cn(
+                          'flex h-8 w-8 shrink-0 items-center justify-center rounded text-xs font-bold',
+                          script.language === 'powershell' ? 'bg-blue-500/20 text-blue-700' :
+                          script.language === 'bash' ? 'bg-green-500/20 text-green-700' :
+                          script.language === 'python' ? 'bg-yellow-500/20 text-yellow-700' :
+                          'bg-gray-500/20 text-gray-700'
+                        )}>
+                          {script.language === 'powershell' ? 'PS' : script.language === 'bash' ? '$' : script.language === 'python' ? 'Py' : '>'}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="font-medium">{script.name}</p>
+                          {script.description && (
+                            <p className="mt-0.5 text-sm text-muted-foreground line-clamp-2">
+                              {script.description}
+                            </p>
+                          )}
+                          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                            <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5">
+                              {script.category}
+                            </span>
+                            <span>{script.osTypes.join(', ')}</span>
+                          </div>
+                        </div>
+                        {alreadyImported ? (
+                          <span className="inline-flex items-center gap-1 text-xs text-muted-foreground shrink-0">
+                            <Check className="h-4 w-4" />
+                            {t('scriptsPage.library.imported')}
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            data-testid={`scripts-library-import-${script.id}`}
+                            onClick={() => handleImport(script)}
+                            disabled={importingId !== null || (isPartner && !importTarget)}
+                            className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border px-3 text-xs font-medium transition hover:bg-muted disabled:opacity-60 shrink-0"
+                          >
+                            {isImporting ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <Download className="h-3 w-3" />
+                            )}
+                            {t('scriptsPage.library.import')}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between border-t px-6 py-4">
+              <p className="text-sm text-muted-foreground">
+                {t('scriptsPage.library.availableCount', { count: filteredSystemScripts.length })}
+              </p>
+              <button
+                type="button"
+                onClick={handleCloseModal}
+                className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+              >
+                {t('common:actions.done')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

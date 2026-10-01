@@ -1,0 +1,1237 @@
+import { randomBytes, createHash } from 'crypto';
+import { createRemoteJWKSet, jwtVerify, customFetch } from 'jose';
+import { safeFetch, SsrfBlockedError, isPrivateIp, isAlwaysBlockedIp } from './urlSafety';
+
+// ============================================
+// Types
+// ============================================
+
+export interface OIDCConfig {
+  issuer: string;
+  clientId: string;
+  clientSecret: string;
+  authorizationUrl: string;
+  tokenUrl: string;
+  userInfoUrl: string;
+  jwksUrl?: string;
+  scopes: string;
+  /**
+   * Self-host escape hatch for an internal IdP on an RFC1918 address / plain
+   * HTTP. Resolved ONCE by getOIDCConfig from selfHostAllowsPrivateNetwork() —
+   * never from a request-supplied value. Loopback/link-local/metadata stay
+   * blocked either way (safeFetch's isAlwaysBlockedIp).
+   */
+  allowPrivateNetwork?: boolean;
+}
+
+export interface OIDCTokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in?: number;
+  refresh_token?: string;
+  id_token?: string;
+  scope?: string;
+}
+
+export interface OIDCUserInfo {
+  sub: string;
+  email?: string;
+  email_verified?: boolean;
+  name?: string;
+  given_name?: string;
+  family_name?: string;
+  picture?: string;
+  [key: string]: unknown;
+}
+
+export interface PKCEChallenge {
+  codeVerifier: string;
+  codeChallenge: string;
+  codeChallengeMethod: 'S256';
+}
+
+// ============================================
+// PKCE Support
+// ============================================
+
+export function generatePKCEChallenge(): PKCEChallenge {
+  const codeVerifier = randomBytes(64).toString('base64url');
+  const codeChallenge = createHash('sha256')
+    .update(codeVerifier)
+    .digest('base64url');
+
+  return {
+    codeVerifier,
+    codeChallenge,
+    codeChallengeMethod: 'S256'
+  };
+}
+
+// ============================================
+// State & Nonce Generation
+// ============================================
+
+export function generateState(): string {
+  return randomBytes(32).toString('hex');
+}
+
+export function generateNonce(): string {
+  return randomBytes(32).toString('hex');
+}
+
+// ============================================
+// Authorization URL Builder
+// ============================================
+
+export interface AuthorizationUrlParams {
+  config: OIDCConfig;
+  state: string;
+  nonce: string;
+  redirectUri: string;
+  pkce?: PKCEChallenge;
+  /** OIDC `prompt`. Pass 'login' to force the IdP to re-authenticate. */
+  prompt?: string;
+  /** OIDC `max_age` in seconds. 0 demands a fresh authentication. */
+  maxAge?: number;
+}
+
+export function buildAuthorizationUrl(params: AuthorizationUrlParams): string {
+  const { config, state, nonce, redirectUri, pkce, prompt, maxAge } = params;
+
+  const url = new URL(config.authorizationUrl);
+  url.searchParams.set('client_id', config.clientId);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('scope', config.scopes);
+  url.searchParams.set('redirect_uri', redirectUri);
+  url.searchParams.set('state', state);
+  url.searchParams.set('nonce', nonce);
+
+  if (pkce) {
+    url.searchParams.set('code_challenge', pkce.codeChallenge);
+    url.searchParams.set('code_challenge_method', pkce.codeChallengeMethod);
+  }
+
+  if (prompt) {
+    url.searchParams.set('prompt', prompt);
+  }
+  // `!= null`, NOT a truthy check: max_age=0 is the value that actually forces
+  // a re-authentication, and `if (maxAge)` would silently drop it.
+  if (maxAge != null) {
+    url.searchParams.set('max_age', String(maxAge));
+  }
+
+  return url.toString();
+}
+
+// ============================================
+// Token Exchange
+// ============================================
+
+export interface TokenExchangeParams {
+  config: OIDCConfig;
+  code: string;
+  redirectUri: string;
+  codeVerifier?: string;
+}
+
+export async function exchangeCodeForTokens(params: TokenExchangeParams): Promise<OIDCTokenResponse> {
+  const { config, code, redirectUri, codeVerifier } = params;
+
+  // SR2-14: this request carries the DECRYPTED client_secret. A malicious or
+  // compromised discovery document could point token_endpoint at a plain-HTTP
+  // public host and exfiltrate it in cleartext. Refuse before the body is built.
+  const allowPrivateNetwork = config.allowPrivateNetwork ?? false;
+  assertSafeOidcEndpoint('token_endpoint', config.tokenUrl, allowPrivateNetwork);
+
+  const body = new URLSearchParams();
+  body.set('grant_type', 'authorization_code');
+  body.set('client_id', config.clientId);
+  body.set('client_secret', config.clientSecret);
+  body.set('code', code);
+  body.set('redirect_uri', redirectUri);
+
+  if (codeVerifier) {
+    body.set('code_verifier', codeVerifier);
+  }
+
+  const response = await safeFetch(config.tokenUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json'
+    },
+    body: body.toString(),
+    timeoutMs: OIDC_FETCH_TIMEOUT_MS,
+    maxBytes: OIDC_MAX_RESPONSE_BYTES,
+    allowPrivateNetwork
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Token exchange failed: ${response.status} ${error}`);
+  }
+
+  return response.json() as Promise<OIDCTokenResponse>;
+}
+
+// ============================================
+// User Info Retrieval
+// ============================================
+
+export async function getUserInfo(config: OIDCConfig, accessToken: string): Promise<OIDCUserInfo> {
+  const allowPrivateNetwork = config.allowPrivateNetwork ?? false;
+  assertSafeOidcEndpoint('userinfo_endpoint', config.userInfoUrl, allowPrivateNetwork);
+
+  const response = await safeFetch(config.userInfoUrl, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Accept': 'application/json'
+    },
+    timeoutMs: OIDC_FETCH_TIMEOUT_MS,
+    maxBytes: OIDC_MAX_RESPONSE_BYTES,
+    allowPrivateNetwork
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`User info fetch failed: ${response.status} ${error}`);
+  }
+
+  return response.json() as Promise<OIDCUserInfo>;
+}
+
+// ============================================
+// Token Refresh
+// ============================================
+
+export async function refreshAccessToken(config: OIDCConfig, refreshToken: string): Promise<OIDCTokenResponse> {
+  // Same client_secret cleartext concern as exchangeCodeForTokens (SR2-14).
+  // Dead code today, but guard it so it can never become a live hole.
+  const allowPrivateNetwork = config.allowPrivateNetwork ?? false;
+  assertSafeOidcEndpoint('token_endpoint', config.tokenUrl, allowPrivateNetwork);
+
+  const body = new URLSearchParams();
+  body.set('grant_type', 'refresh_token');
+  body.set('client_id', config.clientId);
+  body.set('client_secret', config.clientSecret);
+  body.set('refresh_token', refreshToken);
+
+  const response = await safeFetch(config.tokenUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json'
+    },
+    body: body.toString(),
+    timeoutMs: OIDC_FETCH_TIMEOUT_MS,
+    maxBytes: OIDC_MAX_RESPONSE_BYTES,
+    allowPrivateNetwork
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Token refresh failed: ${response.status} ${error}`);
+  }
+
+  return response.json() as Promise<OIDCTokenResponse>;
+}
+
+// ============================================
+// ID Token Verification (Basic)
+// ============================================
+
+export interface IDTokenClaims {
+  iss: string;
+  sub: string;
+  aud: string | string[];
+  exp: number;
+  iat: number;
+  nonce?: string;
+  email?: string;
+  email_verified?: boolean | string;
+  name?: string;
+  // OIDC authentication context (RFC 8176 / OIDC Core §2). `amr` lists the
+  // authentication methods the IdP used; `mfa` means multi-factor was performed.
+  amr?: string[];
+  acr?: string;
+  /** OIDC Core §2: seconds since epoch of the END-USER's authentication.
+   * Required in the id_token whenever the request carried `max_age`. */
+  auth_time?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * True when the IdP's id_token attests that multi-factor authentication was
+ * performed — `amr` contains the RFC 8176 `mfa` method reference. This is only
+ * trusted when the provider opts in via `trustsIdpMfa`; an org that does not
+ * opt in always gets `mfa:false` (fail-safe). Never used to satisfy the L4
+ * step-up, which independently re-verifies a Breeze-held factor.
+ */
+export function idpAssertedMfa(claims: Pick<IDTokenClaims, 'amr'>): boolean {
+  return Array.isArray(claims.amr) && claims.amr.includes('mfa');
+}
+
+/** Tolerance for an IdP clock running ahead of ours. */
+const AUTH_TIME_SKEW_SECONDS = 120;
+
+/**
+ * Convert a Date that postgres.js produced from a `timestamp without time
+ * zone` column into a true UTC epoch in milliseconds.
+ *
+ * postgres.js parses OIDs 1082/1114/1184 with a bare `new Date(x)`
+ * (postgres/src/types.js). For an offsetless column (1114) the wire value is
+ * `2026-08-25 18:34:15.123` — no zone marker — and V8 reads an offsetless
+ * date-time as LOCAL time. So on a host running America/Denver the resulting
+ * Date sits SIX HOURS from the instant the row actually records. Drizzle does
+ * have a UTC-correct path for exactly this (`value + '+0000'`), but it only
+ * fires when the driver hands it a string; postgres.js has already produced a
+ * Date by then, so the value passes straight through unconverted.
+ *
+ * Everywhere else in this codebase that is invisible, because DB-derived
+ * timestamps are only ever compared against other DB-derived timestamps and
+ * the offset cancels on both sides. It stops being invisible the moment one is
+ * compared against an epoch that originated OUTSIDE the database — an OIDC
+ * `auth_time`, say — which is what `assertFreshIdpAuthentication` does below.
+ * Under UTC (every container, hence all hosted production) the offset is zero
+ * and the defect is dormant; a US host then fails 100% closed, and an EU host
+ * silently WIDENS the freshness window by its offset.
+ *
+ * PRECONDITION: the column holds a UTC wall clock. That is true here because
+ * the row is written by `now()` against a Postgres whose TimeZone is UTC, and
+ * any Date the API writes is serialized by Drizzle as `toISOString()`.
+ *
+ * Do NOT use this on a `timestamptz` (1184) column: postgres.js resolves those
+ * to the correct instant already, and this would corrupt them.
+ */
+export function utcMsFromOffsetlessTimestamp(value: Date): number {
+  return value.getTime() - value.getTimezoneOffset() * 60_000;
+}
+
+/**
+ * Verify the IdP actually re-authenticated the user for THIS transaction.
+ *
+ * Two independent bounds, both required:
+ *
+ *  - `auth_time` must EXIST. OIDC Core requires the claim whenever the
+ *    authorization request carried `max_age`, but real IdPs vary: some ignore
+ *    `prompt=login` and replay a cached session, and one that does so while
+ *    omitting `auth_time` would otherwise mint an enrollment grant off a
+ *    months-old browser session. Absent claim === no proof of freshness.
+ *  - `auth_time` must be at or after `startedAtMs` (the sso_sessions row's
+ *    created_at), minus skew. A window measured from NOW would happily accept
+ *    an authentication that predates the user's click — precisely the cached
+ *    session this is meant to reject.
+ *
+ * `iat` is never a substitute: a fresh token can be minted from an old login.
+ */
+export function assertFreshIdpAuthentication(
+  claims: Pick<IDTokenClaims, 'auth_time'>,
+  startedAtMs: number,
+  nowMs: number = Date.now(),
+): { ok: true } | { ok: false; reason: 'auth_time_missing' | 'auth_time_stale' | 'auth_time_future' } {
+  const authTime = claims.auth_time;
+  if (typeof authTime !== 'number' || !Number.isFinite(authTime)) {
+    return { ok: false, reason: 'auth_time_missing' };
+  }
+  const nowSeconds = Math.floor(nowMs / 1000);
+  const startedAtSeconds = Math.floor(startedAtMs / 1000);
+  if (authTime > nowSeconds + AUTH_TIME_SKEW_SECONDS) {
+    return { ok: false, reason: 'auth_time_future' };
+  }
+  if (authTime < startedAtSeconds - AUTH_TIME_SKEW_SECONDS) {
+    return { ok: false, reason: 'auth_time_stale' };
+  }
+  return { ok: true };
+}
+
+export function decodeIdToken(idToken: string): IDTokenClaims {
+  const parts = idToken.split('.');
+  if (parts.length !== 3 || !parts[1]) {
+    throw new Error('Invalid ID token format');
+  }
+
+  const payload = Buffer.from(parts[1], 'base64url').toString('utf-8');
+  return JSON.parse(payload) as IDTokenClaims;
+}
+
+export function verifyIdTokenClaims(claims: IDTokenClaims, config: OIDCConfig, nonce: string): void {
+  // Verify issuer
+  if (claims.iss !== config.issuer) {
+    throw new Error(`Invalid issuer: expected ${config.issuer}, got ${claims.iss}`);
+  }
+
+  // Verify audience
+  const audience = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!audience.includes(config.clientId)) {
+    throw new Error(`Invalid audience: ${config.clientId} not in ${audience}`);
+  }
+
+  // Verify expiration
+  const now = Math.floor(Date.now() / 1000);
+  if (claims.exp < now) {
+    throw new Error('ID token has expired');
+  }
+
+  // Verify nonce
+  if (claims.nonce !== nonce) {
+    throw new Error('Invalid nonce');
+  }
+}
+
+// ============================================
+// ID Token Signature Verification (JWKS)
+// ============================================
+
+// Cache one remote JWKS set per (policy, jwks_uri). jose refreshes on `kid`
+// miss and on cacheMaxAge expiry, so this avoids re-fetching on every login.
+//
+// BOUNDED (SR2-13): the key is tenant-influenced (an admin picks the issuer),
+// so an unbounded Map was a slow memory-growth vector. 500 entries is far
+// beyond any realistic provider count; the oldest is evicted first (Map
+// preserves insertion order).
+const MAX_JWKS_CACHE_ENTRIES = 500;
+const idTokenJwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+
+function getIdTokenJwks(
+  jwksUri: string,
+  allowPrivateNetwork: boolean,
+): ReturnType<typeof createRemoteJWKSet> {
+  // The policy flag is part of the key: a self-host-permissive JWKS set must
+  // never be served to a strict caller.
+  const cacheKey = `${allowPrivateNetwork ? 'priv' : 'pub'}|${jwksUri}`;
+  let jwks = idTokenJwksCache.get(cacheKey);
+  if (!jwks) {
+    jwks = createRemoteJWKSet(new URL(jwksUri), {
+      cacheMaxAge: 10 * 60 * 1000, // 10 minutes
+      cooldownDuration: 30 * 1000,
+      // SR2-13: inject the SSRF-safe transport into jose itself. A URL check at
+      // construct time would NOT be enough — jose re-fetches the JWKS on its own
+      // whenever a `kid` misses or cacheMaxAge expires, using its GLOBAL fetch
+      // (undici): no scheme check, no private-IP check, no DNS pinning. Routing
+      // those refreshes through safeFetch is the only way to satisfy the design's
+      // "caching must not bypass transport validation on refresh".
+      //
+      // safeFetch(urlStr, init) is signature-compatible with jose's
+      // FetchImplementation: (url: string, options) => Promise<Response>.
+      [customFetch]: (url: string, options: Record<string, unknown>) =>
+        safeFetch(url, {
+          ...(options as object),
+          timeoutMs: OIDC_JWKS_TIMEOUT_MS,
+          maxBytes: OIDC_MAX_RESPONSE_BYTES, // unauthenticated route: cap the body
+          allowPrivateNetwork,
+        }),
+    });
+
+    if (idTokenJwksCache.size >= MAX_JWKS_CACHE_ENTRIES) {
+      const oldest = idTokenJwksCache.keys().next().value;
+      if (oldest !== undefined) idTokenJwksCache.delete(oldest);
+    }
+    idTokenJwksCache.set(cacheKey, jwks);
+  }
+  return jwks;
+}
+
+/** Test-only: clear the JWKS cache so a subsequent call rebuilds it. */
+export function _resetIdTokenJwksCacheForTests(): void {
+  idTokenJwksCache.clear();
+}
+
+/**
+ * Cryptographically verify an OIDC id_token: signature against the provider's
+ * JWKS plus issuer/audience/expiry/nonce. This is the hardened path — the IdP's
+ * signature is checked, so a forged or tampered id_token is rejected. Requires
+ * the provider's `jwksUrl` to be configured (populated from OIDC discovery).
+ *
+ * Identity for provisioning/linking still primarily flows from the
+ * server-to-server userinfo call; verifying the id_token signature closes the
+ * gap where `decodeIdToken` previously trusted an unverified token.
+ */
+export async function verifyIdTokenSignature(
+  idToken: string,
+  config: OIDCConfig,
+  nonce: string
+): Promise<IDTokenClaims> {
+  if (!config.jwksUrl) {
+    throw new Error('Cannot verify ID token signature: provider has no JWKS URL configured');
+  }
+
+  const allowPrivateNetwork = config.allowPrivateNetwork ?? false;
+  // Reject the URL before jose ever constructs a key set for it (SR2-13). The
+  // customFetch injection below covers every actual request, including jose's
+  // internal refreshes; this is the cheap up-front rejection.
+  assertSafeOidcEndpoint('jwks_uri', config.jwksUrl, allowPrivateNetwork);
+
+  const jwks = getIdTokenJwks(config.jwksUrl, allowPrivateNetwork);
+
+  let payload: IDTokenClaims;
+  try {
+    const result = await jwtVerify(idToken, jwks, {
+      issuer: config.issuer,
+      audience: config.clientId,
+      // Restrict to asymmetric algorithms; never accept `none` or HMAC, which
+      // would let a token forged with a known/empty key pass verification.
+      algorithms: ['RS256', 'RS384', 'RS512', 'ES256', 'ES384', 'PS256'],
+    });
+    payload = result.payload as unknown as IDTokenClaims;
+  } catch (err) {
+    throw new Error(`ID token signature verification failed: ${(err as Error).message}`);
+  }
+
+  // jose already enforced iss/aud/exp; nonce is OIDC-specific and checked here.
+  if (payload.nonce !== nonce) {
+    throw new Error('Invalid nonce');
+  }
+
+  return payload;
+}
+
+/**
+ * The three possible states of an OIDC `email_verified` claim, read from EITHER
+ * an id_token claim set OR a userinfo body. `email_verified` may legitimately
+ * arrive as a boolean or as a string (SR2-12).
+ *
+ * 'absent' covers missing, null, and any non-boolean junk value — an IdP that
+ * says something we cannot interpret has not asserted verification.
+ */
+export type EmailVerifiedClaim = 'true' | 'false' | 'absent';
+
+export function readEmailVerifiedClaim(
+  source: Record<string, unknown> | null | undefined,
+): EmailVerifiedClaim {
+  const ev = source?.email_verified;
+  if (ev === true || ev === 'true') return 'true';
+  if (ev === false || ev === 'false') return 'false';
+  return 'absent';
+}
+
+/**
+ * @deprecated Superseded by readEmailVerifiedClaim + the callback's axis-aware
+ * gate (SR2-12). Kept because it is the documented "explicit false only"
+ * behavior and is still unit-tested; the SSO callback no longer calls it.
+ */
+export function assertEmailVerified(claims: Pick<IDTokenClaims, 'email_verified'>): void {
+  if (readEmailVerifiedClaim(claims as Record<string, unknown>) === 'false') {
+    throw new Error('ID token email is explicitly not verified (email_verified === false)');
+  }
+}
+
+// ============================================
+// Well-Known Discovery
+// ============================================
+
+export interface OIDCDiscoveryDocument {
+  issuer: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  userinfo_endpoint: string;
+  jwks_uri: string;
+  scopes_supported?: string[];
+  response_types_supported?: string[];
+  grant_types_supported?: string[];
+}
+
+/**
+ * Fast-path SSRF pre-check for an OIDC discovery URL: rejects a bad scheme or a
+ * literal internal-IP issuer before any DNS work, so the common cases get a
+ * specific error and we avoid resolving garbage. `safeFetch` is the
+ * AUTHORITATIVE gate — it re-checks every resolved IP (with pinning) after DNS,
+ * so a hostname that resolves to an internal address is caught there even if it
+ * sails through here.
+ *
+ * IP-range decisions delegate to urlSafety's shared predicates so this
+ * pre-check and safeFetch's post-resolution gate use IDENTICAL range logic
+ * (including CGNAT, multicast, TEST-NET, and hex-pair IPv4-mapped IPv6 — the
+ * classic filter-bypass forms a hand-rolled check tends to miss):
+ *   - strict (hosted SaaS): `isPrivateIp` blocks every private/reserved range.
+ *   - `allowPrivateNetwork` (self-hosted internal IdP, e.g. Authentik/Keycloak):
+ *     `isAlwaysBlockedIp` permits ONLY RFC1918/ULA; loopback, 0.0.0.0/8,
+ *     link-local, cloud metadata, CGNAT, multicast, etc. stay blocked. Plain
+ *     HTTP is also permitted in this mode.
+ *
+ * Exported for unit testing — this is the SSRF policy pre-check, so its exact
+ * allow/block decisions are worth asserting directly.
+ */
+export function isInternalUrl(urlStr: string, allowPrivateNetwork = false): boolean {
+  let url: URL;
+  try {
+    url = new URL(urlStr);
+  } catch {
+    return true; // Malformed URLs are rejected
+  }
+
+  // Hosted SaaS requires HTTPS; self-hosted may reach an internal IdP over http.
+  if (url.protocol !== 'https:' && !(allowPrivateNetwork && url.protocol === 'http:')) return true;
+
+  // URL.hostname keeps the brackets on IPv6 literals; strip them for the IP
+  // predicates below (which expect a bare address).
+  const hostname = url.hostname.replace(/^\[|\]$/g, '');
+
+  // `localhost` is a hostname, not an IP literal — block it explicitly.
+  if (hostname === 'localhost') return true;
+
+  // Only literal IPs can be policy-decided here; a real hostname must be
+  // resolved (and pinned) by safeFetch, so let it through this fast-path and
+  // rely on the authoritative post-DNS gate. Node's URL parser has already
+  // normalized decimal/octal/hex IPv4 forms to dotted-decimal by this point.
+  const isLiteralIp = /^[0-9.]+$/.test(hostname) || hostname.includes(':');
+  if (!isLiteralIp) return false;
+
+  return allowPrivateNetwork ? isAlwaysBlockedIp(hostname) : isPrivateIp(hostname);
+}
+
+/** Wall-clock cap for provider-controlled OIDC fetches. None was set before (SR2-14). */
+export const OIDC_FETCH_TIMEOUT_MS = 10_000;
+/** JWKS cap — matches jose's own default so a healthy IdP sees no change. */
+export const OIDC_JWKS_TIMEOUT_MS = 5_000;
+/**
+ * Body ceiling for every OIDC document (discovery, token, userinfo, JWKS). All
+ * four are small; 1 MiB is orders of magnitude of headroom. safeFetch had NO
+ * size cap, and /sso/callback is UNAUTHENTICATED — so a compromised IdP
+ * returning a multi-GB JWKS would have been an unauthenticated memory-
+ * exhaustion vector the moment JWKS started flowing through safeFetch (SR2-13).
+ */
+export const OIDC_MAX_RESPONSE_BYTES = 1 * 1024 * 1024;
+
+/**
+ * One policy gate for every endpoint we will either PERSIST from a discovery
+ * document or USE at runtime (SR2-14). Enforces HTTPS (http only in self-host
+ * mode) and rejects loopback/link-local/private/metadata targets, delegating
+ * the IP predicates to urlSafety via isInternalUrl. This is the check that
+ * stops a malicious discovery document from making Breeze POST the DECRYPTED
+ * client_secret in cleartext.
+ */
+export function assertSafeOidcEndpoint(
+  label: string,
+  urlStr: string | null | undefined,
+  allowPrivateNetwork = false,
+): void {
+  if (!urlStr) {
+    throw new Error(`OIDC endpoint missing: ${label}`);
+  }
+  if (isInternalUrl(urlStr, allowPrivateNetwork)) {
+    throw new Error(`OIDC endpoint rejected (must be HTTPS and publicly routable): ${label}`);
+  }
+}
+
+/**
+ * Validate every endpoint a discovery document would cause us to persist,
+ * BEFORE it is persisted. Discovery output was written verbatim with zero
+ * validation — no scheme check, no private-IP check. Throws on the first bad
+ * one.
+ */
+export function validateDiscoveredEndpoints(
+  doc: OIDCDiscoveryDocument,
+  allowPrivateNetwork = false,
+): void {
+  assertSafeOidcEndpoint('authorization_endpoint', doc.authorization_endpoint, allowPrivateNetwork);
+  assertSafeOidcEndpoint('token_endpoint', doc.token_endpoint, allowPrivateNetwork);
+  assertSafeOidcEndpoint('userinfo_endpoint', doc.userinfo_endpoint, allowPrivateNetwork);
+  assertSafeOidcEndpoint('jwks_uri', doc.jwks_uri, allowPrivateNetwork);
+}
+
+export interface DiscoverOIDCConfigOptions {
+  /**
+   * Self-hosted opt-in for an internal IdP (Authentik/Keycloak) whose issuer
+   * resolves to an RFC1918/ULA address and/or is served over plain HTTP. Gate
+   * this on `selfHostAllowsPrivateNetwork()` at the call site — NEVER on a
+   * request-supplied value. Loopback/link-local/metadata stay blocked either
+   * way. Default false (strict, hosted-SaaS behavior).
+   */
+  allowPrivateNetwork?: boolean;
+}
+
+export async function discoverOIDCConfig(
+  issuer: string,
+  { allowPrivateNetwork = false }: DiscoverOIDCConfigOptions = {}
+): Promise<OIDCDiscoveryDocument> {
+  const wellKnownUrl = `${issuer.replace(/\/$/, '')}/.well-known/openid-configuration`;
+
+  // Fast-path SSRF pre-check (see isInternalUrl); safeFetch is authoritative.
+  if (isInternalUrl(wellKnownUrl, allowPrivateNetwork)) {
+    throw new Error('OIDC discovery URL must use HTTPS and must not point to internal network addresses');
+  }
+
+  let response: Response;
+  try {
+    response = await safeFetch(wellKnownUrl, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
+      allowPrivateNetwork,
+      timeoutMs: OIDC_FETCH_TIMEOUT_MS,
+      maxBytes: OIDC_MAX_RESPONSE_BYTES
+    });
+  } catch (err) {
+    if (err instanceof SsrfBlockedError) {
+      // Surface the SPECIFIC reason (bad scheme / no DNS records / blocked IP)
+      // and keep the cause — a mistyped issuer ("no DNS records for …") must
+      // not masquerade as an SSRF policy rejection. A blanket "must use HTTPS /
+      // no internal addresses" string is also wrong in self-host mode, where
+      // http + RFC1918 are permitted. The Test route relays this message to the
+      // UI verbatim, so the extra detail reaches the operator directly.
+      throw new Error(`OIDC discovery blocked: ${err.message}`, { cause: err });
+    }
+    throw err;
+  }
+
+  if (!response.ok) {
+    throw new Error(`OIDC discovery failed: ${response.status}`);
+  }
+
+  const doc = (await response.json()) as OIDCDiscoveryDocument;
+  // SR2-14: validate BEFORE the caller persists these. Discovery output was
+  // written to sso_providers verbatim with zero validation.
+  validateDiscoveredEndpoints(doc, allowPrivateNetwork);
+  return doc;
+}
+
+// ============================================
+// Attribute Mapping
+// ============================================
+
+export interface AttributeMapping {
+  email: string;
+  name: string;
+  firstName?: string;
+  lastName?: string;
+  groups?: string;
+}
+
+export interface MappedUserAttributes {
+  email: string;
+  name: string;
+  firstName?: string;
+  lastName?: string;
+  groups?: string[];
+}
+
+export function mapUserAttributes(userInfo: OIDCUserInfo, mapping: AttributeMapping): MappedUserAttributes {
+  const getValue = (key: string): string | undefined => {
+    const value = userInfo[key];
+    return typeof value === 'string' ? value : undefined;
+  };
+
+  const email = getValue(mapping.email);
+  if (!email) {
+    throw new Error(`Required attribute '${mapping.email}' not found in user info`);
+  }
+
+  let name = getValue(mapping.name);
+  if (!name && mapping.firstName && mapping.lastName) {
+    const firstName = getValue(mapping.firstName);
+    const lastName = getValue(mapping.lastName);
+    if (firstName && lastName) {
+      name = `${firstName} ${lastName}`;
+    }
+  }
+  if (!name) {
+    name = email.split('@')[0] || email; // fallback to email prefix or full email
+  }
+
+  const result: MappedUserAttributes = { email, name: name as string };
+
+  if (mapping.firstName) {
+    result.firstName = getValue(mapping.firstName);
+  }
+  if (mapping.lastName) {
+    result.lastName = getValue(mapping.lastName);
+  }
+  if (mapping.groups) {
+    const groups = userInfo[mapping.groups];
+    if (Array.isArray(groups)) {
+      result.groups = groups.filter(g => typeof g === 'string') as string[];
+    }
+  }
+
+  return result;
+}
+
+// ============================================
+// Common Provider Presets
+// ============================================
+
+export interface ProviderPreset {
+  name: string;
+  type: 'oidc' | 'saml';
+  issuerTemplate?: string;
+  authorizationUrl?: string;
+  tokenUrl?: string;
+  userInfoUrl?: string;
+  scopes: string;
+  attributeMapping: AttributeMapping;
+}
+
+export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
+  'azure-ad': {
+    name: 'Microsoft Azure AD',
+    type: 'oidc',
+    issuerTemplate: 'https://login.microsoftonline.com/{tenant}/v2.0',
+    scopes: 'openid profile email',
+    attributeMapping: {
+      email: 'email',
+      name: 'name',
+      firstName: 'given_name',
+      lastName: 'family_name'
+    }
+  },
+  'okta': {
+    name: 'Okta',
+    type: 'oidc',
+    issuerTemplate: 'https://{domain}.okta.com',
+    scopes: 'openid profile email groups',
+    attributeMapping: {
+      email: 'email',
+      name: 'name',
+      firstName: 'given_name',
+      lastName: 'family_name',
+      groups: 'groups'
+    }
+  },
+  'google': {
+    name: 'Google Workspace',
+    type: 'oidc',
+    issuerTemplate: 'https://accounts.google.com',
+    authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    userInfoUrl: 'https://openidconnect.googleapis.com/v1/userinfo',
+    scopes: 'openid profile email',
+    attributeMapping: {
+      email: 'email',
+      name: 'name',
+      firstName: 'given_name',
+      lastName: 'family_name'
+    }
+  },
+  'auth0': {
+    name: 'Auth0',
+    type: 'oidc',
+    issuerTemplate: 'https://{domain}.auth0.com',
+    scopes: 'openid profile email',
+    attributeMapping: {
+      email: 'email',
+      name: 'name',
+      firstName: 'given_name',
+      lastName: 'family_name'
+    }
+  }
+};
+
+// ============================================
+// SAML 2.0 Types
+// ============================================
+
+export interface SAMLConfig {
+  entityId: string;
+  ssoUrl: string;
+  sloUrl?: string;
+  certificate: string;
+  signatureAlgorithm?: 'sha256' | 'sha512';
+  digestAlgorithm?: 'sha256' | 'sha512';
+  wantAssertionsSigned?: boolean;
+  wantResponseSigned?: boolean;
+}
+
+export interface SAMLServiceProviderConfig {
+  entityId: string;
+  acsUrl: string;
+  sloUrl?: string;
+  nameIdFormat: 'emailAddress' | 'persistent' | 'transient' | 'unspecified';
+  signRequests?: boolean;
+  privateKey?: string;
+  certificate?: string;
+}
+
+export interface SAMLAssertion {
+  nameId: string;
+  nameIdFormat: string;
+  sessionIndex?: string;
+  attributes: Record<string, string | string[]>;
+  conditions?: {
+    notBefore?: string;
+    notOnOrAfter?: string;
+    audience?: string;
+  };
+}
+
+export interface SAMLResponse {
+  id: string;
+  inResponseTo?: string;
+  issuer: string;
+  status: 'success' | 'error';
+  statusCode?: string;
+  statusMessage?: string;
+  assertion?: SAMLAssertion;
+}
+
+// ============================================
+// SAML Service Provider Metadata
+// ============================================
+
+export interface SPMetadataParams {
+  entityId: string;
+  acsUrl: string;
+  sloUrl?: string;
+  certificate?: string;
+  nameIdFormat?: string;
+  orgName?: string;
+  orgDisplayName?: string;
+  orgUrl?: string;
+  contactEmail?: string;
+}
+
+export function generateSPMetadata(params: SPMetadataParams): string {
+  const {
+    entityId,
+    acsUrl,
+    sloUrl,
+    certificate,
+    nameIdFormat = 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
+    orgName = 'Breeze RMM',
+    orgDisplayName = 'Breeze RMM',
+    orgUrl = 'https://breeze.io',
+    contactEmail = 'support@breeze.io'
+  } = params;
+
+  const cleanCert = certificate
+    ? certificate.replace(/-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|\n/g, '')
+    : '';
+
+  const keyDescriptor = certificate
+    ? `
+    <md:KeyDescriptor use="signing">
+      <ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+        <ds:X509Data>
+          <ds:X509Certificate>${cleanCert}</ds:X509Certificate>
+        </ds:X509Data>
+      </ds:KeyInfo>
+    </md:KeyDescriptor>
+    <md:KeyDescriptor use="encryption">
+      <ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+        <ds:X509Data>
+          <ds:X509Certificate>${cleanCert}</ds:X509Certificate>
+        </ds:X509Data>
+      </ds:KeyInfo>
+    </md:KeyDescriptor>`
+    : '';
+
+  const sloService = sloUrl
+    ? `
+    <md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="${sloUrl}"/>
+    <md:SingleLogoutService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="${sloUrl}"/>`
+    : '';
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="${entityId}">
+  <md:SPSSODescriptor AuthnRequestsSigned="false" WantAssertionsSigned="true" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    ${keyDescriptor}${sloService}
+    <md:NameIDFormat>${nameIdFormat}</md:NameIDFormat>
+    <md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="${acsUrl}" index="0" isDefault="true"/>
+  </md:SPSSODescriptor>
+  <md:Organization>
+    <md:OrganizationName xml:lang="en">${orgName}</md:OrganizationName>
+    <md:OrganizationDisplayName xml:lang="en">${orgDisplayName}</md:OrganizationDisplayName>
+    <md:OrganizationURL xml:lang="en">${orgUrl}</md:OrganizationURL>
+  </md:Organization>
+  <md:ContactPerson contactType="technical">
+    <md:EmailAddress>${contactEmail}</md:EmailAddress>
+  </md:ContactPerson>
+</md:EntityDescriptor>`;
+}
+
+// ============================================
+// SAML Authentication Request
+// ============================================
+
+export interface SAMLAuthnRequestParams {
+  id: string;
+  issuer: string;
+  destination: string;
+  acsUrl: string;
+  nameIdFormat?: string;
+  forceAuthn?: boolean;
+}
+
+export function buildSAMLAuthnRequest(params: SAMLAuthnRequestParams): string {
+  const {
+    id,
+    issuer,
+    destination,
+    acsUrl,
+    nameIdFormat = 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
+    forceAuthn = false
+  } = params;
+
+  const issueInstant = new Date().toISOString();
+  const forceAuthnAttr = forceAuthn ? ' ForceAuthn="true"' : '';
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                    xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                    ID="${id}"
+                    Version="2.0"
+                    IssueInstant="${issueInstant}"
+                    Destination="${destination}"
+                    AssertionConsumerServiceURL="${acsUrl}"
+                    ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"${forceAuthnAttr}>
+  <saml:Issuer>${issuer}</saml:Issuer>
+  <samlp:NameIDPolicy Format="${nameIdFormat}" AllowCreate="true"/>
+</samlp:AuthnRequest>`;
+}
+
+export function generateSAMLRequestId(): string {
+  return '_' + randomBytes(16).toString('hex');
+}
+
+export function encodeSAMLRequest(xml: string): string {
+  return Buffer.from(xml, 'utf-8').toString('base64');
+}
+
+export function buildSAMLRedirectUrl(
+  ssoUrl: string,
+  samlRequest: string,
+  relayState?: string
+): string {
+  const url = new URL(ssoUrl);
+  url.searchParams.set('SAMLRequest', encodeSAMLRequest(samlRequest));
+  if (relayState) {
+    url.searchParams.set('RelayState', relayState);
+  }
+  return url.toString();
+}
+
+// ============================================
+// SAML Response Parsing (Basic)
+// ============================================
+
+export function decodeSAMLResponse(encodedResponse: string): string {
+  return Buffer.from(encodedResponse, 'base64').toString('utf-8');
+}
+
+export interface ParsedSAMLResponse {
+  success: boolean;
+  issuer?: string;
+  nameId?: string;
+  nameIdFormat?: string;
+  sessionIndex?: string;
+  attributes: Record<string, string>;
+  error?: string;
+}
+
+export function parseSAMLResponse(xml: string): ParsedSAMLResponse {
+  const result: ParsedSAMLResponse = {
+    success: false,
+    attributes: {}
+  };
+
+  // Check for success status
+  const statusMatch = xml.match(/<samlp:StatusCode[^>]*Value="([^"]+)"/);
+  if (statusMatch) {
+    result.success = statusMatch[1] === 'urn:oasis:names:tc:SAML:2.0:status:Success';
+  }
+
+  if (!result.success) {
+    const messageMatch = xml.match(/<samlp:StatusMessage>([^<]+)<\/samlp:StatusMessage>/);
+    result.error = messageMatch ? messageMatch[1] : 'SAML authentication failed';
+    return result;
+  }
+
+  // Extract Issuer
+  const issuerMatch = xml.match(/<(?:saml:)?Issuer[^>]*>([^<]+)<\/(?:saml:)?Issuer>/);
+  if (issuerMatch) {
+    result.issuer = issuerMatch[1];
+  }
+
+  // Extract NameID
+  const nameIdMatch = xml.match(/<(?:saml:)?NameID[^>]*Format="([^"]*)"[^>]*>([^<]+)<\/(?:saml:)?NameID>/);
+  if (nameIdMatch) {
+    result.nameIdFormat = nameIdMatch[1];
+    result.nameId = nameIdMatch[2];
+  } else {
+    const simpleNameIdMatch = xml.match(/<(?:saml:)?NameID[^>]*>([^<]+)<\/(?:saml:)?NameID>/);
+    if (simpleNameIdMatch) {
+      result.nameId = simpleNameIdMatch[1];
+    }
+  }
+
+  // Extract SessionIndex
+  const sessionMatch = xml.match(/SessionIndex="([^"]+)"/);
+  if (sessionMatch) {
+    result.sessionIndex = sessionMatch[1];
+  }
+
+  // Extract Attributes
+  const attributeRegex = /<(?:saml:)?Attribute[^>]*Name="([^"]+)"[^>]*>[\s\S]*?<(?:saml:)?AttributeValue[^>]*>([^<]*)<\/(?:saml:)?AttributeValue>/g;
+  let match;
+  while ((match = attributeRegex.exec(xml)) !== null) {
+    const name = match[1];
+    const value = match[2];
+    if (name && value !== undefined) {
+      const simpleName = mapSAMLAttributeName(name);
+      result.attributes[simpleName] = value;
+    }
+  }
+
+  return result;
+}
+
+function mapSAMLAttributeName(uri: string): string {
+  const mappings: Record<string, string> = {
+    'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress': 'email',
+    'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name': 'name',
+    'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname': 'firstName',
+    'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname': 'lastName',
+    'http://schemas.microsoft.com/ws/2008/06/identity/claims/groups': 'groups',
+    'http://schemas.xmlsoap.org/claims/Group': 'groups',
+    'urn:oid:0.9.2342.19200300.100.1.3': 'email',
+    'urn:oid:2.5.4.42': 'firstName',
+    'urn:oid:2.5.4.4': 'lastName',
+    'urn:oid:2.16.840.1.113730.3.1.241': 'name',
+    'email': 'email',
+    'firstName': 'firstName',
+    'lastName': 'lastName',
+    'displayName': 'name',
+    'name': 'name'
+  };
+
+  return mappings[uri] || uri.split('/').pop() || uri;
+}
+
+// ============================================
+// SAML User Extraction
+// ============================================
+
+export function extractSAMLUserInfo(
+  response: ParsedSAMLResponse,
+  mapping: AttributeMapping
+): MappedUserAttributes {
+  const getValue = (key: string): string | undefined => {
+    return response.attributes[key] || response.attributes[mapping[key as keyof AttributeMapping] as string];
+  };
+
+  let email = getValue(mapping.email);
+  if (!email && response.nameId && response.nameId.includes('@')) {
+    email = response.nameId;
+  }
+
+  if (!email) {
+    throw new Error('Email attribute not found in SAML response');
+  }
+
+  let name = getValue(mapping.name);
+  if (!name && mapping.firstName && mapping.lastName) {
+    const firstName = getValue(mapping.firstName);
+    const lastName = getValue(mapping.lastName);
+    if (firstName && lastName) {
+      name = `${firstName} ${lastName}`;
+    }
+  }
+  if (!name) {
+    name = email.split('@')[0] || email;
+  }
+
+  const result: MappedUserAttributes = { email, name };
+
+  if (mapping.firstName) {
+    result.firstName = getValue(mapping.firstName);
+  }
+  if (mapping.lastName) {
+    result.lastName = getValue(mapping.lastName);
+  }
+  if (mapping.groups) {
+    const groups = response.attributes[mapping.groups];
+    if (groups) {
+      result.groups = Array.isArray(groups) ? groups : [groups];
+    }
+  }
+
+  return result;
+}
+
+// ============================================
+// SAML Provider Presets
+// ============================================
+
+export interface SAMLProviderPreset {
+  name: string;
+  type: 'saml';
+  metadataUrlTemplate?: string;
+  ssoUrlTemplate?: string;
+  certificateInstructions: string;
+  attributeMapping: AttributeMapping;
+}
+
+export const SAML_PROVIDER_PRESETS: Record<string, SAMLProviderPreset> = {
+  'azure-ad-saml': {
+    name: 'Microsoft Azure AD (SAML)',
+    type: 'saml',
+    metadataUrlTemplate: 'https://login.microsoftonline.com/{tenant}/federationmetadata/2007-06/federationmetadata.xml',
+    ssoUrlTemplate: 'https://login.microsoftonline.com/{tenant}/saml2',
+    certificateInstructions: 'Download from Azure Portal > Enterprise Applications > Your App > SAML Signing Certificate',
+    attributeMapping: {
+      email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress',
+      name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name',
+      firstName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname',
+      lastName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname',
+      groups: 'http://schemas.microsoft.com/ws/2008/06/identity/claims/groups'
+    }
+  },
+  'okta-saml': {
+    name: 'Okta (SAML)',
+    type: 'saml',
+    metadataUrlTemplate: 'https://{domain}.okta.com/app/{appId}/sso/saml/metadata',
+    ssoUrlTemplate: 'https://{domain}.okta.com/app/{appId}/sso/saml',
+    certificateInstructions: 'Download from Okta Admin > Applications > Your App > Sign On > SAML Signing Certificates',
+    attributeMapping: {
+      email: 'email',
+      name: 'name',
+      firstName: 'firstName',
+      lastName: 'lastName',
+      groups: 'groups'
+    }
+  },
+  'onelogin-saml': {
+    name: 'OneLogin (SAML)',
+    type: 'saml',
+    metadataUrlTemplate: 'https://{domain}.onelogin.com/saml/metadata/{appId}',
+    ssoUrlTemplate: 'https://{domain}.onelogin.com/trust/saml2/http-post/sso/{appId}',
+    certificateInstructions: 'Download from OneLogin Admin > Applications > Your App > SSO > X.509 Certificate',
+    attributeMapping: {
+      email: 'User.email',
+      name: 'User.FirstName',
+      firstName: 'User.FirstName',
+      lastName: 'User.LastName'
+    }
+  },
+  'adfs-saml': {
+    name: 'Active Directory Federation Services (ADFS)',
+    type: 'saml',
+    metadataUrlTemplate: 'https://{adfs-server}/FederationMetadata/2007-06/FederationMetadata.xml',
+    ssoUrlTemplate: 'https://{adfs-server}/adfs/ls',
+    certificateInstructions: 'Export from ADFS Management Console > Service > Certificates > Token-signing',
+    attributeMapping: {
+      email: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress',
+      name: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name',
+      firstName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname',
+      lastName: 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname',
+      groups: 'http://schemas.xmlsoap.org/claims/Group'
+    }
+  },
+  'google-saml': {
+    name: 'Google Workspace (SAML)',
+    type: 'saml',
+    ssoUrlTemplate: 'https://accounts.google.com/o/saml2/idp?idpid={idpId}',
+    certificateInstructions: 'Download from Google Admin > Apps > Web and mobile apps > Your App > Download certificate',
+    attributeMapping: {
+      email: 'email',
+      name: 'name',
+      firstName: 'first_name',
+      lastName: 'last_name'
+    }
+  }
+};
+
+// Combined presets for UI
+export const ALL_SSO_PRESETS = {
+  ...PROVIDER_PRESETS,
+  ...SAML_PROVIDER_PRESETS
+};

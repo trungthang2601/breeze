@@ -1,0 +1,309 @@
+package providers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	awscfg "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+)
+
+const multipartUploadThreshold = 100 * 1024 * 1024 // 100 MB
+
+// S3Provider is a stub for S3-compatible backup storage.
+type S3Provider struct {
+	Bucket          string
+	Region          string
+	endpoint        string
+	accessKeyID     string
+	secretAccessKey string
+	sessionToken    string
+	sseAlgorithm    string
+	sseKMSKeyID     string
+	client          *s3.Client
+	clientMu        sync.Mutex
+}
+
+// NewS3Provider creates a new S3Provider.
+func NewS3Provider(bucket, region, accessKeyID, secretAccessKey, sessionToken string) *S3Provider {
+	return NewS3ProviderWithEndpoint(bucket, region, "", accessKeyID, secretAccessKey, sessionToken)
+}
+
+// BackupIdentity implements JournalIdentity. The endpoint is included
+// because a custom endpoint means an S3-compatible-but-different backend
+// (MinIO, Backblaze's S3 API, ...) even when bucket+region happen to match.
+func (s *S3Provider) BackupIdentity() string {
+	return fmt.Sprintf("s3|%s|%s|%s", s.endpoint, s.Region, s.Bucket)
+}
+
+// SetServerSideEncryption requires S3 server-side encryption on future uploads.
+func (s *S3Provider) SetServerSideEncryption(algorithm, kmsKeyID string) {
+	s.sseAlgorithm = algorithm
+	s.sseKMSKeyID = kmsKeyID
+}
+
+// NewS3ProviderWithEndpoint creates a new S3Provider with an optional custom endpoint.
+func NewS3ProviderWithEndpoint(bucket, region, endpoint, accessKeyID, secretAccessKey, sessionToken string) *S3Provider {
+	return &S3Provider{
+		Bucket:          bucket,
+		Region:          region,
+		endpoint:        endpoint,
+		accessKeyID:     accessKeyID,
+		secretAccessKey: secretAccessKey,
+		sessionToken:    sessionToken,
+	}
+}
+
+// Upload sends a local file to S3.
+func (s *S3Provider) Upload(localPath, remotePath string) error {
+	return s.UploadContext(context.Background(), localPath, remotePath)
+}
+
+// UploadContext sends a local file to S3 with cancellation support.
+func (s *S3Provider) UploadContext(ctx context.Context, localPath, remotePath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.Bucket == "" || s.Region == "" {
+		return errors.New("s3 bucket and region are required")
+	}
+	if localPath == "" {
+		return errors.New("local source path is required")
+	}
+	if remotePath == "" {
+		return errors.New("remote path is required")
+	}
+
+	client, err := s.getClient()
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to open source file: %w", err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat source file: %w", err)
+	}
+
+	input := &s3.PutObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(remotePath),
+		Body:   file,
+	}
+	switch s.sseAlgorithm {
+	case "AES256":
+		input.ServerSideEncryption = s3types.ServerSideEncryptionAes256
+	case "aws:kms":
+		input.ServerSideEncryption = s3types.ServerSideEncryptionAwsKms
+		if s.sseKMSKeyID != "" {
+			input.SSEKMSKeyId = aws.String(s.sseKMSKeyID)
+		}
+	}
+	if info.Size() > multipartUploadThreshold {
+		uploader := manager.NewUploader(client)
+		if _, err := uploader.Upload(ctx, input); err != nil {
+			return fmt.Errorf("failed to upload file to s3 with multipart upload: %w", err)
+		}
+		return nil
+	}
+
+	if _, err := client.PutObject(ctx, input); err != nil {
+		return fmt.Errorf("failed to upload file to s3: %w", err)
+	}
+	return nil
+}
+
+// Download retrieves a file from S3.
+func (s *S3Provider) Download(remotePath, localPath string) error {
+	if s.Bucket == "" || s.Region == "" {
+		return errors.New("s3 bucket and region are required")
+	}
+	if remotePath == "" {
+		return errors.New("remote path is required")
+	}
+	if localPath == "" {
+		return errors.New("local destination path is required")
+	}
+
+	client, err := s.getClient()
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(remotePath),
+	})
+	if err != nil {
+		var noSuchKey *s3types.NoSuchKey
+		if errors.As(err, &noSuchKey) {
+			return fmt.Errorf("%w: %s", ErrObjectNotFound, err)
+		}
+		return fmt.Errorf("failed to get s3 object: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	file, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("failed to create local destination file: %w", err)
+	}
+	_, copyErr := io.Copy(file, resp.Body)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return fmt.Errorf("failed to write s3 object to local file: %w", copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close local destination file: %w", closeErr)
+	}
+
+	return nil
+}
+
+// List lists objects in the bucket with the given prefix.
+func (s *S3Provider) List(prefix string) ([]string, error) {
+	if s.Bucket == "" || s.Region == "" {
+		return nil, errors.New("s3 bucket and region are required")
+	}
+
+	client, err := s.getClient()
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.Bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	keys := []string{}
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list s3 objects: %w", err)
+		}
+		for _, object := range page.Contents {
+			if object.Key != nil {
+				keys = append(keys, *object.Key)
+			}
+		}
+	}
+
+	return keys, nil
+}
+
+// Delete removes an object from the bucket.
+func (s *S3Provider) Delete(remotePath string) error {
+	if s.Bucket == "" || s.Region == "" {
+		return errors.New("s3 bucket and region are required")
+	}
+	if remotePath == "" {
+		return errors.New("remote path is required")
+	}
+
+	client, err := s.getClient()
+	if err != nil {
+		return err
+	}
+
+	if _, err := client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+		Bucket: aws.String(s.Bucket),
+		Key:    aws.String(remotePath),
+	}); err != nil {
+		return fmt.Errorf("failed to delete s3 object: %w", err)
+	}
+	return nil
+}
+
+func (s *S3Provider) getClient() (*s3.Client, error) {
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+
+	if s.client != nil {
+		return s.client, nil
+	}
+
+	// Defensive transport timeouts: without these, the AWS SDK's HTTP client
+	// has no dial/TLS/header deadline and a stalled network peer wedges the
+	// request forever. The mid-body stall (a peer that accepts the request
+	// but never finishes reading/writing the body) is NOT covered here — that
+	// case is handled by the per-file upload deadline in snapshot.go.
+	httpClient := awshttp.NewBuildableClient().
+		WithDialerOptions(func(d *net.Dialer) { d.Timeout = 30 * time.Second }).
+		WithTransportOptions(func(tr *http.Transport) {
+			tr.TLSHandshakeTimeout = 30 * time.Second
+			tr.ResponseHeaderTimeout = 2 * time.Minute
+			tr.ExpectContinueTimeout = 10 * time.Second
+		})
+
+	options := []func(*awscfg.LoadOptions) error{
+		awscfg.WithRegion(s.Region),
+		awscfg.WithHTTPClient(httpClient),
+		// #6350: the SDK default (WhenSupported) makes every HTTPS PutObject
+		// carry a CRC32 trailer via `aws-chunked` transfer encoding, and when
+		// the body length is known with no explicit ChunkLength the SDK emits
+		// the WHOLE body as ONE chunk. MinIO caps a chunk at 16 MiB
+		// (maxChunkSize in cmd/streaming-signature-v4.go) and rejects anything
+		// larger with HTTP 400 "chunk too big" — so over HTTPS every file
+		// between 16 MiB and multipartUploadThreshold silently failed to
+		// upload. (The same trap returns above ~160 GiB, where the multipart
+		// manager's computed part size grows past 16 MiB again.)
+		//
+		// WhenRequired keeps checksums for operations that mandate them and
+		// drops the chunked trailer otherwise. Content integrity is unaffected
+		// in practice: the transport is TLS + SigV4-signed, and the agent
+		// writes a per-file SHA-256 into the manifest that VerifyIntegrity
+		// re-checks against the downloaded object.
+		awscfg.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+	}
+	if s.endpoint != "" {
+		options = append(options, awscfg.WithEndpointResolverWithOptions(
+			aws.EndpointResolverWithOptionsFunc(func(service, region string, _ ...interface{}) (aws.Endpoint, error) {
+				if service != s3.ServiceID {
+					return aws.Endpoint{}, &aws.EndpointNotFoundError{}
+				}
+				return aws.Endpoint{
+					URL:               s.endpoint,
+					SigningRegion:     region,
+					HostnameImmutable: true,
+				}, nil
+			}),
+		))
+	}
+	if s.accessKeyID != "" && s.secretAccessKey != "" {
+		options = append(options, awscfg.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(s.accessKeyID, s.secretAccessKey, s.sessionToken),
+		))
+	}
+
+	cfg, err := awscfg.LoadDefaultConfig(context.Background(), options...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load aws config: %w", err)
+	}
+
+	s.client = s3.NewFromConfig(cfg)
+	return s.client, nil
+}

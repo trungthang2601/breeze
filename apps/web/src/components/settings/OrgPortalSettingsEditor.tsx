@@ -1,0 +1,434 @@
+import { useCallback, useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+import {
+  PORTAL_CHROME_ACCENT_DEFAULT,
+  PORTAL_CHROME_ACCENT_KEYS,
+  PORTAL_CHROME_ACCENTS,
+  isPortalChromeAccent,
+  type PortalChromeAccent,
+} from '@breeze/shared';
+import { fetchWithAuth } from '../../stores/auth';
+import { navigateTo } from '@/lib/navigation';
+import { runAction, ActionError } from '@/lib/runAction';
+
+type PortalSettings = {
+  enableTickets: boolean;
+  enableAssetCheckout: boolean;
+  enableSelfService: boolean;
+  enablePasswordReset: boolean;
+  enableDevices: boolean;
+  enableDashboard: boolean;
+  enableSecurity: boolean;
+  enableBackups: boolean;
+  enableReports: boolean;
+  enableSupportUsage: boolean;
+  enableService: boolean;
+  enableDocuments: boolean;
+  enableLifecycle: boolean;
+  enableNetworkVisibility: boolean;
+  supportEmail: string | null;
+  supportPhone: string | null;
+  welcomeMessage: string | null;
+  footerText: string | null;
+  chromeAccent: PortalChromeAccent;
+};
+
+type ToggleKey = 'enableTickets' | 'enableAssetCheckout' | 'enableSelfService' | 'enablePasswordReset';
+
+const TOGGLES: Array<{ key: ToggleKey; labelKey: string; descriptionKey: string }> = [
+  {
+    key: 'enableTickets',
+    labelKey: 'orgPortalSettingsEditor.features.toggles.enableTickets.label',
+    descriptionKey: 'orgPortalSettingsEditor.features.toggles.enableTickets.description',
+  },
+  {
+    key: 'enableAssetCheckout',
+    labelKey: 'orgPortalSettingsEditor.features.toggles.enableAssetCheckout.label',
+    descriptionKey: 'orgPortalSettingsEditor.features.toggles.enableAssetCheckout.description',
+  },
+  {
+    key: 'enableSelfService',
+    labelKey: 'orgPortalSettingsEditor.features.toggles.enableSelfService.label',
+    descriptionKey: 'orgPortalSettingsEditor.features.toggles.enableSelfService.description',
+  },
+  {
+    key: 'enablePasswordReset',
+    labelKey: 'orgPortalSettingsEditor.features.toggles.enablePasswordReset.label',
+    descriptionKey: 'orgPortalSettingsEditor.features.toggles.enablePasswordReset.description',
+  },
+];
+
+type VisibilityToggleKey =
+  | 'enableDevices'
+  | 'enableDashboard'
+  | 'enableSecurity'
+  | 'enableBackups'
+  | 'enableReports'
+  | 'enableSupportUsage'
+  | 'enableService'
+  | 'enableDocuments'
+  | 'enableLifecycle'
+  | 'enableNetworkVisibility';
+
+const VISIBILITY_TOGGLES: Array<{
+  key: VisibilityToggleKey;
+  labelKey: string;
+  descriptionKey: string;
+}> = [
+  {
+    key: 'enableDevices',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableDevices.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableDevices.description',
+  },
+  {
+    key: 'enableDashboard',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableDashboard.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableDashboard.description',
+  },
+  {
+    key: 'enableSecurity',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableSecurity.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableSecurity.description',
+  },
+  {
+    key: 'enableBackups',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableBackups.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableBackups.description',
+  },
+  {
+    key: 'enableReports',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableReports.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableReports.description',
+  },
+  {
+    key: 'enableSupportUsage',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableSupportUsage.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableSupportUsage.description',
+  },
+  {
+    key: 'enableService',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableService.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableService.description',
+  },
+  {
+    key: 'enableDocuments',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableDocuments.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableDocuments.description',
+  },
+  {
+    key: 'enableLifecycle',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableLifecycle.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableLifecycle.description',
+  },
+  {
+    key: 'enableNetworkVisibility',
+    labelKey: 'orgPortalSettingsEditor.visibility.toggles.enableNetworkVisibility.label',
+    descriptionKey: 'orgPortalSettingsEditor.visibility.toggles.enableNetworkVisibility.description',
+  },
+];
+
+type OrgPortalSettingsEditorProps = {
+  orgId: string;
+  onDirty: () => void;
+  onSave: () => void;
+};
+
+export default function OrgPortalSettingsEditor({ orgId, onDirty, onSave }: OrgPortalSettingsEditorProps) {
+  const { t } = useTranslation('settings');
+  const [draft, setDraft] = useState<PortalSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setLoadError(false);
+    try {
+      const res = await fetchWithAuth(`/orgs/organizations/${orgId}/portal-settings`);
+      if (res.status === 401) {
+        void navigateTo('/login', { replace: true });
+        return;
+      }
+      if (!res.ok) throw new Error(`portal settings load failed: ${res.status}`);
+      const data = (await res.json()).data ?? null;
+      setDraft(
+        data
+          ? {
+              ...data,
+              chromeAccent: isPortalChromeAccent(data.chromeAccent)
+                ? data.chromeAccent
+                : PORTAL_CHROME_ACCENT_DEFAULT,
+            }
+          : null
+      );
+    } catch (err) {
+      console.warn('[OrgPortalSettingsEditor] load failed', err);
+      setLoadError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, [orgId]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const update = (patch: Partial<PortalSettings>) => {
+    setDraft((d) => (d ? { ...d, ...patch } : d));
+    onDirty();
+  };
+
+  const enableAllVisibility = () => update({
+    enableDevices: true,
+    enableDashboard: true,
+    enableSecurity: true,
+    enableBackups: true,
+    enableReports: true,
+    enableSupportUsage: true,
+    enableService: true,
+    enableDocuments: true,
+    enableLifecycle: true,
+    enableNetworkVisibility: true,
+  });
+
+  const save = useCallback(async () => {
+    if (!draft || saving) return;
+    setSaving(true);
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/orgs/organizations/${orgId}/portal-settings`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            enableTickets: draft.enableTickets,
+            enableAssetCheckout: draft.enableAssetCheckout,
+            enableSelfService: draft.enableSelfService,
+            enablePasswordReset: draft.enablePasswordReset,
+            enableDevices: draft.enableDevices,
+            enableDashboard: draft.enableDashboard,
+            enableSecurity: draft.enableSecurity,
+            enableBackups: draft.enableBackups,
+            enableReports: draft.enableReports,
+            enableSupportUsage: draft.enableSupportUsage,
+            enableService: draft.enableService,
+            enableDocuments: draft.enableDocuments,
+            enableLifecycle: draft.enableLifecycle,
+            enableNetworkVisibility: draft.enableNetworkVisibility,
+            supportEmail: draft.supportEmail?.trim() || null,
+            supportPhone: draft.supportPhone?.trim() || null,
+            welcomeMessage: draft.welcomeMessage?.trim() || null,
+            footerText: draft.footerText?.trim() || null,
+            chromeAccent:
+              draft.chromeAccent === PORTAL_CHROME_ACCENT_DEFAULT ? null : draft.chromeAccent
+          })
+        }),
+        errorFallback: t('orgPortalSettingsEditor.errors.save'),
+        successMessage: t('orgPortalSettingsEditor.toasts.saved'),
+        onUnauthorized: () => void navigateTo('/login', { replace: true })
+      });
+      onSave();
+    } catch (err) {
+      if (!(err instanceof ActionError)) throw err;
+    } finally {
+      setSaving(false);
+    }
+  }, [draft, saving, orgId, onSave, t]);
+
+  if (loading) {
+    return <p className="text-sm text-muted-foreground">{t('orgPortalSettingsEditor.loading')}</p>;
+  }
+
+  if (loadError || !draft) {
+    return (
+      <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground" data-testid="org-portal-load-error">
+        {t('orgPortalSettingsEditor.errors.load')}{' '}
+        <button type="button" onClick={() => void load()} className="underline hover:text-foreground">
+          {t('common:actions.retry')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6" data-testid="org-portal-settings">
+      <section className="rounded-lg border bg-card p-6 shadow-xs">
+        <h2 className="text-lg font-semibold">{t('orgPortalSettingsEditor.features.title')}</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {t('orgPortalSettingsEditor.features.description')}
+        </p>
+        <div className="mt-4 space-y-3">
+          {TOGGLES.map(({ key, labelKey, descriptionKey }) => (
+            <label key={key} className="flex items-start gap-3 rounded-md border bg-muted/30 p-3">
+              <input
+                type="checkbox"
+                checked={draft[key]}
+                onChange={(e) => update({ [key]: e.target.checked } as Partial<PortalSettings>)}
+                className="mt-0.5"
+                data-testid={`org-portal-toggle-${key}`}
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t(/* i18n-dynamic */ labelKey)}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t(/* i18n-dynamic */ descriptionKey)}
+                </span>
+              </span>
+            </label>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-lg border bg-card p-6 shadow-xs">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold">{t('orgPortalSettingsEditor.visibility.title')}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t('orgPortalSettingsEditor.visibility.description')}
+            </p>
+          </div>
+          <button
+            type="button"
+            data-testid="org-portal-enable-all-visibility"
+            onClick={enableAllVisibility}
+            className="rounded-md border px-3 py-1.5 text-sm font-medium hover:bg-muted/50"
+          >
+            {t('orgPortalSettingsEditor.visibility.enableAll')}
+          </button>
+        </div>
+
+        <div className="mt-4 space-y-3">
+          {VISIBILITY_TOGGLES.map(({
+            key,
+            labelKey,
+            descriptionKey,
+          }) => (
+            <label
+              key={key}
+              className="flex items-start gap-3 rounded-md border bg-muted/30 p-3"
+            >
+              <input
+                type="checkbox"
+                checked={draft[key]}
+                onChange={(e) => update({
+                  [key]: e.target.checked,
+                } as Partial<PortalSettings>)}
+                className="mt-0.5"
+                data-testid={`org-portal-toggle-${key}`}
+              />
+              <span>
+                <span className="block text-sm font-medium">
+                  {t(/* i18n-dynamic */ labelKey)}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {t(/* i18n-dynamic */ descriptionKey)}
+                </span>
+              </span>
+            </label>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-lg border bg-card p-6 shadow-xs">
+        <h2 className="text-lg font-semibold">{t('orgPortalSettingsEditor.accent.title')}</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {t('orgPortalSettingsEditor.accent.description')}
+        </p>
+        <div
+          role="radiogroup"
+          aria-label={t('orgPortalSettingsEditor.accent.title')}
+          className="mt-4 flex flex-wrap gap-4"
+          data-testid="org-portal-accent-group"
+        >
+          {PORTAL_CHROME_ACCENT_KEYS.map((key) => {
+            const spec = PORTAL_CHROME_ACCENTS[key];
+            const selected = draft.chromeAccent === key;
+            return (
+              <button
+                key={key}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                aria-label={t(/* i18n-dynamic */ `orgPortalSettingsEditor.accent.options.${key}`)}
+                onClick={() => update({ chromeAccent: key })}
+                className={`flex flex-col items-center gap-1.5 rounded-md p-1.5 text-center focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring ${
+                  selected ? 'ring-2 ring-primary' : ''
+                }`}
+                data-testid={`org-portal-accent-${key}`}
+              >
+                <span
+                  aria-hidden="true"
+                  className="h-8 w-8 rounded-full border"
+                  style={{ backgroundColor: `hsl(${spec.light.primary})` }}
+                />
+                <span className="text-xs text-muted-foreground">
+                  {t(/* i18n-dynamic */ `orgPortalSettingsEditor.accent.options.${key}`)}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="rounded-lg border bg-card p-6 shadow-xs">
+        <h2 className="text-lg font-semibold">{t('orgPortalSettingsEditor.support.title')}</h2>
+        <p className="mt-1 text-sm text-muted-foreground">{t('orgPortalSettingsEditor.support.description')}</p>
+        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+          <div>
+            <label className="text-sm font-medium" htmlFor="portal-support-email">{t('orgPortalSettingsEditor.support.email')}</label>
+            <input
+              id="portal-support-email"
+              type="email"
+              value={draft.supportEmail ?? ''}
+              onChange={(e) => update({ supportEmail: e.target.value })}
+              className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
+              data-testid="org-portal-support-email"
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium" htmlFor="portal-support-phone">{t('orgPortalSettingsEditor.support.phone')}</label>
+            <input
+              id="portal-support-phone"
+              type="tel"
+              value={draft.supportPhone ?? ''}
+              onChange={(e) => update({ supportPhone: e.target.value })}
+              className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
+              data-testid="org-portal-support-phone"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="text-sm font-medium" htmlFor="portal-welcome">{t('orgPortalSettingsEditor.support.welcomeMessage')}</label>
+            <textarea
+              id="portal-welcome"
+              rows={3}
+              value={draft.welcomeMessage ?? ''}
+              onChange={(e) => update({ welcomeMessage: e.target.value })}
+              className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
+              data-testid="org-portal-welcome"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="text-sm font-medium" htmlFor="portal-footer">{t('orgPortalSettingsEditor.support.footerText')}</label>
+            <input
+              id="portal-footer"
+              value={draft.footerText ?? ''}
+              onChange={(e) => update({ footerText: e.target.value })}
+              className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
+              data-testid="org-portal-footer"
+            />
+          </div>
+        </div>
+      </section>
+
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={() => void save()}
+          disabled={saving}
+          className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+          data-testid="org-portal-save"
+        >
+          {saving ? t('common:states.saving') : t('orgPortalSettingsEditor.save')}
+        </button>
+      </div>
+    </div>
+  );
+}

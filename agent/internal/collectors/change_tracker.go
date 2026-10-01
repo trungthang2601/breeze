@@ -1,0 +1,1305 @@
+package collectors
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ChangeType represents the category of change.
+type ChangeType string
+
+const (
+	ChangeTypeSoftware    ChangeType = "software"
+	ChangeTypeService     ChangeType = "service"
+	ChangeTypeStartup     ChangeType = "startup"
+	ChangeTypeNetwork     ChangeType = "network"
+	ChangeTypeTask        ChangeType = "scheduled_task"
+	ChangeTypeUserAccount ChangeType = "user_account"
+	ChangeTypeHardware    ChangeType = "hardware"
+	ChangeTypeOS          ChangeType = "os_version"
+)
+
+// ChangeAction represents the type of detected change.
+type ChangeAction string
+
+const (
+	ChangeActionAdded    ChangeAction = "added"
+	ChangeActionRemoved  ChangeAction = "removed"
+	ChangeActionModified ChangeAction = "modified"
+	ChangeActionUpdated  ChangeAction = "updated"
+)
+
+// ChangeRecord represents a single detected change.
+type ChangeRecord struct {
+	Timestamp    time.Time      `json:"timestamp"`
+	ChangeType   ChangeType     `json:"changeType"`
+	ChangeAction ChangeAction   `json:"changeAction"`
+	Subject      string         `json:"subject"`
+	BeforeValue  map[string]any `json:"beforeValue,omitempty"`
+	AfterValue   map[string]any `json:"afterValue,omitempty"`
+	Details      map[string]any `json:"details,omitempty"`
+}
+
+// TrackedStartupItem captures stable startup metadata for change detection.
+type TrackedStartupItem struct {
+	Name    string `json:"name"`
+	Type    string `json:"type,omitempty"`
+	Path    string `json:"path,omitempty"`
+	Enabled bool   `json:"enabled"`
+}
+
+// TrackedScheduledTask captures task metadata for drift detection.
+type TrackedScheduledTask struct {
+	Name     string `json:"name"`
+	Path     string `json:"path,omitempty"`
+	Status   string `json:"status,omitempty"`
+	Schedule string `json:"schedule,omitempty"`
+	Command  string `json:"command,omitempty"`
+}
+
+// TrackedUserAccount captures user account properties for change detection.
+type TrackedUserAccount struct {
+	Username string `json:"username"`
+	FullName string `json:"fullName,omitempty"`
+	Disabled bool   `json:"disabled"`
+	Locked   bool   `json:"locked"`
+}
+
+// HardwareState is the subset of hardware inventory the change tracker diffs.
+type HardwareState struct {
+	RAMTotalMB   uint64 `json:"ramTotalMb"`
+	CPUModel     string `json:"cpuModel"`
+	CPUCores     int    `json:"cpuCores"`
+	DiskTotalGB  uint64 `json:"diskTotalGb"`
+	BIOSVersion  string `json:"biosVersion"`
+	SerialNumber string `json:"serialNumber"`
+	Motherboard  string `json:"motherboard"`
+}
+
+// SystemState is the OS identity the change tracker diffs.
+type SystemState struct {
+	OSVersion string `json:"osVersion"`
+	OSBuild   string `json:"osBuild"`
+}
+
+// Snapshot represents the current state of trackable items.
+type Snapshot struct {
+	Timestamp       time.Time                       `json:"timestamp"`
+	Software        map[string]SoftwareItem         `json:"software"`
+	Services        map[string]ServiceInfo          `json:"services"`
+	StartupItems    map[string]TrackedStartupItem   `json:"startupItems"`
+	NetworkAdapters map[string]NetworkAdapterInfo   `json:"networkAdapters"`
+	ScheduledTasks  map[string]TrackedScheduledTask `json:"scheduledTasks"`
+	UserAccounts    map[string]TrackedUserAccount   `json:"userAccounts"`
+	Hardware        *HardwareState                  `json:"hardware,omitempty"`
+	System          *SystemState                    `json:"system,omitempty"`
+}
+
+// ChangeTrackerCollector tracks changes in system configuration.
+type ChangeTrackerCollector struct {
+	snapshotPath     string
+	lastSnapshot     *Snapshot
+	gatherSnapshot   func() (*Snapshot, error)
+	now              func() time.Time
+	collectorTimeout time.Duration
+	ignoreRules      []changeIgnoreRule
+	mu               sync.Mutex
+}
+
+type changeIgnoreRule struct {
+	changeType ChangeType
+	pattern    string
+}
+
+// NewChangeTrackerCollector creates a new change tracker.
+func NewChangeTrackerCollector(snapshotPath string) *ChangeTrackerCollector {
+	timeout := 8 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("BREEZE_CHANGE_TRACKER_COLLECTOR_TIMEOUT_SECONDS")); raw != "" {
+		if parsed, err := time.ParseDuration(raw + "s"); err == nil && parsed > 0 {
+			timeout = parsed
+		}
+	}
+
+	rules := defaultChangeIgnoreRules()
+	rules = append(rules, parseChangeIgnoreRules(os.Getenv("BREEZE_CHANGE_TRACKER_IGNORE"))...)
+
+	return &ChangeTrackerCollector{
+		snapshotPath:     snapshotPath,
+		collectorTimeout: timeout,
+		ignoreRules:      rules,
+		now: func() time.Time {
+			return time.Now().UTC()
+		},
+	}
+}
+
+// PendingChanges is a collected but uncommitted change set: the records the
+// caller should upload, plus the snapshot that becomes the new diff baseline
+// once those records are known to have landed.
+//
+// The baseline is the whole reason this type exists. Advancing it destroys the
+// delta it was derived from — a change dropped between collect and commit can
+// never be re-derived, because the next diff runs against a world in which the
+// change already happened (#3529).
+type PendingChanges struct {
+	// Records are the detected changes, ready to upload.
+	Records []ChangeRecord
+
+	// snapshot is the state Records was diffed against. Unexported so a caller
+	// cannot hand Commit a snapshot the tracker never produced.
+	snapshot *Snapshot
+}
+
+// CollectPendingChanges detects changes since the previous snapshot WITHOUT
+// advancing the baseline. Callers that upload the records must call Commit only
+// after the upload is confirmed; skipping Commit re-reports the same changes on
+// the next cycle, which is the recoverable failure mode.
+//
+// Collect and Commit are separate lock acquisitions so the mutex is not held
+// across a network round trip. They are expected to be called in pairs from a
+// single goroutine (the heartbeat's inventory cycle); overlapping collections
+// would each diff the same baseline and report the same changes twice.
+func (c *ChangeTrackerCollector) CollectPendingChanges() (*PendingChanges, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.lastSnapshot == nil {
+		if err := c.loadSnapshot(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("change tracker snapshot corrupt, resetting baseline", "error", err.Error())
+			c.lastSnapshot = nil
+		}
+	}
+
+	currentSnapshot, err := c.gatherCurrentSnapshot()
+	if err != nil {
+		return nil, err
+	}
+
+	// First successful run establishes baseline — emit all discovered items
+	// as "added" so they appear in the API (e.g. known-services autocomplete).
+	if c.lastSnapshot == nil {
+		return &PendingChanges{
+			Records:  c.initialInventory(currentSnapshot),
+			snapshot: currentSnapshot,
+		}, nil
+	}
+
+	changes := make([]ChangeRecord, 0, 16)
+	changes = append(changes, c.diffSoftware(currentSnapshot)...)
+	changes = append(changes, c.diffServices(currentSnapshot)...)
+	changes = append(changes, c.diffStartupItems(currentSnapshot)...)
+	changes = append(changes, c.diffNetworkAdapters(currentSnapshot)...)
+	changes = append(changes, c.diffScheduledTasks(currentSnapshot)...)
+	changes = append(changes, c.diffUserAccounts(currentSnapshot)...)
+	changes = append(changes, c.diffHardware(currentSnapshot)...)
+	changes = append(changes, c.diffOS(currentSnapshot)...)
+	changes = c.filterNoise(changes)
+
+	return &PendingChanges{Records: changes, snapshot: currentSnapshot}, nil
+}
+
+// Commit advances the diff baseline to the snapshot the pending records were
+// derived from and persists it. Call it only once the records are known to be
+// durable server-side (or when there were none to deliver).
+//
+// The baseline only ever moves forward. Because the lock is released across the
+// upload, two overlapping cycles can finish out of order — the one that
+// collected FIRST can commit LAST if its request was slower — and letting the
+// older snapshot win would roll the baseline backwards, re-reporting changes
+// that were already delivered on every subsequent cycle. A stale commit is
+// therefore dropped rather than applied: the newer snapshot already accounts
+// for everything the older one saw.
+//
+// The in-memory baseline advances even when the on-disk write fails: the
+// records have already landed, so re-reporting them every cycle would duplicate
+// them server-side. A failed write costs at most one re-diff after a restart.
+func (c *ChangeTrackerCollector) Commit(pending *PendingChanges) error {
+	if pending == nil || pending.snapshot == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.lastSnapshot != nil && pending.snapshot.Timestamp.Before(c.lastSnapshot.Timestamp) {
+		slog.Debug("change tracker ignoring stale baseline commit",
+			"pending", pending.snapshot.Timestamp,
+			"committed", c.lastSnapshot.Timestamp)
+		return nil
+	}
+
+	c.lastSnapshot = pending.snapshot
+	return c.saveSnapshot()
+}
+
+// CollectChanges detects changes since the previous snapshot and immediately
+// advances the baseline.
+//
+// Prefer CollectPendingChanges + Commit whenever the records are uploaded:
+// committing before delivery is confirmed permanently loses whatever the
+// server rejected (#3529). This wrapper is for callers that only inspect the
+// records locally.
+func (c *ChangeTrackerCollector) CollectChanges() ([]ChangeRecord, error) {
+	pending, err := c.CollectPendingChanges()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.Commit(pending); err != nil {
+		return pending.Records, err
+	}
+	return pending.Records, nil
+}
+
+// initialInventory generates "added" records for every item in the baseline
+// snapshot so the API has full visibility into the device's initial state.
+//
+// Hardware and OS are intentionally excluded here: they are singletons diffed
+// only against a prior snapshot (see diffHardware/diffOS), and the first
+// observed state becomes the silent baseline — we don't want a baseline
+// "added" record for the device's current specs.
+func (c *ChangeTrackerCollector) initialInventory(snap *Snapshot) []ChangeRecord {
+	now := c.now()
+	records := make([]ChangeRecord, 0, len(snap.Services)+len(snap.Software)+len(snap.StartupItems)+len(snap.NetworkAdapters)+len(snap.ScheduledTasks)+len(snap.UserAccounts))
+
+	for _, svc := range snap.Services {
+		records = append(records, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeService,
+			ChangeAction: ChangeActionAdded,
+			Subject:      serviceSubject(svc),
+			AfterValue: map[string]any{
+				"state":       svc.State,
+				"startupType": svc.StartupType,
+				"account":     svc.Account,
+			},
+		})
+	}
+
+	for _, sw := range snap.Software {
+		records = append(records, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeSoftware,
+			ChangeAction: ChangeActionAdded,
+			Subject:      softwareSubject(sw),
+			AfterValue: map[string]any{
+				"name":            sw.Name,
+				"version":         sw.Version,
+				"vendor":          sw.Vendor,
+				"installLocation": sw.InstallLocation,
+			},
+		})
+	}
+
+	for _, item := range snap.StartupItems {
+		records = append(records, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeStartup,
+			ChangeAction: ChangeActionAdded,
+			Subject:      startupSubject(item),
+			AfterValue: map[string]any{
+				"type":    item.Type,
+				"path":    item.Path,
+				"enabled": item.Enabled,
+			},
+		})
+	}
+
+	for _, adapter := range snap.NetworkAdapters {
+		records = append(records, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeNetwork,
+			ChangeAction: ChangeActionAdded,
+			Subject:      adapter.InterfaceName,
+			AfterValue: map[string]any{
+				"ipAddress":  adapter.IPAddress,
+				"macAddress": adapter.MACAddress,
+				"ipType":     adapter.IPType,
+				"isPrimary":  adapter.IsPrimary,
+			},
+		})
+	}
+
+	for _, task := range snap.ScheduledTasks {
+		records = append(records, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeTask,
+			ChangeAction: ChangeActionAdded,
+			Subject:      taskSubject(task),
+			AfterValue: map[string]any{
+				"path":     task.Path,
+				"status":   task.Status,
+				"schedule": task.Schedule,
+				"command":  task.Command,
+			},
+		})
+	}
+
+	for _, account := range snap.UserAccounts {
+		records = append(records, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeUserAccount,
+			ChangeAction: ChangeActionAdded,
+			Subject:      account.Username,
+			AfterValue: map[string]any{
+				"fullName": account.FullName,
+				"disabled": account.Disabled,
+				"locked":   account.Locked,
+			},
+		})
+	}
+
+	return c.filterNoise(records)
+}
+
+func (c *ChangeTrackerCollector) gatherCurrentSnapshot() (*Snapshot, error) {
+	if c.gatherSnapshot != nil {
+		snapshot, err := c.gatherSnapshot()
+		if err != nil {
+			return nil, err
+		}
+		c.ensureSnapshotMaps(snapshot)
+		return snapshot, nil
+	}
+
+	snapshot := &Snapshot{
+		Timestamp:       c.now(),
+		Software:        map[string]SoftwareItem{},
+		Services:        map[string]ServiceInfo{},
+		StartupItems:    map[string]TrackedStartupItem{},
+		NetworkAdapters: map[string]NetworkAdapterInfo{},
+		ScheduledTasks:  map[string]TrackedScheduledTask{},
+		UserAccounts:    map[string]TrackedUserAccount{},
+	}
+
+	var (
+		software       []SoftwareItem
+		services       []ServiceInfo
+		adapters       []NetworkAdapterInfo
+		startupItems   []TrackedStartupItem
+		scheduledTasks []TrackedScheduledTask
+		userAccounts   []TrackedUserAccount
+		hardware       *HardwareInfo
+		systemInfo     *SystemInfo
+
+		softwareErr       error
+		servicesErr       error
+		adaptersErr       error
+		startupItemsErr   error
+		scheduledTasksErr error
+		userAccountsErr   error
+		hardwareErr       error
+		systemInfoErr     error
+	)
+
+	softwareCollector := NewSoftwareCollector()
+	serviceCollector := NewServiceCollector()
+	invCollector := NewInventoryCollector()
+	hwCollector := NewHardwareCollector()
+
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	wg.Add(7)
+	go func() {
+		defer wg.Done()
+		software, softwareErr = collectWithTimeout(ctx, c.collectorTimeout, func(_ context.Context) ([]SoftwareItem, error) {
+			return softwareCollector.Collect()
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		services, servicesErr = collectWithTimeout(ctx, c.collectorTimeout, func(_ context.Context) ([]ServiceInfo, error) {
+			return serviceCollector.Collect()
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		adapters, adaptersErr = collectWithTimeout(ctx, c.collectorTimeout, func(_ context.Context) ([]NetworkAdapterInfo, error) {
+			return invCollector.CollectNetworkAdapters()
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		startupItems, startupItemsErr = collectWithTimeout(ctx, c.collectorTimeout, c.collectStartupItems)
+	}()
+	go func() {
+		defer wg.Done()
+		scheduledTasks, scheduledTasksErr = collectWithTimeout(ctx, c.collectorTimeout, c.collectScheduledTasks)
+	}()
+	go func() {
+		defer wg.Done()
+		userAccounts, userAccountsErr = collectWithTimeout(ctx, c.collectorTimeout, c.collectUserAccounts)
+	}()
+	go func() {
+		defer wg.Done()
+		hardware, hardwareErr = collectWithTimeout(ctx, c.collectorTimeout, func(_ context.Context) (*HardwareInfo, error) {
+			return hwCollector.CollectHardware()
+		})
+		systemInfo, systemInfoErr = collectWithTimeout(ctx, c.collectorTimeout, func(_ context.Context) (*SystemInfo, error) {
+			return hwCollector.CollectSystemInfo()
+		})
+	}()
+	wg.Wait()
+
+	if softwareErr != nil {
+		if c.lastSnapshot != nil {
+			slog.Warn("software collection failed, using previous snapshot", "error", softwareErr.Error())
+			snapshot.Software = maps.Clone(c.lastSnapshot.Software)
+		} else {
+			return nil, fmt.Errorf("collect software inventory: %w", softwareErr)
+		}
+	} else {
+		for _, sw := range software {
+			key := softwareKey(sw)
+			snapshot.Software[key] = sw
+		}
+	}
+
+	if servicesErr != nil {
+		slog.Warn("service collection failed, using previous snapshot", "error", servicesErr.Error())
+		if c.lastSnapshot != nil {
+			snapshot.Services = maps.Clone(c.lastSnapshot.Services)
+		}
+	} else {
+		for _, svc := range services {
+			key := serviceKey(svc)
+			snapshot.Services[key] = svc
+		}
+	}
+
+	if adaptersErr != nil {
+		if c.lastSnapshot != nil {
+			slog.Warn("network adapter collection failed, using previous snapshot", "error", adaptersErr.Error())
+			snapshot.NetworkAdapters = maps.Clone(c.lastSnapshot.NetworkAdapters)
+		} else {
+			return nil, fmt.Errorf("collect network adapters: %w", adaptersErr)
+		}
+	} else {
+		for _, adapter := range adapters {
+			key := networkKey(adapter)
+			snapshot.NetworkAdapters[key] = adapter
+		}
+	}
+
+	if startupItemsErr != nil {
+		slog.Warn("startup items collection failed, using previous snapshot", "error", startupItemsErr.Error())
+		if c.lastSnapshot != nil {
+			snapshot.StartupItems = maps.Clone(c.lastSnapshot.StartupItems)
+		}
+	} else {
+		for _, item := range startupItems {
+			key := startupKey(item)
+			snapshot.StartupItems[key] = item
+		}
+	}
+
+	if scheduledTasksErr != nil {
+		slog.Warn("scheduled tasks collection failed, using previous snapshot", "error", scheduledTasksErr.Error())
+		if c.lastSnapshot != nil {
+			snapshot.ScheduledTasks = maps.Clone(c.lastSnapshot.ScheduledTasks)
+		}
+	} else {
+		for _, task := range scheduledTasks {
+			key := taskKey(task)
+			snapshot.ScheduledTasks[key] = task
+		}
+	}
+
+	if userAccountsErr != nil {
+		slog.Warn("user accounts collection failed, using previous snapshot", "error", userAccountsErr.Error())
+		if c.lastSnapshot != nil {
+			snapshot.UserAccounts = maps.Clone(c.lastSnapshot.UserAccounts)
+		}
+	} else {
+		for _, account := range userAccounts {
+			key := userAccountKey(account)
+			snapshot.UserAccounts[key] = account
+		}
+	}
+
+	if hardwareErr != nil || hardware == nil {
+		if hardwareErr != nil {
+			slog.Warn("hardware collection failed, using previous snapshot", "error", hardwareErr.Error())
+		}
+		if c.lastSnapshot != nil {
+			snapshot.Hardware = c.lastSnapshot.Hardware
+		}
+	} else {
+		snapshot.Hardware = &HardwareState{
+			RAMTotalMB:   hardware.RAMTotalMB,
+			CPUModel:     hardware.CPUModel,
+			CPUCores:     hardware.CPUCores,
+			DiskTotalGB:  hardware.DiskTotalGB,
+			BIOSVersion:  hardware.BIOSVersion,
+			SerialNumber: hardware.SerialNumber,
+			Motherboard:  strings.TrimSpace(hardware.MotherboardManufacturer + " " + hardware.MotherboardProduct),
+		}
+	}
+
+	if systemInfoErr != nil || systemInfo == nil {
+		if systemInfoErr != nil {
+			slog.Warn("system info collection failed, using previous snapshot", "error", systemInfoErr.Error())
+		}
+		if c.lastSnapshot != nil {
+			snapshot.System = c.lastSnapshot.System
+		}
+	} else {
+		snapshot.System = &SystemState{OSVersion: systemInfo.OSVersion, OSBuild: systemInfo.OSBuild}
+	}
+
+	c.ensureSnapshotMaps(snapshot)
+	return snapshot, nil
+}
+
+func collectWithTimeout[T any](parent context.Context, timeout time.Duration, collect func(ctx context.Context) (T, error)) (T, error) {
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	type result struct {
+		value T
+		err   error
+	}
+	out := make(chan result, 1)
+	go func() {
+		value, err := collect(ctx)
+		out <- result{value: value, err: err}
+	}()
+
+	select {
+	case res := <-out:
+		return res.value, res.err
+	case <-ctx.Done():
+		var zero T
+		if ctx.Err() == context.DeadlineExceeded {
+			return zero, fmt.Errorf("collector timed out after %s: %w", timeout, ctx.Err())
+		}
+		return zero, fmt.Errorf("collector cancelled: %w", ctx.Err())
+	}
+}
+
+func (c *ChangeTrackerCollector) loadSnapshot() error {
+	if strings.TrimSpace(c.snapshotPath) == "" {
+		return fmt.Errorf("snapshot path is empty")
+	}
+
+	data, err := os.ReadFile(c.snapshotPath)
+	if err != nil {
+		return err
+	}
+
+	var snapshot Snapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return fmt.Errorf("unmarshal snapshot: %w", err)
+	}
+	c.ensureSnapshotMaps(&snapshot)
+	c.lastSnapshot = &snapshot
+	return nil
+}
+
+func (c *ChangeTrackerCollector) saveSnapshot() error {
+	if c.lastSnapshot == nil {
+		return nil
+	}
+	if strings.TrimSpace(c.snapshotPath) == "" {
+		return fmt.Errorf("snapshot path is empty")
+	}
+
+	data, err := json.Marshal(c.lastSnapshot)
+	if err != nil {
+		return fmt.Errorf("marshal snapshot: %w", err)
+	}
+
+	path := c.snapshotPath
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		fallback := filepath.Join(os.TempDir(), "breeze", "change_tracker_snapshot.json")
+		slog.Warn("snapshot directory unavailable, using temporary fallback",
+			"originalPath", dir,
+			"fallbackPath", fallback,
+			"error", err.Error())
+		if mkdirErr := os.MkdirAll(filepath.Dir(fallback), 0700); mkdirErr != nil {
+			return fmt.Errorf("create snapshot directory: %w", err)
+		}
+		path = fallback
+		// Do NOT mutate c.snapshotPath — retry original path next time
+	}
+
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return fmt.Errorf("write snapshot: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("replace snapshot: %w", err)
+	}
+	return nil
+}
+
+func (c *ChangeTrackerCollector) ensureSnapshotMaps(snapshot *Snapshot) {
+	if snapshot.Software == nil {
+		snapshot.Software = map[string]SoftwareItem{}
+	}
+	if snapshot.Services == nil {
+		snapshot.Services = map[string]ServiceInfo{}
+	}
+	if snapshot.StartupItems == nil {
+		snapshot.StartupItems = map[string]TrackedStartupItem{}
+	}
+	if snapshot.NetworkAdapters == nil {
+		snapshot.NetworkAdapters = map[string]NetworkAdapterInfo{}
+	}
+	if snapshot.ScheduledTasks == nil {
+		snapshot.ScheduledTasks = map[string]TrackedScheduledTask{}
+	}
+	if snapshot.UserAccounts == nil {
+		snapshot.UserAccounts = map[string]TrackedUserAccount{}
+	}
+	if snapshot.Timestamp.IsZero() {
+		snapshot.Timestamp = c.now()
+	}
+}
+
+func (c *ChangeTrackerCollector) diffSoftware(current *Snapshot) []ChangeRecord {
+	now := c.now()
+	changes := make([]ChangeRecord, 0)
+
+	for key, newSw := range current.Software {
+		oldSw, existed := c.lastSnapshot.Software[key]
+		if !existed {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeSoftware,
+				ChangeAction: ChangeActionAdded,
+				Subject:      softwareSubject(newSw),
+				AfterValue: map[string]any{
+					"name":            newSw.Name,
+					"version":         newSw.Version,
+					"vendor":          newSw.Vendor,
+					"installLocation": newSw.InstallLocation,
+				},
+			})
+			continue
+		}
+
+		if oldSw.Version != newSw.Version {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeSoftware,
+				ChangeAction: ChangeActionUpdated,
+				Subject:      softwareSubject(newSw),
+				BeforeValue: map[string]any{
+					"version": oldSw.Version,
+				},
+				AfterValue: map[string]any{
+					"version": newSw.Version,
+				},
+			})
+		}
+	}
+
+	for key, oldSw := range c.lastSnapshot.Software {
+		if _, exists := current.Software[key]; exists {
+			continue
+		}
+		changes = append(changes, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeSoftware,
+			ChangeAction: ChangeActionRemoved,
+			Subject:      softwareSubject(oldSw),
+			BeforeValue: map[string]any{
+				"name":    oldSw.Name,
+				"version": oldSw.Version,
+				"vendor":  oldSw.Vendor,
+			},
+		})
+	}
+
+	return changes
+}
+
+func (c *ChangeTrackerCollector) diffServices(current *Snapshot) []ChangeRecord {
+	now := c.now()
+	changes := make([]ChangeRecord, 0)
+
+	for key, newSvc := range current.Services {
+		oldSvc, existed := c.lastSnapshot.Services[key]
+		if !existed {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeService,
+				ChangeAction: ChangeActionAdded,
+				Subject:      serviceSubject(newSvc),
+				AfterValue: map[string]any{
+					"state":       newSvc.State,
+					"startupType": newSvc.StartupType,
+					"account":     newSvc.Account,
+				},
+			})
+			continue
+		}
+
+		if oldSvc.StartupType != newSvc.StartupType {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeService,
+				ChangeAction: ChangeActionModified,
+				Subject:      serviceSubject(newSvc),
+				BeforeValue: map[string]any{
+					"startupType": oldSvc.StartupType,
+				},
+				AfterValue: map[string]any{
+					"startupType": newSvc.StartupType,
+				},
+				Details: map[string]any{
+					"field": "startup_type",
+				},
+			})
+		}
+
+		if oldSvc.Account != newSvc.Account {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeService,
+				ChangeAction: ChangeActionModified,
+				Subject:      serviceSubject(newSvc),
+				BeforeValue: map[string]any{
+					"account": oldSvc.Account,
+				},
+				AfterValue: map[string]any{
+					"account": newSvc.Account,
+				},
+				Details: map[string]any{
+					"field": "service_account",
+				},
+			})
+		}
+	}
+
+	for key, oldSvc := range c.lastSnapshot.Services {
+		if _, exists := current.Services[key]; exists {
+			continue
+		}
+		changes = append(changes, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeService,
+			ChangeAction: ChangeActionRemoved,
+			Subject:      serviceSubject(oldSvc),
+		})
+	}
+
+	return changes
+}
+
+func (c *ChangeTrackerCollector) diffStartupItems(current *Snapshot) []ChangeRecord {
+	now := c.now()
+	changes := make([]ChangeRecord, 0)
+
+	for key, newItem := range current.StartupItems {
+		oldItem, existed := c.lastSnapshot.StartupItems[key]
+		if !existed {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeStartup,
+				ChangeAction: ChangeActionAdded,
+				Subject:      startupSubject(newItem),
+				AfterValue: map[string]any{
+					"type":    newItem.Type,
+					"path":    newItem.Path,
+					"enabled": newItem.Enabled,
+				},
+			})
+			continue
+		}
+
+		if oldItem.Path != newItem.Path || oldItem.Enabled != newItem.Enabled || oldItem.Type != newItem.Type {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeStartup,
+				ChangeAction: ChangeActionModified,
+				Subject:      startupSubject(newItem),
+				BeforeValue: map[string]any{
+					"type":    oldItem.Type,
+					"path":    oldItem.Path,
+					"enabled": oldItem.Enabled,
+				},
+				AfterValue: map[string]any{
+					"type":    newItem.Type,
+					"path":    newItem.Path,
+					"enabled": newItem.Enabled,
+				},
+			})
+		}
+	}
+
+	for key, oldItem := range c.lastSnapshot.StartupItems {
+		if _, exists := current.StartupItems[key]; exists {
+			continue
+		}
+		changes = append(changes, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeStartup,
+			ChangeAction: ChangeActionRemoved,
+			Subject:      startupSubject(oldItem),
+			BeforeValue: map[string]any{
+				"type":    oldItem.Type,
+				"path":    oldItem.Path,
+				"enabled": oldItem.Enabled,
+			},
+		})
+	}
+
+	return changes
+}
+
+func (c *ChangeTrackerCollector) diffNetworkAdapters(current *Snapshot) []ChangeRecord {
+	now := c.now()
+	changes := make([]ChangeRecord, 0)
+
+	for key, newAdapter := range current.NetworkAdapters {
+		oldAdapter, existed := c.lastSnapshot.NetworkAdapters[key]
+		if !existed {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeNetwork,
+				ChangeAction: ChangeActionAdded,
+				Subject:      newAdapter.InterfaceName,
+				AfterValue: map[string]any{
+					"ipAddress":  newAdapter.IPAddress,
+					"macAddress": newAdapter.MACAddress,
+					"ipType":     newAdapter.IPType,
+					"isPrimary":  newAdapter.IsPrimary,
+				},
+			})
+			continue
+		}
+
+		if oldAdapter.IPAddress != newAdapter.IPAddress || oldAdapter.MACAddress != newAdapter.MACAddress || oldAdapter.IsPrimary != newAdapter.IsPrimary {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeNetwork,
+				ChangeAction: ChangeActionModified,
+				Subject:      newAdapter.InterfaceName,
+				BeforeValue: map[string]any{
+					"ipAddress":  oldAdapter.IPAddress,
+					"macAddress": oldAdapter.MACAddress,
+					"isPrimary":  oldAdapter.IsPrimary,
+				},
+				AfterValue: map[string]any{
+					"ipAddress":  newAdapter.IPAddress,
+					"macAddress": newAdapter.MACAddress,
+					"isPrimary":  newAdapter.IsPrimary,
+				},
+			})
+		}
+	}
+
+	for key, oldAdapter := range c.lastSnapshot.NetworkAdapters {
+		if _, exists := current.NetworkAdapters[key]; exists {
+			continue
+		}
+		changes = append(changes, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeNetwork,
+			ChangeAction: ChangeActionRemoved,
+			Subject:      oldAdapter.InterfaceName,
+			BeforeValue: map[string]any{
+				"ipAddress":  oldAdapter.IPAddress,
+				"macAddress": oldAdapter.MACAddress,
+				"ipType":     oldAdapter.IPType,
+			},
+		})
+	}
+
+	return changes
+}
+
+func (c *ChangeTrackerCollector) diffScheduledTasks(current *Snapshot) []ChangeRecord {
+	now := c.now()
+	changes := make([]ChangeRecord, 0)
+
+	for key, newTask := range current.ScheduledTasks {
+		oldTask, existed := c.lastSnapshot.ScheduledTasks[key]
+		if !existed {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeTask,
+				ChangeAction: ChangeActionAdded,
+				Subject:      taskSubject(newTask),
+				AfterValue: map[string]any{
+					"path":     newTask.Path,
+					"status":   newTask.Status,
+					"schedule": newTask.Schedule,
+					"command":  newTask.Command,
+				},
+			})
+			continue
+		}
+
+		if oldTask.Status != newTask.Status || oldTask.Schedule != newTask.Schedule || oldTask.Command != newTask.Command || oldTask.Path != newTask.Path {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeTask,
+				ChangeAction: ChangeActionModified,
+				Subject:      taskSubject(newTask),
+				BeforeValue: map[string]any{
+					"path":     oldTask.Path,
+					"status":   oldTask.Status,
+					"schedule": oldTask.Schedule,
+					"command":  oldTask.Command,
+				},
+				AfterValue: map[string]any{
+					"path":     newTask.Path,
+					"status":   newTask.Status,
+					"schedule": newTask.Schedule,
+					"command":  newTask.Command,
+				},
+			})
+		}
+	}
+
+	for key, oldTask := range c.lastSnapshot.ScheduledTasks {
+		if _, exists := current.ScheduledTasks[key]; exists {
+			continue
+		}
+		changes = append(changes, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeTask,
+			ChangeAction: ChangeActionRemoved,
+			Subject:      taskSubject(oldTask),
+			BeforeValue: map[string]any{
+				"path":    oldTask.Path,
+				"status":  oldTask.Status,
+				"command": oldTask.Command,
+			},
+		})
+	}
+
+	return changes
+}
+
+func (c *ChangeTrackerCollector) diffUserAccounts(current *Snapshot) []ChangeRecord {
+	now := c.now()
+	changes := make([]ChangeRecord, 0)
+
+	for key, newAccount := range current.UserAccounts {
+		oldAccount, existed := c.lastSnapshot.UserAccounts[key]
+		if !existed {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeUserAccount,
+				ChangeAction: ChangeActionAdded,
+				Subject:      newAccount.Username,
+				AfterValue: map[string]any{
+					"fullName": newAccount.FullName,
+					"disabled": newAccount.Disabled,
+					"locked":   newAccount.Locked,
+				},
+			})
+			continue
+		}
+
+		if oldAccount.FullName != newAccount.FullName || oldAccount.Disabled != newAccount.Disabled || oldAccount.Locked != newAccount.Locked {
+			changes = append(changes, ChangeRecord{
+				Timestamp:    now,
+				ChangeType:   ChangeTypeUserAccount,
+				ChangeAction: ChangeActionModified,
+				Subject:      newAccount.Username,
+				BeforeValue: map[string]any{
+					"fullName": oldAccount.FullName,
+					"disabled": oldAccount.Disabled,
+					"locked":   oldAccount.Locked,
+				},
+				AfterValue: map[string]any{
+					"fullName": newAccount.FullName,
+					"disabled": newAccount.Disabled,
+					"locked":   newAccount.Locked,
+				},
+			})
+		}
+	}
+
+	for key, oldAccount := range c.lastSnapshot.UserAccounts {
+		if _, exists := current.UserAccounts[key]; exists {
+			continue
+		}
+		changes = append(changes, ChangeRecord{
+			Timestamp:    now,
+			ChangeType:   ChangeTypeUserAccount,
+			ChangeAction: ChangeActionRemoved,
+			Subject:      oldAccount.Username,
+			BeforeValue: map[string]any{
+				"fullName": oldAccount.FullName,
+				"disabled": oldAccount.Disabled,
+				"locked":   oldAccount.Locked,
+			},
+		})
+	}
+
+	return changes
+}
+
+// diffHardware compares the current hardware state against the previous
+// snapshot. Hardware is a singleton (not a map), so there is no add/remove —
+// only field-level "modified"/"updated" events. Returns no records when
+// either snapshot's Hardware is nil (first-run seeding or collection
+// unavailable): we never want to emit "changed from nothing".
+func (c *ChangeTrackerCollector) diffHardware(current *Snapshot) []ChangeRecord {
+	now := c.now()
+	changes := make([]ChangeRecord, 0)
+	prev := c.lastSnapshot.Hardware
+	cur := current.Hardware
+	if prev == nil || cur == nil {
+		return nil // first-run seed or unavailable: no events
+	}
+
+	emit := func(subject string, before, after any) {
+		changes = append(changes, ChangeRecord{
+			Timestamp: now, ChangeType: ChangeTypeHardware, ChangeAction: ChangeActionModified,
+			Subject:     subject,
+			BeforeValue: map[string]any{"value": before},
+			AfterValue:  map[string]any{"value": after},
+		})
+	}
+
+	if prev.RAMTotalMB != cur.RAMTotalMB {
+		// Emit as rounded GB strings ("4 GB → 8 GB") rather than raw MB.
+		prevGB := (prev.RAMTotalMB + 512) / 1024
+		curGB := (cur.RAMTotalMB + 512) / 1024
+		changes = append(changes, ChangeRecord{
+			Timestamp: now, ChangeType: ChangeTypeHardware, ChangeAction: ChangeActionModified, Subject: "Memory",
+			BeforeValue: map[string]any{"value": fmt.Sprintf("%d GB", prevGB)},
+			AfterValue:  map[string]any{"value": fmt.Sprintf("%d GB", curGB)},
+		})
+	}
+	if prev.CPUModel != cur.CPUModel || prev.CPUCores != cur.CPUCores {
+		changes = append(changes, ChangeRecord{
+			Timestamp: now, ChangeType: ChangeTypeHardware, ChangeAction: ChangeActionModified, Subject: "Processor",
+			BeforeValue: map[string]any{"model": prev.CPUModel, "cores": prev.CPUCores},
+			AfterValue:  map[string]any{"model": cur.CPUModel, "cores": cur.CPUCores},
+		})
+	}
+	if prev.DiskTotalGB != cur.DiskTotalGB {
+		// DiskTotalGB is already GB — render with a unit ("256 GB → 512 GB").
+		changes = append(changes, ChangeRecord{
+			Timestamp: now, ChangeType: ChangeTypeHardware, ChangeAction: ChangeActionModified, Subject: "Storage",
+			BeforeValue: map[string]any{"value": fmt.Sprintf("%d GB", prev.DiskTotalGB)},
+			AfterValue:  map[string]any{"value": fmt.Sprintf("%d GB", cur.DiskTotalGB)},
+		})
+	}
+	if prev.BIOSVersion != cur.BIOSVersion {
+		changes = append(changes, ChangeRecord{
+			Timestamp: now, ChangeType: ChangeTypeHardware, ChangeAction: ChangeActionUpdated, Subject: "BIOS",
+			BeforeValue: map[string]any{"value": prev.BIOSVersion}, AfterValue: map[string]any{"value": cur.BIOSVersion},
+		})
+	}
+	if prev.SerialNumber != cur.SerialNumber {
+		emit("System Serial", prev.SerialNumber, cur.SerialNumber)
+	}
+	if prev.Motherboard != cur.Motherboard {
+		emit("Motherboard", prev.Motherboard, cur.Motherboard)
+	}
+
+	return changes
+}
+
+// diffOS compares the current OS identity against the previous snapshot.
+// Returns no records when either snapshot's System is nil (first-run seeding
+// or collection unavailable), or when the OS version is unchanged.
+func (c *ChangeTrackerCollector) diffOS(current *Snapshot) []ChangeRecord {
+	now := c.now()
+	prev := c.lastSnapshot.System
+	cur := current.System
+	if prev == nil || cur == nil || prev.OSVersion == cur.OSVersion {
+		return nil
+	}
+
+	return []ChangeRecord{{
+		Timestamp: now, ChangeType: ChangeTypeOS, ChangeAction: ChangeActionUpdated, Subject: "Operating System",
+		BeforeValue: map[string]any{"version": prev.OSVersion, "build": prev.OSBuild},
+		AfterValue:  map[string]any{"version": cur.OSVersion, "build": cur.OSBuild},
+	}}
+}
+
+func (c *ChangeTrackerCollector) filterNoise(changes []ChangeRecord) []ChangeRecord {
+	if len(changes) == 0 || len(c.ignoreRules) == 0 {
+		return changes
+	}
+
+	filtered := make([]ChangeRecord, 0, len(changes))
+	for _, change := range changes {
+		if c.shouldIgnoreChange(change) {
+			continue
+		}
+		filtered = append(filtered, change)
+	}
+	return filtered
+}
+
+func (c *ChangeTrackerCollector) shouldIgnoreChange(change ChangeRecord) bool {
+	subject := strings.ToLower(strings.TrimSpace(change.Subject))
+	if subject == "" {
+		return false
+	}
+
+	for _, rule := range c.ignoreRules {
+		if rule.changeType != change.ChangeType {
+			continue
+		}
+
+		matched, err := filepath.Match(rule.pattern, subject)
+		if err == nil && matched {
+			return true
+		}
+		if rule.pattern == subject {
+			return true
+		}
+	}
+	return false
+}
+
+func defaultChangeIgnoreRules() []changeIgnoreRule {
+	return []changeIgnoreRule{
+		{changeType: ChangeTypeSoftware, pattern: "security intelligence update*"},
+		{changeType: ChangeTypeSoftware, pattern: "definition update for microsoft defender*"},
+	}
+}
+
+func parseChangeIgnoreRules(raw string) []changeIgnoreRule {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	validTypes := map[ChangeType]struct{}{
+		ChangeTypeSoftware:    {},
+		ChangeTypeService:     {},
+		ChangeTypeStartup:     {},
+		ChangeTypeNetwork:     {},
+		ChangeTypeTask:        {},
+		ChangeTypeUserAccount: {},
+		ChangeTypeHardware:    {},
+		ChangeTypeOS:          {},
+	}
+
+	rules := make([]changeIgnoreRule, 0)
+	for _, token := range strings.Split(raw, ",") {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		parts := strings.SplitN(token, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		changeType := ChangeType(strings.TrimSpace(parts[0]))
+		if _, ok := validTypes[changeType]; !ok {
+			continue
+		}
+
+		pattern := strings.ToLower(strings.TrimSpace(parts[1]))
+		if pattern == "" {
+			continue
+		}
+		rules = append(rules, changeIgnoreRule{
+			changeType: changeType,
+			pattern:    pattern,
+		})
+	}
+	return rules
+}
+
+func softwareKey(item SoftwareItem) string {
+	// Use only Name and Vendor — both are stable across collection runs.
+	// InstallLocation and UninstallString are intentionally excluded: on Windows
+	// the registry can have multiple subkeys with the same DisplayName+DisplayVersion
+	// but different values for those fields, and ReadSubKeyNames returns them in
+	// non-deterministic order.  Including unstable fields in the key causes the
+	// same software to appear as removed+added on consecutive runs with no real
+	// change ("metadata churn").  Version is kept out of the key so that a
+	// version upgrade is detected as an "updated" event rather than a
+	// remove+add pair.
+	return strings.Join([]string{
+		normalizeString(item.Name),
+		normalizeString(item.Vendor),
+	}, "|")
+}
+
+func serviceKey(item ServiceInfo) string {
+	return normalizeString(item.Name)
+}
+
+func startupKey(item TrackedStartupItem) string {
+	return strings.Join([]string{
+		normalizeString(item.Name),
+		normalizeString(item.Type),
+		normalizeString(item.Path),
+	}, "|")
+}
+
+func networkKey(item NetworkAdapterInfo) string {
+	return strings.Join([]string{
+		normalizeString(item.InterfaceName),
+		normalizeString(item.IPType),
+		normalizeString(item.MACAddress),
+	}, "|")
+}
+
+func taskKey(item TrackedScheduledTask) string {
+	return strings.Join([]string{
+		normalizeString(item.Name),
+		normalizeString(item.Path),
+	}, "|")
+}
+
+func userAccountKey(item TrackedUserAccount) string {
+	return normalizeString(item.Username)
+}
+
+func softwareSubject(item SoftwareItem) string {
+	if strings.TrimSpace(item.Name) != "" {
+		return item.Name
+	}
+	return "unknown software"
+}
+
+func serviceSubject(item ServiceInfo) string {
+	if strings.TrimSpace(item.DisplayName) != "" {
+		return item.DisplayName
+	}
+	if strings.TrimSpace(item.Name) != "" {
+		return item.Name
+	}
+	return "unknown service"
+}
+
+func startupSubject(item TrackedStartupItem) string {
+	if strings.TrimSpace(item.Name) != "" {
+		return item.Name
+	}
+	return "unknown startup item"
+}
+
+func taskSubject(item TrackedScheduledTask) string {
+	if strings.TrimSpace(item.Name) != "" {
+		return item.Name
+	}
+	return "unknown scheduled task"
+}
+
+func normalizeString(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}

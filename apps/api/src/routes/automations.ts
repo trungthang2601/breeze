@@ -1,0 +1,1806 @@
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
+import { Hono, type Context, type Next } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { scriptParametersSchema } from '@breeze/shared';
+import { and, desc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { db } from '../db';
+import {
+  automations,
+  automationRuns,
+  automationRunDeviceResults,
+  configurationPolicies,
+  devices,
+  scriptExecutions,
+  scripts,
+} from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { writeAuditEvent, writeRouteAudit } from '../services/auditEvents';
+import { getTrustedClientIp } from '../services/clientIp';
+import { PERMISSIONS, type UserPermissions } from '../services/permissions';
+import { getRedis } from '../services/redis';
+import { decryptForColumn, encryptSecret } from '../services/secretCrypto';
+import {
+  AutomationValidationError,
+  checkAutomationTargetsWithinSiteScope,
+  createAutomationRunRecord,
+  normalizeAutomationActions,
+  normalizeAutomationTrigger,
+  normalizeNotificationTargets,
+  replaceAutomationResourceBindings,
+  resolveAutomationReferencesForOwner,
+  withWebhookDefaults,
+} from '../services/automationRuntime';
+import { AutomationReferenceAuthorizationError } from '../services/automationReferenceAuthorization';
+import { enqueueAutomationRun } from '../jobs/automationWorker';
+import {
+  canManagePartnerWidePolicies,
+  PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+} from '../services/partnerWideAccess';
+import { cancelAutomationRun } from '../services/automationRunCancellation';
+import { MAX_GRACE_SECONDS } from '../services/scriptCancellation';
+import {
+  AI_TRIAGE_SYSTEM_MANAGED_ERROR_CODE,
+  MANAGED_AUTOMATION_ERROR_CODE,
+  containsAiTriageAction,
+  isManagedAutomation,
+  managedAutomationOwnerIsLive,
+} from '../services/aiAgents/managedAutomation';
+import { UUID_REGEX } from '../utils/uuid';
+import { projectAutomationRunsToSites, scanProjectedAutomationRuns } from '../services/automationReadProjection';
+import { managedByMonitorResponse } from '../services/monitors/managedRowGuard';
+
+export const automationRoutes = new Hono();
+export const automationWebhookRoutes = new Hono();
+const requireAutomationRead = requirePermission(PERMISSIONS.AUTOMATIONS_READ.resource, PERMISSIONS.AUTOMATIONS_READ.action);
+const requireAutomationWrite = requirePermission(PERMISSIONS.AUTOMATIONS_WRITE.resource, PERMISSIONS.AUTOMATIONS_WRITE.action);
+const AUTOMATION_WEBHOOK_SIGNATURE_WINDOW_MS = 5 * 60 * 1000;
+const automationWebhookReplayCache = new Map<string, number>();
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isAutomationReferenceDenial(error: unknown): boolean {
+  return error instanceof AutomationReferenceAuthorizationError
+    || (typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      && error.code === 'unknown_or_unauthorized_reference');
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function isMaskedSecret(value: unknown): boolean {
+  if (typeof value === 'string') return /^\*+$/.test(value.trim());
+  return isPlainRecord(value) && (value.redacted === true || value.hasSecret === true || value.masked === '********');
+}
+
+function encryptAutomationTriggerSecret(trigger: unknown, existing?: unknown): unknown {
+  if (!isPlainRecord(trigger) || trigger.type !== 'webhook') return trigger;
+  const existingTrigger = isPlainRecord(existing) ? existing : {};
+  const output: Record<string, unknown> = { ...trigger };
+  const value = output.secret ?? output.webhookSecret;
+  if (isMaskedSecret(value)) {
+    output.secret = existingTrigger.secret ?? existingTrigger.webhookSecret;
+  } else if (typeof value === 'string' && value.length > 0) {
+    output.secret = encryptSecret(value);
+  }
+  delete output.webhookSecret;
+  return output;
+}
+
+function decryptAutomationTriggerSecret(trigger: unknown): unknown {
+  if (!isPlainRecord(trigger) || trigger.type !== 'webhook') return trigger;
+  const output: Record<string, unknown> = { ...trigger };
+  const value = output.secret ?? output.webhookSecret;
+  if (typeof value === 'string') {
+    // The secret lives inside automations.trigger (JSON column). AAD is
+    // bound at the parent column so the registry walker and this helper
+    // produce matching tags.
+    output.secret = decryptForColumn('automations', 'trigger', value);
+  }
+  delete output.webhookSecret;
+  return output;
+}
+
+function redactAutomationTrigger(trigger: unknown): unknown {
+  if (!isPlainRecord(trigger) || trigger.type !== 'webhook') return trigger;
+  return {
+    ...trigger,
+    secret: {
+      redacted: true,
+      hasSecret: Boolean(trigger.secret ?? trigger.webhookSecret),
+      masked: '********',
+    },
+    webhookSecret: undefined,
+  };
+}
+
+function envFlag(name: string, defaultValue = false): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return defaultValue;
+  return /^(1|true|yes|on)$/i.test(raw);
+}
+
+function pruneAutomationWebhookReplayCache(now = Date.now()): void {
+  for (const [key, expiresAt] of automationWebhookReplayCache) {
+    if (expiresAt <= now) automationWebhookReplayCache.delete(key);
+  }
+}
+
+function shouldAllowLocalWebhookReplayFallback(): boolean {
+  return process.env.NODE_ENV !== 'production'
+    || envFlag('AUTOMATION_WEBHOOK_ALLOW_LOCAL_REPLAY_FALLBACK');
+}
+
+function checkLocalAutomationWebhookReplay(replayKey: string, now: number): boolean {
+  pruneAutomationWebhookReplayCache(now);
+  if (automationWebhookReplayCache.has(replayKey)) {
+    return false;
+  }
+  automationWebhookReplayCache.set(replayKey, now + AUTOMATION_WEBHOOK_SIGNATURE_WINDOW_MS);
+  return true;
+}
+
+async function reserveAutomationWebhookReplayNonce(replayKey: string, now: number): Promise<
+  { ok: true } | { ok: false; error: string; status: 409 | 503 }
+> {
+  const redis = getRedis();
+  if (!redis) {
+    if (shouldAllowLocalWebhookReplayFallback()) {
+      return checkLocalAutomationWebhookReplay(replayKey, now)
+        ? { ok: true }
+        : { ok: false, error: 'Duplicate webhook delivery', status: 409 };
+    }
+    return { ok: false, error: 'Webhook replay protection is temporarily unavailable', status: 503 };
+  }
+
+  try {
+    const result = await redis.set(
+      `automation-webhook-replay:${replayKey}`,
+      '1',
+      'PX',
+      AUTOMATION_WEBHOOK_SIGNATURE_WINDOW_MS,
+      'NX',
+    );
+    if (result !== 'OK') {
+      return { ok: false, error: 'Duplicate webhook delivery', status: 409 };
+    }
+    return { ok: true };
+  } catch (error) {
+    console.error('[automation-webhook] Redis replay nonce write failed:', error);
+    if (shouldAllowLocalWebhookReplayFallback()) {
+      return checkLocalAutomationWebhookReplay(replayKey, now)
+        ? { ok: true }
+        : { ok: false, error: 'Duplicate webhook delivery', status: 409 };
+    }
+    return { ok: false, error: 'Webhook replay protection is temporarily unavailable', status: 503 };
+  }
+}
+
+async function verifyAutomationWebhookSignature(input: {
+  automationId: string;
+  secret: string;
+  payload: string;
+  signatureHeader?: string | null;
+  timestampHeader?: string | null;
+  eventIdHeader?: string | null;
+}): Promise<{ ok: true } | { ok: false; error: string; status: 400 | 401 | 409 | 503 }> {
+  const signature = input.signatureHeader?.trim();
+  if (!signature) return { ok: false, error: 'Missing webhook signature', status: 401 };
+
+  const timestamp = input.timestampHeader?.trim();
+  if (!timestamp) return { ok: false, error: 'Missing webhook timestamp', status: 401 };
+
+  const parsedTimestamp = Number(timestamp);
+  if (!Number.isFinite(parsedTimestamp) || parsedTimestamp <= 0) {
+    return { ok: false, error: 'Invalid webhook timestamp', status: 400 };
+  }
+
+  const timestampMs = parsedTimestamp > 1_000_000_000_000
+    ? parsedTimestamp
+    : parsedTimestamp * 1000;
+  const now = Date.now();
+  if (Math.abs(now - timestampMs) > AUTOMATION_WEBHOOK_SIGNATURE_WINDOW_MS) {
+    return { ok: false, error: 'Webhook signature timestamp is outside the replay window', status: 401 };
+  }
+
+  const expected = `sha256=${createHmac('sha256', input.secret).update(`${timestamp}.${input.payload}`).digest('hex')}`;
+  const normalizedSignature = signature.startsWith('sha256=') ? signature : `sha256=${signature}`;
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  const providedBuffer = Buffer.from(normalizedSignature, 'utf8');
+  if (expectedBuffer.length !== providedBuffer.length || !timingSafeEqual(expectedBuffer, providedBuffer)) {
+    return { ok: false, error: 'Invalid webhook signature', status: 401 };
+  }
+
+  const replayNonce = input.eventIdHeader?.trim() || normalizedSignature;
+  const replayNonceHash = createHash('sha256').update(replayNonce).digest('hex');
+  const replayKey = `${input.automationId}:${replayNonceHash}`;
+  return reserveAutomationWebhookReplayNonce(replayKey, now);
+}
+
+function getPagination(query: { page?: string; limit?: string }) {
+  const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(query.limit ?? '50', 10) || 50));
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+function ensureOrgAccess(orgId: string, auth: AuthContext) {
+  return auth.canAccessOrg(orgId);
+}
+
+function requireUuidParam(name: string, notFoundMessage: string) {
+  return async (c: Context, next: Next) => {
+    const value = c.req.param(name);
+    if (!value || !UUID_REGEX.test(value)) {
+      return c.json({ error: notFoundMessage }, 404);
+    }
+    await next();
+  };
+}
+
+const requireValidAutomationId = requireUuidParam('id', 'Automation not found');
+const requireValidRunId = requireUuidParam('runId', 'Automation run not found');
+
+/**
+ * Site-scope gate for automations. Site is an app-layer authz axis RLS does not
+ * defend, and the automation runtime resolves targets org-wide (running actions
+ * as `system`). Sibling device-acting routes re-check `canAccessSite` per device;
+ * automations must do the same — both when a site-restricted user creates/updates
+ * an automation (the only gate for unattended schedule/event triggers) and when
+ * one is manually triggered (the resolved set may have drifted).
+ *
+ * Returns a 403 JSON response if the caller is site-restricted and the
+ * automation's target set escapes their allowlist, otherwise null (proceed).
+ * Unrestricted callers always pass.
+ */
+async function enforceAutomationSiteScope(
+  c: Context,
+  automation: Parameters<typeof checkAutomationTargetsWithinSiteScope>[0],
+) {
+  const perms = c.get('permissions') as UserPermissions | undefined;
+  const result = await checkAutomationTargetsWithinSiteScope(automation, perms);
+  if (!result.ok) {
+    if (result.unbounded) {
+      return c.json(
+        { error: 'Site-restricted users cannot create or run automations that target all devices in the organization' },
+        403,
+      );
+    }
+    return c.json({ error: 'Access to one or more target sites denied' }, 403);
+  }
+  return null;
+}
+
+// Dual-ownership (#2133): an automation is org-owned (orgId set) or
+// partner-wide (orgId NULL, partnerId set).
+
+// Access to a LOADED automation row: org-owned keeps the org check; partner-
+// wide rows are visible to system scope and the owning partner's own tokens.
+// Org tokens never see partner-wide automations (RLS is stricter than the app
+// layer — org contexts never pass breeze_has_partner_access).
+function canAccessAutomation(
+  auth: AuthContext,
+  automation: { orgId: string | null; partnerId: string | null },
+): boolean {
+  if (automation.orgId !== null) {
+    return auth.canAccessOrg(automation.orgId);
+  }
+  if (auth.scope === 'system') return true;
+  return auth.scope === 'partner' && !!auth.partnerId && automation.partnerId === auth.partnerId;
+}
+
+async function getAutomationWithOrgCheck(automationId: string, auth: AuthContext) {
+  const [automation] = await db
+    .select()
+    .from(automations)
+    .where(eq(automations.id, automationId))
+    .limit(1);
+
+  if (!automation) {
+    return null;
+  }
+
+  if (!canAccessAutomation(auth, automation)) {
+    return null;
+  }
+
+  return automation;
+}
+
+function normalizeIncomingTrigger(input: {
+  trigger?: unknown;
+  triggerType?: 'schedule' | 'event' | 'webhook' | 'manual';
+  triggerConfig?: unknown;
+}): unknown {
+  if (input.trigger !== undefined) {
+    return input.trigger;
+  }
+
+  if (!input.triggerType) {
+    return undefined;
+  }
+
+  const triggerConfig = isPlainRecord(input.triggerConfig) ? input.triggerConfig : {};
+
+  if (input.triggerType === 'manual') {
+    return { type: 'manual' };
+  }
+
+  if (input.triggerType === 'schedule') {
+    return {
+      type: 'schedule',
+      cronExpression: asString(triggerConfig.cronExpression) ?? asString(triggerConfig.cron) ?? '0 9 * * *',
+      timezone: asString(triggerConfig.timezone) ?? 'UTC',
+    };
+  }
+
+  if (input.triggerType === 'event') {
+    return {
+      type: 'event',
+      eventType: asString(triggerConfig.eventType) ?? 'device.offline',
+      filter: isPlainRecord(triggerConfig.filter) ? triggerConfig.filter : undefined,
+    };
+  }
+
+  return {
+    type: 'webhook',
+    secret: asString(triggerConfig.secret) ?? asString(triggerConfig.webhookSecret),
+    webhookUrl: asString(triggerConfig.webhookUrl),
+  };
+}
+
+function normalizeIncomingNotificationTargets(input: {
+  notificationTargets?: unknown;
+  notifyOnFailureChannelId?: string;
+}): unknown {
+  if (input.notificationTargets !== undefined) {
+    return input.notificationTargets;
+  }
+
+  if (input.notifyOnFailureChannelId) {
+    return { channelIds: [input.notifyOnFailureChannelId] };
+  }
+
+  return undefined;
+}
+
+function shapeAutomationForResponse(automation: typeof automations.$inferSelect) {
+  const trigger = isPlainRecord(automation.trigger) ? automation.trigger : {};
+  const triggerType = asString(trigger.type) ?? 'manual';
+
+  const triggerConfig = {
+    cronExpression: asString(trigger.cronExpression) ?? asString(trigger.cron),
+    timezone: asString(trigger.timezone),
+    eventType: asString(trigger.eventType),
+    webhookUrl: asString(trigger.webhookUrl),
+  };
+
+  const notificationTargets = isPlainRecord(automation.notificationTargets)
+    ? automation.notificationTargets
+    : {};
+
+  const channelIds = Array.isArray(notificationTargets.channelIds)
+    ? notificationTargets.channelIds.filter((value): value is string => typeof value === 'string')
+    : [];
+
+  return {
+    ...automation,
+    trigger: redactAutomationTrigger(automation.trigger),
+    triggerType,
+    triggerConfig,
+    notifyOnFailureChannelId: channelIds[0],
+  };
+}
+
+function shapeRestrictedAutomationForResponse(automation: typeof automations.$inferSelect) {
+  const { runCount: _runCount, lastRunAt: _lastRunAt, ...safe } = shapeAutomationForResponse(automation);
+  return safe;
+}
+
+function toRunStatus(status: (typeof automationRuns.$inferSelect)['status']) {
+  if (status === 'completed') return 'success';
+  return status;
+}
+
+function serializeRunLogs(logs: unknown): string[] {
+  if (!Array.isArray(logs)) return [];
+  return logs
+    .map((entry) => {
+      if (!isPlainRecord(entry)) return null;
+      const level = asString(entry.level) ?? 'info';
+      const message = asString(entry.message) ?? '';
+      if (!message) return null;
+      return `[${level}] ${message}`;
+    })
+    .filter((line): line is string => Boolean(line));
+}
+
+// This response is re-fetched by the run-history panel on every progress tick
+// (4s while a run is live), and `script_executions.stdout` accepts up to 5MB per
+// execution. Truncate in SQL so a chatty fleet run can't turn one poll into a
+// multi-hundred-megabyte payload; the full text stays available through the
+// device's script-execution history (#3162).
+const RUN_SCRIPT_STDOUT_PREVIEW_CHARS = 16_384;
+const RUN_SCRIPT_STDERR_PREVIEW_CHARS = 8_192;
+
+type RunScriptResult = {
+  executionId: string;
+  // Nullable since 2026-10-16-100200: a proposal-backed execution has no
+  // library script.
+  scriptId: string | null;
+  scriptName?: string;
+  status: string;
+  exitCode?: number;
+  stdout?: string;
+  stdoutTruncated?: boolean;
+  stderr?: string;
+  stderrTruncated?: boolean;
+  error?: string;
+};
+
+/** Cut a `left(col, N+1)` preview back to N, reporting whether it overflowed. */
+function takePreview(
+  value: string | null,
+  limit: number,
+): { text?: string; truncated?: boolean } {
+  if (value == null) return {};
+  if (value.length <= limit) return { text: value };
+  return { text: value.slice(0, limit), truncated: true };
+}
+
+/**
+ * Fetch the `script_executions` rows minted by a run's `run_script` actions,
+ * grouped by device (#3162). These carry the script's REAL stdout/stderr/exit
+ * code, which `automation_run_device_results.output` never has — that column
+ * only holds the automation's own log lines. RLS on script_executions (org_id =
+ * device's org) scopes rows to the caller's tenancy, same as
+ * fetchRunDeviceResults.
+ *
+ * `scriptName` is a LEFT JOIN and can legitimately be null: an org-scoped RLS
+ * context cannot see a partner-wide script (`scripts.org_id IS NULL`), so the
+ * UI falls back to a generic label rather than dropping the output row.
+ */
+async function fetchRunScriptExecutions(runId: string, auth: AuthContext, allowedSiteIds?: string[]) {
+  const conditions: SQL[] = [eq(scriptExecutions.automationRunId, runId)];
+  const orgCondition = auth.orgCondition?.(scriptExecutions.orgId);
+  if (orgCondition) conditions.push(orgCondition);
+  if (allowedSiteIds !== undefined) conditions.push(inArray(devices.siteId, allowedSiteIds));
+
+  const rows = await db
+    .select({
+      executionId: scriptExecutions.id,
+      deviceId: scriptExecutions.deviceId,
+      scriptId: scriptExecutions.scriptId,
+      scriptName: scripts.name,
+      status: scriptExecutions.status,
+      exitCode: scriptExecutions.exitCode,
+      // +1 so the TS side can tell "exactly at the limit" from "overflowed".
+      stdout: sql<string | null>`left(${scriptExecutions.stdout}, ${RUN_SCRIPT_STDOUT_PREVIEW_CHARS + 1})`,
+      stderr: sql<string | null>`left(${scriptExecutions.stderr}, ${RUN_SCRIPT_STDERR_PREVIEW_CHARS + 1})`,
+      errorMessage: scriptExecutions.errorMessage,
+      createdAt: scriptExecutions.createdAt,
+    })
+    .from(scriptExecutions)
+    .innerJoin(devices, eq(devices.id, scriptExecutions.deviceId))
+    .leftJoin(scripts, eq(scripts.id, scriptExecutions.scriptId))
+    .where(and(...conditions))
+    .orderBy(scriptExecutions.createdAt);
+
+  const byDevice = new Map<string, RunScriptResult[]>();
+
+  for (const row of rows) {
+    const stdout = takePreview(row.stdout, RUN_SCRIPT_STDOUT_PREVIEW_CHARS);
+    const stderr = takePreview(row.stderr, RUN_SCRIPT_STDERR_PREVIEW_CHARS);
+    const list = byDevice.get(row.deviceId) ?? [];
+    list.push({
+      executionId: row.executionId,
+      scriptId: row.scriptId,
+      scriptName: row.scriptName ?? undefined,
+      status: row.status,
+      exitCode: row.exitCode ?? undefined,
+      stdout: stdout.text,
+      stdoutTruncated: stdout.truncated,
+      stderr: stderr.text,
+      stderrTruncated: stderr.truncated,
+      error: row.errorMessage ?? undefined,
+    });
+    byDevice.set(row.deviceId, list);
+  }
+
+  return byDevice;
+}
+
+/**
+ * Fetch the consolidated per-device breakdown for one run (#2023), joined to
+ * `devices` for a display name. Shaped to the web `DeviceRunResult` contract:
+ * status + start/complete timestamps + duration (ms) + output/error, plus the
+ * per-device script executions the run queued (#3162). RLS on
+ * automation_run_device_results (org_id = device's org) already scopes rows to
+ * the caller's tenancy, so no extra org filter is needed here.
+ */
+async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSiteIds?: string[]) {
+  const conditions: SQL[] = [eq(automationRunDeviceResults.runId, runId)];
+  if (allowedSiteIds !== undefined) conditions.push(inArray(devices.siteId, allowedSiteIds));
+  const [rows, scriptExecutionsByDevice] = await Promise.all([
+    db
+      .select({
+        deviceId: automationRunDeviceResults.deviceId,
+        status: automationRunDeviceResults.status,
+        startedAt: automationRunDeviceResults.startedAt,
+        completedAt: automationRunDeviceResults.completedAt,
+        output: automationRunDeviceResults.output,
+        error: automationRunDeviceResults.error,
+        hostname: devices.hostname,
+        displayName: devices.displayName,
+      })
+      .from(automationRunDeviceResults)
+      .innerJoin(devices, eq(devices.id, automationRunDeviceResults.deviceId))
+      .where(and(...conditions))
+      .orderBy(desc(automationRunDeviceResults.startedAt)),
+    fetchRunScriptExecutions(runId, auth, allowedSiteIds),
+  ]);
+
+  return rows.map((row) => {
+    const duration = row.startedAt && row.completedAt
+      ? new Date(row.completedAt).getTime() - new Date(row.startedAt).getTime()
+      : undefined;
+    const scriptResults = scriptExecutionsByDevice.get(row.deviceId);
+    return {
+      deviceId: row.deviceId,
+      deviceName: row.displayName ?? row.hostname ?? row.deviceId,
+      status: row.status,
+      startedAt: row.startedAt,
+      completedAt: row.completedAt,
+      duration,
+      output: row.output ?? undefined,
+      error: row.error ?? undefined,
+      scriptResults: scriptResults && scriptResults.length > 0 ? scriptResults : undefined,
+    };
+  });
+}
+
+const listAutomationsSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  enabled: z.enum(['true', 'false']).optional(),
+});
+
+const triggerTypeSchema = z.enum(['schedule', 'event', 'webhook', 'manual']);
+
+// Validate submitted script actions separately from the tolerant runtime reader,
+// which must still accept legacy stored actions. Preserve the script_id alias.
+const scriptActionSchema = z.object({
+  type: z.literal('run_script'),
+  scriptId: z.string().min(1).optional(),
+  script_id: z.string().min(1).optional(),
+  parameters: scriptParametersSchema.optional(),
+  runAs: z.enum(['system', 'user', 'elevated']).nullish(),
+  whenOffline: z.enum(['queue', 'skip']).optional(),
+}).passthrough().refine((action) => action.scriptId !== undefined || action.script_id !== undefined, {
+  message: 'run_script requires scriptId',
+});
+
+const automationActionsSchema = z.array(z.union([
+  scriptActionSchema,
+  z.object({ type: z.string().min(1).refine((type) => type !== 'run_script') }).passthrough(),
+])).min(1);
+
+function introducesElevatedAction(actions: z.infer<typeof automationActionsSchema>, stored: unknown = []): boolean {
+  // Runtime normalization does not retain action IDs. Preserve elevation only
+  // for the same script at the same position, using the runtime's alias precedence.
+  const previous = Array.isArray(stored) ? stored : [];
+  return actions.some((action, index) => {
+    if (action.type !== 'run_script' || action.runAs !== 'elevated') return false;
+    const existing = previous[index];
+    return !isPlainRecord(existing)
+      || existing.type !== 'run_script'
+      || existing.runAs !== 'elevated'
+      || (asString(existing.scriptId) ?? asString(existing.script_id))
+        !== (asString(action.scriptId) ?? asString(action.script_id));
+  });
+}
+
+function elevatedActionRefused(c: Context) {
+  return c.json({
+    code: 'elevated_automation_action_refused',
+    error: 'A new run_script automation action may set runAs to "system" or "user" only. Elevation is a property of the saved script, not something an automation action may request. Existing elevated actions may be preserved at their stored positions.',
+  }, 400);
+}
+
+const createAutomationSchema = z.object({
+  orgId: z.string().guid().optional(),
+  // 'partner' creates a partner-wide ("all orgs") automation: orgId NULL,
+  // partnerId = caller's partner (#2133). Create-only — ownership never
+  // changes after creation (updateAutomationSchema has no ownerScope).
+  ownerScope: z.enum(['organization', 'partner']).optional(),
+  name: z.string().min(1).max(255),
+  description: z.string().optional(),
+  enabled: z.boolean().default(true),
+  trigger: z.unknown().optional(),
+  triggerType: triggerTypeSchema.optional(),
+  triggerConfig: z.unknown().optional(),
+  conditions: z.unknown().optional(),
+  actions: automationActionsSchema.optional(),
+  onFailure: z.enum(['stop', 'continue', 'notify']).default('stop'),
+  notificationTargets: z.unknown().optional(),
+  notifyOnFailureChannelId: z.string().guid().optional(),
+});
+
+const updateAutomationSchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  description: z.string().optional(),
+  enabled: z.boolean().optional(),
+  trigger: z.unknown().optional(),
+  triggerType: triggerTypeSchema.optional(),
+  triggerConfig: z.unknown().optional(),
+  conditions: z.unknown().optional(),
+  actions: automationActionsSchema.optional(),
+  onFailure: z.enum(['stop', 'continue', 'notify']).optional(),
+  notificationTargets: z.unknown().optional(),
+  notifyOnFailureChannelId: z.string().guid().optional(),
+});
+
+const listRunsSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  status: z.enum(['running', 'completed', 'failed', 'partial']).optional(),
+});
+
+automationRoutes.use('*', authMiddleware);
+
+// ============================================
+// Read-only routes
+// ============================================
+
+automationRoutes.get(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationRead,
+  zValidator('query', listAutomationsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+
+    const conditions: SQL<unknown>[] = [isNull(automations.retiredAt)];
+
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      conditions.push(eq(automations.orgId, auth.orgId));
+    } else if (auth.scope === 'partner') {
+      // Dual-axis (#2133): partner-scope callers also see their own
+      // partner-wide automations (orgId NULL). Org tokens never get this
+      // branch — they carry a partnerId but never pass partner access.
+      const partnerWideCondition = auth.partnerId
+        ? and(isNull(automations.orgId), eq(automations.partnerId, auth.partnerId))
+        : undefined;
+      if (query.orgId) {
+        const hasAccess = ensureOrgAccess(query.orgId, auth);
+        if (!hasAccess) {
+          return c.json({ error: 'Access to this organization denied' }, 403);
+        }
+        conditions.push(
+          partnerWideCondition
+            ? (or(eq(automations.orgId, query.orgId), partnerWideCondition) as SQL)
+            : eq(automations.orgId, query.orgId),
+        );
+      } else {
+        const orgIds = auth.accessibleOrgIds ?? [];
+        if (orgIds.length === 0 && !partnerWideCondition) {
+          return c.json({
+            data: [],
+            pagination: { page, limit, total: 0 },
+          });
+        }
+        const orgCondition = orgIds.length > 0 ? inArray(automations.orgId, orgIds) : undefined;
+        const combined = orgCondition && partnerWideCondition
+          ? (or(orgCondition, partnerWideCondition) as SQL)
+          : orgCondition ?? partnerWideCondition;
+        if (combined) conditions.push(combined);
+      }
+    } else if (auth.scope === 'system' && query.orgId) {
+      conditions.push(eq(automations.orgId, query.orgId));
+    }
+
+    if (query.enabled !== undefined) {
+      conditions.push(eq(automations.enabled, query.enabled === 'true'));
+    }
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    let rows: Array<typeof automations.$inferSelect>;
+    let total: number;
+    if (permissions?.allowedSiteIds !== undefined) {
+      const scanSize = 100;
+      let databaseOffset = 0;
+      total = 0;
+      rows = [];
+      while (true) {
+        const candidates = await db
+          .select()
+          .from(automations)
+          .where(whereCondition)
+          .orderBy(desc(automations.updatedAt), desc(automations.id))
+          .limit(scanSize)
+          .offset(databaseOffset);
+        if (candidates.length === 0) break;
+        // Dynamic/JSON targets require the canonical resolver. Keep resolution
+        // sequential and batch-bounded so a large definition catalog cannot
+        // fan out an unbounded Promise.all against PostgreSQL.
+        for (const automation of candidates) {
+          const check = await checkAutomationTargetsWithinSiteScope(automation, permissions);
+          if (!check.ok) continue;
+          if (total >= offset && rows.length < limit) rows.push(automation);
+          total += 1;
+        }
+        databaseOffset += candidates.length;
+        if (candidates.length < scanSize) break;
+      }
+    } else {
+      const countResult = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(automations)
+        .where(whereCondition);
+      total = Number(countResult[0]?.count ?? 0);
+
+      rows = await db
+        .select()
+        .from(automations)
+        .where(whereCondition)
+        .orderBy(desc(automations.updatedAt), desc(automations.id))
+        .limit(limit)
+        .offset(offset);
+    }
+
+    return c.json({
+      data: rows.map((automation) => permissions?.allowedSiteIds === undefined
+        ? shapeAutomationForResponse(automation)
+        : shapeRestrictedAutomationForResponse(automation)),
+      pagination: { page, limit, total },
+    });
+  },
+);
+
+automationRoutes.get(
+  '/runs/:runId',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationRead,
+  requireValidRunId,
+  async (c) => {
+    const auth = c.get('auth');
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    const runId = c.req.param('runId')!;
+
+    const [run] = await db
+      .select()
+      .from(automationRuns)
+      .where(eq(automationRuns.id, runId))
+      .limit(1);
+
+    if (!run) {
+      return c.json({ error: 'Automation run not found' }, 404);
+    }
+
+    // For config policy runs (automationId is null), return a lightweight response.
+    // These runs have no automation row to org-check against, so resolve the
+    // owning org via the config policy and enforce tenant access the same way
+    // getAutomationWithOrgCheck does. 404 (not 403) on cross-tenant to avoid an
+    // existence oracle, matching the automation-backed branch below.
+    if (!run.automationId) {
+      if (!run.configPolicyId) {
+        return c.json({ error: 'Automation run not found' }, 404);
+      }
+      const [policy] = await db
+        .select({ orgId: configurationPolicies.orgId })
+        .from(configurationPolicies)
+        .where(eq(configurationPolicies.id, run.configPolicyId))
+        .limit(1);
+      // Partner-owned policies (org_id NULL, #1724) have no owning org to
+      // tenant-check against on this org-scoped path; treat as not found.
+      if (!policy || policy.orgId === null || !ensureOrgAccess(policy.orgId, auth)) {
+        return c.json({ error: 'Automation run not found' }, 404);
+      }
+
+      const [visibleRun] = await projectAutomationRunsToSites([run], permissions?.allowedSiteIds);
+      if (!visibleRun) return c.json({ error: 'Automation run not found' }, 404);
+
+      return c.json({
+        ...visibleRun,
+        status: toRunStatus(visibleRun.status),
+        logs: serializeRunLogs(visibleRun.logs),
+        deviceResults: await fetchRunDeviceResults(run.id, auth, permissions?.allowedSiteIds),
+        automation: null,
+        configPolicyId: run.configPolicyId,
+        configItemName: run.configItemName,
+      });
+    }
+
+    const automation = await getAutomationWithOrgCheck(run.automationId, auth);
+    if (!automation) {
+      return c.json({ error: 'Automation run not found' }, 404);
+    }
+
+    const [visibleRun] = await projectAutomationRunsToSites([run], permissions?.allowedSiteIds);
+    if (!visibleRun) return c.json({ error: 'Automation run not found' }, 404);
+
+    return c.json({
+      ...visibleRun,
+      status: toRunStatus(visibleRun.status),
+      logs: serializeRunLogs(visibleRun.logs),
+      deviceResults: await fetchRunDeviceResults(run.id, auth, permissions?.allowedSiteIds),
+      automation: {
+        id: automation.id,
+        name: automation.name,
+        orgId: automation.orgId,
+      },
+    });
+  },
+);
+
+/**
+ * POST /runs/:runId/cancel — stop a running automation (#3525 W05).
+ *
+ * Same guard quartet as every other mutating automation route. This route owns
+ * ONLY authorization and the audit row; the fence, the fan-out and the
+ * honest reporting live in services/automationRunCancellation so the route, a
+ * future AI tool and any worker cannot drift.
+ */
+const cancelRunBodySchema = z.object({
+  graceSeconds: z.number().int().min(0).max(MAX_GRACE_SECONDS).optional(),
+}).optional();
+
+automationRoutes.post(
+  '/runs/:runId/cancel',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationWrite,
+  requireMfa(),
+  requireValidRunId,
+  async (c) => {
+    const auth = c.get('auth');
+    const runId = c.req.param('runId')!;
+
+    // An absent body is the normal case (the Stop button sends none), so this
+    // is hand-parsed rather than zValidator'd, which would 400 on no body at
+    // all. An out-of-range value is REJECTED rather than quietly replaced by
+    // the default: the agent is only promised 0..30s and silently turning a
+    // requested 999 into 5 would misreport what the endpoint is about to do.
+    // Mirrors POST /scripts/executions/:id/cancel exactly.
+    const rawText = await c.req.text().catch(() => '');
+    let rawBody: unknown = {};
+    if (rawText.trim() !== '') {
+      try {
+        rawBody = JSON.parse(rawText);
+      } catch {
+        return c.json({ error: 'Malformed JSON body' }, 400);
+      }
+    }
+    const parsedBody = cancelRunBodySchema.safeParse(rawBody);
+    if (!parsedBody.success) {
+      return c.json({
+        error: `graceSeconds must be an integer between 0 and ${MAX_GRACE_SECONDS}`,
+      }, 400);
+    }
+    const graceSeconds = parsedBody.data?.graceSeconds;
+
+    const [run] = await db
+      .select()
+      .from(automationRuns)
+      .where(eq(automationRuns.id, runId))
+      .limit(1);
+    if (!run) {
+      return c.json({ error: 'Automation run not found' }, 404);
+    }
+
+    // OD10-B: config-policy runs are out of scope. automation_runs' RLS admits
+    // that arm only through breeze_has_org_access(cp.org_id), so partner-owned
+    // policy runs are invisible today. 404 matches the GET above.
+    if (!run.automationId) {
+      return c.json({ error: 'Automation run not found' }, 404);
+    }
+
+    const automation = await getAutomationWithOrgCheck(run.automationId, auth);
+    if (!automation) {
+      return c.json({ error: 'Automation run not found' }, 404);
+    }
+
+    // OD7-A: an org-scoped operator may cancel individual script executions on
+    // THEIR OWN devices (those rows carry the device's org), but must not stop
+    // a run that fans out across sibling tenants.
+    if (automation.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    // Site scope on top: a site-restricted user must not stop a run spanning
+    // sibling sites.
+    const siteScopeDenied = await enforceAutomationSiteScope(c, automation);
+    if (siteScopeDenied) {
+      return siteScopeDenied;
+    }
+
+    const outcome = await cancelAutomationRun({
+      runId,
+      actorId: auth.user.id,
+      actorLabel: auth.user.email,
+      graceSeconds,
+    });
+
+    if (outcome.kind === 'not_found') {
+      return c.json({ error: 'Automation run not found' }, 404);
+    }
+    if (outcome.kind === 'already_terminal') {
+      // 409, matching POST /scripts/executions/:id/cancel: relabelling a run
+      // that finished on its own would be a lie.
+      return c.json({ error: `Cannot cancel a run with status: ${outcome.status}` }, 409);
+    }
+
+    writeRouteAudit(c, {
+      orgId: automation.orgId,
+      action: 'automation.run.cancel',
+      resourceType: 'automation_run',
+      resourceId: runId,
+      resourceName: automation.name,
+      details: {
+        runId,
+        automationId: run.automationId,
+        ownerScope: automation.orgId === null ? 'partner' : 'organization',
+        // What the REQUEST achieved, never an assumed stop.
+        alreadyCancelling: outcome.alreadyCancelling,
+        actionsCancelled: outcome.actionsCancelled,
+        executionsStopped: outcome.executionsStopped,
+        executionsRequested: outcome.executionsRequested,
+        executions: outcome.executions,
+        uncancellableActions: outcome.uncancellableActions,
+        ...(graceSeconds === undefined ? {} : { graceSeconds }),
+      },
+    });
+
+    return c.json({
+      success: true,
+      run: { id: runId, status: 'cancelled' as const },
+      alreadyCancelling: outcome.alreadyCancelling,
+      actionsCancelled: outcome.actionsCancelled,
+      // Two numbers, not one: `stopped` is proven, `requested` is only asked.
+      executionsStopped: outcome.executionsStopped,
+      executionsRequested: outcome.executionsRequested,
+      executions: outcome.executions,
+      uncancellableActions: outcome.uncancellableActions,
+    });
+  },
+);
+
+automationRoutes.get(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationRead,
+  requireValidAutomationId,
+  async (c) => {
+    const auth = c.get('auth');
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    const automationId = c.req.param('id')!;
+
+    if (automationId === 'runs') {
+      return c.notFound();
+    }
+
+    const automation = await getAutomationWithOrgCheck(automationId, auth);
+    if (!automation) {
+      return c.json({ error: 'Automation not found' }, 404);
+    }
+
+    if (permissions?.allowedSiteIds !== undefined) {
+      const siteCheck = await checkAutomationTargetsWithinSiteScope(automation, permissions);
+      if (!siteCheck.ok) return c.json({ error: 'Automation not found' }, 404);
+    }
+
+    if (permissions?.allowedSiteIds !== undefined) {
+      const scan = await scanProjectedAutomationRuns({
+        automationId,
+        allowedSiteIds: permissions.allowedSiteIds,
+        limit: 10,
+      });
+      const stats = {
+        totalRuns: scan.total,
+        completedRuns: scan.statusCounts.completed,
+        failedRuns: scan.statusCounts.failed,
+        partialRuns: scan.statusCounts.partial,
+      };
+      return c.json({
+        ...shapeAutomationForResponse(automation),
+        runCount: scan.total,
+        lastRunAt: scan.rows[0]?.startedAt ?? null,
+        recentRuns: scan.rows.map((run) => ({
+          ...run,
+          status: toRunStatus(run.status),
+          logs: serializeRunLogs(run.logs),
+        })),
+        statistics: stats,
+      });
+    }
+
+    const recentRuns = await db
+      .select()
+      .from(automationRuns)
+      .where(eq(automationRuns.automationId, automationId))
+      .orderBy(desc(automationRuns.startedAt))
+      .limit(10);
+
+    const runStats = await db
+      .select({
+        totalRuns: sql<number>`count(*)`,
+        completedRuns: sql<number>`count(*) filter (where ${automationRuns.status} = 'completed')`,
+        failedRuns: sql<number>`count(*) filter (where ${automationRuns.status} = 'failed')`,
+        partialRuns: sql<number>`count(*) filter (where ${automationRuns.status} = 'partial')`,
+      })
+      .from(automationRuns)
+      .where(eq(automationRuns.automationId, automationId));
+
+    return c.json({
+      ...shapeAutomationForResponse(automation),
+      recentRuns: recentRuns.map((run) => ({
+        ...run,
+        status: toRunStatus(run.status),
+        logs: serializeRunLogs(run.logs),
+      })),
+      statistics: {
+        totalRuns: Number(runStats[0]?.totalRuns ?? 0),
+        completedRuns: Number(runStats[0]?.completedRuns ?? 0),
+        failedRuns: Number(runStats[0]?.failedRuns ?? 0),
+        partialRuns: Number(runStats[0]?.partialRuns ?? 0),
+      },
+    });
+  },
+);
+
+automationRoutes.get(
+  '/:id/runs',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationRead,
+  requireValidAutomationId,
+  zValidator('query', listRunsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    const automationId = c.req.param('id')!;
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+
+    const automation = await getAutomationWithOrgCheck(automationId, auth);
+    if (!automation) {
+      return c.json({ error: 'Automation not found' }, 404);
+    }
+
+    if (permissions?.allowedSiteIds !== undefined) {
+      const siteCheck = await checkAutomationTargetsWithinSiteScope(automation, permissions);
+      if (!siteCheck.ok) return c.json({ error: 'Automation not found' }, 404);
+    }
+
+    const conditions: SQL<unknown>[] = [eq(automationRuns.automationId, automationId)];
+
+    // Restricted callers' status is recomputed from visible child rows below;
+    // filtering on the stored org-wide status would both leak a hidden-device
+    // outcome and return rows under a contradictory status filter.
+    if (query.status && permissions?.allowedSiteIds === undefined) {
+      conditions.push(eq(automationRuns.status, query.status));
+    }
+
+    const whereCondition = and(...conditions);
+
+    let rows: Array<typeof automationRuns.$inferSelect>;
+    let total: number;
+    if (permissions?.allowedSiteIds !== undefined) {
+      const scan = await scanProjectedAutomationRuns({
+        automationId,
+        allowedSiteIds: permissions.allowedSiteIds,
+        offset,
+        limit,
+        status: query.status,
+      });
+      total = scan.total;
+      rows = scan.rows;
+    } else {
+      const countResult = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(automationRuns)
+        .where(whereCondition);
+      total = Number(countResult[0]?.count ?? 0);
+
+      rows = await db
+        .select()
+        .from(automationRuns)
+        .where(whereCondition)
+        .orderBy(desc(automationRuns.startedAt), desc(automationRuns.id))
+        .limit(limit)
+        .offset(offset);
+    }
+
+    return c.json({
+      data: rows.map((run) => ({
+        ...run,
+        status: toRunStatus(run.status),
+        logs: serializeRunLogs(run.logs),
+      })),
+      pagination: { page, limit, total },
+    });
+  },
+);
+
+// ============================================
+// DEPRECATED: Automations are now managed via Configuration Policies.
+// These mutation routes remain for legacy compatibility.
+// ============================================
+
+// DEPRECATED: Automations are now managed via Configuration Policies. These routes remain for legacy compatibility.
+automationRoutes.post(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationWrite,
+  requireMfa(),
+  zValidator('json', createAutomationSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const data = c.req.valid('json');
+
+    // Resolve the ownership axis (#2133): partner-wide creation requires the
+    // partner-wide capability; the default path stays org-owned.
+    let owner: { orgId: string | null; partnerId: string | null };
+    if (data.ownerScope === 'partner') {
+      if (!canManagePartnerWidePolicies(auth) || !auth.partnerId) {
+        return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      }
+      owner = { orgId: null, partnerId: auth.partnerId };
+    } else {
+      let orgId = data.orgId;
+
+      if (auth.scope === 'organization') {
+        if (!auth.orgId) {
+          return c.json({ error: 'Organization context required' }, 403);
+        }
+        orgId = auth.orgId;
+      } else if (auth.scope === 'partner') {
+        if (!orgId) {
+          const singleOrg = auth.accessibleOrgIds?.[0];
+          if (auth.accessibleOrgIds?.length === 1 && singleOrg) {
+            orgId = singleOrg;
+          } else {
+            return c.json({ error: 'orgId is required when partner has multiple organizations' }, 400);
+          }
+        }
+        const hasAccess = ensureOrgAccess(orgId, auth);
+        if (!hasAccess) {
+          return c.json({ error: 'Access to this organization denied' }, 403);
+        }
+      } else if (auth.scope === 'system' && !orgId) {
+        return c.json({ error: 'orgId is required' }, 400);
+      }
+      owner = { orgId: orgId!, partnerId: null };
+    }
+
+    const triggerInput = normalizeIncomingTrigger(data);
+    if (triggerInput === undefined) {
+      return c.json({ error: 'trigger or triggerType is required' }, 400);
+    }
+
+    // Require a secret for webhook-type automations
+    if (isPlainRecord(triggerInput) && triggerInput.type === 'webhook' && !asNonEmptyString(triggerInput.secret)) {
+      return c.json({ error: 'Webhook automations require a secret' }, 400);
+    }
+
+    if (data.actions === undefined) {
+      return c.json({ error: 'actions are required' }, 400);
+    }
+
+    if (introducesElevatedAction(data.actions)) {
+      return elevatedActionRefused(c);
+    }
+
+    // ai_triage wiring is seeded per AI agent (services/aiAgents/managedAutomation.ts)
+    // and resolved through automations.managed_by_agent_id. A user-authored copy would
+    // be an unmanaged automation whose action has no owning agent, and — worse — would
+    // carry the automation's whole configured target set into the agent gate.
+    if (containsAiTriageAction(data.actions)) {
+      return c.json({ error: AI_TRIAGE_SYSTEM_MANAGED_ERROR_CODE }, 400);
+    }
+
+    try {
+      const automationId = randomUUID();
+      const trigger = withWebhookDefaults(
+        normalizeAutomationTrigger(triggerInput),
+        automationId,
+        c.req.url,
+      );
+      const storedTrigger = encryptAutomationTriggerSecret(trigger);
+      const actions = normalizeAutomationActions(data.actions);
+      const notificationTargets = normalizeNotificationTargets(
+        normalizeIncomingNotificationTargets(data),
+      );
+
+      // Site-scope gate: a site-restricted creator must not own an automation
+      // whose resolvable target set escapes their allowlist. This is the only
+      // gate for unattended schedule/event triggers (no caller context later).
+      const siteScopeDenied = await enforceAutomationSiteScope(c, {
+        orgId: owner.orgId,
+        partnerId: owner.partnerId,
+        conditions: data.conditions,
+        trigger: storedTrigger,
+      } as Parameters<typeof checkAutomationTargetsWithinSiteScope>[0]);
+      if (siteScopeDenied) {
+        return siteScopeDenied;
+      }
+
+      const automation = await db.transaction(async (tx) => {
+        const resolved = await resolveAutomationReferencesForOwner(
+          tx,
+          owner,
+          actions,
+          notificationTargets,
+        );
+        const [created] = await tx
+          .insert(automations)
+          .values({
+            id: automationId,
+            orgId: owner.orgId,
+            partnerId: owner.partnerId,
+            name: data.name,
+            description: data.description,
+            enabled: data.enabled,
+            trigger: storedTrigger,
+            conditions: data.conditions,
+            actions,
+            onFailure: data.onFailure,
+            notificationTargets,
+            createdBy: auth.user.id,
+          })
+          .returning();
+        if (!created) return null;
+        await replaceAutomationResourceBindings(tx, created.id, owner, resolved);
+        return created;
+      });
+
+      if (!automation) {
+        return c.json({ error: 'Failed to create automation' }, 500);
+      }
+
+      writeRouteAudit(c, {
+        orgId: automation.orgId,
+        action: 'automation.create',
+        resourceType: 'automation',
+        resourceId: automation.id,
+        resourceName: automation.name,
+        details: { enabled: automation.enabled },
+      });
+
+      return c.json(shapeAutomationForResponse(automation), 201);
+    } catch (error) {
+      if (error instanceof AutomationValidationError) {
+        return c.json({ error: error.message }, 400);
+      }
+      if (isAutomationReferenceDenial(error)) {
+        return c.json({ error: 'Unknown or unauthorized automation reference' }, 400);
+      }
+      throw error;
+    }
+  },
+);
+
+// DEPRECATED: Automations are now managed via Configuration Policies. These routes remain for legacy compatibility.
+async function handleUpdateAutomation(c: Context) {
+  const auth = c.get('auth');
+  const automationId = c.req.param('id')!;
+  const rawPayload = await c.req.json().catch(() => ({}));
+  const parsedPayload = updateAutomationSchema.safeParse(rawPayload);
+  if (!parsedPayload.success) {
+    return c.json({ error: parsedPayload.error.issues[0]?.message ?? 'Invalid update payload' }, 400);
+  }
+  const data = parsedPayload.data;
+
+  if (Object.keys(data).length === 0) {
+    return c.json({ error: 'No updates provided' }, 400);
+  }
+
+  const automation = await getAutomationWithOrgCheck(automationId, auth);
+  if (!automation) {
+    return c.json({ error: 'Automation not found' }, 404);
+  }
+
+  // #5289 — a row compiled from a monitor definition must be edited only by
+  // the compiler; a side edit here would silently drift from the definition
+  // until the next compile pass overwrote it.
+  if (automation.managedByMonitorId) {
+    return managedByMonitorResponse(c, 'automations', automation.managedByMonitorId);
+  }
+
+  // Even a plain enabled toggle goes through the agent so there is one switch
+  // for both the agent policy and its system-managed trigger wiring.
+  if (isManagedAutomation(automation)) {
+    return c.json({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: automation.managedByAgentId }, 409);
+  }
+
+  // Partner-wide automations mutate behavior across every org under the
+  // partner — administrable only with the partner-wide capability (#2133).
+  if (automation.orgId === null && !canManagePartnerWidePolicies(auth)) {
+    return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+  }
+
+  try {
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+
+    if (data.name !== undefined) updates.name = data.name;
+    if (data.description !== undefined) updates.description = data.description;
+    if (data.enabled !== undefined) updates.enabled = data.enabled;
+    if (data.conditions !== undefined) updates.conditions = data.conditions;
+    if (data.onFailure !== undefined) updates.onFailure = data.onFailure;
+
+    const triggerProvided = data.trigger !== undefined
+      || data.triggerType !== undefined
+      || data.triggerConfig !== undefined;
+
+    if (triggerProvided) {
+      const triggerInput = normalizeIncomingTrigger(data);
+      if (triggerInput === undefined) {
+        return c.json({ error: 'trigger update is invalid' }, 400);
+      }
+
+      let nextTrigger = normalizeAutomationTrigger(triggerInput);
+      if (nextTrigger.type === 'webhook' && !nextTrigger.secret) {
+        const currentTrigger = isPlainRecord(automation.trigger)
+          ? decryptAutomationTriggerSecret(automation.trigger) as Record<string, unknown>
+          : {};
+        const currentSecret = asNonEmptyString(currentTrigger.secret) ?? asNonEmptyString(currentTrigger.webhookSecret);
+        if (currentSecret) {
+          nextTrigger = {
+            ...nextTrigger,
+            secret: currentSecret,
+          };
+        }
+      }
+
+      // Require a secret for webhook-type automations (new or updated)
+      if (nextTrigger.type === 'webhook' && !nextTrigger.secret) {
+        return c.json({ error: 'Webhook automations require a secret' }, 400);
+      }
+
+      updates.trigger = encryptAutomationTriggerSecret(
+        withWebhookDefaults(
+          nextTrigger,
+          automation.id,
+          c.req.url,
+        ),
+        automation.trigger,
+      );
+    }
+
+    if (data.actions !== undefined) {
+      if (introducesElevatedAction(data.actions, automation.actions)) {
+        return elevatedActionRefused(c);
+      }
+      // Same rejection as the create route. Without it the create gate is
+      // trivially bypassed: POST an ordinary automation, then PATCH the
+      // ai_triage action onto it. The row is unmanaged, so the action has no
+      // owning agent to resolve and executeAiTriageAction refuses it once per
+      // configured device — a failing run rather than a 400, for no reason.
+      if (containsAiTriageAction(data.actions)) {
+        return c.json({ error: AI_TRIAGE_SYSTEM_MANAGED_ERROR_CODE }, 400);
+      }
+      updates.actions = normalizeAutomationActions(data.actions);
+    }
+
+    const notificationTargetsProvided = data.notificationTargets !== undefined
+      || data.notifyOnFailureChannelId !== undefined;
+
+    if (notificationTargetsProvided) {
+      updates.notificationTargets = normalizeNotificationTargets(
+        normalizeIncomingNotificationTargets(data),
+      );
+    }
+
+    const effectiveActions = data.actions !== undefined
+      ? updates.actions as ReturnType<typeof normalizeAutomationActions>
+      : normalizeAutomationActions(automation.actions);
+    const effectiveNotificationTargets = notificationTargetsProvided
+      ? updates.notificationTargets as ReturnType<typeof normalizeNotificationTargets>
+      : normalizeNotificationTargets(automation.notificationTargets);
+
+    // Site-scope gate: re-validate the post-update target set against the
+    // caller's allowlist. Covers conditions/trigger changes that would widen
+    // the target set beyond a site-restricted editor's sites.
+    const siteScopeDenied = await enforceAutomationSiteScope(c, {
+      ...automation,
+      conditions: data.conditions !== undefined ? data.conditions : automation.conditions,
+      trigger: updates.trigger !== undefined ? updates.trigger : automation.trigger,
+    } as Parameters<typeof checkAutomationTargetsWithinSiteScope>[0]);
+    if (siteScopeDenied) {
+      return siteScopeDenied;
+    }
+
+    const updated = await db.transaction(async (tx) => {
+      const axes = { orgId: automation.orgId, partnerId: automation.partnerId };
+      const resolved = await resolveAutomationReferencesForOwner(
+        tx,
+        axes,
+        effectiveActions,
+        effectiveNotificationTargets,
+      );
+      const [row] = await tx
+        .update(automations)
+        .set(updates)
+        .where(eq(automations.id, automationId))
+        .returning();
+      if (!row) return null;
+      await replaceAutomationResourceBindings(tx, automationId, axes, resolved);
+      return row;
+    });
+
+    if (!updated) {
+      return c.json({ error: 'Automation not found' }, 404);
+    }
+
+    writeRouteAudit(c, {
+      orgId: automation.orgId,
+      action: 'automation.update',
+      resourceType: 'automation',
+      resourceId: updated.id,
+      resourceName: updated.name,
+      details: { changedFields: Object.keys(data) },
+    });
+
+    return c.json(shapeAutomationForResponse(updated));
+  } catch (error) {
+    if (error instanceof AutomationValidationError) {
+      return c.json({ error: error.message }, 400);
+    }
+    if (isAutomationReferenceDenial(error)) {
+      return c.json({ error: 'Unknown or unauthorized automation reference' }, 400);
+    }
+    throw error;
+  }
+}
+
+// DEPRECATED: Automations are now managed via Configuration Policies. These routes remain for legacy compatibility.
+automationRoutes.put(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationWrite,
+  requireMfa(),
+  requireValidAutomationId,
+  zValidator('json', updateAutomationSchema),
+  handleUpdateAutomation,
+);
+
+// DEPRECATED: Automations are now managed via Configuration Policies. These routes remain for legacy compatibility.
+automationRoutes.patch(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationWrite,
+  requireMfa(),
+  requireValidAutomationId,
+  zValidator('json', updateAutomationSchema),
+  handleUpdateAutomation,
+);
+
+// DEPRECATED: Automations are now managed via Configuration Policies. These routes remain for legacy compatibility.
+automationRoutes.delete(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationWrite,
+  requireMfa(),
+  requireValidAutomationId,
+  async (c) => {
+    const auth = c.get('auth');
+    const automationId = c.req.param('id')!;
+
+    const automation = await getAutomationWithOrgCheck(automationId, auth);
+    if (!automation) {
+      return c.json({ error: 'Automation not found' }, 404);
+    }
+
+    // #5289 — see the guard in handleUpdateAutomation. Unlike the agent-managed
+    // case below, there is no soft-disable escape hatch for a monitor-managed
+    // row: it is removed by disabling/removing its monitor, which the
+    // compiler then reconciles.
+    if (automation.managedByMonitorId) {
+      return managedByMonitorResponse(c, 'automations', automation.managedByMonitorId);
+    }
+
+    // Deletion is the ONE managed-row operation a user may reach, and only
+    // once the owning agent is soft-disabled. disableAgent flips this row to
+    // enabled:false but leaves managed_by_agent_id set, and a disabled agent
+    // can never be re-enabled — so without this branch every disable strands a
+    // row nothing in the product can remove, and each disable+recreate cycle
+    // strands another. Editing/triggering a managed row stays refused either
+    // way; the liveness probe fails closed.
+    if (isManagedAutomation(automation)
+      && await managedAutomationOwnerIsLive(automation.managedByAgentId as string)) {
+      return c.json({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: automation.managedByAgentId }, 409);
+    }
+
+    // Deleting a partner-wide automation affects every org under the partner.
+    if (automation.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    const runningRuns = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(automationRuns)
+      .where(and(eq(automationRuns.automationId, automationId), eq(automationRuns.status, 'running')));
+
+    const runningCount = Number(runningRuns[0]?.count ?? 0);
+    if (runningCount > 0) {
+      return c.json({
+        error: 'Cannot delete automation with running executions',
+        runningExecutions: runningCount,
+      }, 409);
+    }
+
+    await db
+      .delete(automationRuns)
+      .where(eq(automationRuns.automationId, automationId));
+
+    await db
+      .delete(automations)
+      .where(eq(automations.id, automationId));
+
+    writeRouteAudit(c, {
+      orgId: automation.orgId,
+      action: 'automation.delete',
+      resourceType: 'automation',
+      resourceId: automation.id,
+      resourceName: automation.name,
+    });
+
+    return c.json({ success: true });
+  },
+);
+
+// ============================================
+// Manual trigger routes (kept for standalone automations)
+// ============================================
+
+async function triggerAutomationRun(
+  c: Context,
+  automationId: string,
+  triggeredBy: string,
+  details?: Record<string, unknown>,
+) {
+  const auth = c.get('auth');
+
+  const automation = await getAutomationWithOrgCheck(automationId, auth);
+  if (!automation) {
+    return c.json({ error: 'Automation not found' }, 404);
+  }
+
+  // #5289 — see the guard in handleUpdateAutomation.
+  if (automation.managedByMonitorId) {
+    return managedByMonitorResponse(c, 'automations', automation.managedByMonitorId);
+  }
+
+  // A managed trigger is alert.triggered, so a manual run has no event to bind
+  // to. createAutomationRunRecord would instead resolve the automation's whole
+  // configured target set: one button press, one agent run per device — the
+  // exact fleet fan-out this PR closes, reached through a different door.
+  if (isManagedAutomation(automation)) {
+    return c.json({ error: MANAGED_AUTOMATION_ERROR_CODE, agentId: automation.managedByAgentId }, 409);
+  }
+
+  // Manually triggering a partner-wide automation fans actions out to devices
+  // in EVERY org under the partner — gate it like the mutators (#2133,
+  // matching the policy-evaluate precedent from the #2149 review).
+  if (automation.orgId === null && !canManagePartnerWidePolicies(auth)) {
+    return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+  }
+
+  if (!automation.enabled) {
+    return c.json({ error: 'Cannot trigger disabled automation' }, 400);
+  }
+
+  // Site-scope gate: re-validate the *current* resolved target set. Protects
+  // against a target set that drifted (new devices/sites) since creation, and
+  // against an automation created before the user's sites were restricted.
+  const siteScopeDenied = await enforceAutomationSiteScope(c, automation);
+  if (siteScopeDenied) {
+    return siteScopeDenied;
+  }
+
+  const { run, targetDeviceIds } = await createAutomationRunRecord({
+    automation,
+    triggeredBy,
+    details,
+  });
+
+  await enqueueAutomationRun(run.id, targetDeviceIds);
+
+  writeRouteAudit(c, {
+    orgId: automation.orgId,
+    action: 'automation.trigger',
+    resourceType: 'automation',
+    resourceId: automation.id,
+    resourceName: automation.name,
+    details: {
+      runId: run.id,
+      devicesTargeted: targetDeviceIds.length,
+      triggeredBy,
+    },
+  });
+
+  return c.json({
+    message: 'Automation triggered',
+    run: {
+      id: run.id,
+      status: toRunStatus(run.status),
+      devicesTargeted: run.devicesTargeted,
+      startedAt: run.startedAt,
+    },
+  });
+}
+
+automationRoutes.post(
+  '/:id/trigger',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationWrite,
+  requireMfa(),
+  requireValidAutomationId,
+  async (c) => {
+    const auth = c.get('auth');
+    const automationId = c.req.param('id')!;
+    return triggerAutomationRun(c, automationId, `manual:${auth.user.id}`);
+  },
+);
+
+automationRoutes.post(
+  '/:id/run',
+  requireScope('organization', 'partner', 'system'),
+  requireAutomationWrite,
+  requireMfa(),
+  requireValidAutomationId,
+  async (c) => {
+    const auth = c.get('auth');
+    const automationId = c.req.param('id')!;
+    return triggerAutomationRun(c, automationId, `manual:${auth.user.id}`);
+  },
+);
+
+// ============================================
+// Webhook trigger route
+// ============================================
+
+automationWebhookRoutes.post('/:id', async (c) => {
+  const automationId = c.req.param('id')!;
+
+  if (!UUID_REGEX.test(automationId)) {
+    return c.json({ error: 'Automation not found' }, 404);
+  }
+
+  const [automation] = await db
+    .select()
+    .from(automations)
+    .where(eq(automations.id, automationId))
+    .limit(1);
+
+  if (!automation || !automation.enabled) {
+    return c.json({ error: 'Automation not found' }, 404);
+  }
+
+  // Managed rows cannot become webhooks: their event trigger is seeded and the update route rejects changes.
+  let trigger;
+  try {
+    trigger = normalizeAutomationTrigger(decryptAutomationTriggerSecret(automation.trigger));
+  } catch {
+    return c.json({ error: 'Invalid automation trigger configuration' }, 400);
+  }
+
+  if (trigger.type !== 'webhook') {
+    return c.json({ error: 'Automation is not configured for webhook triggering' }, 400);
+  }
+
+  if (!trigger.secret) {
+    return c.json({ error: 'Webhook secret is not configured for this automation' }, 403);
+  }
+
+  const rawBody = await c.req.text();
+  const signatureHeader = c.req.header('x-breeze-signature');
+  const timestampHeader = c.req.header('x-breeze-timestamp');
+  const eventIdHeader = c.req.header('x-breeze-event-id') ?? c.req.header('x-breeze-nonce');
+  const headerSecret = c.req.header('x-automation-secret')
+    ?? c.req.header('x-webhook-secret');
+
+  // `?secret=` query-string authentication has been removed unconditionally.
+  // The value would end up in every proxy/load-balancer/CDN access log on the
+  // request path and remain replayable forever. There is no flag to re-enable it.
+  if (c.req.query('secret')) {
+    return c.json({ error: 'Query-string webhook secrets are no longer accepted; use HMAC signing (x-breeze-signature + x-breeze-timestamp)' }, 401);
+  }
+
+  if (signatureHeader || timestampHeader) {
+    const signatureCheck = await verifyAutomationWebhookSignature({
+      automationId,
+      secret: trigger.secret,
+      payload: rawBody,
+      signatureHeader,
+      timestampHeader,
+      eventIdHeader,
+    });
+    if (!signatureCheck.ok) {
+      return c.json({ error: signatureCheck.error }, signatureCheck.status);
+    }
+  } else {
+    if (!headerSecret) {
+      return c.json({ error: 'Missing signed webhook verification' }, 401);
+    }
+    // Default is HMAC-only. Operators may set AUTOMATION_WEBHOOK_ALLOW_LEGACY_SECRET=true
+    // as a short-term emergency rollback while migrating legacy senders to HMAC, but the
+    // plain x-webhook-secret in transit is replayable forever. This flag will be removed
+    // in a future release.
+    if (!envFlag('AUTOMATION_WEBHOOK_ALLOW_LEGACY_SECRET', false)) {
+      return c.json({ error: 'Signed webhook verification is required (HMAC: x-breeze-signature + x-breeze-timestamp)' }, 401);
+    }
+    console.warn(
+      `[automations] Webhook ${automationId} accepted via legacy header secret. ` +
+      'AUTOMATION_WEBHOOK_ALLOW_LEGACY_SECRET is enabled — migrate sender to HMAC (x-breeze-signature + x-breeze-timestamp) and unset the flag.'
+    );
+
+    const expected = Buffer.from(trigger.secret, 'utf8');
+    const provided = Buffer.from(headerSecret, 'utf8');
+    if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) {
+      return c.json({ error: 'Invalid webhook secret' }, 401);
+    }
+  }
+
+  let payload: unknown = {};
+  try {
+    payload = rawBody ? JSON.parse(rawBody) : {};
+  } catch {
+    return c.json({ error: 'Invalid JSON payload' }, 400);
+  }
+
+  const { run, targetDeviceIds } = await createAutomationRunRecord({
+    automation,
+    triggeredBy: 'webhook',
+    details: {
+      sourceIp: getTrustedClientIp(c, 'unknown'),
+      userAgent: c.req.header('user-agent') ?? 'unknown',
+      payload,
+    },
+  });
+
+  await enqueueAutomationRun(run.id, targetDeviceIds);
+
+  // Webhook callers are anonymous (no auth user / no JWT), so writeRouteAudit's
+  // auth-derived actor doesn't apply. Use writeAuditEvent directly with a
+  // system actor: it records a non-user actor without touching auth context.
+  writeAuditEvent(c, {
+    orgId: automation.orgId,
+    action: 'automation.trigger.webhook',
+    resourceType: 'automation',
+    resourceId: automation.id,
+    resourceName: automation.name,
+    actorType: 'system',
+    details: {
+      runId: run.id,
+      devicesTargeted: targetDeviceIds.length,
+      triggeredBy: 'webhook',
+    },
+  });
+
+  return c.json({
+    accepted: true,
+    run: {
+      id: run.id,
+      status: toRunStatus(run.status),
+      devicesTargeted: run.devicesTargeted,
+      startedAt: run.startedAt,
+    },
+  }, 202);
+});

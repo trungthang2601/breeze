@@ -1,0 +1,809 @@
+import { createHash } from 'node:crypto';
+import { errors } from 'oidc-provider';
+import { and, eq, gte, isNull, lt, or, sql } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import {
+  oauthAuthorizationCodes,
+  oauthClients,
+  oauthGrants,
+  oauthInteractions,
+  oauthRefreshTokens,
+  oauthSessions,
+} from '../db/schema';
+import {
+  writeOAuthRevocationMarkerDurably,
+  type OAuthRevocationMarkerResult,
+} from './revocationRetry';
+import { revokeClientFamilies } from './revocationService';
+import { ERROR_IDS, logOauthDebug, logOauthError, logOauthWarn } from './log';
+import { assertActiveTenantContext, TenantInactiveError } from '../services/tenantStatus';
+import { isOAuthGrantActiveInCurrentDbContext, revokeGrantsDurablyInCurrentDbContext } from './grantStatus';
+
+// Grant-revocation marker TTL must outlive the longest-lived access token
+// minted under the grant. Kept in sync with `ACCESS_TOKEN_TTL_SECONDS` in
+// provider.ts (we'd import it but provider.ts already imports from this
+// file, and pulling in the whole provider module here would cycle).
+// Exported so provider.test.ts can assert the two constants never drift
+// (GRANT_REVOCATION_TTL_SECONDS >= ACCESS_TOKEN_TTL_SECONDS).
+export const GRANT_REVOCATION_TTL_SECONDS = 1800;
+
+const asSystem = <T>(fn: () => Promise<T>): Promise<T> =>
+  runOutsideDbContext(() => withSystemDbAccessContext(fn));
+
+type OidcPayload = Record<string, unknown>;
+type StoredPayload = { payload: OidcPayload; expiresAt: Date | null };
+
+const inMemory = new Map<string, Map<string, StoredPayload>>();
+
+// Breeze tenancy metadata attached to a Grant. oidc-provider's
+// Grant.IN_PAYLOAD allowlist (lib/models/grant.js) drops unknown fields on
+// save, so we can't simply set `grant.breeze = ...`; it lives in the
+// `oauth_grants` row instead.
+//
+// There is deliberately NO process-local cache of this any more. A cached
+// entry outlives its Grant's `revoked_at` transition, which made stale
+// in-memory state answerable as tenancy — and therefore as authority — on
+// paths that should have re-read the row. The DB row is the only store.
+type GrantBreezeMeta = { partner_id: string; org_id: string | null };
+
+export async function setGrantBreezeMeta(
+  grantId: string,
+  meta: GrantBreezeMeta,
+): Promise<void> {
+  // Persist to DB so a process restart between consent and the first
+  // refresh-token grant doesn't orphan the partner_id. The Grant row is
+  // INSERTed by `BreezeOidcAdapter.upsert` during `grant.save()`, which the
+  // consent route calls immediately before invoking us — so an UPDATE here
+  // hits an existing row. Await the write before the consent route resumes
+  // the interaction so the Grant metadata is durable across an immediate
+  // process restart.
+  try {
+    await asSystem(async () => {
+      await db.update(oauthGrants)
+        .set({ partnerId: meta.partner_id, orgId: meta.org_id })
+        .where(eq(oauthGrants.id, grantId));
+    });
+  } catch (err) {
+    // The Grant row already exists at this point (saved by oidc-provider's
+    // grant.save() in the consent route immediately before this call), but
+    // its partner_id/org_id columns are NULL. If we don't propagate this
+    // failure the consent route will resume the interaction and an access
+    // JWT will be minted with `partner_id: null` — bearer middleware then
+    // rejects every request with a confusing 401. Fail closed: throw so
+    // the consent endpoint returns 500 and the user can retry.
+    logOauthError({
+      errorId: ERROR_IDS.OAUTH_GRANT_META_PERSIST_FAILED,
+      message: 'Failed to persist Grant breeze meta to oauth_grants',
+      err,
+      context: { grantId },
+    });
+    throw err;
+  }
+}
+
+export async function getGrantBreezeMetaAsync(
+  grantId: string | undefined | null,
+): Promise<GrantBreezeMeta | undefined> {
+  if (!grantId) return undefined;
+  // Always the DB row, populated by the consent route. We deliberately do NOT
+  // catch DB errors here: callers (`requiredPartnerId`, `resolvedOrgId`)
+  // need to distinguish "no row" (DB returned undefined → grant has no
+  // tenancy) from "lookup failed" (Postgres unavailable → we don't know).
+  // Silently degrading to "missing partner_id" would persist a token row with
+  // a null tenant column, and worse, mask infrastructure failures behind
+  // auth errors.
+  let row;
+  try {
+    row = await asSystem(async () => {
+      const [r] = await db.select({ partnerId: oauthGrants.partnerId, orgId: oauthGrants.orgId })
+        .from(oauthGrants)
+        .where(eq(oauthGrants.id, grantId));
+      return r;
+    });
+  } catch (err) {
+    logOauthError({
+      errorId: ERROR_IDS.OAUTH_GRANT_META_LOOKUP_FAILED,
+      message: 'DB lookup for Grant breeze meta failed',
+      err,
+      context: { grantId },
+    });
+    throw err;
+  }
+  if (!row || !row.partnerId) return undefined;
+  return { partner_id: row.partnerId, org_id: row.orgId };
+}
+
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
+
+// MCP-OAUTH-04: the raw oidc-provider RefreshToken model id equals the opaque
+// token value the client holds, so persisting it verbatim in
+// `oauth_refresh_tokens.id` meant a DB/backup/diagnostic read granted account
+// access for the token's remaining lifetime. We store an UNKEYED sha256 digest
+// instead: refresh tokens are high-entropy opaque values, so the digest is a
+// non-reversible lookup key with no key-rotation dependency (deliberately NOT
+// an HMAC — no secret to manage). Every RefreshToken adapter op transforms the
+// raw id through this before touching the row.
+export function refreshTokenStorageId(rawId: string): string {
+  return createHash('sha256').update(rawId).digest('hex');
+}
+
+// Persisted refresh-token payloads must OMIT `jti` — it equals the raw model
+// id (== the opaque token), so storing it defeats the digested-id protection.
+// Deep-copy so nested payload state isn't shared with the caller's object.
+export function sanitizeRefreshTokenPayload(payload: OidcPayload): OidcPayload {
+  const copy = structuredClone(payload);
+  delete copy.jti;
+  return copy;
+}
+
+// `find` restores `jti` in memory before returning to oidc-provider — the
+// library expects the model's `jti` to equal its id (the raw token). We never
+// persist it; we rehydrate it from the raw id oidc-provider hands us.
+export function restoreRefreshTokenPayload(rawId: string, stored: OidcPayload): OidcPayload {
+  return { ...stored, jti: rawId };
+}
+
+function expiresAtFrom(expiresIn?: number): Date | null {
+  return expiresIn === undefined ? null : new Date(Date.now() + expiresIn * 1000);
+}
+
+// Mirror oidc-provider's epochTime() (helpers/epoch_time.js): seconds since
+// epoch. The consumable mixin's IN_PAYLOAD allowlist carries a `consumed`
+// field that the library stamps into the payload on consume; canonical DB
+// adapters set `payload.consumed = epochTime()` so a later find() surfaces it
+// and the library's own consumed-check fires the grant-wide revoke.
+function epochTime(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+async function requiredPartnerId(payload: OidcPayload): Promise<string> {
+  // First try extra.partner_id (kept for backward compatibility / tests). If
+  // not present, derive it from the Grant's durable row — the RefreshToken
+  // model's IN_PAYLOAD allowlist drops `extra`
+  // (only AccessToken/ClientCredentials carry it), so for tokens minted via
+  // the authorization_code grant the only thing we have to key on is
+  // `grantId`. Reaching here means find() already proved that Grant durably
+  // active, so the row exists.
+  const partnerId = extraField(payload, 'partner_id');
+  if (typeof partnerId === 'string' && partnerId.length > 0) {
+    return partnerId;
+  }
+  const grantId = typeof payload.grantId === 'string' ? payload.grantId : undefined;
+  const meta = await getGrantBreezeMetaAsync(grantId);
+  if (meta && meta.partner_id) {
+    return meta.partner_id;
+  }
+  throw new Error('RefreshToken payload missing required partner_id (no extra.partner_id and no grant meta)');
+}
+
+async function resolvedOrgId(payload: OidcPayload): Promise<string | null> {
+  const fromExtra = extraField(payload, 'org_id');
+  if (typeof fromExtra === 'string' && fromExtra.length > 0) return fromExtra;
+  const grantId = typeof payload.grantId === 'string' ? payload.grantId : undefined;
+  const meta = await getGrantBreezeMetaAsync(grantId);
+  return meta?.org_id ?? null;
+}
+
+function stringField(payload: OidcPayload, key: string): string {
+  const value = payload[key];
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`OIDC payload missing required ${key}`);
+  }
+  return value;
+}
+
+function extraField(payload: OidcPayload, key: string): unknown {
+  const extra = payload.extra;
+  return extra && typeof extra === 'object' ? (extra as Record<string, unknown>)[key] : undefined;
+}
+
+// Stamp `oauth_clients.last_used_at` when the client completes a real
+// authorization (an AuthorizationCode or RefreshToken is issued for it).
+// `cleanupStaleOauthClients` (provider.ts) treats `last_used_at IS NULL` as
+// "never used" and deletes such clients after DCR_STALE_CLIENT_TTL_MS with no
+// live grant. Before this stamp the column was only written on
+// re-registration, so every actively used public DCR client (Claude.ai
+// connector, Claude Code) was GC'd as soon as its refresh token lapsed and
+// then replayed a dead client_id forever (`invalid_client`, 2026-09-10).
+// Throttled to one write per hour per client so token refreshes stay cheap.
+const CLIENT_LAST_USED_STAMP_INTERVAL_MS = 60 * 60 * 1000;
+
+async function touchClientLastUsed(clientId: string, now: Date = new Date()): Promise<void> {
+  const threshold = new Date(now.getTime() - CLIENT_LAST_USED_STAMP_INTERVAL_MS);
+  // Advisory bookkeeping for the DCR GC (#5610): this stamp rides along with
+  // AuthorizationCode / RefreshToken issuance, so a failure here must never
+  // abort the grant the user is actually asking for. Worst case the client
+  // keeps an older last_used_at and is re-stamped on its next token exchange.
+  try {
+    await db.update(oauthClients)
+      .set({ lastUsedAt: now })
+      .where(and(
+        eq(oauthClients.id, clientId),
+        or(isNull(oauthClients.lastUsedAt), lt(oauthClients.lastUsedAt, threshold)),
+      ));
+  } catch (err) {
+    logOauthWarn({
+      errorId: ERROR_IDS.OAUTH_CLIENT_LAST_USED_STAMP_FAILED,
+      message: 'failed to stamp oauth_clients.last_used_at; token issuance continues',
+      err,
+      context: { clientId },
+    });
+  }
+}
+
+export class BreezeOidcAdapter {
+  constructor(private readonly model: string) {}
+
+  async upsert(id: string, payload: OidcPayload, expiresIn?: number): Promise<void> {
+    const expiresAt = expiresAtFrom(expiresIn);
+    return asSystem(async () => {
+      if (this.model === 'Client') {
+        await db.insert(oauthClients).values({
+          id,
+          partnerId: null,
+          clientSecretHash: typeof payload.client_secret === 'string' ? sha256(payload.client_secret) : null,
+          metadata: payload,
+        }).onConflictDoUpdate({
+          target: oauthClients.id,
+          set: { metadata: payload, lastUsedAt: new Date() },
+        });
+      } else if (this.model === 'AuthorizationCode') {
+        await db.insert(oauthAuthorizationCodes).values({
+          id,
+          userId: stringField(payload, 'accountId'),
+          clientId: stringField(payload, 'clientId'),
+          partnerId: extraField(payload, 'partner_id') as string,
+          orgId: (extraField(payload, 'org_id') as string | null) ?? null,
+          payload,
+          expiresAt: expiresAt!,
+        }).onConflictDoUpdate({
+          target: oauthAuthorizationCodes.id,
+          set: { payload, expiresAt: expiresAt! },
+        });
+        await touchClientLastUsed(stringField(payload, 'clientId'));
+      } else if (this.model === 'RefreshToken') {
+        const [partnerId, orgId] = await Promise.all([
+          requiredPartnerId(payload),
+          resolvedOrgId(payload),
+        ]);
+        const storageId = refreshTokenStorageId(id);
+        const storedPayload = sanitizeRefreshTokenPayload(payload);
+        await db.insert(oauthRefreshTokens).values({
+          id: storageId,
+          userId: stringField(payload, 'accountId'),
+          clientId: stringField(payload, 'clientId'),
+          partnerId,
+          orgId,
+          payload: storedPayload,
+          expiresAt: expiresAt!,
+        }).onConflictDoUpdate({
+          target: oauthRefreshTokens.id,
+          set: { payload: storedPayload, expiresAt: expiresAt!, lastUsedAt: new Date() },
+        });
+        await touchClientLastUsed(stringField(payload, 'clientId'));
+      } else if (this.model === 'Session') {
+        // Session.id === Session.jti; uid is a separate, longer-lived alias
+        // used by Session.findByUid during token exchange. accountId is null
+        // for anonymous (pre-login) sessions and gets populated by
+        // session.loginAccount(...). expiresAt is required by the column —
+        // oidc-provider always passes a TTL for Session.save.
+        const uid = typeof payload.uid === 'string' && payload.uid.length > 0
+          ? payload.uid
+          : id;
+        const accountIdRaw = payload.accountId;
+        const accountId = typeof accountIdRaw === 'string' && accountIdRaw.length > 0
+          ? accountIdRaw
+          : null;
+        await db.insert(oauthSessions).values({
+          id,
+          uid,
+          accountId,
+          payload,
+          expiresAt: expiresAt!,
+        }).onConflictDoUpdate({
+          target: oauthSessions.id,
+          set: { uid, accountId, payload, expiresAt: expiresAt!, lastUsedAt: new Date() },
+        });
+      } else if (this.model === 'Interaction') {
+        // Interaction is the short-lived (~1h) record bridging /authorize →
+        // consent UI → resume. Persisted so an API restart mid-flow doesn't
+        // 404 the user with "interaction expired or mismatched". The
+        // interaction's session pointer (payload.session.accountId) starts
+        // null and gets populated after login; the RLS policy checks that
+        // pointer for user-scope access, with a system bypass for the
+        // adapter's writes.
+        await db.insert(oauthInteractions).values({
+          id,
+          payload,
+          expiresAt: expiresAt!,
+        }).onConflictDoUpdate({
+          target: oauthInteractions.id,
+          set: { payload, expiresAt: expiresAt! },
+        });
+      } else if (this.model === 'Grant') {
+        // Grant payload is the IN_PAYLOAD-filtered subset (accountId,
+        // clientId, resources, openid, rejected, rar). partner_id/org_id
+        // are populated by the consent route via setGrantBreezeMeta() —
+        // INSERT them as NULL here and the subsequent UPDATE fills them in.
+        await db.insert(oauthGrants).values({
+          id,
+          accountId: stringField(payload, 'accountId'),
+          clientId: stringField(payload, 'clientId'),
+          partnerId: null,
+          orgId: null,
+          payload,
+          expiresAt: expiresAt!,
+        }).onConflictDoUpdate({
+          target: oauthGrants.id,
+          set: { payload, expiresAt: expiresAt! },
+        });
+      } else {
+        const modelStore = inMemory.get(this.model) ?? new Map<string, StoredPayload>();
+        modelStore.set(id, { payload, expiresAt });
+        inMemory.set(this.model, modelStore);
+      }
+    });
+  }
+
+  async find(id: string): Promise<OidcPayload | undefined> {
+    return asSystem(async () => {
+      if (this.model === 'Client') {
+        const [row] = await db.select().from(oauthClients).where(eq(oauthClients.id, id));
+        return row && !row.disabledAt ? row.metadata as OidcPayload : undefined;
+      }
+      if (this.model === 'AuthorizationCode') {
+        const [row] = await db.select().from(oauthAuthorizationCodes).where(eq(oauthAuthorizationCodes.id, id));
+        if (!row) return undefined;
+        const grantId = typeof (row.payload as { grantId?: unknown } | null)?.grantId === 'string'
+          ? (row.payload as { grantId: string }).grantId
+          : null;
+        if (!grantId || !(await isOAuthGrantActiveInCurrentDbContext(grantId))) return undefined;
+        // Truly-expired non-consumed rows stay invisible via our own
+        // `expiresAt >= new Date()` filter below — and that filter is the only
+        // thing rejecting them: the grant calls find() with
+        // ignoreExpiration:true, so the library will not reject them for us.
+        // But a CONSUMED row must surface
+        // its payload (with `consumed` stamped by consume()) rather than
+        // returning undefined: oidc-provider's authorization_code grant calls
+        // find() with ignoreExpiration:true, and its own
+        // `if (code.consumed) { revoke(grantId); throw }` branch is the canonical
+        // place that revokes the whole grant family on replay. Hiding consumed
+        // rows surfaced replays as a generic "authorization code not found" and
+        // left that revoke branch dead — mirroring the refresh-token reuse gap.
+        if (row.consumedAt) {
+          const payload = row.payload as { grantId?: string } | null;
+          const grantId = typeof payload?.grantId === 'string' ? payload.grantId : undefined;
+          logOauthError({
+            errorId: ERROR_IDS.OAUTH_AUTH_CODE_REUSE,
+            message: 'Consumed authorization code presented again (replay)',
+            context: {
+              code_hash: sha256(id).slice(0, 16),
+              grant_id: grantId,
+            },
+          });
+          // Return the payload so the library's consumed-check fires the
+          // grant-wide revoke. The payload already carries `consumed` (stamped
+          // by consume()); we don't revoke here to keep the revoke path owned
+          // by oidc-provider (revoke() walks the full grant graph).
+          return row.payload as OidcPayload;
+        }
+        return row.expiresAt >= new Date() ? row.payload as OidcPayload : undefined;
+      }
+      if (this.model === 'RefreshToken') {
+        const storageId = refreshTokenStorageId(id);
+        const [row] = await db.select().from(oauthRefreshTokens).where(eq(oauthRefreshTokens.id, storageId));
+        if (!row) return undefined;
+        const grantId = typeof (row.payload as { grantId?: unknown } | null)?.grantId === 'string'
+          ? (row.payload as { grantId: string }).grantId
+          : null;
+        if (!grantId || !(await isOAuthGrantActiveInCurrentDbContext(grantId))) return undefined;
+        try {
+          await assertActiveTenantContext({
+            scope: row.orgId ? 'organization' : 'partner',
+            partnerId: row.partnerId,
+            orgId: row.orgId,
+          });
+        } catch (err) {
+          if (err instanceof TenantInactiveError) {
+            logOauthError({
+              errorId: ERROR_IDS.OAUTH_PROVIDER_GRANT_ERROR,
+              message: 'Refresh token lookup rejected for inactive tenant',
+              context: {
+                client_id: row.clientId,
+                partner_id: row.partnerId,
+                org_id: row.orgId,
+                user_id: row.userId,
+              },
+            });
+            return undefined;
+          }
+          throw err;
+        }
+        if (row.revokedAt) {
+          const payload = row.payload as { grantId?: string; clientId?: string; accountId?: string } | null;
+          const grantId = typeof payload?.grantId === 'string' ? payload.grantId : undefined;
+          // Tradeoff (#2363): this branch fires on ANY presentation of a
+          // consumed/revoked RT — including an INNOCENT retry after a failed
+          // token exchange. oidc-provider rotates the refresh token (consume()
+          // marks revokedAt) BEFORE it finishes validating the exchange, so a
+          // request that later fails (e.g. invalid_target) burns the RT and
+          // the client's spec-correct retry with the old RT lands here and
+          // nukes the whole grant family. We deliberately KEEP the
+          // grant-family revocation — genuine rotation replay is the
+          // canonical token-theft signal and must stay fatal — and instead
+          // fix the known innocent trigger upstream: resource-alias
+          // normalization (`normalizeResourceParams` in
+          // oauth/resourceIndicators.ts, applied by routes/oauth.ts) stops an
+          // alias-only `resource` mismatch from failing the exchange in the
+          // first place.
+          //
+          // SUPPORT-VISIBLE CONSEQUENCE: that revocation is now DURABLE and
+          // IRREVERSIBLE. It used to be recorded only in the Redis grant
+          // marker, so a family effectively "recovered" once the marker
+          // expired (GRANT_REVOCATION_TTL_SECONDS). It now stamps
+          // oauth_grants.revoked_at and revokes every sibling refresh token,
+          // which is the whole point — a thief must not be able to wait the
+          // marker out — but it means an affected client CANNOT recover by
+          // retrying later. The user must re-consent. Runbooks should expect
+          // "re-authorize the connected app", not "wait and retry".
+          //
+          // The revoked_at / revoked_ms_ago context below lets on-call
+          // distinguish the two cases: an innocent post-failure retry presents
+          // within seconds of revocation, while theft replay typically
+          // surfaces much later.
+          logOauthError({
+            errorId: ERROR_IDS.OAUTH_REFRESH_TOKEN_REUSE,
+            message: 'Revoked refresh token lookup detected',
+            context: {
+              token_hash: sha256(id).slice(0, 16),
+              client_id: row.clientId,
+              partner_id: row.partnerId,
+              user_id: row.userId,
+              grant_id: grantId,
+              revoked_at: row.revokedAt.toISOString(),
+              revoked_ms_ago: Date.now() - row.revokedAt.getTime(),
+            },
+          });
+          // Refresh-token reuse is the canonical signal that a token
+          // family has been compromised. Revoke the entire grant family
+          // (all sibling access JWTs and refresh tokens) immediately —
+          // logging alone leaves a window where the attacker continues
+          // to use already-minted access tokens until natural expiry.
+          //
+          // The Redis marker is the EAGER half and it expires
+          // (GRANT_REVOCATION_TTL_SECONDS). It must be paired with the durable
+          // half, or a stolen sibling refresh token starts working again the
+          // moment the marker lapses and the thief regains the whole family.
+          if (grantId) {
+            const result = await writeOAuthRevocationMarkerDurably(db, {
+              userId: row.userId,
+              markerType: 'grant',
+              markerId: grantId,
+              expiresAt: new Date(Date.now() + GRANT_REVOCATION_TTL_SECONDS * 1000),
+            });
+            if (result.status === 'retry_queued') {
+              logOauthError({
+                errorId: ERROR_IDS.OAUTH_REVOCATION_CACHE_WRITE_FAILED,
+                message: 'Grant-wide marker queued after refresh-token reuse',
+                context: { markerType: 'grant', errorCode: result.errorCode },
+              });
+            }
+            await revokeGrantsDurablyInCurrentDbContext({
+              grantIds: [grantId],
+              reason: 'refresh-token-reuse',
+              cascadeRefreshTokens: true,
+            });
+          }
+          return undefined;
+        }
+        // Restore `jti` (== the raw model id) in memory before handing the
+        // payload back to oidc-provider; it is never persisted.
+        return row.expiresAt >= new Date()
+          ? restoreRefreshTokenPayload(id, row.payload as OidcPayload)
+          : undefined;
+      }
+      if (this.model === 'Session') {
+        const [row] = await db.select().from(oauthSessions).where(eq(oauthSessions.id, id));
+        return row && row.expiresAt >= new Date() ? row.payload as OidcPayload : undefined;
+      }
+      if (this.model === 'Grant') {
+        const [row] = await db.select().from(oauthGrants).where(and(
+          eq(oauthGrants.id, id),
+          isNull(oauthGrants.revokedAt),
+          gte(oauthGrants.expiresAt, new Date()),
+        ));
+        return row ? row.payload as OidcPayload : undefined;
+      }
+      if (this.model === 'Interaction') {
+        const [row] = await db.select().from(oauthInteractions).where(eq(oauthInteractions.id, id));
+        return row && row.expiresAt >= new Date() ? row.payload as OidcPayload : undefined;
+      }
+
+      const stored = inMemory.get(this.model)?.get(id);
+      if (!stored) return undefined;
+      if (stored.expiresAt && stored.expiresAt < new Date()) {
+        inMemory.get(this.model)?.delete(id);
+        return undefined;
+      }
+      return stored.payload;
+    });
+  }
+
+  async consume(id: string): Promise<void> {
+    return asSystem(async () => {
+      if (this.model === 'AuthorizationCode') {
+        // Stamp BOTH the `consumedAt` column (our row-level single-use guard)
+        // AND `payload.consumed` (the oidc-provider consumable-mixin field, an
+        // epochTime int). find() returns the payload for a consumed row, and
+        // the library reads `code.consumed` from that payload to fire its
+        // grant-wide revoke on replay. jsonb_set keeps it a single atomic
+        // write — no read-modify-write race on concurrent replays.
+        const consumed = await db.update(oauthAuthorizationCodes).set({
+          consumedAt: new Date(),
+          payload: sql`jsonb_set(${oauthAuthorizationCodes.payload}, '{consumed}', ${epochTime()}::text::jsonb, true)`,
+        }).where(and(
+          eq(oauthAuthorizationCodes.id, id),
+          isNull(oauthAuthorizationCodes.consumedAt),
+        )).returning({ id: oauthAuthorizationCodes.id });
+        if (consumed.length !== 1) {
+          // Losing the CAS aborts before oidc-provider's consumed-replay
+          // handler (which would call revokeGrant) can run. That is correct
+          // ONLY for the true-concurrent case this guards: the winner is a
+          // legitimate first use, not a replay. A genuine later replay still
+          // reaches find(), sees payload.consumed and fires revokeGrant
+          // normally.
+          throw new errors.InvalidGrant('authorization code already consumed');
+        }
+      } else if (this.model === 'RefreshToken') {
+        // oidc-provider rotates refresh tokens by minting a new one and
+        // calling consume() on the previous. Mark it revoked so
+        // `find()` (which filters on revokedAt IS NULL) returns undefined,
+        // preventing replay of the old token after rotation.
+        const consumed = await db.update(oauthRefreshTokens).set({ revokedAt: new Date() }).where(and(
+          eq(oauthRefreshTokens.id, refreshTokenStorageId(id)),
+          isNull(oauthRefreshTokens.revokedAt),
+        )).returning({ id: oauthRefreshTokens.id });
+        if (consumed.length !== 1) {
+          throw new errors.InvalidGrant('refresh token already used');
+        }
+      }
+    });
+  }
+
+  async destroy(id: string): Promise<void> {
+    // For token models we MUST write to the revocation cache before (or as
+    // part of) destroying the row. oidc-provider 8.x doesn't emit the
+    // `revocation.success` event we previously listened for, so the adapter's
+    // destroy is the only sync hook we have on the revocation path. We look
+    // up the payload here to extract `jti`/`exp` and write the cache entry
+    // with the remaining TTL — bearer auth checks the cache on every request.
+    if (this.model === 'AccessToken' || this.model === 'RefreshToken') {
+      const retryQueued = await asSystem(async () => {
+        const markerResults = await this.cacheRevocation(id);
+        if (this.model === 'RefreshToken') {
+          await db
+            .update(oauthRefreshTokens)
+            .set({ revokedAt: new Date() })
+            .where(eq(oauthRefreshTokens.id, refreshTokenStorageId(id)));
+        } else {
+          inMemory.get(this.model)?.delete(id);
+        }
+        return markerResults.some((result) => result.status === 'retry_queued');
+      });
+      if (retryQueued) {
+        throw new Error('OAuth revocation cache unavailable; durable retry queued');
+      }
+      return;
+    }
+    if (this.model === 'Client') {
+      // Registration-management DELETE of a shared DCR client. Enumerate and
+      // revoke EVERY grant family (writing grant + jti Redis markers so
+      // already-minted access JWTs die immediately) and set disabledAt LAST,
+      // only after all families are revoked. The old behavior — set disabledAt
+      // and nothing else — left minted access tokens valid until expiry
+      // (MCP-OAUTH-10). The service establishes its own system DB context.
+      await revokeClientFamilies(id, { kind: 'global' });
+      return;
+    }
+    return asSystem(async () => {
+      if (this.model === 'RefreshToken') {
+        await db.update(oauthRefreshTokens).set({ revokedAt: new Date() }).where(eq(oauthRefreshTokens.id, refreshTokenStorageId(id)));
+      } else if (this.model === 'Session') {
+        await db.delete(oauthSessions).where(eq(oauthSessions.id, id));
+      } else if (this.model === 'Grant') {
+        await db.delete(oauthGrants).where(eq(oauthGrants.id, id));
+      } else if (this.model === 'Interaction') {
+        await db.delete(oauthInteractions).where(eq(oauthInteractions.id, id));
+      } else {
+        inMemory.get(this.model)?.delete(id);
+      }
+    });
+  }
+
+  /**
+   * Look up the token's `jti` and `exp` and write a revocation marker that
+   * lives at least until the token would have naturally expired. The id we
+   * receive from oidc-provider is the model id; for AccessToken/RefreshToken
+   * it equals the `jti` claim, but we still read the payload's `exp` (or
+   * fall back to the row's `expiresAt`) to pick a sensible TTL.
+   *
+   * Failures THROW. For AccessToken there is no DB row at all — the cache
+   * is the only revocation signal, so a silently-dropped write means the
+   * JWT keeps validating until natural expiry. For RefreshToken the DB row
+   * is authoritative for refresh-grant exchanges, but the cache is still
+   * the only mechanism that kills sibling access JWTs minted from the same
+   * grant before their ~10-minute expiry. Either way, fail closed.
+   */
+  private async cacheRevocation(id: string): Promise<OAuthRevocationMarkerResult[]> {
+    try {
+      let exp: number | undefined;
+      let grantId: string | undefined;
+      let userId: string | undefined;
+      // RefreshToken rows are addressed by the digest; the jti revocation
+      // marker for a refresh token is likewise keyed on the digest (AccessToken
+      // markers stay keyed on the raw JWT jti). Compute once and reuse for both
+      // the row lookup and the marker write.
+      const markerId = this.model === 'RefreshToken' ? refreshTokenStorageId(id) : id;
+      if (this.model === 'RefreshToken') {
+        const [row] = await db
+          .select()
+          .from(oauthRefreshTokens)
+          .where(eq(oauthRefreshTokens.id, markerId));
+        if (row) {
+          userId = row.userId;
+          const payloadExp = (row.payload as { exp?: number } | null)?.exp;
+          if (typeof payloadExp === 'number') {
+            exp = payloadExp;
+          } else if (row.expiresAt instanceof Date) {
+            exp = Math.floor(row.expiresAt.getTime() / 1000);
+          }
+          // RefreshToken payload carries grantId — cache the grant-wide
+          // marker too so every access JWT minted from this grant is
+          // immediately rejected by bearer middleware. Without this the
+          // access tokens (separate jtis) would survive until natural
+          // 10-minute expiry.
+          const payloadGrantId = (row.payload as { grantId?: string } | null)?.grantId;
+          if (typeof payloadGrantId === 'string' && payloadGrantId.length > 0) {
+            grantId = payloadGrantId;
+          }
+          const payloadAccountId = (row.payload as { accountId?: string } | null)?.accountId;
+          if (payloadAccountId && payloadAccountId !== row.userId) {
+            throw new Error('RefreshToken ownership does not match persisted user');
+          }
+        }
+      } else {
+        // AccessToken lives in the in-memory store; pull exp directly.
+        const stored = inMemory.get(this.model)?.get(id);
+        const payloadExp = (stored?.payload as { exp?: number } | undefined)?.exp;
+        if (typeof payloadExp === 'number') {
+          exp = payloadExp;
+        } else if (stored?.expiresAt) {
+          exp = Math.floor(stored.expiresAt.getTime() / 1000);
+        }
+        const accountId = (stored?.payload as { accountId?: unknown } | undefined)?.accountId;
+        if (typeof accountId === 'string' && accountId.length > 0) {
+          userId = accountId;
+        }
+      }
+      if (exp === undefined) return []; // nothing to cache
+      if (!userId) {
+        throw new Error('OAuth revocation marker owner is unavailable');
+      }
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const effectiveExp = Math.max(exp, nowSeconds + 1);
+      const results: OAuthRevocationMarkerResult[] = [];
+      results.push(await writeOAuthRevocationMarkerDurably(db, {
+        userId,
+        markerType: 'jti',
+        markerId,
+        expiresAt: new Date(effectiveExp * 1000),
+      }));
+      if (grantId) {
+        results.push(await writeOAuthRevocationMarkerDurably(db, {
+          userId,
+          markerType: 'grant',
+          markerId: grantId,
+          expiresAt: new Date(Date.now() + GRANT_REVOCATION_TTL_SECONDS * 1000),
+        }));
+      }
+      return results;
+    } catch (err) {
+      logOauthError({
+        errorId: ERROR_IDS.OAUTH_REVOCATION_CACHE_WRITE_FAILED,
+        message: 'Revocation cache write failed during destroy()',
+        err,
+        // Never log the raw id: for a RefreshToken it IS the opaque token value.
+        // The digest is a safe, non-reversible correlator (equals id for other models).
+        context: { model: this.model },
+      });
+      throw err;
+    }
+  }
+
+  async revokeByGrantId(grantId: string): Promise<void> {
+    // oidc-provider calls this from its own replay handling (a re-presented
+    // authorization code) as well as from RP-initiated revocation.
+    //
+    // Mark the grant revoked in the cache FIRST so any in-flight bearer
+    // checks immediately reject, then do the durable sweep: consume every
+    // live authorization code, revoke every sibling refresh token and stamp
+    // `oauth_grants.revoked_at`. The cache marker alone expires, so without
+    // the durable half a replayed code could restart the family later.
+    const retryQueued = await asSystem(async () => {
+      const [grant] = await db
+        .select({ accountId: oauthGrants.accountId })
+        .from(oauthGrants)
+        .where(eq(oauthGrants.id, grantId));
+      if (!grant?.accountId) {
+        throw new Error('OAuth grant owner is unavailable');
+      }
+      const marker = await writeOAuthRevocationMarkerDurably(db, {
+        userId: grant.accountId,
+        markerType: 'grant',
+        markerId: grantId,
+        expiresAt: new Date(Date.now() + GRANT_REVOCATION_TTL_SECONDS * 1000),
+      });
+      await revokeGrantsDurablyInCurrentDbContext({
+        grantIds: [grantId],
+        reason: 'provider-revoke-grant',
+        cascadeRefreshTokens: true,
+      });
+      return marker.status === 'retry_queued';
+    });
+    if (retryQueued) {
+      logOauthError({
+        errorId: ERROR_IDS.OAUTH_REVOCATION_CACHE_WRITE_FAILED,
+        message: 'Grant-wide marker queued in revokeByGrantId',
+        context: { markerType: 'grant' },
+      });
+      throw new Error('OAuth revocation cache unavailable; durable retry queued');
+    }
+  }
+
+  async findByUid(uid: string): Promise<OidcPayload | undefined> {
+    // Session.findByUid is called during token issuance to confirm the
+    // authorizing session still exists. Sessions are persisted to
+    // `oauth_sessions` with a dedicated `uid` index — lookup is a single
+    // indexed query.
+    if (this.model === 'Session') {
+      const found = await asSystem(async () => {
+        const [row] = await db.select().from(oauthSessions).where(eq(oauthSessions.uid, uid));
+        return row && row.expiresAt >= new Date() ? row.payload as OidcPayload : undefined;
+      });
+      if (!found) {
+        logOauthDebug({
+          errorId: ERROR_IDS.OAUTH_SESSION_NOT_FOUND_BY_UID,
+          message: 'Session.findByUid returned no row',
+          context: { model: this.model, uidPrefix: uid.slice(0, 8) },
+        });
+      }
+      return found;
+    }
+    // Fallback for models still in the in-memory store (Interaction,
+    // AccessToken, ReplayDetection, etc.). None of these are typically
+    // looked up by uid in our flow, but keep the scan as a safety net.
+    const store = inMemory.get(this.model);
+    if (!store) {
+      logOauthDebug({
+        errorId: ERROR_IDS.OAUTH_SESSION_NOT_FOUND_BY_UID,
+        message: 'findByUid in-memory store empty (post-restart?)',
+        context: { model: this.model, uidPrefix: uid.slice(0, 8) },
+      });
+      return undefined;
+    }
+    for (const [, stored] of store) {
+      if (stored.expiresAt && stored.expiresAt < new Date()) continue;
+      if ((stored.payload as { uid?: unknown }).uid === uid) return stored.payload;
+    }
+    logOauthDebug({
+      errorId: ERROR_IDS.OAUTH_SESSION_NOT_FOUND_BY_UID,
+      message: 'findByUid scanned in-memory store, no match',
+      context: { model: this.model, uidPrefix: uid.slice(0, 8) },
+    });
+    return undefined;
+  }
+
+  async findByUserCode(_code: string): Promise<undefined> { return undefined; }
+}

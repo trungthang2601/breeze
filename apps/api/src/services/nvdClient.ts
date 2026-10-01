@@ -1,0 +1,173 @@
+import { assertSomeValidCveIds, isValidCveId, warnMalformedCveIds } from './cveId';
+import type { VersionRange } from './versionCompare';
+
+const NVD_CVES_URL = 'https://services.nvd.nist.gov/rest/json/cves/2.0';
+
+type JsonObject = Record<string, unknown>;
+
+export interface NvdRecord {
+  cveId: string;
+  cvssVersion: string | null;
+  cvssScore: number | null;
+  cvssVector: string | null;
+  severity: string | null;
+  cpeMatches: Array<{ cpePrefix: string; range: VersionRange }>;
+}
+
+export interface FetchNvdPageParams {
+  lastModStartDate: string;
+  lastModEndDate: string;
+  startIndex: number;
+  resultsPerPage?: number;
+}
+
+export type NvdResponse = unknown;
+
+let warnedMissingApiKey = false;
+
+function asObject(value: unknown): JsonObject | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as JsonObject) : null;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+export function cpePrefix(criteria: string): string {
+  return criteria.split(':').slice(0, 5).join(':');
+}
+
+function selectedMetric(cve: JsonObject): JsonObject | null {
+  const metrics = asObject(cve.metrics);
+  const metric =
+    asArray(metrics?.cvssMetricV31)[0] ?? asArray(metrics?.cvssMetricV40)[0] ?? asArray(metrics?.cvssMetricV2)[0];
+  return asObject(metric);
+}
+
+function flattenNodes(configurations: unknown): JsonObject[] {
+  const nodes: JsonObject[] = [];
+  for (const configuration of asArray(configurations)) {
+    for (const node of asArray(asObject(configuration)?.nodes)) {
+      const parsedNode = asObject(node);
+      if (parsedNode) nodes.push(parsedNode);
+    }
+  }
+  return nodes;
+}
+
+export interface NvdParseResult {
+  records: NvdRecord[];
+  /** Distinct malformed CVE ids dropped at the parse boundary — for log samples (#2427). */
+  skippedCveIds: ReadonlySet<string>;
+  /**
+   * Number of upstream ENTRIES dropped, counting occurrences — not distinct ids
+   * (#2427). Upstream garbage is often a single repeated literal (Microsoft's
+   * Mariner record ships the SAME bogus id on every affected entry), so a
+   * distinct-id count collapses a mass drop to 1 and hides exactly the
+   * regression this instrumentation exists to catch. Includes entries dropped
+   * for a MISSING id, which never reach the malformed set at all.
+   */
+  skippedCount: number;
+  /** Total upstream entries considered (kept + skipped) — the honest ratio denominator. */
+  entryCount: number;
+}
+
+export function parseNvd(doc: unknown): NvdParseResult {
+  const root = asObject(doc);
+  const records: NvdRecord[] = [];
+  const malformedCveIds = new Set<string>();
+  const items = asArray(root?.vulnerabilities);
+  let validCveIdCount = 0;
+  let skippedCount = 0;
+
+  for (const item of items) {
+    const cve = asObject(asObject(item)?.cve);
+    const cveId = asString(cve?.id);
+    if (!cve || !cveId) {
+      // A missing id is still a silently dropped CVE — count it (#2427).
+      skippedCount += 1;
+      continue;
+    }
+    // Upstream garbage guard (#2261): drop records whose CVE id doesn't match
+    // the canonical shape (would overflow varchar(32) and abort the sync).
+    if (!isValidCveId(cveId)) {
+      malformedCveIds.add(cveId);
+      skippedCount += 1;
+      continue;
+    }
+    validCveIdCount += 1;
+
+    const metric = selectedMetric(cve);
+    const cvssData = asObject(metric?.cvssData);
+    const cvssScore = asNumber(cvssData?.baseScore);
+    const cpeMatches: NvdRecord['cpeMatches'] = [];
+
+    for (const node of flattenNodes(cve.configurations)) {
+      for (const cpeMatch of asArray(node.cpeMatch)) {
+        const match = asObject(cpeMatch);
+        const criteria = asString(match?.criteria);
+        if (!match || match.vulnerable === false || !criteria) continue;
+
+        cpeMatches.push({
+          cpePrefix: cpePrefix(criteria),
+          range: {
+            startIncluding: asString(match.versionStartIncluding),
+            startExcluding: asString(match.versionStartExcluding),
+            endIncluding: asString(match.versionEndIncluding),
+            endExcluding: asString(match.versionEndExcluding),
+          },
+        });
+      }
+    }
+
+    records.push({
+      cveId,
+      cvssVersion: asString(cvssData?.version),
+      cvssScore,
+      cvssVector: asString(cvssData?.vectorString),
+      severity: asString(metric?.baseSeverity) ?? asString(cvssData?.baseSeverity),
+      cpeMatches,
+    });
+  }
+
+  assertSomeValidCveIds({
+    tag: 'NvdClient',
+    entryCount: items.length,
+    validCount: validCveIdCount,
+    malformedIds: malformedCveIds,
+  });
+  warnMalformedCveIds('NvdClient', malformedCveIds);
+  return { records, skippedCveIds: malformedCveIds, skippedCount, entryCount: items.length };
+}
+
+export async function fetchNvdPage(params: FetchNvdPageParams): Promise<NvdResponse> {
+  const url = new URL(NVD_CVES_URL);
+  url.searchParams.set('lastModStartDate', params.lastModStartDate);
+  url.searchParams.set('lastModEndDate', params.lastModEndDate);
+  url.searchParams.set('startIndex', String(params.startIndex));
+  url.searchParams.set('resultsPerPage', String(params.resultsPerPage ?? 2000));
+
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  const apiKey = process.env.NVD_API_KEY?.trim();
+  if (apiKey) {
+    headers.apiKey = apiKey;
+  } else if (!warnedMissingApiKey) {
+    warnedMissingApiKey = true;
+    console.warn('NVD_API_KEY is not set; NVD sync will use unauthenticated rate limits.');
+  }
+
+  const response = await fetch(url, { headers });
+  if (!response.ok) {
+    throw new Error(`NVD fetch failed: ${response.status} ${response.statusText}`);
+  }
+
+  return response.json();
+}

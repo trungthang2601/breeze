@@ -1,0 +1,111 @@
+// scripts/dev/wt-stack/cli.ts
+import { execFileSync } from 'node:child_process';
+import { deriveProjectName, descriptorPath } from './project';
+import { writeDescriptor, readDescriptor, type StackDescriptor } from './descriptor';
+import { writeEnvStack, readStackEnvValue } from './env';
+import { composeUp, waitHealthy, publishedPort, containerName, seedDatabase, composeDown } from './compose';
+
+const ADMIN = { email: 'admin@breeze.local', password: 'BreezeAdmin123!' };
+const HEALTH_SERVICES = ['postgres', 'redis', 'api', 'web', 'portal', 'caddy'];
+
+function currentBranch(): string | undefined {
+  try {
+    const b = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).trim();
+    return b === 'HEAD' ? undefined : b;
+  } catch { return undefined; }
+}
+
+function up(shared: boolean, rebuild: boolean): void {
+  const worktreePath = process.cwd();
+  const project = deriveProjectName({ worktreePath, branch: currentBranch(), shared });
+  console.log(`[wt-stack] project=${project} engine=${dockerContext()}`);
+  writeEnvStack(worktreePath);
+  composeUp(project, { rebuild });
+  waitHealthy(project, HEALTH_SERVICES, 5 * 60_000);
+  seedDatabase(project);
+  const caddyPort = publishedPort(project, 'caddy', 80);
+  const baseUrl = `http://localhost:${caddyPort}`;
+  const descriptor: StackDescriptor = {
+    project,
+    baseUrl,
+    apiUrl: `${baseUrl}/api`,
+    portalUrl: `${baseUrl}/portal`,
+    webPort: caddyPort,
+    pgContainer: containerName(project, 'postgres'),
+    redisContainer: containerName(project, 'redis'),
+    admin: ADMIN,
+  };
+  writeDescriptor(worktreePath, descriptor);
+  console.log(JSON.stringify(descriptor, null, 2));
+}
+
+function dockerContext(): string {
+  try { return execFileSync('docker', ['context', 'show'], { encoding: 'utf8' }).trim(); }
+  catch { return 'unknown'; }
+}
+
+function info(): void {
+  console.log(JSON.stringify(readDescriptor(process.cwd()), null, 2));
+}
+
+function down(keepVolumes: boolean): void {
+  const project = deriveProjectName({ worktreePath: process.cwd(), branch: currentBranch(), shared: process.argv.includes('--shared') });
+  composeDown(project, !keepVolumes);
+}
+
+function test(passthrough: string[]): void {
+  const worktreePath = process.cwd();
+  const d = readDescriptor(worktreePath); // throws clear error if not up
+  // #5266 — globalSetup clears the login rate limiter with
+  // `redis-cli -a $REDIS_PASSWORD`; this stack's redis requires auth, so an
+  // absent value makes that clear silently no-op and 429s the one login the
+  // whole suite depends on. The stack is already up here, and compose refuses
+  // to boot redis without a password, so a miss means a lookup bug — say so
+  // rather than passing '' and reproducing the defect one layer down.
+  const redisPassword =
+    process.env.REDIS_PASSWORD ?? readStackEnvValue(worktreePath, 'REDIS_PASSWORD');
+  if (!redisPassword) {
+    throw new Error(
+      '[wt-stack test] REDIS_PASSWORD is not in the environment, .env or .env.stack, yet the ' +
+        "stack is up — so it can't legitimately be missing. globalSetup's login rate-limit " +
+        'clear would silently no-op and 429 the suite. Restore the value (or re-run ' +
+        '`wt-stack up`) before testing.'
+    );
+  }
+  execFileSync('npx', ['playwright', 'test', ...passthrough], {
+    cwd: `${worktreePath}/e2e-tests`,
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      E2E_STACK_FILE: descriptorPath(worktreePath),
+      E2E_BASE_URL: d.baseUrl,
+      E2E_ADMIN_EMAIL: d.admin.email,
+      E2E_ADMIN_PASSWORD: d.admin.password,
+      REDIS_PASSWORD: redisPassword,
+    },
+  });
+}
+
+function ls(): void {
+  const out = execFileSync('docker', ['compose', 'ls', '--format', 'json'], { encoding: 'utf8' });
+  const projects = (JSON.parse(out) as Array<{ Name: string; Status: string }>)
+    .filter((p) => p.Name === 'breeze' || p.Name.startsWith('breeze-wt-'));
+  if (!projects.length) { console.log('No breeze stacks running.'); return; }
+  for (const p of projects) console.log(`${p.Name}\t${p.Status}`);
+}
+
+function main(): void {
+  const [cmd, ...rest] = process.argv.slice(2);
+  switch (cmd) {
+    case 'up': up(rest.includes('--shared'), rest.includes('--rebuild')); break;
+    case 'info': info(); break;
+    case 'down': down(rest.includes('--keep-volumes')); break;
+    case 'test': test(rest[0] === '--' ? rest.slice(1) : rest); break;
+    case 'ls': ls(); break;
+    default:
+      console.error('Usage: wt-stack <up|down|info|test|ls> [--shared] [--rebuild] [--keep-volumes]');
+      process.exit(1);
+  }
+}
+
+main();

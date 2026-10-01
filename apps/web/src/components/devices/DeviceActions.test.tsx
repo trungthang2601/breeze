@@ -1,0 +1,443 @@
+import { render, screen, fireEvent } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import DeviceActions from './DeviceActions';
+import type { Device } from './DeviceList';
+
+// ConnectDesktopButton (rendered inside DeviceActions) imports fetchWithAuth and
+// the Toast helper. Mock both so the action bar renders without touching the
+// network or the toast store.
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+  // useJwtClaims / usePermissions read the store; tokens:null = unresolved,
+  // user:undefined = no permissions, so nothing new is offered by default.
+  useAuthStore: (sel: (s: { tokens: null; user: undefined }) => unknown) => sel({ tokens: null, user: undefined }),
+}));
+
+const { canMoveOrgMock } = vi.hoisted(() => ({ canMoveOrgMock: vi.fn(() => false) }));
+vi.mock('@/lib/moveOrgCapability', () => ({ useCanMoveDeviceOrg: canMoveOrgMock }));
+
+vi.mock('../shared/Toast', async () => {
+  const actual = await vi.importActual<typeof import('../shared/Toast')>('../shared/Toast');
+  return {
+    ...actual,
+    showToast: vi.fn(),
+  };
+});
+
+const baseDevice: Device = {
+  id: 'device-1',
+  hostname: 'edge-01',
+  os: 'windows',
+  osVersion: '11',
+  status: 'online',
+  cpuPercent: 10,
+  ramPercent: 20,
+  lastSeen: '2026-06-29T10:00:00.000Z',
+  orgId: 'org-1',
+  orgName: 'Org One',
+  siteId: 'site-1',
+  siteName: 'HQ',
+  agentVersion: '1.0.0',
+  tags: [],
+};
+
+const onlineDevice: Device = { ...baseDevice, status: 'online' };
+const offlineDevice: Device = { ...baseDevice, status: 'offline' };
+const maintenanceDevice: Device = { ...baseDevice, status: 'maintenance' };
+const updatingDevice: Device = { ...baseDevice, status: 'updating' };
+const quarantinedDevice: Device = { ...baseDevice, status: 'quarantined' };
+
+// A policy that forbids remote tools, so we can exercise the `offlineTitle ??
+// (policy message)` tooltip precedence introduced by #2078.
+const remoteToolsDeniedPolicy = {
+  webrtcDesktop: true,
+  vncRelay: true,
+  remoteTools: false,
+  clipboardHostToViewer: false,
+  clipboardViewerToHost: true,
+  enableProxy: false,
+  policyName: 'Locked Down',
+  policyId: 'policy-1',
+};
+
+// Native disabled buttons aren't reported as disabled via getByRole's name in
+// every jsdom case, so query the DOM element directly and read its props.
+const button = (name: RegExp) => screen.getByRole('button', { name });
+
+it.each(['power', 'menu'])('labels an active lease as exit in the %s menu after a heartbeat reports online', async (menu) => {
+  const onAction = vi.fn();
+  render(<DeviceActions device={{ ...onlineDevice, maintenanceUntil: new Date(Date.now() + 3600000).toISOString() }} onAction={onAction} />);
+  await userEvent.click(menu === 'power' ? button(/^power$/i) : screen.getByTestId('device-actions-menu'));
+  const action = button(/^exit maintenance$/i);
+  expect(screen.queryByRole('button', { name: /^enter maintenance$/i })).not.toBeInTheDocument();
+  await userEvent.click(action);
+  expect(onAction).not.toHaveBeenCalled();
+  expect(screen.getByRole('heading', { name: 'Exit Maintenance Mode' })).toBeInTheDocument();
+});
+
+describe('DeviceActions — offline gating (issue #2013)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('online device', () => {
+    it('leaves Connect Desktop, Power, Run Script and Remote Tools all enabled', () => {
+      render(<DeviceActions device={onlineDevice} />);
+
+      expect(button(/run script/i)).not.toBeDisabled();
+      expect(button(/^connect desktop$/i)).not.toBeDisabled();
+      expect(button(/remote tools/i)).not.toBeDisabled();
+      expect(button(/^power$/i)).not.toBeDisabled();
+    });
+
+    it('does not render the Wake button when the device is online', () => {
+      render(<DeviceActions device={onlineDevice} />);
+      expect(screen.queryByRole('button', { name: /^wake$/i })).toBeNull();
+    });
+  });
+
+  describe('offline device', () => {
+    it('disables Connect Desktop with the "Device is offline" tooltip', () => {
+      render(<DeviceActions device={offlineDevice} />);
+
+      const connect = button(/^connect desktop$/i);
+      expect(connect).toBeDisabled();
+      expect(connect).toHaveAttribute('title', 'Device is offline');
+    });
+
+    it('disables the Power button with the "Device is offline" tooltip', () => {
+      render(<DeviceActions device={offlineDevice} />);
+
+      const power = button(/^power$/i);
+      expect(power).toBeDisabled();
+      expect(power).toHaveAttribute('title', 'Device is offline');
+    });
+
+    // Remote Tools is a live session — disabled-when-offline is CORRECT.
+    // Run Script is a queued command and would be delivered on reconnect, so
+    // disabling it here is stricter than the API requires (#2426). That gate is
+    // deliberately deferred to a maintainer decision (PR #2457), not endorsed;
+    // this test pins the status quo so a change to it is a conscious one.
+    it('keeps Run Script and Remote Tools disabled with the offline tooltip (status quo — Run Script gate is stricter than the API, see #2426)', () => {
+      render(<DeviceActions device={offlineDevice} />);
+
+      const runScript = button(/run script/i);
+      expect(runScript).toBeDisabled();
+      expect(runScript).toHaveAttribute('title', 'Device is offline');
+
+      const remoteTools = button(/remote tools/i);
+      expect(remoteTools).toBeDisabled();
+      expect(remoteTools).toHaveAttribute('title', 'Device is offline');
+    });
+
+    it('keeps Wake ENABLED — Wake-on-LAN is intended for offline devices', () => {
+      render(<DeviceActions device={offlineDevice} />);
+
+      const wake = button(/^wake$/i);
+      expect(wake).toBeInTheDocument();
+      expect(wake).not.toBeDisabled();
+    });
+  });
+
+  // Intermediate statuses (maintenance/updating/quarantined/decommissioned/pending).
+  // Before #2078 the action bar gated on `=== 'offline'`, so these buttons stayed
+  // enabled AND showed the wrong "Device is offline" copy. They are now disabled
+  // with a status-accurate tooltip, which is what these tests pin.
+  //
+  // CORRECTION (#2426): an earlier version of this comment claimed the agent
+  // "can't service a live session or command" in these states and that the API
+  // "rejects [them] with 'Device is not online'". That is true of LIVE SESSIONS
+  // (Connect Desktop, Remote Terminal, Remote Tools) only. QUEUED COMMANDS
+  // (Run Script, Reboot, Shutdown, Refresh) are inserted as pending
+  // `device_commands` and claimed on the agent's next poll — the API refuses
+  // them only for `decommissioned`. So for the queued commands these gates are
+  // stricter than the API requires; the tests below pin existing behaviour, they
+  // do not certify it as correct. See the category note in DeviceActions.tsx.
+  describe('intermediate (non-online, non-offline) statuses — issue #2078', () => {
+    it('disables session/command buttons for a device in maintenance mode', () => {
+      render(<DeviceActions device={maintenanceDevice} />);
+
+      expect(button(/run script/i)).toBeDisabled();
+      expect(button(/^connect desktop$/i)).toBeDisabled();
+      expect(button(/remote tools/i)).toBeDisabled();
+      expect(button(/^power$/i)).toBeDisabled();
+    });
+
+    it('uses a status-accurate tooltip (not "Device is offline") for maintenance', () => {
+      render(<DeviceActions device={maintenanceDevice} />);
+
+      const connect = button(/^connect desktop$/i);
+      expect(connect).toHaveAttribute('title', 'Device is in maintenance mode');
+      expect(button(/^power$/i)).toHaveAttribute('title', 'Device is in maintenance mode');
+    });
+
+    it('uses a status-accurate tooltip for an updating device', () => {
+      render(<DeviceActions device={updatingDevice} />);
+
+      expect(button(/run script/i)).toBeDisabled();
+      expect(button(/run script/i)).toHaveAttribute('title', 'Device is updating');
+    });
+
+    it('does not render the Wake button for a non-offline unavailable status', () => {
+      render(<DeviceActions device={quarantinedDevice} />);
+
+      // Wake is Wake-on-LAN — only meaningful for a genuinely offline device.
+      expect(screen.queryByRole('button', { name: /^wake$/i })).toBeNull();
+      expect(button(/run script/i)).toBeDisabled();
+      expect(button(/run script/i)).toHaveAttribute('title', 'Device is quarantined');
+    });
+  });
+
+  // The Remote Tools tooltip is the one predicate whose SHAPE changed in #2078:
+  // it went from `offline ? "offline" : policy ? "…policy…" : undefined` to
+  // `offlineTitle ?? (policy ? "…policy…" : undefined)`. Lock both branches of
+  // that `??` so a future refactor can't silently drop the policy message or
+  // flip the precedence.
+  describe('Remote Tools policy tooltip precedence — issue #2078', () => {
+    it('shows the policy tooltip (not a status one) when online but remote tools are policy-disabled', () => {
+      const device: Device = { ...onlineDevice, remoteAccessPolicy: remoteToolsDeniedPolicy };
+      render(<DeviceActions device={device} />);
+
+      const remoteTools = button(/remote tools/i);
+      expect(remoteTools).toBeDisabled();
+      expect(remoteTools).toHaveAttribute('title', 'Remote tools disabled by policy "Locked Down"');
+    });
+
+    it('prefers the status tooltip over the policy tooltip when the device is also not online', () => {
+      const device: Device = { ...maintenanceDevice, remoteAccessPolicy: remoteToolsDeniedPolicy };
+      render(<DeviceActions device={device} />);
+
+      const remoteTools = button(/remote tools/i);
+      expect(remoteTools).toBeDisabled();
+      expect(remoteTools).toHaveAttribute('title', 'Device is in maintenance mode');
+    });
+  });
+
+  // The compact variant duplicates the gating logic in its own menu, so it gets
+  // its own coverage. The menu is collapsed until the trigger is clicked.
+  describe('compact variant', () => {
+    it('disables Connect Desktop when offline (with the offline tooltip) but keeps Wake enabled', () => {
+      render(<DeviceActions device={offlineDevice} compact />);
+
+      // Only the MoreHorizontal trigger is rendered until the menu opens.
+      fireEvent.click(screen.getByRole('button'));
+
+      const connect = button(/^connect desktop$/i);
+      expect(connect).toBeDisabled();
+      expect(connect).toHaveAttribute('title', 'Device is offline');
+
+      const wake = button(/^wake$/i);
+      expect(wake).toBeInTheDocument();
+      expect(wake).not.toBeDisabled();
+    });
+
+    it('leaves Connect Desktop enabled when online', () => {
+      render(<DeviceActions device={onlineDevice} compact />);
+
+      fireEvent.click(screen.getByRole('button'));
+
+      expect(button(/^connect desktop$/i)).not.toBeDisabled();
+    });
+
+    // `offline` satisfies BOTH the old `=== 'offline'` and the new
+    // `!== 'online'` predicate, so an offline-only compact test can't tell the
+    // fix from the bug. An intermediate status can — the compact menu must
+    // disable session/command actions and show the status-accurate tooltip.
+    it('disables session/command actions for an intermediate status (maintenance) and shows the status tooltip', () => {
+      render(<DeviceActions device={maintenanceDevice} compact />);
+
+      fireEvent.click(screen.getByRole('button'));
+
+      expect(button(/run script/i)).toBeDisabled();
+      const connect = button(/^connect desktop$/i);
+      expect(connect).toBeDisabled();
+      expect(connect).toHaveAttribute('title', 'Device is in maintenance mode');
+      expect(screen.queryByRole('button', { name: /^wake$/i })).toBeNull();
+    });
+  });
+
+  // #3987: the overflow menu never branched on device status, so an
+  // already-decommissioned device still offered the (destructive, API-rejected)
+  // decommission action, and a decommissioned device never offered permanent
+  // delete from this menu at all. Asserted against data-testid + the onAction
+  // callback rather than label text — Task 2 renames the underlying locale
+  // values, and these testids are stable across that rename.
+  describe('menu parity on removed devices (#3987)', () => {
+    const decommissionedDevice: Device = { ...baseDevice, status: 'decommissioned' };
+
+    it('offers Restore and Delete permanently — not Remove — on a removed device', async () => {
+      const user = userEvent.setup();
+      const onAction = vi.fn();
+      render(<DeviceActions device={decommissionedDevice} onAction={onAction} />);
+
+      await user.click(screen.getByTestId('device-actions-menu'));
+
+      expect(screen.queryByTestId('device-action-remove')).not.toBeInTheDocument();
+      expect(screen.getByTestId('device-action-restore')).toBeInTheDocument();
+      expect(screen.getByTestId('device-action-permanent-delete')).toBeInTheDocument();
+
+      await user.click(screen.getByTestId('device-action-restore'));
+      expect(onAction).toHaveBeenCalledWith('restore', expect.objectContaining({ status: 'decommissioned' }));
+    });
+
+    it('permanent delete dispatches the permanent-delete action', async () => {
+      const user = userEvent.setup();
+      const onAction = vi.fn();
+      render(<DeviceActions device={decommissionedDevice} onAction={onAction} />);
+
+      await user.click(screen.getByTestId('device-actions-menu'));
+      await user.click(screen.getByTestId('device-action-permanent-delete'));
+
+      expect(onAction).toHaveBeenCalledWith('permanent-delete', expect.objectContaining({ status: 'decommissioned' }));
+    });
+
+    it('offers Remove — not Restore or Delete permanently — on a live device', async () => {
+      const user = userEvent.setup();
+      const onAction = vi.fn();
+      render(<DeviceActions device={onlineDevice} onAction={onAction} />);
+
+      await user.click(screen.getByTestId('device-actions-menu'));
+
+      expect(screen.getByTestId('device-action-remove')).toBeInTheDocument();
+      expect(screen.queryByTestId('device-action-restore')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('device-action-permanent-delete')).not.toBeInTheDocument();
+
+      await user.click(screen.getByTestId('device-action-remove'));
+      expect(onAction).not.toHaveBeenCalled();
+      // #3987: the generic "Remove Device" confirm was replaced by
+      // RemoveDeviceDialog, which titles itself with the hostname.
+      expect(await screen.findByText('Remove edge-01?')).toBeInTheDocument();
+    });
+
+    // #3987 items 2 + 6: Remove is no longer a bare yes/no confirm — it asks
+    // what should happen to the agent and forwards the answer, so the detail
+    // page's DELETE carries `uninstallAgent` exactly like the fleet list's.
+    it('Remove opens the agent-choice dialog and forwards the choice to onAction', async () => {
+      const user = userEvent.setup();
+      const onAction = vi.fn();
+      render(<DeviceActions device={onlineDevice} onAction={onAction} />);
+
+      await user.click(screen.getByTestId('device-actions-menu'));
+      await user.click(screen.getByTestId('device-action-remove'));
+
+      expect(screen.getByTestId('remove-choice-uninstall')).toBeChecked();
+      await user.click(screen.getByTestId('remove-choice-leave'));
+      await user.click(screen.getByTestId('device-actions-remove-confirm'));
+
+      expect(onAction).toHaveBeenCalledWith(
+        'decommission',
+        expect.objectContaining({ id: baseDevice.id }),
+        { uninstallAgent: false },
+      );
+    });
+
+    // The compact variant is currently unused in production — the sole
+    // production call site (DeviceDetails.tsx) never passes `compact` — but
+    // it duplicates the same menu markup, so this test guards it against
+    // regressions if/when a future fleet view adopts it.
+    it('compact variant: offers Restore and Delete permanently — not Remove — on a removed device', async () => {
+      const user = userEvent.setup();
+      const onAction = vi.fn();
+      render(<DeviceActions device={decommissionedDevice} onAction={onAction} compact />);
+
+      await user.click(screen.getByTestId('device-actions-menu'));
+
+      expect(screen.queryByTestId('device-action-remove')).not.toBeInTheDocument();
+      expect(screen.getByTestId('device-action-restore')).toBeInTheDocument();
+      expect(screen.getByTestId('device-action-permanent-delete')).toBeInTheDocument();
+    });
+  });
+});
+
+// #4936: putting ONE box into maintenance before a reboot is a per-device act,
+// but the Power dropdown — the menu a tech opens immediately before Reboot /
+// Shutdown — had no maintenance entry. The item added here routes through the
+// SAME ConfirmDialog + onAction("maintenance") contract the "…" overflow item
+// already used, so no new handler, service call or endpoint is involved; the
+// dispatch target is DeviceDetailPage's existing `case "maintenance"`, which
+// calls toggleMaintenanceMode(device.id, …) for that single device.
+describe('DeviceActions — maintenance mode in the Power menu (#4936)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('offers maintenance in the Power menu and dispatches to the reason/duration dialog', async () => {
+    const user = userEvent.setup();
+    const onAction = vi.fn();
+    render(<DeviceActions device={onlineDevice} onAction={onAction} />);
+
+    await user.click(button(/^power$/i));
+    await user.click(screen.getByTestId('device-power-action-maintenance'));
+
+    // Entry opens the parent's form; exit alone retains the yes/no confirmation.
+    expect(onAction).toHaveBeenCalledWith(
+      'maintenance',
+      expect.objectContaining({ id: 'device-1' }),
+    );
+  });
+
+  it('sits beside Reboot and Shutdown rather than replacing the overflow-menu entry', async () => {
+    const user = userEvent.setup();
+    render(<DeviceActions device={onlineDevice} onAction={vi.fn()} />);
+
+    await user.click(button(/^power$/i));
+    expect(screen.getByTestId('device-power-action-maintenance')).toBeInTheDocument();
+
+    // The pre-existing "…" entry is untouched — this PR adds a second path, it
+    // does not move the only one.
+    await user.click(screen.getByTestId('device-actions-menu'));
+    expect(await screen.findByText('Enter Maintenance')).toBeInTheDocument();
+  });
+
+  // The Power BUTTON keeps its pre-existing `!online` gate (pinned by #2013 /
+  // #2078 above), so for a device already in maintenance the dropdown cannot be
+  // opened and exit stays on the "…" menu. Pinned here so that asymmetry is a
+  // documented consequence rather than a surprise: relaxing the Power gate is a
+  // separate decision (bulkActionGating.ts warns against "fixing" it in passing).
+  it('still offers Exit Maintenance on the overflow menu for a device in maintenance', async () => {
+    const user = userEvent.setup();
+    const onAction = vi.fn();
+    render(<DeviceActions device={maintenanceDevice} onAction={onAction} />);
+
+    expect(button(/^power$/i)).toBeDisabled();
+
+    await user.click(screen.getByTestId('device-actions-menu'));
+    await user.click(await screen.findByText('Exit Maintenance'));
+
+    expect(await screen.findByText('Exit Maintenance Mode')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Exit Maintenance' }));
+    expect(onAction).toHaveBeenCalledWith(
+      'maintenance',
+      expect.objectContaining({ id: 'device-1', status: 'maintenance' }),
+    );
+  });
+});
+
+describe('DeviceActions — Move to Organization entry (device move-org D5)', () => {
+  beforeEach(() => { vi.clearAllMocks(); canMoveOrgMock.mockReturnValue(false); });
+
+  it('is hidden when the caller cannot move devices between organizations', async () => {
+    render(<DeviceActions device={onlineDevice} onAction={vi.fn()} />);
+    await userEvent.click(screen.getByTestId('device-actions-menu'));
+    expect(screen.queryByTestId('device-action-move-org')).not.toBeInTheDocument();
+  });
+
+  it('emits onAction("move-org") for a capable caller instead of opening a confirm', async () => {
+    canMoveOrgMock.mockReturnValue(true);
+    const onAction = vi.fn();
+    render(<DeviceActions device={onlineDevice} onAction={onAction} />);
+    await userEvent.click(screen.getByTestId('device-actions-menu'));
+    await userEvent.click(screen.getByTestId('device-action-move-org'));
+    expect(onAction).toHaveBeenCalledWith('move-org', onlineDevice);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('is offered for an offline device too — the move is a database operation, not an agent command', async () => {
+    canMoveOrgMock.mockReturnValue(true);
+    render(<DeviceActions device={offlineDevice} onAction={vi.fn()} />);
+    await userEvent.click(screen.getByTestId('device-actions-menu'));
+    expect(screen.getByTestId('device-action-move-org')).toBeEnabled();
+  });
+});

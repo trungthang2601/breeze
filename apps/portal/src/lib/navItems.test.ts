@@ -1,0 +1,172 @@
+import { describe, it, expect } from 'vitest';
+import { buildPortalNavItems } from './navItems';
+
+describe('buildPortalNavItems — enable_tickets nav gating (#2345)', () => {
+  it('hides the Tickets entry when enableTickets is explicitly false', () => {
+    const items = buildPortalNavItems({ enableTickets: false, enableAssetCheckout: true });
+    expect(items.map((i) => i.href)).not.toContain('/tickets');
+    // Only Tickets is affected — the rest of the nav is untouched.
+    expect(items.map((i) => i.href)).toEqual([
+      '/quotes',
+      '/invoices',
+      '/devices',
+      '/assets',
+      '/profile'
+    ]);
+  });
+
+  it('leads with what a customer actually came for', () => {
+    // A portal customer approves a proposal or pays a bill; /devices is a
+    // read-only inventory and used to sit first.
+    const items = buildPortalNavItems({});
+    expect(items[0]).toEqual({ label: 'Proposals', href: '/quotes' });
+    expect(items[1]).toEqual({ label: 'Invoices', href: '/invoices' });
+  });
+
+  it('labels /quotes "Proposals", matching every page it leads to', () => {
+    const quotes = buildPortalNavItems({}).find((i) => i.href === '/quotes');
+    expect(quotes?.label).toBe('Proposals');
+  });
+
+  it('shows Tickets when enableTickets is true', () => {
+    expect(buildPortalNavItems({ enableTickets: true }).map((i) => i.href)).toContain('/tickets');
+  });
+
+  it('fails OPEN: shows Tickets when the flag is absent (no branding row / default branding)', () => {
+    expect(buildPortalNavItems({}).map((i) => i.href)).toContain('/tickets');
+    expect(
+      buildPortalNavItems({ enableTickets: undefined }).map((i) => i.href)
+    ).toContain('/tickets');
+  });
+});
+
+describe('buildPortalNavItems — full flag set (#4562)', () => {
+  it('orders every enabled portal destination', () => {
+    expect(buildPortalNavItems({
+      enableTickets: true,
+      enableAssetCheckout: true,
+      enableSelfService: true,
+      enablePasswordReset: true,
+      enableDashboard: true,
+      enableSecurity: true,
+      enableBackups: true,
+      enableReports: true,
+      enableSupportUsage: true,
+      enableService: true,
+      enableDocuments: true,
+    }).map((item) => item.href)).toEqual([
+      '/dashboard',
+      '/quotes',
+      '/invoices',
+      '/tickets',
+      '/devices',
+      '/security',
+      '/backups',
+      '/reports',
+      '/service',
+      '/documents',
+      '/assets',
+      '/profile',
+    ]);
+  });
+
+  it('fails closed for new flags and honors self-service false', () => {
+    expect(buildPortalNavItems({
+      enableTickets: false,
+      enableAssetCheckout: false,
+      enableSelfService: false,
+      enablePasswordReset: true,
+      enableDashboard: false,
+      enableSecurity: false,
+      enableBackups: false,
+      enableReports: false,
+      enableSupportUsage: false,
+    }).map((item) => item.href)).toEqual([
+      '/quotes',
+      '/invoices',
+      '/profile',
+    ]);
+  });
+});
+
+describe('buildPortalNavItems — Network (/network) gating (#6640)', () => {
+  it('hides Network when the flag is absent (fails closed, unlike Tickets)', () => {
+    expect(buildPortalNavItems({}).map((i) => i.href)).not.toContain('/network');
+  });
+
+  it('hides Network when the flag is explicitly false', () => {
+    expect(
+      buildPortalNavItems({ enableNetworkVisibility: false }).map((i) => i.href)
+    ).not.toContain('/network');
+  });
+
+  it('hides Network when the flag is undefined', () => {
+    expect(
+      buildPortalNavItems({ enableNetworkVisibility: undefined }).map((i) => i.href)
+    ).not.toContain('/network');
+  });
+
+  it('shows Network only when the flag is explicitly true, appended after the existing fail-closed block', () => {
+    const items = buildPortalNavItems({ enableAssetCheckout: true, enableNetworkVisibility: true });
+    expect(items.map((i) => i.href)).toEqual([
+      '/quotes',
+      '/invoices',
+      '/tickets',
+      '/devices',
+      '/assets',
+      '/network',
+      '/profile',
+    ]);
+    expect(items.find((i) => i.href === '/network')).toEqual({ href: '/network', label: 'Network' });
+  });
+});
+
+describe('buildPortalNavItems — Equipment (/assets) gating', () => {
+  it('shows Equipment only when asset checkout is enabled', () => {
+    expect(
+      buildPortalNavItems({ enableAssetCheckout: true }).map((i) => i.href)
+    ).toContain('/assets');
+  });
+
+  // Fails CLOSED, unlike Tickets: /assets reads the same devices table as
+  // /devices minus a column, so without checkout it is a second nav word for
+  // the same machines.
+  it.each([{}, { enableAssetCheckout: false }, { enableAssetCheckout: undefined }])(
+    'hides Equipment when checkout is not explicitly enabled (%j)',
+    (branding) => {
+      expect(buildPortalNavItems(branding).map((i) => i.href)).not.toContain('/assets');
+    }
+  );
+});
+
+describe('buildPortalNavItems — Devices visibility (#4933)', () => {
+  it.each([
+    { enableDevices: true, enableSelfService: false },
+    { enableDevices: false, enableSelfService: true },
+  ])('shows Devices when either access flag is enabled (%j)', (branding) => {
+    expect(buildPortalNavItems(branding).map((item) => item.href)).toContain('/devices');
+  });
+
+  it('hides Devices when visibility and self-service are both disabled', () => {
+    expect(buildPortalNavItems({
+      enableDevices: false,
+      enableSelfService: false,
+    }).map((item) => item.href)).not.toContain('/devices');
+  });
+});
+
+describe('buildPortalNavItems — W04 service and documents', () => {
+  it('fails CLOSED for the W04 surfaces — absent or false hides them', () => {
+    for (const branding of [{}, { enableService: false, enableDocuments: false }]) {
+      const hrefs = buildPortalNavItems(branding).map((i) => i.href);
+      expect(hrefs).not.toContain('/service');
+      expect(hrefs).not.toContain('/documents');
+    }
+  });
+
+  it('shows each independently of the other', () => {
+    expect(buildPortalNavItems({ enableService: true }).map((i) => i.href)).toContain('/service');
+    expect(buildPortalNavItems({ enableService: true }).map((i) => i.href)).not.toContain('/documents');
+    expect(buildPortalNavItems({ enableDocuments: true }).map((i) => i.href)).toContain('/documents');
+  });
+});

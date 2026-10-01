@@ -1,0 +1,152 @@
+import { createAuditLogAsync, type InitiatedByType } from './auditService';
+import { getTrustedClientIpOrUndefined } from './clientIp';
+import { sanitizeAuditPayload } from './auditPayloadSanitizer';
+
+export const ANONYMOUS_ACTOR_ID = '00000000-0000-0000-0000-000000000000';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Aliased to the shared ActorType so this file cannot drift from the DB enum
+// and the shared validators — parity pinned by db/schema/audit.enums.test.ts.
+type AuditActorType = import('@breeze/shared').ActorType;
+type AuditResult = import('@breeze/shared').AuditResult;
+
+export type RequestLike = {
+  req: {
+    header: (name: string) => string | undefined;
+  };
+};
+
+/** Build a RequestLike shim from a pre-captured IP + user-agent snapshot. */
+export function requestLikeFromSnapshot(snapshot: { ip?: string; userAgent?: string }): RequestLike {
+  return {
+    req: {
+      header: (name: string) => {
+        const lower = name.toLowerCase();
+        if (lower === 'x-forwarded-for') return snapshot.ip;
+        if (lower === 'user-agent') return snapshot.userAgent;
+        return undefined;
+      },
+    },
+  };
+}
+
+export interface AuditEventInput {
+  orgId: string | null | undefined;
+  action: string;
+  resourceType: string;
+  resourceId?: string | null;
+  resourceName?: string | null;
+  details?: Record<string, unknown>;
+  result?: AuditResult;
+  errorMessage?: string;
+  actorType?: AuditActorType;
+  actorId?: string | null;
+  actorEmail?: string | null;
+  initiatedBy?: InitiatedByType;
+  /**
+   * Pre-resolved client IP / user-agent, for a service that audits on behalf of
+   * a request it no longer holds. Takes precedence over deriving them from `c`.
+   * Needed because `requestLikeFromSnapshot` carries no socket peer, so
+   * `getTrustedClientIp` on that shim fails the proxy-trust check in production
+   * (TRUSTED_PROXY_CIDRS set) and silently records no IP — plus a false
+   * `[proxy-trust] MISCONFIGURATION` warning (#5611 review).
+   */
+  ipAddress?: string;
+  userAgent?: string;
+}
+
+function isUuid(value: string | null | undefined): value is string {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+export function writeAuditEventAsync(c: RequestLike, event: AuditEventInput): Promise<void> {
+
+  const details = (event.details && typeof event.details === 'object')
+    ? { ...event.details }
+    : {};
+
+  const rawActorId = event.actorId ?? null;
+  const actorId = isUuid(rawActorId) ? rawActorId : ANONYMOUS_ACTOR_ID;
+  if (rawActorId && !isUuid(rawActorId)) {
+    details.rawActorId = rawActorId;
+  }
+
+  const rawResourceId = event.resourceId ?? null;
+  const resourceId = isUuid(rawResourceId) ? rawResourceId : undefined;
+  if (rawResourceId && !isUuid(rawResourceId)) {
+    details.rawResourceId = rawResourceId;
+  }
+
+  const resolvedActorType = event.actorType ?? (event.actorId ? 'user' : 'system');
+
+  // Auto-derive initiatedBy from actorType when not explicitly set
+  let initiatedBy: InitiatedByType | undefined = event.initiatedBy;
+  if (!initiatedBy) {
+    switch (resolvedActorType) {
+      case 'agent': initiatedBy = 'agent'; break;
+      case 'api_key': initiatedBy = 'integration'; break;
+      case 'system': initiatedBy = 'schedule'; break;
+      case 'ai_agent': initiatedBy = 'ai'; break;
+      default: initiatedBy = 'manual'; break;
+    }
+  }
+
+  // Run details through the shared sanitizer before persisting. ~499
+  // audit call sites previously had to filter secrets at the call point;
+  // applying sanitizeAuditPayload here closes the systemic gap (e.g.
+  // admin/abuse.ts persisting raw err.message strings into details).
+  const sanitizedDetails = Object.keys(details).length > 0
+    ? (sanitizeAuditPayload(details) as Record<string, unknown>)
+    : undefined;
+
+  return createAuditLogAsync({
+    orgId: event.orgId ?? undefined,
+    actorType: resolvedActorType,
+    actorId,
+    actorEmail: event.actorEmail ?? undefined,
+    action: event.action,
+    resourceType: event.resourceType,
+    resourceId,
+    resourceName: event.resourceName ?? undefined,
+    details: sanitizedDetails,
+    ipAddress: event.ipAddress ?? getTrustedClientIpOrUndefined(c),
+    userAgent: event.userAgent ?? c.req.header('user-agent'),
+    result: event.result ?? 'success',
+    errorMessage: event.errorMessage,
+    initiatedBy,
+  });
+}
+
+/** Fire-and-forget compatibility wrapper for existing audit call sites. */
+export function writeAuditEvent(c: RequestLike, event: AuditEventInput): void {
+  void writeAuditEventAsync(c, event);
+}
+
+/**
+ * Convenience wrapper for route handlers that extracts actorId/actorEmail
+ * from the Hono auth context, reducing boilerplate at each call site.
+ */
+export interface RouteAuditInput {
+  orgId: string | null | undefined;
+  action: string;
+  resourceType: string;
+  resourceId?: string | null;
+  resourceName?: string | null;
+  details?: Record<string, unknown>;
+  result?: AuditResult;
+  initiatedBy?: InitiatedByType;
+}
+
+export type AuthContext = RequestLike & {
+  get(key: 'auth'): { user: { id: string; email?: string } };
+};
+
+export function writeRouteAudit(c: AuthContext, event: RouteAuditInput): void {
+  const auth = c.get('auth');
+  const user = auth?.user;
+  writeAuditEvent(c, {
+    ...event,
+    actorId: user?.id ?? ANONYMOUS_ACTOR_ID,
+    actorEmail: user?.email,
+  });
+}

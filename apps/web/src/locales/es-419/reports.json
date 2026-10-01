@@ -1,0 +1,1029 @@
+{
+  "analytics": {
+    "analyticsPage": {
+      "actions": {
+        "refresh": "Actualizar",
+        "retry": "Reintentar"
+      },
+      "alertSeverity": {
+        "acknowledged": "Reconocido",
+        "critical": "Crítico",
+        "high": "Alto",
+        "low": "Bajo",
+        "medium": "Medio"
+      },
+      "dashboardOptions": {
+        "capacity": "Planificación de capacidad",
+        "operations": "Resumen de operaciones",
+        "sla": "SLA Cumplimiento"
+      },
+      "dateRanges": {
+        "customRange": "Rango personalizado",
+        "last24Hours": "Últimas 24 horas",
+        "last30Days": "últimos 30 días",
+        "last7Days": "últimos 7 días"
+      },
+      "errors": {
+        "failedToLoadAnalytics": "No se pudieron cargar los datos analíticos",
+        "unableToLoad": "No se puede cargar: {{sources}}"
+      },
+      "lastUpdated": "Actualizado {{time}}",
+      "subtitle": "Información sobre su flota y servicios",
+      "title": "Analítica",
+      "trend": {
+        "operationalHealth": "Salud operativa"
+      },
+      "widgets": {
+        "alertTable": {
+          "count": "Cantidad",
+          "severity": "Gravedad",
+          "title": "Estadísticas de alerta"
+        },
+        "capacity": {
+          "title": "Previsión de capacidad"
+        },
+        "complianceGauge": {
+          "policiesEvaluated": "Políticas {{count}} evaluadas",
+          "title": "Cumplimiento de políticas"
+        },
+        "osBreakdown": {
+          "subtitle": "Proporción de dispositivos administrados",
+          "title": "Distribución OS"
+        },
+        "performance": {
+          "cpu": "CPU",
+          "memory": "Memoria",
+          "subtitle": "CPU y utilización de la memoria",
+          "title": "Tendencia de rendimiento"
+        },
+        "remoteSessions": {
+          "label": "Sesiones en rango",
+          "title": "Sesiones remotas"
+        },
+        "uptime": {
+          "label": "Tiempo de actividad de la flota",
+          "title": "tiempo de actividad"
+        }
+      }
+    },
+    "capacityForecast": {
+      "actual": "Real",
+      "critical": "Crítico",
+      "criticalValue": "Crítico {{value}}{{unit}}",
+      "current": "Actual",
+      "description": "Proyección de capacidad basada en el uso reciente",
+      "trend": "Tendencia",
+      "warnValue": "Advertir {{value}}{{unit}}",
+      "warning": "Advertencia"
+    },
+    "chartWidget": {
+      "noData": "No hay datos disponibles"
+    },
+    "dashboardGrid": {
+      "drag": "Arrastrar",
+      "errors": {
+        "failedToLoadDashboard": "No se pudo cargar el panel"
+      },
+      "retry": "Reintentar"
+    },
+    "executiveSummary": {
+      "alertSummary": "Resumen de alerta",
+      "critical": "Crítico",
+      "criticalAndWarningAlerts": "Alertas críticas y de advertencia",
+      "deviceOverview": "Descripción general del dispositivo",
+      "fleetAvailabilitySummary": "Resumen de disponibilidad de flota",
+      "last12Weeks": "Últimas 12 semanas",
+      "offline": "Desconectado",
+      "online": "En línea",
+      "operationalHealth": "Salud operativa",
+      "totalDevices": "Dispositivos totales",
+      "uptime": "tiempo de actividad",
+      "warnings": "Advertencias",
+      "weeklyTrend": "tendencia semanal"
+    },
+    "gaugeWidget": {
+      "criticalValue": "Crítico {{value}}",
+      "warnValue": "Advertir {{value}}"
+    },
+    "queryBuilder": {
+      "aggregations": {
+        "average": "Promedio",
+        "maximum": "Máximo",
+        "minimum": "Mínimo",
+        "p95": "P95",
+        "sum": "Suma"
+      },
+      "description": "Configure métricas y agregación para su panel",
+      "errors": {
+        "failedToExecuteQuery": "No se pudo ejecutar la consulta",
+        "noDevicesSelected": "No hay dispositivos seleccionados para la consulta"
+      },
+      "labels": {
+        "aggregation": "Agregación",
+        "endDate": "Fecha de finalización",
+        "metricName": "Nombre de la métrica",
+        "metricType": "Tipo de métrica",
+        "startDate": "Fecha de inicio",
+        "timeRange": "Rango de tiempo"
+      },
+      "metricNames": {
+        "activeDevices": "Dispositivos activos",
+        "automationRuns": "Ejecuciones de automatización",
+        "cpuUtilization": "CPU Utilización",
+        "diskUsage": "Uso del disco",
+        "incidentCount": "Recuento de incidentes",
+        "loginVolume": "Volumen de inicio de sesión",
+        "memoryUtilization": "Utilización de la memoria",
+        "mfaAdoption": "MFA Adopción",
+        "networkThroughput": "Rendimiento de la red",
+        "patchCompliance": "Cumplimiento de parches",
+        "remoteSessions": "Sesiones remotas",
+        "responseTime": "Tiempo de respuesta",
+        "slaCompliance": "SLA Cumplimiento",
+        "threatAlerts": "Alertas de amenazas",
+        "uptime": "tiempo de actividad",
+        "vulnerabilityScore": "Puntuación de vulnerabilidad"
+      },
+      "metricTypes": {
+        "availability": "Disponibilidad",
+        "performance": "Rendimiento",
+        "security": "Seguridad",
+        "usage": "Uso"
+      },
+      "runQuery": "Ejecutar consulta",
+      "running": "En ejecución...",
+      "timeRanges": {
+        "customRange": "Rango personalizado",
+        "last1Hour": "Última 1 hora",
+        "last24Hours": "Últimas 24 horas",
+        "last30Days": "últimos 30 días",
+        "last7Days": "últimos 7 días"
+      },
+      "title": "Generador de consultas"
+    },
+    "slaComplianceCard": {
+      "defaultPeriodLabel": "últimos 30 días",
+      "downtime": "Tiempo de inactividad {{value}}",
+      "incidents": "incidentes {{count}}",
+      "status": {
+        "atRisk": "En riesgo",
+        "breach": "Incumplimiento",
+        "compliant": "Conforme"
+      },
+      "targetUptime": "Objetivo {{target}}% de tiempo de actividad",
+      "title": "SLA Cumplimiento"
+    },
+    "tableWidget": {
+      "filterPlaceholder": "Filtrar",
+      "noMatchingRecords": "No hay registros coincidentes"
+    },
+    "widgetRenderer": {
+      "unsupportedWidget": "Widget no compatible"
+    }
+  },
+  "reports": {
+    "dashboardWidgets": {
+      "accessDenied": "No tiene permiso para ver los datos de este panel.",
+      "activeAlerts": "Alertas activas",
+      "averages": "Promedios",
+      "complianceScore": "Puntuación de cumplimiento",
+      "cpu": "CPU",
+      "criticalCount": "{{count}} crítico",
+      "disk": "Disco",
+      "errors": {
+        "loadDashboardData": "No se pudieron cargar los datos del panel"
+      },
+      "issueCount": "problema {{count}}",
+      "issueCount_one": "problema {{count}}",
+      "issueCount_other": "Problemas con {{count}}",
+      "lastUpdated": "Última actualización: {{time}}",
+      "memory": "Memoria",
+      "onlinePercent": "{{percent}} en línea",
+      "refresh": "Actualizar",
+      "retry": "Reintentar",
+      "topCpuUsage": "Uso principal de CPU",
+      "topDiskUsage": "Uso principal del disco",
+      "topMemoryUsage": "Uso de memoria principal",
+      "totalDevices": "Dispositivos totales"
+    },
+    "postureOptions": {
+      "requireBackupCoverage": "Exigir cobertura de respaldo",
+      "requireBackupCoverageHelp": "Cuando es opcional, el respaldo permanece visible como evidencia neutral y no genera una recomendación.",
+      "cancel": "Cancelar",
+      "createReport": "Crear informe"
+    },
+    "lifecycleOptions": {
+      "cancel": "Cancelar",
+      "createReport": "Crear informe",
+      "includeManualAssets": "Incluir activos ingresados manualmente",
+      "includeManualAssetsHelp": "Los activos manuales con fecha de compra o garantía aparecen junto a los equipos con agente.",
+      "includeOtherEquipment": "Listar otros equipos",
+      "includeOtherEquipmentHelp": "Impresoras, hardware de red e IoT se listan sin cronograma de reemplazo.",
+      "replaceAgeYears": "Planificar reemplazo después de (años)",
+      "replaceAgeYearsHelp": "Un equipo debe reemplazarse esta cantidad de años después de la compra, o cuando termine la garantía activa si es más tarde.",
+      "serverReplaceAgeYears": "Planificar reemplazo de servidores después de (años)",
+      "serverReplaceAgeYearsHelp": "Los servidores siguen su propio calendario y se listan en una sección separada del informe."
+    },
+    "vulnerabilityManagementOptions": {
+      "cancel": "Cancelar",
+      "createReport": "Crear informe",
+      "includeAccepted": "Incluir riesgos aceptados y excepciones",
+      "includeAcceptedHelp": "Lista los hallazgos aceptados y mitigados, y marca aquellos cuya aceptación vence en el próximo período.",
+      "severity": {
+        "critical": "Crítica",
+        "high": "Alta",
+        "low": "Baja",
+        "medium": "Media"
+      },
+      "severityFloor": "Severidad mínima a listar",
+      "severityFloorHelp": "Los hallazgos por debajo de esta severidad quedan fuera de las tablas. Nunca oculta un hallazgo explotado activamente (KEV) ni uno de EPSS alto: esos siempre se cuentan y se listan.",
+      "topN": "Largo de la lista de corrección",
+      "topNHelp": "Cuántos hallazgos con parche incluye la tabla de corrección prioritaria. El informe indica cuántos quedaron fuera en lugar de truncar en silencio."
+    },
+    "reportBuilderPage": {
+      "configurationTitle": "Configuración de informes",
+      "description": "Genere un informe único sin guardarlo.",
+      "errors": {
+        "exportFailed": "La exportación falló. Inténtelo de nuevo.",
+        "generatePreview": "No se pudo generar la vista previa",
+        "generateReportPreview": "No se pudo generar la vista previa del informe"
+      },
+      "title": "Generador de informes ad hoc"
+    },
+    "reportEditPage": {
+      "backToReports": "Volver a Informes",
+      "description": "Actualice la configuración de \"{{name}}\".",
+      "errors": {
+        "fetchReport": "No se pudo recuperar el informe",
+        "generic": "Se produjo un error"
+      },
+      "loading": "Cargando informe...",
+      "notFound": "Informe no encontrado",
+      "reportsBreadcrumb": "Informes",
+      "title": "Editar informe"
+    },
+    "reportPreview": {
+      "charts": {
+        "alertsBySeverity": "Alertas por gravedad",
+        "avgCpu": "Promedio CPU",
+        "avgDisk": "Disco promedio",
+        "avgMemory": "Memoria promedio",
+        "complianceIssues": "Problemas de cumplimiento",
+        "complianceScore": "Puntuación de cumplimiento",
+        "offline": "Desconectado",
+        "online": "En línea",
+        "topAlertingRules": "Principales reglas de alerta",
+        "topCpuConsumers": "Principales consumidores de CPU",
+        "totalDevices": "Dispositivos totales"
+      },
+      "emptyDescription": "Configure la configuración de su informe y haga clic en Vista previa para ver los datos.",
+      "emptyTitle": "No hay vista previa disponible",
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "generated": "Generado {{date}}",
+      "generatedWithRecords": "Registros {{date}} - {{count}} generados",
+      "generating": "Generando vista previa del informe...",
+      "noDataMatches": "Ningún dato coincide con los filtros actuales.",
+      "pagination": {
+        "page": "Página {{current}} de {{total}}",
+        "showing": "Mostrando {{start}} a {{end}} de registros {{total}}"
+      },
+      "refresh": "Actualizar",
+      "lifecycle": {
+        "dueSoon": "Próximo a vencer",
+        "onTrack": "En plazo",
+        "otherEquipment": "Otros equipos",
+        "recommendations": "Lo que recomendamos",
+        "replaceNow": "Reemplazar ahora",
+        "unknownAge": "Antigüedad desconocida"
+      },
+      "vulnerabilityManagement": {
+        "critical": "Críticos abiertos",
+        "expiringExceptions": "Excepciones que vencen el próximo período",
+        "high": "Altos abiertos",
+        "highEpss": "Explotación probable",
+        "knownExploited": "Explotados activamente (KEV)",
+        "notMeasured": "N/D"
+      },
+      "reportTypes": {
+        "ai_fleet_design": "Diseño de flota",
+        "ai_org_narrative": "Narrativa semanal de operaciones con IA",
+        "alert_summary": "Resumen de alerta",
+        "compliance": "Informe de cumplimiento",
+        "device_inventory": "Inventario de dispositivos",
+        "executive_summary": "Resumen ejecutivo",
+        "hardware_lifecycle": "Ciclo de vida del hardware",
+        "vulnerability_management": "Gestión de vulnerabilidades",
+        "identity_access_review": "Revisión de identidad y acceso",
+        "performance": "Informe de desempeño",
+        "security_compliance_posture": "Postura de seguridad y cumplimiento",
+        "software_inventory": "Inventario de software",
+        "threat_detection_review": "Revisión de detección de amenazas",
+        "endpoint_management_review": "Revisión de administración de endpoints"
+      },
+      "threatDetection": {
+        "agents": "Equipos con agente de detección",
+        "breezeDevices": "Dispositivos que Breeze gestiona",
+        "carriedIn": "Arrastradas, aún abiertas",
+        "coverage": "Límites de este informe",
+        "devicesWithoutAgent": "Dispositivos gestionados sin agente",
+        "notMeasured": "N/D",
+        "opened": "Detecciones registradas",
+        "resolved": "Detecciones resueltas"
+      },
+      "tryAgain": "Intentar otra vez",
+      "values": {
+        "no": "No",
+        "yes": "Sí"
+      },
+      "viewModes": {
+        "chart": "Cuadro",
+        "table": "Tabla"
+      },
+      "endpointManagement": {
+        "breezeWithoutIntune": "Dispositivos de Breeze sin inscribir",
+        "dataGaps": "Lo que no pudimos medir",
+        "intuneDevices": "Inscritos en Intune",
+        "intuneWithoutBreezeLink": "Registros de Intune sin vincular",
+        "noncompliant": "Sin cumplimiento",
+        "notMeasured": "N/D",
+        "staleEnrolments": "Inscripciones obsoletas"
+      },
+      "identityAccess": {
+        "notMeasured": "N/D",
+        "coverage": "Límites de este informe",
+        "signins": "Inicios de sesión interactivos",
+        "distinctUsers": "Cuentas que iniciaron sesión",
+        "failures": "Inicios de sesión fallidos",
+        "admins": "Cuentas con rol de administrador",
+        "adminsWithoutMfa": "Administradores sin MFA",
+        "mfaUnknown": "Estado de MFA desconocido",
+        "dormant": "Cuentas inactivas"
+      }
+    },
+    "reportsList": {
+      "actions": {
+        "delete": "Eliminar",
+        "edit": "Editar",
+        "generateNow": "Generar ahora"
+      },
+      "adhocReport": "Informe ad hoc",
+      "aiNarrative": {
+        "managedBySchedule": "Gestionado por la programación de IA",
+        "openLatest": "Abrir el más reciente"
+      },
+      "confirmDelete": "¿Está seguro de que desea eliminar \"{{name}}\"?",
+      "createReport": "Crear informe",
+      "description": "Genere y programe informes para su infraestructura.",
+      "download": "Descargar",
+      "emailRecipients": "Destinatarios de correo electrónico",
+      "emptyReportsDescription": "Cree su primer informe para comenzar.",
+      "emptyReportsTitle": "Aún no hay informes",
+      "emptyRunsDescription": "Genere un informe para verlo aquí.",
+      "emptyRunsTitle": "No hay ejecuciones recientes",
+      "errors": {
+        "deleteReport": "No se pudo eliminar el informe",
+        "downloadFailed": "Descarga fallida",
+        "fetchReports": "No se pudieron recuperar los informes",
+        "generateReport": "No se pudo generar el informe",
+        "generic": "Se produjo un error",
+        "noCompletedRun": "Todavía no hay una narrativa completada para abrir"
+      },
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "loading": "Cargando informes...",
+      "never": "Nunca",
+      "success": {
+        "generated": "Informe \"{{name}}\" generado."
+      },
+      "visibleInPortal": "Visible en el portal del cliente",
+      "newReport": "Nuevo informe",
+      "nextOccurrence": "Siguiente: {{next}}",
+      "reportTypes": {
+        "ai_fleet_design": "Diseño de flota",
+        "ai_org_narrative": "Narrativa semanal de operaciones con IA",
+        "alert_summary": "Resumen de alerta",
+        "compliance": "Informe de cumplimiento",
+        "device_inventory": "Inventario de dispositivos",
+        "executive_summary": "Resumen ejecutivo",
+        "hardware_lifecycle": "Ciclo de vida del hardware",
+        "vulnerability_management": "Gestión de vulnerabilidades",
+        "identity_access_review": "Revisión de identidad y acceso",
+        "performance": "Informe de desempeño",
+        "security_compliance_posture": "Postura de seguridad y cumplimiento",
+        "software_inventory": "Inventario de software",
+        "threat_detection_review": "Revisión de detección de amenazas",
+        "endpoint_management_review": "Revisión de administración de endpoints"
+      },
+      "runsTable": {
+        "actions": "Acciones",
+        "completed": "Terminado",
+        "report": "Informe",
+        "started": "Iniciado",
+        "status": "Estado"
+      },
+      "schedules": {
+        "daily": "A diario",
+        "monthly": "Mensual",
+        "one_time": "una sola vez",
+        "weekly": "Semanalmente"
+      },
+      "status": {
+        "completed": "terminado",
+        "failed": "fallido",
+        "pending": "pendiente",
+        "running": "en ejecución"
+      },
+      "table": {
+        "actions": "Acciones",
+        "format": "Formato",
+        "lastGenerated": "Última generación",
+        "name": "Nombre",
+        "schedule": "Cronograma",
+        "type": "Tipo"
+      },
+      "tabs": {
+        "recentRuns": "Ejecuciones recientes",
+        "savedReports": "Informes guardados"
+      },
+      "templates": "Plantillas",
+      "title": "Informes",
+      "tryAgain": "Intentar otra vez",
+      "unknownReport": "Informe desconocido"
+    },
+    "reportBuilder": {
+      "actions": {
+        "cancel": "Cancelar",
+        "generateReport": "Generar informe",
+        "preview": "Vista previa",
+        "saveReport": "Guardar informe",
+        "updateReport": "Informe de actualización"
+      },
+      "addCondition": "Agregar condición",
+      "addRecipient": "Agregar destinatario",
+      "aggregation": "Agregación",
+      "aggregationField": "Campo de agregación",
+      "aggregationOptions": {
+        "avg": "Promedio",
+        "count": "Cantidad",
+        "sum": "Suma"
+      },
+      "availableFields": "Campos disponibles",
+      "chart": {
+        "notEnoughData": "No hay suficientes datos para trazar.",
+        "pieChartPreview": "Vista previa del gráfico circular"
+      },
+      "chartTypes": {
+        "bar": "Barras",
+        "line": "Línea",
+        "pie": "Circular",
+        "table": "Tabla"
+      },
+      "dataSource": {
+        "activity": {
+          "includeSystem": {
+            "label": "Incluir cuentas del sistema"
+          },
+          "region": {
+            "label": "Región",
+            "options": {
+              "all": "Todas las regiones",
+              "apac": "APAC",
+              "emea": "EMEA",
+              "na": "América del norte"
+            }
+          },
+          "source": {
+            "label": "Fuente de actividad",
+            "options": {
+              "admin": "Acciones de administrador",
+              "api": "Actividad de API",
+              "auth": "Autenticación",
+              "system": "Eventos del sistema"
+            }
+          },
+          "timeWindow": {
+            "label": "ventana de tiempo",
+            "options": {
+              "last_24h": "Últimas 24 horas",
+              "last_30d": "últimos 30 días",
+              "last_7d": "últimos 7 días"
+            }
+          }
+        },
+        "alerts": {
+          "severity": {
+            "label": "Gravedad",
+            "options": {
+              "all": "Todas las gravedades",
+              "critical": "Crítico",
+              "high": "Alto",
+              "low": "Bajo",
+              "medium": "Medio"
+            }
+          },
+          "source": {
+            "label": "Fuente de alerta",
+            "options": {
+              "all": "Todas las fuentes",
+              "monitoring": "Monitoreo",
+              "operations": "Operaciones",
+              "security": "Seguridad"
+            }
+          },
+          "status": {
+            "label": "Estado de alerta",
+            "options": {
+              "acknowledged": "Reconocido",
+              "all": "Todos los estados",
+              "open": "Abierto",
+              "resolved": "Resuelto"
+            }
+          },
+          "timeWindow": {
+            "label": "ventana de tiempo",
+            "options": {
+              "last_24h": "Últimas 24 horas",
+              "last_30d": "últimos 30 días",
+              "last_7d": "últimos 7 días"
+            }
+          }
+        },
+        "compliance": {
+          "includeExceptions": {
+            "label": "Incluir excepciones"
+          },
+          "policySet": {
+            "label": "Conjunto de políticas",
+            "options": {
+              "cis": "CIS Benchmarks",
+              "custom": "Políticas personalizadas",
+              "hipaa": "HIPAA",
+              "iso27001": "ISO 27001"
+            }
+          },
+          "scope": {
+            "label": "Alcance de la cobertura",
+            "options": {
+              "all_devices": "Todos los dispositivos",
+              "by_group": "Por grupo de dispositivos",
+              "by_site": "Por sitio"
+            }
+          },
+          "scoring": {
+            "label": "Método de puntuación",
+            "options": {
+              "pass_fail": "Pasa/falla",
+              "weighted": "Puntuación ponderada"
+            }
+          }
+        },
+        "devices": {
+          "includeInactive": {
+            "label": "Incluir dispositivos inactivos"
+          },
+          "inventorySource": {
+            "label": "fuente de inventario",
+            "options": {
+              "agent": "Agente reportado",
+              "cmdb": "importación CMDB",
+              "combined": "Fuentes combinadas"
+            }
+          },
+          "ownership": {
+            "label": "Propiedad",
+            "options": {
+              "all": "Todos los dispositivos",
+              "managed": "Dispositivos administrados",
+              "unmanaged": "Dispositivos no administrados"
+            }
+          },
+          "platform": {
+            "label": "Plataforma",
+            "options": {
+              "all": "Todas las plataformas",
+              "linux": "Linux",
+              "macos": "macOS",
+              "windows": "Windows"
+            }
+          },
+          "scope": {
+            "label": "Alcance del dispositivo",
+            "options": {
+              "all_devices": "Todos los dispositivos",
+              "by_site": "Por sitio",
+              "by_tag": "Por etiqueta"
+            }
+          }
+        },
+        "patches": {
+          "approval": {
+            "label": "Estado de aprobación",
+            "options": {
+              "approved": "Aprobado",
+              "deployed": "Implementado",
+              "pending": "Pendiente de aprobación"
+            }
+          },
+          "catalog": {
+            "label": "Catálogo de parches",
+            "options": {
+              "firmware": "Firmware y BIOS",
+              "os_updates": "actualizaciones OS",
+              "third_party": "Aplicaciones de terceros"
+            }
+          },
+          "priority": {
+            "label": "Prioridad",
+            "options": {
+              "critical": "Crítico",
+              "important": "Importante",
+              "routine": "Rutina"
+            }
+          },
+          "vendor": {
+            "label": "Proveedor",
+            "options": {
+              "all": "Todos los proveedores",
+              "apple": "Apple",
+              "linux": "Linux",
+              "microsoft": "Microsoft"
+            }
+          }
+        }
+      },
+      "dataSourceSummary": "{{label}}: {{value}}",
+      "dayOfMonth": "Día del mes",
+      "dayOfWeek": "dia de la semana",
+      "deviceFilterDescription": "Alcance este informe para los dispositivos que coincidan con el filtro siguiente.",
+      "emailDistributionList": "Lista de distribución de correo electrónico",
+      "errors": {
+        "generatePreview": "No se pudo generar la vista previa",
+        "generic": "Se produjo un error",
+        "loadLivePreview": "No se pudo cargar la vista previa en vivo",
+        "reportNameRequired": "El nombre del informe es obligatorio.",
+        "saveReport": "No se pudo guardar el informe",
+        "selectExportFormat": "Seleccione al menos un formato de exportación.",
+        "templateNameRequired": "El nombre de la plantilla es obligatorio.",
+        "validEmail": "Ingrese una dirección de correo electrónico válida."
+      },
+      "exportFormats": {
+        "csv": {
+          "description": "Valores separados por comas",
+          "label": "CSV"
+        },
+        "excel": {
+          "description": "libro de hoja de cálculo",
+          "label": "Excel"
+        },
+        "pdf": {
+          "description": "Documento formateado",
+          "label": "PDF"
+        }
+      },
+      "exportFormatsTitle": "Formatos de exportación",
+      "fields": {
+        "activity": {
+          "action": "Acción",
+          "duration_seconds": "Duración (seg)",
+          "ip_address": "dirección IP",
+          "location": "Ubicación",
+          "resource": "Recurso",
+          "result": "Resultado",
+          "target": "Objetivo",
+          "timestamp": "Marca de tiempo",
+          "user": "Usuario"
+        },
+        "alerts": {
+          "alert_id": "Alerta ID",
+          "device": "Dispositivo",
+          "duration_minutes": "Duración (min)",
+          "resolved_at": "Resuelto en",
+          "rule": "Regla",
+          "severity": "Gravedad",
+          "source": "Fuente",
+          "status": "Estado",
+          "triggered_at": "Activado en"
+        },
+        "compliance": {
+          "control_family": "familia de control",
+          "device_count": "Dispositivos",
+          "exception_count": "Excepciones",
+          "last_audit": "Última auditoría",
+          "policy": "Política",
+          "score": "Puntaje",
+          "status": "Estado"
+        },
+        "devices": {
+          "cpu": "Uso de CPU",
+          "disk_usage": "Uso del disco",
+          "hostname": "Nombre de host",
+          "last_seen": "visto por última vez",
+          "memory": "Uso de memoria",
+          "os": "OS",
+          "owner": "Propietario",
+          "patch_level": "Nivel de parche",
+          "serial": "Serie",
+          "site": "Sitio",
+          "status": "Estado"
+        },
+        "patches": {
+          "approved_at": "Aprobado en",
+          "device_count": "Dispositivos",
+          "missing_count": "Faltante",
+          "patch_id": "ID del parche",
+          "release_date": "fecha de lanzamiento",
+          "severity": "Gravedad",
+          "status": "Estado",
+          "title": "Título",
+          "vendor": "Proveedor"
+        }
+      },
+      "fieldsShared": {
+        "reportName": "Nombre del informe",
+        "saveAsTemplate": "Guardar como plantilla",
+        "templateName": "Nombre de la plantilla"
+      },
+      "filterModes": {
+        "deviceFilter": "Filtro de dispositivo",
+        "recordFilters": "Filtros de registro"
+      },
+      "filterOperators": {
+        "contains": "Contiene",
+        "gt": "Más que",
+        "is": "Es",
+        "is_not": "no es",
+        "lt": "Menos que"
+      },
+      "groupBy": "Agrupar por",
+      "groupedMetric": {
+        "avg": "Promedio {{field}}",
+        "count": "Cantidad",
+        "sum": "Suma {{field}}",
+        "value": "Valor"
+      },
+      "livePreview": {
+        "description": "Se actualiza a medida que configura el informe.",
+        "loading": "Cargando vista previa en vivo...",
+        "noData": "No hay datos de vista previa para la configuración actual.",
+        "previewRows": "Vista previa de filas",
+        "title": "Vista previa en vivo",
+        "untitledReport": "Informe sin título"
+      },
+      "logic": {
+        "and": "AND",
+        "or": "OR"
+      },
+      "noFieldsSelected": "Aún no hay campos seleccionados.",
+      "noFilters": "Aún no hay filtros. Agregue su primera condición.",
+      "noGrouping": "Sin agrupación",
+      "noNumericFields": "Sin campos numéricos",
+      "placeholders": {
+        "email": "name@company.com",
+        "reportName": "Resumen de seguridad mensual",
+        "templateName": "Paquete de cumplimiento trimestral",
+        "value": "Valor"
+      },
+      "recipients": {
+        "contacts": "Contactos de la organización",
+        "legacy": "Direcciones de correo electrónico heredadas",
+        "convert": "Convertir en contacto",
+        "added": "Destinatario del informe agregado",
+        "removed": "Destinatario del informe eliminado",
+        "converted": "Dirección de correo electrónico convertida en contacto",
+        "updateFailed": "No se pudieron actualizar los destinatarios del informe",
+        "convertFailed": "No se pudo convertir esta dirección de correo electrónico",
+        "mfaRequired": "La conversión de un destinatario requiere autenticación multifactor. Activa MFA en tu perfil y vuelve a intentarlo.",
+        "loadFailed": "No se pudieron cargar los destinatarios del informe"
+      },
+      "previewTable": {
+        "selectFields": "Seleccione campos para completar la tabla de vista previa."
+      },
+      "reportTypes": {
+        "activity": {
+          "description": "Seguimientos de actividad de usuarios, administradores y sistemas",
+          "label": "Actividad"
+        },
+        "alerts": {
+          "description": "Volumen de alerta, gravedad y rendimiento de la respuesta",
+          "label": "Alertas"
+        },
+        "compliance": {
+          "description": "Preparación para auditorías y visibilidad de alineación de políticas",
+          "label": "Cumplimiento"
+        },
+        "devices": {
+          "description": "Inventario y estado de salud en todos los puntos finales administrados",
+          "label": "Dispositivos"
+        },
+        "patches": {
+          "description": "Preparación de parches, estado de implementación y exposición",
+          "label": "Parches"
+        }
+      },
+      "runTime": "tiempo de ejecución",
+      "schedule": "Cronograma",
+      "scheduleDetail": {
+        "day": "Día {{date}}",
+        "everyDay": "Cada día"
+      },
+      "scheduleOptions": {
+        "daily": {
+          "label": "A diario"
+        },
+        "monthly": {
+          "label": "Mensual"
+        },
+        "weekly": {
+          "label": "Semanalmente"
+        }
+      },
+      "sections": {
+        "chartType": {
+          "description": "Elija cómo se visualiza el informe.",
+          "title": "Tipo de gráfico"
+        },
+        "columns": {
+          "description": "Elija campos y arrástrelos para reordenarlos.",
+          "title": "Columnas y campos"
+        },
+        "dataSource": {
+          "description": "Configure el conjunto de datos para este tipo de informe.",
+          "title": "fuente de datos"
+        },
+        "delivery": {
+          "description": "Establezca cadencia, formatos y destinatarios.",
+          "title": "Horario y entrega"
+        },
+        "filters": {
+          "description": "Filtre los datos del informe por registros o propiedades del dispositivo.",
+          "title": "Filtros"
+        },
+        "grouping": {
+          "description": "Resumir datos con recuentos, sumas o promedios.",
+          "title": "Agrupación y agregación"
+        },
+        "reportDetails": {
+          "description": "Asigne un nombre al informe y decida si se convierte en una plantilla.",
+          "title": "Detalles del informe"
+        },
+        "reportType": {
+          "description": "Elija el tipo de informe que está creando.",
+          "title": "Tipo de informe"
+        }
+      },
+      "selectedFields": "Campos seleccionados",
+      "success": {
+        "created": "Informe \"{{name}}\" guardado.",
+        "updated": "Informe \"{{name}}\" actualizado."
+      },
+      "values": {
+        "enabled": "Activado",
+        "off": "Apagado",
+        "on": "En"
+      },
+      "weekDays": {
+        "friday": "Viernes",
+        "monday": "Lunes",
+        "saturday": "Sábado",
+        "sunday": "Domingo",
+        "thursday": "Jueves",
+        "tuesday": "Martes",
+        "wednesday": "Miércoles"
+      },
+      "where": "Dónde"
+    },
+    "reportTemplates": {
+      "blankConfigurationDescription": "Configure un informe desde cero o comience con una configuración en blanco.",
+      "createCustomTemplate": "Crear plantilla personalizada",
+      "custom": "Personalizado",
+      "description": "Comience a partir de plantillas seleccionadas y adapte los detalles antes de publicar.",
+      "errors": {
+        "createReport": "No se pudo crear el informe",
+        "fetchTemplates": "No se pudieron recuperar las plantillas de informes",
+        "loadTemplates": "No se pueden cargar plantillas"
+      },
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "last30Days": "últimos 30 días",
+      "previewAlt": "Vista previa de {{name}}",
+      "reportTypes": {
+        "activity": "Actividad",
+        "ai_fleet_design": "Diseño de flota",
+        "ai_org_narrative": "Narrativa semanal de operaciones con IA",
+        "alert_summary": "Resumen de alerta",
+        "alerts": "Alertas",
+        "compliance": "Informe de cumplimiento",
+        "device_inventory": "Inventario de dispositivos",
+        "devices": "Dispositivos",
+        "executive_summary": "Resumen ejecutivo",
+        "hardware_lifecycle": "Ciclo de vida del hardware",
+        "vulnerability_management": "Gestión de vulnerabilidades",
+        "identity_access_review": "Revisión de identidad y acceso",
+        "patches": "Parches",
+        "performance": "Informe de desempeño",
+        "security_compliance_posture": "Postura de seguridad y cumplimiento",
+        "software_inventory": "Inventario de software",
+        "threat_detection_review": "Revisión de detección de amenazas",
+        "endpoint_management_review": "Revisión de administración de endpoints"
+      },
+      "schedules": {
+        "daily": "A diario",
+        "monthly": "Mensual",
+        "one_time": "una sola vez",
+        "weekly": "Semanalmente"
+      },
+      "spec": {
+        "cadence": "Cadencia",
+        "defaultRange": "Rango predeterminado",
+        "format": "Formato"
+      },
+      "success": {
+        "created": "Creado \"{{name}}\". Generarlo desde la lista de Informes."
+      },
+      "syncing": "Sincronizando plantillas...",
+      "template": "Plantilla",
+      "templates": {
+        "alert_summary": {
+          "description": "Alertas principales, tendencias de gravedad y carga de trabajo de respuesta.",
+          "name": "Informe resumido de alertas"
+        },
+        "device_health": {
+          "description": "CPU, tendencias de memoria y tiempo de actividad con puntuación del estado del dispositivo.",
+          "name": "Informe de estado del dispositivo"
+        },
+        "executive_summary": {
+          "description": "KPI de alto nivel, postura de riesgo y tendencias estratégicas para el liderazgo.",
+          "name": "Resumen ejecutivo"
+        },
+        "hardware_lifecycle": {
+          "description": "Plan de reemplazo de equipos listo para el cliente: antigüedad, garantía, fechas de reemplazo y estado de soporte del sistema operativo, con una recomendación por etapas.",
+          "name": "Informe de ciclo de vida del hardware"
+        },
+        "vulnerability_management": {
+          "description": "Hallazgos abiertos por severidad, con los explotados activamente (KEV) y los de EPSS alto señalados por separado, los hallazgos con parche que deben corregirse primero y las excepciones de riesgo aceptado que vencen en el próximo período.",
+          "name": "Informe de gestión de vulnerabilidades"
+        },
+        "identity_access_review": {
+          "name": "Revisión de identidad y acceso",
+          "description": "Los inicios de sesión interactivos de Microsoft 365 en un período, con el inventario de identidades, las cuentas inactivas, el estado del acceso condicional y la presencia de clientes de acceso remoto, y con la ventana realmente cubierta declarada en el propio informe."
+        },
+        "security_compliance_posture": {
+          "description": "Evidencia lista para seguro/investigación: cobertura EDR, cifrado, firewall, parches, vulnerabilidades, acceso privilegiado e integraciones de seguridad con paquetes acumulativos de porcentaje implementado.",
+          "name": "Postura de seguridad y cumplimiento (seguros)"
+        },
+        "threat_detection_review": {
+          "description": "Las detecciones de amenazas registradas en un período, con la ventana realmente cubierta declarada en el propio informe: nunca un cero para una fuente que no estaba conectada.",
+          "name": "Revisión de detección de amenazas"
+        },
+        "endpoint_management_review": {
+          "description": "Evidencia de Microsoft Intune: cobertura de inscripción, desglose de cumplimiento con tendencia de 30 días, inscripciones obsoletas y licencias, indicando la actualidad de cada sincronización.",
+          "name": "Revisión de administración de endpoints de Intune"
+        }
+      },
+      "title": "Plantillas de informes",
+      "useTemplate": "Usar plantilla",
+      "useTemplateTitle": "Utilice {{name}}"
+    },
+    "threatDetectionOptions": {
+      "cancel": "Cancelar",
+      "coverageNote": "El informe imprime la ventana que realmente cubre. Si la fuente de detección no estuvo conectada durante parte del período, lo indica en lugar de informar cero.",
+      "createReport": "Crear informe",
+      "includeCarriedIn": "Incluir detecciones arrastradas",
+      "includeCarriedInHelp": "Las detecciones abiertas antes de este período y aún sin resolver se listan junto con las del propio período.",
+      "topIncidents": "Listar como máximo (detecciones)",
+      "topIncidentsHelp": "Limita la tabla de detecciones para que un mes ruidoso no genere un PDF de cien páginas. El informe indica cuántas se omitieron en lugar de truncar en silencio."
+    },
+    "endpointManagementOptions": {
+      "cancel": "Cancelar",
+      "createReport": "Crear informe",
+      "includeLicences": "Incluir licencias",
+      "includeLicencesHelp": "Muestra las licencias en uso frente a las licencias compradas de cada producto de Microsoft 365.",
+      "staleEnrolmentDays": "Marcar inscripciones inactivas desde (días)",
+      "staleEnrolmentDaysHelp": "Un dispositivo que no se comunica con Intune durante esta cantidad de días cuenta como inscripción obsoleta. Se mide contra la cadencia de sincronización de Intune, no contra el período del informe.",
+      "trendDays": "Ventana de tendencia de cumplimiento (días)",
+      "trendDaysHelp": "Hasta dónde llega la tendencia diaria de cumplimiento en los resúmenes de estado de Microsoft 365."
+    },
+    "identityAccessOptions": {
+      "cancel": "Cancelar",
+      "createReport": "Crear informe",
+      "orgWideNote": "Este informe abarca toda la organización. Los datos de identidad de Microsoft 365 no tienen dimensión de sitio, así que no pueden acotarse a sitios concretos, y una cuenta limitada a ciertos sitios no puede ejecutarlo.",
+      "dormantDays": "Considerar una cuenta inactiva tras (días)",
+      "dormantDaysHelp": "Se listan las cuentas habilitadas sin ningún inicio de sesión exitoso registrado en esa cantidad de días. Una cuenta que nunca se vio iniciar sesión aparece como «nunca observada», que no es lo mismo que un intervalo largo.",
+      "homeCountries": "Países de inicio de sesión esperados (códigos ISO)",
+      "homeCountriesHelp": "Códigos de país de dos letras separados por comas, por ejemplo US, CA. Se cuentan los inicios de sesión fuera de la lista. Si se deja vacío, la sección dice «sin configurar» y nunca «sin inicios de sesión desde el exterior».",
+      "adminDetail": "Incluir el detalle de inicios de sesión de administradores",
+      "adminDetailHelp": "Lista cada inicio de sesión interactivo de una cuenta con rol de administrador, incluida la dirección de origen. Es la sección que un auditor lee primero.",
+      "coverageNote": "El informe cubre únicamente inicios de sesión interactivos e imprime la ventana que realmente cubre. Microsoft conserva los registros de inicio de sesión unos 30 días y exige una licencia Entra ID P1 o P2 para entregarlos, por lo que el primer informe tras activar la recolección es parcial y lo declara."
+    }
+  }
+}

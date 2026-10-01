@@ -1,0 +1,3340 @@
+package sessionbroker
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/backupipc"
+	"github.com/breeze-rmm/agent/internal/ipc"
+)
+
+// slowLockThresholdNs is the duration (in nanoseconds, via sync/atomic) above
+// which a broker lock acquisition wait OR a broker write-lock hold triggers a
+// WARN log. Atomic storage lets tests safely override it from other
+// goroutines without tripping -race. Production default is 1s.
+var slowLockThresholdNs atomic.Int64
+
+func init() {
+	slowLockThresholdNs.Store(int64(time.Second))
+}
+
+// slowLockThreshold returns the current threshold as a duration.
+func slowLockThreshold() time.Duration {
+	return time.Duration(slowLockThresholdNs.Load())
+}
+
+// setSlowLockThreshold overrides the threshold and returns the previous
+// value. Intended for tests — production code should leave the default alone.
+func setSlowLockThreshold(d time.Duration) time.Duration {
+	return time.Duration(slowLockThresholdNs.Swap(int64(d)))
+}
+
+// timedRWMutex wraps sync.RWMutex and logs a warning when:
+//  1. Lock or RLock acquisition waits longer than slowLockThreshold (a sign
+//     of contention on the broker).
+//  2. A write-lock (Lock) is HELD longer than slowLockThreshold. Long write
+//     holds under contention are the direct starvation cause described in
+//     issue #387 — e.g. handleConnection holding b.mu.Lock() across a
+//     15-second SendCommandAndWait while heartbeat readers pile up.
+//
+// Read-lock HOLD time is not instrumented. A single `acquiredAt` field cannot
+// safely track multiple concurrent RLock holders, and the alternatives
+// (goroutine-ID maps, returning tokens from RLock, atomic pointers) either
+// race or uglify the API. In this broker, RLock holders never perform
+// long-blocking work — the starvation bug is caused by WRITE-lock holders —
+// so instrumenting Lock holds alone captures the dangerous class of bug.
+//
+// The wrapper uses runtime.Callers to automatically identify the calling
+// function — no changes are required at individual call sites.
+//
+// Do not copy by value: the embedded RWMutex and acquiredAt timestamp are
+// stateful and must be accessed via pointer.
+type timedRWMutex struct {
+	_          noCopy
+	mu         sync.RWMutex
+	acquiredAt time.Time // only valid while write lock is held; read only in Unlock
+}
+
+// noCopy may be embedded into structs which must not be copied after the first
+// use. See https://golang.org/issues/8005#issuecomment-190753527 — `go vet`
+// recognises this pattern.
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+
+func callerName(skip int) string {
+	var pcs [3]uintptr
+	n := runtime.Callers(skip+2, pcs[:])
+	if n == 0 {
+		return "unknown"
+	}
+	frames := runtime.CallersFrames(pcs[:n])
+	f, _ := frames.Next()
+	name := f.Function
+	// Strip the package prefix ("sessionbroker/broker.Foo" → "Foo"). Use the
+	// last '/' to locate the final path segment, then the first '.' inside
+	// that segment to skip the package name. Everything after is the
+	// method/function name (possibly with receiver and suffixes).
+	if slash := strings.LastIndexByte(name, '/'); slash >= 0 {
+		name = name[slash+1:]
+	}
+	if dot := strings.IndexByte(name, '.'); dot >= 0 {
+		name = name[dot+1:]
+	}
+	// Strip receiver: "(*Broker).handleConnection" → "handleConnection"
+	if close := strings.LastIndexByte(name, ')'); close >= 0 && close+1 < len(name) && name[close+1] == '.' {
+		name = name[close+2:]
+	}
+	// Strip method-value ("-fm") and closure ("-func1") suffixes introduced by
+	// the compiler.
+	if i := strings.IndexByte(name, '-'); i >= 0 {
+		name = name[:i]
+	}
+	// Strip nested closure suffixes ("handleConnection.func1" → "handleConnection").
+	// The compiler uses '.' as the closure separator on nested anonymous funcs.
+	if i := strings.IndexByte(name, '.'); i >= 0 {
+		name = name[:i]
+	}
+	return name
+}
+
+func (t *timedRWMutex) Lock() {
+	// Snapshot threshold once so the warn comparisons inside Lock and Unlock
+	// see a consistent value even if a test overrides it mid-call.
+	threshold := slowLockThreshold()
+	start := time.Now()
+	t.mu.Lock()
+	if waited := time.Since(start); waited > threshold {
+		log.Warn("broker write-lock acquisition slow",
+			"op", "Lock", "caller", callerName(1), "waited_ms", waited.Milliseconds())
+	}
+	// Record hold-start timestamp. Safe without additional sync: exactly one
+	// writer holds the lock at a time, and the field is only read in Unlock
+	// (also under the exclusive lock).
+	t.acquiredAt = time.Now()
+}
+
+func (t *timedRWMutex) Unlock() {
+	// Capture hold duration before releasing — `acquiredAt` is only valid
+	// while the write lock is held.
+	held := time.Since(t.acquiredAt)
+	t.acquiredAt = time.Time{}
+	t.mu.Unlock()
+	if held > slowLockThreshold() {
+		log.Warn("broker write-lock held too long",
+			"op", "Lock", "caller", callerName(1), "held_ms", held.Milliseconds())
+	}
+}
+
+func (t *timedRWMutex) RLock() {
+	start := time.Now()
+	t.mu.RLock()
+	if waited := time.Since(start); waited > slowLockThreshold() {
+		log.Warn("broker read-lock acquisition slow",
+			"op", "RLock", "caller", callerName(1), "waited_ms", waited.Milliseconds())
+	}
+}
+
+func (t *timedRWMutex) RUnlock() {
+	t.mu.RUnlock()
+}
+
+const (
+	// HandshakeTimeout is the deadline for completing auth after connecting.
+	HandshakeTimeout = 5 * time.Second
+
+	// IdleTimeout disconnects helpers that send no messages for this duration.
+	IdleTimeout = 30 * time.Minute
+
+	// MaxConnectionsPerIdentity limits concurrent connections per user identity.
+	// Bumped from 3 to 5 so reconnect overlap has headroom — paired with
+	// evict-on-admit below, which frees any slot whose holder has gone idle.
+	MaxConnectionsPerIdentity = 5
+
+	// EvictIdleThreshold is how idle a session must be before evict-on-admit
+	// reclaims its slot for a new connection from the same identity.
+	EvictIdleThreshold = 60 * time.Second
+
+	// RateLimitAttempts is max connection attempts per identity per window.
+	RateLimitAttempts = 5
+
+	// RateLimitWindow is the sliding window for rate limiting.
+	RateLimitWindow = 60 * time.Second
+
+	// IdleCheckInterval is how often to scan for idle sessions.
+	IdleCheckInterval = 60 * time.Second
+)
+
+// Keepalive tuning. Vars (not consts) so tests can override them to drive
+// the goroutine on a short schedule without real sleeps.
+var (
+	keepalivePingInterval = 30 * time.Second
+	keepaliveTimeout      = 45 * time.Second
+)
+
+// roleSupportsKeepalive reports whether the broker should drive its generic
+// TypePing/TypePong keepalive on a session of the given helper role.
+//
+// Watchdog is excluded: its IPC client (internal/watchdog/ipcclient.go) only
+// handles TypeWatchdogPong and never replies to TypePing, so running keepalive
+// against it would evict every watchdog connection at keepaliveTimeout.
+// Watchdog has its own end-to-end liveness probe via WatchdogPing/Pong.
+func roleSupportsKeepalive(role ipc.HelperRole) bool {
+	return role != ipc.HelperRoleWatchdog
+}
+
+// maybeStartKeepalive starts the keepalive goroutine for the session if its
+// role supports it. Extracted from handleConnection so the gating is testable
+// without driving the full IPC handshake (which needs OS-specific peer creds).
+func (b *Broker) maybeStartKeepalive(session *Session, role ipc.HelperRole) {
+	if roleSupportsKeepalive(role) {
+		go b.runKeepalive(session)
+	}
+}
+
+// Role-based scopes: SYSTEM helpers own desktop capture and secure-desktop PAM
+// dialogs; user-token helpers own script execution.
+var (
+	systemHelperScopes = []string{"notify", "tray", "clipboard", "desktop", ipc.ScopePam}
+	userHelperScopes   = []string{"notify", "clipboard", "run_as_user"}
+	// macDesktopHelperScopes is the narrowed grant for the macOS desktop
+	// helper: it is not the full user helper, but it does need "notify" so the
+	// cross-platform reboot warning ladder can reach a logged-in macOS user
+	// (#3197). Named rather than inlined so a test can pin the grant.
+	macDesktopHelperScopes = []string{"desktop", "notify"}
+	watchdogHelperScopes   = []string{"watchdog"}
+	// assistHelperScopes is least-privilege: the Breeze Assist helper receives
+	// only the helper token and must NOT get desktop/clipboard/run_as_user/notify/tray.
+	// consent_ui is a narrow UI-only scope that lets the assist helper receive
+	// remote-session consent prompts and active-session banner messages.
+	assistHelperScopes = []string{ipc.ScopeAssist, ipc.ScopeConsentUI}
+)
+
+// MessageHandler is called when a user helper sends a message that isn't
+// a response to a pending command.
+type MessageHandler func(session *Session, env *ipc.Envelope)
+
+// SessionClosedHandler is called after a helper session has been removed.
+type SessionClosedHandler func(session *Session)
+
+// SessionAuthenticatedHandler is called after a helper session has been
+// successfully authenticated and registered.
+type SessionAuthenticatedHandler func(session *Session)
+
+// sessionSnapshot is an immutable point-in-time view of the broker's session
+// maps. It is stored via an atomic.Pointer so lock-free readers (FindCapableSession,
+// AllSessions, TCCStatus) can avoid acquiring b.mu.RLock() entirely, preventing
+// heartbeat starvation when a write-lock storm (reconnect loop) is in progress.
+//
+// The snapshot maps are shallow copies of the outer maps: the keys/values are
+// copied but the *Session values themselves are not deep-copied. Callers must
+// not mutate sessions obtained from a snapshot.
+type sessionSnapshot struct {
+	sessions    map[string]*Session   // sessionID -> Session
+	byIdentity  map[string][]*Session // identity key -> Sessions
+	consoleUser string
+}
+
+// Broker manages IPC connections from user helper processes.
+type Broker struct {
+	socketPath  string
+	listener    net.Listener
+	rateLimiter *ipc.RateLimiter
+	startTime   time.Time // broker creation time, used for watchdog uptime
+
+	mu                      timedRWMutex
+	sessions                map[string]*Session   // sessionID -> Session
+	byIdentity              map[string][]*Session // identity key -> Sessions (UID string on Unix, SID on Windows)
+	desiredHelperKeys       map[HelperKey]struct{}
+	helperByKey             map[HelperKey]*Session
+	helperByAuthKey         map[AuthenticatedHelperKey]*Session
+	helperReservations      map[uint64]*helperAuthReservation
+	helperKeyReservations   map[HelperKey]uint64
+	helperAuthReservations  map[AuthenticatedHelperKey]uint64
+	identityReservations    map[string]int
+	helperReservedVictims   map[*Session]uint64
+	nextHelperReservationID uint64
+	lifecycleObservers      map[uint64]sessionLifecycleObserver
+	nextLifecycleObserverID uint64
+	consoleUser             string        // macOS: current console user ("loginwindow" at login screen)
+	backup                  *backupHelper // backup helper process and session
+	closed                  bool
+
+	acceptMu               sync.Mutex
+	acceptStopped          bool
+	preAuthConns           map[net.Conn]bool // true once verified auth is being published
+	preAuthHandlers        sync.WaitGroup
+	beforePreAuthRead      func() // test barrier; set before Listen/startAcceptedConnection
+	afterListenerPublished func() // test barrier; set before Listen
+
+	// snap is an atomically updated snapshot of sessions/byIdentity/consoleUser.
+	// Updated under b.mu.Lock() on every mutation. Read-only hot paths use
+	// snap.Load() instead of acquiring b.mu.RLock(), eliminating reader starvation
+	// when the write-lock storm from reconnect loops is in progress.
+	snap atomic.Pointer[sessionSnapshot]
+
+	// snapFallbackWarned fires a single WARN the first time snapshotSessions
+	// hits the nil-snapshot fallback path. This should only ever happen in
+	// tests that construct Broker{} directly; a production occurrence means
+	// New() was bypassed somewhere.
+	snapFallbackWarned atomic.Bool
+
+	onMessage       MessageHandler
+	onSessionClosed SessionClosedHandler
+	onSessionAuthed SessionAuthenticatedHandler
+	selfHashes      map[string]struct{} // SHA-256 of allowed helper binaries
+
+	// consoleSessionIDFn returns the active console (physical-monitor) Windows
+	// session id. It is the injectable seam that makes the assist/user
+	// console-session binding (#1009) unit-testable on non-Windows hosts: the
+	// platform-specific WTSGetActiveConsoleSessionId lookup lives behind the
+	// build-tagged GetConsoleSessionID(), which this defaults to in New().
+	consoleSessionIDFn func() string
+
+	// goos is the effective OS for console-session-binding decisions. Defaults
+	// to runtime.GOOS in New(); tests override it to drive the Windows
+	// multi-user code path on a darwin host.
+	goos string
+
+	// helperKeyRetention holds bounded post-kill ownership retention windows.
+	// When TerminateHelperKey fails to kill a helper, the logical session/role
+	// key is retained here so the next reconcile cannot proactively respawn it
+	// into a duplicate while the original process may still be alive (#2530).
+	// Unlike helperByKey, entries here are filtered by real PID liveness and a
+	// deadline cap, so retention is guaranteed to end — it never wedges the key
+	// the way re-registering a closed session in helperByKey would.
+	helperKeyRetention    map[HelperKey]retainedHelperKey
+	helperKeyRetentionTTL time.Duration
+
+	// nowFn / helperKeyPIDAliveFn are injectable seams for retention tests.
+	// nowFn defaults to time.Now; helperKeyPIDAliveFn defaults to a PID-based
+	// liveness probe (OpenProcess on Windows, indeterminate elsewhere).
+	nowFn               func() time.Time
+	helperKeyPIDAliveFn func(pid uint32) (alive, known bool)
+}
+
+// helperKillRetentionTTL is the hard cap on how long a helper key stays owned
+// after a failed kill. Sized well above the reconcile interval (30s) so a
+// genuinely dying process has time to exit and self-clear retention early,
+// while still guaranteeing the key is released even if the PID stays alive,
+// becomes unprobeable, or is reused.
+const helperKillRetentionTTL = 5 * time.Minute
+
+// retainedHelperKey is a bounded record that a failed kill left a helper PID
+// possibly alive, so a respawn for this key must be blocked until the PID is
+// confirmed dead or the deadline cap elapses, whichever comes first.
+type retainedHelperKey struct {
+	pid      uint32
+	deadline time.Time
+}
+
+// New creates a new session broker.
+func New(socketPath string, onMessage MessageHandler) *Broker {
+	b := &Broker{
+		socketPath:             socketPath,
+		rateLimiter:            ipc.NewRateLimiter(RateLimitAttempts, RateLimitWindow),
+		startTime:              time.Now(),
+		sessions:               make(map[string]*Session),
+		byIdentity:             make(map[string][]*Session),
+		desiredHelperKeys:      make(map[HelperKey]struct{}),
+		helperByKey:            make(map[HelperKey]*Session),
+		helperByAuthKey:        make(map[AuthenticatedHelperKey]*Session),
+		helperReservations:     make(map[uint64]*helperAuthReservation),
+		helperKeyReservations:  make(map[HelperKey]uint64),
+		helperAuthReservations: make(map[AuthenticatedHelperKey]uint64),
+		identityReservations:   make(map[string]int),
+		helperReservedVictims:  make(map[*Session]uint64),
+		lifecycleObservers:     make(map[uint64]sessionLifecycleObserver),
+		preAuthConns:           make(map[net.Conn]bool),
+		onMessage:              onMessage,
+		consoleSessionIDFn:     GetConsoleSessionID,
+		goos:                   runtime.GOOS,
+		helperKeyRetention:     make(map[HelperKey]retainedHelperKey),
+		helperKeyRetentionTTL:  helperKillRetentionTTL,
+	}
+	b.selfHashes = b.computeAllowedHashes()
+	b.publishSnapshotLocked() // initialise with empty maps
+	return b
+}
+
+type sessionLifecycleObserver struct {
+	authenticated func(*Session)
+	closed        func(*Session)
+}
+
+func (b *Broker) AddSessionLifecycleObserver(authenticated, closed func(*Session)) (remove func()) {
+	b.mu.Lock()
+	b.nextLifecycleObserverID++
+	id := b.nextLifecycleObserverID
+	b.lifecycleObservers[id] = sessionLifecycleObserver{authenticated: authenticated, closed: closed}
+	b.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.mu.Lock()
+			delete(b.lifecycleObservers, id)
+			b.mu.Unlock()
+		})
+	}
+}
+
+func (b *Broker) lifecycleAuthenticatedCallbacksLocked() []func(*Session) {
+	callbacks := make([]func(*Session), 0, len(b.lifecycleObservers))
+	for _, observer := range b.lifecycleObservers {
+		if observer.authenticated != nil {
+			callbacks = append(callbacks, observer.authenticated)
+		}
+	}
+	return callbacks
+}
+
+func (b *Broker) lifecycleClosedCallbacksLocked() []func(*Session) {
+	callbacks := make([]func(*Session), 0, len(b.lifecycleObservers))
+	for _, observer := range b.lifecycleObservers {
+		if observer.closed != nil {
+			callbacks = append(callbacks, observer.closed)
+		}
+	}
+	return callbacks
+}
+
+// snapshotSessions returns the sessions map and consoleUser via the atomic
+// snapshot if available, falling back to a locked *copy* for Broker instances
+// that were not created via New() (e.g., test fixtures that construct Broker{} directly).
+//
+// The returned map must be treated as read-only by callers.
+func (b *Broker) snapshotSessions() (map[string]*Session, string) {
+	if snap := b.snap.Load(); snap != nil {
+		return snap.sessions, snap.consoleUser
+	}
+	// Fallback path: Broker was constructed directly (likely a test fixture).
+	// Warn once if this ever happens — production code should always go
+	// through New(), which initialises b.snap. Returning the live map
+	// without copying would race with any concurrent writer once the
+	// deferred RUnlock below fires.
+	if b.snapFallbackWarned.CompareAndSwap(false, true) {
+		log.Warn("sessionbroker: snapshotSessions hit nil-snapshot fallback; Broker not initialised via New()")
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	sessions := make(map[string]*Session, len(b.sessions))
+	for k, v := range b.sessions {
+		sessions[k] = v
+	}
+	return sessions, b.consoleUser
+}
+
+// publishSnapshotLocked builds a new immutable sessionSnapshot from the current
+// state and atomically replaces the stored snapshot. Must be called under b.mu.Lock().
+func (b *Broker) publishSnapshotLocked() {
+	sessionsCopy := make(map[string]*Session, len(b.sessions))
+	for k, v := range b.sessions {
+		sessionsCopy[k] = v
+	}
+	byIdentityCopy := make(map[string][]*Session, len(b.byIdentity))
+	for k, v := range b.byIdentity {
+		cp := make([]*Session, len(v))
+		copy(cp, v)
+		byIdentityCopy[k] = cp
+	}
+	b.snap.Store(&sessionSnapshot{
+		sessions:    sessionsCopy,
+		byIdentity:  byIdentityCopy,
+		consoleUser: b.consoleUser,
+	})
+}
+
+func (b *Broker) SetSessionClosedHandler(handler SessionClosedHandler) {
+	b.mu.Lock()
+	b.onSessionClosed = handler
+	b.mu.Unlock()
+}
+
+// SetSessionAuthenticatedHandler registers a callback invoked (in a goroutine)
+// after each helper session has been authenticated and registered.
+func (b *Broker) SetSessionAuthenticatedHandler(handler SessionAuthenticatedHandler) {
+	b.mu.Lock()
+	b.onSessionAuthed = handler
+	b.mu.Unlock()
+}
+
+// fireSessionAuthenticated invokes the on-authenticated handler if set.
+func (b *Broker) fireSessionAuthenticated(session *Session) {
+	b.firePrimarySessionAuthenticated(session)
+	b.fireLifecycleSessionAuthenticated(session)
+}
+
+func (b *Broker) firePrimarySessionAuthenticated(session *Session) {
+	b.mu.RLock()
+	handler := b.onSessionAuthed
+	b.mu.RUnlock()
+	if handler != nil {
+		handler(session)
+	}
+}
+
+func (b *Broker) fireLifecycleSessionAuthenticated(session *Session) {
+	b.mu.RLock()
+	callbacks := b.lifecycleAuthenticatedCallbacksLocked()
+	b.mu.RUnlock()
+	for _, callback := range callbacks {
+		callback(session)
+	}
+}
+
+// SetConsoleUser updates the current macOS console user. When set to
+// "loginwindow", desktop session selection prefers login_window helpers.
+func (b *Broker) SetConsoleUser(username string) {
+	b.mu.Lock()
+	prev := b.consoleUser
+	b.consoleUser = username
+	b.publishSnapshotLocked()
+	b.mu.Unlock()
+	if prev != username {
+		log.Debug("console user changed", "from", prev, "to", username)
+	}
+}
+
+// Listen starts the IPC listener. Blocks until stopChan is closed.
+func (b *Broker) Listen(stopChan <-chan struct{}) error {
+	listener, err := b.setupSocket()
+	if err != nil {
+		return fmt.Errorf("sessionbroker: setup socket: %w", err)
+	}
+	return b.listenOn(listener, stopChan)
+}
+
+func (b *Broker) listenOn(listener net.Listener, stopChan <-chan struct{}) error {
+	if !b.publishListener(listener) {
+		return nil
+	}
+	if b.afterListenerPublished != nil {
+		b.afterListenerPublished()
+	}
+
+	log.Info("session broker listening", "path", b.socketPath)
+
+	// Start idle session reaper
+	go b.idleReaper(stopChan)
+
+	// Accept loop
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if b.acceptingStopped() {
+					return
+				}
+				log.Warn("accept error", "error", err.Error())
+				continue
+			}
+			b.startAcceptedConnection(conn)
+		}
+	}()
+
+	<-stopChan
+	b.Close()
+	return nil
+}
+
+// Close shuts down the broker and all sessions.
+func (b *Broker) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), HandshakeTimeout)
+	// Logged here rather than discarded: the caller that reaches Close without
+	// having called StopAcceptingAndWait itself (listenOn's own shutdown, a test
+	// harness, a future reordering of the daemon's teardown) would otherwise see
+	// a stalled listener as a perfectly clean shutdown.
+	if err := b.StopAcceptingAndWait(ctx); err != nil {
+		log.Warn("broker close: listener shutdown did not complete", "error", err.Error())
+	}
+	cancel()
+
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return
+	}
+	b.closed = true
+	sessions := make([]*Session, 0, len(b.sessions))
+	for _, s := range b.sessions {
+		sessions = append(sessions, s)
+	}
+	b.mu.Unlock()
+
+	for _, s := range sessions {
+		s.Close()
+	}
+
+	// Clean up socket file on Unix
+	if runtime.GOOS != "windows" {
+		os.Remove(b.socketPath)
+	}
+
+	log.Info("session broker closed")
+}
+
+func (b *Broker) LifecycleHelperKeys() []HelperKey {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	keys := make([]HelperKey, 0, len(b.helperByKey))
+	for key := range b.helperByKey {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// HasHelperKeyOwner reports whether an authenticated helper currently owns the
+// logical Windows session/role key. Scheduled helpers may own a key without a
+// proactive lifecycle registry entry.
+func (b *Broker) HasHelperKeyOwner(key HelperKey) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.helperByKey[key] != nil
+}
+
+// HelperSessionByKey returns the authenticated helper session owning key, or
+// nil. Used by the lifecycle's spawn-wait to detect readiness.
+func (b *Broker) HelperSessionByKey(key HelperKey) *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.helperByKey[key]
+}
+
+func (b *Broker) helperKeyOwnerPID(key HelperKey) (uint32, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	owner := b.helperByKey[key]
+	if owner == nil || owner.PID <= 0 {
+		return 0, owner != nil
+	}
+	return uint32(owner.PID), true
+}
+
+func (b *Broker) whileHelperKeyOwnedBy(key HelperKey, session *Session, fn func()) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if session == nil || b.helperByKey[key] != session {
+		return false
+	}
+	fn()
+	return true
+}
+
+func (b *Broker) now() time.Time {
+	if b.nowFn != nil {
+		return b.nowFn()
+	}
+	return time.Now()
+}
+
+func (b *Broker) helperKeyPIDAlive(pid uint32) (alive, known bool) {
+	if b.helperKeyPIDAliveFn != nil {
+		return b.helperKeyPIDAliveFn(pid)
+	}
+	return defaultHelperKeyPIDAlive(pid)
+}
+
+// defaultHelperKeyPIDAlive probes whether pid is still running, returning
+// (alive, known). known is false whenever liveness cannot be determined:
+// non-Windows hosts (no primitive), an OpenProcess failure (the process may be
+// gone OR access-denied — we cannot tell the two apart cheaply), or a
+// GetExitCodeProcess error. Callers must fail closed on unknown, because a
+// duplicate helper is worse than briefly withholding a respawn.
+func defaultHelperKeyPIDAlive(pid uint32) (alive, known bool) {
+	if pid == 0 {
+		return false, false
+	}
+	proc, err := openOwnedPeerProcess(pid)
+	if err != nil || proc == nil {
+		return false, false
+	}
+	defer func() { _ = proc.Close() }()
+	live, err := proc.Alive()
+	if err != nil {
+		return false, false
+	}
+	return live, true
+}
+
+// retainHelperKeyOwnership records a bounded retention window after a failed
+// kill so the next reconcile cannot proactively respawn key while the original
+// PID may still be alive (#2530). No-op when retention is disabled, the PID is
+// unusable, or a live authenticated helper already owns the key.
+func (b *Broker) retainHelperKeyOwnership(key HelperKey, pid int) {
+	if b.helperKeyRetentionTTL <= 0 || pid <= 0 {
+		return
+	}
+	deadline := b.now().Add(b.helperKeyRetentionTTL)
+	b.mu.Lock()
+	// If a fresh helper already claimed the key between our unlock in
+	// TerminateHelperKey and here, that live owner blocks the respawn on its
+	// own; retention would be pointless and could outlive it.
+	if b.helperByKey[key] == nil {
+		b.helperKeyRetention[key] = retainedHelperKey{pid: uint32(pid), deadline: deadline}
+	}
+	b.mu.Unlock()
+	log.Warn("retaining helper key ownership after failed kill",
+		"helperKey", key.String(), "pid", pid, "retainUntil", deadline.Format(time.RFC3339))
+}
+
+// helperKeySpawnBlocked reports whether a proactive respawn of key must be
+// withheld: either an authenticated helper currently owns it, or a bounded
+// post-kill retention window is still active.
+//
+// The deadline is a HARD cap: once it elapses, retention ends regardless of
+// liveness. That is the "guaranteed to end" half of the invariant — a stuck,
+// un-probeable, or PID-reused process can never extend retention forever, so
+// the key can never wedge. Within the cap, a confirmed-dead PID clears
+// retention EARLY so a legitimately terminated helper can be replaced promptly;
+// otherwise (PID alive, or liveness indeterminate) we fail closed and block.
+func (b *Broker) helperKeySpawnBlocked(key HelperKey) bool {
+	b.mu.Lock()
+	if b.helperByKey[key] != nil {
+		// A live helper owns the key; any stale retention is irrelevant.
+		delete(b.helperKeyRetention, key)
+		b.mu.Unlock()
+		return true
+	}
+	entry, ok := b.helperKeyRetention[key]
+	if !ok {
+		b.mu.Unlock()
+		return false
+	}
+	if !b.now().Before(entry.deadline) {
+		delete(b.helperKeyRetention, key)
+		b.mu.Unlock()
+		return false
+	}
+	b.mu.Unlock()
+
+	// Probe liveness OUTSIDE b.mu, mirroring TerminateHelperKey, which never
+	// holds the broker lock across a process syscall. Only a CONFIRMED-dead PID
+	// clears retention early; alive or indeterminate keeps it blocked until the
+	// cap checked above.
+	alive, known := b.helperKeyPIDAlive(entry.pid)
+	if known && !alive {
+		b.mu.Lock()
+		// Re-check identity: only drop the entry we probed, never a newer one
+		// installed by a retention that replaced it between unlock and relock.
+		if cur, ok := b.helperKeyRetention[key]; ok && cur.pid == entry.pid && cur.deadline.Equal(entry.deadline) {
+			delete(b.helperKeyRetention, key)
+		}
+		b.mu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (b *Broker) currentListener() net.Listener {
+	b.acceptMu.Lock()
+	defer b.acceptMu.Unlock()
+	return b.listener
+}
+
+func (b *Broker) publishListener(listener net.Listener) bool {
+	if listener == nil {
+		return false
+	}
+	b.acceptMu.Lock()
+	if b.acceptStopped {
+		b.acceptMu.Unlock()
+		_ = listener.Close()
+		return false
+	}
+	b.listener = listener
+	b.acceptMu.Unlock()
+	return true
+}
+
+func (b *Broker) acceptingStopped() bool {
+	b.acceptMu.Lock()
+	defer b.acceptMu.Unlock()
+	return b.acceptStopped
+}
+
+func (b *Broker) startAcceptedConnection(conn net.Conn) bool {
+	b.acceptMu.Lock()
+	if b.acceptStopped {
+		b.acceptMu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+	b.preAuthConns[conn] = false
+	b.preAuthHandlers.Add(1)
+	b.acceptMu.Unlock()
+	go func() {
+		defer b.finishPreAuth(conn)
+		b.handleConnection(conn)
+	}()
+	return true
+}
+
+func (b *Broker) beginConnectionPublication(conn net.Conn) bool {
+	b.acceptMu.Lock()
+	defer b.acceptMu.Unlock()
+	if b.acceptStopped {
+		return false
+	}
+	if _, tracked := b.preAuthConns[conn]; !tracked {
+		return false
+	}
+	b.preAuthConns[conn] = true
+	return true
+}
+
+func (b *Broker) finishPreAuth(conn net.Conn) {
+	b.acceptMu.Lock()
+	if _, tracked := b.preAuthConns[conn]; tracked {
+		delete(b.preAuthConns, conn)
+		b.preAuthHandlers.Done()
+	}
+	b.acceptMu.Unlock()
+}
+
+// aLongTimeAgo is a deadline far enough in the past that setting it cancels any
+// pending IO immediately. Mirrors the net/http idiom.
+var aLongTimeAgo = time.Unix(1, 0)
+
+// armHandshakeDeadline gives rawConn its handshake deadline, unless the broker
+// has already stopped accepting — in which case the caller must close and give
+// up.
+//
+// This runs under acceptMu to order it against StopAcceptingAndWait, which
+// cancels unpublished connections by setting a deadline in the past. Without
+// that ordering a handler could re-arm a future deadline immediately after
+// shutdown cancelled it, silently undoing the cancellation and stalling
+// shutdown for a full HandshakeTimeout. A deadline, unlike a closed handle, can
+// be overwritten — so the two must not interleave.
+func (b *Broker) armHandshakeDeadline(rawConn net.Conn) bool {
+	b.acceptMu.Lock()
+	defer b.acceptMu.Unlock()
+	if b.acceptStopped {
+		return false
+	}
+	_ = rawConn.SetDeadline(time.Now().Add(HandshakeTimeout))
+	return true
+}
+
+// StopAcceptingAndWait stops admitting new connections and waits for in-flight
+// pre-auth handlers to finish.
+//
+// Unpublished connections are cancelled with a past deadline rather than closed
+// here. handleConnection reads the raw pipe handle via ipc.GetPeerCredentials,
+// and go-winio's Fd() reads win32File.handle with no synchronization while
+// Close() writes it — closing from this goroutine is a real data race, caught by
+// -race on windows. The consequence is worse than a torn read: a handle closed
+// mid-call can be reused by the OS for an unrelated object, so
+// GetNamedPipeClientProcessId could report a different process's PID and the
+// broker would derive that peer's SID. This is the authentication path.
+//
+// A past deadline cancels pending IO immediately (go-winio special-cases it),
+// never touches the handle, and leaves the handler as the sole owner of closing
+// the connection — every early-exit path in handleConnection closes it.
+//
+// Published connections are excluded: acceptStopped is set under acceptMu here,
+// so beginConnectionPublication returns false afterwards. Nothing cancelled here
+// can later become a live session and inherit a dead deadline, and a connection
+// that already published clears the handshake deadline itself.
+//
+// The listener's own Close() is bounded by ctx rather than awaited outright.
+// Closing a listener is normally instant, but go-winio v0.6.2's named-pipe
+// listener can deadlock its own Close(): Close blocks on doneCh, which
+// listenerRoutine only closes once a makeConnectedServerPipe call returns
+// ErrPipeListenerClosed, and that function's close branch rewrites only nil and
+// ErrFileClosed into that sentinel. A connect that was already failing on its
+// own errno when Close() cancelled it — ERROR_NO_DATA from a client that dialled
+// and hung up, which is exactly what TestNamedPipeListenAndAccept does — leaks
+// that errno through, listenerRoutine leaves `closed` false and returns to its
+// select, and the single closeCh token Close() sends is already spent. Nothing
+// ever closes doneCh. That wedged the whole `Test Agent (Windows)` job for its
+// full ten-minute budget on 2026-09-03, and on a real device it would hang agent
+// shutdown (so a service restart escalates to a kill) rather than a test.
+//
+// Abandoning the close is safe in a way that abandoning the drain is not:
+// acceptStopped is already set, so nothing can be admitted regardless of whether
+// the handle ever closes. The cost is one leaked goroutine and one leaked handle
+// for the remaining life of the process, which is strictly better than never
+// returning.
+func (b *Broker) StopAcceptingAndWait(ctx context.Context) error {
+	b.acceptMu.Lock()
+	b.acceptStopped = true
+	listener := b.listener
+	b.listener = nil
+	for conn, publishing := range b.preAuthConns {
+		if !publishing {
+			_ = conn.SetDeadline(aLongTimeAgo)
+		}
+	}
+	b.acceptMu.Unlock()
+
+	// Started before the drain wait rather than after it, so a well-behaved
+	// listener still closes concurrently with the handlers finishing.
+	listenerClosed := closeListenerAsync(listener)
+
+	done := make(chan struct{})
+	go func() {
+		b.preAuthHandlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case <-listenerClosed:
+		return nil
+	case <-ctx.Done():
+		log.Error("listener Close() did not return within the shutdown budget; abandoning it",
+			"socket", b.socketPath,
+			"consequence", "one goroutine and one socket/pipe handle leak for the life of this process; nothing new is admitted")
+		return fmt.Errorf("%w: %s", ErrListenerCloseStalled, b.socketPath)
+	}
+}
+
+// closeListenerAsync closes listener on its own goroutine and returns a channel
+// that is closed once Close() returns. A nil listener yields an already-closed
+// channel, so callers need no special case for the losing side of two concurrent
+// StopAcceptingAndWait calls (Broker.Close races listenOn's own Close on every
+// shutdown; whichever loses finds b.listener already nil).
+func closeListenerAsync(listener net.Listener) <-chan struct{} {
+	closed := make(chan struct{})
+	if listener == nil {
+		close(closed)
+		return closed
+	}
+	go func() {
+		defer close(closed)
+		_ = listener.Close()
+	}()
+	return closed
+}
+
+// SessionForUser returns the first active session for the given username.
+func (b *Broker) SessionForUser(username string) *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var best *Session
+	for _, s := range b.sessions {
+		if s.Username == username && s.HelperRole == ipc.HelperRoleUser {
+			if betterSession(s, best) {
+				best = s
+			}
+		}
+	}
+	if best != nil {
+		return best
+	}
+
+	for _, s := range b.sessions {
+		if s.Username == username && betterSession(s, best) {
+			best = s
+		}
+	}
+	return best
+}
+
+// SessionByID returns the currently connected session with the given broker session ID.
+func (b *Broker) SessionByID(sessionID string) *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.sessions[sessionID]
+}
+
+// SessionForIdentity returns the first active session for the given identity key.
+// The key is a UID string on Unix or a SID on Windows.
+func (b *Broker) SessionForIdentity(key string) *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if sessions, ok := b.byIdentity[key]; ok && len(sessions) > 0 {
+		var best *Session
+		for _, s := range sessions {
+			if betterSession(s, best) {
+				best = s
+			}
+		}
+		return best
+	}
+	return nil
+}
+
+// SessionForUID returns the first active session for the given UID.
+// Deprecated: Use SessionForIdentity for cross-platform identity.
+// On Windows, UID is always 0; this method only works correctly on Unix.
+func (b *Broker) SessionForUID(uid uint32) *Session {
+	return b.SessionForIdentity(strconv.FormatUint(uint64(uid), 10))
+}
+
+// AllSessions returns info about all connected sessions.
+// Uses the atomic snapshot to avoid lock contention on the hot path.
+func (b *Broker) AllSessions() []SessionInfo {
+	sessions, _ := b.snapshotSessions()
+	infos := make([]SessionInfo, 0, len(sessions))
+	for _, s := range sessions {
+		infos = append(infos, s.Info())
+	}
+	return infos
+}
+
+// SessionsWithScope returns the currently connected sessions authorized for the given scope.
+func (b *Broker) SessionsWithScope(scope string) []*Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	sessions := make([]*Session, 0, len(b.sessions))
+	for _, s := range b.sessions {
+		if s.HasScope(scope) {
+			sessions = append(sessions, s)
+		}
+	}
+	return sessions
+}
+
+// SessionWithScopeInWinSession returns the best connected helper session in
+// exactly the given Windows session that holds the scope. Unlike
+// PreferredSessionWithScope this never falls back to another session — it is
+// the routing primitive for per-session consent/notify/banner delivery on
+// multi-session hosts (the user being shadowed must be the one who sees the
+// prompt).
+func (b *Broker) SessionWithScopeInWinSession(scope, winSessionID string) *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var best *Session
+	for _, s := range b.sessions {
+		if s.WinSessionID != winSessionID || !s.HasScope(scope) {
+			continue
+		}
+		if betterSession(s, best) {
+			best = s
+		}
+	}
+	return best
+}
+
+// PreferredSessionWithScope returns the most appropriate connected session
+// that is authorized for the given scope. User-role helpers are preferred
+// over system helpers, then the newest active session wins.
+func (b *Broker) PreferredSessionWithScope(scope string) *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var best *Session
+	for _, s := range b.sessions {
+		if !s.HasScope(scope) {
+			continue
+		}
+		if best == nil {
+			best = s
+			continue
+		}
+		if s.HelperRole == ipc.HelperRoleUser && best.HelperRole != ipc.HelperRoleUser {
+			best = s
+			continue
+		}
+		if s.HelperRole != ipc.HelperRoleUser && best.HelperRole == ipc.HelperRoleUser {
+			continue
+		}
+		if betterSession(s, best) {
+			best = s
+		}
+	}
+	return best
+}
+
+// ConsoleSessionID returns the active console (physical-monitor) Windows
+// session id via the injectable seam (defaults to GetConsoleSessionID()). On
+// non-Windows hosts GetConsoleSessionID() returns "1".
+func (b *Broker) ConsoleSessionID() string {
+	var id string
+	if b.consoleSessionIDFn != nil {
+		id = b.consoleSessionIDFn()
+	} else {
+		id = GetConsoleSessionID()
+	}
+	// "0" is both the services/SYSTEM session (Session 0 isolation reserves it —
+	// no non-SYSTEM interactive user is ever legitimately there since Vista) and
+	// the sentinel GetConsoleSessionID() returns when WTSGetActiveConsoleSessionId
+	// fails or no session is attached (the API returns 0xFFFFFFFF). Either way it
+	// is not a valid interactive console session, so normalize it to "" — every
+	// consumer treats "" as "unknown → fail closed" for the assist/user binding,
+	// rather than admitting a peer that happens to report session 0 (#1009).
+	if id == "0" {
+		return ""
+	}
+	return id
+}
+
+// SetConsoleSessionIDFunc overrides the active-console-session lookup. Used by
+// tests to drive the assist/user console-session binding (#1009) deterministically
+// on non-Windows hosts.
+func (b *Broker) SetConsoleSessionIDFunc(fn func() string) {
+	b.mu.Lock()
+	b.consoleSessionIDFn = fn
+	b.mu.Unlock()
+}
+
+// SetGOOSForTest overrides the effective OS used for console-session-binding
+// decisions, letting tests drive the Windows multi-user code path on darwin.
+func (b *Broker) SetGOOSForTest(goos string) {
+	b.mu.Lock()
+	b.goos = goos
+	b.mu.Unlock()
+}
+
+// effectiveGOOS returns the OS used for console-session-binding decisions,
+// defaulting to runtime.GOOS for Broker fixtures constructed without New().
+func (b *Broker) effectiveGOOS() string {
+	if b.goos != "" {
+		return b.goos
+	}
+	return runtime.GOOS
+}
+
+// SessionInConsoleSession reports whether the given session is bound to the
+// active console session. Used to gate delivery of the device helper token so a
+// co-logged-in non-console assist helper can never receive it (#1009).
+//
+// The console-session binding is a Windows multi-user (RDS/terminal-server)
+// concept, so on non-Windows it always returns true (single interactive session
+// — no cross-user boundary to enforce here).
+func (b *Broker) SessionInConsoleSession(s *Session) bool {
+	if s == nil {
+		return false
+	}
+	if b.effectiveGOOS() != "windows" {
+		return true
+	}
+	return s.WinSessionID == b.ConsoleSessionID()
+}
+
+// PreferredRunAsUserSession returns the run_as_user helper to target for the
+// current host. On Windows it is constrained to the active console session so a
+// co-logged-in user's helper can never intercept a run_as_user script meant for
+// the console operator (#1009).
+func (b *Broker) PreferredRunAsUserSession() *Session {
+	return b.preferredRunAsUserSessionForOS(b.effectiveGOOS())
+}
+
+// preferredRunAsUserSessionForOS is the goos-parameterized core of
+// PreferredRunAsUserSession, kept separate so the console-session filter is
+// unit-testable on non-Windows hosts.
+func (b *Broker) preferredRunAsUserSessionForOS(goos string) *Session {
+	if goos != "windows" {
+		// Non-Windows: single interactive session; preserve prior behavior.
+		return b.PreferredSessionWithScope("run_as_user")
+	}
+
+	consoleSession := b.ConsoleSessionID()
+
+	b.mu.RLock()
+	var best *Session
+	var excludedNonConsole int // run_as_user helpers skipped solely for being off-console
+	for _, s := range b.sessions {
+		if !s.HasScope("run_as_user") {
+			continue
+		}
+		if s.WinSessionID != consoleSession {
+			// A run_as_user helper exists but is bound to a non-console session.
+			// On a single-user host this never happens; on a multi-user / RDS host
+			// it is either a co-logged-in attacker's helper (the threat #1009
+			// closes) OR the legitimate operator working from a non-console
+			// session. Either way the console binding correctly refuses to deliver
+			// here — but count the exclusion so we can make the drop observable
+			// below rather than vanishing silently.
+			excludedNonConsole++
+			continue
+		}
+		if best == nil {
+			best = s
+			continue
+		}
+		if s.HelperRole == ipc.HelperRoleUser && best.HelperRole != ipc.HelperRoleUser {
+			best = s
+			continue
+		}
+		if s.HelperRole != ipc.HelperRoleUser && best.HelperRole == ipc.HelperRoleUser {
+			continue
+		}
+		if betterSession(s, best) {
+			best = s
+		}
+	}
+	b.mu.RUnlock()
+
+	// Observable fallback (#1009 run_as_user slice). When the ONLY eligible
+	// run_as_user helpers were excluded purely because they sit outside the
+	// active console session, the caller will fall back to local SYSTEM
+	// execution. That fallback is a deliberate fail-safe (don't deliver a
+	// run_as_user script to the wrong principal), but on an unusual
+	// multi-session / RDS host where the operator's helper genuinely lives
+	// off-console it manifests as a silent non-delivery. Emit a clear WARN so
+	// the dropped delivery is diagnosable instead of disappearing. When no
+	// run_as_user helper is connected at all (excludedNonConsole == 0), stay
+	// quiet — nil is the expected result and warning on every poll would be noise.
+	if best == nil && excludedNonConsole > 0 {
+		log.Warn("run_as_user delivery suppressed: helper exists only outside the active console session",
+			"consoleWinSession", consoleSession,
+			"excludedNonConsole", excludedNonConsole,
+		)
+	}
+	return best
+}
+
+func (b *Broker) PreferredDesktopSession() *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.preferredDesktopSessionLocked()
+}
+
+// preferredDesktopSessionFromSnap is the lock-free variant of
+// preferredDesktopSessionLocked. It reads from an already-loaded snapshot
+// so callers on the heartbeat hot path avoid acquiring b.mu.RLock().
+//
+// Capabilities are read via Session.GetCapabilities() (which takes s.mu)
+// because the snapshot does not protect *Session internal fields — only the
+// outer map identity. Direct access to s.Capabilities would race with
+// SetCapabilities under -race.
+func preferredDesktopSessionFromSnap(snap *sessionSnapshot) *Session {
+	atLoginWindow := snap.consoleUser == "loginwindow"
+
+	// Pass 1: if at login window, try login_window helpers first.
+	if atLoginWindow {
+		var best *Session
+		for _, s := range snap.sessions {
+			caps := s.GetCapabilities()
+			if !s.HasScope("desktop") || caps == nil || !caps.CanCapture {
+				continue
+			}
+			if s.DesktopContext == ipc.DesktopContextLoginWindow {
+				if best == nil || betterDesktopSession(s, best) {
+					best = s
+				}
+			}
+		}
+		if best != nil {
+			return best
+		}
+		// No login_window helper — fall through to user_session helpers.
+		// They can still capture the login screen on macOS; input will
+		// use IOHIDPostEvent via dynamic switching.
+	}
+
+	// Pass 2: best available session (normal selection or login window fallback).
+	var best *Session
+	for _, s := range snap.sessions {
+		caps := s.GetCapabilities()
+		if !s.HasScope("desktop") || caps == nil || !caps.CanCapture {
+			continue
+		}
+		if best == nil || betterDesktopSession(s, best) {
+			best = s
+		}
+	}
+	return best
+}
+
+func (b *Broker) preferredDesktopSessionLocked() *Session {
+	atLoginWindow := b.consoleUser == "loginwindow"
+
+	// Pass 1: if at login window, try login_window helpers first.
+	if atLoginWindow {
+		var best *Session
+		for _, s := range b.sessions {
+			caps := s.GetCapabilities()
+			if !s.HasScope("desktop") || caps == nil || !caps.CanCapture {
+				continue
+			}
+			if s.DesktopContext == ipc.DesktopContextLoginWindow {
+				if best == nil || betterDesktopSession(s, best) {
+					best = s
+				}
+			}
+		}
+		if best != nil {
+			return best
+		}
+		// No login_window helper — fall through to user_session helpers.
+		// They can still capture the login screen on macOS; input will
+		// use IOHIDPostEvent via dynamic switching.
+	}
+
+	// Pass 2: best available session (normal selection or login window fallback).
+	var best *Session
+	for _, s := range b.sessions {
+		caps := s.GetCapabilities()
+		if !s.HasScope("desktop") || caps == nil || !caps.CanCapture {
+			continue
+		}
+		if best == nil || betterDesktopSession(s, best) {
+			best = s
+		}
+	}
+	return best
+}
+
+// TCCStatus returns the TCC permission status from the first connected helper
+// session that has reported one, or nil if none have. In practice, only one
+// macOS helper per user reports TCC status. Returns a copy to prevent mutation
+// of session-internal state.
+// Uses the atomic snapshot to avoid lock contention on the heartbeat hot path.
+func (b *Broker) TCCStatus() *ipc.TCCStatus {
+	// Prefer the full atomic snapshot — it has all three fields populated
+	// (sessions, byIdentity, consoleUser), so passing it to snapshot-based
+	// helpers like preferredDesktopSessionFromSnap is safe even as those
+	// helpers evolve to read additional fields. Fall back to a locked copy
+	// only when the broker was constructed directly without New() (tests).
+	snap := b.snap.Load()
+	if snap == nil {
+		sessions, consoleUser := b.snapshotSessions()
+		snap = &sessionSnapshot{
+			sessions:    sessions,
+			byIdentity:  nil, // fallback path: not populated, do not read
+			consoleUser: consoleUser,
+		}
+	}
+
+	if preferred := preferredDesktopSessionFromSnap(snap); preferred != nil {
+		if tcc := preferred.GetTCCStatus(); tcc != nil {
+			cp := *tcc
+			return &cp
+		}
+	}
+
+	for _, s := range snap.sessions {
+		if !s.HasScope("desktop") {
+			continue
+		}
+		if tcc := s.GetTCCStatus(); tcc != nil {
+			cp := *tcc
+			return &cp
+		}
+	}
+
+	for _, s := range snap.sessions {
+		if tcc := s.GetTCCStatus(); tcc != nil {
+			cp := *tcc
+			return &cp
+		}
+	}
+	return nil
+}
+
+// BroadcastNotification sends a desktop notification to one connected session per
+// interactive Windows session, chosen from those holding the "notify" scope.
+//
+// The scope filter is load-bearing, not cosmetic. The Breeze Assist helper
+// connects with assist/consent_ui and the watchdog with "watchdog"; neither
+// has a TypeNotify handler, so an unfiltered broadcast wastes an IPC round
+// trip and — worse — would inflate any delivery accounting built on this
+// broadcast into claiming reach it does not have.
+//
+// The asymmetry this used to document is resolved. The macOS desktop helper
+// runs the shared internal/userhelper client, which dispatches TypeNotify
+// unconditionally, but scopesForRole granted it "desktop" only — so it was
+// filtered out here. That cost nothing while no caller reached macOS. #3197
+// made RebootManager cross-platform (patching/reboot_manager.go replaced the
+// non-Windows no-op stub), so the reboot warning ladder is now exactly the
+// cross-platform caller that was anticipated. Per the instruction left here,
+// the fix was to grant the macOS desktop helper "notify" in scopesForRole —
+// NOT to weaken this filter, which still has to keep the assist helper and
+// watchdog out of any delivery accounting built on this broadcast.
+//
+// The fan-out is one helper per Windows session, not one per notify-scoped
+// session (#4940): in always-on lifecycle mode the broker spawns a system-role
+// and a user-role helper into the same console session and both hold "notify", so
+// an unfiltered broadcast drew every toast twice. See notifyTargets.
+func (b *Broker) BroadcastNotification(title, body, urgency string) {
+	sessions := b.notifyTargets()
+
+	for _, s := range sessions {
+		if err := s.SendNotify("", ipc.TypeNotify, &ipc.NotifyRequest{
+			Title:   title,
+			Body:    body,
+			Urgency: urgency,
+		}); err != nil {
+			log.Debug("broadcast notification to session failed",
+				"sessionId", s.SessionID, "error", err.Error())
+		}
+	}
+}
+
+// notifyDecisionSeq numbers the envelope ids RequestNotificationDecision
+// allocates. A counter, not a timestamp: the repo's other correlated-request ids
+// use time.Now().UnixMilli() (see LaunchProcessViaUserHelperWithArgs), and
+// SendCommand rejects a duplicate in-flight id outright with ErrDuplicateCommand
+// — so two prompts raised inside the same millisecond, which two reminder rungs
+// or a rung and a retry easily are, would lose one answer.
+var notifyDecisionSeq atomic.Uint64
+
+// RequestNotificationDecision sends an interactive notification to one
+// notify-scoped session per interactive Windows session and returns the first
+// answer.
+//
+// This is the response-bearing sibling of BroadcastNotification, which
+// deliberately stays fire-and-forget: the reboot warning LADDER needs no answer
+// (#3197 guarantees the user is TOLD). Only the rungs that offer a postponement
+// come through here.
+//
+// The plumbing already existed and was never usable end to end.
+// NotifyRequest.Actions and NotifyResult.ActionClicked are declared in
+// ipc/message.go, expectedResponseType maps TypeNotify -> TypeNotifyResult, and
+// the helper's handleNotify already replies on the envelope id it was given —
+// but BroadcastNotification calls SendNotify with an EMPTY id, so no pending
+// entry exists, the reply matches nothing, and dispatchHelperMessage drops it as
+// unsolicited. Here the id is real and per-session.
+//
+// Fan-out is concurrent and first-answer-wins: there is one machine and one
+// reboot, so the first human to click decides. Sessions that time out or error
+// are not failures — an unanswered prompt means "proceed as scheduled", which is
+// the fail-safe direction. The reboot still happens; silence never cancels it and
+// never postpones it.
+//
+// The "notify" scope filter is the same one BroadcastNotification documents and
+// must not be weakened (#3255): the assist helper and the watchdog have no
+// TypeNotify handler at all, and a modal prompt is strictly more intrusive than
+// the toast that filter was written for.
+//
+// One prompt per Windows session, not per notify-scoped session (#4940). Always-on
+// lifecycle mode spawns a system-role and a user-role helper into the same console
+// session and both report canNotify=true, so the unfiltered fan-out drew two
+// identical modal dialogs — two taskbar entries, one stacked on the other.
+// First-answer-wins resolved the decision, but the losing dialog stayed on screen
+// for its whole countdown and its late notify_result was dropped as unsolicited.
+// The loser is now never asked, which is also why there is nothing to cancel: see
+// notifyTargets.
+func (b *Broker) RequestNotificationDecision(req ipc.NotifyRequest, timeout time.Duration) (ipc.NotifyResult, error) {
+	sessions := b.notifyTargets()
+
+	if len(sessions) == 0 {
+		// Not an error: a headless box, or Windows sitting at the logon screen.
+		// There is no interactive user to ask.
+		return ipc.NotifyResult{}, nil
+	}
+
+	type answer struct {
+		res ipc.NotifyResult
+		err error
+	}
+	results := make(chan answer, len(sessions))
+	for _, s := range sessions {
+		go func(s *Session) {
+			id := fmt.Sprintf("notify-%s-%d", s.SessionID, notifyDecisionSeq.Add(1))
+			resp, err := s.SendCommand(id, ipc.TypeNotify, &req, timeout)
+			if err != nil {
+				results <- answer{err: fmt.Errorf("session %s: %w", s.SessionID, err)}
+				return
+			}
+			if resp.Error != "" {
+				results <- answer{err: fmt.Errorf("session %s: notify helper error: %s", s.SessionID, resp.Error)}
+				return
+			}
+			var out ipc.NotifyResult
+			if err := json.Unmarshal(resp.Payload, &out); err != nil {
+				results <- answer{err: fmt.Errorf("session %s: decode notify result: %w", s.SessionID, err)}
+				return
+			}
+			results <- answer{res: out}
+		}(s)
+	}
+
+	// results is buffered to len(sessions), so the goroutines belonging to
+	// sessions we stop reading from still finish and exit rather than leaking.
+	var best ipc.NotifyResult
+	var lastErr error
+	for range sessions {
+		a := <-results
+		if a.err != nil {
+			lastErr = a.err
+			continue
+		}
+		if a.res.ActionClicked != "" {
+			return a.res, nil // the first real decision wins
+		}
+		if a.res.Delivered {
+			best.Delivered = true
+		}
+	}
+	if !best.Delivered && lastErr != nil {
+		return best, lastErr
+	}
+	return best, nil
+}
+
+// BroadcastToDesktopSessions sends a fire-and-forget IPC message to all
+// connected sessions that have the "desktop" scope.
+func (b *Broker) BroadcastToDesktopSessions(msgType string, payload any) {
+	b.mu.RLock()
+	sessions := make([]*Session, 0, len(b.sessions))
+	for _, s := range b.sessions {
+		if s.HasScope("desktop") {
+			sessions = append(sessions, s)
+		}
+	}
+	b.mu.RUnlock()
+
+	for _, s := range sessions {
+		if err := s.SendNotify("", msgType, payload); err != nil {
+			log.Debug("broadcast to desktop session failed",
+				"sessionId", s.SessionID, "msgType", msgType, "error", err.Error())
+		}
+	}
+}
+
+// SessionCount returns the number of active sessions.
+// Uses the atomic snapshot to avoid lock contention on the heartbeat hot path.
+func (b *Broker) SessionCount() int {
+	if snap := b.snap.Load(); snap != nil {
+		return len(snap.sessions)
+	}
+	// Fallback for Broker instances not created via New() (e.g., test fixtures).
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.sessions)
+}
+
+// isSessionDisconnectedFn is swappable in tests; IsSessionDisconnected makes a
+// live WTS syscall.
+var isSessionDisconnectedFn = IsSessionDisconnected
+
+// FindCapableSession returns the best connected session whose helper reports
+// the given capability (e.g., "capture"). If targetWinSession is non-empty,
+// only sessions in that Windows session are considered. Otherwise, the console
+// session (physical monitor) is preferred over RDP sessions, and disconnected
+// sessions are skipped.
+//
+// Uses the atomic snapshot to avoid holding b.mu.RLock() across OS API calls
+// (GetConsoleSessionID, IsSessionDisconnected) that can block under system load.
+// This prevents reader starvation of the heartbeat path when write-lock storms
+// (reconnect loops) are in progress.
+func (b *Broker) FindCapableSession(capability string, targetWinSession string) *Session {
+	// snapshotSessions returns the atomic snapshot if available, or falls back
+	// to a locked read for test fixtures. On the hot path the snapshot is always
+	// available, so no lock is held during the OS calls below.
+	sessions, _ := b.snapshotSessions()
+
+	// explicitTarget must be captured before the console rewrite below —
+	// once targetWinSession is rewritten to the console session id, an
+	// untargeted caller becomes indistinguishable from one that explicitly
+	// asked for the console session.
+	explicitTarget := targetWinSession != "" && targetWinSession != "0"
+
+	// When no target specified, prefer the console session (physical display).
+	// NOTE: GetConsoleSessionID() is called outside any lock — safe because we
+	// read from an immutable snapshot and no lock is needed for this OS call.
+	if targetWinSession == "" || targetWinSession == "0" {
+		targetWinSession = GetConsoleSessionID()
+	}
+
+	hasCapability := func(s *Session) bool {
+		if capability == ipc.ScopePam {
+			return s.HelperRole == ipc.HelperRoleSystem && s.HasScope(ipc.ScopePam)
+		}
+		// GetCapabilities takes s.mu — required because the atomic snapshot
+		// only protects the outer map identity, not per-session fields. A
+		// direct read of s.Capabilities races with SetCapabilities writers
+		// (which run under s.mu.Lock()) and trips -race under contention.
+		caps := s.GetCapabilities()
+		if caps == nil {
+			return false
+		}
+		switch capability {
+		case "capture":
+			return caps.CanCapture
+		case "clipboard":
+			return caps.CanClipboard
+		case "notify":
+			return caps.CanNotify
+		}
+		return false
+	}
+
+	var best *Session
+
+	// First pass: find a capable session in the target (console) session.
+	// An explicitly-targeted session that is disconnected has no input desktop
+	// to capture — reject it here so the caller fails with a clear reason
+	// instead of answering with a black stream.
+	for _, s := range sessions {
+		if s.WinSessionID != targetWinSession {
+			continue
+		}
+		if explicitTarget && isSessionDisconnectedFn(s.WinSessionID) {
+			continue
+		}
+		if hasCapability(s) {
+			if betterSession(s, best) {
+				best = s
+			}
+		}
+	}
+	if best != nil {
+		return best
+	}
+	// PAM approval is tied to the requested (normally console) Windows
+	// session. Never fall back to another active session: that would expose
+	// one user's elevation decision to a different interactive user.
+	if capability == ipc.ScopePam {
+		return nil
+	}
+
+	// Second pass: fall back to any capable session that isn't disconnected.
+	// isSessionDisconnectedFn makes a WTS syscall — safe outside any lock.
+	for _, s := range sessions {
+		if !hasCapability(s) {
+			continue
+		}
+		if isSessionDisconnectedFn(s.WinSessionID) {
+			continue
+		}
+		if betterSession(s, best) {
+			best = s
+		}
+	}
+
+	return best
+}
+
+// HasHelperForWinSession returns true if any connected helper is in the
+// given Windows session.
+func (b *Broker) HasHelperForWinSession(winSessionID string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, s := range b.sessions {
+		if s.WinSessionID == winSessionID {
+			return true
+		}
+	}
+	return false
+}
+
+// HasHelperForWinSessionRole returns true if a helper with the given role
+// is connected in the specified Windows session.
+func (b *Broker) HasHelperForWinSessionRole(winSessionID string, role ipc.HelperRole) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if id, err := strconv.ParseUint(winSessionID, 10, 32); err == nil {
+		if owner := b.helperByKey[HelperKey{WindowsSessionID: uint32(id), Role: role}]; owner != nil {
+			return true
+		}
+	}
+	for _, s := range b.sessions {
+		if s.WinSessionID == winSessionID && s.HelperRole == role {
+			return true
+		}
+	}
+	return false
+}
+
+// FindUserSession returns the first connected session with HelperRole=="user"
+// in the given Windows session. Used to route run_as_user scripts.
+func (b *Broker) FindUserSession(winSessionID string) *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var best *Session
+	for _, s := range b.sessions {
+		if s.WinSessionID == winSessionID && s.HelperRole == ipc.HelperRoleUser && betterSession(s, best) {
+			best = s
+		}
+	}
+	return best
+}
+
+func (b *Broker) userHelperSessions() []*Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	sessions := make([]*Session, 0, len(b.sessions))
+	for _, s := range b.sessions {
+		if s.HelperRole == ipc.HelperRoleUser {
+			sessions = append(sessions, s)
+		}
+	}
+	return sessions
+}
+
+func (b *Broker) userHelperSessionForKey(sessionKey string) *Session {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var best *Session
+	for _, s := range b.sessions {
+		if s.HelperRole != ipc.HelperRoleUser {
+			continue
+		}
+		match := s.WinSessionID == sessionKey || s.IdentityKey == sessionKey
+		if !match && s.UID > 0 {
+			match = strconv.FormatUint(uint64(s.UID), 10) == sessionKey
+		}
+		if !match {
+			continue
+		}
+		if betterSession(s, best) {
+			best = s
+		}
+	}
+	return best
+}
+
+// LaunchProcessViaUserHelper asks all connected user-role helpers to launch a
+// binary. The helper is already running as the logged-in user, so the
+// launched process inherits the user's identity and environment.
+func (b *Broker) LaunchProcessViaUserHelper(binaryPath string) error {
+	return b.LaunchProcessViaUserHelperWithArgs(binaryPath)
+}
+
+// LaunchProcessViaUserHelperWithArgs asks all connected user-role helpers to launch a
+// binary with optional CLI args.
+func (b *Broker) LaunchProcessViaUserHelperWithArgs(binaryPath string, args ...string) error {
+	userSessions := b.userHelperSessions()
+	if len(userSessions) == 0 {
+		return fmt.Errorf("no user-role helper connected")
+	}
+
+	var launched int
+	var errs []error
+	for _, userSession := range userSessions {
+		id := fmt.Sprintf("launch-%s-%d", userSession.SessionID, time.Now().UnixMilli())
+		resp, err := userSession.SendCommand(id, ipc.TypeLaunchProcess,
+			ipc.LaunchProcessRequest{BinaryPath: binaryPath, Args: args}, 15*time.Second)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("session %s: launch_process IPC failed: %w", userSession.SessionID, err))
+			continue
+		}
+
+		var result ipc.LaunchProcessResult
+		if err := json.Unmarshal(resp.Payload, &result); err != nil {
+			errs = append(errs, fmt.Errorf("session %s: unmarshal launch result: %w", userSession.SessionID, err))
+			continue
+		}
+		if !result.OK {
+			errs = append(errs, fmt.Errorf("session %s: user helper launch failed: %s", userSession.SessionID, result.Error))
+			continue
+		}
+
+		launched++
+		log.Info("process launched via user helper",
+			"binary", binaryPath,
+			"pid", result.PID,
+			"sessionId", userSession.SessionID,
+			"username", userSession.Username,
+		)
+	}
+
+	if launched == 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+// LaunchProcessViaUserHelperForSession asks the matching connected user-role helper
+// to launch a binary for a specific session key. On Windows the key is the
+// WinSessionID; on Unix it is the UID/identity key.
+func (b *Broker) LaunchProcessViaUserHelperForSession(sessionKey, binaryPath string, args ...string) error {
+	userSession := b.userHelperSessionForKey(sessionKey)
+	if userSession == nil {
+		return fmt.Errorf("no user-role helper connected for session %s", sessionKey)
+	}
+
+	id := fmt.Sprintf("launch-%s-%d", userSession.SessionID, time.Now().UnixMilli())
+	resp, err := userSession.SendCommand(id, ipc.TypeLaunchProcess,
+		ipc.LaunchProcessRequest{BinaryPath: binaryPath, Args: args}, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("session %s: launch_process IPC failed: %w", userSession.SessionID, err)
+	}
+
+	var result ipc.LaunchProcessResult
+	if err := json.Unmarshal(resp.Payload, &result); err != nil {
+		return fmt.Errorf("session %s: unmarshal launch result: %w", userSession.SessionID, err)
+	}
+	if !result.OK {
+		return fmt.Errorf("session %s: user helper launch failed: %s", userSession.SessionID, result.Error)
+	}
+
+	log.Info("process launched via user helper",
+		"binary", binaryPath,
+		"args", args,
+		"pid", result.PID,
+		"sessionId", userSession.SessionID,
+		"username", userSession.Username,
+	)
+	return nil
+}
+
+// SendCommandAndWait forwards a command to a session and waits for the response.
+func (b *Broker) SendCommandAndWait(session *Session, id, cmdType string, payload any, timeout time.Duration) (*ipc.Envelope, error) {
+	return session.SendCommand(id, cmdType, payload, timeout)
+}
+
+// RequestPamApproval sends a PAM approval request to the given user-helper
+// session and waits for the correlated dialog result. Failure to complete the
+// round-trip is treated as an explicit deny+dismiss so callers never proceed on
+// a missing user decision.
+func (b *Broker) RequestPamApproval(session *Session, id string, req ipc.PamRequestDialog, timeout time.Duration) (ipc.PamDialogResult, error) {
+	denyDismiss := ipc.PamDialogResult{Approved: false, DismissedByUser: true}
+	if session == nil {
+		return denyDismiss, fmt.Errorf("nil PAM helper session")
+	}
+	if session.HelperRole != ipc.HelperRoleSystem {
+		return denyDismiss, fmt.Errorf("PAM dialog requires a SYSTEM helper session")
+	}
+	if !session.HasScope(ipc.ScopePam) {
+		return denyDismiss, fmt.Errorf("PAM SYSTEM helper session is missing %q scope", ipc.ScopePam)
+	}
+
+	resp, err := b.SendCommandAndWait(session, id, ipc.TypePamRequestDialog, req, timeout)
+	if err != nil {
+		return denyDismiss, err
+	}
+	if resp.Error != "" {
+		return denyDismiss, fmt.Errorf("PAM dialog helper error: %s", resp.Error)
+	}
+
+	var result ipc.PamDialogResult
+	if err := json.Unmarshal(resp.Payload, &result); err != nil {
+		return denyDismiss, fmt.Errorf("decode PAM dialog result: %w", err)
+	}
+	return result, nil
+}
+
+// DismissPamConsent asks the SYSTEM PAM helper to dismiss the active Windows
+// consent process and waits for the correlated result.
+func (b *Broker) DismissPamConsent(session *Session, id string, timeout time.Duration) (ipc.PamDismissConsentResult, error) {
+	var zero ipc.PamDismissConsentResult
+	if session == nil {
+		return zero, fmt.Errorf("nil PAM helper session")
+	}
+	if session.HelperRole != ipc.HelperRoleSystem {
+		return zero, fmt.Errorf("PAM consent dismissal requires a SYSTEM helper session")
+	}
+	if !session.HasScope(ipc.ScopePam) {
+		return zero, fmt.Errorf("PAM SYSTEM helper session is missing %q scope", ipc.ScopePam)
+	}
+	deadline, err := pamDismissConsentDeadline(time.Now(), timeout)
+	if err != nil {
+		return zero, err
+	}
+
+	resp, quiesced, err := session.sendCommandWithQuiescence(
+		id,
+		ipc.TypePamDismissConsent,
+		ipc.PamDismissConsentRequest{DeadlineUnixMs: deadline.UnixMilli()},
+		timeout,
+	)
+	if err != nil {
+		if quiesced != nil {
+			return zero, &PamDismissUncertainError{Cause: err, Quiesced: pamDismissQuiescence(quiesced)}
+		}
+		return zero, err
+	}
+	if resp.Error != "" {
+		return zero, fmt.Errorf("PAM consent dismissal helper error: %s", resp.Error)
+	}
+
+	var result ipc.PamDismissConsentResult
+	if err := json.Unmarshal(resp.Payload, &result); err != nil {
+		return zero, fmt.Errorf("decode PAM consent dismissal result: %w", err)
+	}
+	return result, nil
+}
+
+// pamDismissQuiescence decodes the late helper envelope into a typed outcome so
+// the fail-closed gate can distinguish "the dismissal succeeded" from "the
+// dismissal definitively failed" and from "the helper died and we never found
+// out".
+//
+// The returned channel yields AT MOST one outcome, then closes. It yields
+// nothing at all while the helper is hung but its session stays connected,
+// because the upstream envelope channel is only resolved by a correlated
+// response or session teardown. Readers must bound their receive.
+func pamDismissQuiescence(envelopes <-chan *ipc.Envelope) <-chan PamDismissOutcome {
+	out := make(chan PamDismissOutcome, 1)
+	go func() {
+		defer close(out)
+		env, ok := <-envelopes
+		if !ok || env == nil {
+			// Session died before any correlated response. The helper may still
+			// be driving input at the consent desktop.
+			out <- PamDismissOutcome{Proven: false}
+			return
+		}
+		outcome := PamDismissOutcome{Proven: true}
+		switch {
+		case env.Error != "":
+			outcome.Err = fmt.Errorf("PAM consent dismissal helper error: %s", env.Error)
+		default:
+			if err := json.Unmarshal(env.Payload, &outcome.Result); err != nil {
+				outcome.Err = fmt.Errorf("decode PAM consent dismissal result: %w", err)
+			}
+		}
+		out <- outcome
+	}()
+	return out
+}
+
+// pamDismissConsentDeadline reserves enough of the broker timeout for the
+// helper to serialize and return its result after input injection stops. The
+// deadline is truncated to the request's millisecond wire precision.
+func pamDismissConsentDeadline(now time.Time, timeout time.Duration) (time.Time, error) {
+	if timeout <= 0 {
+		return time.Time{}, fmt.Errorf("PAM consent dismissal timeout must be positive")
+	}
+
+	grace := timeout / 5
+	if grace > time.Second {
+		grace = time.Second
+	}
+	if grace <= 0 {
+		return time.Time{}, fmt.Errorf("PAM consent dismissal timeout is too small")
+	}
+
+	deadline := now.Add(timeout - grace).Truncate(time.Millisecond)
+	if !deadline.After(now) {
+		return time.Time{}, fmt.Errorf("PAM consent dismissal timeout is too small for millisecond deadline precision")
+	}
+	return deadline, nil
+}
+
+// sendPreAuthRejectAndClose wraps rawConn, sends a PreAuthReject envelope
+// with a short write timeout so the broker isn't held up by a stuck client,
+// then closes the connection. All errors are ignored — this is best-effort.
+// The helper uses the envelope to distinguish fatal ("don't retry") from
+// transient ("retry later") rejections.
+func sendPreAuthRejectAndClose(rawConn net.Conn, code, reason string, permanent bool) {
+	defer rawConn.Close()
+	conn := ipc.NewConn(rawConn)
+	// Cap this write via the Conn's own write timeout. ipc.Conn.Send now owns
+	// the underlying write deadline (issue #2273), so a bare
+	// rawConn.SetWriteDeadline here would be overwritten by Send's default —
+	// SetWriteTimeout is the supported way to keep the 2s hostile-peer bound.
+	conn.SetWriteTimeout(2 * time.Second)
+	if err := conn.SendTyped("pre-auth-reject", ipc.TypePreAuthReject, ipc.PreAuthReject{
+		Code:      code,
+		Reason:    reason,
+		Permanent: permanent,
+	}); err != nil && permanent {
+		// When a permanent rejection can't be delivered, the helper won't know
+		// to back off — it will interpret the dropped connection as a transient
+		// error and resume retrying immediately (reconnect storm risk).
+		log.Warn("failed to deliver permanent pre-auth rejection to helper",
+			"code", code,
+			"error", err.Error(),
+		)
+	}
+}
+
+// tryAdmitLocked decides whether a new connection for identityKey can be
+// accepted. The caller must hold b.mu.Lock() for the full duration of this
+// call and any subsequent registration step — otherwise concurrent admits
+// for the same identity can each observe a stale `existing` slice and
+// collectively push the count past MaxConnectionsPerIdentity.
+//
+// If under the cap, returns (true, nil). If at the cap and an idle victim
+// over EvictIdleThreshold exists, removes the victim from b.sessions /
+// b.byIdentity in place (atomic with the cap check) and returns (true,
+// victim). If nothing evictable, returns (false, nil).
+//
+// The caller owns the returned victim and must Close() it outside the lock
+// (Close() does I/O) and call onSessionClosed, if any.
+func (b *Broker) tryAdmitLocked(identityKey string) (admitted bool, victim *Session) {
+	existing := b.byIdentity[identityKey]
+	if len(existing) < MaxConnectionsPerIdentity {
+		return true, nil
+	}
+
+	var oldest time.Duration
+	for _, s := range existing {
+		idle := s.IdleDuration()
+		if idle > EvictIdleThreshold && idle > oldest {
+			victim = s
+			oldest = idle
+		}
+	}
+	if victim == nil {
+		return false, nil
+	}
+
+	log.Warn("evicting idle session to admit reconnect",
+		"identity", identityKey,
+		"sessionId", victim.SessionID,
+		"idleMs", oldest.Milliseconds(),
+	)
+	b.removeSessionMapsLocked(victim)
+	return true, victim
+}
+
+// admitOrEvict is the pre-auth admission check called from handleConnection
+// before the auth handshake runs, so DoS attempts are rejected cheaply.
+// Caller must NOT hold b.mu. The register step later calls tryAdmitLocked
+// again under its own write lock as the authoritative decision, so a race
+// between this pre-check returning true and the register site cannot
+// actually exceed the cap.
+func (b *Broker) admitOrEvict(identityKey string) bool {
+	b.mu.Lock()
+	admitted, victim := b.tryAdmitLocked(identityKey)
+	if victim != nil {
+		b.publishSnapshotLocked()
+	}
+	onClosed := b.onSessionClosed
+	callbacks := b.lifecycleClosedCallbacksLocked()
+	b.mu.Unlock()
+
+	if victim != nil {
+		if err := victim.Close(); err != nil {
+			log.Error("error closing evicted session",
+				"sessionId", victim.SessionID,
+				"error", err.Error(),
+			)
+		}
+		if onClosed != nil {
+			onClosed(victim)
+		}
+		for _, callback := range callbacks {
+			callback(victim)
+		}
+	}
+	return admitted
+}
+
+func (b *Broker) handleConnection(rawConn net.Conn) {
+	if b.beforePreAuthRead != nil {
+		b.beforePreAuthRead()
+	}
+	// Set handshake deadline. Fails closed if shutdown began first, so we never
+	// re-arm a connection StopAcceptingAndWait just cancelled.
+	if !b.armHandshakeDeadline(rawConn) {
+		rawConn.Close()
+		return
+	}
+
+	// Step 1: Get peer credentials (kernel-enforced)
+	creds, err := ipc.GetPeerCredentials(rawConn)
+	if err != nil {
+		log.Warn("peer credential check failed", "error", err.Error())
+		sendPreAuthRejectAndClose(rawConn, ipc.PreAuthCodeCredCheckFailed, err.Error(), false)
+		return
+	}
+
+	verifiedWinSessionID := peerWinSessionID(creds.PID)
+	baseIdentityKey := creds.IdentityKey()
+
+	// Wrap connection
+	conn := ipc.NewConn(rawConn)
+
+	// Step 2: Read auth request
+	// (Moved ahead of binary-path verification so the hash from the auth
+	// request can serve as the authoritative binary identity signal —
+	// Windows cross-session spawns produce process paths that don't always
+	// match our allowlist after path normalization. See issue #387 part D.)
+	env, err := conn.Recv()
+	if err != nil {
+		log.Warn("auth request read failed", "identity", baseIdentityKey, "error", err.Error())
+		conn.Close()
+		return
+	}
+
+	if env.Type != ipc.TypeAuthRequest {
+		log.Warn("expected auth_request, got", "type", env.Type)
+		conn.Close()
+		return
+	}
+
+	var authReq ipc.AuthRequest
+	if err := json.Unmarshal(env.Payload, &authReq); err != nil {
+		log.Warn("invalid auth request payload", "error", err.Error())
+		conn.Close()
+		return
+	}
+
+	// Determine helper role before selecting the admission identity. Windows
+	// system/user helpers are scoped by kernel SID + Windows session; assist,
+	// watchdog, and backup retain the legacy SID bucket. Unknown roles use the
+	// legacy bucket for rate/cap enforcement before permanent rejection.
+	helperRole := authReq.HelperRole
+	if helperRole == "" {
+		helperRole = ipc.HelperRoleSystem
+	}
+	roleKnown := true
+	switch helperRole {
+	case ipc.HelperRoleSystem, ipc.HelperRoleUser, ipc.HelperRoleWatchdog, ipc.HelperRoleAssist, backupipc.HelperRoleBackup:
+	default:
+		roleKnown = false
+	}
+	identityKey := helperAdmissionIdentityKey(baseIdentityKey, verifiedWinSessionID, b.goos, helperRole)
+
+	// Step 3: Rate and connection quotas are authoritative after the bounded auth
+	// request reveals the role. Lifecycle roles reserve without pre-auth
+	// eviction; every other role keeps the previous admit-or-evict behavior.
+	if !b.rateLimiter.Allow(identityKey) {
+		log.Warn("connection rate limited", "identity", identityKey, "pid", creds.PID)
+		sendPreAuthRejectAndClose(rawConn, ipc.PreAuthCodeRateLimited, "connection rate limited", false)
+		return
+	}
+	var preAuthAdmitted bool
+	if isWindowsLifecycleRole(b.goos, helperRole) {
+		preAuthAdmitted = b.canAdmitWithoutEviction(identityKey)
+	} else {
+		preAuthAdmitted = b.admitOrEvict(identityKey)
+	}
+	if !preAuthAdmitted {
+		b.mu.RLock()
+		identityCount := len(b.byIdentity[identityKey])
+		b.mu.RUnlock()
+		log.Warn("max connections exceeded", "identity", identityKey, "count", identityCount)
+		sendPreAuthRejectAndClose(rawConn, ipc.PreAuthCodeMaxConnsExceeded, "too many connections for identity", false)
+		return
+	}
+
+	// Step 4: Verify protocol version
+	if authReq.ProtocolVersion != ipc.ProtocolVersion {
+		log.Warn("protocol version mismatch", "got", authReq.ProtocolVersion, "want", ipc.ProtocolVersion)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    fmt.Sprintf("unsupported protocol version %d (expected %d)", authReq.ProtocolVersion, ipc.ProtocolVersion),
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+	if !roleKnown {
+		log.Warn("unknown helper role", "role", helperRole, "identity", identityKey, "pid", creds.PID)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    "unknown helper role",
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+
+	// Step 5: Verify identity — SID on Windows, UID on Unix.
+	// The watchdog role is exempt from identity claim validation: it runs
+	// as SYSTEM but its IPCClient doesn't self-report a SID or a usable
+	// UID (Go's os.Getuid() returns -1 on Windows → uint32 overflow).
+	// The kernel-verified creds from GetPeerCredentials (step 1) are
+	// sufficient — a caller can't fake them on a named pipe / Unix socket.
+	if helperRole != ipc.HelperRoleWatchdog {
+		if runtime.GOOS == "windows" {
+			if authReq.SID == "" {
+				log.Warn("auth missing SID on Windows", "pid", creds.PID)
+				_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+					Accepted:  false,
+					Reason:    "SID required on Windows",
+					Permanent: true,
+				})
+				conn.Close()
+				return
+			}
+			if authReq.SID != creds.SID {
+				log.Warn("auth SID mismatch", "claimed", authReq.SID, "actual", creds.SID)
+				_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+					Accepted:  false,
+					Reason:    "SID mismatch",
+					Permanent: true,
+				})
+				conn.Close()
+				return
+			}
+		} else {
+			if authReq.UID != creds.UID {
+				log.Warn("auth UID mismatch", "claimed", authReq.UID, "actual", creds.UID)
+				_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+					Accepted:  false,
+					Reason:    "UID mismatch",
+					Permanent: true,
+				})
+				conn.Close()
+				return
+			}
+		}
+	}
+
+	// Step 6: Verify binary path and hash from kernel-resolved peer metadata.
+	// Do not trust authReq.BinaryHash: any local peer can self-report it.
+	if strings.TrimSpace(creds.BinaryPath) == "" {
+		log.Warn("rejecting helper connection: peer binary path unresolved",
+			"identity", identityKey,
+			"pid", creds.PID,
+		)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    "peer binary path unresolved",
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+	if !b.verifyBinaryPath(creds.BinaryPath) {
+		log.Warn("binary path mismatch",
+			"identity", identityKey,
+			"pid", creds.PID,
+			"path", creds.BinaryPath,
+			"allowed", b.allowedHelperPaths(),
+		)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    "binary path mismatch",
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+
+	// Step 7: Verify binary hash — reject helpers if no allowed helper hash could be loaded.
+	if len(b.selfHashes) == 0 {
+		log.Error("rejecting helper connection: helper binary hash allowlist unavailable",
+			"identity", identityKey,
+			"pid", creds.PID,
+		)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    "helper binary hash allowlist unavailable",
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+	peerHash, err := hashFileSHA256(creds.BinaryPath)
+	if err != nil {
+		log.Warn("failed to hash peer binary",
+			"identity", identityKey,
+			"pid", creds.PID,
+			"path", creds.BinaryPath,
+			"error", err.Error(),
+		)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    "peer binary hash unavailable",
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+	hashVerified := b.isAllowedBinaryHash(peerHash)
+	if !hashVerified {
+		allowed := make([]string, 0, len(b.selfHashes))
+		for h := range b.selfHashes {
+			allowed = append(allowed, h)
+		}
+		log.Warn("binary hash mismatch",
+			"identity", identityKey,
+			"expected", allowed,
+			"got", peerHash,
+		)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    "binary hash mismatch",
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+
+	// Step 8: Reject duplicate session IDs
+	b.mu.RLock()
+	if _, exists := b.sessions[authReq.SessionID]; exists {
+		b.mu.RUnlock()
+		log.Warn("duplicate session ID", "sessionId", authReq.SessionID, "identity", identityKey)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted: false,
+			Reason:   "session ID already in use",
+		})
+		conn.Close()
+		return
+	}
+	b.mu.RUnlock()
+
+	// Generate session key
+	sessionKey, err := ipc.GenerateSessionKey()
+	if err != nil {
+		log.Error("failed to generate session key", "error", err.Error())
+		conn.Close()
+		return
+	}
+
+	// Kernel-verify the peer's Windows session id (from peer PID, via
+	// ProcessIdToSessionId) before the role gate. System/user helpers must claim
+	// that exact interactive session; assist remains bound to the active console.
+	// On non-Windows this session gate is inert.
+	verifiedWinSession := ""
+	if verifiedWinSessionID != 0 {
+		verifiedWinSession = fmt.Sprintf("%d", verifiedWinSessionID)
+	}
+	claimedWinSession := fmt.Sprintf("%d", authReq.WinSessionID)
+	consoleWinSession := b.ConsoleSessionID()
+
+	// Step 9: Validate role matches peer identity to prevent privilege escalation.
+	// On Windows, SYSTEM helpers must run as SYSTEM (S-1-5-18), and user/assist
+	// helpers must NOT run as SYSTEM. This prevents a non-SYSTEM process from
+	// claiming system role to get desktop scopes, or SYSTEM from claiming user
+	// role. The watchdog must also run as root/SYSTEM. System/user claims must
+	// equal the kernel-derived interactive session, while assist stays bound to
+	// the active console session (#1009). The decision is factored into
+	// roleIdentityRejection so the gate can be
+	// unit-tested with an injected peer-cred SID/UID and session ids (none of
+	// which can be faked over a pipe).
+	if reason, rejected := roleIdentityRejection(helperRole, creds.SID, creds.UID, verifiedWinSession, claimedWinSession, consoleWinSession, runtime.GOOS); rejected {
+		log.Warn("role/identity mismatch",
+			"reason", reason, "role", helperRole, "sid", creds.SID, "uid", creds.UID,
+			"peerWinSession", verifiedWinSession, "claimedWinSession", claimedWinSession, "consoleWinSession", consoleWinSession,
+			"pid", creds.PID, "binaryKind", authReq.BinaryKind)
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    reason,
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+
+	var backupReservation *backupSpawnReservation
+	if helperRole == backupipc.HelperRoleBackup {
+		backupReservation, err = b.claimBackupHelperAdmission(uint32(creds.PID))
+		if err != nil {
+			log.Warn("backup helper admission rejected",
+				"identity", identityKey,
+				"pid", creds.PID,
+				"error", err.Error(),
+			)
+			_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+				Accepted:  false,
+				Reason:    "backup helper was not started by the agent",
+				Permanent: true,
+			})
+			_ = conn.Close()
+			return
+		}
+	}
+
+	scopes := b.grantScopes(helperRole, authReq, runtime.GOOS, creds.BinaryPath)
+	ownedProcess, err := openOwnedPeerProcess(uint32(creds.PID))
+	if err != nil {
+		log.Warn("failed to retain authenticated peer process handle", "pid", creds.PID, "error", err.Error())
+		_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+			Accepted:  false,
+			Reason:    "peer process handle unavailable",
+			Permanent: true,
+		})
+		conn.Close()
+		return
+	}
+	peerProcessRef := newOwnedPeerProcessRef(ownedProcess)
+	peerProcessPublished := false
+	defer func() {
+		if !peerProcessPublished {
+			_ = peerProcessRef.close()
+		}
+	}()
+
+	var helperReservation *helperAuthReservation
+	if isWindowsLifecycleRole(b.goos, helperRole) {
+		helperKey := HelperKey{WindowsSessionID: verifiedWinSessionID, Role: helperRole}
+		helperReservation, err = b.reserveWindowsHelper(identityKey, creds.SID, helperKey)
+		if err != nil {
+			log.Warn("Windows helper admission rejected",
+				"identity", identityKey,
+				"sessionId", authReq.SessionID,
+				"helperKey", helperKey.String(),
+				"error", err.Error(),
+			)
+			_ = conn.SendTyped(env.ID, ipc.TypeAuthResponse, ipc.AuthResponse{
+				Accepted:  false,
+				Reason:    err.Error(),
+				Permanent: errors.Is(err, errDuplicateHelperKey) || errors.Is(err, errHelperKeyNotDesired),
+				Code:      admissionRejectCode(err),
+			})
+			conn.Close()
+			return
+		}
+		defer func() {
+			if helperReservation != nil {
+				b.releaseWindowsHelper(helperReservation)
+			}
+		}()
+	}
+
+	// Send auth response
+	authResp := ipc.AuthResponse{
+		Accepted:      true,
+		SessionKey:    hex.EncodeToString(sessionKey),
+		AllowedScopes: scopes,
+	}
+	if err := conn.SendTyped(env.ID, ipc.TypeAuthResponse, authResp); err != nil {
+		log.Warn("failed to send auth response", "error", err.Error())
+		conn.Close()
+		return
+	}
+	if !b.beginConnectionPublication(rawConn) {
+		conn.Close()
+		return
+	}
+
+	// Set session key for HMAC validation
+	conn.SetSessionKey(sessionKey)
+
+	// Clear the handshake deadline
+	rawConn.SetDeadline(time.Time{})
+
+	// Create session
+	session := NewSession(conn, creds.UID, identityKey, authReq.Username, authReq.DisplayEnv, authReq.SessionID, scopes)
+	session.PID = int(creds.PID)
+	session.HelperRole = helperRole
+	session.BinaryKind = authReq.BinaryKind
+	if session.BinaryKind == "" {
+		session.BinaryKind = ipc.HelperBinaryUserHelper
+	}
+	session.DesktopContext = authReq.DesktopContext
+	session.peerProcess = peerProcessRef
+
+	// Use the kernel-verified Windows session ID (computed above from the peer
+	// PID) instead of trusting the self-reported value, preventing
+	// session-jumping attacks. System/user helpers cannot reach this point when
+	// the kernel lookup failed or disagrees with the authenticated claim. Other
+	// roles retain the legacy fallback when no kernel session is available.
+	if verifiedWinSession != "" {
+		session.WinSessionID = verifiedWinSession
+		if verifiedWinSession != claimedWinSession {
+			log.Warn("WinSessionID mismatch — using kernel-verified value",
+				"reported", authReq.WinSessionID,
+				"verified", verifiedWinSession,
+				"pid", creds.PID,
+			)
+		}
+	} else {
+		session.WinSessionID = claimedWinSession
+	}
+
+	if helperReservation != nil {
+		if err := b.commitWindowsHelper(helperReservation, session); err != nil {
+			log.Warn("Windows helper admission changed before commit",
+				"identity", identityKey,
+				"sessionId", authReq.SessionID,
+				"error", err.Error(),
+			)
+			conn.Close()
+			return
+		}
+		helperReservation = nil
+	} else {
+		if err := b.registerNonLifecycleSession(identityKey, helperRole, session, backupReservation); err != nil {
+			log.Warn("max connections exceeded at register (admit race)",
+				"identity", identityKey,
+				"sessionId", authReq.SessionID,
+			)
+			conn.Close()
+			return
+		}
+	}
+	peerProcessPublished = true
+	b.finishPreAuth(rawConn)
+
+	log.Info("user helper connected",
+		"identity", identityKey,
+		"username", authReq.Username,
+		"sessionId", authReq.SessionID,
+		"display", authReq.DisplayEnv,
+		"pid", creds.PID,
+		"role", helperRole,
+		"binaryKind", session.BinaryKind,
+		"desktopContext", session.DesktopContext,
+	)
+
+	// Lifecycle ownership must be published synchronously before RecvLoop can
+	// fail and emit the corresponding close callback. The primary application
+	// handler remains asynchronous because it may perform slow IPC work.
+	b.fireLifecycleSessionAuthenticated(session)
+	go b.firePrimarySessionAuthenticated(session)
+
+	// Keepalive: send periodic pings and close the session if pongs stop
+	// arriving. Without this, a wedged helper (e.g. a capture process killed
+	// mid-stream) can hold a slot forever because RecvLoop blocks on a read
+	// with no deadline. See issue #443. Watchdog is exempt — see
+	// roleSupportsKeepalive.
+	b.maybeStartKeepalive(session, helperRole)
+
+	// Start receive loop — blocks until disconnect
+	session.RecvLoop(b.dispatchHelperMessage)
+
+	b.finishHelperSession(session)
+}
+
+// finishHelperSession performs post-disconnect cleanup for a helper session.
+// Every way a session can end funnels through here, because they all work by
+// closing the transport, which returns RecvLoop above.
+//
+// Split out of handleConnection so the backup-death reporting path (#2998) is
+// exercisable without standing up a full IPC handshake.
+func (b *Broker) finishHelperSession(session *Session) {
+	b.removeSession(session)
+	if session.HelperRole == backupipc.HelperRoleBackup {
+		// Report before clearing the session pointer: the report has to see
+		// that this session is the one that owns the in-flight run.
+		b.reportBackupHelperDeath(session)
+		b.ClearBackupSession(session)
+	}
+	log.Info("user helper disconnected", "uid", session.UID, "sessionId", session.SessionID)
+}
+
+// removeSessionMapsLocked removes session from b.sessions and b.byIdentity.
+// Caller must hold b.mu.Lock(). Does NOT Close() the session, publish a
+// snapshot, or fire onSessionClosed; the caller is responsible for those.
+func (b *Broker) removeSessionMapsLocked(session *Session) bool {
+	if b.sessions[session.SessionID] != session {
+		return false
+	}
+	delete(b.sessions, session.SessionID)
+
+	key := session.IdentityKey
+	sessions := b.byIdentity[key]
+	for i, s := range sessions {
+		if s == session {
+			b.byIdentity[key] = append(sessions[:i], sessions[i+1:]...)
+			break
+		}
+	}
+	if len(b.byIdentity[key]) == 0 {
+		delete(b.byIdentity, key)
+	}
+	for helperKey, owner := range b.helperByKey {
+		if owner == session {
+			delete(b.helperByKey, helperKey)
+		}
+	}
+	for authKey, owner := range b.helperByAuthKey {
+		if owner == session {
+			delete(b.helperByAuthKey, authKey)
+		}
+	}
+	return true
+}
+
+func (b *Broker) removeSession(session *Session) {
+	_ = b.closeSession(session)
+}
+
+func (b *Broker) closeSession(session *Session) error {
+	b.mu.Lock()
+	removed := b.removeSessionMapsLocked(session)
+	if removed {
+		b.publishSnapshotLocked()
+	}
+	onSessionClosed := b.onSessionClosed
+	callbacks := b.lifecycleClosedCallbacksLocked()
+	b.mu.Unlock()
+
+	closeErr := session.closeTransportAndPeer()
+	if removed {
+		if onSessionClosed != nil {
+			onSessionClosed(session)
+		}
+		for _, callback := range callbacks {
+			callback(session)
+		}
+	}
+	return closeErr
+}
+
+func (b *Broker) TerminateHelperKey(key HelperKey) {
+	b.mu.Lock()
+	session := b.helperByKey[key]
+	if session == nil {
+		b.mu.Unlock()
+		return
+	}
+	claim := session.peerProcess.claimTermination()
+	removed := b.removeSessionMapsLocked(session)
+	if removed {
+		b.publishSnapshotLocked()
+	}
+	onSessionClosed := b.onSessionClosed
+	callbacks := b.lifecycleClosedCallbacksLocked()
+	b.mu.Unlock()
+
+	if claim != nil {
+		if err := claim.terminateAndClose(); err != nil {
+			// Warn, not Debug: the default level is info (config.go), so the
+			// previous Debug line meant a failed kill left NO evidence at all.
+			// This is the enforcement path, not best-effort cleanup.
+			//
+			// The maps were cleared above, which is safe for lifecycle-tracked
+			// helpers: helperRegistry.reserve refuses to respawn while the
+			// tracked process is alive OR its liveness is unknown. A scheduled
+			// helper has no registry entry, so a failed kill there could once be
+			// followed by a proactive spawn and a duplicate (#2530). We now
+			// record a bounded retention window keyed on the surviving PID via
+			// retainHelperKeyOwnership; helperKeySpawnBlocked consults it at the
+			// spawn gate and clears it once the PID is confirmed dead or the
+			// deadline cap elapses, whichever comes first. Do NOT instead
+			// re-register this closed session in helperByKey: the session is
+			// closed immediately below, HasHelperKeyOwner does not filter closed
+			// owners, and nothing would ever clear the entry, so the key would
+			// be wedged for the process lifetime — the exact failure retention
+			// is designed to avoid.
+			log.Warn("failed to terminate helper process",
+				"helperKey", key.String(), "pid", session.PID, "error", err.Error())
+			b.retainHelperKeyOwnership(key, session.PID)
+		}
+	}
+	_ = session.closeTransportAndPeer()
+	if removed {
+		if onSessionClosed != nil {
+			onSessionClosed(session)
+		}
+		for _, callback := range callbacks {
+			callback(session)
+		}
+	}
+}
+
+// CloseSessionsByDesktopContext closes all sessions with the given desktop
+// context (e.g., "user_session"). Used on macOS to tear down stale helpers
+// after a logout event. Returns the number of sessions closed.
+//
+// Note: this method iterates b.sessions under b.mu.Lock() and queues matching
+// sessions into a local slice before releasing the lock and calling Close on
+// each one. Because the atomic snapshot is NOT refreshed until removeSession
+// runs (via the RecvLoop exit path for each closed session), snapshot-path
+// readers may briefly see closed sessions during that window. This is an
+// acceptable trade-off: Close() is idempotent, and the calling code tolerates
+// a best-effort teardown on macOS logout.
+func (b *Broker) CloseSessionsByDesktopContext(ctx string) int {
+	b.mu.Lock()
+	var toClose []*Session
+	for _, s := range b.sessions {
+		if s.DesktopContext == ctx {
+			toClose = append(toClose, s)
+		}
+	}
+	b.mu.Unlock()
+
+	for _, s := range toClose {
+		if err := s.Close(); err != nil {
+			log.Debug("failed to close session by desktop context",
+				"sessionId", s.SessionID,
+				"desktopContext", ctx,
+				"error", err.Error())
+		}
+	}
+	return len(toClose)
+}
+
+// setupSocket is implemented in broker_windows.go and broker_unix.go.
+
+func (b *Broker) verifyBinaryPath(peerPath string) bool {
+	ok := binaryPathMatchesAllowed(peerPath, b.allowedHelperPaths())
+	if ok {
+		return true
+	}
+	log.Debug("verifyBinaryPath: no match",
+		"peer", filepath.Clean(peerPath),
+		"allowed", b.allowedHelperPaths(),
+	)
+	return false
+}
+
+func binaryPathMatchesAllowed(peerPath string, allowed []string) bool {
+	peerResolved, err := filepath.EvalSymlinks(peerPath)
+	if err != nil {
+		return false
+	}
+	peerResolved = normalizeBinaryPath(filepath.Clean(peerResolved))
+	for _, candidate := range allowed {
+		resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			resolvedCandidate = candidate
+		}
+		if normalizeBinaryPath(filepath.Clean(resolvedCandidate)) == peerResolved {
+			return true
+		}
+	}
+	return false
+}
+
+// scopesForRole maps a validated helper role to its allowed scopes.
+// systemSID is the well-known Windows Local System account SID.
+const systemSID = "S-1-5-18"
+
+// roleIdentityRejection reports whether a helper claiming helperRole from the
+// given kernel-verified peer identity (SID on Windows, UID on Unix) must be
+// rejected, and the rejection reason. All role/identity mismatches are
+// permanent. It returns ("", false) when the role/identity pairing is allowed.
+//
+// peerWinSession is the kernel-verified Windows session id of the peer (from
+// ProcessIdToSessionId), claimedWinSession is the authenticated numeric claim,
+// and consoleWinSession is the active console session id. Windows system/user
+// helpers require a nonzero peer session that exactly matches their claim, so
+// legitimate RDP helpers are admitted without trusting self-reported routing.
+// Assist remains console-bound for its cross-user token capability (#1009).
+// Session binding does not apply on Unix.
+//
+// Pure and OS-parameterized so the privilege-escalation gate can be unit-tested
+// with an injected SID/UID and session ids — a real peer-cred SID and
+// kernel-verified session id can't be forged over a named pipe / Unix socket,
+// so end-to-end pipe tests can only exercise the current test process's own
+// identity.
+func roleIdentityRejection(role ipc.HelperRole, sid string, uid uint32, peerWinSession, claimedWinSession, consoleWinSession, goos string) (reason string, rejected bool) {
+	if goos == "windows" {
+		switch {
+		case role == ipc.HelperRoleSystem && sid != systemSID:
+			return "system role requires SYSTEM identity", true
+		case role == backupipc.HelperRoleBackup && sid != systemSID:
+			return "backup role requires SYSTEM identity", true
+		case role == ipc.HelperRoleUser && sid == systemSID:
+			return "user role requires non-SYSTEM identity", true
+		case role == ipc.HelperRoleAssist && sid == systemSID:
+			return "assist role requires non-SYSTEM identity", true
+		case role == ipc.HelperRoleWatchdog && sid != systemSID:
+			return "watchdog role requires SYSTEM identity", true
+		}
+		if role == ipc.HelperRoleUser || role == ipc.HelperRoleSystem {
+			if peerWinSession == "" || peerWinSession == "0" {
+				return string(role) + " role requires an interactive peer session", true
+			}
+			if peerWinSession != claimedWinSession {
+				return string(role) + " role session claim does not match peer token", true
+			}
+		}
+		if role == ipc.HelperRoleAssist && (consoleWinSession == "" || consoleWinSession == "0" || peerWinSession != consoleWinSession) {
+			return "assist role requires the active console session", true
+		}
+		return "", false
+	}
+	// Unix: watchdog and system-role helpers must run as root. The macOS
+	// desktop helper runs in the GUI user/loginwindow session, so it must
+	// authenticate as user-role and receives only desktop scope. The assist
+	// helper is Windows-only; on Unix it would receive only the inert "assist"
+	// scope, so no identity gate is required here.
+	switch {
+	case role == ipc.HelperRoleWatchdog && uid != 0:
+		return "watchdog role requires root identity", true
+	case role == ipc.HelperRoleSystem && uid != 0:
+		return "system role requires root identity", true
+	case role == backupipc.HelperRoleBackup && uid != 0:
+		return "backup role requires root identity", true
+	}
+	return "", false
+}
+
+func (b *Broker) scopesForRole(role ipc.HelperRole, binaryKind, goos, peerPath string) []string {
+	switch role {
+	case ipc.HelperRoleUser:
+		if goos == "darwin" &&
+			binaryKind == ipc.HelperBinaryDesktopHelper &&
+			b.isDesktopHelperPeerPath(peerPath) {
+			// "notify" is granted deliberately (#3197): this helper is the only
+			// thing that can render a toast for a logged-in macOS user, and the
+			// cross-platform reboot warning ladder now dispatches through
+			// BroadcastNotification. Without it a macOS patch reboot would warn
+			// nobody — the exact defect #3197 fixes on Windows.
+			return macDesktopHelperScopes
+		}
+		return userHelperScopes
+	case backupipc.HelperRoleBackup:
+		return backupHelperScopes
+	case ipc.HelperRoleWatchdog:
+		return watchdogHelperScopes
+	case ipc.HelperRoleAssist:
+		return assistHelperScopes
+	case ipc.HelperRoleSystem:
+		return systemHelperScopes
+	}
+	return nil
+}
+
+// grantScopes computes the final AllowedScopes for an authenticated helper:
+// the role's base scopes plus consent_ui_fallback when a user-role helper
+// advertised native consent support. Always returns a fresh slice — the
+// role-scope vars are shared package state and must not be appended to.
+func (b *Broker) grantScopes(role ipc.HelperRole, authReq ipc.AuthRequest, goos, peerPath string) []string {
+	base := b.scopesForRole(role, authReq.BinaryKind, goos, peerPath)
+	scopes := make([]string, len(base), len(base)+1)
+	copy(scopes, base)
+	if role == ipc.HelperRoleUser && authReq.SupportsConsentUI {
+		scopes = append(scopes, ipc.ScopeConsentUIFallback)
+	}
+	return scopes
+}
+
+func (b *Broker) isDesktopHelperPeerPath(peerPath string) bool {
+	peerResolved, err := filepath.EvalSymlinks(peerPath)
+	if err != nil {
+		return false
+	}
+	peerResolved = normalizeBinaryPath(filepath.Clean(peerResolved))
+	for _, candidate := range b.allowedHelperPaths() {
+		if !strings.Contains(filepath.Base(candidate), "breeze-desktop-helper") {
+			continue
+		}
+		resolvedCandidate, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			resolvedCandidate = candidate
+		}
+		if normalizeBinaryPath(filepath.Clean(resolvedCandidate)) == peerResolved {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Broker) allowedHelperPaths() []string {
+	exePath, err := os.Executable()
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			// On Windows all trusted paths are derived from the exe location;
+			// without it we cannot determine any safe paths.
+			log.Warn("failed to get executable path; no helper paths available", "error", err.Error())
+			return []string{}
+		}
+		log.Warn("failed to get executable path, falling back to hardcoded helper paths", "error", err.Error())
+		return []string{
+			"/usr/local/bin/breeze-agent",
+			"/usr/local/bin/breeze-desktop-helper",
+			"/usr/local/bin/breeze-watchdog",
+		}
+	}
+	exePath, err = filepath.EvalSymlinks(exePath)
+	if err != nil {
+		exePath = filepath.Clean(exePath)
+	}
+	dir := filepath.Dir(exePath)
+	paths := []string{
+		exePath,
+		filepath.Join(dir, "breeze-desktop-helper"),
+		filepath.Join(dir, "breeze-watchdog"),
+		filepath.Join(dir, "breeze-desktop-helper.exe"),
+		filepath.Join(dir, UserHelperBinaryName),
+		filepath.Join(dir, "breeze-watchdog.exe"),
+		// Backup helper (breeze-backup / breeze-backup.exe) connects to the same
+		// IPC socket and must be allowed, else backup_run always times out.
+		filepath.Join(dir, "breeze-backup"),
+		filepath.Join(dir, "breeze-backup.exe"),
+	}
+	if runtime.GOOS != "windows" {
+		paths = append(paths,
+			"/usr/local/bin/breeze-agent",
+			"/usr/local/bin/breeze-desktop-helper",
+			"/usr/local/bin/breeze-watchdog",
+		)
+	}
+	// Allowlist the Breeze Assist helper binary so it can connect over IPC.
+	paths = append(paths, assistHelperBinaryPaths(dir)...)
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		clean := filepath.Clean(path)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+	return out
+}
+
+// assistHelperBinaryPaths returns candidate install paths for the Breeze Assist
+// helper, derived from the agent install dir. Used so RefreshAllowedHashes
+// allowlists the genuine breeze-helper binary's SHA-256. Non-existent paths are
+// skipped silently by computeAllowedHashes, so listing all platform candidates
+// is safe even when the helper is not installed.
+func assistHelperBinaryPaths(agentDir string) []string {
+	return assistHelperBinaryPathsForOS(agentDir, runtime.GOOS, os.Getenv("ProgramFiles"))
+}
+
+// assistHelperBinaryPathsForOS is the OS-parameterized core, exported-for-test
+// so the Windows path (which can't run on the CI host) is verified directly.
+//
+// IMPORTANT: the Helper MSI installs to "<ProgramFiles>\Breeze Helper\"
+// (Tauri productName "Breeze Helper"), NOT the agent's install dir. An earlier
+// version allowlisted only "<agentDir>\breeze-helper.exe", which never matches
+// the real install location, so the genuine Helper's hash was never added to
+// the allowlist and the assist IPC session was rejected on Windows. We now
+// cover the real install path (ProgramFiles + agent-dir sibling) plus the
+// legacy colocated path; missing candidates are skipped by computeAllowedHashes.
+func assistHelperBinaryPathsForOS(agentDir, goos, programFiles string) []string {
+	switch goos {
+	case "windows":
+		paths := []string{
+			// Sibling of the agent dir, e.g. C:\Program Files\Breeze ->
+			// C:\Program Files\Breeze Helper. Robust to ProgramFiles localization.
+			filepath.Join(filepath.Dir(agentDir), "Breeze Helper", "breeze-helper.exe"),
+			filepath.Join(agentDir, "breeze-helper.exe"), // legacy/colocated
+		}
+		if programFiles != "" {
+			paths = append(paths, filepath.Join(programFiles, "Breeze Helper", "breeze-helper.exe"))
+		}
+		return paths
+	case "darwin":
+		return []string{
+			"/Applications/Breeze Helper.app/Contents/MacOS/breeze-helper",
+			filepath.Join(agentDir, "breeze-helper"),
+		}
+	default:
+		return []string{filepath.Join(agentDir, "breeze-helper")}
+	}
+}
+
+// RefreshAllowedHashes recomputes the helper binary hash allowlist from the
+// binaries currently present on disk. Call this after a dev push that
+// replaces a helper binary so the next connection from the newly spawned
+// helper (which will hash to a new value) is accepted.
+// RefreshAllowedHashes recomputes the helper binary hash allowlist from
+// disk and atomically swaps the broker's selfHashes map.
+//
+// Returns the count of successfully-hashed binaries and a non-nil error if
+// the recompute produced zero hashes (every allowed path failed to hash,
+// usually because the helper binaries are missing or unreadable). Callers
+// that just installed a binary should treat a zero-count refresh as a fatal
+// dev-update outcome — the next helper spawn will be rejected at the IPC
+// handshake because no hash in the new map matches the peer.
+func (b *Broker) RefreshAllowedHashes() (int, error) {
+	newHashes := b.computeAllowedHashes()
+	b.mu.Lock()
+	b.selfHashes = newHashes
+	b.mu.Unlock()
+	log.Info("refreshed helper binary hash allowlist", "count", len(newHashes))
+	if len(newHashes) == 0 {
+		return 0, fmt.Errorf("no helper binary hashes could be computed; all helper connections will be rejected")
+	}
+	return len(newHashes), nil
+}
+
+// HashAndVerifyAllowed hashes the binary at path and reports whether the
+// resulting hash is in the broker's current selfHashes allowlist. Used by
+// dev-update handlers to verify that a freshly-installed binary will be
+// accepted at the next helper-spawn IPC handshake. Returns the computed hash
+// for diagnostic logging.
+func (b *Broker) HashAndVerifyAllowed(path string) (string, bool, error) {
+	sum, err := hashFileSHA256(path)
+	if err != nil {
+		return "", false, fmt.Errorf("hash %s: %w", path, err)
+	}
+	b.mu.RLock()
+	_, ok := b.selfHashes[sum]
+	b.mu.RUnlock()
+	return sum, ok, nil
+}
+
+func (b *Broker) computeAllowedHashes() map[string]struct{} {
+	hashes := make(map[string]struct{})
+	for _, path := range b.allowedHelperPaths() {
+		sum, err := hashFileSHA256(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				log.Debug("allowed helper binary not present", "path", path)
+			} else {
+				log.Warn("failed to hash allowed helper binary", "path", path, "error", err.Error())
+			}
+			continue
+		}
+		hashes[sum] = struct{}{}
+	}
+	if len(hashes) == 0 {
+		log.Error("no valid helper binary hashes could be computed; all helper connections will be rejected")
+	}
+	return hashes
+}
+
+func (b *Broker) isAllowedBinaryHash(hash string) bool {
+	if hash == "" {
+		return false
+	}
+	_, ok := b.selfHashes[hash]
+	return ok
+}
+
+func hashFileSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("path is not a regular file")
+	}
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// dispatchHelperMessage is the RecvLoop callback for an authed helper
+// session. Extracted from the handleConnection closure so keepalive/pong
+// tests can drive the real dispatch through a paired ipc.Conn without
+// replicating the switch.
+func (b *Broker) dispatchHelperMessage(s *Session, env *ipc.Envelope) {
+	switch env.Type {
+	case ipc.TypePing:
+		if err := s.conn.SendTyped(env.ID, ipc.TypePong, nil); err != nil {
+			log.Warn("failed to send pong", "uid", s.UID, "error", err.Error())
+			return
+		}
+	case ipc.TypePong:
+		// Reply to broker-initiated keepalive ping. RecvLoop has already
+		// called s.Touch(), so the idle reaper won't claim this session.
+		s.NotePong()
+	case ipc.TypeCapabilities:
+		var caps ipc.Capabilities
+		if err := json.Unmarshal(env.Payload, &caps); err != nil {
+			log.Warn("invalid capabilities payload", "uid", s.UID, "error", err.Error())
+		} else {
+			sanitized := sanitizeCapabilitiesForSession(s, &caps)
+			s.SetCapabilities(sanitized)
+			// Log from the locally-held copy to avoid a post-Set read of
+			// s.Capabilities that would race with any concurrent reader.
+			log.Info("capabilities received",
+				"uid", s.UID,
+				"canNotify", sanitized.CanNotify,
+				"canTray", sanitized.CanTray,
+				"canCapture", sanitized.CanCapture,
+				"canClipboard", sanitized.CanClipboard,
+				"displayServer", sanitized.DisplayServer,
+			)
+		}
+	case ipc.TypeTCCStatus:
+		var status ipc.TCCStatus
+		if err := json.Unmarshal(env.Payload, &status); err != nil {
+			log.Warn("invalid tcc_status payload", "uid", s.UID, "error", err.Error())
+		} else {
+			sanitized := sanitizeTCCStatusForSession(s, &status)
+			if sanitized == nil {
+				log.Warn("dropping unauthorized tcc_status message",
+					"sessionId", s.SessionID, "role", s.HelperRole)
+				return
+			}
+			s.SetTCCStatus(sanitized)
+			log.Info("TCC permissions received",
+				"uid", s.UID,
+				"screenRecording", sanitized.ScreenRecording,
+				"accessibility", sanitized.Accessibility,
+				"fullDiskAccess", sanitized.FullDiskAccess,
+				"remoteDesktop", sanitized.RemoteDesktop,
+			)
+		}
+	case ipc.TypeDisconnect:
+		log.Info("user helper disconnecting", "uid", s.UID, "sessionId", s.SessionID)
+		s.Close()
+	case ipc.TypeWatchdogPing:
+		if !s.HasScope("watchdog") {
+			log.Warn("dropping watchdog_ping from non-watchdog session",
+				"sessionId", s.SessionID, "role", s.HelperRole)
+			return
+		}
+		var ping ipc.WatchdogPing
+		if err := json.Unmarshal(env.Payload, &ping); err != nil {
+			log.Warn("invalid watchdog_ping payload", "error", err.Error())
+			return
+		}
+		pong := ipc.WatchdogPong{
+			Healthy: true,
+			Uptime:  int64(time.Since(b.startTime).Seconds()),
+		}
+		if ping.RequestHealthSummary && b.onMessage != nil {
+			// Health summary is populated by the heartbeat module via onMessage;
+			// for the broker-level ping we include uptime only.
+		}
+		if err := s.SendNotify(env.ID, ipc.TypeWatchdogPong, pong); err != nil {
+			log.Warn("failed to send watchdog_pong", "error", err.Error())
+		}
+	case ipc.TypeWatchdogCommandResult:
+		if !shouldForwardUnsolicitedHelperMessage(s, env) {
+			log.Warn("dropping unauthorized watchdog_command_result",
+				"sessionId", s.SessionID, "role", s.HelperRole)
+			return
+		}
+		if b.onMessage != nil {
+			b.onMessage(s, env)
+		}
+	case backupipc.TypeBackupResult, backupipc.TypeBackupProgress, backupipc.TypeBackupReady:
+		if !shouldForwardUnsolicitedHelperMessage(s, env) {
+			log.Warn("dropping unauthorized backup helper message",
+				"type", env.Type, "sessionId", s.SessionID, "role", s.HelperRole)
+			return
+		}
+		// A terminal result retires the in-flight run, so a helper exit right
+		// after it (the normal end of every async backup) reports nothing
+		// further (#2998). Cleared before the forward: the handler may block
+		// on a websocket send, and the run must already be untracked by then.
+		if env.Type == backupipc.TypeBackupResult {
+			b.noteBackupRunResult(env)
+		}
+		if b.onMessage != nil {
+			b.onMessage(s, env)
+		}
+	case ipc.TypeTrayAction, ipc.TypeNotifyResult, ipc.TypeClipboardData, ipc.TypeCommandResult, ipc.TypeSASRequest, ipc.TypeDesktopPeerDisconnected,
+		ipc.TypeDesktopLeaseRenew, ipc.TypeDesktopStart, ipc.TypeDesktopStop, ipc.TypeLaunchResult:
+		if !shouldForwardUnsolicitedHelperMessage(s, env) {
+			log.Warn("dropping unsolicited or unauthorized helper message",
+				"type", env.Type, "sessionId", s.SessionID, "role", s.HelperRole)
+			return
+		}
+		if b.onMessage != nil {
+			b.onMessage(s, env)
+		}
+	default:
+		log.Warn("unknown message type from helper, ignoring",
+			"type", env.Type, "identity", s.IdentityKey, "sessionId", s.SessionID)
+	}
+}
+
+// keepaliveMaxSendFailures is the number of consecutive ping sends that may
+// fail before runKeepalive gives up and closes the session. The real "helper
+// is wedged" signal is the pong-age check, not the send side, so the send path
+// is deliberately slow to condemn a session.
+//
+// This is a guard against a one-off anomalous Send error, not a recovery
+// window — do not raise it expecting more resilience. Since #2273 no send
+// failure this loop can observe is actually transient: a failed Write poisons
+// the Conn permanently, a SetWriteDeadline failure means the socket is already
+// closed, and a slow drain blocks up to the ipc writeTimeout rather than
+// erroring early. So the first real failure is terminal and the threshold only
+// defers the close by keepaliveMaxSendFailures-1 ticks. The threshold and the
+// reset-on-success are pinned by TestKeepaliveClosesAtSendFailureThreshold and
+// TestKeepaliveToleratesSendFailuresBelowThreshold.
+const keepaliveMaxSendFailures = 3
+
+// runKeepalive pings the helper every keepalivePingInterval and closes the
+// session if no pong has arrived for keepaliveTimeout. Exits when the session
+// is closed by anything else (RecvLoop return, explicit Close, reaper, etc).
+//
+// Order inside the ticker branch is `check age → send ping`, not the other
+// way around. If we sent first and then checked age, a tick that happens to
+// straddle a just-arriving pong would read a stale "previous pong" age and
+// spuriously close a healthy session. Checking first means we only close
+// when the most recent pong we actually have is already too old — a
+// decision that is independent of this tick's outgoing ping.
+func (b *Broker) runKeepalive(session *Session) {
+	ticker := time.NewTicker(keepalivePingInterval)
+	defer ticker.Stop()
+
+	sendFailures := 0
+	for {
+		select {
+		case <-session.Done():
+			return
+		case <-ticker.C:
+			if session.IsClosed() {
+				return
+			}
+
+			// Authoritative wedge check: the age here is the time since the
+			// most recently received pong (seeded to session creation time
+			// in NewSession), not the time since the ping we're about to
+			// send below.
+			if age := session.LastPongAge(); age > keepaliveTimeout {
+				log.Warn("keepalive pong timeout, closing stranded session",
+					"sessionId", session.SessionID,
+					"identity", session.IdentityKey,
+					"ageMs", age.Milliseconds(),
+				)
+				if err := session.Close(); err != nil {
+					log.Error("keepalive close returned error",
+						"sessionId", session.SessionID,
+						"error", err.Error(),
+					)
+				}
+				return
+			}
+
+			// Send is mutex-serialised by ipc.Conn (see protocol.go), so
+			// this is safe to call concurrently with RecvLoop/SendCommand
+			// paths.
+			if err := session.conn.SendTyped("keepalive", ipc.TypePing, nil); err != nil {
+				sendFailures++
+				log.Warn("keepalive ping send failed",
+					"sessionId", session.SessionID,
+					"identity", session.IdentityKey,
+					"consecutive", sendFailures,
+					"error", err.Error(),
+				)
+				if sendFailures >= keepaliveMaxSendFailures {
+					log.Warn("keepalive ping send failed repeatedly, closing session",
+						"sessionId", session.SessionID,
+						"identity", session.IdentityKey,
+						"consecutive", sendFailures,
+					)
+					if err := session.Close(); err != nil {
+						log.Error("keepalive close returned error",
+							"sessionId", session.SessionID,
+							"error", err.Error(),
+						)
+					}
+					return
+				}
+				continue
+			}
+			sendFailures = 0
+		}
+	}
+}
+
+func (b *Broker) idleReaper(stopChan <-chan struct{}) {
+	ticker := time.NewTicker(IdleCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			b.reapIdleSessions()
+		case <-stopChan:
+			return
+		}
+	}
+}
+
+func (b *Broker) reapIdleSessions() {
+	b.mu.RLock()
+	var toClose []*Session
+	for _, s := range b.sessions {
+		// CanCapture is no longer exempt: a streaming helper touches the
+		// session on every frame, so a capture session only reaches
+		// IdleTimeout if its helper is stranded (killed pipe / WER hang).
+		// See issue #443.
+		if s.IdleDuration() > IdleTimeout {
+			toClose = append(toClose, s)
+		}
+	}
+	b.mu.RUnlock()
+
+	for _, s := range toClose {
+		log.Info("disconnecting idle user helper", "uid", s.UID, "sessionId", s.SessionID, "idle", s.IdleDuration())
+		s.Close()
+		b.removeSession(s)
+	}
+}
+
+func betterSession(candidate, current *Session) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+	if candidate.LastSeen.After(current.LastSeen) {
+		return true
+	}
+	if current.LastSeen.After(candidate.LastSeen) {
+		return false
+	}
+	if candidate.ConnectedAt.After(current.ConnectedAt) {
+		return true
+	}
+	if current.ConnectedAt.After(candidate.ConnectedAt) {
+		return false
+	}
+	return candidate.SessionID < current.SessionID
+}
+
+func betterDesktopSession(candidate, current *Session) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+	if candidate.BinaryKind == ipc.HelperBinaryDesktopHelper && current.BinaryKind != ipc.HelperBinaryDesktopHelper {
+		return true
+	}
+	if candidate.BinaryKind != ipc.HelperBinaryDesktopHelper && current.BinaryKind == ipc.HelperBinaryDesktopHelper {
+		return false
+	}
+	if candidate.DesktopContext == ipc.DesktopContextUserSession && current.DesktopContext != ipc.DesktopContextUserSession {
+		return true
+	}
+	if candidate.DesktopContext != ipc.DesktopContextUserSession && current.DesktopContext == ipc.DesktopContextUserSession {
+		return false
+	}
+	if candidate.DesktopContext == ipc.DesktopContextLoginWindow && current.DesktopContext == "" {
+		return true
+	}
+	if candidate.DesktopContext == "" && current.DesktopContext == ipc.DesktopContextLoginWindow {
+		return false
+	}
+	return betterSession(candidate, current)
+}
+
+func shouldForwardUnsolicitedHelperMessage(session *Session, env *ipc.Envelope) bool {
+	switch env.Type {
+	case backupipc.TypeBackupResult, backupipc.TypeBackupProgress, backupipc.TypeBackupReady:
+		return session.HasScope("backup")
+	case ipc.TypeTrayAction:
+		return session.HasScope("tray")
+	case ipc.TypeSASRequest, ipc.TypeDesktopPeerDisconnected, ipc.TypeDesktopLeaseRenew:
+		return session.HasScope("desktop")
+	case ipc.TypeWatchdogCommandResult:
+		return session.HasScope("watchdog")
+	case ipc.TypeNotifyResult, ipc.TypeClipboardData, ipc.TypeCommandResult:
+		return false
+	default:
+		return false
+	}
+}
+
+func sanitizeCapabilitiesForSession(session *Session, caps *ipc.Capabilities) *ipc.Capabilities {
+	if caps == nil {
+		return nil
+	}
+	sanitized := *caps
+	sanitized.DisplayServer = truncateSessionString(sanitized.DisplayServer, 64)
+	if session == nil {
+		return &sanitized
+	}
+	if !session.HasScope("notify") {
+		sanitized.CanNotify = false
+	}
+	if !session.HasScope("tray") {
+		sanitized.CanTray = false
+	}
+	if !session.HasScope("desktop") {
+		sanitized.CanCapture = false
+	}
+	if !session.HasScope("clipboard") {
+		sanitized.CanClipboard = false
+	}
+	return &sanitized
+}
+
+func sanitizeTCCStatusForSession(session *Session, status *ipc.TCCStatus) *ipc.TCCStatus {
+	if status == nil {
+		return nil
+	}
+	if session != nil && !session.HasScope("desktop") {
+		return nil
+	}
+	sanitized := *status
+	return &sanitized
+}
+
+func truncateSessionString(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= max {
+		return value
+	}
+	return strings.TrimSpace(value[:max]) + "... [truncated]"
+}

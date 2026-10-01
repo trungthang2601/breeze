@@ -1,0 +1,462 @@
+/**
+ * AI Billing/Invoice Tools
+ *
+ * AI tools over the invoice engine:
+ *  - `list_invoices` — list invoices for the caller's accessible orgs, with
+ *    optional org/status filters.
+ *  - `get_invoice`   — full accounting view (invoice + all lines) for one invoice.
+ *  - `manage_invoices` — action multiplexer for draft edits, issuance, voids,
+ *    payments, assembly, and pay links.
+ *
+ * Org-scope guarded AT THE TOOL LAYER (do not rely on the route scanner — the
+ * known aiTools site/org-scope gap): each tool builds an `InvoiceActor` from the
+ * AI session's auth context (partnerId + accessibleOrgIds) and calls
+ * `listInvoices` / `getInvoice`, which already enforce `requireOrgAccess`. A
+ * thrown `InvoiceServiceError` (e.g. ORG_DENIED, INVOICE_NOT_FOUND) is converted
+ * to a JSON error string rather than propagated. `manage_invoices` is a write
+ * action-multiplexer; issue/void/record_payment/void_payment are approval-gated
+ * Tier 3 actions.
+ */
+
+import { z } from 'zod';
+import {
+  INVOICE_STATUSES,
+  manualLineSchema,
+  updateLineSchema,
+  updateInvoiceSchema,
+  recordPaymentSchema
+} from '@breeze/shared';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool, AiToolTier } from './aiTools';
+import {
+  listInvoices,
+  getInvoice,
+  createManualInvoice,
+  addManualLine,
+  addCatalogLine,
+  addBundleLine,
+  updateLine,
+  removeLine,
+  updateInvoice,
+  deleteDraftInvoice,
+  assembleDraftFromOrg,
+  assembleDraftFromTicket,
+  issueInvoice,
+  recordPayment,
+  voidPayment,
+  voidInvoice,
+  lockContractLineMaterializationSource
+} from './invoiceService';
+import { createInvoicePayLink } from './invoiceCheckout';
+import { InvoiceServiceError, type InvoiceActor } from './invoiceTypes';
+import { actorCan } from './contractTypes';
+import { resolveContractActorFromAuth } from './contractActor';
+import { PERMISSIONS } from './permissions';
+import { db } from '../db';
+import type { DeviceSnapshotRow } from './contractQuantities';
+import { computeContractEstimate, getContract, materializeContractLineOntoInvoice } from './contractService';
+import { toCents } from './invoiceMath';
+import { missingParamsJson, zodErrorToJson } from './aiToolValidation';
+
+function actorFromAuth(auth: AuthContext): InvoiceActor {
+  return {
+    userId: auth.user.id,
+    partnerId: auth.partnerId ?? null,
+    accessibleOrgIds: auth.accessibleOrgIds,
+    // Thread the caller's site-axis restriction so a site-limited AI session can't
+    // read/mutate out-of-site invoices. undefined (partner/system, all-sites org
+    // users) stays unrestricted, preserving prior behavior.
+    allowedSiteIds: auth.allowedSiteIds
+  };
+}
+
+/** Same shape as the HTTP invoice error handler (routes/invoices/invoices.ts):
+ *  `details` rides along when present so structured recovery data (e.g. the
+ *  ALL_BLOCKED_BY_CURRENCY per-currency groups, #3776) reaches the model. */
+function serviceErrorToJson(err: unknown): string | null {
+  if (err instanceof InvoiceServiceError) {
+    return JSON.stringify({ error: err.message, code: err.code, ...(err.details ? { details: err.details } : {}) });
+  }
+  return null;
+}
+
+// Payload parsers wrap the value under its param name so ZodError paths are
+// self-describing ("line.quantity: ...", "payment.receivedAt: ..."). These
+// are the SAME schemas the HTTP invoice routes validate with — one source of
+// truth. Without this, a malformed manage_invoices call skipped validation
+// entirely (the type-cast reached invoiceService with no Zod layer at all)
+// and died as an opaque DB constraint 500 instead of a structured
+// VALIDATION_ERROR the model could act on.
+const manualLinePayload = z.object({ line: manualLineSchema });
+const lineUpdatePayload = z.object({ patch: updateLineSchema });
+const headerUpdatePayload = z.object({ patch: updateInvoiceSchema });
+const paymentPayload = z.object({ payment: recordPaymentSchema });
+
+/**
+ * Adds a derived `depositPaid` boolean (amountPaid >= depositDue, compared in
+ * integer cents to avoid float/string drift) to a read-only invoice payload.
+ * When no deposit is configured (`depositDue` null/undefined), `depositPaid`
+ * is omitted entirely rather than emitted as `false` — there's no deposit
+ * state to report, and `false` would misleadingly read as "deposit unpaid".
+ */
+function withDepositPaid<T extends { depositDue?: string | null; amountPaid: string }>(
+  inv: T
+): T & { depositPaid?: boolean } {
+  if (inv.depositDue == null) return inv;
+  return { ...inv, depositPaid: toCents(inv.amountPaid) >= toCents(inv.depositDue) };
+}
+
+/**
+ * Params each manage_invoices action requires, presence-checked BEFORE any
+ * `String(...)` coercion so a missing id can't become the literal string
+ * "undefined" and die downstream as an opaque uuid/DB 500 (#2362 sweep).
+ */
+const MANAGE_INVOICES_REQUIRED: Record<string, readonly string[]> = {
+  create_draft: ['orgId'],
+  add_manual_line: ['invoiceId', 'line'],
+  add_catalog_line: ['invoiceId', 'catalogItemId', 'quantity'],
+  add_bundle_line: ['invoiceId', 'bundleId', 'quantity'],
+  add_contract_line: ['invoiceId', 'contractId', 'contractLineId'],
+  update_line: ['invoiceId', 'lineId', 'patch'],
+  remove_line: ['invoiceId', 'lineId'],
+  update_header: ['invoiceId', 'patch'],
+  delete_draft: ['invoiceId'],
+  assemble_from_org: ['orgId', 'from', 'to'],
+  assemble_from_ticket: ['ticketId'],
+  issue: ['invoiceId'],
+  void: ['invoiceId', 'reason'],
+  record_payment: ['invoiceId', 'payment'],
+  void_payment: ['paymentId'],
+  create_pay_link: ['invoiceId'],
+};
+
+
+/**
+ * SCOPE PARITY WITH THE HTTP DOOR (#6110 review, finding 1).
+ *
+ * A tool must require exactly what its route requires. Every route file under `routes/invoices/` is
+ * `requireScope('partner','system')` (invoices.ts:20, lifecycle.ts:24,
+ * assembly.ts:17, payments.ts:12, pdf.ts:12, stripe.ts:18, evidence.ts:14,
+ * bulk.ts:11, settings.ts:23).
+ * An organization-scoped token therefore cannot reach this domain over HTTP at
+ * all — and an org token still carries the OWNING PARTNER's partnerId, so a
+ * bare partnerId-presence check is not a substitute. Autonomous AI-agent runs
+ * mint `scope: 'organization'` too (aiAgents/agentAuthContext.ts), so this gate
+ * refuses them as well; the `business` capability group that carries these
+ * tools already contains partner-only tools (aiToolsDeliverables.ts), so that is
+ * an existing, expected shape rather than a new one.
+ */
+function partnerScopeRefusal(auth: AuthContext): string | null {
+  if (auth.scope === 'partner' || auth.scope === 'system') return null;
+  return JSON.stringify({
+    error: 'Invoice access requires a partner-scoped session; organization-scoped callers cannot reach the '
+      + 'matching HTTP routes either',
+    code: 'PARTNER_SCOPE_REQUIRED',
+  });
+}
+
+export function registerBillingTools(aiTools: Map<string, AiTool>): void {
+  aiTools.set('list_invoices', {
+    tier: 2 as AiToolTier,
+    deviceArgs: [],
+    domain: 'billing',
+    searchHint: 'invoices by organization or status, balances, deposits and currencies',
+    definition: {
+      name: 'list_invoices',
+      description:
+        "List accessible invoices newest first, with depositDue and depositPaid when configured. All amounts use each invoice currencyCode; never sum across currencies; group by currencyCode for totals.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          orgId: { type: 'string', description: 'Filter to a single organization (UUID)' },
+          status: {
+            type: 'string',
+            enum: [...INVOICE_STATUSES],
+            description: 'Filter by invoice status'
+          },
+          limit: { type: 'number', description: 'Max results (default 25, max 100)' }
+        },
+        required: []
+      }
+    },
+    handler: async (input, auth) => {
+      const refusal = partnerScopeRefusal(auth);
+      if (refusal) return refusal;
+      const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
+      try {
+        const rows = await listInvoices(
+          {
+            orgId: input.orgId ? String(input.orgId) : undefined,
+            status: input.status ? String(input.status) : undefined,
+            limit
+          },
+          actorFromAuth(auth)
+        );
+        return JSON.stringify({ invoices: rows.map(withDepositPaid), showing: rows.length });
+      } catch (err) {
+        const json = serviceErrorToJson(err);
+        if (json) return json;
+        throw err;
+      }
+    }
+  });
+
+  aiTools.set('get_invoice', {
+    tier: 2 as AiToolTier,
+    deviceArgs: [],
+    domain: 'billing',
+    searchHint: 'invoice accounting details, line items, balances and deposit payment status',
+    definition: {
+      name: 'get_invoice',
+      description:
+        "Get an invoice header and all lines, including depositDue and depositPaid when configured. All amounts use its currencyCode; never sum across currencies; group by currencyCode for totals.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          invoiceId: { type: 'string', description: 'Invoice UUID' }
+        },
+        required: ['invoiceId']
+      }
+    },
+    handler: async (input, auth) => {
+      const refusal = partnerScopeRefusal(auth);
+      if (refusal) return refusal;
+      try {
+        const result = await getInvoice(String(input.invoiceId), actorFromAuth(auth));
+        return JSON.stringify({ ...result, invoice: withDepositPaid(result.invoice) });
+      } catch (err) {
+        const json = serviceErrorToJson(err);
+        if (json) return json;
+        throw err;
+      }
+    }
+  });
+
+  aiTools.set('manage_invoices', {
+    tier: 2 as AiToolTier,
+    deviceArgs: [],
+    domain: 'billing',
+    searchHint: 'invoices: create, edit, issue, void, record or void payments, create Stripe pay links',
+    definition: {
+      name: 'manage_invoices',
+      description:
+        "Invoices; issue/void/payments need approval. Never sum currencies. Actions:create_draft,add_manual_line,add_catalog_line,add_bundle_line,add_contract_line,update_line,remove_line,update_header,delete_draft,assemble_from_org,assemble_from_ticket,issue,void,record_payment,void_payment,create_pay_link.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          action: {
+            type: 'string',
+            description: 'Relay create_pay_link warning CURRENCY_DIFFERS_FROM_STRIPE_ACCOUNT to the user; it does not block the link.',
+            enum: [
+              'create_draft', 'add_manual_line', 'add_catalog_line', 'add_bundle_line', 'add_contract_line',
+              'update_line', 'remove_line', 'update_header', 'delete_draft',
+              'assemble_from_org', 'assemble_from_ticket',
+              'issue', 'void', 'record_payment', 'void_payment', 'create_pay_link',
+            ],
+          },
+          orgId: { type: 'string', description: 'Organization UUID (create_draft, assemble_from_org)' },
+          siteId: { type: 'string' },
+          invoiceId: { type: 'string', description: 'Invoice UUID; required for add_contract_line with contractId and contractLineId' },
+          lineId: { type: 'string' },
+          paymentId: { type: 'string' },
+          catalogItemId: { type: 'string', description: 'Catalog item UUID for add_catalog_line (priced in the invoice currency; NO_PRICE_FOR_CURRENCY on a gap)' },
+          bundleId: { type: 'string', description: 'Bundle item UUID for add_bundle_line (NO_PRICE_FOR_CURRENCY / PRICE_BOOK_INCOMPLETE on a gap)' },
+          contractId: { type: 'string', description: 'Contract UUID for add_contract_line' },
+          contractLineId: { type: 'string', description: 'Contract line UUID for add_contract_line' },
+          ticketId: { type: 'string' },
+          quantity: { type: 'number' },
+          notes: { type: 'string' },
+          termsAndConditions: { type: 'string' },
+          reason: { type: 'string', description: 'Void reason (required for void)' },
+          reissue: { type: 'boolean' },
+          from: { type: 'string', description: 'ISO date (assemble_from_org)' },
+          to: { type: 'string', description: 'ISO date (assemble_from_org)' },
+          currencyCode: { type: 'string', description: "ISO-4217 header currency for assemble_from_org / assemble_from_ticket; default org currency. Money inputs use invoice currencyCode." },
+          line: { type: 'object', description: 'Manual line fields for add_manual_line' },
+          patch: { type: 'object', description: 'Line or header patch fields' },
+          payment: { type: 'object', description: 'Payment fields (amount in the invoice\'s currencyCode, method, ...)' },
+        },
+        required: ['action'],
+      },
+    },
+    handler: async (input, auth) => {
+      const refusal = partnerScopeRefusal(auth);
+      if (refusal) return refusal;
+      const actor = actorFromAuth(auth);
+      const s = (k: string) => (input[k] == null ? undefined : String(input[k]));
+
+      const action = String(input.action);
+      const required = MANAGE_INVOICES_REQUIRED[action];
+      if (!required) {
+        return JSON.stringify({ error: `Unknown action: ${action}`, code: 'VALIDATION_ERROR' });
+      }
+      const missing = missingParamsJson(input, action, required);
+      if (missing) return missing;
+
+      // PARTNER SCOPE FOR THE PAYMENT ACTIONS (review wave 2, finding 5).
+      // NOW SUBSUMED by the family-wide `partnerScopeRefusal` at the top of this
+      // handler (#6110 finding 1) — kept deliberately as the narrowest statement
+      // of WHY these two actions in particular can never run at org scope, so
+      // that relaxing the family gate cannot silently relax these.
+
+      // `recordPayment`/`voidPayment` reach `accounting_entity_mappings` and
+      // `accounting_connections`, both PARTNER-axis under RLS: an org-scoped
+      // principal sees ZERO rows there, so `requestPaymentPush` /
+      // `requestPaymentDelete` and the QuickBooks-origin void guard all read
+      // empty and FAIL OPEN — the payment silently never reaches QuickBooks, and
+      // a QuickBooks-owned payment is voidable. The HTTP routes gate this with
+      // `requireScope`; this tool is a second door onto the same services and
+      // there is no route scanner covering it (the known aiTools scope gap noted
+      // at the top of this file). Refused with a code the model can act on.
+      if ((action === 'record_payment' || action === 'void_payment')
+        && auth.scope !== 'partner' && auth.scope !== 'system') {
+        return JSON.stringify({
+          error: 'Recording or voiding a payment requires a partner-scoped session; QuickBooks sync state '
+            + 'is partner-owned and is not visible to an organization-scoped caller',
+          code: 'PARTNER_SCOPE_REQUIRED',
+        });
+      }
+
+      try {
+        switch (action) {
+          case 'create_draft':
+            return JSON.stringify(await createManualInvoice(
+              {
+                orgId: String(input.orgId),
+                siteId: s('siteId'),
+                notes: s('notes'),
+                termsAndConditions: s('termsAndConditions')
+              },
+              actor
+            ));
+          case 'add_manual_line':
+            return JSON.stringify(await addManualLine(
+              String(input.invoiceId),
+              manualLinePayload.parse({ line: input.line }).line,
+              actor
+            ));
+          case 'add_catalog_line':
+            return JSON.stringify(await addCatalogLine(String(input.invoiceId), String(input.catalogItemId), Number(input.quantity), actor));
+          case 'add_bundle_line':
+            return JSON.stringify(await addBundleLine(String(input.invoiceId), String(input.bundleId), Number(input.quantity), actor));
+          case 'add_contract_line': {
+            // Contracts are a partner/system-owned billing surface. A selected-
+            // site closure cannot safely project an org-wide contract quantity
+            // or its device evidence, so fail closed before any source or
+            // destination read. The canonical guardrail separately requires
+            // both invoices:write and contracts:read for this exact action.
+            if (auth.scope !== 'partner' && auth.scope !== 'system') {
+              return JSON.stringify({
+                error: 'Adding a contract line requires a partner-scoped session',
+                code: 'PARTNER_SCOPE_REQUIRED',
+              });
+            }
+            if (auth.allowedSiteIds !== undefined) {
+              return JSON.stringify({
+                error: 'Adding a contract line requires unrestricted organization visibility',
+                code: 'FULL_PARTNER_SCOPE_REQUIRED',
+              });
+            }
+            // Resolve the caller's REAL contract permissions. `ContractActor`
+            // is fail-closed BY CONSTRUCTION (contractTypes.ts): a hard-coded
+            // `permissions` set forges the evidence the contract service relies
+            // on and converts that design into fail-open. The guardrail's
+            // TOOL_ACTION_EXTRA_PERMISSIONS gate still applies on top of this.
+            const contractActor = await resolveContractActorFromAuth(auth);
+            if (!actorCan(contractActor, PERMISSIONS.CONTRACTS_READ)) {
+              return JSON.stringify({
+                error: 'Adding a contract line requires the contracts:read permission',
+                code: 'CONTRACTS_READ_REQUIRED',
+              });
+            }
+            const contractId = String(input.contractId);
+            const contractLineId = String(input.contractLineId);
+            // The tool executes inside the request's ambient DB transaction.
+            // Lock destination then source in the canonical invoice -> contract
+            // order. Both locks remain held through quantity resolution,
+            // evidence capture and materialization.
+            await lockContractLineMaterializationSource(String(input.invoiceId), contractId, actor);
+            const { contract, lines } = await getContract(contractId, contractActor);
+            const line = lines.find((candidate) => candidate.id === contractLineId);
+            if (!line) return JSON.stringify({ error: 'Contract line not found for this contract' });
+
+            const deviceEvidence = new Map<string, readonly DeviceSnapshotRow[]>();
+            const estimate = await computeContractEstimate(contractId, contractActor, deviceEvidence);
+            const est = estimate.lines.find((candidate) => candidate.lineId === line.id);
+            if (!est) return JSON.stringify({ error: 'Contract line estimate not found for this contract' });
+
+            const materialized = await materializeContractLineOntoInvoice(actor, {
+              invoiceId: String(input.invoiceId),
+              contract,
+              line,
+              resolved: {
+                counted: est.counted,
+                billed: est.quantity,
+                included: est.included,
+                overage: est.overage,
+                overageMode: est.overageMode,
+              },
+              deviceEvidence: deviceEvidence.get(line.id),
+              currencyCode: estimate.currencyCode,
+            });
+            return JSON.stringify({
+              line: materialized.baseLine,
+              pricedFrom: materialized.pricedFrom,
+              overages: materialized.overage ? [materialized.overage] : [],
+            });
+          }
+          case 'update_line':
+            return JSON.stringify(await updateLine(
+              String(input.invoiceId),
+              String(input.lineId),
+              lineUpdatePayload.parse({ patch: input.patch }).patch,
+              actor
+            ));
+          case 'remove_line':
+            return JSON.stringify(await removeLine(String(input.invoiceId), String(input.lineId), actor));
+          case 'update_header':
+            return JSON.stringify(await updateInvoice(
+              String(input.invoiceId),
+              headerUpdatePayload.parse({ patch: input.patch }).patch,
+              actor
+            ));
+          case 'delete_draft':
+            // deleteDraftInvoice returns Promise<void>; stringifying the await
+            // directly produced the string "undefined" (not JSON), which the
+            // MCP layer rejected as a tool failure AFTER the delete already
+            // committed — matches aiToolsContracts.ts's delete_draft/remove_line
+            // and aiToolsQuotes.ts's delete_draft/delete_block pattern.
+            await deleteDraftInvoice(String(input.invoiceId), actor);
+            return JSON.stringify({ ok: true });
+          case 'assemble_from_org':
+            return JSON.stringify(await assembleDraftFromOrg(
+              { orgId: String(input.orgId), siteId: s('siteId'), from: String(input.from), to: String(input.to), currencyCode: s('currencyCode') },
+              actor
+            ));
+          case 'assemble_from_ticket':
+            return JSON.stringify(await assembleDraftFromTicket(String(input.ticketId), actor, { currencyCode: s('currencyCode') }));
+          case 'issue':
+            return JSON.stringify(await issueInvoice(String(input.invoiceId), actor));
+          case 'void':
+            return JSON.stringify(await voidInvoice(String(input.invoiceId), String(input.reason), { reissue: Boolean(input.reissue) }, actor));
+          case 'record_payment':
+            return JSON.stringify(await recordPayment(
+              String(input.invoiceId),
+              paymentPayload.parse({ payment: input.payment }).payment,
+              actor
+            ));
+          case 'void_payment':
+            return JSON.stringify(await voidPayment(String(input.paymentId), actor));
+          case 'create_pay_link':
+            return JSON.stringify(await createInvoicePayLink(String(input.invoiceId), actor));
+          default:
+            return JSON.stringify({ error: `Unknown action: ${action}`, code: 'VALIDATION_ERROR' });
+        }
+      } catch (err) {
+        const json = serviceErrorToJson(err) ?? zodErrorToJson(err);
+        if (json) return json;
+        throw err;
+      }
+    },
+  });
+}

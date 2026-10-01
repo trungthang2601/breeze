@@ -1,0 +1,53 @@
+import { Hono } from 'hono';
+import { authMiddleware, requireScope } from '../../middleware/auth';
+import { configsRoutes } from './configs';
+import { profilesRoutes } from './profiles';
+import { jobsRoutes } from './jobs';
+import { snapshotsRoutes } from './snapshots';
+import { reconcileRoutes } from './reconcile';
+import { restoreRoutes } from './restore';
+import { dashboardRoutes } from './dashboard';
+import { backupVerificationRoutes } from './verification';
+import { vssRoutes } from './vss';
+import { encryptionRoutes } from './encryption';
+import { bmrRoutes, bmrPublicRoutes } from './bmr';
+import { bmrRecoveryRoutes, bmrRecoveryPublicRoutes } from './bmrRecoveries';
+import { vmRestoreRoutes } from './vmrestore';
+import { mssqlRoutes } from './mssql';
+import { hypervRoutes } from './hyperv';
+import { slaRoutes } from './sla';
+import { vaultRoutes } from './vault';
+import { backupProviderRoutes } from './providers';
+
+export const backupRoutes = new Hono();
+
+// Public recovery endpoints (token-based auth, no JWT required).
+// Must be mounted BEFORE the authMiddleware wildcard.
+backupRoutes.route('/', bmrPublicRoutes);
+// Bare-metal recovery W04a: code-exchange and phase-progress are also
+// token-less/token-authed public endpoints — same placement requirement.
+backupRoutes.route('/', bmrRecoveryPublicRoutes);
+
+backupRoutes.use('*', authMiddleware);
+backupRoutes.use('*', requireScope('organization', 'partner', 'system'));
+
+backupRoutes.route('/', configsRoutes);
+backupRoutes.route('/', profilesRoutes);
+backupRoutes.route('/', jobsRoutes);
+backupRoutes.route('/', snapshotsRoutes);
+backupRoutes.route('/', reconcileRoutes);
+backupRoutes.route('/', restoreRoutes);
+backupRoutes.route('/', dashboardRoutes);
+backupRoutes.route('/', backupVerificationRoutes);
+backupRoutes.route('/', bmrRoutes);
+backupRoutes.route('/', bmrRecoveryRoutes);
+backupRoutes.route('/', vmRestoreRoutes);
+backupRoutes.route('/', mssqlRoutes);
+backupRoutes.route('/hyperv', hypervRoutes);
+backupRoutes.route('/vss', vssRoutes);
+backupRoutes.route('/encryption', encryptionRoutes);
+backupRoutes.route('/sla', slaRoutes);
+backupRoutes.route('/vault', vaultRoutes);
+// #6008 W01 — /backup/providers/*. Mounted at '/' because the sub-router
+// carries its own '/providers' prefix, like configsRoutes and dashboardRoutes.
+backupRoutes.route('/', backupProviderRoutes);

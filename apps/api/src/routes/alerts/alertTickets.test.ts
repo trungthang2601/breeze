@@ -1,0 +1,207 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+
+const { authRef, dbJoinResult, getAlertWithOrgCheckMock, capturedWhere } = vi.hoisted(() => ({
+  authRef: {
+    current: {
+      scope: 'partner' as string,
+      user: { id: 'u-1', name: 'Tess Tech', email: 'tess@msp.example' },
+      partnerId: 'p-1' as string | null,
+      orgId: null as string | null,
+      accessibleOrgIds: null as string[] | null,
+      canAccessOrg: (_id: string) => true as boolean
+    }
+  },
+  dbJoinResult: vi.fn(),
+  getAlertWithOrgCheckMock: vi.fn(),
+  // Captures the arg the linked-tickets join hands to .where() so the soft-delete
+  // exclusion can be asserted on the serialized SQL.
+  capturedWhere: { args: [] as unknown[] }
+}));
+
+// requireScope injects auth here because alertsRoutes gets authMiddleware from
+// routes/alerts/index.ts, which this test does not mount.
+vi.mock('../../middleware/auth', () => ({
+  authMiddleware: vi.fn(async (_c: any, next: any) => next()),
+  requireScope: () => async (c: any, next: any) => {
+    if (!authRef.current) {
+      return c.json({ error: 'Not authenticated' }, 401);
+    }
+    c.set('auth', authRef.current);
+    await next();
+  },
+  requirePermission: () => async (c: any, next: any) => { c.set('permissions', {}); return next(); }
+}));
+
+vi.mock('../../db', () => ({
+  db: {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        innerJoin: vi.fn(() => ({
+          where: vi.fn((...args: unknown[]) => {
+            capturedWhere.args = args;
+            return {
+              orderBy: vi.fn(() => dbJoinResult())
+            };
+          })
+        })),
+        // GET /:id and friends use other chains; tolerate them.
+        where: vi.fn(() => ({
+          orderBy: vi.fn(() => dbJoinResult()),
+          limit: vi.fn(() => dbJoinResult())
+        }))
+      }))
+    }))
+  }
+}));
+
+vi.mock('../../db/schema', () => ({
+  alertRules: {}, alertTemplates: {}, alerts: {}, notificationChannels: {},
+  alertNotifications: {}, devices: {},
+  tickets: {
+    id: 'id', internalNumber: 'internalNumber', subject: 'subject',
+    status: 'status', priority: 'priority', deletedAt: 'deletedAt'
+  },
+  ticketAlertLinks: {
+    ticketId: 'ticketId', alertId: 'alertId', linkType: 'linkType', createdAt: 'createdAt'
+  }
+}));
+
+vi.mock('./helpers', () => ({
+  getPagination: vi.fn(() => ({ page: 1, limit: 50, offset: 0 })),
+  ensureOrgAccess: vi.fn(() => true),
+  getAlertWithOrgCheck: (...args: unknown[]) => getAlertWithOrgCheckMock(...args)
+}));
+
+vi.mock('../../services/alertCooldown', () => ({
+  setCooldown: vi.fn(),
+  markConfigPolicyRuleCooldown: vi.fn()
+}));
+vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: vi.fn() }));
+vi.mock('../../services/eventBus', () => ({ publishEvent: vi.fn() }));
+vi.mock('../../services/ticketService', () => ({
+  createTicketFromAlert: vi.fn(),
+  TicketServiceError: class TicketServiceError extends Error { status = 400; }
+}));
+// Phase 2 wave P2-1 (alert verdicts), Task 14 — `alerts.ts` now imports
+// `latestVerdictsForAlerts`/`projectAlertAiVerdictSummary`. Unmocked, the
+// real module drags in `createActionIntent` (services/actionIntents/
+// intentService.ts) and its own transitive graph (aiTools/aiToolSchemas,
+// commandQueue, …), which this file's other partial mocks were never built
+// to cover. Mocked here purely to sever that transitive chain — this suite
+// doesn't exercise aiVerdict at all.
+vi.mock('../../services/aiAgents/alertVerdicts', () => ({
+  latestVerdictsForAlerts: vi.fn(async () => new Map()),
+  projectAlertAiVerdictSummary: vi.fn(),
+}));
+
+import { alertsRoutes } from './alerts';
+import { createTicketFromAlert, TicketServiceError } from '../../services/ticketService';
+
+const ALERT_ID = '5d4c3b2a-1111-4222-8333-444455556666';
+
+function makeApp() {
+  const app = new Hono();
+  app.route('/alerts', alertsRoutes);
+  return app;
+}
+
+describe('GET /alerts/:id/tickets', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = {
+      scope: 'partner', user: { id: 'u-1', name: 'Tess Tech', email: 'tess@msp.example' },
+      partnerId: 'p-1', orgId: null, accessibleOrgIds: null, canAccessOrg: () => true
+    } as typeof authRef.current;
+  });
+
+  it('returns linked tickets for a visible alert', async () => {
+    getAlertWithOrgCheckMock.mockResolvedValue({ id: ALERT_ID, orgId: 'org-1' });
+    dbJoinResult.mockResolvedValue([
+      {
+        id: 't-1', internalNumber: 'T-2026-0042', subject: 'CPU pegged',
+        status: 'open', priority: 'high', linkType: 'created_from',
+        linkedAt: '2026-06-11T00:00:00.000Z'
+      }
+    ]);
+    const res = await makeApp().request(`/alerts/${ALERT_ID}/tickets`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0].internalNumber).toBe('T-2026-0042');
+    expect(body.data[0].linkType).toBe('created_from');
+  });
+
+  it('excludes soft-deleted tickets from the linked-tickets panel (deleted_at IS NULL)', async () => {
+    // Phase 6: the join filters on and(eq(alertId), isNull(tickets.deletedAt)) so a
+    // soft-deleted ticket never surfaces as a dead link / false open-duplicate.
+    getAlertWithOrgCheckMock.mockResolvedValue({ id: ALERT_ID, orgId: 'org-1' });
+    dbJoinResult.mockResolvedValue([]);
+    const res = await makeApp().request(`/alerts/${ALERT_ID}/tickets`);
+    expect(res.status).toBe(200);
+
+    const whereStr = JSON.stringify(capturedWhere.args);
+    expect(whereStr).toContain('deletedAt');
+    expect(whereStr).toContain('is null');
+  });
+
+  it('returns an empty list when nothing is linked', async () => {
+    getAlertWithOrgCheckMock.mockResolvedValue({ id: ALERT_ID, orgId: 'org-1' });
+    dbJoinResult.mockResolvedValue([]);
+    const res = await makeApp().request(`/alerts/${ALERT_ID}/tickets`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toHaveLength(0);
+  });
+
+  it('404 when the alert is not visible to the caller (cross-org)', async () => {
+    getAlertWithOrgCheckMock.mockResolvedValue(null);
+    const res = await makeApp().request(`/alerts/${ALERT_ID}/tickets`);
+    expect(res.status).toBe(404);
+    expect(await res.json()).toHaveProperty('error', 'Alert not found');
+  });
+
+  it('400 on a non-uuid alert id', async () => {
+    const res = await makeApp().request('/alerts/not-a-uuid/tickets');
+    expect(res.status).toBe(400);
+  });
+
+  it('401 when unauthenticated', async () => {
+    authRef.current = null as unknown as typeof authRef.current;
+    const res = await makeApp().request(`/alerts/${ALERT_ID}/tickets`);
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('POST /alerts/:id/create-ticket', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = {
+      scope: 'partner', user: { id: 'u-1', name: 'Tess Tech', email: 'tess@msp.example' },
+      partnerId: 'p-1', orgId: null, accessibleOrgIds: null, canAccessOrg: () => true
+    } as typeof authRef.current;
+  });
+
+  // #5075 W04 — Service Management 'off' refuses new-ticket creation.
+  // createTicketFromAlert rejects with a TicketServiceError(409,
+  // 'service_management_off'); the route's `catch (err) { if (err instanceof
+  // TicketServiceError) return c.json({ error: err.message }, err.status); }`
+  // (alerts.ts) must surface that status verbatim rather than defaulting to 400.
+  it('returns 409 when createTicketFromAlert rejects with a service_management_off TicketServiceError', async () => {
+    getAlertWithOrgCheckMock.mockResolvedValue({ id: ALERT_ID, orgId: 'org-1' });
+    const err = new TicketServiceError('Service Management is turned off for this partner');
+    // The mocked TicketServiceError class (vi.mock above) hardcodes status = 400;
+    // set the real status this test needs to distinguish it from the default.
+    (err as unknown as { status: number }).status = 409;
+    vi.mocked(createTicketFromAlert).mockRejectedValue(err);
+
+    const res = await makeApp().request(`/alerts/${ALERT_ID}/create-ticket`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Service Management is turned off for this partner');
+  });
+});

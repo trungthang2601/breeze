@@ -1,0 +1,147 @@
+---
+title: Security Hardening
+description: Production security checklist for Breeze RMM covering secrets, TLS, firewall rules, container security, audit logging, and rate limiting.
+sidebar:
+  order: 1
+  label: Hardening Guide
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+## Production Security Checklist
+
+Before going live, verify every item:
+
+### Secrets & Encryption
+
+- [ ] All secrets generated with `openssl rand -hex 32` (not default values)
+- [ ] `.env.prod` file permissions set to `600` (owner-only)
+- [ ] `.env.prod` is in `.gitignore` and never committed
+- [ ] `JWT_SECRET` is at least 32 characters
+- [ ] Separate encryption keys for `APP_ENCRYPTION_KEY`, `MFA_ENCRYPTION_KEY`
+- [ ] `AGENT_ENROLLMENT_SECRET` rotated after initial enrollment batch
+
+### Network
+
+- [ ] Only ports 80/443 (and optionally 3478 for TURN) exposed publicly
+- [ ] PostgreSQL bound to `127.0.0.1` (not `0.0.0.0`)
+- [ ] Redis bound to `127.0.0.1` (not `0.0.0.0`)
+- [ ] Redis password authentication enabled via `REDIS_PASSWORD` (set in docker-compose and included in `REDIS_URL`)
+- [ ] Grafana/Prometheus accessible only via localhost or VPN
+- [ ] SSH key-only authentication (no password auth)
+- [ ] UFW or iptables configured
+
+### TLS
+
+- [ ] Caddy auto-TLS configured with valid domain and ACME email
+- [ ] HSTS header enabled with `includeSubDomains; preload`
+- [ ] No self-signed certificates in production
+
+### Container Security
+
+- [ ] `no-new-privileges: true` and `cap_drop: ALL` set on the `api` and `worker` containers (default in prod compose) — other services (web, portal, billing, caddy, redis, etc.) do not carry these flags
+- [ ] Resource limits (`cpus`, `mem_limit`, `pids_limit`) are not set in the shipped compose file — add them per-service if your host needs the isolation
+- [ ] No container runs with a `read_only: true` rootfs by default (the `api` container's root filesystem is intentionally kept writable — see the comment in `deploy/docker-compose.prod.yml`); layer this on yourself if you need it
+- [ ] Non-root container users (UID 1001)
+
+### Authentication
+
+- [ ] MFA enabled for all admin accounts (authenticator app, SMS, or a passkey)
+- [ ] **Require MFA** is on for your partner (Settings → Partner → Security). Partners created after 2026-09-18 have it on by default; partners created earlier keep whatever they had and their policy-managers see a daily reminder banner until it is turned on. When the partner setting is on, it is locked for every organisation under that partner and users without an enrolled factor are routed to enrolment at their next sign-in. To opt a partner out, turn the toggle off — a platform administrator creating a partner via `POST /orgs/partners` can also pass `settings.security.requireMfa: false`.
+- [ ] Roles that should require MFA have **Force MFA** turned on. Users in a force-MFA role get a `428 Precondition Required` response until they enrol an allowed MFA method; the dashboard then redirects them through a forced-enrollment page before any other workflow becomes available. **This enforcement defaults OFF** (`MFA_FORCE_FOR_PARTNER_ADMIN=false`) as of this release — set it to `true` to actually enforce Force MFA roles; see `.env.example`. From v0.113.0 a user who has never enrolled a factor gets a nonrenewable 14-day enrolment window (banner and email notices) before the wall applies — see [Users & Roles](/reference/users-and-roles/).
+- [ ] Registration disabled in production (`ENABLE_REGISTRATION=false`) after initial setup
+- [ ] Rate limiting active on login endpoints
+- [ ] Session lifetime is a fixed 7 days (`SESSION_EXPIRY_DAYS` in `services/session.ts`) — there is no env var to configure it
+- [ ] Session revocation is fail-closed — revoked sessions stay revoked even if Redis is unavailable
+- [ ] Refresh tokens use family-based reuse detection — replaying a previously rotated refresh token immediately revokes every other token in that family, log out included.
+
+### Agent Security
+
+- [ ] Agent tokens stored as SHA-256 hashes (automatic for new enrollments)
+- [ ] Agent token rotation tested (`POST /agents/:id/rotate-token`) — both old and new tokens are valid for a 5-minute grace period, and the agent picks up the new token on its next heartbeat with no downtime
+- [ ] Config file permissions: `0750` for `/etc/breeze/`, `0640` for `agent.yaml`, `0600` for `secrets.yaml`
+- [ ] Agent rate limiting enabled (120 req/60s per agent via Redis)
+- [ ] Enrollment keys set with expiry and usage limits
+- [ ] Cross-tenant probe detection enabled — if an agent token is used to access a device in another tenant, the token is automatically suspended and re-enrollment is blocked until an admin reviews the device.
+- [ ] Source-IP tracking active — every heartbeat records the agent's source IP, and an `agent.source.ip.changed` audit event fires when it shifts, surfacing token theft or NAT changes.
+- [ ] Consider enabling [Cloudflare mTLS](/security/mtls/) for zero-trust agent auth
+- [ ] Helper (device) authentication now enforces the full device-credential lifecycle — a suspended agent token, a decommissioned or quarantined device, or a suspended/severed tenant all deny a Helper session with the same opaque response a stale token would get. The Helper's database access context also no longer carries partner-axis write access; it is scoped to its own organization only.
+- [ ] Partner trust review requests require partner-wide manage access (`canManagePartnerWidePolicies`) — an org-scoped caller can no longer request a review on the partner's behalf.
+- [ ] Script parameter values are rendered as data, never code, consistently across bash, PowerShell, and Python interpreter frames on the agent — including nested constructs such as command substitutions, heredocs, and f-string fields. See [Scripts](/features/scripts/) for the full contract, including the contexts a placeholder cannot be used in.
+
+### Outbound Request Safety (SSRF)
+
+- [ ] Outbound integrations (webhooks, DNS providers, SSO discovery) flow through the platform's SSRF guard, which blocks private/loopback ranges and cloud metadata hostnames unless an explicit allowlist entry permits them.
+- [ ] `partners.settings` and `sites.settings` columns are AES-256-GCM encrypted at rest — secrets stored here (provider credentials, integration tokens) never leave the database in plaintext.
+
+### Monitoring
+
+- [ ] Prometheus metrics endpoint protected with bearer token
+- [ ] Alert rules configured for error rates and infrastructure
+- [ ] Audit logging enabled (automatic for all mutating operations)
+- [ ] Log aggregation configured (Loki)
+
+## Firewall Configuration
+
+```bash
+# UFW example
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow ssh
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+# Only if using TURN for WebRTC:
+# sudo ufw allow 3478/tcp
+# sudo ufw allow 3478/udp
+sudo ufw enable
+```
+
+## Audit Logging
+
+All mutating operations are automatically logged with:
+
+| Field | Description |
+|---|---|
+| `actorType` | `user`, `api_key`, `agent`, `system`, or `ai_agent` |
+| `actorId` | User ID or device ID |
+| `action` | Operation performed |
+| `resource` | Target resource type |
+| `resourceId` | Target resource ID |
+| `details` | JSON payload of changes |
+| `ipAddress` | Client IP address |
+| `timestamp` | ISO 8601 timestamp |
+| `checksum` | SHA-256 of the canonical row payload |
+| `prev_checksum` | Checksum of the previous row in this organization's chain |
+
+### Tamper evidence
+
+The `audit_logs` table is **append-only at the database level**. Database triggers refuse `UPDATE`, `DELETE`, and `TRUNCATE` operations against audit rows — not even a superuser can quietly edit history. Each row also carries a `prev_checksum` that links to the previous audit row in the same organization, producing a per-org SHA-256 hash chain. The chain link is **sealed at commit time** under a per-organization advisory lock, so concurrent agent and user writes can no longer fork the chain (a defect that previously produced false-positive verification failures on busy instances). Verifying the chain end-to-end detects any insertion, deletion, or alteration between two timestamps.
+
+Retention pruning is the one legitimate path that removes audit rows, and it works by **prefix-cut**: it deletes the contiguous oldest segment of the chain that has aged past the retention window. There is **no re-anchoring** — the first surviving row simply becomes the new head, and the verifier treats a null `prev_checksum` on the earliest retained row as a pruned prefix rather than a break.
+
+Audit deletion is **isolated by connection-level privilege separation**. The normal API role (`breeze_app`) holds only `SELECT`/`INSERT` on the audit tables; it cannot `UPDATE` or `DELETE` them at all. Retention runs on a separate, dedicated database connection authenticated as `breeze_audit_admin` via `AUDIT_ADMIN_DATABASE_URL`, and even that path additionally requires the `breeze.allow_audit_retention='1'` session GUC. Because the deletion capability lives on a connection the request path never uses, a compromise of the API process cannot reach audit-log destruction. The platform's audit retention worker is the only caller — operators do not run pruning by hand.
+
+Query audit logs via the API:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://breeze.yourdomain.com/api/v1/audit?resource=devices&action=delete"
+```
+
+## Rate Limiting
+
+Breeze implements Redis-backed sliding window rate limiting:
+
+| Endpoint | Limit | Window |
+|---|---|---|
+| Login | 5 attempts | 5 minutes |
+| API (per user) | 100 requests | 60 seconds |
+| Agent (per device) | 120 requests | 60 seconds |
+| Agent (per organization) | `max(600, devices × 12)`, capped at 20,000 | 60 seconds |
+| Enrollment | 10 attempts | 60 seconds |
+
+The per-organization agent limit caps total fleet traffic for any single tenant. It scales with the org's enrolled device count between a floor (`AGENT_ORG_RATE_LIMIT_PER_MIN`, default 600) and a hard platform ceiling (`AGENT_ORG_RATE_LIMIT_MAX`, default 20,000), with the per-device allowance set by `AGENT_ORG_RATE_LIMIT_PER_DEVICE` (default 12). A flat ceiling was previously applied to every tenant regardless of fleet size, which silently dropped patch inventory for larger orgs.
+
+When exceeded, the API returns `429` with `Retry-After: 60` — the full window. It deliberately does not advertise the moment the next slot frees, because under sustained saturation that is almost immediately, which would turn agent backoff into a hot loop. Agents respect the header and back off automatically, adding their own randomized jitter on top so a rejected fleet doesn't retry in lockstep.
+
+Because the organization bucket is shared across every device in the tenant, durable inventory ingest is admitted from a small **reserved lane** worth 20% of the ceiling when the main bucket is exhausted. This prevents constant heartbeat traffic from starving the uploads that carry operator-facing device posture. The reserved endpoints are `patches` (and `patches/pending` / `patches/installed`), `hardware`, `software`, `disks`, `network`, `changes`, `connections`, `eventlogs` and `management/posture` — cadences range from roughly 5 minutes (event logs) to 24 hours (patches and hardware). Higher-frequency traffic (`heartbeat`, `process-sample`, `logs`, `commands`, `sessions`, `security/status`) is deliberately excluded, so it cannot spend the lane it is being throttled against.

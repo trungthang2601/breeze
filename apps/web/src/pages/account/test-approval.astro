@@ -1,0 +1,10 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import AuthOverlay from '../../components/auth/AuthOverlay';
+import TestApprovalPage from '../../components/account/TestApprovalPage';
+---
+
+<Layout titleKey="titles.accountTestApproval">
+  <AuthOverlay client:load />
+  <TestApprovalPage client:load />
+</Layout>

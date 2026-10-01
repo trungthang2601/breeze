@@ -1,0 +1,437 @@
+import { describe, expect, it, vi, beforeEach } from 'vitest';
+
+const getCurrentDbAccessContextMock = vi.hoisted(() => vi.fn(() => undefined as { scope: string } | undefined));
+
+vi.mock('../db', () => ({
+  db: { select: vi.fn(), update: vi.fn() },
+  getCurrentDbAccessContext: getCurrentDbAccessContextMock,
+  runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+}));
+
+vi.mock('../db/schema', () => ({
+  apiKeys: { id: 'apiKeys.id', orgId: 'apiKeys.orgId', status: 'apiKeys.status', updatedAt: 'apiKeys.updatedAt' },
+  devices: {
+    id: 'devices.id',
+    orgId: 'devices.orgId',
+    agentId: 'devices.agentId',
+    agentTokenSuspendedAt: 'devices.agentTokenSuspendedAt',
+    agentTokenSuspendedReason: 'devices.agentTokenSuspendedReason',
+  },
+  enrollmentKeys: { id: 'enrollmentKeys.id', orgId: 'enrollmentKeys.orgId', expiresAt: 'enrollmentKeys.expiresAt' },
+  organizationUsers: { userId: 'organizationUsers.userId', orgId: 'organizationUsers.orgId' },
+  organizations: { id: 'organizations.id', partnerId: 'organizations.partnerId' },
+  partnerUsers: { userId: 'partnerUsers.userId', partnerId: 'partnerUsers.partnerId' },
+}));
+
+vi.mock('../oauth/grantRevocation', () => ({
+  revokeAllOrgOauthArtifacts: vi.fn(async () => ({ grantsRevoked: 0, refreshTokensRevoked: 0 })),
+  revokeAllPartnerOauthArtifacts: vi.fn(async () => ({ grantsRevoked: 0, refreshTokensRevoked: 0 })),
+}));
+
+vi.mock('./permissions', () => ({ clearPermissionCache: vi.fn(async () => undefined) }));
+vi.mock('./tokenRevocation', () => ({ revokeAllUserTokens: vi.fn(async () => undefined) }));
+vi.mock('./tenantStatus', () => ({ invalidateAgentTenantCache: vi.fn(async () => undefined) }));
+
+// Finding #3(b): severAgentCredentialsForOrgIds dynamically imports agentWs to
+// sever live sockets. Default: no connected agents, so the disconnect branch is
+// skipped and the existing revoke/restore tests' db.select ordering is
+// untouched. Individual tests override getConnectedAgentIds to exercise it.
+vi.mock('../routes/agentWs', () => ({
+  disconnectAgent: vi.fn(),
+  getConnectedAgentIds: vi.fn(() => [] as string[]),
+}));
+
+vi.mock('drizzle-orm', () => ({
+  and: vi.fn((...args) => ({ and: args })),
+  eq: vi.fn((l, r) => ({ eq: [l, r] })),
+  inArray: vi.fn((c, vals) => ({ inArray: [c, vals] })),
+  isNull: vi.fn((c) => ({ isNull: c })),
+  isNotNull: vi.fn((c) => ({ isNotNull: c })),
+  gt: vi.fn((l, r) => ({ gt: [l, r] })),
+  or: vi.fn((...args) => ({ or: args })),
+  sql: vi.fn(),
+}));
+
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { apiKeys, devices, enrollmentKeys } from '../db/schema';
+import { invalidateAgentTenantCache } from './tenantStatus';
+import { disconnectAgent, getConnectedAgentIds } from '../routes/agentWs';
+import {
+  ARCHIVE_SUSPENDED_TOKEN_REASON,
+  liftArchiveSuspension,
+  revokeOrganizationTenantAccess,
+  revokePartnerTenantAccess,
+  restoreOrganizationTenantAccess,
+  restorePartnerTenantAccess,
+  suspendOrganizationTenantAccessReversibly,
+} from './tenantLifecycle';
+
+const updateLog: { table: unknown; values: Record<string, unknown>; where: unknown }[] = [];
+let returningByTable: Map<unknown, unknown[]>;
+
+function setupUpdate() {
+  updateLog.length = 0;
+  returningByTable = new Map<unknown, unknown[]>([
+    [apiKeys, [{ id: 'a1' }]],
+    [devices, [{ id: 'd1' }, { id: 'd2' }]],
+    [enrollmentKeys, [{ id: 'k1' }]],
+  ]);
+  // Capture BOTH .set(values) and .where(predicate): the WHERE clause carries
+  // the load-bearing security filters (restore reason-tag isolation, sever
+  // idempotency) — tests must be able to assert on them, or a regression that
+  // drops a predicate would pass silently.
+  vi.mocked(db.update).mockImplementation(
+    (table: any) =>
+      ({
+        set: vi.fn((values: any) => ({
+          where: vi.fn((where: any) => {
+            updateLog.push({ table, values, where });
+            return {
+              returning: vi.fn().mockResolvedValue(returningByTable.get(table) ?? []),
+            };
+          }),
+        })),
+      }) as any
+  );
+}
+
+function queueSelect(rows: unknown[]) {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn(() => ({ where: vi.fn().mockResolvedValue(rows) })),
+  } as any);
+}
+
+// The drizzle-orm mock renders predicates as plain objects:
+//   and(...a) -> {and:a}, eq(l,r) -> {eq:[l,r]}, isNull(c) -> {isNull:c},
+//   inArray(c,v) -> {inArray:[c,v]}, gt(l,r) -> {gt:[l,r]}, or(...a) -> {or:a}.
+// Flatten an `and(...)` predicate's clauses so a specific one can be asserted.
+function andClauses(where: any): any[] {
+  return Array.isArray(where?.and) ? where.and : [where];
+}
+
+describe('tenantLifecycle — agent fleet severance', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getCurrentDbAccessContextMock.mockReturnValue(undefined);
+    setupUpdate();
+  });
+
+  it('revokeOrganizationTenantAccess suspends agent tokens (reason-tagged) and invalidates enrollment keys', async () => {
+    queueSelect([{ userId: 'u1' }]); // organizationUsers
+
+    const result = await revokeOrganizationTenantAccess('org-1');
+
+    const tables = updateLog.map((u) => u.table);
+    expect(tables).toContain(devices);
+    expect(tables).toContain(enrollmentKeys);
+
+    const deviceUpdate = updateLog.find((u) => u.table === devices)!;
+    expect(deviceUpdate.values.agentTokenSuspendedAt).toBeInstanceOf(Date);
+    expect(deviceUpdate.values.agentTokenSuspendedReason).toBe('tenant_suspended');
+    // C2: idempotency predicate — sever must only touch not-already-suspended
+    // devices so it never clobbers a cross-tenant-probe suspension's reason.
+    expect(andClauses(deviceUpdate.where)).toContainEqual({ isNull: 'devices.agentTokenSuspendedAt' });
+
+    const keyUpdate = updateLog.find((u) => u.table === enrollmentKeys)!;
+    expect(keyUpdate.values.expiresAt).toBeInstanceOf(Date);
+
+    expect(invalidateAgentTenantCache).toHaveBeenCalledWith(['org-1']);
+    expect(result.agentTokensSuspended).toBe(2);
+    expect(result.enrollmentKeysInvalidated).toBe(1);
+  });
+
+  it('severs live agent WS sockets for connected devices in a suspended org (Finding #3b)', async () => {
+    queueSelect([{ userId: 'u1' }]); // organizationUsers
+    queueSelect([{ agentId: 'agent-live' }, { agentId: 'agent-offline' }]); // devices in org
+    // Only one of the two devices has a live socket right now.
+    vi.mocked(getConnectedAgentIds).mockReturnValueOnce(['agent-live']);
+
+    await revokeOrganizationTenantAccess('org-1');
+
+    // The connected agent's socket is force-closed immediately (containment is
+    // not deferred to its next auth gate); the offline device is left alone.
+    expect(disconnectAgent).toHaveBeenCalledTimes(1);
+    expect(disconnectAgent).toHaveBeenCalledWith('agent-live', 4001, 'Tenant suspended');
+  });
+
+  it('does not query devices or disconnect when no agents are connected', async () => {
+    queueSelect([{ userId: 'u1' }]); // organizationUsers
+    // getConnectedAgentIds defaults to [] — the disconnect branch is skipped
+    // entirely (no device SELECT is issued).
+    const result = await revokeOrganizationTenantAccess('org-1');
+
+    expect(disconnectAgent).not.toHaveBeenCalled();
+    expect(result.agentTokensSuspended).toBe(2);
+  });
+
+  it('revokePartnerTenantAccess severs agents across every org under the partner', async () => {
+    queueSelect([{ id: 'org-1' }, { id: 'org-2' }]); // organizations under partner
+    queueSelect([{ userId: 'pu1' }]); // partnerUsers
+    queueSelect([{ userId: 'ou1' }]); // org memberships
+
+    const result = await revokePartnerTenantAccess('partner-1');
+
+    const tables = updateLog.map((u) => u.table);
+    expect(tables).toContain(devices);
+    expect(tables).toContain(enrollmentKeys);
+    expect(result.agentTokensSuspended).toBe(2);
+    expect(result.enrollmentKeysInvalidated).toBe(1);
+  });
+
+  it('revokePartnerTenantAccess with no orgs does not touch devices or enrollment keys', async () => {
+    queueSelect([]); // no organizations under the partner
+    queueSelect([{ userId: 'pu1' }]); // partnerUsers
+
+    const result = await revokePartnerTenantAccess('partner-1');
+
+    const tables = updateLog.map((u) => u.table);
+    expect(tables).not.toContain(devices);
+    expect(tables).not.toContain(enrollmentKeys);
+    expect(result.agentTokensSuspended).toBe(0);
+    expect(result.enrollmentKeysInvalidated).toBe(0);
+  });
+
+  it('restoreOrganizationTenantAccess clears ONLY tenant-suspended tokens', async () => {
+    returningByTable.set(devices, [{ id: 'd1' }]);
+
+    const result = await restoreOrganizationTenantAccess('org-1');
+
+    const deviceUpdate = updateLog.find((u) => u.table === devices)!;
+    expect(deviceUpdate.values.agentTokenSuspendedAt).toBeNull();
+    expect(deviceUpdate.values.agentTokenSuspendedReason).toBeNull();
+    // C1: reason-tag isolation — restore must filter on reason='tenant_suspended'
+    // so a 'cross-tenant-probe' suspension is never lifted by reactivation.
+    // Without this assertion the test would pass even if the filter were dropped.
+    expect(andClauses(deviceUpdate.where)).toContainEqual({
+      eq: ['devices.agentTokenSuspendedReason', 'tenant_suspended'],
+    });
+    // Must NOT un-expire enrollment keys.
+    expect(updateLog.some((u) => u.table === enrollmentKeys)).toBe(false);
+    expect(result.agentTokensRestored).toBe(1);
+  });
+
+  it('restorePartnerTenantAccess clears tenant-suspended tokens across partner orgs', async () => {
+    queueSelect([{ id: 'org-1' }, { id: 'org-2' }]);
+    returningByTable.set(devices, [{ id: 'd1' }, { id: 'd2' }, { id: 'd3' }]);
+
+    const result = await restorePartnerTenantAccess('partner-1');
+
+    expect(updateLog.some((u) => u.table === devices)).toBe(true);
+    expect(result.agentTokensRestored).toBe(3);
+  });
+
+  it('archive suspension and lift round-trip only the org_archived reason tag', async () => {
+    returningByTable.set(devices, [{ id: 'd1' }]);
+
+    const suspended = await suspendOrganizationTenantAccessReversibly('org-1');
+    const lifted = await liftArchiveSuspension('org-1');
+
+    const deviceUpdates = updateLog.filter((u) => u.table === devices);
+    expect(deviceUpdates).toHaveLength(2);
+
+    const [suspend, lift] = deviceUpdates;
+    expect(suspend!.values.agentTokenSuspendedAt).toBeInstanceOf(Date);
+    expect(suspend!.values.agentTokenSuspendedReason).toBe(ARCHIVE_SUSPENDED_TOKEN_REASON);
+    expect(andClauses(suspend!.where)).toContainEqual({
+      inArray: ['devices.orgId', ['org-1']],
+    });
+    expect(andClauses(suspend!.where)).toContainEqual({
+      isNull: 'devices.agentTokenSuspendedAt',
+    });
+
+    expect(lift!.values).toEqual({
+      agentTokenSuspendedAt: null,
+      agentTokenSuspendedReason: null,
+    });
+    expect(andClauses(lift!.where)).toContainEqual({
+      inArray: ['devices.orgId', ['org-1']],
+    });
+    expect(andClauses(lift!.where)).toContainEqual({
+      eq: ['devices.agentTokenSuspendedReason', ARCHIVE_SUSPENDED_TOKEN_REASON],
+    });
+
+    expect(updateLog.some((u) => u.table === apiKeys)).toBe(false);
+    expect(updateLog.some((u) => u.table === enrollmentKeys)).toBe(false);
+    expect(suspended.agentTokensSuspended).toBe(1);
+    expect(lifted.agentTokensRestored).toBe(1);
+  });
+
+  // Review fix I-3: archive must not take OWNERSHIP of a suspension it did not
+  // create. It used to re-tag `tenant_suspended` rows to `org_archived`, and
+  // `liftArchiveSuspension` then cleared them on restore — so archive→restore
+  // was a two-call fleet un-suspension for an org suspended for non-payment or
+  // abuse, with the status column overwritten too. Now it only claims devices
+  // that nothing else has suspended.
+  it('archive suspension claims ONLY unsuspended devices — no reason tag is re-tagged', async () => {
+    await suspendOrganizationTenantAccessReversibly('org-1');
+
+    const suspend = updateLog.find((u) => u.table === devices)!;
+    const where = JSON.stringify(suspend.where);
+    expect(where).toContain('agentTokenSuspendedAt');
+    expect(where).not.toContain('tenant_suspended');
+    expect(where).not.toContain('cross_tenant_probe');
+    expect(where).not.toContain('cross-tenant-probe');
+  });
+
+  it('archive suspend/lift reuse an ambient system transaction instead of opening a second connection', async () => {
+    getCurrentDbAccessContextMock.mockReturnValue({ scope: 'system' });
+
+    await suspendOrganizationTenantAccessReversibly('org-1');
+    await liftArchiveSuspension('org-1');
+
+    expect(runOutsideDbContext).not.toHaveBeenCalled();
+    expect(withSystemDbAccessContext).not.toHaveBeenCalled();
+  });
+
+  // #2774 — the offboarding drain must lock users out WITHOUT suspending
+  // agent tokens, or the queued self_uninstall is undeliverable by
+  // construction (the exact bug the drain state exists to fix).
+  describe('agentChannel: drain', () => {
+    it('revokeOrganizationTenantAccess keeps agent tokens but expires enrollment keys', async () => {
+      queueSelect([{ userId: 'u1' }]); // organizationUsers
+
+      const result = await revokeOrganizationTenantAccess('org-1', { agentChannel: 'drain' });
+
+      // The ONLY devices UPDATE is the #2785 unsuspend — never a suspend. Agent
+      // tokens must stay valid for the drain window.
+      const deviceUpdates = updateLog.filter((u) => u.table === devices);
+      expect(deviceUpdates).toHaveLength(1);
+      expect(deviceUpdates[0]!.values.agentTokenSuspendedAt).toBeNull();
+      // Enrollment keys still expire — no NEW devices during a drain.
+      expect(updateLog.some((u) => u.table === enrollmentKeys)).toBe(true);
+      expect(invalidateAgentTenantCache).toHaveBeenCalledWith(['org-1']);
+      expect(result.agentTokensSuspended).toBe(0);
+      expect(result.enrollmentKeysInvalidated).toBe(1);
+    });
+
+    it('drain mode still severs live WS sockets (interactive channel must not survive)', async () => {
+      queueSelect([{ userId: 'u1' }]); // organizationUsers
+      queueSelect([{ agentId: 'agent-live' }]); // devices in org
+      vi.mocked(getConnectedAgentIds).mockReturnValueOnce(['agent-live']);
+
+      await revokeOrganizationTenantAccess('org-1', { agentChannel: 'drain' });
+
+      expect(disconnectAgent).toHaveBeenCalledWith('agent-live', 4001, 'Tenant offboarding');
+    });
+
+    it('revokePartnerTenantAccess drain mode keeps agent tokens across partner orgs', async () => {
+      queueSelect([{ id: 'org-1' }, { id: 'org-2' }]); // organizations under partner
+      queueSelect([{ userId: 'pu1' }]); // partnerUsers
+      queueSelect([{ userId: 'ou1' }]); // org memberships
+
+      const result = await revokePartnerTenantAccess('partner-1', { agentChannel: 'drain' });
+
+      const deviceUpdates = updateLog.filter((u) => u.table === devices);
+      expect(deviceUpdates).toHaveLength(1);
+      expect(deviceUpdates[0]!.values.agentTokenSuspendedAt).toBeNull();
+      expect(updateLog.some((u) => u.table === enrollmentKeys)).toBe(true);
+      expect(result.agentTokensSuspended).toBe(0);
+    });
+
+    // #2785 — entering the drain from suspended/churned. agentAuthMiddleware
+    // 401s on devices.agentTokenSuspendedAt BEFORE it reaches the drain
+    // narrowing, so a drain that leaves a prior sever's suspension in place
+    // queues self_uninstalls that can never be delivered.
+    describe('#2785 supersedes a prior token suspension', () => {
+      it('clears the tenant-suspension so the queued self_uninstall is deliverable', async () => {
+        queueSelect([{ userId: 'u1' }]); // organizationUsers
+        returningByTable.set(devices, [{ id: 'd1' }, { id: 'd2' }]);
+
+        await revokeOrganizationTenantAccess('org-1', { agentChannel: 'drain' });
+
+        const deviceUpdate = updateLog.find((u) => u.table === devices)!;
+        expect(deviceUpdate.values.agentTokenSuspendedAt).toBeNull();
+        expect(deviceUpdate.values.agentTokenSuspendedReason).toBeNull();
+      });
+
+      it('scopes the unsuspend to the draining orgs AND the tenant_suspended reason tag', async () => {
+        queueSelect([{ userId: 'u1' }]); // organizationUsers
+
+        await revokeOrganizationTenantAccess('org-1', { agentChannel: 'drain' });
+
+        const deviceUpdate = updateLog.find((u) => u.table === devices)!;
+        const clauses = andClauses(deviceUpdate.where);
+        // Tenant isolation: only the orgs being drained.
+        expect(clauses).toContainEqual({ inArray: ['devices.orgId', ['org-1']] });
+        // Reason-tag isolation: a cross-tenant-probe (or any other) suspension
+        // must survive the transition. Dropping this predicate would turn the
+        // drain into a fleet-wide unsuspend — assert it explicitly.
+        expect(clauses).toContainEqual({
+          eq: ['devices.agentTokenSuspendedReason', 'tenant_suspended'],
+        });
+        // ...and the UPDATE writes nothing beyond lifting the suspension.
+        expect(Object.keys(deviceUpdate.values).sort()).toEqual([
+          'agentTokenSuspendedAt',
+          'agentTokenSuspendedReason',
+        ]);
+      });
+
+      it('never writes a suspension timestamp in drain mode', async () => {
+        queueSelect([{ userId: 'u1' }]); // organizationUsers
+
+        await revokeOrganizationTenantAccess('org-1', { agentChannel: 'drain' });
+
+        for (const update of updateLog.filter((u) => u.table === devices)) {
+          expect(update.values.agentTokenSuspendedAt).toBeNull();
+          expect(update.values.agentTokenSuspendedReason).toBeNull();
+        }
+      });
+
+      it('lifts the suspension AFTER the socket sever, before the final cache drop', async () => {
+        const order: string[] = [];
+        queueSelect([{ userId: 'u1' }]); // organizationUsers
+        queueSelect([{ agentId: 'agent-live' }]); // devices in org (socket sweep)
+        vi.mocked(getConnectedAgentIds).mockReturnValueOnce(['agent-live']);
+        // ...Once variants so these implementations can't leak into later tests
+        // (vi.clearAllMocks in beforeEach clears calls, not implementations).
+        vi.mocked(disconnectAgent).mockImplementationOnce(() => {
+          order.push('disconnect');
+          return 'closed';
+        });
+        const recordInvalidate = async () => {
+          order.push('invalidate');
+        };
+        vi.mocked(invalidateAgentTenantCache)
+          .mockImplementationOnce(recordInvalidate)
+          .mockImplementationOnce(recordInvalidate);
+        const baseUpdate = vi.mocked(db.update).getMockImplementation()!;
+        vi.mocked(db.update).mockImplementation((table: any) => {
+          if (table === devices) order.push('unsuspend');
+          return baseUpdate(table);
+        });
+
+        await revokeOrganizationTenantAccess('org-1', { agentChannel: 'drain' });
+
+        // Restore must not re-open the auth gate before live sockets are torn
+        // down, and the cache invalidation stays the LAST write (in drain mode
+        // the cache IS the narrowing gate).
+        expect(order.indexOf('unsuspend')).toBeGreaterThan(order.indexOf('disconnect'));
+        expect(order[order.length - 1]).toBe('invalidate');
+      });
+
+      it('partner drain lifts suspensions across every org under the partner', async () => {
+        queueSelect([{ id: 'org-1' }, { id: 'org-2' }]); // organizations under partner
+        queueSelect([{ userId: 'pu1' }]); // partnerUsers
+        queueSelect([{ userId: 'ou1' }]); // org memberships
+
+        await revokePartnerTenantAccess('partner-1', { agentChannel: 'drain' });
+
+        const clauses = andClauses(updateLog.find((u) => u.table === devices)!.where);
+        expect(clauses).toContainEqual({ inArray: ['devices.orgId', ['org-1', 'org-2']] });
+        expect(clauses).toContainEqual({
+          eq: ['devices.agentTokenSuspendedReason', 'tenant_suspended'],
+        });
+      });
+
+      it('drain with no orgs under the partner touches no devices', async () => {
+        queueSelect([]); // organizations under partner
+        queueSelect([{ userId: 'pu1' }]); // partnerUsers
+
+        await revokePartnerTenantAccess('partner-1', { agentChannel: 'drain' });
+
+        expect(updateLog.some((u) => u.table === devices)).toBe(false);
+      });
+    });
+  });
+});

@@ -1,0 +1,398 @@
+import {
+  createRoutingRuleSchema, updateRoutingRuleSchema, upsertDefaultRowSchema,
+  getRoutingRuleWithAccess, routingSiteIds, canAccessRoutingSites,
+} from '../../services/delivery/railContracts';
+export {
+  createRoutingRuleSchema, updateRoutingRuleSchema, upsertDefaultRowSchema,
+  getRoutingRuleWithAccess, routingSiteIds, canAccessRoutingSites,
+} from '../../services/delivery/railContracts';
+import { Hono } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { z } from 'zod';
+import { db } from '../../db';
+import { notificationRoutingRules } from '../../db/schema';
+import { eq, and, asc, inArray, isNull, or } from 'drizzle-orm';
+import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { writeRouteAudit } from '../../services/auditEvents';
+import { ensureOrgAccess, resolveWriteOrgId } from './helpers';
+import {
+  canManagePartnerWidePolicies,
+  PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+} from '../../services/partnerWideAccess';
+import { PERMISSIONS } from '../../services/permissions';
+
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../../services/siteCeilingAccess';
+import {
+  DeliveryWriteError,
+  assertDefaultRowPatch,
+  escalationPolicyCompatible,
+  upsertDefaultRow,
+} from '../../services/delivery/routingRuleWrites';
+
+const listRoutingRulesSchema = z.object({
+  orgId: z.string().guid().optional(),
+});
+
+const ESCALATION_POLICY_AXIS_MESSAGE = 'Escalation policy is not available to this rule owner';
+
+export const routingRoutes = new Hono();
+
+const requireAlertRead = requirePermission(PERMISSIONS.ALERTS_READ.resource, PERMISSIONS.ALERTS_READ.action);
+const requireAlertWrite = requirePermission(PERMISSIONS.ALERTS_WRITE.resource, PERMISSIONS.ALERTS_WRITE.action);
+
+routingRoutes.get(
+  '/routing-rules',
+  requireScope('organization', 'partner', 'system'),
+  requireAlertRead,
+  zValidator('query', listRoutingRulesSchema),
+  async (c) => {
+    try {
+      const auth = c.get('auth');
+      const query = c.req.valid('query');
+
+      // Scope the listing the same way GET /alerts/channels does so the page
+      // can load without a specific org selected. Org-scoped users are pinned to
+      // their own org; partner/system users honour an explicit ?orgId= and
+      // otherwise fall back to all accessible orgs. A clean tenant with no rules
+      // (or a partner with no accessible orgs) returns an empty list — never 400.
+      let orgFilter;
+      if (auth.scope === 'organization') {
+        if (!auth.orgId) {
+          return c.json({ error: 'Organization context required' }, 403);
+        }
+        orgFilter = eq(notificationRoutingRules.orgId, auth.orgId);
+      } else if (query.orgId) {
+        if (!ensureOrgAccess(query.orgId, auth)) {
+          return c.json({ error: 'Access to this organization denied' }, 403);
+        }
+        // Per-org view must also surface this partner's own partner-wide
+        // rules (org_id NULL, #2130) — they apply to every org under the
+        // partner, including this one (sweep 2026-09-08 G6-4). Org-scoped
+        // callers never take this branch: an org token carries a partnerId
+        // too, but must not see partner-wide rows at the app layer (RLS is
+        // stricter than the app layer here; never claim parity) — the
+        // `auth.scope === 'organization'` arm above already returned before
+        // reaching here, so this branch only runs for partner/system scope.
+        const orgCondition = eq(notificationRoutingRules.orgId, query.orgId);
+        const partnerCondition = auth.scope === 'partner' && auth.partnerId
+          ? and(isNull(notificationRoutingRules.orgId), eq(notificationRoutingRules.partnerId, auth.partnerId))
+          : undefined;
+        orgFilter = partnerCondition ? or(orgCondition, partnerCondition) : orgCondition;
+      } else if (auth.scope === 'partner') {
+        // "All orgs" view: org-owned rules across accessible orgs PLUS this
+        // partner's own partner-wide rules (org_id NULL, #2130).
+        const orgIds = auth.accessibleOrgIds ?? [];
+        const orgCondition = orgIds.length > 0
+          ? inArray(notificationRoutingRules.orgId, orgIds)
+          : undefined;
+        const partnerCondition = auth.partnerId
+          ? and(isNull(notificationRoutingRules.orgId), eq(notificationRoutingRules.partnerId, auth.partnerId))
+          : undefined;
+        orgFilter = orgCondition && partnerCondition
+          ? or(orgCondition, partnerCondition)
+          : (orgCondition ?? partnerCondition);
+        if (!orgFilter) {
+          return c.json({ data: [] });
+        }
+      }
+      // system scope with no orgId falls through to no filter (sees all rules);
+      // RLS still constrains what breeze_app can read.
+
+      const rules = await db
+        .select()
+        .from(notificationRoutingRules)
+        .where(orgFilter)
+        .orderBy(asc(notificationRoutingRules.priority));
+
+      const visibleRules = auth.allowedSiteIds === undefined
+        ? rules
+        : (await Promise.all(rules.map(async (rule) => ({
+          rule,
+          visible: await canAccessRoutingSites(
+            auth,
+            { orgId: rule.orgId, partnerId: rule.partnerId },
+            routingSiteIds(rule.conditions),
+            false
+          ),
+        })))).filter(({ visible }) => visible).map(({ rule }) => rule);
+
+      return c.json({ data: visibleRules });
+    } catch (error) {
+      console.error('[RoutingRules] Failed to list routing rules', error);
+      return c.json({ error: 'Failed to list routing rules' }, 500);
+    }
+  }
+);
+
+routingRoutes.post(
+  '/routing-rules',
+  requireScope('organization', 'partner', 'system'),
+  requireAlertWrite,
+  requireMfa(),
+  zValidator('json', createRoutingRuleSchema),
+  async (c) => {
+    try {
+      const auth = c.get('auth');
+      const data = c.req.valid('json');
+
+      // Resolve the ownership axis (#2130): partner-wide creation requires
+      // the partner-wide capability; the default path stays org-owned.
+      let owner: { orgId: string | null; partnerId: string | null };
+      if (data.ownerScope === 'partner') {
+        if (!canManagePartnerWidePolicies(auth) || !auth.partnerId) {
+          return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+        }
+        owner = { orgId: null, partnerId: auth.partnerId };
+      } else {
+        const resolved = resolveWriteOrgId(auth, c.req.query('orgId'));
+        if (resolved.error) {
+          return c.json({ error: resolved.error }, resolved.status ?? 400);
+        }
+        owner = { orgId: resolved.orgId!, partnerId: null };
+      }
+
+      const canAccessSites = await canAccessRoutingSites(
+        auth,
+        owner,
+        routingSiteIds(data.conditions),
+        true
+      );
+      if (!canAccessSites) {
+        return c.json({ error: 'Routing rule sites are outside your permitted sites' }, 403);
+      }
+
+      if (data.escalationPolicyId && !(await escalationPolicyCompatible(data.escalationPolicyId, owner))) {
+        return c.json({ error: ESCALATION_POLICY_AXIS_MESSAGE }, 400);
+      }
+
+      const [rule] = await db
+        .insert(notificationRoutingRules)
+        .values({
+          orgId: owner.orgId,
+          partnerId: owner.partnerId,
+          name: data.name,
+          priority: data.priority,
+          conditions: data.conditions,
+          channelIds: data.channelIds,
+          enabled: data.enabled,
+          escalationPolicyId: data.escalationPolicyId ?? null,
+          isDefault: false,
+        })
+        .returning();
+
+      writeRouteAudit(c, {
+        orgId: owner.orgId,
+        action: 'notification_routing_rule.create',
+        resourceType: 'notification_routing_rule',
+        resourceId: rule?.id,
+        resourceName: data.name,
+        details: { priority: data.priority, channelCount: data.channelIds.length },
+      });
+
+      return c.json({ data: rule }, 201);
+    } catch (error) {
+      console.error('[RoutingRules] Failed to create routing rule', error);
+      return c.json({ error: 'Failed to create routing rule' }, 500);
+    }
+  }
+);
+
+// Import canMutateOrgWideGovernance and SITE_CEILING_WRITE_DENIED_MESSAGE
+// from '../../services/siteCeilingAccess'. The shared writer repeats this guard.
+// PUT /alerts/routing-rules/default — upsert the axis's "Everything else" row.
+// An org token writes its org row (which shadows the partner's for that org);
+// a partner-scoped caller writes the partner row with ownerScope 'partner' or
+// an org row with ?orgId=.
+routingRoutes.put(
+  '/routing-rules/default',
+  requireScope('organization', 'partner', 'system'),
+  requireAlertWrite,
+  requireMfa(),
+  zValidator('json', upsertDefaultRowSchema),
+  async (c) => {
+    try {
+      const auth = c.get('auth');
+      if (!canMutateOrgWideGovernance(auth)) return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+      const data = c.req.valid('json');
+      let owner: { orgId: string | null; partnerId: string | null };
+      if (data.ownerScope === 'partner') {
+        if (!canManagePartnerWidePolicies(auth) || !auth.partnerId) {
+          return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+        }
+        owner = { orgId: null, partnerId: auth.partnerId };
+      } else {
+        const resolved = resolveWriteOrgId(auth, c.req.query('orgId'));
+        if (resolved.error) {
+          return c.json({ error: resolved.error }, resolved.status ?? 400);
+        }
+        owner = { orgId: resolved.orgId!, partnerId: null };
+      }
+      if (data.escalationPolicyId && !(await escalationPolicyCompatible(data.escalationPolicyId, owner))) {
+        return c.json({ error: ESCALATION_POLICY_AXIS_MESSAGE }, 400);
+      }
+      const row = await upsertDefaultRow(owner, { channelIds: data.channelIds, escalationPolicyId: data.escalationPolicyId ?? null }, auth);
+      writeRouteAudit(c, {
+        orgId: owner.orgId,
+        action: 'notification_routing_rule.default_upsert',
+        resourceType: 'notification_routing_rule',
+        resourceId: row.id,
+        resourceName: row.name,
+        details: { channelCount: data.channelIds.length, inboxOnly: data.channelIds.length === 0 },
+      });
+      return c.json({ data: row });
+    } catch (error) {
+      if (error instanceof DeliveryWriteError) return c.json({ error: error.message }, error.status);
+      console.error('[RoutingRules] Failed to upsert default routing row', error);
+      return c.json({ error: 'Failed to save the Everything else row' }, 500);
+    }
+  }
+);
+
+routingRoutes.patch(
+  '/routing-rules/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAlertWrite,
+  requireMfa(),
+  zValidator('json', updateRoutingRuleSchema),
+  async (c) => {
+    try {
+      const auth = c.get('auth');
+      const ruleId = c.req.param('id')!;
+      const updates = c.req.valid('json');
+
+      const existing = await getRoutingRuleWithAccess(ruleId, auth);
+      if (!existing) {
+        return c.json({ error: 'Routing rule not found' }, 404);
+      }
+
+      // Partner-wide routing rules are administrable only with the
+      // partner-wide capability (#2130).
+      if (existing.orgId === null && !canManagePartnerWidePolicies(auth)) {
+        return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      }
+
+      if (existing.isDefault) {
+        if (!canMutateOrgWideGovernance(auth)) return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+        try {
+          assertDefaultRowPatch(updates);
+        } catch (err) {
+          if (err instanceof DeliveryWriteError) return c.json({ error: err.message }, err.status);
+          throw err;
+        }
+      } else if (updates.channelIds !== undefined && updates.channelIds.length === 0) {
+        return c.json({ error: 'channelIds must contain at least one channel' }, 400);
+      }
+      if (updates.escalationPolicyId && !(await escalationPolicyCompatible(updates.escalationPolicyId, { orgId: existing.orgId, partnerId: existing.partnerId }))) {
+        return c.json({ error: ESCALATION_POLICY_AXIS_MESSAGE }, 400);
+      }
+
+      const owner = { orgId: existing.orgId, partnerId: existing.partnerId };
+      const canAccessExistingSites = await canAccessRoutingSites(
+        auth,
+        owner,
+        routingSiteIds(existing.conditions),
+        true
+      );
+      if (!canAccessExistingSites) {
+        return c.json({ error: 'Routing rule sites are outside your permitted sites' }, 403);
+      }
+      if (updates.conditions !== undefined) {
+        const canAccessUpdatedSites = await canAccessRoutingSites(
+          auth,
+          owner,
+          routingSiteIds(updates.conditions),
+          true
+        );
+        if (!canAccessUpdatedSites) {
+          return c.json({ error: 'Routing rule sites are outside your permitted sites' }, 403);
+        }
+      }
+
+      const setValues: Record<string, unknown> = { updatedAt: new Date() };
+      if (updates.name !== undefined) setValues.name = updates.name;
+      if (updates.priority !== undefined) setValues.priority = updates.priority;
+      if (updates.conditions !== undefined) setValues.conditions = updates.conditions;
+      if (updates.channelIds !== undefined) setValues.channelIds = updates.channelIds;
+      if (updates.enabled !== undefined) setValues.enabled = updates.enabled;
+      if (updates.escalationPolicyId !== undefined) setValues.escalationPolicyId = updates.escalationPolicyId;
+
+      const [updated] = await db
+        .update(notificationRoutingRules)
+        .set(setValues)
+        .where(eq(notificationRoutingRules.id, ruleId))
+        .returning();
+
+      writeRouteAudit(c, {
+        orgId: existing.orgId,
+        action: 'notification_routing_rule.update',
+        resourceType: 'notification_routing_rule',
+        resourceId: ruleId,
+        resourceName: updated?.name ?? existing.name,
+        details: { updatedFields: Object.keys(updates) },
+      });
+
+      return c.json({ data: updated });
+    } catch (error) {
+      console.error('[RoutingRules] Failed to update routing rule', error);
+      return c.json({ error: 'Failed to update routing rule' }, 500);
+    }
+  }
+);
+
+routingRoutes.delete(
+  '/routing-rules/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAlertWrite,
+  requireMfa(),
+  async (c) => {
+    try {
+      const auth = c.get('auth');
+      const ruleId = c.req.param('id')!;
+
+      const existing = await getRoutingRuleWithAccess(ruleId, auth);
+      if (!existing) {
+        return c.json({ error: 'Routing rule not found' }, 404);
+      }
+
+      // Partner-wide routing rules are administrable only with the
+      // partner-wide capability (#2130).
+      if (existing.orgId === null && !canManagePartnerWidePolicies(auth)) {
+        return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      }
+
+      if (existing.isDefault) {
+        if (existing.orgId === null) {
+          return c.json({ error: "The partner's Everything else row cannot be deleted; empty its channels for inbox only" }, 409);
+        }
+        if (!canMutateOrgWideGovernance(auth)) return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+      }
+
+      const canAccessExistingSites = await canAccessRoutingSites(
+        auth,
+        { orgId: existing.orgId, partnerId: existing.partnerId },
+        routingSiteIds(existing.conditions),
+        true
+      );
+      if (!canAccessExistingSites) {
+        return c.json({ error: 'Routing rule sites are outside your permitted sites' }, 403);
+      }
+
+      await db.delete(notificationRoutingRules).where(
+        eq(notificationRoutingRules.id, ruleId)
+      );
+
+      writeRouteAudit(c, {
+        orgId: existing.orgId,
+        action: 'notification_routing_rule.delete',
+        resourceType: 'notification_routing_rule',
+        resourceId: existing.id,
+        resourceName: existing.name,
+      });
+
+      return c.json({ data: { id: ruleId, deleted: true } });
+    } catch (error) {
+      console.error('[RoutingRules] Failed to delete routing rule', error);
+      return c.json({ error: 'Failed to delete routing rule' }, 500);
+    }
+  }
+);

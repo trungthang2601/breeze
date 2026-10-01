@@ -1,0 +1,180 @@
+import { and, eq, inArray, isNull } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { oauthGrants, oauthRefreshTokens } from '../db/schema';
+import { revokeGrantsDurablyInCurrentDbContext } from './grantStatus';
+import { writeOAuthRevocationMarkerDurably } from './revocationRetry';
+import { ACCESS_TOKEN_TTL_SECONDS } from './provider';
+import { ERROR_IDS, logOauthError } from './log';
+
+export interface UserOauthRevocationResult {
+  grantsRevoked: number;
+  refreshTokensRevoked: number;
+  jtisRevoked: number;
+}
+
+async function revokeOauthArtifactsByColumn(
+  target: 'user' | 'partner' | 'org',
+  value: string,
+  logContextKey: 'userId' | 'partnerId' | 'orgId',
+): Promise<{ result: UserOauthRevocationResult; retryQueued: boolean }> {
+  const refreshColumn = target === 'user'
+    ? oauthRefreshTokens.userId
+    : target === 'partner'
+      ? oauthRefreshTokens.partnerId
+      : oauthRefreshTokens.orgId;
+  const grantColumn = target === 'user'
+    ? oauthGrants.accountId
+    : target === 'partner'
+      ? oauthGrants.partnerId
+      : oauthGrants.orgId;
+
+  const tokens = await db
+    .select({
+      id: oauthRefreshTokens.id,
+      userId: oauthRefreshTokens.userId,
+      expiresAt: oauthRefreshTokens.expiresAt,
+    })
+    .from(oauthRefreshTokens)
+    .where(and(eq(refreshColumn, value), isNull(oauthRefreshTokens.revokedAt)));
+
+  const now = new Date();
+  const seenGrants = new Set<string>();
+  let jtisRevoked = 0;
+  let refreshTokensRevoked = 0;
+  let retryQueued = false;
+
+  for (const token of tokens) {
+    await db
+      .update(oauthRefreshTokens)
+      .set({ revokedAt: now })
+      .where(eq(oauthRefreshTokens.id, token.id));
+    refreshTokensRevoked += 1;
+
+    // Key the jti marker on the token ROW id, never on payload.jti — Task 3
+    // removes jti from the refresh payload, so payload is no longer a reliable
+    // discovery source. The row id (its digest) is the authoritative token id.
+    const expiresAt = new Date(token.expiresAt);
+    const result = await writeOAuthRevocationMarkerDurably(db, {
+      userId: token.userId,
+      markerType: 'jti',
+      markerId: token.id,
+      expiresAt,
+    });
+    if (result.status === 'written') {
+      jtisRevoked += 1;
+    } else {
+      retryQueued = true;
+      logOauthError({
+        errorId: ERROR_IDS.OAUTH_REVOCATION_CACHE_WRITE_FAILED,
+        message: 'tenant-lifecycle jti marker queued for retry',
+        context: { markerType: 'jti', errorCode: result.errorCode, [logContextKey]: value },
+      });
+    }
+  }
+
+  // Grant discovery is authoritative from oauth_grants — never from refresh
+  // payload grantIds. This is what makes code-only grants (no refresh row)
+  // still get a revocation marker. Already-revoked grants are skipped so a
+  // repeat call is a no-op (matches revocationService.ts).
+  const grants = await db
+    .select({ id: oauthGrants.id, accountId: oauthGrants.accountId })
+    .from(oauthGrants)
+    .where(and(eq(grantColumn, value), isNull(oauthGrants.revokedAt)));
+
+  for (const grant of grants) {
+    if (seenGrants.has(grant.id)) continue;
+    seenGrants.add(grant.id);
+    const result = await writeOAuthRevocationMarkerDurably(db, {
+      userId: grant.accountId,
+      markerType: 'grant',
+      markerId: grant.id,
+      expiresAt: new Date(Date.now() + ACCESS_TOKEN_TTL_SECONDS * 1000),
+    });
+    if (result.status === 'retry_queued') {
+      retryQueued = true;
+      logOauthError({
+        errorId: ERROR_IDS.OAUTH_REVOCATION_CACHE_WRITE_FAILED,
+        message: 'tenant-lifecycle grant marker queued for retry',
+        context: { markerType: 'grant', errorCode: result.errorCode, [logContextKey]: value },
+      });
+    }
+  }
+
+  // Stamp revoked_at AFTER every marker write succeeded (fail closed, same
+  // ordering as revocationService.ts): a stamped-but-unmarked grant would look
+  // revoked in the DB while its in-flight access JWTs kept working.
+  if (seenGrants.size > 0) {
+    await revokeGrantsDurablyInCurrentDbContext({
+      grantIds: [...seenGrants],
+      reason: `tenant-lifecycle:${target}`,
+      now,
+    });
+  }
+
+  return {
+    result: {
+      grantsRevoked: seenGrants.size,
+      refreshTokensRevoked,
+      jtisRevoked,
+    },
+    retryQueued,
+  };
+}
+
+function inExplicitSystemContext<T>(fn: () => Promise<T>): Promise<T> {
+  return runOutsideDbContext(() => withSystemDbAccessContext(fn));
+}
+
+/**
+ * Revoke ALL OAuth artifacts belonging to a user. Used when a user is
+ * suspended/disabled so every active access JWT, refresh token, and Grant is
+ * killed immediately rather than surviving until natural expiry.
+ *
+ * Mechanics (grants-driven discovery):
+ *   1. Stamp `revokedAt` on every non-revoked refresh token row for the user.
+ *   2. For each refresh token, write a jti marker keyed on the token ROW id
+ *      (not payload.jti — Task 3 removes it) so bearer middleware rejects any
+ *      in-flight access JWT.
+ *   3. Write a grant-level marker for every Grant row discovered from the
+ *      authoritative oauth_grants table, so code-only grants (auth-code access
+ *      tokens with no refresh row) are also rejected. Once every marker is
+ *      written, stamp `revoked_at` on those grant rows so revocation survives
+ *      marker expiry / Redis loss (durability parity with revocationService).
+ *
+ * We intentionally do NOT delete the oauth_grants / oauth_refresh_tokens rows:
+ * keeping them simplifies audit trail and matches what `connectedApps.ts`
+ * does (stamp `revokedAt`, not DELETE). The oidc-provider adapter will treat
+ * revoked rows as expired.
+ *
+ * Any cache write failure bubbles up — callers must treat this as a hard
+ * failure (suspension is only half-done otherwise).
+ */
+export async function revokeAllUserOauthArtifacts(userId: string): Promise<UserOauthRevocationResult> {
+  const outcome = await inExplicitSystemContext(() =>
+    revokeOauthArtifactsByColumn('user', userId, 'userId'),
+  );
+  if (outcome.retryQueued) {
+    throw new Error('OAuth revocation cache unavailable; durable retry queued');
+  }
+  return outcome.result;
+}
+
+export async function revokeAllPartnerOauthArtifacts(partnerId: string): Promise<UserOauthRevocationResult> {
+  const outcome = await inExplicitSystemContext(() =>
+    revokeOauthArtifactsByColumn('partner', partnerId, 'partnerId'),
+  );
+  if (outcome.retryQueued) {
+    throw new Error('OAuth revocation cache unavailable; durable retry queued');
+  }
+  return outcome.result;
+}
+
+export async function revokeAllOrgOauthArtifacts(orgId: string): Promise<UserOauthRevocationResult> {
+  const outcome = await inExplicitSystemContext(() =>
+    revokeOauthArtifactsByColumn('org', orgId, 'orgId'),
+  );
+  if (outcome.retryQueued) {
+    throw new Error('OAuth revocation cache unavailable; durable retry queued');
+  }
+  return outcome.result;
+}

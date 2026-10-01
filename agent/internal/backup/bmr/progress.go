@@ -1,0 +1,251 @@
+package bmr
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// ProgressUpdate is one phase-progress report posted to
+// POST /api/v1/backup/bmr/recover/progress during a token-driven bare-metal
+// recovery (W04a). See plan
+// docs/superpowers/plans/backup/2026-09-10-bare-metal-w04a-recovery-codes-state-machine-checkin.md
+// Task 3/6 and apps/api/src/routes/backup/schemas.ts bmrProgressSchema.
+type ProgressUpdate struct {
+	Status   string         `json:"status"` // media_booted|planned|restoring|validated|rebooted|failed|refused
+	Target   map[string]any `json:"target,omitempty"`
+	Plan     any            `json:"plan,omitempty"`
+	Result   any            `json:"result,omitempty"`
+	Reason   string         `json:"reason,omitempty"`
+	Warnings []string       `json:"warnings,omitempty"`
+}
+
+// ProgressConflictError is returned when the server rejects a progress post
+// as an invalid state transition (409 invalid_transition) — e.g. two
+// concurrent reporters (the console and the helper) racing a phase.
+type ProgressConflictError struct {
+	From string
+	To   string
+}
+
+func (e *ProgressConflictError) Error() string {
+	return fmt.Sprintf("bmr: invalid recovery transition from %q to %q", e.From, e.To)
+}
+
+const (
+	progressMaxRetries  = 3
+	progressRequestPath = "/api/v1/backup/bmr/recover/progress"
+
+	// Caps mirror the server schema (apps/api/src/routes/backup/schemas.ts
+	// bmrProgressSchema) and w09-part0.md's Global Constraint "Bounded
+	// reporting": warnings <= 64 entries x 2000 chars, reason <= 2000
+	// chars, failedFilesSample <= 50 entries, serialized body <= 768 KiB
+	// (server body limit is 1 MiB).
+	maxProgressReasonRunes  = 2000
+	maxProgressWarnings     = 64
+	maxProgressWarningRunes = 2000
+	maxProgressFailedSample = 50
+	maxProgressBodyBytes    = 768 * 1024
+)
+
+// boundedFailures lets BoundProgressUpdate trim a typed Result (e.g.
+// *rebuild.Result) without bmr importing rebuild — rebuild already imports
+// bmr, so the reverse import would be a cycle. rebuild.Result implements
+// this via FailedFilesLen/CloneWithTrimmedFailedFiles.
+type boundedFailures interface {
+	FailedFilesLen() int
+	CloneWithTrimmedFailedFiles(max int) any
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+// BoundProgressUpdate applies the caps this wave's Global Constraints
+// require (warnings <= 64 x 2000 chars, reason <= 2000 chars,
+// failedFilesSample <= 50 entries, serialized body <= 768 KiB) before a
+// ProgressUpdate is posted. It never mutates the caller's u.
+func BoundProgressUpdate(u ProgressUpdate) ProgressUpdate {
+	bounded := u
+	bounded.Reason = truncateRunes(u.Reason, maxProgressReasonRunes)
+
+	if len(u.Warnings) > 0 {
+		n := len(u.Warnings)
+		if n > maxProgressWarnings {
+			n = maxProgressWarnings
+		}
+		warnings := make([]string, n)
+		for i := 0; i < n; i++ {
+			warnings[i] = truncateRunes(u.Warnings[i], maxProgressWarningRunes)
+		}
+		bounded.Warnings = warnings
+	}
+
+	// Every real production call site passes a typed *rebuild.Result, never
+	// a map[string]any — the map branch below only covers the legacy path.
+	// Trim on a COPY, never the caller's pointer. CloneWithTrimmedFailedFiles
+	// is called unconditionally (not gated on FailedFilesLen() alone) since
+	// it also bounds Warnings/Error/Refusal (review finding #2): a Result
+	// whose FailedFilesSample is already <= maxProgressFailedSample (it is
+	// always capped to 50 at construction by restore_tree.go) but whose
+	// Warnings carries one entry per failed file still needs trimming, and
+	// a no-op trim on an already-small Result is cheap.
+	switch v := u.Result.(type) {
+	case boundedFailures:
+		bounded.Result = v.CloneWithTrimmedFailedFiles(maxProgressFailedSample)
+	case map[string]any:
+		if sample, ok := v["failedFilesSample"].([]string); ok && len(sample) > maxProgressFailedSample {
+			trimmed := make(map[string]any, len(v))
+			for k, val := range v {
+				trimmed[k] = val
+			}
+			trimmed["failedFilesSample"] = sample[:maxProgressFailedSample]
+			bounded.Result = trimmed
+		}
+	}
+
+	body, err := json.Marshal(bounded)
+	if err == nil && len(body) <= maxProgressBodyBytes {
+		return bounded
+	}
+
+	// Still too large (e.g. the failedFilesSample entries themselves are
+	// individually huge, or Result carries something else bulky) — fall
+	// back to a minimal, always-small summary rather than posting an
+	// oversized body the 1 MiB server limit would reject outright. Must
+	// read from a typed *rebuild.Result too (review finding #2) — not
+	// only from the legacy map[string]any shape — otherwise every
+	// production caller (which always passes a typed Result) degrades to
+	// a bare {"status","truncated":true} here, losing filesFailed and the
+	// failed-file sample even though bounded.Result (already trimmed
+	// above) would have fit comfortably.
+	summary := map[string]any{"status": bounded.Status, "truncated": true}
+	switch m := u.Result.(type) {
+	case map[string]any:
+		for _, k := range []string{"status", "error", "refusal", "filesFailed"} {
+			if v, present := m[k]; present {
+				summary[k] = v
+			}
+		}
+	default:
+		if sf, ok := bounded.Result.(resultSummaryFields); ok {
+			for k, v := range sf.SummaryFields() {
+				summary[k] = v
+			}
+		}
+	}
+	bounded.Result = summary
+	return bounded
+}
+
+// resultSummaryFields lets the last-resort fallback above pull a handful
+// of scalar fields (filesFailed, failedFilesOmitted, error, refusal) out
+// of a typed Result even when the full trimmed clone still didn't fit
+// under maxProgressBodyBytes — mirrors the boundedFailures seam (bmr
+// cannot import rebuild).
+type resultSummaryFields interface {
+	SummaryFields() map[string]any
+}
+
+// progressRetryDelay is a var (not const) so tests can shrink it to 0 —
+// see setProgressRetryDelayForTest in progress_test.go.
+var progressRetryDelay = 2 * time.Second
+
+// PostRecoveryProgress posts one phase-progress update. A 409
+// invalid_transition response is returned as *ProgressConflictError
+// (informational — the caller should not retry it, the transition is
+// simply not going to become valid). Other non-2xx responses and network
+// errors are retried up to progressMaxRetries times with a fixed backoff,
+// then returned as a plain error. Progress posting is deliberately
+// best-effort from the caller's perspective: a failure here must never
+// abort the rebuild itself (see rebuild_cmd.go — every report() call logs
+// and continues on error).
+func PostRecoveryProgress(ctx context.Context, serverURL, token string, u ProgressUpdate) error {
+	body := struct {
+		Token string `json:"token"`
+		ProgressUpdate
+	}{Token: token, ProgressUpdate: BoundProgressUpdate(u)}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("bmr: marshal progress update: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= progressMaxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(progressRetryDelay):
+			}
+		}
+
+		conflictErr, retryable, err := doPostRecoveryProgress(ctx, serverURL, payload)
+		if conflictErr != nil {
+			return conflictErr
+		}
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !retryable {
+			return lastErr
+		}
+	}
+	return fmt.Errorf("bmr: progress update failed after %d attempts: %w", progressMaxRetries+1, lastErr)
+}
+
+// doPostRecoveryProgress makes one attempt. Returns (conflictErr, nil, nil)
+// on a 409 (never retryable), (nil, false, err) on a non-retryable failure
+// (4xx other than 409, or a body/decode problem), (nil, true, err) on a
+// retryable failure (network error or 5xx), and (nil, false, nil) on
+// success.
+func doPostRecoveryProgress(ctx context.Context, serverURL string, payload []byte) (conflictErr *ProgressConflictError, retryable bool, err error) {
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, buildBMRURL(serverURL, progressRequestPath), bytes.NewReader(payload))
+	if reqErr != nil {
+		return nil, false, fmt.Errorf("bmr: create progress request: %w", reqErr)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, doErr := newHTTPClient().Do(req)
+	if doErr != nil {
+		return nil, true, fmt.Errorf("bmr: progress request failed: %w", doErr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	data, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return nil, true, fmt.Errorf("bmr: read progress response: %w", readErr)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil, false, nil
+	}
+
+	if resp.StatusCode == http.StatusConflict {
+		var body struct {
+			Error string `json:"error"`
+			From  string `json:"from"`
+			To    string `json:"to"`
+		}
+		if err := json.Unmarshal(data, &body); err == nil && body.Error == "invalid_transition" {
+			return &ProgressConflictError{From: body.From, To: body.To}, false, nil
+		}
+		return nil, false, fmt.Errorf("bmr: progress update conflict: %s", string(data))
+	}
+
+	if resp.StatusCode >= 500 {
+		return nil, true, fmt.Errorf("bmr: progress update failed with status %d: %s", resp.StatusCode, string(data))
+	}
+
+	return nil, false, fmt.Errorf("bmr: progress update failed with status %d: %s", resp.StatusCode, string(data))
+}

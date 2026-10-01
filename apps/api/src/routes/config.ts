@@ -1,0 +1,79 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { aiOperatorServiceRecoveryEnabled, aiOperatorTasksEnabled, cfAccessTrustEnabled, sweepActEnabled, toolSourcesEnabled } from '../config/env';
+import { envFlag } from '../utils/envFlag';
+import { isS3Configured } from '../services/s3Storage';
+import { authMiddleware, requireScope, type AuthContext } from '../middleware/auth';
+import { resolveAllMlFeatureFlagsForOrg } from '../services/mlFeatureFlags';
+import { isCallerVerificationEnabled } from '../services/callerVerification/gate';
+
+export const configRoutes = new Hono();
+
+const mlFeatureFlagsQuerySchema = z.object({
+  orgId: z.string().uuid().optional(),
+});
+
+// GET /api/v1/config — returns feature flags for the UI. No auth required;
+// flags are derived purely from server env, not user state, so self-hosted
+// deployments can fetch this before login to decide what to render.
+configRoutes.get('/', (c) => {
+  const hasExternalServices = !!process.env.BREEZE_BILLING_URL;
+  return c.json({
+    features: {
+      billing: hasExternalServices,
+      support: hasExternalServices,
+      // W08 of #5205 (#5246) — gates the "Delegate to Operator" action; AND of
+      // `AI_OPERATOR_TASKS_ENABLED` and `AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED`,
+      // both default off (decision D2: internal/test orgs only).
+      aiOperatorTasks: aiOperatorTasksEnabled() && aiOperatorServiceRecoveryEnabled(),
+      // Task A7 (tool-catalog W1) — platform kill switch for tool sources.
+      toolSources: toolSourcesEnabled(),
+      aiAgentsSweepAct: sweepActEnabled(),
+      // Caller verification (#6354): W04's UI reads this before showing any
+      // verification surface. Exact-'true' contract via the real getter.
+      callerVerification: isCallerVerificationEnabled(),
+    },
+    cfAccessLogin: {
+      enabled: cfAccessTrustEnabled(),
+    },
+    // Runtime source of truth for whether self-service MSP registration is
+    // open. The web bundle can't read PUBLIC_ENABLE_REGISTRATION at runtime
+    // (it's frozen into the prebuilt image at build time), so the UI gates the
+    // "Register your MSP" link and the register pages on this value instead —
+    // keeping it in lockstep with the same ENABLE_REGISTRATION env the
+    // /auth/register-partner enforcement reads (issue #1308).
+    registration: {
+      enabled: envFlag('ENABLE_REGISTRATION', false),
+    },
+    // Whether software package file uploads can succeed (S3 object storage
+    // fully configured). The web uses this to gray out upload affordances up
+    // front instead of letting the user pick a file and then hit the 503 the
+    // upload routes return when storage is missing.
+    softwarePackages: {
+      uploadsEnabled: isS3Configured(),
+    },
+  });
+});
+
+configRoutes.get(
+  '/ml-feature-flags',
+  authMiddleware,
+  requireScope('organization', 'partner', 'system'),
+  zValidator('query', mlFeatureFlagsQuerySchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const query = c.req.valid('query');
+    const orgId = query.orgId ?? auth.orgId;
+
+    if (!orgId) {
+      return c.json({ error: 'Organization context required' }, 400);
+    }
+    if (!auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Organization not found or access denied' }, 403);
+    }
+
+    const flags = await resolveAllMlFeatureFlagsForOrg(orgId);
+    return c.json({ orgId, mlFeatureFlags: flags, data: flags });
+  }
+);

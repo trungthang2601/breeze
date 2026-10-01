@@ -1,0 +1,711 @@
+import { Hono } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { z } from 'zod';
+import { eq, and, sql } from 'drizzle-orm';
+import { randomUUID } from 'crypto';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { DeleteObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { createGuardedS3Client } from '../../services/guardedS3Client';
+import { assertSafeUrl, SsrfBlockedError } from '../../services/urlSafety';
+import { selfHostAllowsPrivateNetwork } from '../../config/env';
+import { db } from '../../db';
+import { backupConfigs, backupSnapshots } from '../../db/schema';
+import { normalizeStorageIdentity } from '../../jobs/backupRetention';
+import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { writeRouteAudit } from '../../services/auditEvents';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../../services/siteCeilingAccess';
+import {
+  assertBackupStorageEncryptionSupported,
+  buildBackupStorageEncryptionResponse,
+} from '../../services/backupEncryption';
+import { checkBackupProviderCapabilities, type ProviderCapabilityStatus } from '../../services/backupSnapshotStorage';
+import { PERMISSIONS } from '../../services/permissions';
+import { coerceS3EndpointUrl, deriveS3RegionFromEndpoint } from '@breeze/shared';
+import { resolveScopedOrgId } from './helpers';
+import { canonicalizeS3CredentialFields, configSchema, configUpdateSchema, validateS3Details } from './schemas';
+
+export const configsRoutes = new Hono();
+
+const configIdParamSchema = z.object({ id: z.string().guid() });
+const MASKED_SECRET = '********';
+const SECRET_FIELD_NAMES = new Set([
+  'accesskey',
+  'accesskeyid',
+  'apikey',
+  'apisecret',
+  'authtoken',
+  'clientsecret',
+  'credential',
+  'credentials',
+  'password',
+  'secret',
+  'secretaccesskey',
+  'secretkey',
+  'sessiontoken',
+  'token',
+]);
+
+type JsonRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is JsonRecord {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isSecretField(key: string): boolean {
+  const normalized = key.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+  return SECRET_FIELD_NAMES.has(normalized) || normalized.endsWith('token') || normalized.endsWith('secret');
+}
+
+function isRedactedSecretMarker(value: unknown): boolean {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed === MASKED_SECRET || /^\*+$/.test(trimmed);
+  }
+  if (isRecord(value)) {
+    return value.redacted === true || value.hasSecret === true || value.masked === MASKED_SECRET;
+  }
+  return false;
+}
+
+function redactProviderConfig(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(redactProviderConfig);
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+
+  const redacted: JsonRecord = {};
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (isSecretField(key)) {
+      redacted[key] = {
+        redacted: true,
+        hasSecret: nestedValue !== null && nestedValue !== undefined && nestedValue !== '',
+        masked: MASKED_SECRET,
+      };
+    } else {
+      redacted[key] = redactProviderConfig(nestedValue);
+    }
+  }
+  return redacted;
+}
+
+function preserveSecretFields(incoming: unknown, existing: unknown): unknown {
+  if (!isRecord(incoming)) {
+    return incoming;
+  }
+
+  const existingRecord = isRecord(existing) ? existing : {};
+  const merged: JsonRecord = {};
+
+  for (const [key, value] of Object.entries(incoming)) {
+    const previous = existingRecord[key];
+    if (isSecretField(key) && isRedactedSecretMarker(value)) {
+      merged[key] = previous;
+    } else if (isRecord(value) && isRecord(previous)) {
+      merged[key] = preserveSecretFields(value, previous);
+    } else {
+      merged[key] = value;
+    }
+  }
+
+  for (const [key, value] of Object.entries(existingRecord)) {
+    if (isSecretField(key) && !(key in merged)) {
+      merged[key] = value;
+    } else if (isRecord(value) && isRecord(merged[key])) {
+      merged[key] = preserveSecretFields(merged[key], value);
+    }
+  }
+
+  return merged;
+}
+
+function buildCapabilityState(
+  checkedAt: string | null,
+  capability?: ProviderCapabilityStatus | null,
+) {
+  if (!checkedAt || !capability) {
+    return null;
+  }
+
+  return {
+    objectLock: {
+      supported: capability.objectLock.supported,
+      checkedAt,
+      error: capability.objectLock.error,
+    },
+  };
+}
+
+async function probeLocalConfig(details: Record<string, unknown>): Promise<void> {
+  const rootPath = typeof details.path === 'string' ? details.path : '';
+  if (!rootPath.trim()) {
+    throw new Error('Local backup path is not configured');
+  }
+
+  await mkdir(rootPath, { recursive: true });
+  const probePath = join(rootPath, `.breeze-probe-${randomUUID()}`);
+  await writeFile(probePath, 'breeze-backup-probe');
+  await rm(probePath, { force: true });
+}
+
+async function probeS3Config(rawDetails: Record<string, unknown>): Promise<void> {
+  // #6511: tolerate a config stored under the AWS-idiomatic accessKeyId/
+  // secretAccessKey spelling before canonicalization existed (no backfill
+  // migration) — copy first so this never mutates the caller's row object.
+  const details = { ...rawDetails };
+  canonicalizeS3CredentialFields(details);
+  const bucket = typeof details.bucket === 'string' ? details.bucket : '';
+  const storedRegion = typeof details.region === 'string' ? details.region.trim() : '';
+  const accessKeyId = typeof details.accessKey === 'string' ? details.accessKey : '';
+  const secretAccessKey = typeof details.secretKey === 'string' ? details.secretKey : '';
+  const endpoint = typeof details.endpoint === 'string' ? details.endpoint : undefined;
+  const prefix = typeof details.prefix === 'string' ? details.prefix.replace(/\/+$/, '') : '';
+
+  if (!bucket.trim() || !accessKeyId.trim() || !secretAccessKey.trim()) {
+    throw new Error('S3 bucket and credentials are required');
+  }
+
+  // Configs saved before region validation existed can carry '' — derive
+  // from the endpoint (required for B2 etc., where the signing region must
+  // match) and only fall back to us-east-1 for endpoint-less AWS configs.
+  const region = storedRegion || deriveS3RegionFromEndpoint(endpoint) || (endpoint ? '' : 'us-east-1');
+  if (!region) {
+    throw new Error('S3 region is not configured — edit the storage configuration and set the region for this endpoint');
+  }
+
+  // Coerce here too (not just at config-save time in validateS3Details) —
+  // configs saved before that validation existed can still carry a
+  // scheme-less endpoint, which would otherwise reach the SDK and fail
+  // opaquely deep inside @smithy/core's endpoint resolver instead of giving a
+  // message a user can act on (Sentry BREEZE-P). See coerceS3EndpointUrl for
+  // the two distinct failure modes a scheme-less value produces.
+  const normalizedEndpoint = coerceS3EndpointUrl(endpoint);
+
+  // SSRF: the endpoint is tenant-controlled and this is the "test connection"
+  // route, i.e. the most directly triggerable outbound primitive on the backup
+  // surface. Validate up front so the operator gets an actionable message
+  // instead of an opaque socket error. This is UX, not the enforcement —
+  // createGuardedS3Client below pins every connection at connect time, which is
+  // what actually closes the DNS-rebinding window.
+  //
+  // The policy must match the one createGuardedS3Client applies, or a
+  // self-hosted install pointed at LAN MinIO would fail here with an SSRF
+  // message on a connection the client would happily have made. Metadata,
+  // link-local, loopback and CGNAT stay blocked in BOTH modes.
+  if (normalizedEndpoint) {
+    try {
+      await assertSafeUrl(normalizedEndpoint, {
+        allowPrivateNetwork: selfHostAllowsPrivateNetwork(),
+      });
+    } catch (error) {
+      if (error instanceof SsrfBlockedError) {
+        throw new Error(`S3 endpoint is not reachable: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+
+  const client = createGuardedS3Client({
+    region,
+    endpoint: normalizedEndpoint,
+    forcePathStyle: Boolean(normalizedEndpoint),
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+    },
+  });
+
+  const key = `${prefix ? `${prefix}/` : ''}.breeze-probe-${randomUUID()}`;
+  await client.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: 'breeze-backup-probe',
+  }));
+  await client.send(new DeleteObjectCommand({
+    Bucket: bucket,
+    Key: key,
+  }));
+}
+
+configsRoutes.get('/configs', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), async (c) => {
+  const auth = c.get('auth');
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const rows = await db
+    .select()
+    .from(backupConfigs)
+    .where(eq(backupConfigs.orgId, orgId));
+
+  const data = rows.map(toConfigResponse);
+  return c.json({ data });
+});
+
+configsRoutes.post(
+  '/configs',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.BACKUP_WRITE.resource, PERMISSIONS.BACKUP_WRITE.action),
+  requireMfa(),
+  zValidator('json', configSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if (!orgId) {
+      return c.json({ error: 'orgId is required for this scope' }, 400);
+    }
+
+    const payload = c.req.valid('json');
+    const details: Record<string, unknown> = { ...(payload.details ?? {}) };
+    if (payload.provider === 's3') {
+      // Schema already rejected unresolvable configs; persist the resolved
+      // region AND the normalized endpoint so both are explicit in storage.
+      // The endpoint matters most: it is shipped verbatim to the Go agent
+      // (jobs/backupWorker.ts -> agent/internal/backup/providers/s3.go), which
+      // does no scheme coercion of its own, so a scheme-less value stored here
+      // fails on every device while this API's own test probe passes.
+      const { region, endpoint } = validateS3Details(details);
+      if (region) details.region = region;
+      if (endpoint) {
+        details.endpoint = endpoint;
+      } else {
+        // coerceS3EndpointUrl returns undefined for a blank/absent endpoint
+        // (e.g. the web form's initial ''). Without this, the raw '' from
+        // the payload would survive in `details` and blank rows would keep
+        // accumulating (Sentry BREEZE-P residual gap).
+        delete details.endpoint;
+      }
+      // #6511: canonicalize accessKeyId/secretAccessKey to accessKey/secretKey
+      // — see canonicalizeS3CredentialFields for why.
+      canonicalizeS3CredentialFields(details);
+    }
+    const encryption = payload.encryption ?? false;
+    try {
+      assertBackupStorageEncryptionSupported({
+        encryption,
+        provider: payload.provider,
+        providerConfig: details,
+      });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : 'Backup encryption is not supported for this config' }, 400);
+    }
+
+    const now = new Date();
+    // Demote + insert atomically: a failed insert must not leave the org with
+    // its previous default already cleared and no new one to replace it (the
+    // org default is the destination every partner-wide backup resolves to).
+    // The partial unique index on (org_id) WHERE is_default enforces at most one.
+    const [row] = await db.transaction(async (tx) => {
+      if (payload.isDefault === true) {
+        await tx
+          .update(backupConfigs)
+          .set({ isDefault: false, updatedAt: now })
+          .where(and(eq(backupConfigs.orgId, orgId), eq(backupConfigs.isDefault, true)));
+      }
+      return tx
+        .insert(backupConfigs)
+        .values({
+          orgId,
+          name: payload.name,
+          type: 'file',
+          provider: payload.provider,
+          providerConfig: details,
+          providerCapabilities: null,
+          providerCapabilitiesCheckedAt: null,
+          encryption,
+          isActive: payload.enabled ?? true,
+          isDefault: payload.isDefault ?? false,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+    });
+
+    if (!row) {
+      return c.json({ error: 'Failed to create config' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'backup.config.create',
+      resourceType: 'backup_config',
+      resourceId: row.id,
+      resourceName: row.name,
+      details: { provider: row.provider, enabled: row.isActive },
+    });
+
+    return c.json(toConfigResponse(row), 201);
+  }
+);
+
+configsRoutes.get('/configs/:id', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), zValidator('param', configIdParamSchema), async (c) => {
+  const auth = c.get('auth');
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const { id: configId } = c.req.valid('param');
+  const [row] = await db
+    .select()
+    .from(backupConfigs)
+    .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+    .limit(1);
+
+  if (!row) {
+    return c.json({ error: 'Config not found' }, 404);
+  }
+  return c.json(toConfigResponse(row));
+});
+
+configsRoutes.patch(
+  '/configs/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.BACKUP_WRITE.resource, PERMISSIONS.BACKUP_WRITE.action),
+  requireMfa(),
+  zValidator('param', configIdParamSchema),
+  zValidator('json', configUpdateSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if (!orgId) {
+      return c.json({ error: 'orgId is required for this scope' }, 400);
+    }
+
+    const { id: configId } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    // Every validation and existence check runs BEFORE any write. Demoting the
+    // org's current default and then bailing out with a 400/404 would leave the
+    // org with NO default destination — and the org default is what every
+    // partner-wide and profile-linked backup resolves to, so their scheduled
+    // backups would start skipping with no obvious cause.
+    const [current] = await db
+      .select()
+      .from(backupConfigs)
+      .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+      .limit(1);
+
+    if (!current) {
+      return c.json({ error: 'Config not found' }, 404);
+    }
+
+    const updateData: Record<string, unknown> = {
+      updatedAt: new Date(),
+      // Site-ceiling gate contract §3: bump on every PATCH so a queued
+      // dispatch job carrying the OLD generation can tell it has been
+      // superseded and fail closed instead of dispatching stale config.
+      approvalGeneration: sql`${backupConfigs.approvalGeneration} + 1`,
+    };
+    if (payload.name !== undefined) updateData.name = payload.name;
+    if (payload.enabled !== undefined) updateData.isActive = payload.enabled;
+    if (payload.encryption !== undefined) updateData.encryption = payload.encryption;
+    if (payload.isDefault !== undefined) updateData.isDefault = payload.isDefault;
+
+    if (payload.details !== undefined || payload.encryption !== undefined) {
+      // #6511: canonicalize the INCOMING payload only (not `current.providerConfig`)
+      // to accessKey/secretKey before the secret-preserving merge below. This
+      // makes a payload that renames credentials from accessKey/secretKey to
+      // accessKeyId/secretAccessKey (or vice versa) land on the same field
+      // name preserveSecretFields already uses for "this is a real update,
+      // not an omission" — so the new value wins outright instead of being
+      // shadowed by whatever the existing config happens to be keyed under.
+      //
+      // Deliberately does NOT also canonicalize `current.providerConfig`
+      // here (a review finding caught this): a config stored under the
+      // legacy accessKeyId/secretAccessKey spelling with no migration yet
+      // MUST keep surfacing its real secret under ITS ORIGINAL field name
+      // through this merge, because the web UI does not yet recognize that
+      // legacy spelling when redacting the GET response — it has no way to
+      // show the field as "already set" and initializes it blank. If we
+      // canonicalized `current.providerConfig`'s field name to match the
+      // incoming blank `accessKey` here, preserveSecretFields would see the
+      // SAME key on both sides, take the "incoming wins" branch, and
+      // silently overwrite the only copy of the real credential with an
+      // empty string — an unrecoverable data-loss regression this fix must
+      // not introduce. Leaving `current.providerConfig` untouched preserves
+      // preserveSecretFields' fallback loop (restores any secret field
+      // present in `existing` but absent from `merged`), which is exactly
+      // what recovers a legacy-keyed secret when the incoming payload never
+      // mentions it. The post-merge canonicalizeS3CredentialFields call
+      // below then migrates whatever survived the merge to the canonical
+      // name for persistence.
+      let incomingDetails: unknown = payload.details;
+      if (current.provider === 's3' && incomingDetails !== undefined && isRecord(incomingDetails)) {
+        const canonicalizedIncoming: Record<string, unknown> = { ...incomingDetails };
+        canonicalizeS3CredentialFields(canonicalizedIncoming);
+        incomingDetails = canonicalizedIncoming;
+      }
+      const nextProviderConfig = incomingDetails !== undefined
+        ? preserveSecretFields(incomingDetails, current.providerConfig)
+        : current.providerConfig;
+      if (payload.details !== undefined && current.provider === 's3' && isRecord(nextProviderConfig)) {
+        // NOTE: configUpdateSchema has no superRefine (it cannot — `provider`
+        // is not part of an update payload, so the schema can't tell an s3
+        // config from a local one). This hand-rolled call is therefore the
+        // ONLY thing standing between a malformed endpoint and the database on
+        // the PATCH path. Do not remove it without adding equivalent
+        // validation elsewhere. Covered by the PATCH tests in configs.test.ts.
+        const { error, region, endpoint } = validateS3Details(nextProviderConfig);
+        if (error) {
+          return c.json({ error }, 400);
+        }
+        if (region) nextProviderConfig.region = region;
+        if (endpoint) {
+          nextProviderConfig.endpoint = endpoint;
+        } else {
+          // coerceS3EndpointUrl returns undefined for a blank/absent endpoint.
+          // Without this, the raw '' from the payload would survive in
+          // nextProviderConfig and blank rows would keep accumulating
+          // (Sentry BREEZE-P residual gap).
+          delete nextProviderConfig.endpoint;
+        }
+        // #6511: canonicalize whatever field names survived the merge above
+        // to accessKey/secretKey before persisting. This is load-bearing,
+        // not just tidy-up: `current.providerConfig` is deliberately left
+        // uncanonicalized going into the merge (see the comment above), so
+        // a legacy accessKeyId/secretAccessKey secret the merge restored
+        // via its "existing but omitted from incoming" fallback still needs
+        // migrating to the canonical name here, once it's safe to do so
+        // (the merge has already resolved which value — incoming or prior —
+        // wins).
+        canonicalizeS3CredentialFields(nextProviderConfig);
+      }
+      const nextEncryption = payload.encryption ?? current.encryption;
+
+      try {
+        assertBackupStorageEncryptionSupported({
+          encryption: nextEncryption,
+          provider: current.provider,
+          providerConfig: nextProviderConfig,
+        });
+      } catch (error) {
+        return c.json({ error: error instanceof Error ? error.message : 'Backup encryption is not supported for this config' }, 400);
+      }
+
+      if (payload.details !== undefined) {
+        updateData.providerConfig = nextProviderConfig;
+        updateData.providerCapabilities = null;
+        updateData.providerCapabilitiesCheckedAt = null;
+      }
+    }
+
+    // Demote + promote atomically: the partial unique index on (org_id) WHERE
+    // is_default allows at most one default, so a concurrent promote must not
+    // see a half-applied swap.
+    const [row] = await db.transaction(async (tx) => {
+      if (payload.isDefault === true) {
+        await tx
+          .update(backupConfigs)
+          .set({ isDefault: false, updatedAt: new Date() })
+          .where(and(eq(backupConfigs.orgId, orgId), eq(backupConfigs.isDefault, true)));
+      }
+      return tx
+        .update(backupConfigs)
+        .set(updateData)
+        .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+        .returning();
+    });
+
+    if (!row) {
+      return c.json({ error: 'Config not found' }, 404);
+    }
+
+    const warnings: string[] = [];
+    const priorIdentity = normalizeStorageIdentity(current.provider, (current.providerConfig ?? {}) as Record<string, unknown>);
+    const nextIdentity = normalizeStorageIdentity(row.provider, (row.providerConfig ?? {}) as Record<string, unknown>);
+    if (priorIdentity !== nextIdentity) {
+      const [existingSnapshot] = await db
+        .select({ id: backupSnapshots.id })
+        .from(backupSnapshots)
+        .where(eq(backupSnapshots.configId, configId))
+        .limit(1);
+      if (existingSnapshot) {
+        warnings.push('storage_identity_changed');
+      }
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'backup.config.update',
+      resourceType: 'backup_config',
+      resourceId: row.id,
+      resourceName: row.name,
+      details: { changedFields: Object.keys(payload) },
+    });
+
+    // Always present (possibly empty) -- a stable response shape, per
+    // coordinator decision, rather than an optional field callers must guard.
+    return c.json({ ...toConfigResponse(row), warnings });
+  }
+);
+
+configsRoutes.delete(
+  '/configs/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.BACKUP_WRITE.resource, PERMISSIONS.BACKUP_WRITE.action),
+  requireMfa(),
+  zValidator('param', configIdParamSchema),
+  async (c) => {
+  const auth = c.get('auth');
+  if (!canMutateOrgWideGovernance(auth)) {
+    return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+  }
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const { id: configId } = c.req.valid('param');
+  const [deleted] = await db
+    .delete(backupConfigs)
+    .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+    .returning();
+
+  if (!deleted) {
+    return c.json({ error: 'Config not found' }, 404);
+  }
+
+  writeRouteAudit(c, {
+    orgId,
+    action: 'backup.config.delete',
+    resourceType: 'backup_config',
+    resourceId: deleted.id,
+    resourceName: deleted.name,
+  });
+
+  return c.json({ deleted: true });
+});
+
+configsRoutes.post(
+  '/configs/:id/test',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.BACKUP_WRITE.resource, PERMISSIONS.BACKUP_WRITE.action),
+  requireMfa(),
+  zValidator('param', configIdParamSchema),
+  async (c) => {
+  const auth = c.get('auth');
+  if (!canMutateOrgWideGovernance(auth)) {
+    return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+  }
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const { id: configId } = c.req.valid('param');
+  const [row] = await db
+    .select()
+    .from(backupConfigs)
+    .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+    .limit(1);
+
+  if (!row) {
+    return c.json({ error: 'Config not found' }, 404);
+  }
+
+  const checkedAt = new Date().toISOString();
+  const checkedAtDate = new Date(checkedAt);
+  writeRouteAudit(c, {
+    orgId,
+    action: 'backup.config.test',
+    resourceType: 'backup_config',
+    resourceId: row.id,
+    resourceName: row.name,
+  });
+
+  const details = (row.providerConfig ?? {}) as Record<string, unknown>;
+  let status: 'success' | 'failed' | 'unsupported' = 'success';
+  let errorMessage: string | null = null;
+  let capability: ProviderCapabilityStatus | null = null;
+
+  try {
+    if (row.provider === 'local') {
+      await probeLocalConfig(details);
+      capability = await checkBackupProviderCapabilities({
+        provider: row.provider,
+        providerConfig: details,
+      });
+    } else if (row.provider === 's3') {
+      await probeS3Config(details);
+      capability = await checkBackupProviderCapabilities({
+        provider: row.provider,
+        providerConfig: details,
+      });
+    } else {
+      status = 'unsupported';
+      errorMessage = `Connection testing is not implemented for provider ${row.provider}`;
+      capability = await checkBackupProviderCapabilities({
+        provider: row.provider,
+        providerConfig: details,
+      });
+    }
+  } catch (error) {
+    status = 'failed';
+    errorMessage = error instanceof Error ? error.message : 'Connection test failed';
+    capability = {
+      objectLock: {
+        supported: false,
+        error: errorMessage,
+      },
+    };
+  }
+
+  const [updated] = await db
+    .update(backupConfigs)
+    .set({
+      providerCapabilities: capability,
+      providerCapabilitiesCheckedAt: checkedAtDate,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+    .returning();
+
+  const response = {
+    id: row.id,
+    provider: row.provider,
+    status,
+    checkedAt,
+    error: errorMessage,
+    providerCapabilities: buildCapabilityState(checkedAt, capability),
+    config: updated ? toConfigResponse(updated) : undefined,
+  };
+
+  if (status === 'failed' || status === 'unsupported') {
+    return c.json(response, 400);
+  }
+
+  return c.json(response);
+});
+
+function toConfigResponse(row: typeof backupConfigs.$inferSelect) {
+  const checkedAt = row.providerCapabilitiesCheckedAt?.toISOString() ?? null;
+  return {
+    id: row.id,
+    name: row.name,
+    provider: row.provider,
+    enabled: row.isActive,
+    isDefault: row.isDefault,
+    encryption: buildBackupStorageEncryptionResponse({
+      encryption: row.encryption,
+      provider: row.provider,
+      providerConfig: row.providerConfig ?? {},
+    }),
+    details: redactProviderConfig(row.providerConfig ?? {}) as Record<string, unknown>,
+    providerCapabilities: buildCapabilityState(
+      checkedAt,
+      (row.providerCapabilities as ProviderCapabilityStatus | null | undefined) ?? null,
+    ),
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}

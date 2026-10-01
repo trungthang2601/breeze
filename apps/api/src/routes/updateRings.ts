@@ -1,0 +1,687 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { and, eq, sql, desc, asc, inArray, type SQL } from 'drizzle-orm';
+import { db } from '../db';
+import {
+  patchPolicies,
+  patchApprovals,
+  patchJobs,
+  patches,
+  devicePatches,
+} from '../db/schema';
+import { resolveRingDeviceCounts, resolveRingDeviceIds } from './updateRingsHelpers';
+import { getPagination, inferPatchOs } from './patches/helpers';
+import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
+import { writeRouteAudit } from '../services/auditEvents';
+import { PERMISSIONS } from '../services/permissions';
+import {
+  PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+  canManagePartnerWidePolicies,
+} from '../services/partnerWideAccess';
+import { ringAutoApproveSchema, mergeRingAutoApproveWrite } from '@breeze/shared/validators';
+
+// Typed default for a ring's autoApprove JSONB (#1317). A freshly created or
+// auto-provisioned ring auto-approves nothing until an operator opts in.
+const DEFAULT_RING_AUTO_APPROVE = {
+  enabled: false, severities: [], deferralDays: 0, thirdPartyApps: false, thirdPartyDeferralDays: null,
+  autoApproveUnrated: false,
+} as const;
+
+export const updateRingRoutes = new Hono();
+const requireUpdateRingRead = requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action);
+const requireUpdateRingWrite = requirePermission(PERMISSIONS.DEVICES_WRITE.resource, PERMISSIONS.DEVICES_WRITE.action);
+
+updateRingRoutes.use('*', authMiddleware);
+
+// ============================================
+// Helpers
+// ============================================
+
+// Pagination is shared with the /patches list endpoints (patches/helpers.ts):
+// default 50, capped at MAX_PAGE_LIMIT (200). Previously a local copy here
+// capped at 100 and the web's ring path sent no `limit`, so selecting a ring
+// silently collapsed the visible patch list from the all-rings 200 down to 50.
+
+/**
+ * Update rings are partner-owned by construction — a ring drives patch
+ * deferral/approval for every org under the partner. Writing one is therefore
+ * partner-wide administration and needs the capability, not merely partner
+ * scope (epic #2135; security review 2026-08-16 §1.1 #3). Returns a 403 body
+ * for the caller to return, or null when the write may proceed.
+ */
+function partnerWideRingWriteDenial(
+  c: any,
+  auth: { scope: 'system' | 'partner' | 'organization'; partnerOrgAccess?: 'all' | 'selected' | 'none' | null },
+): { response: Response } | null {
+  if (canManagePartnerWidePolicies(auth)) return null;
+  return { response: c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403) };
+}
+
+function resolvePartnerId(
+  auth: { scope: 'system' | 'partner' | 'organization'; partnerId: string | null },
+  requestedPartnerId?: string
+): { partnerId: string } | { error: string; status: 400 | 403 } {
+  if (auth.scope === 'organization') {
+    return { error: 'Update rings are managed at partner scope', status: 403 };
+  }
+  if (requestedPartnerId) {
+    if (auth.scope === 'partner' && auth.partnerId !== requestedPartnerId) {
+      return { error: 'Access denied to this partner', status: 403 };
+    }
+    return { partnerId: requestedPartnerId };
+  }
+  if (auth.partnerId) return { partnerId: auth.partnerId };
+  return { error: 'partnerId is required', status: 400 };
+}
+
+function resolveListPartnerIds(
+  auth: { scope: 'system' | 'partner' | 'organization'; partnerId: string | null },
+  requestedPartnerId?: string
+): { partnerIds: string[] | null } | { error: string; status: 400 | 403 } {
+  if (auth.scope === 'organization') {
+    return { error: 'Update rings are managed at partner scope', status: 403 };
+  }
+  if (requestedPartnerId) {
+    if (auth.scope === 'partner' && auth.partnerId !== requestedPartnerId) {
+      return { error: 'Access denied to this partner', status: 403 };
+    }
+    return { partnerIds: [requestedPartnerId] };
+  }
+  if (auth.partnerId) return { partnerIds: [auth.partnerId] };
+  if (auth.scope === 'system') return { partnerIds: null }; // all partners
+  return { error: 'partnerId is required', status: 400 };
+}
+
+// ============================================
+// Schemas
+// ============================================
+
+const listRingsSchema = z.object({
+  partnerId: z.string().guid().optional(),
+});
+
+const categoryRuleSchema = z.object({
+  category: z.string().max(100).refine((c) => c.trim().toLowerCase() !== 'third_party_app', {
+    message: "The 'third_party_app' category rule was replaced by autoApprove.thirdPartyApps on the ring.",
+  }),
+  autoApprove: z.boolean(),
+  autoApproveSeverities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).optional(),
+  autoApproveUnrated: z.boolean().optional(),
+  deferralDaysOverride: z.number().int().min(0).max(365).nullable().optional(),
+});
+
+const createRingSchema = z.object({
+  partnerId: z.string().guid().optional(),
+  name: z.string().min(1).max(255),
+  description: z.string().max(2000).optional(),
+  enabled: z.boolean().optional(),
+  ringOrder: z.number().int().min(0).max(100).optional(),
+  deferralDays: z.number().int().min(0).max(365).optional(),
+  deadlineDays: z.number().int().min(0).max(365).nullable().optional(),
+  gracePeriodHours: z.number().int().min(0).max(168).optional(),
+  categories: z.array(z.string().max(100)).optional(),
+  excludeCategories: z.array(z.string().max(100)).optional(),
+  categoryRules: z.array(categoryRuleSchema).optional(),
+  // Ring-level auto-approval gate (#1317). Typed shape replaces the old
+  // free-form record so the ring owns approval rules with validated severities.
+  autoApprove: ringAutoApproveSchema.optional(),
+  targets: z.record(z.string(), z.unknown()).optional(),
+});
+
+const updateRingSchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  description: z.string().max(2000).optional(),
+  enabled: z.boolean().optional(),
+  ringOrder: z.number().int().min(0).max(100).optional(),
+  deferralDays: z.number().int().min(0).max(365).optional(),
+  deadlineDays: z.number().int().min(0).max(365).nullable().optional(),
+  gracePeriodHours: z.number().int().min(0).max(168).optional(),
+  categories: z.array(z.string().max(100)).optional(),
+  excludeCategories: z.array(z.string().max(100)).optional(),
+  categoryRules: z.array(categoryRuleSchema).optional(),
+  // Ring-level auto-approval gate (#1317). See createRingSchema.
+  autoApprove: ringAutoApproveSchema.optional(),
+  targets: z.record(z.string(), z.unknown()).optional(),
+});
+
+const ringIdParamSchema = z.object({
+  id: z.string().guid(),
+});
+
+const ringPatchesQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  source: z.enum(['microsoft', 'apple', 'linux', 'third_party', 'custom']).optional(),
+  severity: z.enum(['critical', 'important', 'moderate', 'low', 'unknown']).optional(),
+});
+
+// ============================================
+// Routes
+// ============================================
+
+// GET /update-rings — List rings sorted by ringOrder
+updateRingRoutes.get(
+  '/',
+  requireScope('partner', 'system'),
+  requireUpdateRingRead,
+  zValidator('query', listRingsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+
+    const listResult = resolveListPartnerIds(auth, query.partnerId);
+    if ('error' in listResult) return c.json({ error: listResult.error }, listResult.status);
+    const { partnerIds } = listResult;
+
+    if (Array.isArray(partnerIds) && partnerIds.length === 0) {
+      return c.json({ data: [] });
+    }
+
+    const partnerCond = partnerIds === null
+      ? undefined
+      : partnerIds.length === 1
+        ? eq(patchPolicies.partnerId, partnerIds[0]!)
+        : inArray(patchPolicies.partnerId, partnerIds);
+
+    const conditions = [eq(patchPolicies.kind, 'ring'), eq(patchPolicies.enabled, true)];
+    if (partnerCond) {
+      conditions.push(partnerCond);
+    }
+
+    const rings = await db
+      .select({
+        id: patchPolicies.id,
+        partnerId: patchPolicies.partnerId,
+        name: patchPolicies.name,
+        description: patchPolicies.description,
+        enabled: patchPolicies.enabled,
+        ringOrder: patchPolicies.ringOrder,
+        deferralDays: patchPolicies.deferralDays,
+        deadlineDays: patchPolicies.deadlineDays,
+        gracePeriodHours: patchPolicies.gracePeriodHours,
+        categories: patchPolicies.categories,
+        excludeCategories: patchPolicies.excludeCategories,
+        autoApprove: patchPolicies.autoApprove,
+        categoryRules: patchPolicies.categoryRules,
+        targets: patchPolicies.targets,
+        createdAt: patchPolicies.createdAt,
+        updatedAt: patchPolicies.updatedAt,
+      })
+      .from(patchPolicies)
+      .where(and(...conditions))
+      .orderBy(asc(patchPolicies.ringOrder), asc(patchPolicies.createdAt));
+
+    const deviceCountMap = await resolveRingDeviceCounts(rings.map(r => r.id));
+
+    const ringsWithCounts = rings.map(r => ({
+      ...r,
+      deviceCount: deviceCountMap.get(r.id) ?? 0,
+    }));
+
+    return c.json({ data: ringsWithCounts });
+  }
+);
+
+// POST /update-rings — Create ring
+updateRingRoutes.post(
+  '/',
+  requireScope('partner', 'system'),
+  requireUpdateRingWrite,
+  requireMfa(),
+  zValidator('json', createRingSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const data = c.req.valid('json');
+
+    const partnerResult = resolvePartnerId(auth, data.partnerId ?? c.req.query('partnerId'));
+    if ('error' in partnerResult) return c.json({ error: partnerResult.error }, partnerResult.status);
+    const { partnerId } = partnerResult;
+
+    const createDenial = partnerWideRingWriteDenial(c, auth);
+    if (createDenial) return createDenial.response;
+
+    const [ring] = await db
+      .insert(patchPolicies)
+      .values({
+        partnerId,
+        kind: 'ring',
+        name: data.name,
+        description: data.description ?? null,
+        enabled: data.enabled ?? true,
+        ringOrder: data.ringOrder ?? 0,
+        deferralDays: data.deferralDays ?? 0,
+        deadlineDays: data.deadlineDays ?? null,
+        gracePeriodHours: data.gracePeriodHours ?? 4,
+        categories: data.categories ?? [],
+        excludeCategories: data.excludeCategories ?? [],
+        autoApprove: data.autoApprove
+          ? mergeRingAutoApproveWrite(data.autoApprove, undefined)
+          : DEFAULT_RING_AUTO_APPROVE,
+        categoryRules: data.categoryRules ?? [],
+        targets: data.targets ?? {},
+        createdBy: auth.user.id,
+      })
+      .returning();
+
+    writeRouteAudit(c, {
+      orgId: null,
+      action: 'update_ring.create',
+      resourceType: 'update_ring',
+      resourceId: ring!.id,
+      resourceName: data.name,
+      details: { partnerId, ringOrder: ring!.ringOrder, deferralDays: ring!.deferralDays },
+    });
+
+    return c.json(ring, 201);
+  }
+);
+
+// GET /update-rings/:id — Ring detail + compliance summary
+updateRingRoutes.get(
+  '/:id',
+  requireScope('partner', 'system'),
+  requireUpdateRingRead,
+  zValidator('param', ringIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+
+    const [ring] = await db
+      .select()
+      .from(patchPolicies)
+      .where(and(eq(patchPolicies.id, id), eq(patchPolicies.kind, 'ring')))
+      .limit(1);
+
+    if (!ring) return c.json({ error: 'Update ring not found' }, 404);
+    if (auth.scope !== 'system' && auth.partnerId !== ring.partnerId) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    // Get approval counts for this ring
+    const approvalCounts = await db
+      .select({
+        status: patchApprovals.status,
+        count: sql<number>`count(*)`,
+      })
+      .from(patchApprovals)
+      .where(and(eq(patchApprovals.partnerId, ring.partnerId), eq(patchApprovals.ringId, id)))
+      .groupBy(patchApprovals.status);
+
+    const approvalSummary: Record<string, number> = {};
+    for (const row of approvalCounts) {
+      approvalSummary[row.status] = Number(row.count);
+    }
+
+    // Get recent jobs for this ring
+    const recentJobs = await db
+      .select({
+        id: patchJobs.id,
+        name: patchJobs.name,
+        status: patchJobs.status,
+        devicesTotal: patchJobs.devicesTotal,
+        devicesCompleted: patchJobs.devicesCompleted,
+        devicesFailed: patchJobs.devicesFailed,
+        createdAt: patchJobs.createdAt,
+      })
+      .from(patchJobs)
+      .where(eq(patchJobs.ringId, id))
+      .orderBy(desc(patchJobs.createdAt))
+      .limit(5);
+
+    return c.json({
+      ...ring,
+      approvalSummary,
+      recentJobs,
+    });
+  }
+);
+
+// PATCH /update-rings/:id — Update ring
+updateRingRoutes.patch(
+  '/:id',
+  requireScope('partner', 'system'),
+  requireUpdateRingWrite,
+  requireMfa(),
+  zValidator('param', ringIdParamSchema),
+  zValidator('json', updateRingSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+    const data = c.req.valid('json');
+
+    const [existing] = await db
+      .select({
+        id: patchPolicies.id,
+        partnerId: patchPolicies.partnerId,
+        autoApprove: patchPolicies.autoApprove,
+      })
+      .from(patchPolicies)
+      .where(and(eq(patchPolicies.id, id), eq(patchPolicies.kind, 'ring')))
+      .limit(1);
+
+    if (!existing) return c.json({ error: 'Update ring not found' }, 404);
+    if (auth.scope !== 'system' && auth.partnerId !== existing.partnerId) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const patchDenial = partnerWideRingWriteDenial(c, auth);
+    if (patchDenial) return patchDenial.response;
+
+    const updateFields: Record<string, unknown> = { updatedAt: new Date() };
+    if (data.name !== undefined) updateFields.name = data.name;
+    if (data.description !== undefined) updateFields.description = data.description;
+    if (data.enabled !== undefined) updateFields.enabled = data.enabled;
+    if (data.ringOrder !== undefined) updateFields.ringOrder = data.ringOrder;
+    if (data.deferralDays !== undefined) updateFields.deferralDays = data.deferralDays;
+    if (data.deadlineDays !== undefined) updateFields.deadlineDays = data.deadlineDays;
+    if (data.gracePeriodHours !== undefined) updateFields.gracePeriodHours = data.gracePeriodHours;
+    if (data.categories !== undefined) updateFields.categories = data.categories;
+    if (data.excludeCategories !== undefined) updateFields.excludeCategories = data.excludeCategories;
+    // Merge, don't replace: absent third-party fields (old-shape writers)
+    // preserve the ring's current opt-in instead of resetting it to defaults.
+    if (data.autoApprove !== undefined) {
+      updateFields.autoApprove = mergeRingAutoApproveWrite(data.autoApprove, existing.autoApprove);
+    }
+    if (data.categoryRules !== undefined) updateFields.categoryRules = data.categoryRules;
+    if (data.targets !== undefined) updateFields.targets = data.targets;
+
+    const [updated] = await db
+      .update(patchPolicies)
+      .set(updateFields)
+      .where(and(eq(patchPolicies.id, id), eq(patchPolicies.kind, 'ring')))
+      .returning();
+
+    writeRouteAudit(c, {
+      orgId: null,
+      action: 'update_ring.update',
+      resourceType: 'update_ring',
+      resourceId: id,
+      details: { partnerId: existing.partnerId, changes: Object.keys(data) },
+    });
+
+    return c.json(updated);
+  }
+);
+
+// DELETE /update-rings/:id — Soft delete (enabled=false)
+updateRingRoutes.delete(
+  '/:id',
+  requireScope('partner', 'system'),
+  requireUpdateRingWrite,
+  requireMfa(),
+  zValidator('param', ringIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+
+    const [existing] = await db
+      .select({ id: patchPolicies.id, partnerId: patchPolicies.partnerId, name: patchPolicies.name })
+      .from(patchPolicies)
+      .where(and(eq(patchPolicies.id, id), eq(patchPolicies.kind, 'ring')))
+      .limit(1);
+
+    if (!existing) return c.json({ error: 'Update ring not found' }, 404);
+    if (auth.scope !== 'system' && auth.partnerId !== existing.partnerId) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const deleteDenial = partnerWideRingWriteDenial(c, auth);
+    if (deleteDenial) return deleteDenial.response;
+
+    await db
+      .update(patchPolicies)
+      .set({ enabled: false, updatedAt: new Date() })
+      .where(and(eq(patchPolicies.id, id), eq(patchPolicies.kind, 'ring')));
+
+    writeRouteAudit(c, {
+      orgId: null,
+      action: 'update_ring.delete',
+      resourceType: 'update_ring',
+      resourceId: id,
+      resourceName: existing.name,
+      details: { partnerId: existing.partnerId },
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+// GET /update-rings/:id/patches — Patches with ring-scoped approval status
+updateRingRoutes.get(
+  '/:id/patches',
+  requireScope('partner', 'system'),
+  requireUpdateRingRead,
+  zValidator('param', ringIdParamSchema),
+  zValidator('query', ringPatchesQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+    const query = c.req.valid('query');
+
+    const [ring] = await db
+      .select({ id: patchPolicies.id, partnerId: patchPolicies.partnerId })
+      .from(patchPolicies)
+      .where(and(eq(patchPolicies.id, id), eq(patchPolicies.kind, 'ring')))
+      .limit(1);
+
+    if (!ring) return c.json({ error: 'Update ring not found' }, 404);
+    if (auth.scope !== 'system' && auth.partnerId !== ring.partnerId) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const { page, limit, offset } = getPagination(query);
+
+    // Mirror GET /patches (patches/list.ts): track the source predicate
+    // separately so the per-source counts ignore the source filter and the
+    // chips always reflect the full breakdown of visible patches.
+    const conditions: SQL[] = [];
+    let sourcePredicate: SQL | undefined;
+    if (query.source) {
+      sourcePredicate = eq(patches.source, query.source);
+      conditions.push(sourcePredicate);
+    }
+    if (query.severity) conditions.push(eq(patches.severity, query.severity));
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const patchList = await db
+      .select({
+        id: patches.id,
+        title: patches.title,
+        description: patches.description,
+        source: patches.source,
+        severity: patches.severity,
+        category: patches.category,
+        osTypes: patches.osTypes,
+        // Same device-derived OS hint as GET /patches (list.ts): the most
+        // recently checked device reporting this patch. Feeds inferPatchOs so
+        // third_party/custom patches with empty osTypes can still resolve an
+        // OS when a reporting device exists (otherwise inferPatchOs falls
+        // back to the source mapping, then 'unknown').
+        inferredOs: sql<string | null>`(
+          SELECT "devices"."os_type"
+          FROM "device_patches"
+          INNER JOIN "devices" ON "devices"."id" = "device_patches"."device_id"
+          WHERE "device_patches"."patch_id" = "patches"."id"
+          ORDER BY "device_patches"."last_checked_at" DESC NULLS LAST
+          LIMIT 1
+        )`,
+        releaseDate: patches.releaseDate,
+        requiresReboot: patches.requiresReboot,
+        downloadSizeMb: patches.downloadSizeMb,
+        createdAt: patches.createdAt,
+      })
+      .from(patches)
+      .where(whereClause)
+      // `patches.id` is a mandatory tiebreaker — see the same note in
+      // routes/patches/list.ts. `created_at` ties en masse (agent ingest runs
+      // in a transaction, so `now()` is identical for a whole scan report), and
+      // without a unique second key a client paging this endpoint gets some
+      // rows twice and never sees others.
+      .orderBy(desc(patches.createdAt), desc(patches.id))
+      .limit(limit)
+      .offset(offset);
+
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(patches)
+      .where(whereClause);
+
+    // Per-source counts for the web's source filter chips — same shape as
+    // GET /patches so the ring view doesn't render all-zero chips (#2215).
+    const sourceConditions = conditions.filter((c) => c !== sourcePredicate);
+    const sourceWhereClause = sourceConditions.length > 0 ? and(...sourceConditions) : undefined;
+    const sourceCounts = await db
+      .select({ source: patches.source, count: sql<number>`count(*)::int` })
+      .from(patches)
+      .where(sourceWhereClause)
+      .groupBy(patches.source);
+    const counts: Record<string, number> = {
+      microsoft: 0,
+      apple: 0,
+      linux: 0,
+      third_party: 0,
+      custom: 0,
+    };
+    for (const row of sourceCounts) counts[row.source] = Number(row.count);
+
+    // Get ring-scoped approval statuses
+    const patchIdsInPage = patchList.map((p) => p.id);
+    let ringApprovals: Record<string, string> = {};
+
+    if (patchIdsInPage.length > 0) {
+      const approvals = await db
+        .select({
+          patchId: patchApprovals.patchId,
+          status: patchApprovals.status,
+        })
+        .from(patchApprovals)
+        .where(
+          and(
+            eq(patchApprovals.partnerId, ring.partnerId),
+            eq(patchApprovals.ringId, id),
+            inArray(patchApprovals.patchId, patchIdsInPage)
+          )
+        );
+
+      ringApprovals = Object.fromEntries(approvals.map((a) => [a.patchId, a.status]));
+    }
+
+    const data = patchList.map((patch) => ({
+      ...patch,
+      // Derived scalar `os` — same field GET /patches returns; the web's
+      // normalizePatch reads this to render the OS column (#2215).
+      os: inferPatchOs(patch.osTypes, patch.source, patch.inferredOs),
+      approvalStatus: ringApprovals[patch.id] || 'pending',
+    }));
+
+    return c.json({
+      data,
+      counts,
+      pagination: { page, limit, total: Number(countResult[0]?.count ?? 0) },
+    });
+  }
+);
+
+// GET /update-rings/:id/compliance — Ring-specific compliance
+updateRingRoutes.get(
+  '/:id/compliance',
+  requireScope('partner', 'system'),
+  requireUpdateRingRead,
+  zValidator('param', ringIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+
+    const [ring] = await db
+      .select({ id: patchPolicies.id, partnerId: patchPolicies.partnerId, name: patchPolicies.name })
+      .from(patchPolicies)
+      .where(and(eq(patchPolicies.id, id), eq(patchPolicies.kind, 'ring')))
+      .limit(1);
+
+    if (!ring) return c.json({ error: 'Update ring not found' }, 404);
+    if (auth.scope !== 'system' && auth.partnerId !== ring.partnerId) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    // Resolve devices assigned to this ring via config-policy assignments.
+    // A partner ring spans many orgs, so org-scoped device queries are incorrect.
+    const deviceIds = await resolveRingDeviceIds(id);
+
+    if (deviceIds.length === 0) {
+      return c.json({
+        data: {
+          ringId: id,
+          ringName: ring.name,
+          summary: { total: 0, pending: 0, installed: 0, failed: 0, missing: 0 },
+          compliancePercent: 100,
+        },
+      });
+    }
+
+    // Get ring-approved patch IDs (partner-scoped)
+    const approvedPatches = await db
+      .select({ patchId: patchApprovals.patchId })
+      .from(patchApprovals)
+      .where(
+        and(
+          eq(patchApprovals.partnerId, ring.partnerId),
+          eq(patchApprovals.ringId, id),
+          eq(patchApprovals.status, 'approved')
+        )
+      );
+
+    const approvedPatchIds = approvedPatches.map((a) => a.patchId);
+
+    if (approvedPatchIds.length === 0) {
+      return c.json({
+        data: {
+          ringId: id,
+          ringName: ring.name,
+          summary: { total: 0, pending: 0, installed: 0, failed: 0, missing: 0 },
+          compliancePercent: 100,
+          approvedPatches: 0,
+        },
+      });
+    }
+
+    // Get device patch status for ring-approved patches
+    const statusCounts = await db
+      .select({
+        status: devicePatches.status,
+        count: sql<number>`count(*)`,
+      })
+      .from(devicePatches)
+      .where(
+        and(
+          inArray(devicePatches.deviceId, deviceIds),
+          inArray(devicePatches.patchId, approvedPatchIds)
+        )
+      )
+      .groupBy(devicePatches.status);
+
+    const summary = { total: 0, pending: 0, installed: 0, failed: 0, missing: 0, skipped: 0 };
+    for (const row of statusCounts) {
+      const count = Number(row.count);
+      summary.total += count;
+      if (row.status in summary) {
+        summary[row.status as keyof typeof summary] = count;
+      }
+    }
+
+    const compliancePercent =
+      summary.total > 0 ? Math.round((summary.installed / summary.total) * 100) : 100;
+
+    return c.json({
+      data: {
+        ringId: id,
+        ringName: ring.name,
+        summary,
+        compliancePercent,
+        approvedPatches: approvedPatchIds.length,
+        totalDevices: deviceIds.length,
+      },
+    });
+  }
+);

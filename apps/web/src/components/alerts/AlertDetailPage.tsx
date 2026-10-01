@@ -1,0 +1,569 @@
+import { useState, useEffect, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import '../../lib/i18n';
+import { ArrowLeft, AlertTriangle, CheckCircle, XCircle, Clock, ExternalLink, User, Bell, Ticket } from 'lucide-react';
+import { fetchWithAuth } from '../../stores/auth';
+import { cn } from '@/lib/utils';
+import { useAiStore } from '@/stores/aiStore';
+import { navigateTo } from '@/lib/navigation';
+import { ActionError, handleActionError, runAction } from '../../lib/runAction';
+import Breadcrumbs from '../layout/Breadcrumbs';
+import {
+  severityConfig,
+  statusConfig,
+  formatDateTime,
+  type AlertSeverity,
+  type AlertStatus,
+} from './alertConfig';
+import CreateTicketFromAlertDialog from './CreateTicketFromAlertDialog';
+import { useOrgStore } from '@/stores/orgStore';
+import type { TicketStatus, TicketPriority } from '../tickets/ticketConfig';
+import RemediationSuggestionsPanel from '../remediation/RemediationSuggestionsPanel';
+import AlertDeviceInfo from './AlertDeviceInfo';
+import { DelegateToOperatorButton } from '../aiOperator/DelegateToOperatorButton';
+import { extractServiceNameFromAlert } from '../aiOperator/alertServiceName';
+import {
+  formatAnomalyConfidence,
+  formatAnomalyType,
+  formatAnomalyValue,
+  normalizeMetricAnomalyContext,
+  type MetricAnomalyAlertContext,
+} from './alertMlContext';
+import { fillDevicePlaceholders, type AlertAiVerdictSummaryDto } from '@breeze/shared';
+import AlertVerdictBadge, { submitVerdictFeedback } from './AlertVerdictBadge';
+
+type Alert = {
+  id: string;
+  title: string;
+  message: string;
+  severity: AlertSeverity;
+  status: AlertStatus;
+  deviceId: string;
+  deviceName: string;
+  /**
+   * The alert's OWN org. W08 (#5246): the delegate action targets this org,
+   * never the globally selected one — spec §5.1, "changing global
+   * organization context while drafting cannot retarget the task". The API
+   * has always returned it (the detail route spreads the whole alert row);
+   * it simply was not declared here before.
+   */
+  orgId: string;
+  ruleId?: string;
+  ruleName?: string;
+  // #5287 — the authored monitor behind a compiled rule, when this alert was
+  // raised by a rule compiled from a monitor definition.
+  monitorId?: string | null;
+  triggeredAt: string;
+  acknowledgedAt?: string;
+  acknowledgedBy?: string;
+  // Server-resolved display name for the actor ids (#3966); null when the id no
+  // longer resolves to a user.
+  acknowledgedByName?: string | null;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  resolvedByName?: string | null;
+  context?: Record<string, unknown>;
+  contextData?: Record<string, unknown>;
+  anomalyContext?: MetricAnomalyAlertContext | null;
+  // Phase 2 wave P2-1 (alert verdicts), Task 15. Null when the alert has no
+  // verdict yet (or the org has AI agents disabled).
+  aiVerdict?: AlertAiVerdictSummaryDto | null;
+};
+
+type LinkedTicket = {
+  id: string;
+  internalNumber: string | null;
+  subject: string;
+  status: TicketStatus;
+  priority: TicketPriority;
+  linkType: string;
+  linkedAt: string;
+};
+
+// Statuses that no longer count as "open" for the duplicate-ticket warning.
+const NON_OPEN_TICKET_STATUSES: readonly TicketStatus[] = ['resolved', 'closed'];
+
+type AlertDetailPageProps = {
+  alertId: string;
+};
+
+const statusIcons: Record<AlertStatus, typeof Bell> = {
+  active: Bell,
+  acknowledged: CheckCircle,
+  resolved: CheckCircle,
+  suppressed: Bell,
+  dismissed: Bell,
+};
+
+export default function AlertDetailPage({ alertId }: AlertDetailPageProps) {
+  const { t } = useTranslation('alerts');
+  const [alert, setAlert] = useState<Alert | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [actionInProgress, setActionInProgress] = useState(false);
+  const [linkedTickets, setLinkedTickets] = useState<LinkedTicket[]>([]);
+  const [linkedError, setLinkedError] = useState(false);
+  const [ticketDialogOpen, setTicketDialogOpen] = useState(false);
+  const serviceManagementMode = useOrgStore((state) => state.serviceManagementMode);
+
+  const fetchAlert = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(undefined);
+
+      const response = await fetchWithAuth(`/alerts/${alertId}`);
+      if (!response.ok) {
+        if (response.status === 404) {
+          throw new Error(t('alertDetailPage.alertNotFound'));
+        }
+        throw new Error(t('alertDetailPage.failedToFetchAlert'));
+      }
+
+      const data = await response.json();
+      const deviceName = data.device?.hostname || data.deviceName || t('alertDetailPage.unknownDevice');
+      // Map API response to component structure
+      setAlert({
+        ...data,
+        title: typeof data.title === 'string' ? fillDevicePlaceholders(data.title, deviceName) : data.title,
+        message: typeof data.message === 'string' ? fillDevicePlaceholders(data.message, deviceName) : data.message,
+        deviceName,
+        ruleName: data.rule?.name || data.ruleName,
+        ruleId: data.rule?.id || data.ruleId,
+        contextData: data.contextData ?? data.context,
+        anomalyContext: data.anomalyContext ?? normalizeMetricAnomalyContext(data.contextData ?? data.context),
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('alertDetailPage.failedToFetchAlert'));
+    } finally {
+      setLoading(false);
+    }
+  }, [alertId, t]);
+
+  const fetchLinkedTickets = useCallback(async () => {
+    try {
+      const res = await fetchWithAuth(`/alerts/${alertId}/tickets`);
+      if (!res.ok) throw new Error('failed');
+      setLinkedTickets((await res.json()).data ?? []);
+      setLinkedError(false);
+    } catch {
+      setLinkedError(true);
+    }
+  }, [alertId]);
+
+  useEffect(() => {
+    fetchAlert();
+    void fetchLinkedTickets();
+  }, [fetchAlert, fetchLinkedTickets]);
+
+  // Inject AI context when alert data is available
+  const setPageContext = useAiStore((s) => s.setPageContext);
+  useEffect(() => {
+    if (alert) {
+      setPageContext({
+        type: 'alert',
+        id: alert.id,
+        title: alert.title,
+        severity: alert.severity,
+        deviceHostname: alert.deviceName
+      });
+    }
+    return () => setPageContext(null);
+  }, [alert, setPageContext]);
+
+  const handleBack = () => {
+    void navigateTo('/alerts');
+  };
+
+  const handleAcknowledge = async () => {
+    if (!alert || actionInProgress) return;
+    try {
+      setActionInProgress(true);
+      await runAction({
+        request: () => fetchWithAuth(`/alerts/${alertId}/acknowledge`, { method: 'POST' }),
+        errorFallback: t('alertDetailPage.failedToAcknowledgeAlert'),
+        successMessage: t('alertDetailPage.alertAcknowledged'),
+        onUnauthorized: () => void navigateTo('/login', { replace: true })
+      });
+      await fetchAlert();
+    } catch (err) {
+      handleActionError(err, t('alertDetailPage.failedToAcknowledgeAlert'));
+      if (!(err instanceof ActionError && err.status === 401)) {
+        setError(err instanceof Error ? err.message : t('alertDetailPage.failedToAcknowledgeAlert'));
+      }
+    } finally {
+      setActionInProgress(false);
+    }
+  };
+
+  const handleResolve = async () => {
+    if (!alert || actionInProgress) return;
+    try {
+      setActionInProgress(true);
+      await runAction({
+        request: () => fetchWithAuth(`/alerts/${alertId}/resolve`, { method: 'POST' }),
+        errorFallback: t('alertDetailPage.failedToResolveAlert'),
+        successMessage: t('alertDetailPage.alertResolved'),
+        onUnauthorized: () => void navigateTo('/login', { replace: true })
+      });
+      await fetchAlert();
+    } catch (err) {
+      handleActionError(err, t('alertDetailPage.failedToResolveAlert'));
+      // 409 = another technician (or the auto-resolve sweep) won the
+      // compare-and-swap; the alert IS resolved, this request just didn't do it
+      // (#4094). runAction already toasted the server's reason, so a persistent
+      // red banner on top of it would frame a benign race as a broken page.
+      // Re-fetch instead, so the header shows the resolved state.
+      if (err instanceof ActionError && err.status === 409) {
+        // `fetchAlert` sets its own error state on failure, but a rejection here
+        // would escape this catch entirely (nothing wraps the recovery path) and
+        // become an unhandled rejection with no feedback for the second failure.
+        await fetchAlert().catch(() => {
+          setError(t('alertDetailPage.failedToFetchAlert'));
+        });
+        return;
+      }
+      if (!(err instanceof ActionError && err.status === 401)) {
+        setError(err instanceof Error ? err.message : t('alertDetailPage.failedToResolveAlert'));
+      }
+    } finally {
+      setActionInProgress(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('alertDetailPage.loadingAlert')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !alert) {
+    return (
+      <div className="space-y-6">
+        <button
+          type="button"
+          onClick={handleBack}
+          className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          {t('alertDetailPage.backToAlerts')}
+        </button>
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+          <p className="text-sm text-destructive">{error || t('alertDetailPage.alertNotFound')}</p>
+          <button
+            type="button"
+            onClick={handleBack}
+            className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+          >
+            {t('alertDetailPage.goBack')}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const StatusIcon = statusIcons[alert.status];
+
+  return (
+    <div className="space-y-6">
+      <Breadcrumbs items={[
+        { label: t('alertDetailPage.alertsBreadcrumb'), href: '/alerts' },
+        { label: alert.title || t('alertDetailPage.alertFallback') }
+      ]} />
+
+      {/* Header Card */}
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-start gap-4">
+            <div
+              className={cn(
+                'flex h-12 w-12 items-center justify-center rounded-lg',
+                severityConfig[alert.severity].bg, severityConfig[alert.severity].border
+              )}
+            >
+              <AlertTriangle className={cn('h-6 w-6', severityConfig[alert.severity].color)} />
+            </div>
+            <div>
+              <h1 className="text-xl font-semibold tracking-tight">{alert.title}</h1>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <span
+                  className={cn(
+                    'inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium',
+                    severityConfig[alert.severity].bg, severityConfig[alert.severity].border,
+                    severityConfig[alert.severity].color
+                  )}
+                >
+                  {t(/* i18n-dynamic */ `alertDetailPage.severity.${alert.severity}`)}
+                </span>
+                <span
+                  className={cn(
+                    'inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium',
+                    statusConfig[alert.status].color
+                  )}
+                >
+                  <StatusIcon className="h-3 w-3" />
+                  {t(/* i18n-dynamic */ `alertDetailPage.status.${alert.status}`)}
+                </span>
+                {alert.aiVerdict && (
+                  <AlertVerdictBadge
+                    verdict={alert.aiVerdict}
+                    onFeedback={value => submitVerdictFeedback(alert.aiVerdict!.id, value)}
+                  />
+                )}
+              </div>
+              {alert.aiVerdict && (
+                <p className="mt-2 max-w-2xl text-sm text-muted-foreground">{alert.aiVerdict.rationale}</p>
+              )}
+              {alert.aiVerdict?.suggestedIntentId && (
+                <a
+                  href="/approvals"
+                  className="mt-1 inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
+                >
+                  {t('alertVerdict.suggestionPending')}
+                  <ExternalLink className="h-3 w-3" />
+                </a>
+              )}
+            </div>
+          </div>
+
+          {/* Actions */}
+          <div className="flex gap-2">
+            {/* #5075 W04 — Service Management gate.
+                'off': the API refuses with a 409 (the backstop lives in
+                ticketService.createTicket), so this avoids offering a button
+                that cannot succeed.
+                'external': the API WOULD accept the create (it still writes the
+                Breeze-side shadow row), but the alert flow has no PSA-linking
+                step yet, so a ticket raised here would strand outside the
+                partner's system of record. Hidden until that ships — unlike the
+                org record's Tickets tab, which stays visible under external
+                because it lists those shadow rows. */}
+            {serviceManagementMode === 'native' && (
+              <button
+                type="button"
+                onClick={() => setTicketDialogOpen(true)}
+                className="h-10 rounded-md border px-4 text-sm font-medium hover:bg-muted"
+                data-testid="alert-create-ticket"
+              >
+                <Ticket className="mr-2 inline-block h-4 w-4" />
+                {t('alertDetailPage.createTicket')}
+              </button>
+            )}
+            {alert.status === 'active' && (
+              <button
+                type="button"
+                onClick={handleAcknowledge}
+                disabled={actionInProgress}
+                className="h-10 rounded-md border border-yellow-500/40 bg-yellow-500/20 px-4 text-sm font-medium text-yellow-700 hover:bg-yellow-500/30 disabled:opacity-50"
+              >
+                <CheckCircle className="mr-2 inline-block h-4 w-4" />
+                {t('alertDetailPage.acknowledge')}
+              </button>
+            )}
+            {/* W08 of #5205 (#5246). Hidden entirely unless the AI Operator
+                flags are on. Targets the ALERT's org and device, and cites
+                the alert as its source so the verification criterion gets a
+                recurrence signal (without one, the best achievable outcome is
+                `investigation_complete`, never `verified_resolved`). */}
+            {(alert.status === 'active' || alert.status === 'acknowledged') && (
+              <DelegateToOperatorButton
+                orgId={alert.orgId}
+                deviceId={alert.deviceId}
+                deviceLabel={alert.deviceName}
+                source={{ kind: 'alert', id: alert.id }}
+                defaultServiceName={extractServiceNameFromAlert(alert) ?? undefined}
+              />
+            )}
+            {(alert.status === 'active' || alert.status === 'acknowledged') && (
+              <button
+                type="button"
+                onClick={handleResolve}
+                disabled={actionInProgress}
+                className="h-10 rounded-md bg-green-600 px-4 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
+              >
+                <CheckCircle className="mr-2 inline-block h-4 w-4" />
+                {t('alertDetailPage.resolve')}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Alert Message */}
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        <h3 className="text-sm font-semibold text-muted-foreground mb-2">{t('alertDetailPage.message')}</h3>
+        <p className="text-sm">{alert.message}</p>
+      </div>
+
+      <RemediationSuggestionsPanel sourceType="alert" sourceId={alert.id} />
+
+      {alert.anomalyContext && (
+        <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-6 shadow-xs">
+          <h3 className="text-sm font-semibold text-muted-foreground mb-4">{t('alertDetailPage.mlAnomalyEvidence')}</h3>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div>
+              <p className="text-xs text-muted-foreground">{t('alertDetailPage.metric')}</p>
+              <p className="text-sm font-medium">{alert.anomalyContext.metricName ?? t('alertDetailPage.unknownMetric')}</p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">{t('alertDetailPage.type')}</p>
+              <p className="text-sm font-medium capitalize">{formatAnomalyType(alert.anomalyContext.anomalyType)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">{t('alertDetailPage.confidence')}</p>
+              <p className="text-sm font-medium tabular-nums">{formatAnomalyConfidence(alert.anomalyContext.confidence)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">{t('alertDetailPage.observed')}</p>
+              <p className="text-sm font-medium tabular-nums">{formatAnomalyValue(alert.anomalyContext.observedValue)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">{t('alertDetailPage.baseline')}</p>
+              <p className="text-sm font-medium tabular-nums">{formatAnomalyValue(alert.anomalyContext.baselineValue)}</p>
+            </div>
+            {alert.anomalyContext.modelVersion && (
+              <div>
+                <p className="text-xs text-muted-foreground">{t('alertDetailPage.model')}</p>
+                <p className="text-sm font-medium">{alert.anomalyContext.modelVersion}</p>
+              </div>
+            )}
+          </div>
+          <a
+            href={`/devices/${alert.deviceId}#anomalies${alert.anomalyContext.anomalyId ? `/${alert.anomalyContext.anomalyId}` : ''}`}
+            className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-sky-700 hover:underline"
+          >
+            {t('alertDetailPage.openDeviceAnomalies')}
+            <ExternalLink className="h-3 w-3" />
+          </a>
+        </div>
+      )}
+
+      {/* Linked Tickets */}
+      {(linkedTickets.length > 0 || linkedError) && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs" data-testid="alert-linked-tickets">
+          <h3 className="text-sm font-semibold text-muted-foreground mb-3">{t('alertDetailPage.linkedTickets')}</h3>
+          {linkedError ? (
+            <p className="text-sm text-muted-foreground">
+              {t('alertDetailPage.linkedTicketsFailedToLoad')}{' '}
+              <button type="button" onClick={() => void fetchLinkedTickets()} className="underline hover:text-foreground">{t('alertDetailPage.retry')}</button>
+            </p>
+          ) : (
+            <ul className="space-y-2">
+              {linkedTickets.map((t) => (
+                <li key={t.id} className="flex items-center justify-between gap-3 text-sm">
+                  <a href={`/tickets#${t.internalNumber ?? ''}`} className="font-medium hover:underline">
+                    {t.internalNumber ?? t.id} — {t.subject}
+                  </a>
+                  <span className="rounded-full border px-2 py-0.5 text-xs capitalize text-muted-foreground">
+                    {t.status.replace('_', ' ')}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* Details Grid */}
+      <div className="grid gap-6 md:grid-cols-2">
+        {/* Device Info */}
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <h3 className="text-sm font-semibold text-muted-foreground mb-4">{t('alertDetailPage.deviceInformation')}</h3>
+          <div className="space-y-3">
+            <AlertDeviceInfo
+              deviceId={alert.deviceId}
+              deviceName={alert.deviceName}
+              ruleName={alert.ruleName}
+              monitorId={alert.monitorId}
+            />
+          </div>
+        </div>
+
+        {/* Timeline */}
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <h3 className="text-sm font-semibold text-muted-foreground mb-4">{t('alertDetailPage.timeline')}</h3>
+          <div className="space-y-3">
+            <div className="flex items-start gap-3">
+              <Clock className="h-4 w-4 text-muted-foreground mt-0.5" />
+              <div>
+                <p className="text-xs text-muted-foreground">{t('alertDetailPage.triggered')}</p>
+                <p className="text-sm">{formatDateTime(alert.triggeredAt)}</p>
+              </div>
+            </div>
+            {alert.acknowledgedAt && (
+              <div className="flex items-start gap-3">
+                <CheckCircle className="h-4 w-4 text-yellow-600 mt-0.5" />
+                <div>
+                  <p className="text-xs text-muted-foreground">{t('alertDetailPage.acknowledged')}</p>
+                  <p className="text-sm">
+                    {formatDateTime(alert.acknowledgedAt)}
+                    {alert.acknowledgedBy && (
+                      <span
+                        className="text-muted-foreground flex items-center gap-1 mt-0.5"
+                        title={alert.acknowledgedBy}
+                      >
+                        <User className="h-3 w-3" />
+                        {alert.acknowledgedByName || t('alertDetailPage.unknownUser')}
+                      </span>
+                    )}
+                  </p>
+                </div>
+              </div>
+            )}
+            {alert.resolvedAt && (
+              <div className="flex items-start gap-3">
+                <XCircle className="h-4 w-4 text-green-600 mt-0.5" />
+                <div>
+                  <p className="text-xs text-muted-foreground">{t('alertDetailPage.resolved')}</p>
+                  <p className="text-sm">
+                    {formatDateTime(alert.resolvedAt)}
+                    {alert.resolvedBy && (
+                      <span
+                        className="text-muted-foreground flex items-center gap-1 mt-0.5"
+                        title={alert.resolvedBy}
+                      >
+                        <User className="h-3 w-3" />
+                        {alert.resolvedByName || t('alertDetailPage.unknownUser')}
+                      </span>
+                    )}
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Context Data */}
+      {alert.contextData && Object.keys(alert.contextData).length > 0 && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <h3 className="text-sm font-semibold text-muted-foreground mb-4">{t('alertDetailPage.contextData')}</h3>
+          <pre className="overflow-x-auto rounded-md bg-muted/40 p-4 text-xs">
+            {JSON.stringify(alert.contextData, null, 2)}
+          </pre>
+        </div>
+      )}
+
+      {ticketDialogOpen && (
+        <CreateTicketFromAlertDialog
+          alertId={alert.id}
+          alertTitle={alert.title}
+          alertSeverity={alert.severity}
+          openTicketNumber={
+            linkedTickets.find((t) => !NON_OPEN_TICKET_STATUSES.includes(t.status))?.internalNumber ?? null
+          }
+          duplicateCheckFailed={linkedError}
+          onClose={() => setTicketDialogOpen(false)}
+          onCreated={() => {
+            setTicketDialogOpen(false);
+            void fetchLinkedTickets();
+          }}
+        />
+      )}
+    </div>
+  );
+}

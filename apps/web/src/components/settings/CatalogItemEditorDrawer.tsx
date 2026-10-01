@@ -1,0 +1,1121 @@
+import { i18n } from '@/lib/i18n';
+import { useTranslation } from 'react-i18next';
+import {
+  useCallback, useEffect, useId, useMemo, useRef, useState,
+  type KeyboardEvent, type MouseEvent,
+} from 'react';
+import { createPortal } from 'react-dom';
+import { runAction, handleActionError } from '../../lib/runAction';
+import { showToast } from '../shared/Toast';
+import { navigateTo } from '@/lib/navigation';
+import { loginPathWithNext, getJwtClaims } from '../../lib/authScope';
+import { usePermissions } from '../../lib/permissions';
+import { useOrgStore } from '@/stores/orgStore';
+import { fetchWithAuth } from '../../stores/auth';
+import { currencyLabel, currencyOptions } from '@/lib/currencies';
+import { usePartnerCurrency } from '../../lib/usePartnerCurrency';
+import {
+  createCatalogItem, updateCatalogItem, getCatalogItem, setBundleComponents,
+  setOrgPriceOverride, removeOrgPriceOverride, setItemPrice, removeItemPrice,
+  uploadCatalogItemImage, importCatalogItemImageFromUrl, catalogItemImagePath, deleteCatalogItemImageRequest,
+  computeMargin, formatMargin, marginTone,
+  CATALOG_TYPE_LABELS, CATALOG_TYPE_ORDER,
+  type CatalogItem, type CatalogItemType, type CatalogItemDetail, type OrgPriceOverride,
+  type PriceBookEntry, type EnrichResult, type EnrichmentProvenance,
+} from '../../lib/api/catalog';
+import CatalogEnrichButton from '../catalog/CatalogEnrichButton';
+import PolishButton from '../catalog/PolishButton';
+
+const UNAUTHORIZED = () => void navigateTo(loginPathWithNext(), { replace: true });
+
+const FOCUSABLE =
+  'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+// A bundle component as edited in the form (quantity kept as a string for free typing).
+interface ComponentDraft {
+  componentItemId: string;
+  quantity: string;
+  showOnInvoice: boolean;
+}
+
+// A price-book row as edited in the form (amount kept as a string for free typing).
+interface PriceDraft {
+  currencyCode: string;
+  unitPrice: string;
+}
+
+/** The org list payload carries `currencyCode` (organizations.currency_code,
+ *  wave 1) but the org store's `Organization` type predates it. */
+function orgCurrencyOf(org: unknown): string | null {
+  const code = (org as { currencyCode?: unknown } | null)?.currencyCode;
+  return typeof code === 'string' && code.trim() ? code.trim().toUpperCase() : null;
+}
+
+interface Props {
+  open: boolean;
+  /** The item being edited, or null to create a new one. */
+  item: CatalogItem | null;
+  /** Active catalog items, used to populate the bundle component picker. */
+  allItems: CatalogItem[];
+  onClose: () => void;
+  /** Called after a fully-successful save (item + components) so the host reloads. */
+  onSaved: () => void;
+}
+
+/** Map a server bundle error code to a short user-facing message. */
+function bundleFriendly(code: string): string | undefined {
+  switch (code) {
+    case 'BUNDLE_NESTED': return 'A bundle component cannot itself be a bundle.';
+    case 'BUNDLE_SELF_REFERENCE': return 'A bundle cannot contain itself.';
+    case 'BUNDLE_CROSS_PARTNER': return 'Components must belong to your catalog.';
+    case 'BUNDLE_COMPONENT_NOT_FOUND': return 'One or more components no longer exist.';
+    case 'BUNDLE_DUPLICATE_COMPONENT': return 'Each component can only be added once.';
+    case 'NOT_A_BUNDLE': return 'This item is not a bundle.';
+    default: return undefined;
+  }
+}
+
+export default function CatalogItemEditorDrawer({ open, item, allItems, onClose, onSaved }: Props) {
+  const { t } = useTranslation('settings');
+  const editId = item?.id ?? null;
+
+  const { can } = usePermissions();
+  const canWrite = can('catalog', 'write');
+  // Per-org overrides are a partner surface (an MSP pricing a customer). Detect
+  // partner scope from the JWT claims — useOrgStore().partners is only populated
+  // from a system-scope-only endpoint, so a real partner-scope user gets an empty
+  // array and the section would never render (#1368).
+  const { organizations } = useOrgStore();
+  const { scope: jwtScope, partnerId: jwtPartnerId } = getJwtClaims();
+  const isPartnerScope = jwtScope === 'partner' && !!jwtPartnerId;
+  // Partner currency drives the default price-book row, the cost currency
+  // default and the margin preview. Null until GET /orgs/partners/me resolves —
+  // never assumed (a USD default would mint USD rows for a non-USD partner).
+  const { currency: partnerCurrency, failed: partnerCurrencyFailed, retry: retryPartnerCurrency } = usePartnerCurrency(open);
+
+  const [itemType, setItemType] = useState<CatalogItemType>('service');
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [sku, setSku] = useState('');
+  // Price book: one row per currency. `basePrices` is the last-known persisted
+  // set (seeded from the list row, refreshed from the detail load) so an edit
+  // save can diff rows into setItemPrice / removeItemPrice calls.
+  const [priceRows, setPriceRows] = useState<PriceDraft[]>([]);
+  const [basePrices, setBasePrices] = useState<PriceBookEntry[]>([]);
+  const [costBasis, setCostBasis] = useState('');
+  const [costCurrency, setCostCurrency] = useState('');
+  const [isBundle, setIsBundle] = useState(false);
+  const [components, setComponents] = useState<ComponentDraft[]>([]);
+  const [componentsLoading, setComponentsLoading] = useState(false);
+  // True when the detail load (components + overrides) failed for an existing
+  // item. Empty `components` is then "we couldn't load them", NOT "this item has
+  // none" — so the bundle save path must be blocked to avoid wiping the bundle.
+  const [detailLoadFailed, setDetailLoadFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // Per-org price overrides (#1368). Loaded for an existing item and edited as a
+  // sub-resource — each set/remove applies immediately (the item already exists),
+  // independent of the main Save.
+  const [overrides, setOverrides] = useState<OrgPriceOverride[]>([]);
+  const [newOverrideOrgId, setNewOverrideOrgId] = useState('');
+  const [newOverridePrice, setNewOverridePrice] = useState('');
+  const [newOverrideCurrency, setNewOverrideCurrency] = useState('');
+  const [overrideBusy, setOverrideBusy] = useState(false);
+  // Once a *new* item is created we hold its id, so a retry after a partial
+  // failure (item saved, components failed) PATCHes instead of creating a dupe.
+  const [committedId, setCommittedId] = useState<string | null>(null);
+  // AI-enrichment provenance, stashed when the user auto-fills a NEW item and
+  // persisted under attributes.enrichment on create. Null for plain/edited items.
+  const [enrichment, setEnrichment] = useState<EnrichmentProvenance | null>(null);
+  const effectiveId = editId ?? committedId;
+
+  // Product image (one per item; manual upload, shown on quotes). Only available
+  // once the item is persisted (effectiveId). `imageVersion` bumps to refetch the
+  // preview after an upload/remove.
+  const [imageBusy, setImageBusy] = useState(false);
+  const [imageVersion, setImageVersion] = useState(0);
+  const [imageUrl, setImageUrl] = useState('');
+  const imageInputRef = useRef<HTMLInputElement>(null);
+
+  const panelRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<Element | null>(null);
+  const titleId = useId();
+
+  // ---- hydrate form when opened -------------------------------------------
+  useEffect(() => {
+    if (!open) return;
+    setCommittedId(null);
+    setSaving(false);
+    setEnrichment(null);
+    setOverrides([]);
+    setNewOverrideOrgId('');
+    setNewOverridePrice('');
+    setNewOverrideCurrency('');
+    setDetailLoadFailed(false);
+    if (item) {
+      setItemType(item.itemType);
+      setName(item.name);
+      setDescription(item.description ?? '');
+      setSku(item.sku ?? '');
+      // The list row already carries the aggregated price book; the detail
+      // load refreshes it below.
+      const listPrices = (item.prices ?? []).map((p) => ({ currencyCode: p.currencyCode, unitPrice: p.unitPrice }));
+      setPriceRows(listPrices);
+      setBasePrices(listPrices);
+      setCostBasis(item.costBasis ?? '');
+      setCostCurrency(item.costCurrency ?? '');
+      setIsBundle(item.isBundle);
+      setComponents([]);
+      // Existing items carry sub-resources (bundle components + per-org price
+      // overrides) — load the detail once and hydrate both.
+      setComponentsLoading(item.isBundle);
+      const failDetailLoad = () => {
+        // The detail load is load-bearing: it drives what the bundle save writes
+        // back. Surfacing the failure (and flagging it) prevents a silent "empty
+        // bundle" that a save would persist as zero components (#1944). Contrast
+        // QuoteEditor's loadEcStatus, where `if (!res.ok) return` is intentional
+        // optional context.
+        setDetailLoadFailed(true);
+        showToast({
+          message: t('catalogItemEditorDrawer.couldNotLoadThisItemSComponentsAndPricingReopenToRetryBe'),
+          type: 'error',
+        });
+      };
+      void getCatalogItem(item.id)
+        .then(async (res) => {
+          if (res.status === 401) return UNAUTHORIZED();
+          if (!res.ok) return failDetailLoad();
+          const body = (await res.json().catch(() => null)) as { data?: CatalogItemDetail } | null;
+          if (!body?.data) return failDetailLoad();
+          const rows = body.data.components ?? [];
+          setComponents(rows.map((r) => ({
+            componentItemId: r.componentItemId,
+            quantity: r.quantity,
+            showOnInvoice: r.showOnInvoice,
+          })));
+          setOverrides(body.data.overrides ?? []);
+          const detailPrices = (body.data.prices ?? []).map((p) => ({ currencyCode: p.currencyCode, unitPrice: p.unitPrice }));
+          setPriceRows(detailPrices);
+          setBasePrices(detailPrices);
+        })
+        .catch(() => failDetailLoad())
+        .finally(() => setComponentsLoading(false));
+    } else {
+      setItemType('service');
+      setName('');
+      setDescription('');
+      setSku('');
+      // Seeded with a single partner-currency row once that currency is known
+      // (effect below) — never a hard-coded 'USD'.
+      setPriceRows([]);
+      setBasePrices([]);
+      setCostBasis('');
+      setCostCurrency('');
+      setIsBundle(false);
+      setComponents([]);
+    }
+  }, [open, item]);
+
+  // Partner currency arrives asynchronously: seed the create form's single
+  // price row and default the cost currency once it is known. Existing rows /
+  // an explicit cost currency are left alone.
+  useEffect(() => {
+    if (!open || !partnerCurrency) return;
+    if (!item) setPriceRows((rows) => (rows.length === 0 ? [{ currencyCode: partnerCurrency, unitPrice: '' }] : rows));
+    setCostCurrency((cur) => cur || partnerCurrency);
+  }, [open, item, partnerCurrency]);
+
+  // ---- a11y: focus, scroll-lock, escape, focus-trap -----------------------
+  useEffect(() => {
+    if (!open) return;
+    triggerRef.current = document.activeElement;
+    const raf = requestAnimationFrame(() => {
+      const first = panelRef.current?.querySelector<HTMLElement>(FOCUSABLE);
+      (first ?? panelRef.current)?.focus();
+    });
+    document.body.style.overflow = 'hidden';
+    return () => {
+      cancelAnimationFrame(raf);
+      document.body.style.overflow = '';
+      if (triggerRef.current instanceof HTMLElement) triggerRef.current.focus();
+    };
+  }, [open]);
+
+  const handleKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Escape') { e.stopPropagation(); onClose(); return; }
+    if (e.key === 'Tab' && panelRef.current) {
+      const nodes = Array.from(panelRef.current.querySelectorAll<HTMLElement>(FOCUSABLE));
+      if (nodes.length === 0) return;
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  }, [onClose]);
+
+  const handleBackdropClick = useCallback((e: MouseEvent<HTMLDivElement>) => {
+    if (e.target === e.currentTarget && !saving) onClose();
+  }, [onClose, saving]);
+
+  // ---- bundle component editing -------------------------------------------
+  const selectedIds = useMemo(() => new Set(components.map((c) => c.componentItemId)), [components]);
+
+  // Items eligible to add as a component: active, not a bundle, not this item.
+  const eligible = useMemo(
+    () => allItems.filter((i) => i.isActive && !i.isBundle && i.id !== effectiveId),
+    [allItems, effectiveId],
+  );
+
+  const itemName = useCallback(
+    (id: string) => allItems.find((i) => i.id === id)?.name ?? t('catalogItemEditorDrawer.unknownItem'),
+    [allItems, t],
+  );
+
+  const addComponent = () => setComponents((cs) => [...cs, { componentItemId: '', quantity: '1', showOnInvoice: false }]);
+
+  // ---- price book editing --------------------------------------------------
+  const usedCurrencies = useMemo(() => new Set(priceRows.map((r) => r.currencyCode)), [priceRows]);
+  // Currency choices: the curated list, plus the partner's own code should it
+  // ever be off-list (currencyOptions never drops a stored code).
+  const allCurrencyOptions = useMemo(() => currencyOptions(partnerCurrency ?? ''), [partnerCurrency]);
+  const addableCurrencies = useMemo(
+    () => allCurrencyOptions.filter((code) => !usedCurrencies.has(code)),
+    [allCurrencyOptions, usedCurrencies],
+  );
+  const addPriceRow = (currencyCode: string) => {
+    if (!currencyCode || usedCurrencies.has(currencyCode)) return;
+    setPriceRows((rows) => [...rows, { currencyCode, unitPrice: '' }]);
+  };
+  const removePriceRow = (currencyCode: string) =>
+    setPriceRows((rows) => rows.filter((r) => r.currencyCode !== currencyCode));
+  const patchPriceRow = (idx: number, patch: Partial<PriceDraft>) =>
+    setPriceRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  const removeComponent = (idx: number) => setComponents((cs) => cs.filter((_, i) => i !== idx));
+  const patchComponent = (idx: number, patch: Partial<ComponentDraft>) =>
+    setComponents((cs) => cs.map((c, i) => (i === idx ? { ...c, ...patch } : c)));
+
+  // ---- per-org price overrides (#1368) ------------------------------------
+  const orgNameFor = useCallback(
+    (orgId: string) => organizations.find((o) => o.id === orgId)?.name ?? orgId,
+    [organizations],
+  );
+  const overriddenOrgIds = useMemo(() => new Set(overrides.map((o) => o.orgId)), [overrides]);
+  const orgsWithoutOverride = useMemo(
+    () => organizations.filter((o) => !overriddenOrgIds.has(o.id)),
+    [organizations, overriddenOrgIds],
+  );
+  // Org pricing only applies to a persisted, non-bundle item (a bundle's price
+  // derives from its components), for a partner-scope user who can write.
+  const showOrgPricing = !!effectiveId && !isBundle && isPartnerScope && canWrite;
+
+  // Picking an org defaults the override currency to that org's currency
+  // (organizations.currency_code), falling back to the partner's.
+  const pickOverrideOrg = (orgId: string) => {
+    setNewOverrideOrgId(orgId);
+    const org = organizations.find((o) => o.id === orgId);
+    setNewOverrideCurrency(orgCurrencyOf(org) ?? partnerCurrency ?? '');
+  };
+
+  const addOverride = useCallback(async () => {
+    if (overrideBusy || !effectiveId) return;
+    if (!newOverrideOrgId) { showToast({ message: t('catalogItemEditorDrawer.pickAnOrganization'), type: 'error' }); return; }
+    const price = Number(newOverridePrice);
+    if (newOverridePrice.trim() === '' || !Number.isFinite(price) || price < 0) {
+      showToast({ message: t('catalogItemEditorDrawer.enterAValidOverridePrice'), type: 'error' });
+      return;
+    }
+    setOverrideBusy(true);
+    try {
+      const saved = await runAction<{ data: OrgPriceOverride }>({
+        request: () => setOrgPriceOverride(effectiveId, newOverrideOrgId, price, newOverrideCurrency || undefined),
+        errorFallback: t('catalogItemEditorDrawer.couldNotSetTheOverrideRetry'),
+        successMessage: t('catalogItemEditorDrawer.overrideSaved'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setOverrides((cur) => [...cur.filter((o) => o.orgId !== newOverrideOrgId), saved.data]);
+      setNewOverrideOrgId('');
+      setNewOverridePrice('');
+      setNewOverrideCurrency('');
+    } catch (err) {
+      handleActionError(err, 'Could not set the override. Retry.');
+    } finally {
+      setOverrideBusy(false);
+    }
+  }, [overrideBusy, effectiveId, newOverrideOrgId, newOverridePrice, newOverrideCurrency]);
+
+  const deleteOverride = useCallback(async (orgId: string) => {
+    if (overrideBusy || !effectiveId) return;
+    setOverrideBusy(true);
+    try {
+      await runAction({
+        request: () => removeOrgPriceOverride(effectiveId, orgId),
+        errorFallback: t('catalogItemEditorDrawer.couldNotRemoveTheOverrideRetry'),
+        successMessage: t('catalogItemEditorDrawer.overrideRemoved'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setOverrides((cur) => cur.filter((o) => o.orgId !== orgId));
+    } catch (err) {
+      handleActionError(err, 'Could not remove the override. Retry.');
+    } finally {
+      setOverrideBusy(false);
+    }
+  }, [overrideBusy, effectiveId]);
+
+  // ---- product image (#5) --------------------------------------------------
+  const uploadImage = useCallback(async (file: File) => {
+    if (!effectiveId || imageBusy) return;
+    setImageBusy(true);
+    try {
+      await runAction({
+        request: () => uploadCatalogItemImage(effectiveId, file),
+        errorFallback: t('catalogItemEditorDrawer.couldNotUploadTheImageRetry'),
+        successMessage: t('catalogItemEditorDrawer.imageUploaded'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setImageVersion((v) => v + 1);
+    } catch (err) {
+      handleActionError(err, 'Could not upload the image. Retry.');
+    } finally {
+      setImageBusy(false);
+      if (imageInputRef.current) imageInputRef.current.value = '';
+    }
+  }, [effectiveId, imageBusy]);
+
+  const importFromUrl = useCallback(async () => {
+    if (!effectiveId || imageBusy) return;
+    const url = imageUrl.trim();
+    if (!url) { showToast({ message: t('catalogItemEditorDrawer.enterAnImageURL'), type: 'error' }); return; }
+    setImageBusy(true);
+    try {
+      await runAction({
+        request: () => importCatalogItemImageFromUrl(effectiveId, url),
+        errorFallback: t('catalogItemEditorDrawer.couldNotImportTheImageFromThatURLRetry'),
+        successMessage: t('catalogItemEditorDrawer.imageImported'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setImageVersion((v) => v + 1);
+      setImageUrl('');
+    } catch (err) {
+      handleActionError(err, 'Could not import the image from that URL. Retry.');
+    } finally {
+      setImageBusy(false);
+    }
+  }, [effectiveId, imageBusy, imageUrl]);
+
+  const removeImage = useCallback(async () => {
+    if (!effectiveId || imageBusy) return;
+    setImageBusy(true);
+    try {
+      await runAction({
+        request: () => deleteCatalogItemImageRequest(effectiveId),
+        errorFallback: t('catalogItemEditorDrawer.couldNotRemoveTheImageRetry'),
+        successMessage: t('catalogItemEditorDrawer.imageRemoved'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      setImageVersion((v) => v + 1);
+    } catch (err) {
+      handleActionError(err, 'Could not remove the image. Retry.');
+    } finally {
+      setImageBusy(false);
+    }
+  }, [effectiveId, imageBusy]);
+
+  // ---- save ----------------------------------------------------------------
+  const priceRowValid = (r: PriceDraft) => {
+    const n = Number(r.unitPrice);
+    return !!r.currencyCode && r.unitPrice.trim() !== '' && Number.isFinite(n) && n >= 0;
+  };
+  // At least one priced currency (PRICE_REQUIRED server-side), every row valid.
+  const pricesValid = priceRows.length > 0 && priceRows.every(priceRowValid);
+  const partnerPrice = partnerCurrency
+    ? priceRows.find((r) => r.currencyCode === partnerCurrency)?.unitPrice ?? null
+    : null;
+  const marginPreview = computeMargin(partnerPrice, costBasis, partnerCurrency, costCurrency);
+  const costCurrencyMismatch = costBasis.trim() !== '' && !!costCurrency && !!partnerCurrency && costCurrency !== partnerCurrency;
+  // Block saving a bundle whose components never loaded — an empty save would
+  // wipe the real components (#1944). Also block until the partner currency is
+  // known: the price-book default row and the cost currency depend on it.
+  const canSave = !saving && name.trim() !== '' && pricesValid && !!partnerCurrency && !(isBundle && detailLoadFailed);
+
+  const save = useCallback(async () => {
+    if (saving) return;
+    if (!name.trim()) { showToast({ message: t('catalogItemEditorDrawer.enterAnItemName'), type: 'error' }); return; }
+    if (!partnerCurrency) { showToast({ message: t('catalogItemEditorDrawer.partnerCurrencyUnavailable'), type: 'error' }); return; }
+    if (priceRows.length === 0) { showToast({ message: t('catalogItemEditorDrawer.noPricesYet'), type: 'error' }); return; }
+    if (!pricesValid) { showToast({ message: t('catalogItemEditorDrawer.enterAValidUnitPrice'), type: 'error' }); return; }
+    // If the detail load failed, our `components` state is unknown — not empty.
+    // Saving a bundle would overwrite its real components with this stale/empty
+    // set, wiping the bundle (#1944). Block until the user reopens and reloads.
+    if (isBundle && detailLoadFailed) {
+      showToast({
+        message: t('catalogItemEditorDrawer.thisBundleSComponentsCouldNotBeLoadedReopenTheItemToRetr'),
+        type: 'error',
+      });
+      return;
+    }
+
+    const comps = isBundle ? components : [];
+    for (const c of comps) {
+      if (!c.componentItemId) { showToast({ message: t('catalogItemEditorDrawer.pickAnItemForEveryBundleComponent'), type: 'error' }); return; }
+      const q = Number(c.quantity);
+      if (c.quantity.trim() === '' || !Number.isFinite(q) || q <= 0) {
+        showToast({ message: t('catalogItemEditorDrawer.componentQuantityMustBeGreaterThan0'), type: 'error' });
+        return;
+      }
+    }
+
+    const prices = priceRows.map((r) => ({ currencyCode: r.currencyCode, unitPrice: Number(r.unitPrice) }));
+    const body = {
+      itemType,
+      name: name.trim(),
+      description: description.trim() || null,
+      sku: sku.trim() || null,
+      costBasis: costBasis.trim() ? Number(costBasis) : null,
+      costCurrency: costCurrency || partnerCurrency,
+      isBundle,
+      // Persist AI provenance only for auto-filled new items (enrichment resets
+      // to null when the drawer opens for an existing item). A bundle-retry PATCH
+      // may still carry it, which is fine — the item was just created this session.
+      ...(enrichment ? { attributes: { enrichment } } : {}),
+    };
+
+    setSaving(true);
+    try {
+      const targetId = effectiveId;
+      // Create carries the whole price book in the POST (no deprecated
+      // unitPrice); edit PATCHes the non-price fields and diffs the rows below.
+      const saved = await runAction<{ data: CatalogItem }>({
+        request: () => (targetId ? updateCatalogItem(targetId, body) : createCatalogItem({ ...body, prices })),
+        errorFallback: targetId
+          ? t('catalogItemEditorDrawer.updateFailedRetry')
+          : t('catalogItemEditorDrawer.itemCreationFailedRetry'),
+        onUnauthorized: UNAUTHORIZED,
+      });
+      const savedId = saved.data.id;
+      // Remember the id so a component-step retry edits rather than re-creates.
+      if (!editId) setCommittedId(savedId);
+
+      if (targetId) {
+        // Upserts first, removals last, so the item never transiently loses its
+        // only row. Each success is folded into basePrices so a retry after a
+        // partial failure only replays what is still pending.
+        const baseByCode = new Map(basePrices.map((p) => [p.currencyCode, p.unitPrice]));
+        for (const row of prices) {
+          const prev = baseByCode.get(row.currencyCode);
+          if (prev !== undefined && Number(prev) === row.unitPrice) continue;
+          await runAction({
+            request: () => setItemPrice(savedId, row.currencyCode, row.unitPrice),
+            errorFallback: t('catalogItemEditorDrawer.priceCouldNotBeSavedRetry', { currency: row.currencyCode }),
+            onUnauthorized: UNAUTHORIZED,
+          });
+          setBasePrices((cur) => [
+            ...cur.filter((p) => p.currencyCode !== row.currencyCode),
+            { currencyCode: row.currencyCode, unitPrice: row.unitPrice.toFixed(2) },
+          ]);
+        }
+        const keep = new Set(prices.map((p) => p.currencyCode));
+        for (const base of basePrices) {
+          if (keep.has(base.currencyCode)) continue;
+          await runAction({
+            request: () => removeItemPrice(savedId, base.currencyCode),
+            errorFallback: t('catalogItemEditorDrawer.priceCouldNotBeRemovedRetry', { currency: base.currencyCode }),
+            onUnauthorized: UNAUTHORIZED,
+          });
+          setBasePrices((cur) => cur.filter((p) => p.currencyCode !== base.currencyCode));
+        }
+      } else {
+        setBasePrices(prices.map((p) => ({ currencyCode: p.currencyCode, unitPrice: p.unitPrice.toFixed(2) })));
+      }
+
+      if (isBundle) {
+        await runAction({
+          request: () => setBundleComponents(savedId, comps.map((c) => ({
+            componentItemId: c.componentItemId,
+            quantity: Number(c.quantity),
+            showOnInvoice: c.showOnInvoice,
+          }))),
+          errorFallback: t('catalogItemEditorDrawer.bundleComponentsCouldNotBeSavedRetry'),
+          friendly: bundleFriendly,
+          onUnauthorized: UNAUTHORIZED,
+        });
+      }
+
+      showToast({
+        message: editId
+          ? t('catalogItemEditorDrawer.itemUpdated')
+          : t('catalogItemEditorDrawer.itemCreated', { name: body.name }),
+        type: 'success'
+      });
+      onSaved();
+      onClose();
+    } catch (err) {
+      handleActionError(err, 'Save failed. Retry.');
+    } finally {
+      setSaving(false);
+    }
+  }, [saving, name, description, pricesValid, priceRows, basePrices, partnerCurrency, isBundle, detailLoadFailed, components, itemType, sku, costBasis, costCurrency, enrichment, effectiveId, editId, onSaved, onClose]);
+
+  // Auto-fill a NEW item from the web: fill the fields this form actually edits
+  // (name + type) and stash provenance. Price is never auto-set — the button shows
+  // a guidance hint and the user enters the real price. The AI's acquisition-cost
+  // estimate pre-fills an EMPTY cost basis (internal field, feeds the margin
+  // preview) but never overwrites one the user already typed.
+  const applyEnrichment = useCallback((result: EnrichResult) => {
+    setName(result.draft.name);
+    if (result.draft.description) setDescription(result.draft.description);
+    setItemType(result.draft.itemType);
+    if (result.estimatedCost != null) {
+      setCostBasis((cur) => (cur.trim() === '' ? result.estimatedCost!.toFixed(2) : cur));
+    }
+    setEnrichment(result.provenance);
+  }, []);
+
+  if (!open || typeof document === 'undefined') return null;
+
+  const fieldCls = 'w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring';
+
+  return createPortal(
+    <div
+      className="dialog-backdrop fixed inset-0 z-50 flex justify-end bg-background/80"
+      style={{ animation: 'dialog-backdrop-in 150ms ease-out' }}
+      onClick={handleBackdropClick}
+      onKeyDown={handleKeyDown}
+      data-testid="catalog-editor-backdrop"
+    >
+      <div
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className="drawer-panel flex h-full w-full max-w-md flex-col border-l bg-card shadow-xl focus:outline-hidden"
+        style={{ animation: 'slide-in-from-right 220ms cubic-bezier(0.22, 1, 0.36, 1)' }}
+        data-testid="catalog-item-editor"
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between border-b px-5 py-4">
+          <h2 id={titleId} className="text-base font-semibold">
+            {editId ? t('catalogItemEditorDrawer.editItem') : t('catalogItemEditorDrawer.newItem')}
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label={t('catalogItemEditorDrawer.close')}
+            data-testid="catalog-form-close"
+          >
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M18 6 6 18M6 6l12 12" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Body (scrolls) */}
+        <div className="flex-1 space-y-4 overflow-y-auto px-5 py-5">
+          {/* AI auto-fill — new items only */}
+          {!editId && canWrite && (
+            <div className="rounded-md border border-dashed p-3" data-testid="catalog-form-enrich">
+              <p className="mb-2 text-xs font-medium text-muted-foreground">{t('catalogItemEditorDrawer.autoFillANewItemFromTheWeb')}</p>
+              <CatalogEnrichButton idSuffix="drawer" hint={itemType} onApply={applyEnrichment} />
+            </div>
+          )}
+          {/* Type — segmented */}
+          <div>
+            <span className="mb-1.5 block text-xs font-medium text-muted-foreground">{t('catalogItemEditorDrawer.type')}</span>
+            <div className="grid grid-cols-3 gap-1 rounded-md border bg-muted/40 p-1" role="group" aria-label={t('catalogItemEditorDrawer.itemType')}>
+              {CATALOG_TYPE_ORDER.map((catalogType) => (
+                <button
+                  key={catalogType}
+                  type="button"
+                  onClick={() => setItemType(catalogType)}
+                  aria-pressed={itemType === catalogType}
+                  className={`rounded px-2 py-1.5 text-sm font-medium transition ${
+                    itemType === catalogType ? 'bg-card text-foreground shadow-xs' : 'text-muted-foreground hover:text-foreground'
+                  }`}
+                  data-testid={`catalog-form-type-${catalogType}`}
+                >
+                  {CATALOG_TYPE_LABELS[catalogType]}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-muted-foreground" htmlFor="catalog-form-name-input">{t('catalogItemEditorDrawer.name')}</label>
+            <input
+              id="catalog-form-name-input"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className={fieldCls}
+              placeholder={t('catalogItemEditorDrawer.eGManagedWorkstation')}
+              data-testid="catalog-form-name"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-muted-foreground" htmlFor="catalog-form-description-input">{t('catalogItemEditorDrawer.description')}<span className="font-normal opacity-70">{t('catalogItemEditorDrawer.optional')}</span></label>
+            <textarea
+              id="catalog-form-description-input"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              rows={3}
+              className={`${fieldCls} resize-y`}
+              placeholder={t('catalogItemEditorDrawer.customerFacingDetailsShownOnQuotesAndInvoices')}
+              data-testid="catalog-form-description"
+            />
+            {canWrite && (name.trim() || description.trim()) && (
+              <div className="mt-2 flex items-center gap-2">
+                <PolishButton
+                  idSuffix="catalog"
+                  getText={() => ({ name, description })}
+                  onApply={(r) => {
+                    if (r.name !== null) setName(r.name);
+                    if (r.description !== null) setDescription(r.description);
+                  }}
+                />
+                <span className="text-xs text-muted-foreground">{t('catalogItemEditorDrawer.cleansUpWordingAmpFormattingYourNumbersAmpSpecsStayYouRe')}</span>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-muted-foreground" htmlFor="catalog-form-sku-input">{t('catalogItemEditorDrawer.sKU')}<span className="font-normal opacity-70">{t('catalogItemEditorDrawer.optional')}</span></label>
+            <input
+              id="catalog-form-sku-input"
+              value={sku}
+              onChange={(e) => setSku(e.target.value)}
+              className={`${fieldCls} font-mono`}
+              placeholder={t('catalogItemEditorDrawer.sKU001')}
+              data-testid="catalog-form-sku"
+            />
+          </div>
+
+          {/* Price book — one sell price per currency; a missing currency is a
+              gap the server reports (NO_PRICE_FOR_CURRENCY), never a conversion. */}
+          <div className="space-y-2 rounded-md border p-3" data-testid="catalog-form-price-book">
+            <span className="text-xs font-medium text-muted-foreground">{t('catalogItemEditorDrawer.priceBook')}</span>
+            {partnerCurrency == null ? (
+              partnerCurrencyFailed ? (
+                <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive" data-testid="catalog-form-price-book-error">
+                  {t('catalogItemEditorDrawer.partnerCurrencyUnavailable')}{' '}
+                  <button type="button" onClick={retryPartnerCurrency} className="underline hover:text-foreground">{t('catalogItemEditorDrawer.retry')}</button>
+                </p>
+              ) : (
+                <p className="py-2 text-center text-xs text-muted-foreground" data-testid="catalog-form-price-book-loading">
+                  {t('catalogItemEditorDrawer.loadingPartnerCurrency')}</p>
+              )
+            ) : (
+              <>
+                {priceRows.length === 0 ? (
+                  <p className="py-2 text-center text-xs text-muted-foreground" data-testid="catalog-form-price-book-empty">
+                    {t('catalogItemEditorDrawer.noPricesYet')}</p>
+                ) : (
+                  <ul className="space-y-1.5">
+                    {priceRows.map((r, idx) => (
+                      <li key={r.currencyCode} className="flex items-center gap-2" data-testid={`catalog-form-price-row-${r.currencyCode}`}>
+                        <select
+                          value={r.currencyCode}
+                          onChange={(e) => patchPriceRow(idx, { currencyCode: e.target.value })}
+                          aria-label={t('catalogItemEditorDrawer.priceCurrency')}
+                          className="h-9 w-40 rounded-md border bg-background px-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                          data-testid={`catalog-form-price-currency-${idx}`}
+                        >
+                          {allCurrencyOptions
+                            .filter((code) => code === r.currencyCode || !usedCurrencies.has(code))
+                            .map((code) => (
+                              <option key={code} value={code}>{currencyLabel(code, i18n.language)}</option>
+                            ))}
+                        </select>
+                        <input
+                          value={r.unitPrice}
+                          onChange={(e) => patchPriceRow(idx, { unitPrice: e.target.value })}
+                          inputMode="decimal"
+                          aria-label={t('catalogItemEditorDrawer.unitPrice')}
+                          className={`${fieldCls} flex-1 text-right tabular-nums`}
+                          placeholder="0.00"
+                          data-testid={`catalog-form-price-${idx}`}
+                        />
+                        {canWrite && (
+                          <button
+                            type="button"
+                            onClick={() => removePriceRow(r.currencyCode)}
+                            className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-destructive"
+                            aria-label={t('catalogItemEditorDrawer.removePrice', { currency: r.currencyCode })}
+                            data-testid={`catalog-form-price-remove-${r.currencyCode}`}
+                          >
+                            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M3 6h18M8 6V4h8v2m-9 0v14a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V6" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {canWrite && addableCurrencies.length > 0 && (
+                  <select
+                    value=""
+                    onChange={(e) => addPriceRow(e.target.value)}
+                    aria-label={t('catalogItemEditorDrawer.addCurrencyPrice')}
+                    className="h-9 w-full rounded-md border bg-background px-2 text-sm text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                    data-testid="catalog-form-price-add"
+                  >
+                    <option value="">{t('catalogItemEditorDrawer.addCurrencyPrice')}</option>
+                    {addableCurrencies.map((code) => (
+                      <option key={code} value={code}>{currencyLabel(code, i18n.language)}</option>
+                    ))}
+                  </select>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1.5 block text-xs font-medium text-muted-foreground" htmlFor="catalog-form-cost-input">{t('catalogItemEditorDrawer.costBasis')}<span className="font-normal opacity-70">{t('catalogItemEditorDrawer.optional')}</span></label>
+              <input
+                id="catalog-form-cost-input"
+                value={costBasis}
+                onChange={(e) => setCostBasis(e.target.value)}
+                inputMode="decimal"
+                className={`${fieldCls} text-right tabular-nums`}
+                placeholder="0.00"
+                data-testid="catalog-form-cost"
+              />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-xs font-medium text-muted-foreground" htmlFor="catalog-form-cost-currency-input">{t('catalogItemEditorDrawer.costCurrency')}</label>
+              <select
+                id="catalog-form-cost-currency-input"
+                value={costCurrency}
+                onChange={(e) => setCostCurrency(e.target.value)}
+                disabled={partnerCurrency == null && !costCurrency}
+                className={`${fieldCls} disabled:opacity-50`}
+                data-testid="catalog-form-cost-currency"
+              >
+                {!costCurrency && <option value="">{t('catalogItemEditorDrawer.loadingPartnerCurrency')}</option>}
+                {currencyOptions(costCurrency || partnerCurrency || '').map((code) => (
+                  <option key={code} value={code}>{currencyLabel(code, i18n.language)}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Live margin preview — partner-currency price vs cost, only when the
+              cost is in that same currency (never computed across currencies). */}
+          <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2 text-sm" data-testid="catalog-form-margin">
+            <span className="text-muted-foreground">{t('catalogItemEditorDrawer.margin')}</span>
+            <span className={`text-right font-medium tabular-nums ${marginTone(marginPreview)}`}>
+              {marginPreview != null
+                ? formatMargin(marginPreview)
+                : costCurrencyMismatch
+                  ? t('catalogItemEditorDrawer.marginUnavailableCostIn', { currency: costCurrency })
+                  : costBasis.trim() === ''
+                    ? t('catalogItemEditorDrawer.addACostBasisToSeeMargin')
+                    : '—'}
+            </span>
+          </div>
+
+          {/* Product image (#5) — manual upload, shown on quotes */}
+          {canWrite && (
+            <div className="space-y-2 rounded-md border p-3" data-testid="catalog-form-image">
+              <span className="text-xs font-medium text-muted-foreground">{t('catalogItemEditorDrawer.productImage')}</span>
+              {effectiveId ? (
+                <>
+                  <CatalogImagePreview itemId={effectiveId} version={imageVersion} />
+                  <div className="flex items-center gap-2">
+                    <input
+                      ref={imageInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg"
+                      disabled={imageBusy}
+                      onChange={(e) => { const f = e.target.files?.[0]; if (f) void uploadImage(f); }}
+                      className="block w-full text-xs file:mr-2 file:rounded-md file:border file:bg-muted file:px-2 file:py-1 file:text-xs file:font-medium disabled:opacity-50"
+                      data-testid="catalog-form-image-input"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void removeImage()}
+                      disabled={imageBusy}
+                      className="rounded-md border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                      data-testid="catalog-form-image-remove"
+                    >
+                      {t('catalogItemEditorDrawer.remove')}</button>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="url"
+                      value={imageUrl}
+                      onChange={(e) => setImageUrl(e.target.value)}
+                      disabled={imageBusy}
+                      placeholder={t('catalogItemEditorDrawer.httpsExampleComProductPng')}
+                      className={`${fieldCls} text-xs disabled:opacity-50`}
+                      data-testid="catalog-form-image-url"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void importFromUrl()}
+                      disabled={imageBusy || imageUrl.trim() === ''}
+                      className="shrink-0 rounded-md border px-2 py-1 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                      data-testid="catalog-form-image-url-btn"
+                    >
+                      {t('catalogItemEditorDrawer.importFromURL')}</button>
+                  </div>
+                  <p className="chart-legend-xs text-muted-foreground">{t('catalogItemEditorDrawer.pNGJPEGOrWebPUpTo5MB')}</p>
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground" data-testid="catalog-form-image-hint">
+                  {t('catalogItemEditorDrawer.saveTheItemFirstThenAddAProductImage')}</p>
+              )}
+            </div>
+          )}
+
+          {/* Bundle toggle */}
+          <label className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
+            <input
+              type="checkbox"
+              checked={isBundle}
+              onChange={(e) => setIsBundle(e.target.checked)}
+              className="h-4 w-4"
+              data-testid="catalog-form-bundle"
+            />
+            <span>
+              <span className="font-medium">{t('catalogItemEditorDrawer.thisItemIsABundle')}</span>
+              <span className="block text-xs text-muted-foreground">{t('catalogItemEditorDrawer.groupsOtherCatalogItemsSoldTogether')}</span>
+            </span>
+          </label>
+
+          {/* Bundle component builder */}
+          {isBundle && (
+            <div className="space-y-2 rounded-md border p-3" data-testid="catalog-bundle-builder">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-muted-foreground">{t('catalogItemEditorDrawer.itemsIncludedInThisBundle')}</span>
+                {canWrite && (
+                  <button
+                    type="button"
+                    onClick={addComponent}
+                    className="rounded-md border px-2 py-1 text-xs font-medium hover:bg-muted"
+                    data-testid="catalog-bundle-add"
+                  >
+                    {t('catalogItemEditorDrawer.addComponent')}</button>
+                )}
+              </div>
+
+              {componentsLoading ? (
+                <p className="py-2 text-center text-xs text-muted-foreground">{t('catalogItemEditorDrawer.loadingComponents')}</p>
+              ) : detailLoadFailed ? (
+                <p
+                  className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-center text-xs text-destructive"
+                  data-testid="catalog-bundle-load-error"
+                >
+                  {t('catalogItemEditorDrawer.couldNotLoadThisBundleSComponentsReopenTheItemToRetrySav')}</p>
+              ) : components.length === 0 ? (
+                <p className="py-2 text-center text-xs text-muted-foreground" data-testid="catalog-bundle-empty">
+                  {t('catalogItemEditorDrawer.noComponentsYetAddTheItemsThisBundleIncludes')}</p>
+              ) : (
+                <ul className="space-y-2">
+                  {components.map((c, idx) => {
+                    // Options: eligible items not already chosen, plus this row's own choice.
+                    const opts = eligible.filter((e) => !selectedIds.has(e.id) || e.id === c.componentItemId);
+                    return (
+                      <li key={idx} className="space-y-1.5 rounded-md border bg-background p-2" data-testid={`catalog-bundle-row-${idx}`}>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={c.componentItemId}
+                            onChange={(e) => patchComponent(idx, { componentItemId: e.target.value })}
+                            className="h-9 flex-1 rounded-md border bg-background px-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                            data-testid={`catalog-bundle-item-${idx}`}
+                          >
+                            <option value="">{t('catalogItemEditorDrawer.selectItem')}</option>
+                            {c.componentItemId && !opts.some((o) => o.id === c.componentItemId) && (
+                              <option value={c.componentItemId}>{itemName(c.componentItemId)}</option>
+                            )}
+                            {opts.map((o) => (
+                              <option key={o.id} value={o.id}>{o.name}</option>
+                            ))}
+                          </select>
+                          <input
+                            value={c.quantity}
+                            onChange={(e) => patchComponent(idx, { quantity: e.target.value })}
+                            inputMode="decimal"
+                            aria-label={t('catalogItemEditorDrawer.quantity')}
+                            className="h-9 w-16 rounded-md border bg-background px-2 text-right text-sm tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring"
+                            data-testid={`catalog-bundle-qty-${idx}`}
+                          />
+                          {canWrite && (
+                            <button
+                              type="button"
+                              onClick={() => removeComponent(idx)}
+                              className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-destructive"
+                              aria-label={t('catalogItemEditorDrawer.removeComponent')}
+                              data-testid={`catalog-bundle-remove-${idx}`}
+                            >
+                              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <path d="M3 6h18M8 6V4h8v2m-9 0v14a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V6" strokeLinecap="round" strokeLinejoin="round" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={c.showOnInvoice}
+                            onChange={(e) => patchComponent(idx, { showOnInvoice: e.target.checked })}
+                            data-testid={`catalog-bundle-showoninvoice-${idx}`}
+                          />
+                          {t('catalogItemEditorDrawer.showThisLineOnTheInvoice')}</label>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {/* Per-organization price overrides (#1368) */}
+          {showOrgPricing && (
+            <div className="space-y-2 rounded-md border p-3" data-testid="catalog-org-pricing">
+              <span className="text-xs font-medium text-muted-foreground">{t('catalogItemEditorDrawer.perOrganizationPricing')}</span>
+              <p className="text-xs text-muted-foreground">
+                {t('catalogItemEditorDrawer.overrideTheBaseUnitPriceForASpecificCustomerEveryoneElse')}</p>
+
+              {overrides.length === 0 ? (
+                <p className="py-2 text-center text-xs text-muted-foreground" data-testid="catalog-org-pricing-empty">
+                  {t('catalogItemEditorDrawer.noOverridesEveryOrganizationIsBilledTheBasePrice')}</p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {overrides.map((o) => (
+                    <li
+                      key={o.orgId}
+                      className="flex items-center gap-2 rounded-md border bg-background p-2 text-sm"
+                      data-testid={`catalog-override-row-${o.orgId}`}
+                    >
+                      <span className="flex-1 truncate">{orgNameFor(o.orgId)}</span>
+                      <span className="tabular-nums" data-testid={`catalog-override-price-${o.orgId}`}>{o.currencyCode} {o.unitPrice}</span>
+                      <button
+                        type="button"
+                        onClick={() => void deleteOverride(o.orgId)}
+                        disabled={overrideBusy}
+                        aria-label={t('catalogItemEditorDrawer.removeOverride', { organization: orgNameFor(o.orgId) })}
+                        data-testid={`catalog-override-remove-${o.orgId}`}
+                        className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-destructive disabled:opacity-50"
+                      >
+                        <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M3 6h18M8 6V4h8v2m-9 0v14a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V6" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <div className="flex items-center gap-2">
+                <select
+                  value={newOverrideOrgId}
+                  onChange={(e) => pickOverrideOrg(e.target.value)}
+                  className="h-9 flex-1 rounded-md border bg-background px-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  data-testid="catalog-override-org"
+                >
+                  <option value="">{t('catalogItemEditorDrawer.selectOrganization')}</option>
+                  {orgsWithoutOverride.map((o) => (
+                    <option key={o.id} value={o.id}>{o.name}</option>
+                  ))}
+                </select>
+                <select
+                  value={newOverrideCurrency}
+                  onChange={(e) => setNewOverrideCurrency(e.target.value)}
+                  aria-label={t('catalogItemEditorDrawer.overrideCurrency')}
+                  className="h-9 w-20 rounded-md border bg-background px-1 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  data-testid="catalog-override-currency"
+                >
+                  {!newOverrideCurrency && <option value="">—</option>}
+                  {currencyOptions(newOverrideCurrency || partnerCurrency || '').map((code) => (
+                    <option key={code} value={code}>{code}</option>
+                  ))}
+                </select>
+                <input
+                  value={newOverridePrice}
+                  onChange={(e) => setNewOverridePrice(e.target.value)}
+                  inputMode="decimal"
+                  aria-label={t('catalogItemEditorDrawer.overridePrice')}
+                  placeholder="0.00"
+                  className="h-9 w-20 rounded-md border bg-background px-2 text-right text-sm tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  data-testid="catalog-override-price-input"
+                />
+                <button
+                  type="button"
+                  onClick={() => void addOverride()}
+                  disabled={overrideBusy || !newOverrideOrgId}
+                  className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                  data-testid="catalog-override-add"
+                >
+                  {t('catalogItemEditorDrawer.set')}</button>
+              </div>
+              {organizations.length > 0 && orgsWithoutOverride.length === 0 && (
+                <p className="text-center chart-legend-xs text-muted-foreground">{t('catalogItemEditorDrawer.allOrganizationsHaveAnOverride')}</p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Footer (sticky) */}
+        <div className="flex items-center justify-end gap-2 border-t px-5 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={saving}
+            className="rounded-md border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+            data-testid="catalog-form-cancel"
+          >
+            {t('catalogItemEditorDrawer.cancel')}</button>
+          {canWrite && (
+            <button
+              type="button"
+              onClick={() => void save()}
+              disabled={!canSave}
+              className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+              data-testid="catalog-form-save"
+            >
+              {saving ? t('catalogItemEditorDrawer.saving') : editId ? t('catalogItemEditorDrawer.saveChanges') : t('catalogItemEditorDrawer.createItem')}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+// Product-image preview. GET /catalog/:id/image needs the Bearer auth header, so a
+// bare <img src> would 401 — fetchWithAuth → blob → object URL (mirrors
+// QuoteImagePreview). 404 means the item simply has no image yet. `version` bumps
+// to refetch after an upload/remove.
+function CatalogImagePreview({ itemId, version }: { itemId: string; version: number }) {
+  const [url, setUrl] = useState<string>();
+  const [state, setState] = useState<'loading' | 'none' | 'error' | 'ok'>('loading');
+
+  useEffect(() => {
+    let objectUrl: string | undefined;
+    let cancelled = false;
+    setState('loading');
+    void (async () => {
+      try {
+        const res = await fetchWithAuth(catalogItemImagePath(itemId));
+        if (res.status === 404) { if (!cancelled) setState('none'); return; }
+        if (!res.ok) { if (!cancelled) setState('error'); return; }
+        const blob = await res.blob();
+        if (cancelled) return;
+        objectUrl = window.URL.createObjectURL(blob);
+        setUrl(objectUrl);
+        setState('ok');
+      } catch {
+        if (!cancelled) setState('error');
+      }
+    })();
+    return () => { cancelled = true; if (objectUrl) window.URL.revokeObjectURL(objectUrl); };
+  }, [itemId, version]);
+
+  if (state === 'loading') return <div className="h-32 w-full animate-pulse rounded border bg-muted" data-testid="catalog-image-loading" />;
+  if (state === 'none') return <p className="rounded border border-dashed py-6 text-center text-xs text-muted-foreground" data-testid="catalog-image-empty">{i18n.t('settings:catalogItemEditorDrawer.noImageYet')}</p>;
+  if (state === 'error' || !url) return <p className="text-xs text-muted-foreground">{i18n.t('settings:catalogItemEditorDrawer.imagePreviewUnavailable')}</p>;
+  return <img src={url} alt={i18n.t('settings:catalogItemEditorDrawer.product')} className="max-h-40 rounded border" data-testid="catalog-image-preview" />;
+}

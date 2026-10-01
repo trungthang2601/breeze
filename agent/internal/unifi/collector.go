@@ -1,0 +1,274 @@
+package unifi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/observability"
+)
+
+type CollectorConfig struct {
+	CollectorID         string `json:"collectorId"`
+	UnifiHostID         string `json:"unifiHostId"`
+	ControllerURL       string `json:"controllerUrl"`
+	APIKey              string `json:"apiKey"`
+	PollIntervalSeconds int    `json:"pollIntervalSeconds"`
+}
+
+type CollectorDeps struct {
+	// APIBaseURL returns the CURRENT Breeze server root, e.g.
+	// https://breeze.example.com — NOT including /api/v1. It is a provider
+	// (typically heartbeat.ServerURL), not a copied string, so backup-server-URL
+	// promotion after failover (#2323) is visible to every request. A copied
+	// cfg.ServerURL kept uploading to a dead primary for the process lifetime
+	// (#2423).
+	APIBaseURL func() string
+	AgentID    string       // this agent's id; agent telemetry endpoints live under /api/v1/agents/<AgentID>/
+	HTTP       *http.Client // authed transport to the Breeze API (agent token attached)
+	Logf       func(format string, args ...any)
+}
+
+// agentBase builds the per-agent endpoint prefix the API mounts under
+// (agentAuthMiddleware runs on /api/v1/agents/:id/*). The /api/v1 prefix is
+// mandatory — every other agent call (heartbeat, monitoring, commands, logs)
+// builds ServerURL + "/api/v1/agents/...", and the collector must match or the
+// API 404s the request and the collector never leaves status=pending (#2263).
+// The device is resolved from the agent token server-side; the :id in the path
+// matches the existing agent routes.
+//
+// An unset or empty-returning APIBaseURL provider is a wiring bug, not a
+// runtime condition: report it as a named error rather than dereferencing a
+// nil func (which would panic the collector goroutine) or silently building a
+// scheme-less relative URL that fails as a cryptic transport error forever.
+func (d CollectorDeps) agentBase() (string, error) {
+	if d.APIBaseURL == nil {
+		return "", errors.New("unifi collector: APIBaseURL provider not set")
+	}
+	baseURL := d.APIBaseURL()
+	if baseURL == "" {
+		return "", errors.New("unifi collector: APIBaseURL provider returned an empty server URL")
+	}
+	return baseURL + "/api/v1/agents/" + d.AgentID, nil
+}
+
+func (d CollectorDeps) logf(format string, args ...any) {
+	if d.Logf != nil {
+		d.Logf(format, args...)
+	}
+}
+
+// The upload DTOs match the API's camelCase ingest contract (telemetrySchema in
+// routes/agents/unifiTelemetry.ts). They are deliberately separate from Device/
+// Client: those decode the CONTROLLER's response, and the two vocabularies do
+// not line up even where both are camelCase (the controller says macAddress /
+// ipAddress / uplinkDeviceId, Breeze ingest says mac / ip / connectedDeviceId,
+// and Breeze needs unifiDeviceId, which the controller calls id). Keep them
+// separate — do not collapse one into the other.
+type uploadDevice struct {
+	UnifiDeviceID string `json:"unifiDeviceId"`
+	UnifiSiteID   string `json:"unifiSiteId,omitempty"`
+	Mac           string `json:"mac,omitempty"`
+	Name          string `json:"name,omitempty"`
+	// omitempty on the metric fields is load-bearing, not cosmetic. None of these
+	// are readable from the device LIST endpoint (see Device in client.go), so
+	// they are always zero today. The ingest column and the web UI both treat
+	// null/absent as "not collected" (`d.numClients ?? "—"`), so sending a
+	// literal 0 renders as a real measurement — the same "silent zero looks like
+	// data" failure #5087 was about, one hop downstream.
+	//
+	// WHEN the statistics/latest fetch is implemented: omitempty can no longer
+	// carry this meaning, because a genuine zero would be dropped too. Switch
+	// these to pointers (nil = not collected, &0 = measured zero) at that point.
+	UptimeSeconds int64           `json:"uptimeSeconds,omitempty"`
+	CPUPct        float64         `json:"cpuPct,omitempty"`
+	MemPct        float64         `json:"memPct,omitempty"`
+	TxBytes       int64           `json:"txBytes,omitempty"`
+	RxBytes       int64           `json:"rxBytes,omitempty"`
+	NumClients    int             `json:"numClients,omitempty"`
+	PoePorts      []PoePort       `json:"poePorts,omitempty"`
+	Raw           json.RawMessage `json:"raw,omitempty"`
+}
+
+type uploadClient struct {
+	Mac               string          `json:"mac"`
+	UnifiSiteID       string          `json:"unifiSiteId,omitempty"`
+	Hostname          string          `json:"hostname,omitempty"`
+	IP                string          `json:"ip,omitempty"`
+	ConnectedDeviceID string          `json:"connectedDeviceId,omitempty"`
+	UplinkPortIdx     int             `json:"uplinkPortIdx"`
+	IsWired           bool            `json:"isWired"`
+	SSID              string          `json:"ssid,omitempty"`
+	Vlan              int             `json:"vlan"`
+	SignalDbm         int             `json:"signalDbm"`
+	TxBytes           int64           `json:"txBytes"`
+	RxBytes           int64           `json:"rxBytes"`
+	UptimeSeconds     int64           `json:"uptimeSeconds"`
+	Raw               json.RawMessage `json:"raw,omitempty"`
+}
+
+type uploadSite struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
+type telemetryPayload struct {
+	CollectorID string         `json:"collectorId"`
+	PolledAt    string         `json:"polledAt"`
+	FirmwareOK  bool           `json:"firmwareOk"`
+	Devices     []uploadDevice `json:"devices"`
+	Clients     []uploadClient `json:"clients"`
+	Sites       []uploadSite   `json:"sites,omitempty"`
+	Error       string         `json:"error,omitempty"`
+}
+
+func toUploadDevices(in []Device) []uploadDevice {
+	out := make([]uploadDevice, len(in))
+	for i, d := range in {
+		out[i] = uploadDevice{
+			UnifiDeviceID: d.ID, UnifiSiteID: d.SiteID, Mac: d.Mac, Name: d.Name,
+			UptimeSeconds: d.UptimeSeconds, CPUPct: d.CPUPct, MemPct: d.MemPct,
+			TxBytes: d.TxBytes, RxBytes: d.RxBytes, NumClients: d.NumClients,
+			PoePorts: d.PoePorts, Raw: d.Raw,
+		}
+	}
+	return out
+}
+
+func toUploadClients(in []Client) []uploadClient {
+	out := make([]uploadClient, len(in))
+	for i, cl := range in {
+		out[i] = uploadClient{
+			Mac: cl.Mac, UnifiSiteID: cl.SiteID, Hostname: cl.Hostname, IP: cl.IP,
+			ConnectedDeviceID: cl.ConnectedDeviceID, UplinkPortIdx: cl.UplinkPortIdx, IsWired: cl.IsWired(),
+			SSID: cl.SSID, Vlan: cl.Vlan, SignalDbm: cl.SignalDbm,
+			TxBytes: cl.TxBytes, RxBytes: cl.RxBytes, UptimeSeconds: cl.UptimeSeconds, Raw: cl.Raw,
+		}
+	}
+	return out
+}
+
+// RunOnce polls one controller and uploads the snapshot. controllerHTTP may be nil
+// (DefaultHTTPClient is used). Returns an error only on upload failure; controller-side
+// failures are reported in the payload (FirmwareOK / Error).
+func RunOnce(ctx context.Context, deps CollectorDeps, cfg CollectorConfig, controllerHTTP *http.Client) error {
+	api := NewAPIClient(cfg.ControllerURL, cfg.APIKey, controllerHTTP)
+	snap, pollErr := api.Poll(ctx)
+	sites := make([]uploadSite, len(snap.Sites))
+	for i, s := range snap.Sites {
+		sites[i] = uploadSite{ID: s.ID, Name: s.Name}
+	}
+	payload := telemetryPayload{
+		CollectorID: cfg.CollectorID,
+		PolledAt:    time.Now().UTC().Format(time.RFC3339),
+		FirmwareOK:  snap.FirmwareOK,
+		Devices:     toUploadDevices(snap.Devices),
+		Clients:     toUploadClients(snap.Clients),
+		Sites:       sites,
+	}
+	if pollErr != nil {
+		payload.Error = pollErr.Error()
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	base, err := deps.agentBase()
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/unifi-telemetry", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := deps.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("telemetry upload: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// StartCollectorLoop periodically fetches this agent's collector configs from
+// GET /api/v1/agents/:id/unifi-collectors and runs each due collector. It spawns its
+// own goroutine and returns a channel that closes once the loop has exited
+// (after ctx is cancelled), so shutdownAgent can wait for a clean teardown
+// instead of leaking the loop across in-process restarts.
+func StartCollectorLoop(ctx context.Context, deps CollectorDeps) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// A panic in this loop must not take the whole agent down with it —
+		// the sibling workspaceindex loop has carried this guard since it
+		// shipped; the collector never did.
+		defer observability.Recoverer("unifi.collector")
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		lastRun := map[string]time.Time{}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				configs, err := fetchConfigs(ctx, deps)
+				if err != nil {
+					deps.logf("[unifi] fetch configs: %v", err)
+					continue
+				}
+				now := time.Now()
+				for _, cfg := range configs {
+					interval := time.Duration(maxInt(cfg.PollIntervalSeconds, 15)) * time.Second
+					if last, ok := lastRun[cfg.CollectorID]; ok && now.Sub(last) < interval {
+						continue
+					}
+					lastRun[cfg.CollectorID] = now
+					if err := RunOnce(ctx, deps, cfg, nil); err != nil {
+						deps.logf("[unifi] collector %s: %v", cfg.CollectorID, err)
+					}
+				}
+			}
+		}
+	}()
+	return done
+}
+
+func fetchConfigs(ctx context.Context, deps CollectorDeps) ([]CollectorConfig, error) {
+	base, err := deps.agentBase()
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/unifi-collectors", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := deps.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch configs: status %d", resp.StatusCode)
+	}
+	var out struct {
+		Collectors []CollectorConfig `json:"collectors"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Collectors, nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

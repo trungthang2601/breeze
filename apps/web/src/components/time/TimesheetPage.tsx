@@ -1,0 +1,705 @@
+import { usePermissions } from '../../lib/permissions';
+import BillingOutcome, { type BillingOutcomeStamp } from './BillingOutcome';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { sourceBadgeLabelKey } from './timeEntrySource';
+import { fetchWithAuth } from '../../stores/auth';
+import { runAction, ActionError, handleActionError } from '../../lib/runAction';
+import { showToast } from '../shared/Toast';
+import { formatMinutes } from '../../lib/timeFormat';
+import { formatMoney } from '../billing/shared/format';
+import { ApproximateMoneyLine } from '../billing/shared/ApproximateMoneyLine';
+import { onTimerChanged } from '../../lib/timerActions';
+import WorkTypeSelect, { type WorkTypeOption } from '../shared/WorkTypeSelect';
+import { useHashState } from '@/lib/useHashState';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface TsEntry extends BillingOutcomeStamp {
+  billingOverridden?: boolean;
+  workTypeId?: string | null;
+  workType?: WorkTypeOption | null;
+  id: string;
+  startedAt: string;
+  endedAt: string | null;
+  durationMinutes: number;
+  /** #4628 §3.5 billed quantity after the card's minimum/rounding. Absent or
+   *  null on a pre-feature row — then the duration is what bills. */
+  billableMinutes?: number | null;
+  description: string | null;
+  isBillable: boolean;
+  hourlyRate: string | null;
+  /** Snapshot stamped when the rate was set; null only while hourlyRate is null. */
+  currencyCode: string | null;
+  /** `billed` locks startedAt/endedAt/isBillable/hourlyRate server-side (409 ENTRY_BILLED
+   *  if any of them is PRESENT in a PATCH) — only the description may change. */
+  billingStatus?: 'not_billed' | 'billed' | 'no_charge' | 'contract';
+  /** W06 (#3900) server-stamped provenance. Absent on an API predating the
+   *  column — render nothing rather than guessing 'manual'. */
+  source?: string | null;
+  isApproved: boolean;
+  ticketId: string;
+  ticketNumber: string;
+  ticketSubject: string;
+  userName: string;
+}
+
+/** #4628 §3.5 — one line naming the worked time whenever a minimum or the
+ *  card's rounding moved the billed quantity. Returns null when they agree.
+ *  Duplicated locally from TicketTimeBilling: a two-line helper, per the
+ *  repo's file guidance. */
+function billedVsWorked(
+  t: (key: string, options?: Record<string, unknown>) => string,
+  durationMinutes: number | null,
+  billableMinutes: number | null | undefined
+): string | null {
+  const worked = ((durationMinutes ?? 0) / 60).toFixed(2);
+  const billed = (((billableMinutes ?? durationMinutes) ?? 0) / 60).toFixed(2);
+  if (worked === billed) return null;
+  return t('longTail.time.TimesheetPage.billedVsWorked', { worked, billed });
+}
+
+interface TsDay {
+  date: string;
+  totalMinutes: number;
+  billableMinutes: number;
+  entries: TsEntry[];
+}
+
+/** Mirrors the API's `CurrencyAmount` — per-currency, never summed across. */
+interface CurrencyAmount {
+  currencyCode: string;
+  amount: string;
+}
+
+interface TsSheet {
+  weekStart: string;
+  days: TsDay[];
+  totals: { totalMinutes: number; billableMinutes: number; billableAmounts: CurrencyAmount[] };
+}
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+interface EditForm {
+  workTypeId: string | null;
+  description: string;
+  isBillable: boolean;
+  hourlyRate: string;
+}
+
+// ---------------------------------------------------------------------------
+// Hash-state helpers
+// ---------------------------------------------------------------------------
+
+function mondayUtc(d: Date): string {
+  const utc = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dow = (utc.getUTCDay() + 6) % 7; // Mon=0 … Sun=6
+  utc.setUTCDate(utc.getUTCDate() - dow);
+  return utc.toISOString().slice(0, 10);
+}
+
+/** The date the approximate line asks rates for. A timesheet is HISTORICAL, so
+ *  an old week must be converted at that week's rates, not today's — but never
+ *  at a future date, because the feed has no rows past today. Hence the earlier
+ *  of today (UTC) and the displayed week's end (Sunday). */
+function reportingDateForWeek(weekStart: string): string {
+  const [y, mo, d] = weekStart.split('-').map(Number);
+  const end = new Date(Date.UTC(y, mo - 1, d));
+  end.setUTCDate(end.getUTCDate() + 6);
+  const weekEnd = end.toISOString().slice(0, 10);
+  const todayUtc = new Date().toISOString().slice(0, 10);
+  return weekEnd < todayUtc ? weekEnd : todayUtc;
+}
+
+function shiftWeek(weekStart: string, delta: number): string {
+  const [y, mo, d] = weekStart.split('-').map(Number);
+  const base = new Date(Date.UTC(y, mo - 1, d));
+  base.setUTCDate(base.getUTCDate() + delta * 7);
+  return base.toISOString().slice(0, 10);
+}
+
+// Pure: takes the raw hash (leading `#` already stripped by useHashState, #2421).
+function parseHash(hash: string): { week: string; tech: string | null } {
+  let week: string | null = null;
+  let tech: string | null = null;
+  for (const part of hash.split('&')) {
+    if (!part) continue;
+    if (part.startsWith('week=')) {
+      const v = part.slice('week='.length);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(v)) week = v;
+    } else if (part.startsWith('tech=')) {
+      tech = part.slice('tech='.length) || null;
+    }
+  }
+  return { week: week ?? mondayUtc(new Date()), tech };
+}
+
+function writeHash(week: string, tech: string | null): void {
+  const parts: string[] = [`week=${week}`];
+  if (tech) parts.push(`tech=${tech}`);
+  history.replaceState(null, '', `#${parts.join('&')}`);
+}
+
+// ---------------------------------------------------------------------------
+// Friendly error codes
+// ---------------------------------------------------------------------------
+
+const FRIENDLY: Record<string, string> = {
+  ADMIN_REQUIRED: 'friendly.adminRequired',
+  APPROVED_IMMUTABLE: 'friendly.approvedImmutable',
+  NOT_OWN_ENTRY: 'friendly.notOwnEntry',
+};
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
+export default function TimesheetPage() {
+  const { t } = useTranslation('common');
+  const { can } = usePermissions();
+  const canManageBilling = can('time_entries', 'manage_billing');
+  // SSR-safe hash adoption lives in the hook (#2421). parseHash's week already
+  // falls back to the current Monday; tech → undefined keeps the null default.
+  const [week, setWeek] = useHashState<string>(mondayUtc(new Date()), (h) => parseHash(h).week);
+  const [tech, setTech] = useHashState<string | null>(null, (h) => parseHash(h).tech ?? undefined);
+  const [sheet, setSheet] = useState<TsSheet | null>(null);
+  const [users, setUsers] = useState<User[]>([]);
+  const [adminDenied, setAdminDenied] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState<EditForm>({ workTypeId: null, description: '', isBillable: true, hourlyRate: '' });
+  const [loading, setLoading] = useState(true);
+  // Monotonic id of the newest in-flight timesheet request (see loadSheet).
+  const fetchSeq = useRef(0);
+  const [loadError, setLoadError] = useState(false);
+  const friendly = useCallback((code: string): string | undefined => {
+    const key = FRIENDLY[code];
+    return key ? t(/* i18n-dynamic */ `longTail.time.TimesheetPage.${key}`) : undefined;
+  }, [t]);
+
+  // Load users once on mount
+  useEffect(() => {
+    void (async () => {
+      const res = await fetchWithAuth('/users');
+      if (!res.ok) return;
+      const body = await res.json().catch(() => null) as { data?: User[] } | User[] | null;
+      const rows = Array.isArray(body) ? body : body?.data ?? [];
+      setUsers(rows);
+    })();
+  }, []);
+
+  // Load timesheet when week or tech changes.
+  //
+  // Latest-request-wins. A deep-linked load (`/time#week=…&tech=…`) fires this
+  // twice — once with the SSR-safe defaults (current Monday, own sheet), then
+  // again once useHashState adopts the hash (#2421). The `weekStart !== loadWeek`
+  // check below only compares a response against its OWN request, so both pass;
+  // without a sequence guard the seed response could land last and paint the
+  // current week's own hours under a header naming another week and tech.
+  const loadSheet = useCallback(async (loadWeek: string, loadTech: string | null) => {
+    const seq = ++fetchSeq.current;
+    setLoading(true);
+    setLoadError(false);
+    try {
+      const params = new URLSearchParams({ weekStart: loadWeek });
+      if (loadTech) params.set('userId', loadTech);
+      const res = await fetchWithAuth(`/time-entries/timesheet?${params.toString()}`);
+      if (seq !== fetchSeq.current) return;
+      if (!res.ok) {
+        if (res.status === 403 && loadTech) {
+          // No admin access to another tech's sheet — fall back to own
+          setAdminDenied(true);
+          setTech(null);
+          writeHash(loadWeek, null);
+          // The effect will re-run with tech=null
+          return;
+        }
+        setLoadError(true);
+        return;
+      }
+      const body = await res.json().catch(() => null) as { data?: TsSheet } | null;
+      if (seq !== fetchSeq.current) return;
+      if (body?.data?.weekStart && body.data.weekStart !== loadWeek) return; // stale response from rapid navigation
+      setSheet(body?.data ?? null);
+      setSelected(new Set()); // clear selection on new load
+    } catch {
+      if (seq !== fetchSeq.current) return;
+      setLoadError(true);
+    } finally {
+      if (seq === fetchSeq.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSheet(week, tech);
+  }, [week, tech, loadSheet]);
+
+  // Subscribe to timer changes
+  useEffect(() => {
+    return onTimerChanged(() => void loadSheet(week, tech));
+  }, [week, tech, loadSheet]);
+
+  // Navigation helpers
+  const goToPrevWeek = useCallback(() => {
+    const newWeek = shiftWeek(week, -1);
+    setWeek(newWeek);
+    writeHash(newWeek, tech);
+  }, [week, tech]);
+
+  const goToNextWeek = useCallback(() => {
+    const newWeek = shiftWeek(week, 1);
+    setWeek(newWeek);
+    writeHash(newWeek, tech);
+  }, [week, tech]);
+
+  const goToThisWeek = useCallback(() => {
+    // mondayUtc(new Date()) buckets by UTC — late-Sunday users west of UTC may land on "next" week; matches the API's UTC day-bucketing.
+    const newWeek = mondayUtc(new Date());
+    setWeek(newWeek);
+    writeHash(newWeek, tech);
+  }, [tech]);
+
+  const handleTechChange = useCallback((userId: string) => {
+    const newTech = userId || null;
+    setTech(newTech);
+    setAdminDenied(false);
+    writeHash(week, newTech);
+  }, [week]);
+
+  // Selection
+  const toggleSelect = useCallback((id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  // Bulk approve/unapprove
+  const bulkApprove = useCallback(async (approve: boolean) => {
+    const ids = Array.from(selected);
+    if (ids.length === 0) return;
+    try {
+      const result = await runAction<{ updated: number; skipped: number; skippedReasons: Record<string, number>; total: number }>({
+        request: () => fetchWithAuth('/time-entries/bulk-approve', {
+          method: 'POST',
+          body: JSON.stringify({ ids, approve }),
+        }),
+        errorFallback: t('longTail.time.TimesheetPage.errors.bulkApprovalFailed'),
+        parseSuccess: (data) => {
+          const d = data as { data: { updated: number; skipped: number; skippedReasons: Record<string, number>; total: number } };
+          return d.data;
+        },
+        friendly,
+      });
+      if (result.skipped > 0) {
+        const reasons = Object.entries(result.skippedReasons ?? {})
+          .map(([code, count]) => `${count}× ${code.toLowerCase().replace(/_/g, ' ')}`)
+          .join(', ');
+        showToast({ type: 'warning', message: t('longTail.time.TimesheetPage.toasts.bulkSkipped', { updated: result.updated, skipped: result.skipped, reasons }) });
+      } else {
+        showToast({
+          type: 'success',
+          message: approve
+            ? t('longTail.time.TimesheetPage.toasts.bulkApproved', { count: result.updated })
+            : t('longTail.time.TimesheetPage.toasts.bulkUnapproved', { count: result.updated }),
+        });
+      }
+      setSelected(new Set());
+      void loadSheet(week, tech);
+    } catch (err) {
+      handleActionError(err, t('longTail.time.TimesheetPage.errors.bulkApprovalFailed'));
+    }
+  }, [selected, week, tech, loadSheet]);
+
+  // Inline edit
+  const startEdit = useCallback((entry: TsEntry) => {
+    setEditingId(entry.id);
+    setEditForm({
+      workTypeId: entry.workTypeId ?? null,
+      description: entry.description ?? '',
+      isBillable: entry.isBillable,
+      hourlyRate: entry.hourlyRate ?? '',
+    });
+  }, []);
+
+  const saveEdit = useCallback(async (entry: TsEntry) => {
+    // Billed rows (#3776 review #5): the API rejects the PATCH when a locked
+    // field is present at all, not just when it changed — send only the
+    // description. The locked inputs are disabled in the form for the same reason.
+    const body = entry.billingStatus === 'billed'
+      ? { description: editForm.description || null }
+      : {
+          description: editForm.description || null,
+          ...(editForm.workTypeId !== (entry.workTypeId ?? null) ? { workTypeId: editForm.workTypeId } : {}),
+          ...(canManageBilling && editForm.isBillable !== entry.isBillable ? { isBillable: editForm.isBillable } : {}),
+          ...(canManageBilling && editForm.hourlyRate !== (entry.hourlyRate ?? '') ? { hourlyRate: editForm.hourlyRate === '' ? null : Number(editForm.hourlyRate) } : {}),
+        };
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/time-entries/${entry.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify(body),
+        }),
+        errorFallback: t('longTail.time.TimesheetPage.errors.saveEntryFailed'),
+        successMessage: t('longTail.time.TimesheetPage.toasts.entryUpdated'),
+        friendly,
+      });
+      setEditingId(null);
+      void loadSheet(week, tech);
+    } catch (err) {
+      handleActionError(err, t('longTail.time.TimesheetPage.errors.saveEntryFailed'));
+      // BQ-6: a 404 means the entry was deleted out from under the edit (e.g.
+      // by another session) — leaving the form open just edits a ghost row.
+      // Exit edit mode and refetch so it disappears from the list.
+      if (err instanceof ActionError && err.status === 404) {
+        setEditingId(null);
+        void loadSheet(week, tech);
+      }
+    }
+  }, [editForm, week, tech, loadSheet, canManageBilling]);
+
+  // Formatted week label
+  const weekLabel = (() => {
+    const [y, mo, d] = week.split('-').map(Number);
+    return new Date(Date.UTC(y, mo - 1, d)).toLocaleDateString(undefined, { timeZone: 'UTC', month: 'long', day: 'numeric', year: 'numeric' });
+  })();
+
+  return (
+    <div className="flex flex-col gap-4" data-testid="timesheet-page">
+      {/* Header */}
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="text-xl font-semibold">{t('longTail.time.TimesheetPage.title')}</h1>
+
+        {users.length > 0 && (
+          <select
+            value={tech ?? ''}
+            onChange={(e) => handleTechChange(e.target.value)}
+            aria-label={t('longTail.time.TimesheetPage.selectTechnician')}
+            data-testid="timesheet-tech-select"
+            className="h-8 rounded-md border bg-background px-2 text-sm"
+          >
+            <option value="">{t('longTail.time.TimesheetPage.myTimesheet')}</option>
+            {users.map((u) => (
+              <option key={u.id} value={u.id}>{u.name || u.email}</option>
+            ))}
+          </select>
+        )}
+
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            type="button"
+            onClick={goToPrevWeek}
+            data-testid="timesheet-prev-week"
+            aria-label={t('longTail.time.TimesheetPage.previousWeek')}
+            className="rounded-md border px-2.5 py-1.5 text-sm hover:bg-muted"
+          >
+            ←
+          </button>
+          <span className="px-2 text-sm" data-testid="timesheet-week-label">{t('longTail.time.TimesheetPage.weekOf', { week: weekLabel })}</span>
+          <button
+            type="button"
+            onClick={goToNextWeek}
+            data-testid="timesheet-next-week"
+            aria-label={t('longTail.time.TimesheetPage.nextWeek')}
+            className="rounded-md border px-2.5 py-1.5 text-sm hover:bg-muted"
+          >
+            →
+          </button>
+          <button
+            type="button"
+            onClick={goToThisWeek}
+            data-testid="timesheet-this-week"
+            className="rounded-md border px-2.5 py-1.5 text-sm hover:bg-muted"
+          >
+            {t('longTail.time.TimesheetPage.thisWeek')}
+          </button>
+        </div>
+      </div>
+
+      {/* Admin notice */}
+      {adminDenied && (
+        <div
+          data-testid="timesheet-admin-notice"
+          className="rounded-md border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800"
+        >
+          {t('longTail.time.TimesheetPage.adminNotice')}
+        </div>
+      )}
+
+      {/* Bulk action bar */}
+      {selected.size > 0 && (
+        <div
+          data-testid="timesheet-bulk-bar"
+          className="flex items-center gap-3 rounded-md border bg-background px-3 py-2 shadow-xs"
+        >
+          <span className="text-sm font-medium tabular-nums">{t('longTail.time.TimesheetPage.selectedCount', { count: selected.size })}</span>
+          <button
+            type="button"
+            onClick={() => void bulkApprove(true)}
+            data-testid="timesheet-approve-selected"
+            className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary/90"
+          >
+            {t('longTail.time.TimesheetPage.approveSelected')}
+          </button>
+          <button
+            type="button"
+            onClick={() => void bulkApprove(false)}
+            data-testid="timesheet-unapprove-selected"
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            {t('longTail.time.TimesheetPage.unapprove')}
+          </button>
+        </div>
+      )}
+
+      {/* Loading / error states */}
+      {loading && !sheet && (
+        <div data-testid="timesheet-loading" className="py-8 text-center text-sm text-muted-foreground">
+          {t('common:states.loading')}
+        </div>
+      )}
+      {!loading && !sheet && loadError && (
+        <div data-testid="timesheet-error" className="py-8 text-center text-sm text-destructive">
+          {t('longTail.time.TimesheetPage.errors.loadTimesheetFailed')}
+        </div>
+      )}
+
+      {/* Days */}
+      {sheet && (
+        <div className="flex flex-col gap-3">
+          <div className="px-4 text-sm font-medium" data-testid="timesheet-header-work-type">
+            {t('tickets:timesheet.workTypeColumn')}
+          </div>
+          {sheet.days.map((day) => (
+            <section
+              key={day.date}
+              data-testid={`timesheet-day-${day.date}`}
+              className="rounded-lg border"
+            >
+              <div className="flex items-center justify-between border-b bg-muted/30 px-4 py-2">
+                <span className="text-sm font-medium">
+                  {new Date(`${day.date}T00:00:00Z`).toLocaleDateString(undefined, {
+                    timeZone: 'UTC',
+                    weekday: 'short',
+                    month: 'short',
+                    day: 'numeric',
+                  })}
+                </span>
+                <span className="text-sm text-muted-foreground">
+                  {day.totalMinutes > 0 ? (
+                    <>
+                      {formatMinutes(day.totalMinutes)}
+                      {day.billableMinutes > 0 && t('longTail.time.TimesheetPage.billableDuration', { duration: formatMinutes(day.billableMinutes) })}
+                    </>
+                  ) : '—'}
+                </span>
+              </div>
+
+              {day.entries.length === 0 ? (
+                <div className="px-4 py-3 text-sm text-muted-foreground">{t('longTail.time.TimesheetPage.noEntries')}</div>
+              ) : (
+                <div className="divide-y">
+                  {day.entries.map((entry) => (
+                    <div
+                      key={entry.id}
+                      data-testid={`timesheet-entry-${entry.id}`}
+                      className="flex flex-wrap items-start gap-3 px-4 py-3"
+                    >
+                      {editingId === entry.id ? (
+                        // Inline edit form
+                        <div className="flex flex-1 flex-wrap items-center gap-2">
+                          <input
+                            type="text"
+                            value={editForm.description}
+                            onChange={(e) => setEditForm((f) => ({ ...f, description: e.target.value }))}
+                            data-testid={`timesheet-edit-description-${entry.id}`}
+                            placeholder={t('common:labels.description')}
+                            className="min-w-0 flex-1 rounded-md border bg-background px-2 py-1 text-sm"
+                          />
+                          <div className="w-full sm:w-40">
+                            <WorkTypeSelect
+                              value={editForm.workTypeId}
+                              onChange={(workTypeId) => setEditForm((form) => ({ ...form, workTypeId }))}
+                              fallbackOption={entry.workType}
+                              disabled={entry.billingStatus === 'billed'}
+                              testId="timesheet-edit-work-type"
+                            />
+                          </div>
+                          <BillingOutcome stamp={entry} overrides={canManageBilling ? { ...(editForm.isBillable !== entry.isBillable ? { isBillable: editForm.isBillable } : {}), ...(editForm.hourlyRate !== (entry.hourlyRate ?? '') ? { hourlyRate: editForm.hourlyRate === '' ? null : editForm.hourlyRate } : {}) } : undefined} pending={!entry.billingOverridden && editForm.workTypeId !== (entry.workTypeId ?? null)} testId={`timesheet-edit-outcome-${entry.id}`} />
+                          <label className="flex items-center gap-1 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={editForm.isBillable}
+                              disabled={entry.billingStatus === 'billed' || !canManageBilling}
+                              onChange={(e) => setEditForm((f) => ({ ...f, isBillable: e.target.checked }))}
+                              data-testid={`timesheet-edit-billable-${entry.id}`}
+                            />
+                            {t('longTail.time.TimesheetPage.billable')}
+                          </label>
+                          <input
+                            type="number"
+                            value={editForm.hourlyRate}
+                            readOnly={!canManageBilling}
+                            disabled={entry.billingStatus === 'billed'}
+                            onChange={(e) => setEditForm((f) => ({ ...f, hourlyRate: e.target.value }))}
+                            aria-label={t('longTail.time.TimesheetPage.rate')}
+                            placeholder={t('longTail.time.TimesheetPage.rate')}
+                            className="w-24 rounded-md border bg-background px-2 py-1 text-sm"
+                            data-testid={`timesheet-edit-rate-${entry.id}`}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void saveEdit(entry)}
+                            data-testid={`timesheet-edit-save-${entry.id}`}
+                            className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary/90"
+                          >
+                            {t('common:actions.save')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingId(null)}
+                            data-testid={`timesheet-edit-cancel-${entry.id}`}
+                            className="rounded-md border px-2.5 py-1.5 text-xs hover:bg-muted"
+                          >
+                            {t('common:actions.cancel')}
+                          </button>
+                        </div>
+                      ) : (
+                        // Normal row
+                        <>
+                          <span className="w-32 shrink-0 break-words text-sm text-muted-foreground" data-testid={`timesheet-work-type-${entry.id}`}>
+                            {entry.workType?.name ?? t('tickets:workType.none')}
+                          </span>
+                          <input
+                            type="checkbox"
+                            checked={selected.has(entry.id)}
+                            onChange={() => toggleSelect(entry.id)}
+                            disabled={!entry.endedAt}
+                            data-testid={`timesheet-select-${entry.id}`}
+                            aria-label={t('longTail.time.TimesheetPage.selectEntry', { id: entry.id })}
+                            className="mt-0.5"
+                          />
+                          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <a
+                                href={`/tickets/${entry.ticketId}`}
+                                className="text-sm font-medium text-primary hover:underline"
+                              >
+                                {entry.ticketNumber}
+                              </a>
+                              {entry.description ? (
+                                <span className="text-sm">{entry.description}</span>
+                              ) : (
+                                <span className="text-sm text-muted-foreground">{t('longTail.time.TimesheetPage.noDescription')}</span>
+                              )}
+                              {sourceBadgeLabelKey(entry.source) && (
+                                <span
+                                  data-testid={`time-entry-source-${entry.id}`}
+                                  className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+                                >
+                                  {t(/* i18n-dynamic */ sourceBadgeLabelKey(entry.source)!)}
+                                </span>
+                              )}
+                              {entry.isApproved && (
+                                <span
+                                  data-testid={`timesheet-approved-${entry.id}`}
+                                  className="rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700"
+                                >
+                                  {t('longTail.time.TimesheetPage.approved')}
+                                </span>
+                              )}
+                              {!entry.isBillable && (
+                                <span className="text-xs text-muted-foreground">{t('longTail.time.TimesheetPage.nonBillable')}</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <BillingOutcome stamp={entry} testId={`timesheet-outcome-${entry.id}`} />
+                            <span className="text-right text-sm tabular-nums text-muted-foreground">
+                              {entry.endedAt ? formatMinutes(entry.durationMinutes) : t('longTail.time.TimesheetPage.running')}
+                              {entry.endedAt && billedVsWorked(t, entry.durationMinutes, entry.billableMinutes) && (
+                                <span className="block text-xs" data-testid={`timesheet-billed-vs-worked-${entry.id}`}>
+                                  {billedVsWorked(t, entry.durationMinutes, entry.billableMinutes)}
+                                </span>
+                              )}
+                            </span>
+                            {/* Rate in its stamped currency only — a rate without a currency
+                                cannot exist server-side, and guessing USD would relabel money. */}
+                            <span
+                              className="text-sm tabular-nums text-muted-foreground"
+                              data-testid={`timesheet-rate-${entry.id}`}
+                            >
+                              {entry.hourlyRate != null && entry.currencyCode != null
+                                ? formatMoney(entry.hourlyRate, entry.currencyCode)
+                                : t('tickets:ticketTimeBilling.noAmount')}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => startEdit(entry)}
+                              data-testid={`timesheet-edit-${entry.id}`}
+                              aria-label={t('longTail.time.TimesheetPage.editEntry', { id: entry.id })}
+                              className="rounded-md border px-2 py-1 text-xs hover:bg-muted"
+                            >
+                              {t('common:actions.edit')}
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          ))}
+        </div>
+      )}
+
+      {/* Footer totals */}
+      {sheet && (
+        <div
+          data-testid="timesheet-total"
+          className="flex flex-col gap-1 rounded-lg border bg-muted/30 px-4 py-3 text-sm font-medium"
+        >
+          <div className="flex items-center gap-4">
+            <span>{t('longTail.time.TimesheetPage.total', { duration: formatMinutes(sheet.totals.totalMinutes) })}</span>
+            {sheet.totals.billableMinutes > 0 && (
+              <span className="text-muted-foreground">{t('longTail.time.TimesheetPage.billableTotal', { duration: formatMinutes(sheet.totals.billableMinutes) })}</span>
+            )}
+            {(sheet.totals.billableAmounts?.length ?? 0) > 0 && (
+              <span className="flex flex-wrap gap-1" data-testid="timesheet-billable-amounts">
+                {sheet.totals.billableAmounts.map((a) => (
+                  <span
+                    key={a.currencyCode}
+                    className="rounded-full border bg-background px-2 py-0.5 text-xs tabular-nums"
+                    data-testid={`timesheet-billable-amount-${a.currencyCode}`}
+                  >
+                    {formatMoney(a.amount, a.currencyCode)}
+                  </span>
+                ))}
+              </span>
+            )}
+          </div>
+          {/* Reporting-only companion to the chips above; hides itself whenever
+              a leg is missing or stale (multi-currency spec §8). */}
+          <ApproximateMoneyLine
+            byCurrency={(sheet.totals.billableAmounts ?? []).map((a) => ({ code: a.currencyCode, amount: a.amount }))}
+            date={reportingDateForWeek(sheet.weekStart)}
+            testId="timesheet-total-approx"
+          />
+        </div>
+      )}
+    </div>
+  );
+}

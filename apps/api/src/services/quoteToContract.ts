@@ -1,0 +1,162 @@
+// Phase 4: map an accepted quote's recurring lines into draft Contract specs.
+// Pure / DB-free so the grouping rules are exhaustively unit-testable.
+// Grouping is BY CADENCE: a Contract has a single intervalMonths, so monthly
+// and annual lines can never share one — they become separate contracts.
+
+import type { DeviceRole } from '@breeze/shared';
+
+export interface QuoteForContract {
+  orgId: string;
+  partnerId: string;
+  quoteNumber: string;
+  currencyCode: string;
+  terms: string | null;
+}
+
+export interface QuoteLineForContract {
+  sourceQuoteLineId: string;
+  recurrence: 'one_time' | 'monthly' | 'annual';
+  customerVisible: boolean;
+  name: string | null;
+  description: string | null;
+  unitPrice: string;
+  quantity: string;
+  taxable: boolean;
+  catalogItemId: string | null;
+  termMonths: number | null;
+  contractLineType: 'per_device' | 'per_device_role' | 'per_device_group' | 'per_seat' | null;
+  deviceRoles: DeviceRole[] | null;
+  deviceGroupId: string | null;
+  deviceGroupName: string | null;
+  siteId: string | null;
+  siteName: string | null;
+  includedQuantity: string | null;
+  overageMode: 'bill' | 'flag' | null;
+  overageUnitPrice: string | null;
+}
+
+export interface NewContractLineSpec {
+  lineType: 'flat' | 'per_device' | 'per_device_role' | 'per_device_group' | 'per_seat' | 'manual';
+  description: string;
+  unitPrice: string;
+  taxable: boolean;
+  catalogItemId?: string | null;
+  manualQuantity?: string | null;
+  siteId?: string | null;
+  /** #4693: Task 9 populates this from the accepted quote. */
+  siteName?: string | null;
+  /** #3205: required (non-empty) when lineType is per_device_role, otherwise absent. */
+  deviceRoles?: DeviceRole[] | null;
+  /** #3205 W02: required when lineType is per_device_group, otherwise absent. Name is stamped by the writer. */
+  deviceGroupId?: string | null;
+  /** #3205 W04: allowance carried from a device-set quote line. W05 populates
+   *  these; W04 leaves every quote-accepted line's allowance null. */
+  includedQuantity?: string | null;
+  overageMode?: 'bill' | 'flag' | null;
+  overageUnitPrice?: string | null;
+  sortOrder?: number;
+  /** In-memory Phase 4 → Phase 5 correlation only; never persisted. */
+  sourceQuoteLineId?: string | null;
+}
+
+export interface NewContractSpec {
+  orgId: string;
+  partnerId: string;
+  name: string;
+  billingTiming: 'advance' | 'arrears';
+  intervalMonths: number;
+  startDate: string;
+  endDate?: string | null;
+  currencyCode: string;
+  notes?: string | null;
+  terms?: string | null;
+  createdBy?: string | null;
+  lines: NewContractLineSpec[];
+}
+
+// Date-only (YYYY-MM-DD) month arithmetic in UTC. Month overflow rolls forward
+// (Jan 31 + 1mo -> Mar 03), matching JS Date semantics — acceptable for term ends.
+export function addMonthsToDate(dateStr: string, months: number): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    throw new Error(`addMonthsToDate: expected YYYY-MM-DD, got "${dateStr}"`);
+  }
+  if (!Number.isInteger(months) || months < 1) {
+    throw new Error(`addMonthsToDate: months must be a positive integer, got ${months}`);
+  }
+  const [y, m, d] = dateStr.split('-').map((n) => parseInt(n, 10));
+  const base = new Date(Date.UTC(y!, m! - 1, d!));
+  base.setUTCMonth(base.getUTCMonth() + months);
+  return base.toISOString().slice(0, 10);
+}
+
+const CADENCES: ReadonlyArray<{ key: 'monthly' | 'annual'; intervalMonths: number; label: string }> = [
+  { key: 'monthly', intervalMonths: 1, label: 'Monthly' },
+  { key: 'annual', intervalMonths: 12, label: 'Annual' },
+];
+
+export function buildContractSpecsFromQuote(
+  quote: QuoteForContract,
+  lines: QuoteLineForContract[],
+  startDate: string,
+  createdBy: string | null,
+): NewContractSpec[] {
+  const specs: NewContractSpec[] = [];
+
+  for (const cadence of CADENCES) {
+    const group = lines.filter((l) => l.recurrence === cadence.key && l.customerVisible);
+    if (group.length === 0) continue;
+
+    // endDate only when every line in the group agrees on a single non-null term.
+    const distinctTerms = [...new Set(group.map((l) => l.termMonths).filter((t): t is number => t != null))];
+    const endDate = distinctTerms.length === 1 ? addMonthsToDate(startDate, distinctTerms[0]!) : null;
+
+    specs.push({
+      orgId: quote.orgId,
+      partnerId: quote.partnerId,
+      name: `${quote.quoteNumber} — ${cadence.label}`,
+      billingTiming: 'advance',
+      intervalMonths: cadence.intervalMonths,
+      startDate,
+      endDate,
+      currencyCode: quote.currencyCode,
+      notes: `Auto-created from accepted quote ${quote.quoteNumber}`,
+      terms: quote.terms ?? null,
+      createdBy,
+      lines: group.map((l, i) => {
+        const base = {
+          description: (l.name && l.description ? `${l.name} — ${l.description}` : (l.name ?? l.description ?? '')),
+          unitPrice: l.unitPrice,
+          taxable: l.taxable,
+          // Deliberately drop the catalog link: the accepted price is frozen
+          // and must never be re-resolved later. Unchanged by W05.
+          catalogItemId: null,
+          sourceQuoteLineId: l.sourceQuoteLineId,
+          sortOrder: i,
+        };
+        if (!l.contractLineType) {
+          return { ...base, lineType: 'manual' as const, manualQuantity: l.quantity };
+        }
+        // #3205 W05: the descriptor becomes the contract line's own quantity
+        // resolver. The quote's estimated `quantity` is deliberately dropped —
+        // the contract counts afresh every period, which is the point.
+        const siteScopable = l.contractLineType === 'per_device' || l.contractLineType === 'per_device_role';
+        return {
+          ...base,
+          lineType: l.contractLineType,
+          manualQuantity: null,
+          deviceRoles: l.contractLineType === 'per_device_role' ? l.deviceRoles : null,
+          deviceGroupId: l.contractLineType === 'per_device_group' ? l.deviceGroupId : null,
+          siteId: siteScopable ? l.siteId : null,
+          // #4693: the contract line inherits the string the customer SIGNED,
+          // not a fresh read of a site that may have been renamed since.
+          siteName: siteScopable ? l.siteName : null,
+          includedQuantity: l.includedQuantity,
+          overageMode: l.overageMode,
+          overageUnitPrice: l.overageUnitPrice,
+        };
+      }),
+    });
+  }
+
+  return specs;
+}

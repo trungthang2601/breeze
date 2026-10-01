@@ -1,0 +1,181 @@
+export { createPolicySchema, updatePolicySchema } from '../../services/delivery/railContracts';
+import { z } from 'zod';
+export { escalationStepSchema, escalationStepsSchema, type EscalationStep } from '../../services/delivery/escalationSteps';
+import { NOTIFICATION_CHANNEL_TYPES } from '@breeze/shared';
+
+// Alert Rules schemas
+export const listAlertRulesSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  isActive: z.enum(['true', 'false']).optional(),
+  enabled: z.enum(['true', 'false']).optional(),
+  includeRetired: z.enum(['true', 'false']).optional()
+});
+
+export const createAlertRuleSchema = z.object({
+  orgId: z.string().guid().optional(),
+  // Ownership axis (#2128, mirrors software/security policies). 'organization'
+  // (default) = classic org-scoped rule. 'partner' = partner-wide / all-orgs;
+  // the server derives the partner from the caller's own token. Create-only.
+  ownerScope: z.enum(['organization', 'partner']).optional(),
+  templateId: z.string().guid().optional(),
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().max(2000).optional(),
+  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
+  targetType: z.string().min(1).max(50).optional(),
+  targetId: z.string().guid().optional(),
+  targets: z.object({
+    type: z.enum(['all', 'org', 'site', 'group', 'device']),
+    ids: z.array(z.string().guid()).optional()
+  }).optional(),
+  conditions: z.any().optional(),
+  notificationChannelIds: z.array(z.string().guid()).optional(),
+  notificationChannels: z.array(z.string().guid()).optional(),
+  cooldownMinutes: z.coerce.number().int().min(1).max(1440).optional(),
+  autoResolve: z.boolean().optional(),
+  enabled: z.boolean().optional(),
+  active: z.boolean().optional(),
+  isActive: z.boolean().optional(),
+  overrideSettings: z.any().optional(),
+  overrides: z.any().optional(),
+  escalationPolicyId: z.string().guid().optional()
+}).superRefine((data, ctx) => {
+  if (!data.templateId) {
+    if (!data.name) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['name'],
+        message: 'Rule name is required'
+      });
+    }
+    if (!data.severity) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['severity'],
+        message: 'Severity is required'
+      });
+    }
+    if (data.conditions === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['conditions'],
+        message: 'Conditions are required'
+      });
+    }
+  }
+});
+
+export const updateAlertRuleSchema = z.object({
+  templateId: z.string().guid().optional(),
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().max(2000).optional(),
+  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
+  targetType: z.string().min(1).max(50).optional(),
+  targetId: z.string().guid().optional(),
+  targets: z.object({
+    type: z.enum(['all', 'org', 'site', 'group', 'device']),
+    ids: z.array(z.string().guid()).optional()
+  }).optional(),
+  conditions: z.any().optional(),
+  notificationChannelIds: z.array(z.string().guid()).optional(),
+  notificationChannels: z.array(z.string().guid()).optional(),
+  cooldownMinutes: z.coerce.number().int().min(1).max(1440).optional(),
+  autoResolve: z.boolean().optional(),
+  enabled: z.boolean().optional(),
+  active: z.boolean().optional(),
+  overrideSettings: z.any().optional(),
+  overrides: z.any().optional(),
+  escalationPolicyId: z.string().guid().optional(),
+  isActive: z.boolean().optional()
+});
+
+export const testAlertRuleSchema = z.object({
+  deviceId: z.string().guid()
+});
+
+export const bulkAlertActionSchema = z.object({
+  action: z.enum(['acknowledge', 'resolve', 'suppress', 'dismiss']),
+  alertIds: z.array(z.string().guid()).min(1).max(100),
+  // Absolute deadline the alerts stay muted until (ISO date string), mirroring
+  // POST /alerts/:id/suppress. Optional even for `suppress`: omit for indefinite
+  // ("Forever") suppression.
+  until: z.string().optional()
+});
+
+// Alerts schemas
+export const ALERT_STATUS_VALUES = ['active', 'acknowledged', 'resolved', 'suppressed', 'dismissed'] as const;
+export type AlertStatusValue = (typeof ALERT_STATUS_VALUES)[number];
+
+export const listAlertsSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  // Single status or comma-separated list (e.g. 'active,acknowledged' for the
+  // dashboard's open-alerts view). Omitted => every status EXCEPT 'dismissed'.
+  status: z
+    .string()
+    .refine(
+      (v) => v.split(',').every((s) => (ALERT_STATUS_VALUES as readonly string[]).includes(s)),
+      { message: `status must be a comma-separated list of: ${ALERT_STATUS_VALUES.join(', ')}` }
+    )
+    .optional(),
+  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
+  deviceId: z.string().guid().optional(),
+  startDate: z.string().optional(),
+  endDate: z.string().optional(),
+  // Phase 2 wave P2-1 (alert verdicts), Task 14 — exclude alerts whose
+  // LATEST AI verdict classified them as noise (transient_self_healed /
+  // recurring_pattern / duplicate_of_group). Applied as a WHERE-clause
+  // NOT EXISTS in the route (see hideAiNoiseCondition in alerts.ts), not a
+  // post-fetch filter, so pagination stays correct.
+  hideAiNoise: z.enum(['true', 'false']).optional()
+});
+
+export const resolveAlertSchema = z.object({
+  note: z.string().optional()
+});
+
+export const suppressAlertSchema = z.object({
+  // Absolute ISO deadline the alert stays muted until. Omit for indefinite
+  // ("Forever") suppression — the row's suppressedUntil is then left null.
+  until: z.string().optional()
+});
+
+// Notification Channels schemas
+export const listChannelsSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  type: z.enum(NOTIFICATION_CHANNEL_TYPES).optional(),
+  enabled: z.enum(['true', 'false']).optional()
+});
+
+export const createChannelSchema = z.object({
+  orgId: z.string().guid().optional(),
+  // 'partner' creates a partner-wide ("all orgs") channel: orgId NULL,
+  // partnerId = caller's partner (#2130). Create-only.
+  ownerScope: z.enum(['organization', 'partner']).optional(),
+  name: z.string().min(1).max(255),
+  type: z.enum(NOTIFICATION_CHANNEL_TYPES),
+  config: z.record(z.string(), z.unknown()), // JSONB for type-specific config
+  enabled: z.boolean().default(true),
+  // Feature #4: per-channel notification throttle. null/omitted = unlimited.
+  throttleMaxPerWindow: z.number().int().min(1).max(10000).nullable().optional(),
+  throttleWindowSeconds: z.number().int().min(60).max(86400).optional()
+});
+
+export const updateChannelSchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  config: z.record(z.string(), z.unknown()).optional(),
+  enabled: z.boolean().optional(),
+  throttleMaxPerWindow: z.number().int().min(1).max(10000).nullable().optional(),
+  throttleWindowSeconds: z.number().int().min(60).max(86400).optional()
+});
+
+// Escalation Policies schemas
+export const listPoliciesSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional()
+});

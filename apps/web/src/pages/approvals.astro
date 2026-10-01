@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../layouts/DashboardLayout.astro';
+import ApprovalsInbox from '../components/approvals/ApprovalsInbox';
+---
+
+<DashboardLayout titleKey="titles.approvals">
+  <ApprovalsInbox client:load />
+</DashboardLayout>

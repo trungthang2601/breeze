@@ -1,0 +1,973 @@
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { Monitor, MonitorOff, ExternalLink, Download, X, Globe } from 'lucide-react';
+import * as Sentry from '@sentry/astro';
+import type { DesktopAccessState, RemoteAccessPolicy } from '@breeze/shared';
+import { isAllowedLauncherScheme } from '@breeze/shared';
+import { fetchWithAuth } from '@/stores/auth';
+import { getViewerDownloadInfo, getAllViewerDownloads } from '@/lib/viewerDownload';
+import { buildRemoteVncPageUrl } from '@/lib/remoteTunnelUrls';
+import { extractApiError } from '@/lib/apiError';
+import { showToast } from '@/components/shared/Toast';
+import { runAction, ActionError } from '@/lib/runAction';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+import SessionPickerModal from './SessionPickerModal';
+
+interface Props {
+  deviceId: string;
+  className?: string;
+  compact?: boolean;
+  iconOnly?: boolean;
+  disabled?: boolean;
+  /** Tooltip shown while the button is disabled via the `disabled` prop (e.g. "Device is offline"). */
+  disabledTitle?: string;
+  isHeadless?: boolean;
+  desktopAccess?: DesktopAccessState | null;
+  remoteAccessPolicy?: RemoteAccessPolicy | null;
+  /**
+   * Helper lifecycle mode for this device (Task 12). When 'on-demand' the
+   * device is an RDS host with per-session helpers: clicking connect opens a
+   * session picker first so the tech targets a specific session, and the
+   * chosen id is appended to the viewer deep link as &targetSessionId=N.
+   * Absent / 'always-on' / null ⇒ unchanged behavior for non-RDS devices.
+   */
+  helperLifecycleMode?: 'always-on' | 'on-demand' | null;
+}
+
+/**
+ * Launch a custom-protocol deep link. Uses an anchor click so the browser
+ * hands the URL to the OS protocol handler without navigating the page.
+ */
+function tryDeepLink(url: string) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 100);
+}
+
+// Reasons where VNC relay is a viable fallback (when the user has enabled VNC Relay policy).
+// These are cases where WebRTC desktop can't work but the native macOS Screen Sharing
+// path via kickstart can still connect (login window, legacy OS, helper stuck, etc).
+const VNC_FALLBACK_REASONS = new Set([
+  'unsupported_os',
+  'helper_not_connected',
+  'virtual_display_unavailable',
+]);
+
+function canFallbackToVNC(
+  desktopAccess: DesktopAccessState | null | undefined,
+  remoteAccessPolicy?: RemoteAccessPolicy | null,
+): boolean {
+  if (!desktopAccess || desktopAccess.mode !== 'unavailable') return false;
+  if (remoteAccessPolicy?.vncRelay !== true) return false;
+  return VNC_FALLBACK_REASONS.has(desktopAccess.reason ?? '');
+}
+
+function desktopAccessUnavailableReason(
+  desktopAccess: DesktopAccessState | null | undefined,
+  remoteAccessPolicy?: RemoteAccessPolicy | null,
+  translate?: (key: string) => string,
+): string | null {
+  if (!desktopAccess || desktopAccess.mode !== 'unavailable') {
+    return null;
+  }
+
+  // VNC fallback masks the unavailable reason — user can click through to VNC.
+  if (canFallbackToVNC(desktopAccess, remoteAccessPolicy)) {
+    return null;
+  }
+
+  switch (desktopAccess.reason) {
+    case 'unsupported_os':
+      return translate?.('connectDesktopButton.unavailable.unsupportedOs') ?? null;
+    case 'missing_entitlement':
+      return translate?.('connectDesktopButton.unavailable.missingEntitlement') ?? null;
+    case 'manual_install':
+      return translate?.('connectDesktopButton.unavailable.manualInstall') ?? null;
+    case 'missing_permission':
+      return translate?.('connectDesktopButton.unavailable.missingPermission') ?? null;
+    case 'virtual_display_unavailable':
+      return translate?.('connectDesktopButton.unavailable.virtualDisplay') ?? null;
+    case 'helper_not_connected':
+      return translate?.('connectDesktopButton.unavailable.helperNotConnected') ?? null;
+    case 'no_display_session':
+      return translate?.('connectDesktopButton.unavailable.noDisplaySession') ?? null;
+    case 'wayland_unsupported':
+      return translate?.('connectDesktopButton.unavailable.waylandUnsupported') ?? null;
+    case 'x11_connect_failed':
+      return translate?.('connectDesktopButton.unavailable.x11ConnectFailed') ?? null;
+    case 'x11_auth_failed':
+      return translate?.('connectDesktopButton.unavailable.x11AuthFailed') ?? null;
+    default:
+      return translate?.('connectDesktopButton.unavailable.default') ?? null;
+  }
+}
+
+export default function ConnectDesktopButton({ deviceId, className = '', compact = false, iconOnly = false, disabled = false, disabledTitle, isHeadless = false, desktopAccess = null, remoteAccessPolicy = null, helperLifecycleMode = null }: Props) {
+  const { t } = useTranslation('remote');
+  const [status, setStatus] = useState<'idle' | 'creating' | 'launching' | 'fallback' | 'denied' | 'ending' | 'revoked'>('idle');
+  const [error, setError] = useState<string | null>(null);
+  // Populated when the server-side revocation lease killed the session before
+  // the viewer connected (#6120) — the raw RevocationReason parsed from the
+  // session row's `errorMessage: 'revoked:<reason>'`.
+  const [revokedReason, setRevokedReason] = useState<string | null>(null);
+  // RDS hosts (helperLifecycleMode === 'on-demand') gate connect behind a
+  // session picker so the tech targets a specific WTS session.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  // Populated when the VNC auto-fallback path times out — carries the info needed
+  // for the "Open in Browser" fallback card so we don't navigate away automatically.
+  const [vncFallback, setVncFallback] = useState<{ tunnelId: string } | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const autoDismissTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const sessionIdRef = useRef<string | null>(null);
+
+  // Clean up timers on unmount
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+      if (autoDismissTimerRef.current) clearTimeout(autoDismissTimerRef.current);
+    };
+  }, []);
+
+  // Clear any stale "Connection failed" error once the button becomes disabled
+  // (e.g. the device just went offline). Otherwise the leftover error label and
+  // title would mask the `disabledTitle` ("Device is offline") tooltip.
+  useEffect(() => {
+    if (disabled) setError(null);
+  }, [disabled]);
+
+  const endSession = useCallback((sessionId: string) => {
+    fetchWithAuth(`/remote/sessions/${sessionId}/end`, { method: 'POST' }).catch(() => {});
+  }, []);
+
+  const startConnect = useCallback(async (targetSessionId?: number) => {
+    setStatus('creating');
+    setError(null);
+
+    try {
+      // The `desktopAccess` prop is fetched once when the Remote Tools page mounts
+      // and never refreshed. On a slow helper-attach or after the user logs in
+      // on the Mac, the snapshot goes stale and we'd route to VNC even when
+      // WebRTC is now available. Re-fetch the device record right before
+      // deciding so the click always uses fresh state.
+      let liveDesktopAccess: DesktopAccessState | null = desktopAccess ?? null;
+      let hasRemoteAccessLauncher = false;
+      // Populated when the partner HAS a launcher configured but it can't fire
+      // for THIS device (most often `missing_device_identifier`). We toast and
+      // continue to WebRTC so the user understands why the third-party tool
+      // didn't launch, rather than wondering why their RustDesk/ScreenConnect
+      // default was silently ignored.
+      let launcherSkipReason: string | null = null;
+      try {
+        const devRes = await fetchWithAuth(`/devices/${deviceId}`);
+        if (devRes.ok) {
+          const devBody = await devRes.json() as {
+            desktopAccess?: DesktopAccessState | null;
+            hasRemoteAccessLauncher?: boolean;
+            remoteAccessLaunchSkipReason?: string | null;
+          };
+          liveDesktopAccess = devBody.desktopAccess ?? null;
+          hasRemoteAccessLauncher = devBody.hasRemoteAccessLauncher === true;
+          launcherSkipReason = devBody.remoteAccessLaunchSkipReason ?? null;
+        }
+      } catch {
+        // Network blip — fall back to the prop so the connect flow still runs.
+      }
+
+      // The partner has a launcher configured but this specific device can't
+      // use it. Toast the reason and fall through to WebRTC so the user
+      // doesn't silently get the wrong remote tool. `no_provider_configured`
+      // is intentionally NOT toasted — that's the expected-empty case.
+      // `scheme_not_allowed` would be a 422 on the launch POST, so it's
+      // surfaced loudly there rather than here.
+      if (!hasRemoteAccessLauncher && launcherSkipReason && launcherSkipReason !== 'no_provider_configured') {
+        const friendly =
+          launcherSkipReason === 'missing_device_identifier'
+            ? t('connectDesktopButton.launcherSkip.missingIdentifier')
+            : launcherSkipReason === 'provider_disabled'
+              ? t('connectDesktopButton.launcherSkip.providerDisabled')
+              : launcherSkipReason === 'empty_url_template'
+                ? t('connectDesktopButton.launcherSkip.emptyUrlTemplate')
+                : launcherSkipReason === 'config_error'
+                  ? t('connectDesktopButton.launcherSkip.configError')
+                  : null;
+        if (friendly) {
+          // 'error' type matches the loud-failure styling the other launcher
+          // paths in this component use (422 / 500). The Toast component
+          // currently only supports success | error | undo (Toast.tsx:7);
+          // 'error' is the closest match for "your preferred remote tool
+          // didn't fire — here's why" without being a hard blocker.
+          showToast({ type: 'error', message: friendly });
+        }
+      }
+
+      // If the partner has configured a third-party remote-tool provider
+      // (RustDesk, ScreenConnect, TeamViewer, etc.) and this device has the
+      // matching per-device identifier in its custom_fields, request the
+      // one-shot launch URL from POST /devices/:id/remote-access-launch.
+      // The URL (with any preset password substituted and percent-encoded)
+      // is never embedded in the GET response so we only get it back in
+      // response to an explicit click. Each issuance is audited server-side.
+      //
+      // Auto-detect launch mode by URL prefix:
+      //   - http(s):// → open in a new browser tab (ScreenConnect, web-launchers)
+      //   - any other scheme → hand off to the OS protocol handler (RustDesk, etc.)
+      // Either way, skip the built-in WebRTC desktop flow.
+      //
+      // Defense in depth: the API rejects javascript:, data:, vbscript:,
+      // file:, etc. at write time AND re-checks the substituted URL before
+      // returning 422. We still re-check on the client so a tampered
+      // response can't execute a hostile scheme in the partner's origin.
+      if (hasRemoteAccessLauncher) {
+        const launchRes = await fetchWithAuth(`/devices/${deviceId}/remote-access-launch`, {
+          method: 'POST',
+        });
+
+        if (launchRes.status === 422) {
+          // Server detected a tampered template that resolved to a
+          // disallowed scheme after substitution. The server already
+          // emitted an audit event and Sentry capture. Surface a loud
+          // user-facing error rather than silently falling back.
+          const body = await launchRes.json().catch(() => ({} as { code?: string }));
+          Sentry.captureMessage(
+            'Remote-access launcher rejected by scheme policy',
+            { level: 'warning', extra: { deviceId, code: body?.code } },
+          );
+          showToast({
+            type: 'error',
+            message: t('connectDesktopButton.errors.securityCheckToast'),
+          });
+          setError(t('connectDesktopButton.errors.securityPolicy'));
+          setStatus('idle');
+          return;
+        }
+
+        if (launchRes.ok) {
+          const body = await launchRes.json() as { launchUrl?: string; scheme?: string };
+          const url = body?.launchUrl;
+          if (typeof url === 'string' && isAllowedLauncherScheme(url)) {
+            setStatus('launching');
+            if (/^https?:\/\//i.test(url)) {
+              window.open(url, '_blank', 'noopener,noreferrer');
+            } else {
+              tryDeepLink(url);
+            }
+            setTimeout(() => setStatus('idle'), 1500);
+            return;
+          }
+          // Defense in depth: server should have returned 422, but the
+          // URL we got back has a disallowed scheme. Refuse the click.
+          Sentry.captureMessage(
+            'Remote-access launcher returned disallowed scheme client-side',
+            { level: 'warning', extra: { deviceId } },
+          );
+          showToast({
+            type: 'error',
+            message: t('connectDesktopButton.errors.securityCheckToast'),
+          });
+          setError(t('connectDesktopButton.errors.securityPolicy'));
+          setStatus('idle');
+          return;
+        }
+        // Non-OK, non-422. Fail loudly to match the 422 path's "config
+        // visibility over network-blip tolerance" framing. A 500 most
+        // likely indicates a partner DB lookup error the admin needs to
+        // see; a 404 means the device record changed since this UI
+        // loaded and the user should refresh. In both cases, falling
+        // through to WebRTC would mask the real failure mode.
+        Sentry.captureMessage(
+          'Remote-access launcher POST failed unexpectedly',
+          { level: 'warning', extra: { deviceId, status: launchRes.status } },
+        );
+        const friendly = launchRes.status === 404
+          ? t('connectDesktopButton.errors.deviceChanged')
+          : t('connectDesktopButton.errors.server');
+        showToast({ type: 'error', message: friendly });
+        setError(t('connectDesktopButton.errors.http', { status: launchRes.status }));
+        setStatus('idle');
+        return;
+      }
+
+      // Auto-detect: fall back to VNC when the WebRTC path can't work but VNC relay is enabled.
+      // Covers old macOS (unsupported_os), stuck helper (helper_not_connected), and virtual
+      // display unavailable — all cases where native Screen Sharing via kickstart can still connect.
+      const needsVNC = canFallbackToVNC(liveDesktopAccess, remoteAccessPolicy);
+
+      if (needsVNC) {
+        // Create VNC tunnel — user provides their macOS credentials in the noVNC prompt
+        const tunnelRes = await fetchWithAuth('/tunnels', {
+          method: 'POST',
+          body: JSON.stringify({ deviceId, type: 'vnc' }),
+        });
+
+        if (!tunnelRes.ok) {
+          const err = await tunnelRes.json().catch(() => ({ error: t('connectDesktopButton.errors.createVncTunnel') }));
+          throw new Error(err.error || t('connectDesktopButton.errors.createVncTunnel'));
+        }
+
+        const tunnel = await tunnelRes.json();
+
+        // Issue a short-lived connect code for the Tauri viewer deep link (keeps JWT out of URL)
+        const codeRes = await fetchWithAuth(`/tunnels/${tunnel.id}/connect-code`, { method: 'POST' });
+        if (!codeRes.ok) {
+          fetchWithAuth(`/tunnels/${tunnel.id}`, { method: 'DELETE' }).catch(() => {});
+          throw new Error(t('connectDesktopButton.errors.issueVncCode'));
+        }
+        const { code } = await codeRes.json();
+
+        const apiUrl = import.meta.env.PUBLIC_API_URL || window.location.origin;
+        const deepLink = `breeze://vnc?tunnel=${encodeURIComponent(tunnel.id)}` +
+          `&device=${encodeURIComponent(deviceId)}` +
+          `&api=${encodeURIComponent(apiUrl)}` +
+          `&code=${encodeURIComponent(code)}`;
+
+        setStatus('launching');
+
+        // Try to hand off to the Breeze Viewer first
+        tryDeepLink(deepLink);
+
+        // Poll the tunnel to detect whether the viewer picked it up.
+        // Tunnel moves from 'pending' → 'active' once the viewer connects.
+        // If it stays pending after ~7.5 s, show the "Open in Browser" card.
+        let vncPollCount = 0;
+        const vncMaxPolls = 5;
+
+        const pollVnc = async () => {
+          vncPollCount++;
+          try {
+            const res = await fetchWithAuth(`/tunnels/${tunnel.id}`);
+            if (res.ok) {
+              const data = await res.json();
+              if (data.status === 'active') {
+                setStatus((cur) => cur === 'launching' || cur === 'fallback' ? 'idle' : cur);
+                return;
+              }
+              if (data.status === 'failed') {
+                setError(extractApiError(data, t('connectDesktopButton.errors.vncTunnelFailed')));
+                setStatus('idle');
+                return;
+              }
+            }
+          } catch { /* network error — keep polling */ }
+
+          if (vncPollCount >= vncMaxPolls) {
+            // Viewer didn't pick it up in time — show the fallback card so the
+            // user can choose to open noVNC in the browser instead.
+            setVncFallback({ tunnelId: tunnel.id });
+            setStatus((cur) => cur === 'launching' ? 'fallback' : cur);
+
+            if (autoDismissTimerRef.current) clearTimeout(autoDismissTimerRef.current);
+            autoDismissTimerRef.current = setTimeout(() => {
+              setStatus((cur) => cur === 'fallback' ? 'idle' : cur);
+              setVncFallback(null);
+            }, 30000);
+            return;
+          }
+
+          pollTimerRef.current = setTimeout(pollVnc, 1500);
+        };
+
+        pollTimerRef.current = setTimeout(pollVnc, 1500);
+        return;
+      }
+
+      // Do NOT sweep /remote/sessions/stale here. The unscoped sweep (no
+      // deviceId, no type) revoked every live session the caller could see,
+      // including a Terminal on the same device (close 4003 "Session revoked"),
+      // and racing it against the POST could catch the brand-new desktop row
+      // too (#4090). POST /remote/sessions already terminates stale rows
+      // scoped to this device+type server-side.
+      // runAction so the outcome always reaches the operator — and so the
+      // fail-closed revocation-lease gate has somewhere to speak: an agent that
+      // has not yet declared lease support answers 503 `agent_upgrade_required`,
+      // which is a temporary "the agent is updating", NOT "the device is
+      // offline" and NOT a generic connection failure.
+      const session = await runAction<{ id: string }>({
+        request: () =>
+          fetchWithAuth('/remote/sessions', {
+            method: 'POST',
+            body: JSON.stringify({ deviceId, type: 'desktop' }),
+          }),
+        errorFallback: t('connectDesktopButton.errors.createDesktopSession'),
+        friendly: (code) =>
+          code === 'agent_upgrade_required'
+            ? t('connectDesktopButton.errors.agentUpgradeRequired')
+            : undefined,
+        parseSuccess: (data) => data as { id: string },
+      });
+      sessionIdRef.current = session.id;
+
+      // Create one-time desktop connect code for deep-link handoff
+      const codeResponse = await fetchWithAuth(`/remote/sessions/${session.id}/desktop-connect-code`, {
+        method: 'POST',
+      });
+      if (!codeResponse.ok) {
+        const err = await codeResponse.json().catch(() => ({ error: t('connectDesktopButton.errors.createDesktopCode') }));
+        endSession(session.id);
+        throw new Error(err.error || t('connectDesktopButton.errors.createDesktopCode'));
+      }
+      const codeData = await codeResponse.json() as { code?: string };
+      if (!codeData.code) {
+        endSession(session.id);
+        throw new Error(t('connectDesktopButton.errors.invalidDesktopCode'));
+      }
+
+      // Build deep link URL
+      const apiUrl = import.meta.env.PUBLIC_API_URL || window.location.origin;
+      const deepLink = `breeze://connect?session=${encodeURIComponent(session.id)}&code=${encodeURIComponent(codeData.code)}&api=${encodeURIComponent(apiUrl)}&device=${encodeURIComponent(deviceId)}`
+        + (targetSessionId != null ? `&targetSessionId=${targetSessionId}` : '');
+
+      setStatus('launching');
+
+      // Use hidden iframe to trigger protocol handler without affecting the page
+      tryDeepLink(deepLink);
+
+      // Poll session status to detect whether the viewer actually opened.
+      // The session starts as 'pending'; the viewer exchanges the connect code
+      // almost immediately, moving it to 'connecting' then 'active'.
+      // If it stays 'pending' after ~8s the viewer likely didn't launch.
+      const pollSessionId = session.id;
+      let pollCount = 0;
+      const maxPolls = 5; // 5 polls × ~1.5s = ~7.5s window
+
+      const poll = async () => {
+        pollCount++;
+        try {
+          const res = await fetchWithAuth(`/remote/sessions/${pollSessionId}`);
+          if (res.ok) {
+            const data = await res.json();
+            const sessionStatus = data.status ?? data.data?.status;
+            const terminationPhase = data.terminationPhase ?? data.data?.terminationPhase;
+            if (terminationPhase === 'pending') {
+              // SEC-038 W06: the server has already ended this session but the
+              // agent has not yet acknowledged the stop. This is NOT "viewer
+              // connected" — say so, and stop polling.
+              setStatus('ending');
+              return;
+            }
+            if (sessionStatus === 'denied') {
+              // End user denied the consent prompt — surface an explicit message
+              setStatus('denied');
+              return;
+            }
+            // #6120: the revocation lease killed the session before the viewer
+            // connected (permissions changed, MFA now required, site scope
+            // lost, …). Without this check `disconnected` falls into the
+            // generic "connected" branch below and the technician gets no
+            // explanation — the viewer just silently reverts to idle.
+            const revokedMessage = typeof data.errorMessage === 'string' ? data.errorMessage : undefined;
+            if (sessionStatus === 'disconnected' && revokedMessage?.startsWith('revoked:')) {
+              setRevokedReason(revokedMessage.slice('revoked:'.length));
+              setStatus('revoked');
+              return;
+            }
+            if (sessionStatus && sessionStatus !== 'pending') {
+              // Viewer connected — silently go back to idle
+              setStatus((cur) => cur === 'launching' || cur === 'fallback' ? 'idle' : cur);
+              return;
+            }
+          }
+        } catch { /* network error — keep polling */ }
+
+        if (pollCount >= maxPolls) {
+          // Timed out still pending — viewer didn't open, show fallback
+          setStatus((cur) => cur === 'launching' ? 'fallback' : cur);
+
+          // Auto-dismiss fallback after 20s so it doesn't linger
+          if (autoDismissTimerRef.current) clearTimeout(autoDismissTimerRef.current);
+          autoDismissTimerRef.current = setTimeout(() => {
+            setStatus((cur) => cur === 'fallback' ? 'idle' : cur);
+          }, 20000);
+          return;
+        }
+
+        pollTimerRef.current = setTimeout(poll, 1500);
+      };
+
+      pollTimerRef.current = setTimeout(poll, 1500);
+    } catch (err) {
+      // A 401 is the auth redirect's business; a non-401 ActionError was
+      // already toasted by runAction, so only the inline label is set here.
+      if (err instanceof ActionError && err.status === 401) return;
+      setError(
+        err instanceof ActionError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : t('connectDesktopButton.errors.connectionFailed'),
+      );
+      setStatus('idle');
+    }
+  }, [deviceId, desktopAccess, remoteAccessPolicy, endSession, t]);
+
+  // Entry point for a connect click. RDS hosts open the session picker first;
+  // everything else connects immediately (unchanged behavior).
+  const handleClick = useCallback(() => {
+    if (helperLifecycleMode === 'on-demand') {
+      setPickerOpen(true);
+      return;
+    }
+    void startConnect();
+  }, [helperLifecycleMode, startConnect]);
+
+  const handleDismiss = useCallback(() => {
+    setVncFallback(null);
+    setStatus('idle');
+  }, []);
+
+  const handleDismissAndCleanup = useCallback(() => {
+    // End the session since the viewer didn't open
+    if (sessionIdRef.current) {
+      endSession(sessionIdRef.current);
+      sessionIdRef.current = null;
+    }
+    setVncFallback(null);
+    setStatus('idle');
+  }, [endSession]);
+
+  // VNC-specific: open noVNC in the browser when the viewer didn't pick up
+  const handleOpenInBrowser = useCallback(() => {
+    if (vncFallback) {
+      window.open(buildRemoteVncPageUrl(vncFallback.tunnelId), '_blank');
+    }
+    setVncFallback(null);
+    setStatus('idle');
+  }, [vncFallback]);
+
+  // VNC-specific: cancel — clean up the tunnel and dismiss
+  const handleCancelVnc = useCallback(() => {
+    if (vncFallback) {
+      fetchWithAuth(`/tunnels/${vncFallback.tunnelId}`, { method: 'DELETE' }).catch(() => {});
+      setVncFallback(null);
+    }
+    setStatus('idle');
+  }, [vncFallback]);
+
+  const handleDismissDenied = useCallback(() => {
+    setStatus('idle');
+  }, []);
+
+  const handleDismissEnding = useCallback(() => {
+    setStatus('idle');
+  }, []);
+
+  const handleDismissRevoked = useCallback(() => {
+    setRevokedReason(null);
+    setStatus('idle');
+  }, []);
+
+  // SEC-038 W06: shown when the session was ended server-side before the
+  // viewer connected and the device has not yet confirmed the teardown.
+  // Deliberately not the connected/idle state and not the denied card.
+  const endingContent = status === 'ending' ? (
+    <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm shadow-lg dark:border-amber-800 dark:bg-amber-950">
+      <div className="flex items-start gap-2.5">
+        <MonitorOff className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+        <div className="flex-1">
+          <p className="font-medium text-amber-800 dark:text-amber-300">
+            {t('connectDesktopButton.ending.title')}
+          </p>
+          <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+            {t('connectDesktopButton.ending.description')}
+          </p>
+          <div className="mt-2.5">
+            <button
+              type="button"
+              onClick={handleDismissEnding}
+              className="text-xs text-muted-foreground transition hover:text-foreground"
+            >
+              {t('connectDesktopButton.dismiss')}
+            </button>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleDismissEnding}
+          aria-label={t('connectDesktopButton.dismiss')}
+          className="flex h-5 w-5 items-center justify-center rounded hover:bg-amber-200 dark:hover:bg-amber-800"
+        >
+          <X className="h-3 w-3 text-amber-600 dark:text-amber-400" />
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  // Shown when the end user on the managed device denied the consent prompt.
+  const deniedContent = status === 'denied' ? (
+    <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-red-200 bg-red-50 p-3 text-sm shadow-lg dark:border-red-800 dark:bg-red-950">
+      <div className="flex items-start gap-2.5">
+        <MonitorOff className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+        <div className="flex-1">
+          <p className="font-medium text-red-800 dark:text-red-300">
+            {t('connectDesktopButton.denied.title')}
+          </p>
+          <p className="mt-1 text-xs text-red-700 dark:text-red-400">
+            {t('connectDesktopButton.denied.description')}
+          </p>
+          <div className="mt-2.5">
+            <button
+              type="button"
+              onClick={handleDismissDenied}
+              className="text-xs text-muted-foreground transition hover:text-foreground"
+            >
+              {t('connectDesktopButton.dismiss')}
+            </button>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleDismissDenied}
+          className="flex h-5 w-5 items-center justify-center rounded hover:bg-red-200 dark:hover:bg-red-800"
+        >
+          <X className="h-3 w-3 text-red-600 dark:text-red-400" />
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  // Shown when the revocation lease killed the session before the viewer
+  // connected. Maps the server's `RevocationReason` (apps/api/src/services/
+  // remoteRevocationLease.ts) to plain-language copy; unrecognized reasons
+  // fall back to the generic message rather than showing nothing (#6120).
+  const knownRevokedReasons = new Set([
+    'session_ended', 'user_inactive', 'epoch_baseline_missing',
+    'permissions_changed', 'membership_removed', 'site_scope_lost',
+    'mfa_required', 'hard_deadline',
+  ]);
+  const revokedReasonKey = revokedReason && knownRevokedReasons.has(revokedReason)
+    ? revokedReason
+    : 'default';
+  const revokedContent = status === 'revoked' ? (
+    <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-red-200 bg-red-50 p-3 text-sm shadow-lg dark:border-red-800 dark:bg-red-950">
+      <div className="flex items-start gap-2.5">
+        <MonitorOff className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+        <div className="flex-1">
+          <p className="font-medium text-red-800 dark:text-red-300">
+            {t('connectDesktopButton.revoked.title')}
+          </p>
+          <p className="mt-1 text-xs text-red-700 dark:text-red-400">
+            {t(/* i18n-dynamic */ `connectDesktopButton.revoked.reasons.${revokedReasonKey}`)}
+          </p>
+          {revokedReasonKey === 'mfa_required' && (
+            <div className="mt-2.5">
+              <a
+                href="/auth/mfa/setup"
+                className="inline-flex items-center rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-red-700"
+              >
+                {t('connectDesktopButton.revoked.setUpMfa')}
+              </a>
+            </div>
+          )}
+          <div className="mt-2.5">
+            <button
+              type="button"
+              onClick={handleDismissRevoked}
+              className="text-xs text-muted-foreground transition hover:text-foreground"
+            >
+              {t('connectDesktopButton.dismiss')}
+            </button>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleDismissRevoked}
+          aria-label={t('connectDesktopButton.dismiss')}
+          className="flex h-5 w-5 items-center justify-center rounded hover:bg-red-200 dark:hover:bg-red-800"
+        >
+          <X className="h-3 w-3 text-red-600 dark:text-red-400" />
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  // Shared fallback content for both compact and full modes.
+  // When the VNC auto-fallback path times out we show a "Open in Browser / Cancel"
+  // card (blue, matching ConnectVncButton). When the WebRTC deep-link path times
+  // out we show the existing "download viewer" card (amber).
+  const fallbackContent = status === 'fallback' ? (
+    vncFallback ? (
+      // VNC path timed out — viewer didn't pick up the deep link
+      <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm shadow-lg dark:border-blue-800 dark:bg-blue-950">
+        <div className="flex items-start gap-2.5">
+          <Monitor className="mt-0.5 h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+          <div className="flex-1">
+            <p className="font-medium text-blue-800 dark:text-blue-300">
+              {t('connectDesktopButton.fallback.title')}
+            </p>
+            <p className="mt-1 text-xs text-blue-700 dark:text-blue-400">
+              {t('connectDesktopButton.fallback.vncDescription')}
+            </p>
+            <div className="mt-2.5 flex items-center gap-3">
+              <button
+                type="button"
+                onClick={handleOpenInBrowser}
+                className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-700"
+              >
+                <Globe className="h-3.5 w-3.5" />
+                {t('connectDesktopButton.openInBrowser')}
+              </button>
+              <button
+                type="button"
+                onClick={handleCancelVnc}
+                className="text-xs text-muted-foreground transition hover:text-foreground"
+              >
+                {t('common:actions.cancel')}
+              </button>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleDismiss}
+            className="flex h-5 w-5 items-center justify-center rounded hover:bg-blue-200 dark:hover:bg-blue-800"
+          >
+            <X className="h-3 w-3 text-blue-600 dark:text-blue-400" />
+          </button>
+        </div>
+      </div>
+    ) : (
+      // WebRTC path timed out — viewer didn't pick up the deep link
+      <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm shadow-lg dark:border-amber-800 dark:bg-amber-950">
+        <div className="flex items-start gap-2.5">
+          <Monitor className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          <div className="flex-1">
+            <p className="font-medium text-amber-800 dark:text-amber-300">
+              {t('connectDesktopButton.fallback.title')}
+            </p>
+            <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+              {t('connectDesktopButton.fallback.viewerDescription')}
+            </p>
+            {(() => {
+              const downloadInfo = getViewerDownloadInfo();
+              if (downloadInfo) {
+                return (
+                  <>
+                    {/* The Linux build ships as an AppImage, which the browser
+                        saves without the executable bit and which registers the
+                        breeze:// handler only once it has been run. Without
+                        saying so, downloading looks like it did nothing and this
+                        same card reappears on every attempt (issue #2614). */}
+                    {downloadInfo.os === 'linux' && (
+                      <>
+                        <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">
+                          {t('connectDesktopButton.fallback.linuxFirstRun')}
+                        </p>
+                        {/* The AppImage mounts itself with FUSE 2, which current
+                            Debian/Ubuntu no longer ship by default. Worse, the
+                            package was renamed by the t64 transition, so the
+                            widely-quoted `apt install libfuse2` looks wrong when
+                            apt answers "selecting 'libfuse2t64' instead". Without
+                            naming the real package the run above just exits with
+                            no window and the user is stuck (issue #3415). */}
+                        <p className="mt-1.5 text-xs text-amber-700 dark:text-amber-400">
+                          {t('connectDesktopButton.fallback.linuxFuse')}
+                        </p>
+                      </>
+                    )}
+                    <div className="mt-2.5 flex items-center gap-3">
+                      <a
+                        href={downloadInfo.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => handleDismissAndCleanup()}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-700"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        {t('connectDesktopButton.downloadFor', { platform: downloadInfo.label })}
+                      </a>
+                      <button
+                        type="button"
+                        onClick={handleDismiss}
+                        className="text-xs text-muted-foreground transition hover:text-foreground"
+                      >
+                        {t('connectDesktopButton.dismiss')}
+                      </button>
+                    </div>
+                  </>
+                );
+              }
+              return (
+                <div className="mt-2.5 space-y-2">
+                  <div className="flex flex-col gap-1.5">
+                    {getAllViewerDownloads().map((dl) => (
+                      <a
+                        key={dl.os}
+                        href={dl.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => handleDismissAndCleanup()}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-700"
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                        {dl.label}
+                      </a>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleDismiss}
+                    className="text-xs text-muted-foreground transition hover:text-foreground"
+                  >
+                    {t('connectDesktopButton.dismiss')}
+                  </button>
+                </div>
+              );
+            })()}
+          </div>
+          <button
+            type="button"
+            onClick={handleDismiss}
+            className="flex h-5 w-5 items-center justify-center rounded hover:bg-amber-200 dark:hover:bg-amber-800"
+          >
+            <X className="h-3 w-3 text-amber-600 dark:text-amber-400" />
+          </button>
+        </div>
+      </div>
+    )
+  ) : null;
+
+  const headlessTitle = t('connectDesktopButton.unavailable.headless');
+  const desktopAccessUnavailable = desktopAccessUnavailableReason(desktopAccess, remoteAccessPolicy, (key) => t(/* i18n-dynamic */ key));
+  const policyDisabled = remoteAccessPolicy?.webrtcDesktop === false;
+  const policyTitle = policyDisabled
+    ? remoteAccessPolicy?.policyName
+      ? t('connectDesktopButton.policyDisabledNamed', { name: remoteAccessPolicy.policyName })
+      : t('connectDesktopButton.policyDisabled')
+    : null;
+  const unavailableTitle = policyTitle ?? desktopAccessUnavailable ?? headlessTitle;
+
+  if (policyDisabled || isHeadless || desktopAccessUnavailable) {
+    if (iconOnly) {
+      return (
+        <div className={`relative ${className}`}>
+          <button
+            type="button"
+            disabled
+            title={unavailableTitle}
+            className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground cursor-not-allowed opacity-50"
+          >
+            <MonitorOff className="h-4 w-4" />
+          </button>
+        </div>
+      );
+    }
+
+    if (compact) {
+      return (
+        <div className="relative">
+          <button
+            type="button"
+            disabled
+            title={unavailableTitle}
+            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-muted-foreground cursor-not-allowed opacity-50"
+          >
+            <MonitorOff className="h-4 w-4" />
+            {t('connectDesktopButton.desktopUnavailable')}
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className={`relative ${className}`}>
+        <button
+          type="button"
+          disabled
+          title={unavailableTitle}
+          className="flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium text-muted-foreground cursor-not-allowed opacity-50"
+        >
+          <MonitorOff className="h-4 w-4" />
+          {t('connectDesktopButton.desktopUnavailable')}
+        </button>
+      </div>
+    );
+  }
+
+  // RDS host session picker — only mounted (isOpen-gated) for 'on-demand'
+  // devices. onSelect threads the chosen WTS session id into the deep link.
+  const pickerModal = (
+    <SessionPickerModal
+      isOpen={pickerOpen}
+      deviceId={deviceId}
+      purpose="desktop"
+      onSelect={(sessionId) => { setPickerOpen(false); void startConnect(sessionId); }}
+      onClose={() => setPickerOpen(false)}
+    />
+  );
+
+  if (iconOnly) {
+    return (
+      <div className={`relative ${className}`}>
+        <button
+          type="button"
+          onClick={handleClick}
+          disabled={disabled || status === 'creating' || status === 'launching'}
+          title={error || (disabled ? disabledTitle : undefined) || t('connectDesktopButton.connectDesktop')}
+          className={`flex h-8 w-8 items-center justify-center rounded-md transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 ${error ? 'text-red-500' : ''}`}
+        >
+          {status === 'creating' || status === 'launching' ? (
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          ) : (
+            <Monitor className="h-4 w-4" />
+          )}
+        </button>
+        {fallbackContent}
+        {deniedContent}
+      {endingContent}
+        {revokedContent}
+        {pickerModal}
+      </div>
+    );
+  }
+
+  if (compact) {
+    return (
+      <div className="relative">
+        <button
+          type="button"
+          onClick={handleClick}
+          disabled={disabled || status === 'creating' || status === 'launching'}
+          title={error || (disabled ? disabledTitle : undefined)}
+          className={`flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 ${error ? 'text-red-500' : ''}`}
+        >
+          <Monitor className="h-4 w-4" />
+          {error ? t('connectDesktopButton.errors.connectionFailed') :
+           status === 'creating' ? t('connectDesktopButton.connecting') :
+           status === 'launching' ? t('connectDesktopButton.launching') :
+           t('connectDesktopButton.connectDesktop')}
+        </button>
+        {fallbackContent}
+        {deniedContent}
+      {endingContent}
+        {revokedContent}
+        {pickerModal}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`relative ${className}`}>
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={disabled || status === 'creating' || status === 'launching'}
+        title={error || (disabled ? disabledTitle : undefined)}
+        className={`flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${error ? 'border-red-300 bg-red-50 text-red-600 hover:bg-red-100 dark:border-red-800 dark:bg-red-950 dark:text-red-400 dark:hover:bg-red-900' : 'bg-background hover:bg-muted'}`}
+      >
+        <Monitor className="h-4 w-4" />
+        {error ? t('connectDesktopButton.errors.connectionFailed') :
+         status === 'creating' ? t('connectDesktopButton.creatingSession') :
+         status === 'launching' ? t('connectDesktopButton.launchingViewer') :
+         t('connectDesktopButton.connectDesktop')}
+        {status === 'idle' && !error && <ExternalLink className="w-3.5 h-3.5 opacity-60" />}
+      </button>
+
+      {fallbackContent}
+      {deniedContent}
+      {endingContent}
+      {revokedContent}
+      {pickerModal}
+    </div>
+  );
+}

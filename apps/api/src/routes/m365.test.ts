@@ -1,0 +1,284 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+
+// --- mutable mock state, set per-test ---
+let selectRows: unknown[] = [];
+let insertRows: unknown[] = [];
+let deleteRows: unknown[] = [];
+let insertedValues: unknown;
+let tokenResult: { accessToken: string; expiresIn: number };
+let graphResult: { ok: boolean; orgDisplayName?: string; error?: string };
+let tokenThrows = false;
+
+const { authOverrides } = vi.hoisted(() => ({ authOverrides: { current: null as Record<string, unknown> | null } }));
+
+vi.mock('../config/env', () => ({ M365_ENABLED: true }));
+vi.mock('../services/permissions', () => ({
+  PERMISSIONS: {
+    ORGS_READ: { resource: 'organizations', action: 'read' },
+    ORGS_WRITE: { resource: 'organizations', action: 'write' },
+  },
+}));
+// `allowedSiteIds` is left UNDEFINED by default (an unrestricted caller);
+// the site-ceiling suite sets it per-test. Hoisted ref, not a module const —
+// vi.mock factories are hoisted above module initialisation.
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      scope: 'organization', orgId: 'org-1', user: { id: 'user-1' },
+      ...(authOverrides.current ?? {}),
+    });
+    return next();
+  }),
+  requirePermission: vi.fn(() => (_c: any, next: any) => next()),
+  requireMfa: vi.fn(() => (_c: any, next: any) => next()),
+}));
+vi.mock('../db/schema/m365', () => ({
+  m365Connections: {
+    orgId: 'org_id',
+    profile: 'profile',
+    status: 'status',
+  },
+}));
+vi.mock('../services/auditEvents', () => ({ writeRouteAudit: vi.fn() }));
+vi.mock('../services/sentry', () => ({ captureException: vi.fn() }));
+vi.mock('../services/secretCrypto', () => ({ encryptSecret: vi.fn(() => 'ENCRYPTED-SECRET') }));
+vi.mock('./c2c/helpers', () => ({ resolveScopedOrgId: vi.fn(() => 'org-1') }));
+vi.mock('../services/c2cM365', () => ({
+  acquireClientCredentialsToken: vi.fn(async () => {
+    if (tokenThrows) throw new Error('AADSTS7000215 invalid client secret');
+    return tokenResult;
+  }),
+  testGraphAccess: vi.fn(async () => graphResult),
+  isM365TenantId: (x: string) => /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(x),
+}));
+vi.mock('../db', () => ({
+  db: {
+    select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(async () => selectRows) })) })) })),
+    insert: vi.fn(() => ({
+      values: vi.fn((values: unknown) => {
+        insertedValues = values;
+        return { onConflictDoUpdate: vi.fn(() => ({ returning: vi.fn(async () => insertRows) })) };
+      }),
+    })),
+    delete: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(async () => deleteRows) })) })),
+  },
+}));
+
+import { m365Routes } from './m365';
+import { authMiddleware } from '../middleware/auth';
+import { encryptSecret } from '../services/secretCrypto';
+import { acquireClientCredentialsToken, testGraphAccess } from '../services/c2cM365';
+import { db } from '../db';
+import { SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
+
+function app() {
+  const a = new Hono();
+  a.use('*', authMiddleware as any);
+  a.route('/m365', m365Routes);
+  return a;
+}
+
+const storedRow = {
+  id: 'conn-1', orgId: 'org-1', tenantId: '11111111-1111-1111-1111-111111111111', clientId: 'client-1',
+  clientSecret: 'ENCRYPTED-SECRET', displayName: 'Contoso', status: 'active',
+  profile: 'legacy-direct', authMode: 'client-secret-legacy', credentialDomain: 'legacy-direct',
+  vaultRef: null, permissionManifestVersion: 0, observedGrants: [],
+  lastVerifiedAt: new Date('2026-06-01T00:00:00Z'), createdAt: new Date('2026-06-01T00:00:00Z'),
+  updatedAt: new Date('2026-06-01T00:00:00Z'),
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  authOverrides.current = null;
+  selectRows = []; insertRows = []; deleteRows = [];
+  tokenResult = { accessToken: 'tok', expiresIn: 3600 };
+  graphResult = { ok: true, orgDisplayName: 'Contoso' };
+  tokenThrows = false;
+  insertedValues = undefined;
+});
+
+describe('m365 connection routes', () => {
+  it('scopes the M365_ENABLED middleware to the singular legacy /connection surface', () => {
+    const middleware = m365Routes.routes.filter((route) => route.method === 'ALL');
+    expect(middleware.filter((route) => route.path === '/*')).toHaveLength(1);
+    expect(middleware.some((route) => route.path === '/connection')).toBe(true);
+  });
+
+  it('GET /connection with no row → connected:false', async () => {
+    const res = await app().request('/m365/connection');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ connected: false });
+  });
+
+  it('GET /connection with a row → connected:true and NEVER returns the secret', async () => {
+    selectRows = [storedRow];
+    const res = await app().request('/m365/connection');
+    const body = await res.json();
+    expect(body.connected).toBe(true);
+    expect(body.tenantId).toBe('11111111-1111-1111-1111-111111111111');
+    expect(body.displayName).toBe('Contoso');
+    expect(body).not.toHaveProperty('clientSecret');
+    expect(JSON.stringify(body)).not.toContain('ENCRYPTED-SECRET');
+  });
+
+  it('POST /connection verifies via Graph, encrypts the secret, returns 201 without the secret', async () => {
+    insertRows = [storedRow];
+    const res = await app().request('/m365/connection', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: '11111111-1111-1111-1111-111111111111', clientId: 'client-1', clientSecret: 'super-secret' }),
+    });
+    expect(res.status).toBe(201);
+    expect(acquireClientCredentialsToken).toHaveBeenCalledOnce();
+    expect(testGraphAccess).toHaveBeenCalledWith('tok');
+    expect(encryptSecret).toHaveBeenCalledWith('super-secret');
+    const body = await res.json();
+    expect(body.connected).toBe(true);
+    expect(JSON.stringify(body)).not.toContain('super-secret');
+    expect(JSON.stringify(body)).not.toContain('ENCRYPTED-SECRET');
+    expect(insertedValues).toMatchObject({
+      profile: 'legacy-direct',
+      authMode: 'client-secret-legacy',
+      credentialDomain: 'legacy-direct',
+      permissionManifestVersion: 0,
+      vaultRef: null,
+    });
+  });
+
+  it('does not attempt Graph auth when a legacy row has no encrypted secret', async () => {
+    selectRows = [{ ...storedRow, clientSecret: null }];
+    const res = await app().request('/m365/connection');
+    expect(res.status).toBe(200);
+    expect((await res.json()).connected).toBe(true);
+  });
+
+  it('POST /connection returns 400 with a hint when Graph verification fails', async () => {
+    graphResult = { ok: false, error: 'insufficient privileges' };
+    const res = await app().request('/m365/connection', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: '11111111-1111-1111-1111-111111111111', clientId: 'client-1', clientSecret: 'super-secret' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain('Could not verify');
+    expect(body.hint).toBeTruthy();
+    expect(encryptSecret).not.toHaveBeenCalled();
+  });
+
+  it('POST /connection returns 400 when token acquisition throws (bad credentials)', async () => {
+    tokenThrows = true;
+    const res = await app().request('/m365/connection', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: '11111111-1111-1111-1111-111111111111', clientId: 'client-1', clientSecret: 'bad' }),
+    });
+    expect(res.status).toBe(400);
+    expect(encryptSecret).not.toHaveBeenCalled();
+  });
+
+  it('POST /connection rejects a missing client secret (zod) with 400', async () => {
+    const res = await app().request('/m365/connection', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: '11111111-1111-1111-1111-111111111111', clientId: 'client-1' }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /connection rejects a non-GUID tenant id with 400 before any token call', async () => {
+    const res = await app().request('/m365/connection', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tenantId: 'contoso.onmicrosoft.com', clientId: 'client-1', clientSecret: 'super-secret' }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/tenant guid/i);
+    expect(encryptSecret).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /connection → connected:false', async () => {
+    deleteRows = [storedRow];
+    const res = await app().request('/m365/connection', { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ connected: false });
+  });
+
+  // Regression: the route module itself must attach authMiddleware. index.ts
+  // does NOT apply a global auth middleware to the /api/v1 group, so a route
+  // that forgets `.use('*', authMiddleware)` reaches requirePermission with no
+  // auth context and 401s every authenticated request. Mount the router WITHOUT
+  // the harness auth and assert the router invoked authMiddleware on its own.
+  it('attaches authMiddleware itself (regression: 401 for all callers when missing)', async () => {
+    const bare = new Hono();
+    bare.route('/m365', m365Routes);
+    await bare.request('/m365/connection');
+    expect(authMiddleware).toHaveBeenCalled();
+  });
+});
+
+/**
+ * An M365 connection IS the org's whole Entra tenant: connecting or
+ * disconnecting one turns every m365_* tool on or off for the entire
+ * organization at once. There is no per-site slice of it, so it belongs to
+ * the same org-wide governance class as webhooks, notification channels and
+ * config policies — `organizations:write` + MFA alone let a site-restricted
+ * technician rewire (or cut off) an org's identity integration.
+ */
+describe('m365 connection routes — org-wide governance site ceiling', () => {
+  const connectBody = JSON.stringify({
+    tenantId: '11111111-1111-1111-1111-111111111111',
+    clientId: 'client-1',
+    clientSecret: 'super-secret',
+  });
+
+  it('POST /connection is 403 for a site-restricted caller, before any credential use', async () => {
+    authOverrides.current = { allowedSiteIds: ['site-1'] };
+    const res = await app().request('/m365/connection', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: connectBody,
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(acquireClientCredentialsToken).not.toHaveBeenCalled();
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('POST /connection is 403 when the ceiling is the EMPTY site list', async () => {
+    authOverrides.current = { allowedSiteIds: [] };
+    const res = await app().request('/m365/connection', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: connectBody,
+    });
+    expect(res.status).toBe(403);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /connection is 403 for a site-restricted caller, with no delete issued', async () => {
+    authOverrides.current = { allowedSiteIds: ['site-1'] };
+    const res = await app().request('/m365/connection', { method: 'DELETE' });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(db.delete).not.toHaveBeenCalled();
+  });
+
+  it('leaves the UNRESTRICTED write paths unchanged', async () => {
+    // Control: same requests, no ceiling — the 201/200 contract is untouched.
+    insertRows = [storedRow];
+    const created = await app().request('/m365/connection', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: connectBody,
+    });
+    expect(created.status).toBe(201);
+
+    deleteRows = [storedRow];
+    const removed = await app().request('/m365/connection', { method: 'DELETE' });
+    expect(removed.status).toBe(200);
+    expect(await removed.json()).toEqual({ connected: false });
+  });
+
+  it('does NOT gate the read surface', async () => {
+    // A site-restricted tech may still SEE whether the org is connected.
+    authOverrides.current = { allowedSiteIds: ['site-1'] };
+    const res = await app().request('/m365/connection');
+    expect(res.status).toBe(200);
+  });
+});

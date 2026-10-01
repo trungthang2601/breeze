@@ -1,0 +1,941 @@
+import { useCallback, useEffect, useState } from "react";
+import { Link2, MessageSquare, Save, Send, Users, Webhook } from "lucide-react";
+import { fetchWithAuth } from "../../stores/auth";
+import { useTranslation } from "react-i18next";
+import "@/lib/i18n";
+
+type Severity = "critical" | "high" | "medium" | "low" | "info";
+
+type StatusTone = "success" | "error" | "info";
+
+type StatusMessage = {
+  tone: StatusTone;
+  message: string;
+};
+
+type RoutingRule = {
+  severity: Severity;
+  slack: string;
+  teams: string;
+  discord: string;
+};
+
+type ProviderKey = "slack" | "teams" | "discord";
+
+const severityStyles: Record<Severity, string> = {
+  critical: "border-red-500/40 bg-red-500/20 text-red-700",
+  high: "border-orange-500/40 bg-orange-500/20 text-orange-700",
+  medium: "border-yellow-500/40 bg-yellow-500/20 text-yellow-700",
+  low: "border-blue-500/40 bg-blue-500/20 text-blue-700",
+  info: "border-slate-400/40 bg-slate-400/20 text-slate-700",
+};
+
+const severityLabelKeys: Record<Severity, string> = {
+  critical: "communicationIntegrations.critical",
+  high: "communicationIntegrations.high",
+  medium: "communicationIntegrations.medium",
+  low: "communicationIntegrations.low",
+  info: "communicationIntegrations.info",
+};
+
+const statusToneStyles: Record<StatusTone, string> = {
+  success: "text-emerald-600",
+  error: "text-red-600",
+  info: "text-muted-foreground",
+};
+
+const defaultIntegrationSettings = {
+  slack: {
+    enabled: false,
+    workspaceName: "",
+    workspaceId: "",
+    defaultChannel: "#ops-alerts",
+  },
+  teams: {
+    enabled: false,
+    tenantId: "",
+    clientId: "",
+    clientSecret: "",
+  },
+  discord: {
+    enabled: false,
+    webhookUrl: "",
+  },
+  routingRules: [
+    {
+      severity: "critical",
+      slack: "#sev1",
+      teams: "Ops - Sev1",
+      discord: "#critical",
+    },
+    {
+      severity: "high",
+      slack: "#ops-alerts",
+      teams: "Ops - Alerts",
+      discord: "#high",
+    },
+    {
+      severity: "medium",
+      slack: "#ops-triage",
+      teams: "Ops - Triage",
+      discord: "#medium",
+    },
+    {
+      severity: "low",
+      slack: "#ops-info",
+      teams: "Ops - Info",
+      discord: "#low",
+    },
+    {
+      severity: "info",
+      slack: "#ops-feed",
+      teams: "Ops - Feed",
+      discord: "#info",
+    },
+  ] as RoutingRule[],
+  messageTemplate:
+    "[{severity}] {alert}\nDevice: {device}\nSite: {site}\nTime: {timestamp}",
+};
+
+const templateVariables = [
+  "{device}",
+  "{alert}",
+  "{severity}",
+  "{site}",
+  "{organization}",
+  "{timestamp}",
+];
+
+const buildRoutingPayload = (rules: RoutingRule[], provider: ProviderKey) =>
+  rules.map((rule) => ({
+    severity: rule.severity,
+    channel: rule[provider],
+  }));
+
+const saveIntegration = async (
+  endpoint: string,
+  payload: Record<string, unknown>,
+  errorMessage: string,
+) => {
+  const response = await fetchWithAuth(endpoint, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(errorMessage);
+  }
+};
+
+const sendTest = async (
+  endpoint: string,
+  payload: Record<string, unknown>,
+  errorMessage: string,
+) => {
+  const response = await fetchWithAuth(endpoint, {
+    method: "POST",
+    body: JSON.stringify({ ...payload, test: true }),
+  });
+
+  if (!response.ok) {
+    throw new Error(errorMessage);
+  }
+};
+
+export default function CommunicationIntegrations() {
+  const { t } = useTranslation("integrations");
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string>();
+
+  const [slackEnabled, setSlackEnabled] = useState(
+    defaultIntegrationSettings.slack.enabled,
+  );
+  const [slackWorkspaceName, setSlackWorkspaceName] = useState(
+    defaultIntegrationSettings.slack.workspaceName,
+  );
+  const [slackWorkspaceId, setSlackWorkspaceId] = useState(
+    defaultIntegrationSettings.slack.workspaceId,
+  );
+  const [slackDefaultChannel, setSlackDefaultChannel] = useState(
+    defaultIntegrationSettings.slack.defaultChannel,
+  );
+  const [slackStatus, setSlackStatus] = useState<StatusMessage | null>(null);
+  const [slackSaving, setSlackSaving] = useState(false);
+  const [slackTesting, setSlackTesting] = useState(false);
+
+  const [teamsEnabled, setTeamsEnabled] = useState(
+    defaultIntegrationSettings.teams.enabled,
+  );
+  const [teamsTenantId, setTeamsTenantId] = useState(
+    defaultIntegrationSettings.teams.tenantId,
+  );
+  const [teamsClientId, setTeamsClientId] = useState(
+    defaultIntegrationSettings.teams.clientId,
+  );
+  const [teamsClientSecret, setTeamsClientSecret] = useState(
+    defaultIntegrationSettings.teams.clientSecret,
+  );
+  const [teamsStatus, setTeamsStatus] = useState<StatusMessage | null>(null);
+  const [teamsSaving, setTeamsSaving] = useState(false);
+  const [teamsTesting, setTeamsTesting] = useState(false);
+
+  const [discordEnabled, setDiscordEnabled] = useState(
+    defaultIntegrationSettings.discord.enabled,
+  );
+  const [discordWebhookUrl, setDiscordWebhookUrl] = useState(
+    defaultIntegrationSettings.discord.webhookUrl,
+  );
+  const [discordStatus, setDiscordStatus] = useState<StatusMessage | null>(
+    null,
+  );
+  const [discordSaving, setDiscordSaving] = useState(false);
+  const [discordTesting, setDiscordTesting] = useState(false);
+
+  const [routingRules, setRoutingRules] = useState<RoutingRule[]>(
+    defaultIntegrationSettings.routingRules,
+  );
+  const [messageTemplate, setMessageTemplate] = useState(
+    defaultIntegrationSettings.messageTemplate,
+  );
+  const severityLabels: Record<Severity, { label: string; className: string }> =
+    {
+      critical: {
+        label: t(/* i18n-dynamic */ severityLabelKeys.critical),
+        className: severityStyles.critical,
+      },
+      high: {
+        label: t(/* i18n-dynamic */ severityLabelKeys.high),
+        className: severityStyles.high,
+      },
+      medium: {
+        label: t(/* i18n-dynamic */ severityLabelKeys.medium),
+        className: severityStyles.medium,
+      },
+      low: { label: t(/* i18n-dynamic */ severityLabelKeys.low), className: severityStyles.low },
+      info: {
+        label: t(/* i18n-dynamic */ severityLabelKeys.info),
+        className: severityStyles.info,
+      },
+    };
+
+  const fetchSettings = useCallback(async () => {
+    try {
+      setLoading(true);
+      setLoadError(undefined);
+      const response = await fetchWithAuth("/integrations/communication");
+      if (response.status === 404) {
+        // No settings saved yet, use defaults
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(
+          t("communicationIntegrations.failedToLoadCommunicationSettings"),
+        );
+      }
+      const data = await response.json();
+      const settings = data.data ?? data ?? {};
+
+      if (settings.slack) {
+        setSlackEnabled(settings.slack.enabled ?? false);
+        setSlackWorkspaceName(settings.slack.workspaceName ?? "");
+        setSlackWorkspaceId(settings.slack.workspaceId ?? "");
+        setSlackDefaultChannel(settings.slack.defaultChannel ?? "#ops-alerts");
+      }
+      if (settings.teams) {
+        setTeamsEnabled(settings.teams.enabled ?? false);
+        setTeamsTenantId(settings.teams.tenantId ?? "");
+        setTeamsClientId(settings.teams.clientId ?? "");
+        setTeamsClientSecret(settings.teams.clientSecret ?? "");
+      }
+      if (settings.discord) {
+        setDiscordEnabled(settings.discord.enabled ?? false);
+        setDiscordWebhookUrl(settings.discord.webhookUrl ?? "");
+      }
+      if (
+        Array.isArray(settings.routingRules) &&
+        settings.routingRules.length > 0
+      ) {
+        setRoutingRules(settings.routingRules);
+      }
+      if (settings.messageTemplate) {
+        setMessageTemplate(settings.messageTemplate);
+      }
+    } catch (err) {
+      setLoadError(
+        err instanceof Error
+          ? err.message
+          : t("communicationIntegrations.failedToLoadCommunicationSettings"),
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSettings();
+  }, [fetchSettings]);
+
+  const handleRoutingChange = (
+    severity: Severity,
+    provider: ProviderKey,
+    value: string,
+  ) => {
+    setRoutingRules((prev) =>
+      prev.map((rule) =>
+        rule.severity === severity ? { ...rule, [provider]: value } : rule,
+      ),
+    );
+  };
+
+  const handleSlackSave = async () => {
+    setSlackSaving(true);
+    setSlackStatus(null);
+    try {
+      await saveIntegration(
+        "/integrations/slack",
+        {
+          enabled: slackEnabled,
+          workspaceName: slackWorkspaceName,
+          workspaceId: slackWorkspaceId,
+          defaultChannel: slackDefaultChannel,
+          routing: buildRoutingPayload(routingRules, "slack"),
+          messageTemplate,
+        },
+        t("communicationIntegrations.unableToSaveIntegrationSettings"),
+      );
+      setSlackStatus({
+        tone: "success",
+        message: t("communicationIntegrations.slackSettingsSaved"),
+      });
+    } catch (err) {
+      setSlackStatus({
+        tone: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : t("communicationIntegrations.unableToSaveSlackSettings"),
+      });
+    } finally {
+      setSlackSaving(false);
+    }
+  };
+
+  const handleSlackTest = async () => {
+    setSlackTesting(true);
+    setSlackStatus(null);
+    try {
+      await sendTest(
+        "/integrations/slack",
+        {
+          enabled: slackEnabled,
+          workspaceName: slackWorkspaceName,
+          workspaceId: slackWorkspaceId,
+          defaultChannel: slackDefaultChannel,
+          routing: buildRoutingPayload(routingRules, "slack"),
+          messageTemplate,
+        },
+        t("communicationIntegrations.unableToSendTestNotification"),
+      );
+      setSlackStatus({
+        tone: "success",
+        message: t("communicationIntegrations.slackTestNotificationQueued"),
+      });
+    } catch (err) {
+      setSlackStatus({
+        tone: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : t("communicationIntegrations.slackTestNotificationFailed"),
+      });
+    } finally {
+      setSlackTesting(false);
+    }
+  };
+
+  const handleTeamsSave = async () => {
+    setTeamsSaving(true);
+    setTeamsStatus(null);
+    try {
+      await saveIntegration(
+        "/integrations/teams",
+        {
+          enabled: teamsEnabled,
+          tenantId: teamsTenantId,
+          clientId: teamsClientId,
+          clientSecret: teamsClientSecret,
+          routing: buildRoutingPayload(routingRules, "teams"),
+          messageTemplate,
+        },
+        t("communicationIntegrations.unableToSaveIntegrationSettings"),
+      );
+      setTeamsStatus({
+        tone: "success",
+        message: t("communicationIntegrations.teamsSettingsSaved"),
+      });
+    } catch (err) {
+      setTeamsStatus({
+        tone: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : t("communicationIntegrations.unableToSaveTeamsSettings"),
+      });
+    } finally {
+      setTeamsSaving(false);
+    }
+  };
+
+  const handleTeamsTest = async () => {
+    setTeamsTesting(true);
+    setTeamsStatus(null);
+    try {
+      await sendTest(
+        "/integrations/teams",
+        {
+          enabled: teamsEnabled,
+          tenantId: teamsTenantId,
+          clientId: teamsClientId,
+          clientSecret: teamsClientSecret,
+          routing: buildRoutingPayload(routingRules, "teams"),
+          messageTemplate,
+        },
+        t("communicationIntegrations.unableToSendTestNotification"),
+      );
+      setTeamsStatus({
+        tone: "success",
+        message: t("communicationIntegrations.teamsTestNotificationQueued"),
+      });
+    } catch (err) {
+      setTeamsStatus({
+        tone: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : t("communicationIntegrations.teamsTestNotificationFailed"),
+      });
+    } finally {
+      setTeamsTesting(false);
+    }
+  };
+
+  const handleDiscordSave = async () => {
+    setDiscordSaving(true);
+    setDiscordStatus(null);
+    try {
+      await saveIntegration(
+        "/integrations/discord",
+        {
+          enabled: discordEnabled,
+          webhookUrl: discordWebhookUrl,
+          routing: buildRoutingPayload(routingRules, "discord"),
+          messageTemplate,
+        },
+        t("communicationIntegrations.unableToSaveIntegrationSettings"),
+      );
+      setDiscordStatus({
+        tone: "success",
+        message: t("communicationIntegrations.discordSettingsSaved"),
+      });
+    } catch (err) {
+      setDiscordStatus({
+        tone: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : t("communicationIntegrations.unableToSaveDiscordSettings"),
+      });
+    } finally {
+      setDiscordSaving(false);
+    }
+  };
+
+  const handleDiscordTest = async () => {
+    setDiscordTesting(true);
+    setDiscordStatus(null);
+    try {
+      await sendTest(
+        "/integrations/discord",
+        {
+          enabled: discordEnabled,
+          webhookUrl: discordWebhookUrl,
+          routing: buildRoutingPayload(routingRules, "discord"),
+          messageTemplate,
+        },
+        t("communicationIntegrations.unableToSendTestNotification"),
+      );
+      setDiscordStatus({
+        tone: "success",
+        message: t("communicationIntegrations.discordTestNotificationQueued"),
+      });
+    } catch (err) {
+      setDiscordStatus({
+        tone: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : t("communicationIntegrations.discordTestNotificationFailed"),
+      });
+    } finally {
+      setDiscordTesting(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+          <p className="mt-4 text-sm text-muted-foreground">
+            {t("communicationIntegrations.loadingCommunicationIntegrations")}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold">
+          {t("communicationIntegrations.communicationIntegrations")}
+        </h1>
+        <p className="text-sm text-muted-foreground">
+          {t(
+            "communicationIntegrations.connectChatToolsRouteAlertsBySeverityAnd",
+          )}
+        </p>
+      </div>
+
+      {loadError && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {loadError}
+        </div>
+      )}
+
+      <div className="grid gap-6 xl:grid-cols-3">
+        <section className="rounded-xl border bg-card p-6 shadow-xs">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <span className="flex h-10 w-10 items-center justify-center rounded-full bg-muted text-foreground">
+                <MessageSquare className="h-5 w-5" />
+              </span>
+              <div>
+                <h2 className="text-lg font-semibold">
+                  {t("communicationIntegrations.slack")}
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  {t(
+                    "communicationIntegrations.connectAWorkspaceWithOAuthAndPostAlerts",
+                  )}
+                </p>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <span className="text-muted-foreground">
+                {t("common:states.enabled")}
+              </span>
+              <input
+                type="checkbox"
+                checked={slackEnabled}
+                onChange={(event) => setSlackEnabled(event.target.checked)}
+                className="h-4 w-4"
+              />
+            </label>
+          </div>
+
+          <div className="mt-5 space-y-4">
+            <div className="rounded-lg border bg-muted/40 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase text-muted-foreground">
+                    {t("communicationIntegrations.workspace")}
+                  </p>
+                  <p className="text-sm font-medium">
+                    {slackWorkspaceName ? slackWorkspaceName : "Not connected"}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {t("communicationIntegrations.workspaceID", {
+                      id: slackWorkspaceId || "Pending connection",
+                    })}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (slackEnabled) {
+                      window.location.assign("/api/integrations/slack/oauth");
+                    }
+                  }}
+                  disabled={!slackEnabled}
+                  className="inline-flex items-center gap-2 rounded-md border bg-background px-3 py-2 text-xs font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <Link2 className="h-4 w-4" />
+                  {t("communicationIntegrations.connectWorkspace")}
+                </button>
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {t(
+                  "communicationIntegrations.oauthRedirectStartsWhenYouConnectASlack",
+                )}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium">
+                {t("communicationIntegrations.defaultChannel")}
+              </label>
+              <input
+                type="text"
+                value={slackDefaultChannel}
+                onChange={(event) => setSlackDefaultChannel(event.target.value)}
+                disabled={!slackEnabled}
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm disabled:cursor-not-allowed disabled:bg-muted/40"
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleSlackTest}
+                disabled={!slackEnabled || slackSaving || slackTesting}
+                className="inline-flex h-10 items-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Send className="h-4 w-4" />
+                {slackTesting
+                  ? t("communicationIntegrations.testing")
+                  : t("communicationIntegrations.testNotification")}
+              </button>
+              <button
+                type="button"
+                onClick={handleSlackSave}
+                disabled={!slackEnabled || slackSaving || slackTesting}
+                className="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Save className="h-4 w-4" />
+                {slackSaving
+                  ? t("communicationIntegrations.saving")
+                  : t("communicationIntegrations.saveSettings")}
+              </button>
+            </div>
+            {slackStatus ? (
+              <p className={`text-xs ${statusToneStyles[slackStatus.tone]}`}>
+                {slackStatus.message}
+              </p>
+            ) : null}
+          </div>
+        </section>
+
+        <section className="rounded-xl border bg-card p-6 shadow-xs">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <span className="flex h-10 w-10 items-center justify-center rounded-full bg-muted text-foreground">
+                <Users className="h-5 w-5" />
+              </span>
+              <div>
+                <h2 className="text-lg font-semibold">
+                  {t("communicationIntegrations.microsoftTeams")}
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  {t(
+                    "communicationIntegrations.configureTenantCredentialsForTeamsAlertDelivery",
+                  )}
+                </p>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <span className="text-muted-foreground">
+                {t("common:states.enabled")}
+              </span>
+              <input
+                type="checkbox"
+                checked={teamsEnabled}
+                onChange={(event) => setTeamsEnabled(event.target.checked)}
+                className="h-4 w-4"
+              />
+            </label>
+          </div>
+
+          <div className="mt-5 space-y-4">
+            <div className="grid gap-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">
+                  {t("communicationIntegrations.tenantID")}
+                </label>
+                <input
+                  type="text"
+                  value={teamsTenantId}
+                  onChange={(event) => setTeamsTenantId(event.target.value)}
+                  disabled={!teamsEnabled}
+                  className="h-10 w-full rounded-md border bg-background px-3 text-sm disabled:cursor-not-allowed disabled:bg-muted/40"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">
+                  {t("communicationIntegrations.clientID")}
+                </label>
+                <input
+                  type="text"
+                  value={teamsClientId}
+                  onChange={(event) => setTeamsClientId(event.target.value)}
+                  disabled={!teamsEnabled}
+                  className="h-10 w-full rounded-md border bg-background px-3 text-sm disabled:cursor-not-allowed disabled:bg-muted/40"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">
+                  {t("communicationIntegrations.clientSecret")}
+                </label>
+                <input
+                  type="password"
+                  value={teamsClientSecret}
+                  onChange={(event) => setTeamsClientSecret(event.target.value)}
+                  disabled={!teamsEnabled}
+                  className="h-10 w-full rounded-md border bg-background px-3 text-sm disabled:cursor-not-allowed disabled:bg-muted/40"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleTeamsTest}
+                disabled={!teamsEnabled || teamsSaving || teamsTesting}
+                className="inline-flex h-10 items-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Send className="h-4 w-4" />
+                {teamsTesting
+                  ? t("communicationIntegrations.testing")
+                  : t("communicationIntegrations.testNotification")}
+              </button>
+              <button
+                type="button"
+                onClick={handleTeamsSave}
+                disabled={!teamsEnabled || teamsSaving || teamsTesting}
+                className="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Save className="h-4 w-4" />
+                {teamsSaving
+                  ? t("communicationIntegrations.saving")
+                  : t("communicationIntegrations.saveSettings")}
+              </button>
+            </div>
+            {teamsStatus ? (
+              <p className={`text-xs ${statusToneStyles[teamsStatus.tone]}`}>
+                {teamsStatus.message}
+              </p>
+            ) : null}
+          </div>
+        </section>
+
+        <section className="rounded-xl border bg-card p-6 shadow-xs">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <span className="flex h-10 w-10 items-center justify-center rounded-full bg-muted text-foreground">
+                <Webhook className="h-5 w-5" />
+              </span>
+              <div>
+                <h2 className="text-lg font-semibold">
+                  {t("communicationIntegrations.discord")}
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  {t(
+                    "communicationIntegrations.sendAlertsToADiscordChannelViaWebhook",
+                  )}
+                </p>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <span className="text-muted-foreground">
+                {t("common:states.enabled")}
+              </span>
+              <input
+                type="checkbox"
+                checked={discordEnabled}
+                onChange={(event) => setDiscordEnabled(event.target.checked)}
+                className="h-4 w-4"
+              />
+            </label>
+          </div>
+
+          <div className="mt-5 space-y-4">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">
+                {t("communicationIntegrations.webhookURL")}
+              </label>
+              <input
+                type="text"
+                value={discordWebhookUrl}
+                onChange={(event) => setDiscordWebhookUrl(event.target.value)}
+                disabled={!discordEnabled}
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm disabled:cursor-not-allowed disabled:bg-muted/40"
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={handleDiscordTest}
+                disabled={!discordEnabled || discordSaving || discordTesting}
+                className="inline-flex h-10 items-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Send className="h-4 w-4" />
+                {discordTesting
+                  ? t("communicationIntegrations.testing")
+                  : t("communicationIntegrations.testNotification")}
+              </button>
+              <button
+                type="button"
+                onClick={handleDiscordSave}
+                disabled={!discordEnabled || discordSaving || discordTesting}
+                className="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Save className="h-4 w-4" />
+                {discordSaving
+                  ? t("communicationIntegrations.saving")
+                  : t("communicationIntegrations.saveSettings")}
+              </button>
+            </div>
+            {discordStatus ? (
+              <p className={`text-xs ${statusToneStyles[discordStatus.tone]}`}>
+                {discordStatus.message}
+              </p>
+            ) : null}
+          </div>
+        </section>
+      </div>
+
+      <section className="rounded-xl border bg-card p-6 shadow-xs">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {t("communicationIntegrations.channelRoutingRules")}
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            {t(
+              "communicationIntegrations.mapAlertSeverityToTheDestinationChannelsFor",
+            )}
+          </p>
+        </div>
+
+        <div className="mt-4 overflow-auto">
+          <table className="w-full min-w-[720px] text-left text-sm">
+            <thead className="text-xs uppercase text-muted-foreground">
+              <tr>
+                <th className="px-2 py-2">
+                  {t("communicationIntegrations.severity")}
+                </th>
+                <th className="px-2 py-2">
+                  {t("communicationIntegrations.slackChannel")}
+                </th>
+                <th className="px-2 py-2">
+                  {t("communicationIntegrations.teamsChannel")}
+                </th>
+                <th className="px-2 py-2">
+                  {t("communicationIntegrations.discordChannel")}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {routingRules.map((rule) => {
+                const meta = severityLabels[rule.severity];
+                return (
+                  <tr key={rule.severity} className="border-t">
+                    <td className="px-2 py-3">
+                      <span
+                        className={`inline-flex items-center rounded-full border px-2 py-1 text-xs ${meta.className}`}
+                      >
+                        {meta.label}
+                      </span>
+                    </td>
+                    <td className="px-2 py-3">
+                      <input
+                        type="text"
+                        value={rule.slack}
+                        onChange={(event) =>
+                          handleRoutingChange(
+                            rule.severity,
+                            "slack",
+                            event.target.value,
+                          )
+                        }
+                        className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                      />
+                    </td>
+                    <td className="px-2 py-3">
+                      <input
+                        type="text"
+                        value={rule.teams}
+                        onChange={(event) =>
+                          handleRoutingChange(
+                            rule.severity,
+                            "teams",
+                            event.target.value,
+                          )
+                        }
+                        className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                      />
+                    </td>
+                    <td className="px-2 py-3">
+                      <input
+                        type="text"
+                        value={rule.discord}
+                        onChange={(event) =>
+                          handleRoutingChange(
+                            rule.severity,
+                            "discord",
+                            event.target.value,
+                          )
+                        }
+                        className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                      />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">
+          {t(
+            "communicationIntegrations.updateAProviderSettingsCardToSaveRouting",
+          )}
+        </p>
+      </section>
+
+      <section className="rounded-xl border bg-card p-6 shadow-xs">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {t("communicationIntegrations.messageTemplates")}
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            {t("communicationIntegrations.customizeTheMessageBodyThatIsSentTo")}
+          </p>
+        </div>
+
+        <div className="mt-4 space-y-3">
+          <textarea
+            value={messageTemplate}
+            onChange={(event) => setMessageTemplate(event.target.value)}
+            rows={6}
+            className="u-min-h-px-140 w-full rounded-md border bg-background p-3 text-sm"
+          />
+          <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+            {templateVariables.map((variable) => (
+              <span
+                key={variable}
+                className="rounded-full border bg-muted px-2 py-1"
+              >
+                {variable}
+              </span>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {t(
+              "communicationIntegrations.variablesAreReplacedAtSendTimeWithAlert",
+            )}
+          </p>
+        </div>
+      </section>
+    </div>
+  );
+}

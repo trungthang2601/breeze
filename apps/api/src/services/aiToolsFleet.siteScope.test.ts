@@ -1,0 +1,998 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
+
+const { deleteSpy, reportScopeMocks, reportPreflightMock } = vi.hoisted(() => ({
+  deleteSpy: vi.fn(),
+  reportPreflightMock: vi.fn(),
+  reportScopeMocks: {
+    // #3198 W01 — mirrors siteScope.reportOwnerOf: exactly one owner axis, or
+    // throw. A plain function (not vi.fn) so a mock reset cannot blank it and
+    // turn aiToolsFleet's owner guard into a no-op.
+    reportOwnerOf: (row: { orgId: string | null; partnerId: string | null }) => {
+      const hasOrg = typeof row.orgId === 'string' && row.orgId.length > 0;
+      const hasPartner = typeof row.partnerId === 'string' && row.partnerId.length > 0;
+      if (hasOrg === hasPartner) throw new Error('report row must have exactly one owner axis');
+      return hasOrg ? { orgId: row.orgId as string } : { partnerId: row.partnerId as string };
+    },
+    resolveRequestReportAuthority: vi.fn(),
+    resolveRequestReportAuthorityMap: vi.fn(),
+    decodeSiteScope: vi.fn(),
+    isSiteScopeSubset: vi.fn(),
+    intersectSiteScopes: vi.fn(),
+    siteScopeFingerprint: vi.fn(),
+    persistedSiteScopeValues: vi.fn(),
+    reportDefinitionScopeSqlPredicate: vi.fn(),
+    reportDefinitionMultiOrgScopeSqlPredicate: vi.fn(),
+    unrestrictedReportDefinitionScopeSqlPredicate: vi.fn(),
+    reportRunScopeSqlPredicate: vi.fn(),
+    reportRunMultiOrgScopeSqlPredicate: vi.fn(),
+    unrestrictedReportRunScopeSqlPredicate: vi.fn(),
+  },
+}));
+vi.mock('../db', () => ({
+  runOutsideDbContext: vi.fn((fn: any) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: deleteSpy, transaction: vi.fn() },
+}));
+vi.mock('../jobs/peripheralJobs', () => ({
+  schedulePeripheralPolicyDevice: vi.fn(async () => undefined),
+}));
+
+// Override only the reused site-scope helpers (spread the rest so other
+// importers still get the real exports). These drive SR5-05 (automations) and
+// SR5-06 (reports) which delegate their site check to these functions.
+vi.mock('./automationRuntime', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./automationRuntime')>();
+  return { ...actual, checkAutomationTargetsWithinSiteScope: vi.fn() };
+});
+vi.mock('./reportGenerationService', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./reportGenerationService')>();
+  return {
+    ...actual,
+    assertReportExecutionPreflight: (...args: unknown[]) => reportPreflightMock(...args),
+  };
+});
+vi.mock('./siteScope', () => reportScopeMocks);
+
+import { db } from '../db';
+import { registerFleetTools } from './aiToolsFleet';
+import { checkAutomationTargetsWithinSiteScope } from './automationRuntime';
+import {
+  reportRunScopeSqlPredicate,
+  resolveRequestReportAuthority,
+} from './siteScope';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+
+const mockCheck = checkAutomationTargetsWithinSiteScope as unknown as ReturnType<typeof vi.fn>;
+
+const mockDb = db as unknown as {
+  select: ReturnType<typeof vi.fn>;
+  insert: ReturnType<typeof vi.fn>;
+  update: ReturnType<typeof vi.fn>;
+  transaction: ReturnType<typeof vi.fn>;
+};
+function handlerFor(name: string): AiTool['handler'] {
+  const reg = new Map<string, AiTool>();
+  registerFleetTools(reg);
+  return reg.get(name)!.handler;
+}
+function makeAuth(allowedSiteIds?: string[]): AuthContext {
+  return {
+    principal: { kind: 'user_session' },
+    user: { id: 'u1', email: 'a@b.c', name: 'A', isPlatformAdmin: false },
+    token: {} as any, partnerId: null, orgId: 'org-1', scope: 'organization',
+    accessibleOrgIds: ['org-1'], orgCondition: () => undefined, canAccessOrg: () => true,
+    allowedSiteIds, canAccessSite: (s) => (!allowedSiteIds ? true : !!s && allowedSiteIds.includes(s)),
+  };
+}
+
+reportScopeMocks.resolveRequestReportAuthority.mockImplementation(
+  async (auth: AuthContext, orgId: string) => ({
+    ok: true,
+    authority: {
+      principalKind: 'user',
+      scope: auth.allowedSiteIds === undefined
+        ? { version: 1, kind: 'unrestricted', orgId }
+        : { version: 1, kind: 'restricted', orgId, siteIds: auth.allowedSiteIds },
+      principalUserId: auth.user.id,
+      capturedAt: new Date('2026-07-25T12:00:00.000Z'),
+      fingerprint: auth.allowedSiteIds === undefined ? 'f'.repeat(64) : 'a'.repeat(64),
+    },
+  }),
+);
+
+describe('manage_patches — per-device site scoping', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('install denies when a target device is owned but outside the caller site scope', async () => {
+    // ownedDevices returns the device (org match) WITH its real forbidden site —
+    // the site gate (not org ownership) must reject it. Proves the gate is live.
+    mockDb.select.mockReturnValue({
+      from: () => ({ where: () => Promise.resolve([{ id: 'd1', siteId: 'site-FORBIDDEN' }]) }),
+    });
+    const r = await handlerFor('manage_patches')({ action: 'install', patchIds: ['p1'], deviceIds: ['d1'] }, makeAuth(['site-A']));
+    expect(r).toContain('Access denied');
+    expect(mockDb.insert).not.toHaveBeenCalled();
+  });
+
+  it('install allows an unrestricted caller (no regression)', async () => {
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => Promise.resolve([{ id: 'd1', siteId: 'site-FORBIDDEN' }]) }) });
+    (db as any).insert = vi.fn(() => ({ values: () => ({ returning: () => Promise.resolve([{ id: 'job1' }]) }) }));
+    const r = await handlerFor('manage_patches')({ action: 'install', patchIds: ['p1'], deviceIds: ['d1'] }, makeAuth(undefined));
+    expect(r).not.toContain('Access denied');
+  });
+
+  it('rollback denies a device owned but outside the caller site scope', async () => {
+    // rollback selects { id, siteId } for the single device; site is forbidden.
+    mockDb.select.mockReturnValue({
+      from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'd1', siteId: 'site-FORBIDDEN' }]) }) }),
+    });
+    const r = await handlerFor('manage_patches')({ action: 'rollback', patchId: 'p1', deviceIds: ['d1'] }, makeAuth(['site-A']));
+    expect(r).toContain('access denied');
+    expect(mockDb.insert).not.toHaveBeenCalled();
+  });
+});
+
+describe('manage_groups remove_devices — per-device site scoping', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('only removes in-scope devices; out-of-site device ids are excluded from the delete', async () => {
+    let call = 0;
+    mockDb.select.mockImplementation((cols?: unknown) => {
+      // 1st select: the group row (orgId)
+      if (call === 0) { call++; return { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'g1', name: 'G', orgId: 'org-1' }]) }) }) }; }
+      // 2nd select: candidate devices { id, siteId }
+      return { from: () => ({ where: () => Promise.resolve([
+        { id: 'd-in', siteId: 'site-A' },
+        { id: 'd-out', siteId: 'site-FORBIDDEN' },
+      ]) }) };
+    });
+    let deletedIds: string[] | null = null;
+    deleteSpy.mockReturnValue({
+      where: (_cond: any) => {
+        // Capture the device-id list the delete is scoped to by re-running the
+        // inArray against a probe. We can't introspect the SQL easily, so the
+        // handler must have narrowed the id list before building the condition.
+        return { returning: () => Promise.resolve([{ deviceId: 'd-in' }]) };
+      },
+    });
+    // Spy on inArray indirectly: assert handler reports the skipped count.
+    const r = await handlerFor('manage_groups')({ action: 'remove_devices', groupId: 'g1', deviceIds: ['d-in', 'd-out'] }, makeAuth(['site-A']));
+    const parsed = JSON.parse(r);
+    expect(parsed.success).toBe(true);
+    // out-of-site device must be reported as skipped (not silently removed)
+    expect(parsed.removed).toBe(1);
+    expect(parsed.skipped).toBe(1);
+  });
+
+  it('removes nothing (no delete) when all requested devices are out-of-site', async () => {
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call === 0) { call++; return { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'g1', name: 'G', orgId: 'org-1' }]) }) }) }; }
+      return { from: () => ({ where: () => Promise.resolve([{ id: 'd-out', siteId: 'site-FORBIDDEN' }]) }) };
+    });
+    const r = await handlerFor('manage_groups')({ action: 'remove_devices', groupId: 'g1', deviceIds: ['d-out'] }, makeAuth(['site-A']));
+    const parsed = JSON.parse(r);
+    expect(parsed.removed).toBe(0);
+    expect(deleteSpy).not.toHaveBeenCalled();
+  });
+
+  it('unrestricted caller removes all requested devices (no regression)', async () => {
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call === 0) { call++; return { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'g1', name: 'G', orgId: 'org-1' }]) }) }) }; }
+      return { from: () => ({ where: () => Promise.resolve([{ id: 'd1', siteId: 'site-Z' }, { id: 'd2', siteId: 'site-Y' }]) }) };
+    });
+    deleteSpy.mockReturnValue({
+      where: () => ({
+        returning: () => Promise.resolve([{ deviceId: 'd1' }, { deviceId: 'd2' }]),
+      }),
+    });
+    const r = await handlerFor('manage_groups')({ action: 'remove_devices', groupId: 'g1', deviceIds: ['d1', 'd2'] }, makeAuth(undefined));
+    const parsed = JSON.parse(r);
+    expect(parsed.success).toBe(true);
+    expect(deleteSpy).toHaveBeenCalled();
+  });
+});
+
+describe('report data device_inventory — site narrowing', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('site-restricted caller with no in-scope devices gets empty inventory', async () => {
+    let inventoryRan = false;
+    let inventoryCondition: SQL | undefined;
+    mockDb.select.mockImplementation((cols?: unknown) => {
+      if (cols && typeof cols === 'object' && 'id' in (cols as object) && 'siteId' in (cols as object) && Object.keys(cols as object).length === 2) {
+        return { from: () => ({ where: () => Promise.resolve([{ id: 'd1', siteId: 'site-FORBIDDEN' }]) }) };
+      }
+      inventoryRan = true;
+      return { from: () => ({ leftJoin: () => ({ where: (condition: SQL) => {
+        inventoryCondition = condition;
+        return { orderBy: () => ({ limit: () => Promise.resolve([]) }) };
+      } }) }) };
+    });
+    const r = await handlerFor('generate_report')({ action: 'data', reportType: 'device_inventory' }, makeAuth(['site-A']));
+    const parsed = JSON.parse(r);
+    expect(parsed.showing).toBe(0);
+    expect(inventoryRan).toBe(true);
+    const rendered = new PgDialect().sqlToQuery(inventoryCondition!);
+    expect(rendered.params).toContain('site-A');
+    expect(rendered.params).not.toContain('site-FORBIDDEN');
+  });
+});
+
+function makeAuthWithPartner(allowedSiteIds: string[] | undefined, partnerId: string): AuthContext {
+  return { ...makeAuth(allowedSiteIds), partnerId };
+}
+
+// ── SR5-22: manage_alert_rules ────────────────────────────────────────────────
+describe('SR5-22 manage_alert_rules — alert site scoping', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('alert_summary narrows via device leftJoin for a site-restricted caller', async () => {
+    let leftJoined = false;
+    mockDb.select.mockReturnValue({
+      from: () => ({
+        leftJoin: () => { leftJoined = true; return { where: () => Promise.resolve([{ total: 0, active: 0 }]) }; },
+        where: () => Promise.resolve([{ total: 99, active: 99 }]),
+      }),
+    });
+    const r = await handlerFor('manage_alert_rules')({ action: 'alert_summary' }, makeAuth(['site-A']));
+    expect(leftJoined).toBe(true);
+    expect(JSON.parse(r).summary.total).toBe(0);
+  });
+
+  it('alert_summary uses no device join for an unrestricted caller (no regression)', async () => {
+    let leftJoined = false;
+    mockDb.select.mockReturnValue({
+      from: () => ({
+        leftJoin: () => { leftJoined = true; return { where: () => Promise.resolve([{ total: 0 }]) }; },
+        where: () => Promise.resolve([{ total: 99, active: 99 }]),
+      }),
+    });
+    const r = await handlerFor('manage_alert_rules')({ action: 'alert_summary' }, makeAuth(undefined));
+    expect(leftJoined).toBe(false);
+    expect(JSON.parse(r).summary.total).toBe(99);
+  });
+
+  it('get_rule denies a rule that targets a forbidden site (and never queries alerts)', async () => {
+    let selectCalls = 0;
+    mockDb.select.mockImplementation(() => {
+      selectCalls++;
+      return { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'r1', targetType: 'site', targetId: 'site-FORBIDDEN' }]) }) }) };
+    });
+    const r = await handlerFor('manage_alert_rules')({ action: 'get_rule', ruleId: 'r1' }, makeAuth(['site-A']));
+    expect(r).toContain('access denied');
+    // Only the rule lookup ran — the recent-alerts query was short-circuited.
+    expect(selectCalls).toBe(1);
+  });
+});
+
+// ── SR5-03: manage_deployments ────────────────────────────────────────────────
+describe('SR5-03 manage_deployments — site scoping', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('pause denies a site-restricted caller when a member device is out of site', async () => {
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call === 0) { call++; return { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'dep1', name: 'D', status: 'running' }]) }) }) }; }
+      return { from: () => ({ leftJoin: () => ({ where: () => Promise.resolve([{ deploymentId: 'dep1', deviceId: 'd-out', siteId: 'site-FORBIDDEN' }]) }) }) };
+    });
+    (db as any).update = vi.fn();
+    const r = await handlerFor('manage_deployments')({ action: 'pause', deploymentId: 'dep1' }, makeAuth(['site-A']));
+    expect(r).toContain('access denied');
+    expect((db as any).update).not.toHaveBeenCalled();
+  });
+
+  it('device_status returns empty for a zero-site restricted caller (no device query)', async () => {
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'dep1' }]) }) }) });
+    const r = await handlerFor('manage_deployments')({ action: 'device_status', deploymentId: 'dep1' }, makeAuth([]));
+    expect(JSON.parse(r).showing).toBe(0);
+  });
+
+  it('pause allows an unrestricted caller (no regression)', async () => {
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'dep1', name: 'D', status: 'running' }]) }) }) });
+    (db as any).update = vi.fn(() => ({ set: () => ({ where: () => Promise.resolve() }) }));
+    const r = await handlerFor('manage_deployments')({ action: 'pause', deploymentId: 'dep1' }, makeAuth(undefined));
+    expect(JSON.parse(r).success).toBe(true);
+  });
+});
+
+// ── SR5-04: manage_groups ─────────────────────────────────────────────────────
+describe('SR5-04 manage_groups — group site scoping', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('get denies a site-restricted caller for an out-of-site group', async () => {
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'g1', name: 'G', orgId: 'org-1', siteId: 'site-FORBIDDEN' }]) }) }) });
+    const r = await handlerFor('manage_groups')({ action: 'get', groupId: 'g1' }, makeAuth(['site-A']));
+    expect(r).toContain('access denied');
+  });
+
+  it('list returns empty for a zero-site restricted caller', async () => {
+    const r = await handlerFor('manage_groups')({ action: 'list' }, makeAuth([]));
+    expect(JSON.parse(r).showing).toBe(0);
+  });
+
+  it('create rejects a siteId outside the caller site scope (no insert)', async () => {
+    (db as any).insert = vi.fn();
+    const r = await handlerFor('manage_groups')({ action: 'create', name: 'X', siteId: 'site-FORBIDDEN' }, makeAuth(['site-A']));
+    expect(r).toContain('Access denied');
+    expect((db as any).insert).not.toHaveBeenCalled();
+  });
+
+  it('create allows an unrestricted caller (no regression)', async () => {
+    (db as any).insert = vi.fn(() => ({ values: () => ({ returning: () => Promise.resolve([{ id: 'g1', name: 'X' }]) }) }));
+    const r = await handlerFor('manage_groups')({ action: 'create', name: 'X', siteId: 'site-Z' }, makeAuth(undefined));
+    expect(JSON.parse(r).success).toBe(true);
+  });
+});
+
+// ── SR5-05: manage_automations ────────────────────────────────────────────────
+describe('SR5-05 manage_automations — target site scoping', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const autoRow = { id: 'a1', orgId: 'org-1', partnerId: null, trigger: {}, conditions: {} };
+
+  it('get denies when the target site-scope check fails', async () => {
+    mockCheck.mockResolvedValue({ ok: false, unbounded: false, outOfScopeDeviceIds: ['d1'] });
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => ({ limit: () => Promise.resolve([autoRow]) }) }) });
+    const r = await handlerFor('manage_automations')({ action: 'get', automationId: 'a1' }, makeAuth(['site-A']));
+    expect(r).toContain('target sites denied');
+  });
+
+  it('run denies an unbounded (all-devices) automation for a restricted caller', async () => {
+    mockCheck.mockResolvedValue({ ok: false, unbounded: true, outOfScopeDeviceIds: [] });
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => ({ limit: () => Promise.resolve([autoRow]) }) }) });
+    (db as any).insert = vi.fn();
+    const r = await handlerFor('manage_automations')({ action: 'run', automationId: 'a1' }, makeAuth(['site-A']));
+    expect(r).toContain('target all devices');
+    expect((db as any).insert).not.toHaveBeenCalled();
+  });
+
+  it('get allows an unrestricted caller (check passes)', async () => {
+    mockCheck.mockResolvedValue({ ok: true, unbounded: false, outOfScopeDeviceIds: [] });
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => ({ limit: () => Promise.resolve([autoRow]) }) }) });
+    const r = await handlerFor('manage_automations')({ action: 'get', automationId: 'a1' }, makeAuth(undefined));
+    expect(JSON.parse(r).automation.id).toBe('a1');
+  });
+
+  it('get omits org-wide run metadata for a restricted caller', async () => {
+    mockCheck.mockResolvedValue({ ok: true, unbounded: false, outOfScopeDeviceIds: [] });
+    mockDb.select.mockReturnValue({
+      from: () => ({ where: () => ({ limit: () => Promise.resolve([{
+        ...autoRow, runCount: 99, lastRunAt: new Date('2026-09-05T00:00:00Z'),
+      }]) }) }),
+    });
+    const r = await handlerFor('manage_automations')({ action: 'get', automationId: 'a1' }, makeAuth(['site-A']));
+    expect(JSON.parse(r).automation).not.toHaveProperty('runCount');
+    expect(JSON.parse(r).automation).not.toHaveProperty('lastRunAt');
+  });
+
+  it('list omits automations that fail the site-scope check', async () => {
+    mockCheck.mockImplementation(async (a: any) => ({ ok: a.id === 'keep', unbounded: false, outOfScopeDeviceIds: [] }));
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => ({ orderBy: () => ({ limit: () => ({ offset: () => Promise.resolve([
+      { id: 'keep', name: 'K', trigger: {}, orgId: 'org-1', partnerId: null, conditions: {}, runCount: 7, lastRunAt: new Date() },
+      { id: 'drop', name: 'D', trigger: {}, orgId: 'org-1', partnerId: null, conditions: {}, runCount: 9, lastRunAt: new Date() },
+    ]) }) }) }) }) });
+    const r = await handlerFor('manage_automations')({ action: 'list' }, makeAuth(['site-A']));
+    const parsed = JSON.parse(r);
+    expect(parsed.showing).toBe(1);
+    expect(parsed.automations[0].id).toBe('keep');
+    expect(parsed.automations[0]).not.toHaveProperty('runCount');
+    expect(parsed.automations[0]).not.toHaveProperty('lastRunAt');
+  });
+});
+
+// ── SR5-06: generate_report (history/download scope gate) ──────────────────────
+describe('SR5-06 generate_report — run scope gating', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    reportScopeMocks.resolveRequestReportAuthority.mockResolvedValue({
+      ok: true,
+      authority: {
+        principalKind: 'user',
+        scope: { version: 1, kind: 'unrestricted', orgId: 'org-1' },
+        principalUserId: 'u1',
+        capturedAt: new Date('2026-07-25T12:00:00.000Z'),
+        fingerprint: 'f'.repeat(64),
+      },
+    });
+    reportScopeMocks.decodeSiteScope.mockReturnValue({
+      version: 1,
+      kind: 'unrestricted',
+      orgId: 'org-1',
+    });
+    reportScopeMocks.isSiteScopeSubset.mockReturnValue(true);
+    reportScopeMocks.reportRunScopeSqlPredicate.mockReturnValue({
+      op: 'run-scope',
+    });
+  });
+
+  const runRow = {
+    id: 'run1',
+    reportId: 'rep1',
+    status: 'completed',
+    orgId: 'org-1',
+    reportOrgId: 'org-1',
+    outputUrl: 'u',
+    reportName: 'N',
+    reportType: 't',
+    reportFormat: 'csv',
+    rowCount: 1,
+    completedAt: null,
+    executionScopeVersion: 1,
+    executionScopeKind: 'unrestricted',
+    executionScopeSiteIds: null,
+    executionScopeUserId: 'u1',
+    executionScopeFingerprint: 'f'.repeat(64),
+    executionScopeCapturedAt: new Date('2026-07-25T12:00:00.000Z'),
+  };
+
+  const definitionRow = {
+    id: 'rep1',
+    orgId: 'org-1',
+    name: 'Scoped report',
+    type: 'device_inventory',
+    config: { filters: { siteIds: ['site-B'] } },
+    executionScopeVersion: 1,
+    executionScopeKind: 'unrestricted',
+    executionScopeSiteIds: null,
+    executionScopeUserId: 'u1',
+    executionScopeFingerprint: 'f'.repeat(64),
+    executionScopeCapturedAt: new Date('2026-07-25T12:00:00.000Z'),
+  };
+
+  function definitionSelectChain() {
+    return {
+      from: () => ({
+        where: () => ({ limit: () => Promise.resolve([definitionRow]) }),
+      }),
+    };
+  }
+
+  it('download denies when the report scope exceeds the caller sites', async () => {
+    reportScopeMocks.resolveRequestReportAuthority.mockResolvedValueOnce({
+      ok: false,
+      reason: 'permission_removed',
+    });
+    mockDb.select.mockReturnValue({ from: () => ({ innerJoin: () => ({ where: () => ({ limit: () => Promise.resolve([runRow]) }) }) }) });
+    const r = await handlerFor('generate_report')({ action: 'download', reportRunId: 'run1' }, makeAuth(['site-A']));
+    expect(r).toContain('Report run not found');
+    expect(resolveRequestReportAuthority).toHaveBeenCalledWith(
+      expect.anything(),
+      'org-1',
+      'export',
+    );
+    expect(reportRunScopeSqlPredicate).not.toHaveBeenCalled();
+  });
+
+  it('download allows an unrestricted caller (no regression)', async () => {
+    mockDb.select.mockReturnValue({ from: () => ({ innerJoin: () => ({ where: () => ({ limit: () => Promise.resolve([runRow]) }) }) }) });
+    const r = await handlerFor('generate_report')({ action: 'download', reportRunId: 'run1' }, makeAuth(undefined));
+    expect(JSON.parse(r).outputUrl).toBe('u');
+    expect(resolveRequestReportAuthority).toHaveBeenCalledWith(
+      expect.anything(),
+      'org-1',
+      'export',
+    );
+    expect(reportRunScopeSqlPredicate).toHaveBeenCalled();
+  });
+
+  it('report data alert_summary zeroes out for a zero-site restricted caller', async () => {
+    reportScopeMocks.resolveRequestReportAuthority.mockResolvedValueOnce({
+      ok: true,
+      authority: {
+        principalKind: 'user',
+        scope: { version: 1, kind: 'restricted', orgId: 'org-1', siteIds: [] },
+        principalUserId: 'u1',
+        capturedAt: new Date('2026-07-25T12:00:00.000Z'),
+        fingerprint: 'a'.repeat(64),
+      },
+    });
+    // resolveSiteAllowedDeviceIds → org devices, all filtered out by the empty allowlist.
+    mockDb.select.mockReturnValue({ from: () => ({ where: () => Promise.resolve([{ id: 'd1', siteId: 'site-A' }]) }) });
+    const r = await handlerFor('generate_report')({ action: 'data', reportType: 'alert_summary' }, makeAuth([]));
+    expect(JSON.parse(r).data.total).toBe(0);
+  });
+
+  it('does not report update success when the guarded definition mutation loses its scope race', async () => {
+    reportScopeMocks.reportDefinitionScopeSqlPredicate.mockReturnValue({ op: 'definition-scope' });
+    mockDb.select.mockReturnValue(definitionSelectChain());
+    const returning = vi.fn(async () => []);
+    mockDb.update.mockReturnValue({
+      set: () => ({ where: () => ({ returning }) }),
+    });
+
+    const result = JSON.parse(await handlerFor('generate_report')(
+      { action: 'update', reportId: 'rep1', name: 'Renamed' },
+      makeAuth(undefined),
+    ));
+
+    expect(returning).toHaveBeenCalled();
+    expect(result.success).not.toBe(true);
+  });
+
+  it('rejects saved generation config before inserting a run or updating the definition', async () => {
+    const restrictedScope = {
+      version: 1,
+      kind: 'restricted',
+      orgId: 'org-1',
+      siteIds: ['site-A'],
+    };
+    reportScopeMocks.resolveRequestReportAuthority.mockResolvedValue({
+      ok: true,
+      authority: {
+        principalKind: 'user',
+        scope: restrictedScope,
+        principalUserId: 'u1',
+        capturedAt: new Date('2026-07-25T12:00:00.000Z'),
+        fingerprint: 'a'.repeat(64),
+      },
+    });
+    reportScopeMocks.decodeSiteScope.mockReturnValue(restrictedScope);
+    reportScopeMocks.intersectSiteScopes.mockReturnValue(restrictedScope);
+    reportScopeMocks.isSiteScopeSubset.mockReturnValue(true);
+    reportScopeMocks.siteScopeFingerprint.mockReturnValue('a'.repeat(64));
+    mockDb.select.mockReturnValue(definitionSelectChain());
+    reportPreflightMock.mockImplementationOnce(() => {
+      throw new Error('outside authority');
+    });
+
+    const result = JSON.parse(await handlerFor('generate_report')(
+      { action: 'generate', reportId: 'rep1' },
+      makeAuth(['site-A']),
+    ));
+
+    expect(reportPreflightMock).toHaveBeenCalled();
+    expect(mockDb.insert).not.toHaveBeenCalled();
+    expect(mockDb.update).not.toHaveBeenCalled();
+    expect(result.success).not.toBe(true);
+  });
+
+  it('records AI-tool saved report runs with the acting user requester provenance', async () => {
+    reportScopeMocks.intersectSiteScopes.mockReturnValue({
+      version: 1,
+      kind: 'unrestricted',
+      orgId: 'org-1',
+    });
+    reportScopeMocks.siteScopeFingerprint.mockReturnValue('f'.repeat(64));
+    reportScopeMocks.persistedSiteScopeValues.mockReturnValue({
+      executionScopeVersion: 1,
+      executionScopeKind: 'unrestricted',
+      executionScopeSiteIds: null,
+      executionScopeUserId: 'u1',
+      executionScopeFingerprint: 'f'.repeat(64),
+      executionScopeCapturedAt: new Date('2026-07-25T12:00:00.000Z'),
+      executionScopePrincipalKind: 'user',
+    });
+    mockDb.select.mockReturnValue(definitionSelectChain());
+    const values = vi.fn(() => ({
+      returning: () => Promise.resolve([{ id: 'run-1' }]),
+    }));
+    mockDb.insert.mockReturnValue({ values });
+    mockDb.update.mockReturnValue({ set: () => ({ where: () => Promise.resolve() }) });
+
+    const result = JSON.parse(await handlerFor('generate_report')(
+      { action: 'generate', reportId: 'rep1' },
+      makeAuth(undefined),
+    ));
+
+    expect(result.success).toBe(true);
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      requestedByKind: 'user',
+      requestedByUserId: 'u1',
+      requestedByPortalUserId: null,
+    }));
+  });
+
+  it('rolls back run deletion when the guarded definition delete loses its scope race', async () => {
+    reportScopeMocks.reportDefinitionScopeSqlPredicate.mockReturnValue({ op: 'definition-scope' });
+    mockDb.select.mockReturnValue(definitionSelectChain());
+    const definitionReturning = vi.fn(async () => []);
+    let deleteCall = 0;
+    const txDelete = vi.fn(() => ++deleteCall === 1
+      ? { where: () => Promise.resolve([]) }
+      : { where: () => ({ returning: definitionReturning }) });
+    mockDb.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => fn({
+      delete: txDelete,
+    }));
+
+    const result = JSON.parse(await handlerFor('generate_report')(
+      { action: 'delete', reportId: 'rep1' },
+      makeAuth(undefined),
+    ));
+
+    expect(definitionReturning).toHaveBeenCalled();
+    expect(result.success).not.toBe(true);
+  });
+});
+
+// ── SR5-20: manage_patches compliance ─────────────────────────────────────────
+describe('SR5-20 manage_patches — compliance site scoping', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('recomputes (zeroed) for a zero-site restricted caller instead of the org snapshot', async () => {
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call === 0) { call++; return { from: () => ({ where: () => Promise.resolve([{ total: 3, pending: 1 }]) }) }; }
+      // resolveSiteAllowedDeviceIds — org devices filtered out by empty allowlist.
+      return { from: () => ({ where: () => Promise.resolve([{ id: 'd1', siteId: 'site-A' }]) }) };
+    });
+    const r = await handlerFor('manage_patches')({ action: 'compliance' }, makeAuthWithPartner([], 'p1'));
+    const parsed = JSON.parse(r);
+    expect(parsed.snapshot.siteScoped).toBe(true);
+    expect(parsed.snapshot.totalDevices).toBe(0);
+    expect(parsed.approvals.total).toBe(3);
+  });
+
+  it('returns the precomputed snapshot for an unrestricted caller (no regression)', async () => {
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call === 0) { call++; return { from: () => ({ where: () => Promise.resolve([{ total: 3 }]) }) }; }
+      return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([{ id: 'snap1', totalDevices: 10 }]) }) }) }) };
+    });
+    const r = await handlerFor('manage_patches')({ action: 'compliance' }, makeAuthWithPartner(undefined, 'p1'));
+    expect(JSON.parse(r).snapshot.id).toBe('snap1');
+  });
+});
+
+// ============================================================================
+// manage_maintenance_windows — site-axis read scoping (#3654)
+//
+// `maintenanceWindowWhere` filters on the org/partner axis only, so before this
+// the tool disclosed every maintenance window in the org to a site-restricted
+// caller — the same enumeration step the HTTP exploit in #3654 starts from.
+// (The tool's create/update/delete actions are disabled upstream, so only the
+// read surface is reachable here.)
+// ============================================================================
+describe('manage_maintenance_windows — site-axis read scoping (#3654)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const winA = {
+    id: 'w-a', name: 'Site A night', orgId: 'org-1', targetType: 'site',
+    siteIds: ['site-A'], groupIds: null, deviceIds: null,
+    startTime: null, endTime: null, recurrence: 'once', status: 'scheduled',
+    suppressAlerts: true, suppressPatching: true,
+  };
+  const winForbidden = { ...winA, id: 'w-b', name: 'Site FORBIDDEN night', siteIds: ['site-FORBIDDEN'] };
+  const winAll = { ...winA, id: 'w-all', name: 'Org wide', targetType: 'all', siteIds: null };
+
+  function mockList(rows: unknown[]) {
+    mockDb.select.mockReturnValue({
+      from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve(rows) }) }) }),
+    });
+  }
+
+  it('hides a window targeting only a forbidden site from list', async () => {
+    mockList([winA, winForbidden, winAll]);
+
+    const raw = await handlerFor('manage_maintenance_windows')({ action: 'list' }, makeAuth(['site-A']));
+    const body = JSON.parse(raw as string);
+
+    // The `all` window really does suppress the caller's own fleet, so it stays
+    // visible; the forbidden-site one must not.
+    expect(body.windows.map((w: { id: string }) => w.id)).toEqual(['w-a', 'w-all']);
+    expect(body.showing).toBe(2);
+    expect(raw).not.toContain('site-FORBIDDEN');
+  });
+
+  it('does not leak the site-axis columns it filters on', async () => {
+    mockList([winA]);
+
+    const body = JSON.parse(await handlerFor('manage_maintenance_windows')({ action: 'list' }, makeAuth(['site-A'])) as string);
+
+    expect(body.windows[0]).not.toHaveProperty('siteIds');
+    expect(body.windows[0]).not.toHaveProperty('groupIds');
+    expect(body.windows[0]).not.toHaveProperty('deviceIds');
+    expect(body.windows[0]).not.toHaveProperty('orgId');
+    expect(body.windows[0].id).toBe('w-a');
+  });
+
+  it('leaves an unrestricted caller seeing every window (no regression)', async () => {
+    mockList([winA, winForbidden, winAll]);
+
+    const body = JSON.parse(await handlerFor('manage_maintenance_windows')({ action: 'list' }, makeAuth(undefined)) as string);
+
+    expect(body.windows.map((w: { id: string }) => w.id)).toEqual(['w-a', 'w-b', 'w-all']);
+  });
+
+  it('refuses to fetch a forbidden-site window by id', async () => {
+    mockDb.select.mockReturnValue({
+      from: () => ({ where: () => ({ limit: () => Promise.resolve([winForbidden]) }) }),
+    });
+
+    const raw = await handlerFor('manage_maintenance_windows')(
+      { action: 'get', windowId: 'w-b' }, makeAuth(['site-A'])
+    ) as string;
+
+    expect(JSON.parse(raw).error).toBe('Maintenance window not found or access denied');
+    // The occurrence read must never happen — it would disclose the window too.
+    expect(mockDb.select).toHaveBeenCalledTimes(1);
+  });
+
+  it('still fetches an in-scope window by id', async () => {
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) return { from: () => ({ where: () => ({ limit: () => Promise.resolve([winA]) }) }) };
+      return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([]) }) }) }) };
+    });
+
+    const body = JSON.parse(await handlerFor('manage_maintenance_windows')(
+      { action: 'get', windowId: 'w-a' }, makeAuth(['site-A'])
+    ) as string);
+
+    expect(body.window.id).toBe('w-a');
+  });
+
+  it('filters BOTH the active and the scheduled sets in active_now', async () => {
+    // active_now runs two queries and merges them; a filter applied to only one
+    // would leak the other. Forbidden window comes back in the ACTIVE set.
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      const rows = call++ === 0 ? [winForbidden] : [winA];
+      return { from: () => ({ where: () => Promise.resolve(rows) }) };
+    });
+
+    const raw = await handlerFor('manage_maintenance_windows')({ action: 'active_now' }, makeAuth(['site-A'])) as string;
+    const body = JSON.parse(raw);
+
+    expect(body.activeWindows.map((w: { id: string }) => w.id)).toEqual(['w-a']);
+    expect(body.count).toBe(1);
+    expect(raw).not.toContain('site-FORBIDDEN');
+    expect(body.activeWindows[0]).not.toHaveProperty('siteIds');
+  });
+
+  it('narrows a spanning window to the caller\u2019s own sites on get', async () => {
+    const spanning = { ...winA, id: 'w-span', siteIds: ['site-A', 'site-FORBIDDEN'] };
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) return { from: () => ({ where: () => ({ limit: () => Promise.resolve([spanning]) }) }) };
+      return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([]) }) }) }) };
+    });
+
+    const raw = await handlerFor('manage_maintenance_windows')(
+      { action: 'get', windowId: 'w-span' }, makeAuth(['site-A'])
+    ) as string;
+
+    expect(JSON.parse(raw).window.siteIds).toEqual(['site-A']);
+    expect(raw).not.toContain('site-FORBIDDEN');
+  });
+});
+
+describe('manage_patches setup_auto_approval — site-ceiling gate (contract-site-ceiling-gate §7A)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  // setup_auto_approval is disabled for EVERY caller (see the unconditional
+  // early-return in aiToolsFleet.ts) — patch policies must be configured via
+  // manage_policy_feature_link instead. The org configuration_policies insert
+  // further down the handler is therefore dead code today; it carries its own
+  // canMutateOrgWideGovernance check as defense-in-depth in case the disabled
+  // gate is ever lifted (same convention as the canManagePartnerWidePolicies
+  // check a few lines above it). These two cases pin the LIVE behavior: the
+  // action is blocked identically for a site-restricted and an unrestricted
+  // caller, i.e. there is no live bypass through this action today.
+  it('is blocked for a site-restricted caller (via the disabled-action gate, not reachable)', async () => {
+    const r = await handlerFor('manage_patches')({ action: 'setup_auto_approval' }, makeAuth(['site-A'])) as string;
+    expect(r).toContain('disabled');
+    expect(mockDb.insert).not.toHaveBeenCalled();
+  });
+
+  it('is blocked identically for an unrestricted caller (no live bypass either way)', async () => {
+    const r = await handlerFor('manage_patches')({ action: 'setup_auto_approval' }, makeAuth(undefined)) as string;
+    expect(r).toContain('disabled');
+    expect(mockDb.insert).not.toHaveBeenCalled();
+  });
+});
+
+describe('manage_deployments get/list — site axis (audit §1.1)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  // Deployments carry no siteId; their site attribution is their member
+  // devices. `get` exposes the row plus org-wide progress counts and `list`
+  // exposes every deployment's metadata — both had no site check while
+  // start/pause/resume/cancel did.
+  function mockGet(members: Array<{ deviceId: string; siteId: string | null }>) {
+    const memberRows = members.map((m) => ({ deploymentId: 'dep-1', ...m }));
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) {
+        return { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'dep-1', name: 'D', status: 'running' }]) }) }) };
+      }
+      // member lookup (leftJoin) then, if reached, the progress aggregate
+      return {
+        from: () => ({
+          leftJoin: () => ({ where: () => Promise.resolve(memberRows) }),
+          where: () => Promise.resolve([{ total: 3, pending: 1, running: 1, completed: 1, failed: 0, skipped: 0 }]),
+        }),
+      };
+    });
+  }
+
+  it('get denies a deployment whose members live in another site', async () => {
+    mockGet([{ deviceId: 'd-out', siteId: 'site-2' }]);
+    const r = await handlerFor('manage_deployments')({ action: 'get', deploymentId: 'dep-1' }, makeAuth(['site-1'])) as string;
+    expect(JSON.parse(r).error).toContain('access denied');
+    expect(r).not.toContain('progress');
+  });
+
+  it('get still returns a deployment confined to the caller site', async () => {
+    mockGet([{ deviceId: 'd-in', siteId: 'site-1' }]);
+    const r = await handlerFor('manage_deployments')({ action: 'get', deploymentId: 'dep-1' }, makeAuth(['site-1'])) as string;
+    const parsed = JSON.parse(r);
+    expect(parsed.deployment.id).toBe('dep-1');
+    expect(parsed.progress.total).toBe(3);
+  });
+
+  it('get runs no member query for an unrestricted caller', async () => {
+    let memberQueries = 0;
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) {
+        return { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'dep-1', name: 'D', status: 'running' }]) }) }) };
+      }
+      return {
+        from: () => ({
+          leftJoin: () => { memberQueries++; return { where: () => Promise.resolve([]) }; },
+          where: () => Promise.resolve([{ total: 0 }]),
+        }),
+      };
+    });
+    const r = await handlerFor('manage_deployments')({ action: 'get', deploymentId: 'dep-1' }, makeAuth(undefined)) as string;
+    expect(JSON.parse(r).deployment.id).toBe('dep-1');
+    expect(memberQueries).toBe(0);
+  });
+
+  it('list hides deployments that reach devices outside the caller site', async () => {
+    let call = 0;
+    let memberQueries = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) {
+        return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([
+          { id: 'dep-in', name: 'In', type: 't', status: 'running', targetType: 'device', createdAt: null, startedAt: null, completedAt: null },
+          { id: 'dep-out', name: 'Out', type: 't', status: 'running', targetType: 'device', createdAt: null, startedAt: null, completedAt: null },
+        ]) }) }) }) };
+      }
+      return { from: () => ({ leftJoin: () => ({ where: () => { memberQueries++; return Promise.resolve([
+        { deploymentId: 'dep-in', deviceId: 'd-in', siteId: 'site-1' },
+        { deploymentId: 'dep-out', deviceId: 'd-out', siteId: 'site-2' },
+      ]); } }) }) };
+    });
+    const r = await handlerFor('manage_deployments')({ action: 'list' }, makeAuth(['site-1'])) as string;
+    const parsed = JSON.parse(r);
+    expect(parsed.deployments.map((d: any) => d.id)).toEqual(['dep-in']);
+    expect(parsed.showing).toBe(1);
+    // one batched membership query, not one per deployment
+    expect(memberQueries).toBe(1);
+  });
+
+  it('list is unchanged and pays no extra query for an unrestricted caller', async () => {
+    let call = 0;
+    let memberQueries = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) {
+        return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([
+          { id: 'dep-in', name: 'In', type: 't', status: 'running', targetType: 'device', createdAt: null, startedAt: null, completedAt: null },
+          { id: 'dep-out', name: 'Out', type: 't', status: 'running', targetType: 'device', createdAt: null, startedAt: null, completedAt: null },
+        ]) }) }) }) };
+      }
+      return { from: () => ({ leftJoin: () => ({ where: () => { memberQueries++; return Promise.resolve([]); } }) }) };
+    });
+    const r = await handlerFor('manage_deployments')({ action: 'list' }, makeAuth(undefined)) as string;
+    expect(JSON.parse(r).showing).toBe(2);
+    expect(memberQueries).toBe(0);
+  });
+});
+
+describe('manage_deployments — zero-member deployments and page-completeness (review #6110)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  // A deployment with NO deploymentDevices rows produced no member rows at all,
+  // so the denied set stayed empty and the deployment sailed through every gate
+  // for a site-restricted caller (fail-OPEN). It is unattributable: the repo
+  // rule is that an unattributable resource is denied to a restricted caller.
+  function mockSingle(members: Array<{ deploymentId: string; deviceId: string | null; siteId: string | null }>) {
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) {
+        return { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ id: 'dep-1', name: 'D', status: 'draft' }]) }) }) };
+      }
+      return {
+        from: () => ({
+          leftJoin: () => ({ where: () => Promise.resolve(members) }),
+          where: () => Promise.resolve([{ total: 0, pending: 0, running: 0, completed: 0, failed: 0, skipped: 0 }]),
+        }),
+      };
+    });
+  }
+
+  it('get denies a zero-member deployment for a site-restricted caller', async () => {
+    mockSingle([]);
+    const r = await handlerFor('manage_deployments')({ action: 'get', deploymentId: 'dep-1' }, makeAuth(['site-1'])) as string;
+    expect(JSON.parse(r).error).toContain('access denied');
+  });
+
+  it('start denies a zero-member deployment for a site-restricted caller', async () => {
+    mockSingle([]);
+    const r = await handlerFor('manage_deployments')({ action: 'start', deploymentId: 'dep-1' }, makeAuth(['site-1'])) as string;
+    expect(JSON.parse(r).error).toContain('access denied');
+    expect(mockDb.update).not.toHaveBeenCalled();
+  });
+
+  it('cancel denies a zero-member deployment for a site-restricted caller', async () => {
+    mockSingle([]);
+    const r = await handlerFor('manage_deployments')({ action: 'cancel', deploymentId: 'dep-1' }, makeAuth(['site-1'])) as string;
+    expect(JSON.parse(r).error).toContain('access denied');
+    expect(mockDb.update).not.toHaveBeenCalled();
+  });
+
+  it('get still allows a zero-member deployment for an unrestricted caller', async () => {
+    mockSingle([]);
+    const r = await handlerFor('manage_deployments')({ action: 'get', deploymentId: 'dep-1' }, makeAuth(undefined)) as string;
+    expect(JSON.parse(r).deployment.id).toBe('dep-1');
+  });
+
+  it('list hides a zero-member deployment from a site-restricted caller and says the page was narrowed', async () => {
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) {
+        return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([
+          { id: 'dep-empty', name: 'Empty', type: 't', status: 'draft', targetType: 'device', createdAt: null, startedAt: null, completedAt: null },
+          { id: 'dep-in', name: 'In', type: 't', status: 'running', targetType: 'device', createdAt: null, startedAt: null, completedAt: null },
+        ]) }) }) }) };
+      }
+      return { from: () => ({ leftJoin: () => ({ where: () => Promise.resolve([
+        { deploymentId: 'dep-in', deviceId: 'd-in', siteId: 'site-1' },
+      ]) }) }) };
+    });
+    const r = await handlerFor('manage_deployments')({ action: 'list' }, makeAuth(['site-1'])) as string;
+    const parsed = JSON.parse(r);
+    expect(parsed.deployments.map((d: any) => d.id)).toEqual(['dep-in']);
+    expect(parsed.scopeNote).toBeTruthy();
+  });
+
+  it('list over-scans so a restricted caller still fills a full page', async () => {
+    // 30 deployments exist; the first 25 are all out of scope. With the SQL
+    // LIMIT applied before the site filter the caller saw ZERO rows and the
+    // model reads that as "no deployments exist".
+    const rows = Array.from({ length: 30 }, (_, i) => ({
+      id: `dep-${i}`, name: `D${i}`, type: 't', status: 'running', targetType: 'device',
+      createdAt: null, startedAt: null, completedAt: null,
+    }));
+    let requestedLimit = 0;
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) {
+        return { from: () => ({ where: () => ({ orderBy: () => ({ limit: (n: number) => { requestedLimit = n; return Promise.resolve(rows.slice(0, n)); } }) }) }) };
+      }
+      return { from: () => ({ leftJoin: () => ({ where: () => Promise.resolve(
+        rows.map((r2, i) => ({ deploymentId: r2.id, deviceId: `d-${i}`, siteId: i < 25 ? 'site-2' : 'site-1' })),
+      ) }) }) };
+    });
+    const r = await handlerFor('manage_deployments')({ action: 'list', limit: 5 }, makeAuth(['site-1'])) as string;
+    const parsed = JSON.parse(r);
+    expect(requestedLimit).toBeGreaterThan(5);
+    expect(parsed.deployments.map((d: any) => d.id)).toEqual(['dep-25', 'dep-26', 'dep-27', 'dep-28', 'dep-29']);
+    expect(parsed.showing).toBe(5);
+  });
+
+  it('list does not over-scan or annotate for an unrestricted caller', async () => {
+    let requestedLimit = 0;
+    let call = 0;
+    mockDb.select.mockImplementation(() => {
+      if (call++ === 0) {
+        return { from: () => ({ where: () => ({ orderBy: () => ({ limit: (n: number) => { requestedLimit = n; return Promise.resolve([
+          { id: 'dep-1', name: 'D', type: 't', status: 'running', targetType: 'device', createdAt: null, startedAt: null, completedAt: null },
+        ]); } }) }) }) };
+      }
+      return { from: () => ({ leftJoin: () => ({ where: () => Promise.resolve([]) }) }) };
+    });
+    const r = await handlerFor('manage_deployments')({ action: 'list', limit: 5 }, makeAuth(undefined)) as string;
+    const parsed = JSON.parse(r);
+    expect(requestedLimit).toBe(5);
+    expect(parsed.scopeNote).toBeUndefined();
+    expect(parsed.showing).toBe(1);
+  });
+});

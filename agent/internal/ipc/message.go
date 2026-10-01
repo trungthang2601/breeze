@@ -1,0 +1,637 @@
+package ipc
+
+import (
+	"encoding/json"
+	"time"
+)
+
+// Message type constants for IPC communication.
+const (
+	TypeAuthRequest   = "auth_request"
+	TypeAuthResponse  = "auth_response"
+	TypeCommand       = "command"
+	TypeCommandResult = "command_result"
+	TypePing          = "ping"
+	TypePong          = "pong"
+	TypeCapabilities  = "capabilities"
+	TypeDisconnect    = "disconnect"
+
+	// Phase 2: Notifications + Tray
+	TypeNotify       = "notify"
+	TypeNotifyResult = "notify_result"
+	TypeTrayUpdate   = "tray_update"
+	TypeTrayAction   = "tray_action"
+
+	// PAM approval and consent dismissal
+	TypePamRequestDialog        = "pam_request_dialog"
+	TypePamDialogResult         = "pam_dialog_result"
+	TypePamDismissConsent       = "pam_dismiss_consent"
+	TypePamDismissConsentResult = "pam_dismiss_consent_result"
+
+	// Phase 4: Desktop + Clipboard
+	TypeDesktopStart  = "desktop_start"
+	TypeDesktopFrame  = "desktop_frame"
+	TypeDesktopInput  = "desktop_input"
+	TypeDesktopStop   = "desktop_stop"
+	TypeClipboardGet  = "clipboard_get"
+	TypeClipboardData = "clipboard_data"
+	TypeClipboardSet  = "clipboard_set"
+
+	// SAS (Secure Attention Sequence) — helper requests service to invoke SendSAS
+	TypeSASRequest  = "sas_request"
+	TypeSASResponse = "sas_response"
+
+	// Desktop peer disconnected — helper notifies service when WebRTC drops
+	TypeDesktopPeerDisconnected = "desktop_peer_disconnected"
+
+	// Console user changed — agent notifies helpers to switch input mode
+	TypeConsoleUserChanged = "console_user_changed"
+
+	// Launch a process as the logged-in user (sent to user-role helper)
+	TypeLaunchProcess = "launch_process"
+	TypeLaunchResult  = "launch_result"
+
+	// TCC (Transparency, Consent, Control) permission status from macOS helpers
+	TypeTCCStatus = "tcc_status"
+
+	// Watchdog
+	TypeWatchdogPing          = "watchdog_ping"
+	TypeWatchdogPong          = "watchdog_pong"
+	TypeShutdownIntent        = "shutdown_intent"
+	TypeTokenUpdate           = "token_update"
+	TypeHelperTokenUpdate     = "helper_token_update" // sent to the Assist helper
+	TypeWatchdogCommand       = "watchdog_command"
+	TypeWatchdogCommandResult = "watchdog_command_result"
+	TypeStateSync             = "state_sync"
+
+	// Tamper protection (v2 — defined, not implemented)
+	TypeIntegrityCheck  = "integrity_check"
+	TypeIntegrityResult = "integrity_result"
+	TypeTamperAlert     = "tamper_alert"
+
+	// TypePreAuthReject is sent by the broker to a connecting helper when
+	// the connection is rejected BEFORE the auth-request/auth-response
+	// exchange (e.g. rate limit, peer credential failure, max connections
+	// exceeded, or binary path unknown). Distinct from AuthResponse so the
+	// helper can differentiate "never got to auth" from "auth was rejected".
+	TypePreAuthReject = "pre_auth_reject"
+
+	// Desktop revocation-lease bridge. A helper-hosted session's SessionManager
+	// has no command WebSocket of its own, so its lease renewals travel over
+	// IPC: the helper asks (desktop_lease_renew), the agent turns that into a
+	// renew on the command socket, and forwards the control plane's answer back
+	// (desktop_lease_update). Without this bridge a helper-hosted session
+	// renews nothing and dies at expiresAt+grace.
+	TypeDesktopLeaseRenew  = "desktop_lease_renew"  // helper -> agent
+	TypeDesktopLeaseUpdate = "desktop_lease_update" // agent -> helper
+
+	// SEC-038 start fence. The service seeds a connecting helper with its
+	// fence (desktop_fence_sync) and the helper acknowledges, so a start
+	// carrying a generation is never admitted by a helper that has not yet
+	// learned what the service already knows.
+	TypeDesktopFenceSync = "desktop_fence_sync" // agent -> helper
+
+	// Remote-session consent + banner
+	TypeConsentRequest = "consent_request"
+	TypeConsentResult  = "consent_result"
+	TypeBannerShow     = "banner_show"
+	TypeBannerHide     = "banner_hide"
+)
+
+// PreAuthReject codes identify why the broker rejected a connection.
+// Callers can switch on these programmatically without parsing Reason.
+const (
+	PreAuthCodeRateLimited       = "rate_limited"
+	PreAuthCodeBinaryPathUnknown = "binary_path_unknown"
+	PreAuthCodeMaxConnsExceeded  = "max_conns_exceeded"
+	PreAuthCodeCredCheckFailed   = "cred_check_failed"
+)
+
+// PreAuthReject is the payload sent with TypePreAuthReject. Permanent=true
+// signals the helper that retrying will not help — the helper should exit
+// and let the lifecycle manager (on the parent side) decide when to retry.
+type PreAuthReject struct {
+	Code      string `json:"code"`
+	Reason    string `json:"reason,omitempty"`
+	Permanent bool   `json:"permanent,omitempty"`
+}
+
+// MaxMessageSize is the maximum size of a JSON IPC message (16MB).
+const MaxMessageSize = 16 * 1024 * 1024
+
+// MaxBinaryFrameSize is the maximum size of a binary channel frame (4MB).
+const MaxBinaryFrameSize = 4 * 1024 * 1024
+
+// ProtocolVersion is the current IPC protocol version.
+const ProtocolVersion = 1
+
+// Envelope is the wire-format wrapper for all IPC messages.
+type Envelope struct {
+	ID      string          `json:"id"`
+	Seq     uint64          `json:"seq"`
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+	Error   string          `json:"error,omitempty"`
+	HMAC    string          `json:"hmac"`
+}
+
+// HelperRole identifies a connecting helper process and gates its scopes. It is
+// a named string so signatures and struct fields can state intent and so
+// conversions are forced at the wire/CLI boundary; it still marshals as a plain
+// JSON string. Note that a named string type does NOT give exhaustiveness —
+// HelperRole("sytem") still compiles — so the spawnable allow-list, the
+// fail-closed switch defaults, and scopesForRole remain the real safety gates.
+type HelperRole string
+
+// Helper role constants identify connecting helper processes and gate their scopes.
+const (
+	HelperRoleSystem   HelperRole = "system"
+	HelperRoleUser     HelperRole = "user"
+	HelperRoleWatchdog HelperRole = "watchdog"
+	HelperRoleAssist   HelperRole = "assist" // Breeze Assist Tauri helper; receives helper token only
+)
+
+// Scope constants identify the capabilities granted to a helper session.
+const (
+	ScopeAssist    = "assist"     // IPC scope granted to the assist helper
+	ScopePam       = "pam"        // IPC scope granted to the SYSTEM helper for PAM dialogs
+	ScopeConsentUI = "consent_ui" // narrow IPC scope: lets the assist helper receive remote-session consent prompt + active-session banner messages (UI only; NOT desktop/clipboard/notify)
+
+	// ScopeConsentUIFallback lets a user-role helper that advertised native
+	// consent-dialog support (AuthRequest.SupportsConsentUI) receive the
+	// remote-session consent prompt + banner messages when no assist helper
+	// (ScopeConsentUI) is connected. Granted only on explicit advertisement so
+	// older helpers keep helper_absent semantics instead of timing out.
+	ScopeConsentUIFallback = "consent_ui_fallback"
+)
+
+const (
+	HelperBinaryUserHelper    = "user_helper"
+	HelperBinaryDesktopHelper = "desktop_helper"
+	HelperBinaryAssistHelper  = "assist_helper"
+)
+
+const (
+	DesktopContextUserSession = "user_session"
+	DesktopContextLoginWindow = "login_window"
+)
+
+// ConsoleUserChangedPayload is sent from agent to desktop helpers when
+// the macOS console user changes (login/logout/switch).
+type ConsoleUserChangedPayload struct {
+	Username string `json:"username"`
+}
+
+// AuthRequest is sent by the user helper to the root daemon after connecting.
+type AuthRequest struct {
+	ProtocolVersion int        `json:"protocolVersion"`
+	UID             uint32     `json:"uid"`
+	SID             string     `json:"sid,omitempty"` // Windows Security Identifier
+	Username        string     `json:"username"`
+	SessionID       string     `json:"sessionId"`
+	DisplayEnv      string     `json:"displayEnv"`
+	PID             int        `json:"pid"`
+	BinaryHash      string     `json:"binaryHash"`
+	WinSessionID    uint32     `json:"winSessionId,omitempty"` // Windows session ID (1, 2, etc.)
+	HelperRole      HelperRole `json:"helperRole,omitempty"`   // "system" | "user" | "watchdog" | "assist" (default: "system")
+	BinaryKind      string     `json:"binaryKind,omitempty"`   // "user_helper", "desktop_helper", or "assist_helper"
+	DesktopContext  string     `json:"desktopContext,omitempty"`
+
+	// SupportsConsentUI advertises that this helper can natively render the
+	// remote-session consent dialog (consent_request). The granted
+	// consent_ui_fallback scope also carries the active-session banner
+	// messages (banner_show/banner_hide), not only the consent dialog itself.
+	// Drives the consent_ui_fallback scope grant. Additive: absent/false on
+	// older helpers.
+	SupportsConsentUI bool `json:"supportsConsentUi,omitempty"`
+}
+
+// AuthResponse is sent by the root daemon back to the user helper.
+//
+// Permanent is set to true when the rejection reason is not transient
+// (SID mismatch, protocol version mismatch, binary hash mismatch, etc.).
+// The helper treats Permanent=true as fatal: it exits with code 2 so the
+// lifecycle manager can back off, instead of immediately reconnecting.
+type AuthResponse struct {
+	Accepted      bool     `json:"accepted"`
+	SessionKey    string   `json:"sessionKey,omitempty"`
+	AgentID       string   `json:"agentId,omitempty"`
+	AllowedScopes []string `json:"allowedScopes,omitempty"`
+	Reason        string   `json:"reason,omitempty"`
+	Permanent     bool     `json:"permanent,omitempty"`
+
+	// Code is a machine-readable rejection class for Accepted==false. Known
+	// values: "not_desired" (helper key absent from the lifecycle desired set
+	// — in on-demand mode this is the NORMAL answer for a logon-task helper
+	// and the helper should exit 0), "duplicate_key".
+	Code string `json:"code,omitempty"`
+}
+
+// Capabilities is sent by the user helper after successful auth.
+type Capabilities struct {
+	CanNotify     bool   `json:"canNotify"`
+	CanTray       bool   `json:"canTray"`
+	CanCapture    bool   `json:"canCapture"`
+	CanClipboard  bool   `json:"canClipboard"`
+	DisplayServer string `json:"displayServer"`
+}
+
+// IPCCommand is a command forwarded from root daemon to user helper.
+type IPCCommand struct {
+	CommandID string          `json:"commandId"`
+	Type      string          `json:"type"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// IPCCommandResult is the result from user helper back to root daemon.
+type IPCCommandResult struct {
+	CommandID string          `json:"commandId"`
+	Status    string          `json:"status"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Error     string          `json:"error,omitempty"`
+}
+
+// NotifyRequest asks the user helper to show a desktop notification.
+//
+// Actions turns it into an interactive prompt: a helper that understands them
+// renders a modal dialog with those buttons and answers with the clicked label
+// in NotifyResult.ActionClicked. Both Actions and TimeoutMs are optional and
+// omitempty, so an OLD helper still unmarshals the request and shows its plain
+// toast, and a NEW helper on an old agent simply never receives any actions.
+type NotifyRequest struct {
+	Title   string   `json:"title"`
+	Body    string   `json:"body"`
+	Icon    string   `json:"icon,omitempty"`
+	Urgency string   `json:"urgency,omitempty"`
+	Actions []string `json:"actions,omitempty"`
+	// TimeoutMs is how long the helper should hold an interactive prompt open
+	// before giving up and reporting no decision. Ignored when Actions is empty.
+	TimeoutMs int `json:"timeoutMs,omitempty"`
+}
+
+// NotifyResult is the user helper's response after showing a notification.
+type NotifyResult struct {
+	Delivered     bool   `json:"delivered"`
+	ActionClicked string `json:"actionClicked,omitempty"`
+}
+
+// PamRequestDialog asks the user helper to show a PAM elevation approval dialog.
+type PamRequestDialog struct {
+	ExePath        string `json:"exePath"`
+	Signer         string `json:"signer"`
+	Hash           string `json:"hash"`
+	SubjectUser    string `json:"subjectUser"`
+	CommandLine    string `json:"commandLine"`
+	Reason         string `json:"reason"`
+	IntentSummary  string `json:"intentSummary"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+}
+
+// PamDialogResult is the user helper's response after showing a PAM dialog.
+type PamDialogResult struct {
+	Approved        bool   `json:"approved"`
+	Reason          string `json:"reason,omitempty"`
+	DismissedByUser bool   `json:"dismissedByUser"`
+}
+
+// PamDismissConsentRequest asks the SYSTEM helper to dismiss consent.exe.
+// DeadlineUnixMs bounds input injection inside the target session and leaves
+// the broker time to receive the helper's correlated response.
+type PamDismissConsentRequest struct {
+	DeadlineUnixMs int64 `json:"deadlineUnixMs"`
+}
+
+// PamDismissConsentResult reports whether the helper dismissed consent.exe.
+type PamDismissConsentResult struct {
+	Success       bool   `json:"success"`
+	Reason        string `json:"reason"`
+	DetailMessage string `json:"detailMessage,omitempty"`
+}
+
+// TrayUpdate tells the user helper to update the system tray icon/menu.
+type TrayUpdate struct {
+	Status    string     `json:"status"`
+	Tooltip   string     `json:"tooltip"`
+	MenuItems []MenuItem `json:"menuItems,omitempty"`
+}
+
+// MenuItem is an entry in the system tray menu.
+type MenuItem struct {
+	ID      string `json:"id"`
+	Label   string `json:"label"`
+	Enabled bool   `json:"enabled"`
+}
+
+// TrayAction is sent by the user helper when a tray menu item is clicked.
+type TrayAction struct {
+	MenuItemID string `json:"menuItemId"`
+}
+
+// DesktopStartRequest is sent from the service to the user helper to start a
+// remote desktop session. The helper creates the full WebRTC pipeline and
+// returns an SDP answer.
+type DesktopStartRequest struct {
+	SessionID string `json:"sessionId"`
+	// StartGeneration is the server's monotonic desktop_start_generation for
+	// this start, as a canonical decimal string (SEC-038). It is a bigint on
+	// the server and an int64 here, so it never travels as a JSON number —
+	// above 2^53 that silently rounds. Empty from an older service, which the
+	// helper admits exactly as the agent does (mixed-fleet rollout).
+	StartGeneration string          `json:"startGeneration,omitempty"`
+	Offer           string          `json:"offer"`
+	ICEServers      json.RawMessage `json:"iceServers,omitempty"`
+	DisplayIndex    int             `json:"displayIndex"`
+	GPUVendor       string          `json:"gpuVendor,omitempty"`
+	// Agent-enforced session policy (findings #2, #7). Clipboard direction gates
+	// are pointers so an older service that doesn't set them leaves the helper at
+	// permissive defaults (preserve existing behavior). Timeouts of 0 = disabled.
+	ClipboardHostToViewer   *bool `json:"clipboardHostToViewer,omitempty"`
+	ClipboardViewerToHost   *bool `json:"clipboardViewerToHost,omitempty"`
+	IdleTimeoutMinutes      int   `json:"idleTimeoutMinutes,omitempty"`
+	MaxSessionDurationHours int   `json:"maxSessionDurationHours,omitempty"`
+	// RevocationLease is the server-issued lease this session must keep alive.
+	// The agent process (the only one holding the command WebSocket) performs
+	// the renewals and forwards a revocation to the helper as TypeDesktopStop;
+	// the helper still needs the lease so its own watchdog enforces the hard
+	// deadline and the expiry+grace cutoff locally. Nil is refused by
+	// validateDesktopStartRequest — a session with no lease is unrevokable.
+	RevocationLease *RevocationLease `json:"revocationLease,omitempty"`
+	// Prompt carries the consent/notification configuration for the session.
+	// Nil means no prompt or banner is requested (legacy behaviour).
+	Prompt *DesktopPrompt `json:"prompt,omitempty"`
+}
+
+// RevocationLease is the wire form of a desktop session's revocation lease.
+// Times are epoch milliseconds and intervals are whole seconds so the JSON is
+// identical to what the API ships in the start_desktop payload.
+type RevocationLease struct {
+	Token              string `json:"token"`
+	ExpiresAtUnixMs    int64  `json:"expiresAtUnixMs"`
+	HardDeadlineUnixMs int64  `json:"hardDeadlineUnixMs"`
+	RenewEverySec      int64  `json:"renewEverySec"`
+	GraceSec           int64  `json:"graceSec"`
+}
+
+// DesktopStartResponse is returned by the user helper after creating the
+// WebRTC peer connection.
+type DesktopStartResponse struct {
+	SessionID string `json:"sessionId"`
+	Answer    string `json:"answer"`
+}
+
+// DesktopLeaseRenewRequest is sent by a helper that hosts a desktop session,
+// asking the agent to renew that session's revocation lease with the control
+// plane. Unsolicited (no reply on this envelope) — the answer comes back
+// separately as a DesktopLeaseUpdate, because the round trip to the API is far
+// longer than the IPC command timeout and must not hold an IPC slot open.
+type DesktopLeaseRenewRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
+// DesktopLeaseUpdate is the agent forwarding the control plane's answer to a
+// helper-hosted session's lease renewal.
+//
+// Revoked=true means the control plane ended the session; the helper stops it
+// through its normal stop path. Otherwise the deadlines extend the helper's
+// local watchdog, which stays authoritative: it stops the session at
+// expiresAt+grace or the hard deadline whether or not the agent ever answers.
+type DesktopLeaseUpdate struct {
+	SessionID          string `json:"sessionId"`
+	ExpiresAtUnixMs    int64  `json:"expiresAtUnixMs,omitempty"`
+	HardDeadlineUnixMs int64  `json:"hardDeadlineUnixMs,omitempty"`
+	Revoked            bool   `json:"revoked,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+	// Unavailable is the control plane's "I cannot answer right now". It is
+	// NOT a renewal: before a session's first successful renewal it ends the
+	// session (SEC-038 owner decision 2), afterwards the grace window governs.
+	// Absent on an older service, where the answer was swallowed entirely.
+	Unavailable bool `json:"unavailable,omitempty"`
+}
+
+// DesktopStopRequest tells the user helper to tear down a desktop session.
+type DesktopStopRequest struct {
+	SessionID string `json:"sessionId"`
+	// TerminalGeneration is the generation at which the session was declared
+	// terminal, as a canonical decimal string (SEC-038). Empty from an older
+	// service; the helper's tombstone is installed either way, since a stop is
+	// an unambiguous terminal decision whatever its generation says.
+	TerminalGeneration string `json:"terminalGeneration,omitempty"`
+}
+
+// DesktopFenceSync seeds a freshly connected helper with the service's
+// SEC-038 start fence, so a helper that restarts mid-session cannot be talked
+// into replaying a start the service has already superseded or tombstoned.
+//
+// Sent agent -> helper on connect, before any start may be admitted for a
+// session carrying a generation.
+type DesktopFenceSync struct {
+	Sessions map[string]DesktopFenceEntry `json:"sessions"`
+}
+
+// DesktopFenceEntry is one session's fence state on the wire. Generations are
+// canonical decimal strings for the same reason as everywhere else.
+type DesktopFenceEntry struct {
+	// HighWater is the highest start generation the service has admitted.
+	HighWater string `json:"highWater,omitempty"`
+	// Terminal is the absolute tombstone.
+	Terminal bool `json:"terminal,omitempty"`
+}
+
+// SASRequest is sent by the user helper to the service when it needs to
+// trigger the Secure Attention Sequence (Ctrl+Alt+Del). The service is the
+// SCM-registered process with the highest chance of SendSAS(FALSE) succeeding.
+// The helper may also attempt it as a fallback.
+type SASRequest struct {
+	WinSessionID uint32 `json:"winSessionId,omitempty"`
+}
+
+// SASResponse is sent by the service back to the helper after invoking SAS.
+type SASResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// DesktopPeerDisconnectedNotice is sent by the user helper to the service
+// when a WebRTC peer connection drops (Failed or Closed). The service relays
+// this to the API so it can mark the session as disconnected.
+//
+// Reason (#5300) is the session's LastStopReason() at the time it stopped —
+// e.g. the Win32 error the no-video watchdog's capturer swallowed — so a
+// mid-session capture failure reaches the technician the same way the
+// startup probe path already does. Empty for every other stop path (peer
+// disconnect grace timeout, lifetime policy, operator stop). Older helpers
+// omit this field entirely; the service treats a missing Reason the same as
+// an empty one.
+type DesktopPeerDisconnectedNotice struct {
+	SessionID string `json:"sessionId"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// LaunchProcessRequest asks the user-role helper to launch a binary.
+// The helper is already running as the logged-in user, so no token
+// manipulation is needed.
+//
+// Security: handlers MUST validate BinaryPath against an allowlist of
+// permitted executables before launching. Args should be bounded to a
+// reasonable length to prevent resource exhaustion. Validation is the
+// responsibility of the handler, not this message type.
+type LaunchProcessRequest struct {
+	BinaryPath string   `json:"binaryPath"`
+	Args       []string `json:"args,omitempty"`
+}
+
+// LaunchProcessResult is the response from the user helper.
+type LaunchProcessResult struct {
+	OK    bool   `json:"ok"`
+	PID   int    `json:"pid,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// TCCStatus reports macOS TCC (Transparency, Consent, Control) permission
+// state from the user helper to the root daemon.
+type TCCStatus struct {
+	ScreenRecording bool      `json:"screenRecording"`
+	Accessibility   bool      `json:"accessibility"`
+	FullDiskAccess  bool      `json:"fullDiskAccess"`
+	RemoteDesktop   *bool     `json:"remoteDesktop,omitempty"`
+	CheckedAt       time.Time `json:"checkedAt"`
+}
+
+// SessionInfoItem describes one interactive Windows session for the
+// list_sessions command response.
+type SessionInfoItem struct {
+	SessionID       uint32 `json:"sessionId"`
+	Username        string `json:"username"`
+	State           string `json:"state"`
+	Type            string `json:"type"`
+	HelperConnected bool   `json:"helperConnected"`
+	// IdleMinutes is minutes since last user input in the session, capped at
+	// one week. Nil when the platform could not measure input idle.
+	IdleMinutes *int `json:"idleMinutes,omitempty"`
+}
+
+// WatchdogPing is sent by the watchdog to the agent to request a liveness check.
+type WatchdogPing struct {
+	RequestHealthSummary bool `json:"requestHealthSummary"`
+}
+
+// WatchdogPong is the agent's response to a WatchdogPing.
+type WatchdogPong struct {
+	Healthy       bool           `json:"healthy"`
+	HealthSummary map[string]any `json:"healthSummary,omitempty"`
+	Uptime        int64          `json:"uptimeSeconds"`
+}
+
+// ShutdownIntent is sent by the agent to the watchdog before a graceful shutdown.
+type ShutdownIntent struct {
+	Reason           string `json:"reason"`
+	ExpectedDuration int    `json:"expectedDurationSeconds,omitempty"`
+}
+
+// TokenUpdate is sent by the agent to the watchdog when the watchdog-scoped token changes.
+type TokenUpdate struct {
+	Token string `json:"token"`
+}
+
+// HelperTokenUpdate carries the helper-scoped API token to the Assist helper.
+// Distinct from TokenUpdate (agent token -> watchdog) so the two tokens can
+// never be cross-delivered.
+type HelperTokenUpdate struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expiresAt,omitempty"` // RFC3339, optional
+}
+
+// WatchdogCommand is a command forwarded from the watchdog to the agent.
+type WatchdogCommand struct {
+	CommandID string         `json:"commandId"`
+	Type      string         `json:"type"`
+	Payload   map[string]any `json:"payload,omitempty"`
+}
+
+// WatchdogCommandResult is the agent's response to a WatchdogCommand.
+type WatchdogCommandResult struct {
+	CommandID string `json:"commandId"`
+	Status    string `json:"status"`
+	Result    any    `json:"result,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// StateSync is sent by the agent to the watchdog to synchronize key state.
+type StateSync struct {
+	AgentVersion  string `json:"agentVersion"`
+	ConfigHash    string `json:"configHash"`
+	Connected     bool   `json:"connected"`
+	LastHeartbeat string `json:"lastHeartbeat"`
+	// ActiveBackupRuns is the number of backup_run commands the backup
+	// helper is currently executing (sessionbroker.Broker.ActiveBackupRunCount).
+	// The watchdog's CheckIPC (internal/watchdog/checks.go) uses this to veto
+	// an IPC-failure escalation while a backup is in flight and this sync is
+	// recent (D3): killing the backup helper mid-run on a transient IPC
+	// hiccup previously had no guard at all.
+	ActiveBackupRuns int `json:"activeBackupRuns,omitempty"`
+}
+
+// IntegrityCheck asks the agent to verify the integrity of the given targets.
+// Tamper protection v2 — defined, not yet implemented.
+type IntegrityCheck struct {
+	Targets []string `json:"targets"`
+}
+
+// IntegrityResult is the agent's response to an IntegrityCheck.
+// Tamper protection v2 — defined, not yet implemented.
+type IntegrityResult struct {
+	Results map[string]string `json:"results"`
+}
+
+// DesktopPrompt carries consent and notification configuration embedded in a
+// DesktopStartRequest. Pointer fields are optional so older services that omit
+// them leave the helper at safe defaults.
+type DesktopPrompt struct {
+	// Mode controls how the helper handles end-user consent: "off",
+	// "notify", or "consent".
+	Mode string `json:"mode"`
+	// TechnicianName is the display name of the connecting technician, shown
+	// in consent dialogs and the session banner.
+	TechnicianName *string `json:"technicianName,omitempty"`
+	// TechnicianEmail is the technician's email address, shown in dialogs.
+	TechnicianEmail *string `json:"technicianEmail,omitempty"`
+	// OrgName is the partner/MSP organisation name shown in dialogs.
+	OrgName *string `json:"orgName,omitempty"`
+	// ConsentUnavailableBehavior governs what happens when the helper cannot
+	// display a consent dialog (e.g. no interactive user): "proceed" or "block".
+	ConsentUnavailableBehavior string `json:"consentUnavailableBehavior"`
+	// ConsentTimeoutMs is how long (in ms) the helper waits for user input
+	// before applying ConsentUnavailableBehavior. 0 means no timeout.
+	ConsentTimeoutMs int `json:"consentTimeoutMs"`
+	// NotifyOnEnd controls whether the helper shows a notification when the
+	// remote session ends.
+	NotifyOnEnd bool `json:"notifyOnEnd"`
+	// ShowIndicator controls whether the on-screen session banner is displayed.
+	ShowIndicator bool `json:"showIndicator"`
+}
+
+// ConsentRequest is sent from the service (via the helper) to the desktop
+// prompt UI to ask the local user to allow or deny a remote session.
+type ConsentRequest struct {
+	SessionID       string `json:"sessionId"`
+	TechnicianName  string `json:"technicianName"`
+	TechnicianEmail string `json:"technicianEmail,omitempty"`
+	OrgName         string `json:"orgName,omitempty"`
+	TimeoutMs       int    `json:"timeoutMs"`
+	// OnTimeout is the behaviour when the dialog times out: "proceed" or "block".
+	OnTimeout string `json:"onTimeout"`
+}
+
+// ConsentResult is the user's decision returned from the desktop prompt UI.
+// Decision is "allow" or "deny".
+type ConsentResult struct {
+	Decision string `json:"decision"`
+}
+
+// BannerShowRequest tells the desktop helper to display the on-screen session
+// indicator banner.
+type BannerShowRequest struct {
+	SessionID       string `json:"sessionId"`
+	Label           string `json:"label"`
+	StartedAtUnixMs int64  `json:"startedAtUnixMs"`
+}

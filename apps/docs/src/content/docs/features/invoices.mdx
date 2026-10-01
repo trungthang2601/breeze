@@ -1,0 +1,157 @@
+---
+title: Invoices
+description: Create invoices from your catalog, tracked time, and parts. Issue and send them, record payments, void and reissue, and download a clean PDF.
+sidebar:
+  label: "Invoices"
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Breeze's invoice engine turns the work you already track -- catalog items, time entries, and parts -- into invoices you can issue, send, and collect on without leaving the platform. Open **Billing → Invoices** to get started.
+
+Invoices are **partner-scoped**: you can invoice any of your customer organizations from one place.
+
+The Billing section, including Invoices, is only available when the **Service Management** module is enabled for your account; see [Service Management mode](/reference/partner-management/#service-management-mode).
+
+## The Invoice List
+
+The list shows every invoice with its number, organization, status, issue and due dates, total, and outstanding balance. An **Outstanding** summary strip at the top totals what's still owed across all invoices. Search by number or organization, filter by status, organization, or date, and sort by issued date, due date, total, or balance.
+
+### Invoice Statuses
+
+| Status | Meaning |
+|--------|---------|
+| Draft | Being assembled; not yet issued and not visible to the customer |
+| Sent | Issued and delivered to the customer |
+| Partially paid | One or more payments recorded, but a balance remains |
+| Paid | Fully paid |
+| Overdue | Past its due date with a balance remaining |
+| Void | Cancelled; no longer collectible |
+
+## Creating an Invoice
+
+<Steps>
+1. Go to **Billing → Invoices** and click **New invoice**.
+2. Choose **Assemble from work** to pull in tracked time and parts, or **Blank invoice** to start empty.
+3. Select the customer organization the invoice is for.
+4. When assembling from work, choose the draft's **Currency**. **Organization default** uses the currency the organization bills in today; pick an explicit currency only when you need to bill work that was priced in a currency the organization no longer uses.
+5. The invoice opens as a **draft** for editing.
+</Steps>
+
+### Where the currency comes from
+
+Every invoice is stamped with the **customer organization's billing currency**. An organization inherits that from your partner currency (**Settings → Billing**) when it is created, and the stamp then travels with the document -- clones and reissues keep it, and issuing never rewrites it.
+
+The stamped currency can't be changed from the console. Changing a draft's currency is an API-only operation (`POST /invoices/:id/currency`) that first clears the draft's lines or reprices catalog-sourced lines into the new currency; nothing is ever converted at an exchange rate. Retargeting a draft to an organization that bills in a different currency is refused rather than silently re-priced.
+
+### Assembling across currencies
+
+Tracked time and parts keep the currency they were priced in when they were logged. Assembling only pulls in work whose currency matches the draft's currency; nothing is ever converted. If some unbilled work in the range is priced in another currency, the draft is still created and a notice tells you how many items were left out and in which currency -- assemble a separate draft in that currency to bill them. If *all* the unbilled work is in another currency, nothing is assembled and the dialog offers an **Assemble in …** button for each currency found (with the item count and total); clicking it creates a draft in that currency containing exactly those items. The same **Assemble in** shortcut appears on a ticket's **Create invoice** action when its unbilled work is in a different currency than the organization now bills in.
+
+Once an invoice is issued, the time entries and parts it billed are locked: their hours, rates, quantities, and prices can no longer be edited (descriptions and notes still can). Void and reissue the invoice if an amount needs to change.
+
+### Adding Line Items
+
+The draft editor's primary way to add lines is the shared **catalog picker** -- start typing to search your [Product Catalog](/features/product-catalog/) by name or SKU, pick an item or bundle, and set the quantity. Catalog items use the customer's per-customer price when one is set. You can also add a **manual line** with a custom description, quantity, and price for anything not in the catalog.
+
+Line items can come from several sources: catalog items, bundles, tracked time entries, parts, recurring contracts, or manual entries. The running subtotal, tax, total, and balance update live as you edit.
+
+<Aside>
+  If your catalog is empty, the editor links straight to **Product Catalog** so you can add the items you sell.
+</Aside>
+
+### Line grouping by ticket and category
+
+Wherever an invoice is rendered -- the web editor and document view, the generated PDF, the authenticated customer portal, and the public invoice link -- line items are grouped under the ticket they came from, then by category within that ticket (Labour, Materials, Recurring, and so on), instead of a flat list. This makes it clear to the customer which charges belong to which piece of work. Lines with no ticket are grouped together at the top.
+
+<Aside type="caution" title="Known gap">
+  The customer portal's **logged-in** invoice view groups lines by ticket but does not yet show the ticket's category label next to the group heading. The web editor/document view, the generated PDF, and the public (non-portal) invoice link all show the category label correctly. This is tracked for a follow-up fix.
+</Aside>
+
+## Issuing and Sending
+
+**Issuing** an invoice finalizes it: it assigns the next sequential invoice number (using your partner prefix and the current year), sets the issue and due dates, and generates the PDF. **Sending** emails the invoice to the customer.
+
+<Steps>
+1. Review the draft and confirm the line items and totals.
+2. Click **Issue** to assign a number and lock the invoice.
+3. Click **Send** to email it to the customer.
+</Steps>
+
+**Send** opens a composer prefilled from the organization's billing contact: recipients, Cc, subject, a personal message, and whether to attach the PDF. The email and the PDF both carry a **Pay online** link.
+
+Partners edit the invoice email under **Settings → Partner → Email templates** (Invoice) -- subject, heading, button label, and HTML body. Merge variables: `{{invoice_number}}`, `{{partner_name}}`, `{{total}}`, `{{due_date}}`, and `{{portal_url}}`. The pay/view button always uses the server invoice link; partners cannot point it somewhere else. A personal message, the PDF note, amount due, and your email signature still appear around that body. Leave it on the default to keep the built-in wording. This does not change the email card's accent bar or pull colors from the Branding tab.
+
+An invoice that has already been issued can be **re-sent** without changing anything about it -- its number, dates, amounts, and "sent" timestamp all stay as they were, so a reminder never looks like a second invoice. A paid invoice can be re-sent too, as a receipt. Drafts and voided invoices can't be sent this way.
+
+The issued-invoice view puts the **balance due** front and center, shows recorded payments, and offers a one-click **PDF download**, plus **Copy invoice link** and **Reset customer link** -- see [Online Payments](/features/online-payments/#the-customer-invoice-link).
+
+## Recording Payments
+
+When a customer pays offline, record it against the invoice so the balance and status stay accurate. Payments collected online through [Stripe](/features/online-payments/) are recorded automatically and badged **Online**.
+
+<Steps>
+1. Open the issued invoice.
+2. Click **Record payment**.
+3. Choose the method -- cash, check, bank transfer, card, or other -- and enter the amount, date, and an optional reference.
+4. Save. The invoice moves to **partially paid** or **paid** automatically based on the remaining balance.
+</Steps>
+
+A payment amount has to be expressible in the invoice's currency: an invoice in a currency with no minor unit (such as Japanese yen) won't accept `100.50`.
+
+You can void a manually recorded payment if it was entered in error. Payments collected online through Stripe are reconciled from Stripe and can't be voided by hand.
+
+## Deposit Invoices
+
+When an invoice is created from an accepted [quote](/features/quotes/) that requires a deposit, it carries a **deposit due** amount -- and that deposit is what the customer pays **first**. The invoice shows the deposit as the amount due up front; once it's covered, the remaining balance becomes due per the invoice's terms. A single invoice therefore carries the whole engagement while still collecting the deposit before the balance, and the customer can pay both the deposit and the balance through [Online Payments](/features/online-payments/). See [Quotes → Deposits](/features/quotes/#deposits) for how the deposit is configured before the quote is sent.
+
+## Per-Organization Tax & Billing Address
+
+Each customer organization has a **Billing** tab (**Settings → Organizations → [organization] → Billing**) that holds the details Breeze prints on and calculates for that customer's invoices:
+
+- **Tax ID**, a **tax-exempt** flag, and a per-organization **tax rate**. When a rate is set here it applies to that customer's invoices; otherwise Breeze falls back to your partner default tax rate (**Settings → Billing**).
+- A **billing contact** and full **billing address** (address lines, city, region, postal code, and country), which appear on the invoice PDF.
+
+Setting these once per customer means invoices carry the right tax and address without re-entering them each time.
+
+## Voiding and Reissuing
+
+If an issued invoice needs to be cancelled, **void** it with a reason. You can optionally **reissue** at the same time, which creates a fresh draft you can correct and issue anew -- keeping the original on record for audit purposes.
+
+**An invoice with payments applied to it cannot be voided.** Breeze refuses the void and tells you how much is applied, rather than silently un-applying the payments and leaving the money unaccounted for: *"This invoice has &lt;amount&gt; of payments applied to it. Remove those payments first (and in QuickBooks, if it is synced there), then void the invoice."* Remove the payments, then void. This applies to every invoice, whether or not it is synced to an accounting integration -- see [Accounting Integrations](/features/accounting-integrations/#payment-push).
+
+## Billed devices
+
+Every auto-counted line on a contract-generated invoice can be expanded to show the exact devices it billed, including each device's role and how it was counted: **Included**, **Overage** or **Flagged, not billed**. A device deleted or moved to another organization afterwards still appears on the past invoice by hostname and is marked **Device removed**. Reissuing an invoice copies this recorded evidence to the replacement instead of counting the fleet again.
+
+The optional **Billed devices** appendix on the invoice PDF is **off by default**. Turn it on for every invoice with **Include billed devices appendix on invoice PDFs** under **Settings → Billing**, or choose **Include billed devices appendix** for one invoice from the send dialog while that invoice is still a draft. Flagged devices are never printed because they were not charged. The appendix prints at most 2,000 device rows and notes when additional billed devices are omitted.
+
+The choice is **frozen when the invoice is issued**. Changing the partner default later does not alter an already-issued invoice's PDF, and the per-invoice choice cannot be changed after issue.
+
+Invoices generated before this feature was available have no device detail and say so. Editing a draft line's quantity by hand does **not** rewrite its device evidence because the evidence records what the generation run counted. Deleting a draft line deletes its evidence with it.
+
+## PDF and Accounting View
+
+Every issued invoice can be downloaded as a clean, single-page **PDF** to send or archive. The detail view also offers an accounting-oriented breakdown of subtotal, tax, total, payments, and balance.
+
+## Bulk Actions
+
+Select invoices using the checkboxes in the invoice list to reveal a bulk action bar.
+
+| Action | Permission required | Notes |
+|--------|---------------------|-------|
+| **Issue** | Invoice send | Issues all selected draft invoices |
+| **Void** | Invoice send | Prompts for a void reason; applies to all selected issued invoices |
+| **Delete drafts** | Invoice write | Deletes all selected draft invoices |
+
+Actions run per-item in isolation, so partial success is possible -- the bar reports what succeeded and what failed.
+
+## Permissions
+
+Invoice access is governed by role permissions: viewing requires invoice read access, creating and editing drafts requires invoice write access, and issuing, sending, voiding, and recording payments require invoice send access. Assign these through **Settings → Users & Roles**.
+
+## Related
+
+- [Product Catalog](/features/product-catalog/) -- the price list invoices pull from
+- [Recurring Contracts](/features/contracts/) -- generate invoices automatically on a schedule
+- [Online Payments](/features/online-payments/) -- collect card payments online

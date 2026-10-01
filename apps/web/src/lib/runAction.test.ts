@@ -1,0 +1,366 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const showToast = vi.fn();
+vi.mock('../components/shared/Toast', () => ({ showToast: (a: unknown) => showToast(a) }));
+
+// Force the translated path for the validation envelope: with i18n uninitialized
+// (as in the other runAction tests) exists() is false and the envelope no-ops,
+// so we stub it to assert the Step-4 behavior explicitly.
+vi.mock('./i18n', () => ({
+  i18n: {
+    exists: (key: string) => key === 'errors:VALIDATION_FAILED',
+    t: (key: string) => (key === 'errors:VALIDATION_FAILED' ? 'Check the highlighted fields' : key),
+  },
+}));
+
+import { runAction, ActionError } from './runAction';
+import { TRUST_DENIED_EVENT } from './trustProbation';
+
+function res(body: unknown, status = 200): Response {
+  return new Response(body === undefined ? '' : JSON.stringify(body), {
+    status, headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+beforeEach(() => showToast.mockReset());
+
+describe('runAction', () => {
+  it('returns parsed data and toasts success EXACTLY ONCE when successMessage given', async () => {
+    // Regression guard for #1301 ("duplicate success toasts on runAction").
+    // The ×2 toast reported there was an Astro/Vite dev-server render
+    // double-invoke that does not exist in a production build (the app has no
+    // <StrictMode>, and the prod bundle ships production React). runAction must
+    // emit a single success toast per call — asserting the call COUNT, not just
+    // `toHaveBeenCalledWith`, is what locks that single-emit guarantee in.
+    const out = await runAction<{ id: string }>({
+      request: async () => res({ id: 'x' }),
+      successMessage: 'Done',
+      errorFallback: 'fb',
+    });
+    expect(out).toEqual({ id: 'x' });
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast).toHaveBeenCalledWith({ message: 'Done', type: 'success' });
+  });
+
+  it('no success toast when successMessage omitted', async () => {
+    await runAction({ request: async () => res({ ok: 1 }), errorFallback: 'fb' });
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('toasts + throws ActionError on !ok with readable message', async () => {
+    await expect(runAction({
+      request: async () => res({ error: 'boom', code: 'X' }, 422),
+      errorFallback: 'fb',
+    })).rejects.toBeInstanceOf(ActionError);
+    expect(showToast).toHaveBeenCalledWith({ message: 'boom', type: 'error' });
+  });
+
+  it('treats 200 + {success:false} as failure', async () => {
+    await expect(runAction({
+      request: async () => res({ success: false, message: 'nope' }, 200),
+      errorFallback: 'fb',
+    })).rejects.toMatchObject({ message: 'nope' });
+    expect(showToast).toHaveBeenCalledWith({ message: 'nope', type: 'error' });
+  });
+
+  it('treats 200 + {testResult:{success:false}} as failure', async () => {
+    await expect(runAction({
+      request: async () => res({ testResult: { success: false, message: 'bad token' } }, 200),
+      errorFallback: 'fb',
+    })).rejects.toMatchObject({ message: 'bad token' });
+  });
+
+  it('applies friendly(code) when provided', async () => {
+    await expect(runAction({
+      request: async () => res({ error: 'raw', code: 'NO_MACS' }, 412),
+      errorFallback: 'fb',
+      friendly: (c) => (c === 'NO_MACS' ? 'No MAC on file' : undefined),
+    })).rejects.toMatchObject({ code: 'NO_MACS', message: 'No MAC on file' });
+    expect(showToast).toHaveBeenCalledWith({ message: 'No MAC on file', type: 'error' });
+  });
+
+  it('calls onUnauthorized and throws on 401', async () => {
+    const onUnauthorized = vi.fn();
+    await expect(runAction({
+      request: async () => res({ error: 'unauth' }, 401),
+      errorFallback: 'fb',
+      onUnauthorized,
+    })).rejects.toBeInstanceOf(ActionError);
+    expect(onUnauthorized).toHaveBeenCalledOnce();
+  });
+
+  it('non-JSON body -> fallback message and error toast', async () => {
+    await expect(runAction({
+      request: async () => new Response('<html>', { status: 500 }),
+      errorFallback: 'Server error',
+    })).rejects.toMatchObject({ message: 'Server error' });
+    expect(showToast).toHaveBeenCalledWith({ message: 'Server error', type: 'error' });
+  });
+
+  it('network reject -> fallback toast + ActionError status 0', async () => {
+    await expect(runAction({
+      request: async () => { throw new Error('network down'); },
+      errorFallback: 'Network error',
+    })).rejects.toMatchObject({ message: 'Network error', status: 0 });
+    expect(showToast).toHaveBeenCalledWith({ message: 'Network error', type: 'error' });
+  });
+
+  it('successMessage as function receives result and toasts formatted string', async () => {
+    const out = await runAction<{ id: string }>({
+      request: async () => res({ id: '7' }),
+      successMessage: (d) => `Created ${d.id}`,
+      errorFallback: 'fb',
+    });
+    expect(out).toEqual({ id: '7' });
+    expect(showToast).toHaveBeenCalledWith({ message: 'Created 7', type: 'success' });
+  });
+
+  it('401 is silent (no toast) and calls onUnauthorized', async () => {
+    const onUnauthorized = vi.fn();
+    await expect(runAction({
+      request: async () => res({ error: 'unauth' }, 401),
+      errorFallback: 'fb',
+      onUnauthorized,
+    })).rejects.toMatchObject({ status: 401 });
+    expect(onUnauthorized).toHaveBeenCalledOnce();
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('treatUnauthorizedAsError: a 401 is toasted with its real reason instead of swallowed', async () => {
+    // For routes that proxy a downstream 401 (approvals decide answers 401 for
+    // `assertion_failed` / `reauth_required`), the session-expiry branch would
+    // throw with no feedback at all.
+    const onUnauthorized = vi.fn();
+    await expect(runAction({
+      request: async () => res({ error: 'assertion_failed' }, 401),
+      errorFallback: 'fb',
+      onUnauthorized,
+      treatUnauthorizedAsError: true,
+    })).rejects.toMatchObject({ status: 401, message: 'assertion_failed' });
+    expect(showToast).toHaveBeenCalledWith({ message: 'assertion_failed', type: 'error' });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it('friendly falls back to body.error when the body carries no code', async () => {
+    await expect(runAction({
+      request: async () => res({ error: 'step_up_required', requiredLevel: 3 }, 403),
+      errorFallback: 'fb',
+      friendly: (token) => (token === 'step_up_required' ? 'Use Touch ID to approve' : undefined),
+    })).rejects.toMatchObject({ status: 403, message: 'Use Touch ID to approve' });
+    expect(showToast).toHaveBeenCalledWith({ message: 'Use Touch ID to approve', type: 'error' });
+  });
+
+  it('dispatches trust denials and suppresses the generic error toast when a listener claims it', async () => {
+    const denial = {
+      error: 'TRUST_PROBATION',
+      capability: 'remote_control',
+      reason: 'probation_default_deny',
+      reviewRequested: false,
+      meetingUrl: null,
+    };
+    // Mirrors TrustProbationBanner's handler: claims the event so runAction
+    // doesn't also show a generic toast on top of the banner.
+    const listener = vi.fn((event: Event) => event.preventDefault());
+    window.addEventListener(TRUST_DENIED_EVENT, listener);
+
+    await expect(runAction({
+      request: async () => res(denial, 403),
+      errorFallback: 'Remote control failed',
+    })).rejects.toMatchObject({ status: 403, body: denial });
+
+    expect(listener).toHaveBeenCalledOnce();
+    expect((listener.mock.calls[0]![0] as CustomEvent).detail).toEqual(denial);
+    expect(showToast).not.toHaveBeenCalled();
+    window.removeEventListener(TRUST_DENIED_EVENT, listener);
+  });
+
+  it('falls back to the generic error toast when nothing handles the trust-denied event', async () => {
+    const denial = {
+      error: 'TRUST_PROBATION',
+      capability: 'remote_control',
+      reason: 'probation_default_deny',
+      reviewRequested: false,
+      meetingUrl: null,
+    };
+    // No listener at all — simulates a page where TrustProbationBanner isn't
+    // mounted. The failure must not be silently swallowed.
+    await expect(runAction({
+      request: async () => res(denial, 403),
+      errorFallback: 'Remote control failed',
+    })).rejects.toMatchObject({ status: 403, body: denial });
+
+    expect(showToast).toHaveBeenCalledWith({ message: expect.any(String), type: 'error' });
+  });
+
+  it('falls back to the generic error toast when a listener observes but does not claim the trust-denied event', async () => {
+    const denial = {
+      error: 'TRUST_PROBATION',
+      capability: 'remote_control',
+      reason: 'probation_default_deny',
+      reviewRequested: false,
+      meetingUrl: null,
+    };
+    const listener = vi.fn();
+    window.addEventListener(TRUST_DENIED_EVENT, listener);
+
+    await expect(runAction({
+      request: async () => res(denial, 403),
+      errorFallback: 'Remote control failed',
+    })).rejects.toMatchObject({ status: 403, body: denial });
+
+    expect(listener).toHaveBeenCalledOnce();
+    expect(showToast).toHaveBeenCalledWith({ message: expect.any(String), type: 'error' });
+    window.removeEventListener(TRUST_DENIED_EVENT, listener);
+  });
+
+  it('still shows the generic error toast for other 403 responses', async () => {
+    const listener = vi.fn();
+    window.addEventListener(TRUST_DENIED_EVENT, listener);
+
+    await expect(runAction({
+      request: async () => res({ error: 'Forbidden' }, 403),
+      errorFallback: 'Action failed',
+    })).rejects.toMatchObject({ status: 403, message: 'Forbidden' });
+
+    expect(listener).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith({ message: 'Forbidden', type: 'error' });
+    window.removeEventListener(TRUST_DENIED_EVENT, listener);
+  });
+
+  it('parseSuccess throws -> toasted failure with errorFallback', async () => {
+    await expect(runAction({
+      request: async () => res({ val: 1 }, 200),
+      errorFallback: 'Parse failed',
+      parseSuccess: () => { throw new Error('bad shape'); },
+    })).rejects.toMatchObject({ message: 'Parse failed', status: 200 });
+    expect(showToast).toHaveBeenCalledWith({ message: 'Parse failed', type: 'error' });
+  });
+
+  it('successMessage function throws -> generic success toast, value returned, error logged', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const out = await runAction<{ ok: number }>({
+      request: async () => res({ ok: 1 }),
+      successMessage: () => { throw new Error('x'); },
+      errorFallback: 'fb',
+    });
+    expect(out).toEqual({ ok: 1 });
+    // The action succeeded — a formatter bug must NOT silence feedback (M1).
+    expect(showToast).toHaveBeenCalledWith({ message: 'Done', type: 'success' });
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('toasts exactly once on failure (no double-toast with caller catch pattern)', async () => {
+    // Mirrors the documented caller contract: runAction toasts the failure and
+    // throws ActionError; the caller's catch must NOT re-toast a non-401
+    // ActionError. Asserts runAction itself emits a single toast.
+    let caught: unknown;
+    try {
+      await runAction({
+        request: async () => res({ error: 'boom' }, 422),
+        errorFallback: 'fb',
+      });
+    } catch (err) {
+      caught = err;
+      // Documented caller pattern:
+      if (err instanceof ActionError && err.status === 401) { /* redirect */ }
+      else if (!(err instanceof ActionError)) showToast({ message: 'extra', type: 'error' });
+      // ActionError non-401 -> already toasted by runAction, caller stays silent
+    }
+    expect(caught).toBeInstanceOf(ActionError);
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast).toHaveBeenCalledWith({ message: 'boom', type: 'error' });
+  });
+  it('Zod validation 400 without code: keeps specific field text as message, translated headline as detail (Step 4 of #3859, #1976 contract)', async () => {
+    const specific =
+      'Template must include the {id} placeholder for the per-device value';
+
+    await expect(
+      runAction({
+        request: async () =>
+          res(
+            {
+              success: false,
+              error: {
+                name: 'ZodError',
+                message: JSON.stringify([
+                  {
+                    code: 'custom',
+                    path: ['settings', 'remoteAccessProviders', 0, 'urlTemplate'],
+                    message: specific,
+                  },
+                ]),
+              },
+            },
+            400
+          ),
+        errorFallback: 'fb',
+      })
+    ).rejects.toBeInstanceOf(ActionError);
+
+    expect(showToast).toHaveBeenCalledWith({
+      message: specific,
+      detail: 'Check the highlighted fields',
+      type: 'error',
+    });
+  });
+
+  it('Zod validation 400 with no specific field text: translated headline becomes the message', async () => {
+    await expect(
+      runAction({
+        request: async () =>
+          res(
+            {
+              details: {
+                formErrors: [],
+                fieldErrors: {},
+              },
+            },
+            400
+          ),
+        errorFallback: 'fb',
+      })
+    ).rejects.toBeInstanceOf(ActionError);
+
+    expect(showToast).toHaveBeenCalledWith({
+      message: 'Check the highlighted fields',
+      type: 'error',
+    });
+  });
+
+  it('ordinary non-Zod 400 without code does not get the validation headline', async () => {
+    await expect(
+      runAction({
+        request: async () => res({ error: 'Incorrect password.' }, 400),
+        errorFallback: 'fb',
+      })
+    ).rejects.toBeInstanceOf(ActionError);
+
+    expect(showToast).toHaveBeenCalledWith({
+      message: 'Incorrect password.',
+      type: 'error',
+    });
+  });
+
+  it('validation envelope does NOT fire when a code is present (code path wins)', async () => {
+    await expect(runAction({
+      request: async () =>
+        res(
+          {
+            error: 'name is required',
+            details: {
+              formErrors: ['name is required'],
+              fieldErrors: {},
+            },
+            code: 'SOME_CODE',
+          },
+          400
+        ),
+      errorFallback: 'fb',
+    })).rejects.toBeInstanceOf(ActionError);
+    // code present -> envelope skipped; detail stays undefined
+    const call = showToast.mock.calls.at(-1)?.[0];
+    expect(call.detail).toBeUndefined();
+  });
+});

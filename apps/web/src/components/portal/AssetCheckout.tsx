@@ -1,0 +1,109 @@
+import { useMemo } from 'react';
+import { useForm } from 'react-hook-form';
+import { useTranslation } from 'react-i18next';
+import { z } from 'zod';
+import { zodResolver } from '@hookform/resolvers/zod';
+
+type AssetCheckoutValues = {
+  expectedReturnDate: string;
+  notes?: string;
+};
+
+type AssetCheckoutProps = {
+  assetName?: string;
+  onSubmit?: (values: AssetCheckoutValues) => void | Promise<void>;
+  errorMessage?: string;
+  submitLabel?: string;
+  loading?: boolean;
+};
+
+export default function AssetCheckout({
+  assetName,
+  onSubmit,
+  errorMessage,
+  submitLabel,
+  loading
+}: AssetCheckoutProps) {
+  const { t } = useTranslation('portal');
+  const assetCheckoutSchema = useMemo(
+    () =>
+      z.object({
+        expectedReturnDate: z.string().min(1, t('assetCheckout.validation.expectedReturnDate')),
+        notes: z.string().optional()
+      }),
+    [t]
+  );
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting }
+  } = useForm<AssetCheckoutValues>({
+    resolver: zodResolver(assetCheckoutSchema),
+    defaultValues: {
+      expectedReturnDate: '',
+      notes: ''
+    }
+  });
+
+  const isLoading = useMemo(() => loading ?? isSubmitting, [loading, isSubmitting]);
+
+  return (
+    <form
+      onSubmit={handleSubmit(async values => {
+        await onSubmit?.(values);
+      })}
+      className="space-y-6 rounded-lg border bg-card p-6 shadow-xs"
+    >
+      <div>
+        <h2 className="text-sm font-semibold text-foreground">{t('assetCheckout.title')}</h2>
+        {assetName && (
+          <p className="text-xs text-muted-foreground">
+            {t('assetCheckout.requesting', { assetName })}
+          </p>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        <label htmlFor="expectedReturnDate" className="text-sm font-medium">
+          {t('assetCheckout.expectedReturnDate')}
+        </label>
+        <input
+          id="expectedReturnDate"
+          type="date"
+          className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          {...register('expectedReturnDate')}
+        />
+        {errors.expectedReturnDate && (
+          <p className="text-sm text-destructive">{errors.expectedReturnDate.message}</p>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        <label htmlFor="notes" className="text-sm font-medium">
+          {t('assetCheckout.notes')}
+        </label>
+        <textarea
+          id="notes"
+          rows={3}
+          placeholder={t('assetCheckout.notesPlaceholder')}
+          className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+          {...register('notes')}
+        />
+      </div>
+
+      {errorMessage && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {errorMessage}
+        </div>
+      )}
+
+      <button
+        type="submit"
+        disabled={isLoading}
+        className="flex h-11 w-full items-center justify-center rounded-md bg-primary text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {isLoading ? t('assetCheckout.submitting') : submitLabel ?? t('assetCheckout.submit')}
+      </button>
+    </form>
+  );
+}

@@ -1,0 +1,494 @@
+import { useEffect, useState } from 'react';
+import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'react-native';
+
+import {
+  getDeviceMetrics,
+  sendDeviceAction,
+  sendWakeAction,
+  type Device,
+  type DeviceAction,
+  type WakeFailureCode,
+} from '../../services/api';
+import {
+  useApprovalTheme,
+  palette,
+  radii,
+  spacing,
+  type,
+} from '../../theme';
+import { Spinner } from '../../components/Spinner';
+import { reportInternalError } from '../../lib/errorReporting';
+import { osLabel } from '../../lib/osLabel';
+import { relativeTime } from '../../lib/relativeTime';
+import { formatCountLabel, formatDetailValue, formatIpValue, formatOsVersionValue } from './deviceDetailFields';
+
+interface Props {
+  route: { params: { device: Device } };
+}
+
+/**
+ * Relative time reads at a glance, but an absolute timestamp is genuinely
+ * useful on a detail screen (matching against agent logs, ticket timestamps,
+ * etc.), so this keeps both rather than picking one.
+ */
+function formatTimestamp(iso: string): string {
+  const rel = relativeTime(iso);
+  const abs = new Date(iso).toLocaleString();
+  return rel ? `${rel} · ${abs}` : abs;
+}
+
+function statusDotColor(status: Device['status']): string {
+  switch (status) {
+    case 'online':
+      return palette.approve.base;
+    case 'warning':
+      return palette.warning.base;
+    case 'offline':
+      return palette.deny.base;
+    default:
+      return palette.dark.textLo;
+  }
+}
+
+function statusLabel(status: Device['status']): string {
+  switch (status) {
+    case 'online':
+      return 'ONLINE';
+    case 'warning':
+      return 'WARNING';
+    case 'offline':
+      return 'OFFLINE';
+    default:
+      return 'UNKNOWN';
+  }
+}
+
+function DetailRow({
+  label,
+  value,
+  textHi,
+  textLo,
+  border,
+}: {
+  label: string;
+  value: string;
+  textHi: string;
+  textLo: string;
+  border: string;
+}) {
+  return (
+    <View
+      style={{
+        paddingVertical: spacing[3],
+        borderBottomWidth: 1,
+        borderBottomColor: border,
+      }}
+    >
+      <Text style={[type.metaCaps, { color: textLo }]}>{label}</Text>
+      <Text
+        style={[type.body, { color: textHi, marginTop: spacing[1] }]}
+        selectable
+      >
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+/**
+ * A single-line row for the Open alerts / Open tickets counts (#5140):
+ * the label lives inside the text itself ("Open alerts · 3"), unlike
+ * DetailRow's caps-label-then-value shape, since neither count links to a
+ * filtered list yet (no such screen exists on mobile — see
+ * formatCountLabel's caller) and a bare label/value split would read oddly
+ * for a value that's already a full sentence fragment.
+ */
+function SummaryRow({
+  text,
+  textHi,
+  border,
+}: {
+  text: string;
+  textHi: string;
+  border: string;
+}) {
+  return (
+    <View
+      style={{
+        paddingVertical: spacing[3],
+        borderBottomWidth: 1,
+        borderBottomColor: border,
+      }}
+    >
+      <Text style={[type.body, { color: textHi }]} selectable>
+        {text}
+      </Text>
+    </View>
+  );
+}
+
+function MetricTile({
+  label,
+  value,
+  textHi,
+  textLo,
+  bg,
+}: {
+  label: string;
+  value: string;
+  textHi: string;
+  textLo: string;
+  bg: string;
+}) {
+  return (
+    <View
+      style={{
+        flex: 1,
+        backgroundColor: bg,
+        borderRadius: radii.md,
+        padding: spacing[4],
+      }}
+    >
+      <Text style={[type.metaCaps, { color: textLo }]}>{label}</Text>
+      <Text style={[type.title, { color: textHi, marginTop: spacing[1] }]}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function ActionButton({
+  label,
+  onPress,
+  loading,
+  disabled,
+  textHi,
+  bg,
+  border,
+  brand,
+}: {
+  label: string;
+  onPress: () => void;
+  loading: boolean;
+  disabled: boolean;
+  textHi: string;
+  bg: string;
+  border: string;
+  brand: string;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled || loading}
+      style={({ pressed }) => ({
+        flex: 1,
+        minWidth: 120,
+        paddingVertical: spacing[4],
+        borderRadius: radii.lg,
+        borderWidth: 1,
+        borderColor: pressed ? textHi : border,
+        backgroundColor: pressed ? bg : 'transparent',
+        alignItems: 'center',
+        flexDirection: 'row',
+        justifyContent: 'center',
+        gap: spacing[2],
+        opacity: disabled && !loading ? 0.5 : 1,
+      })}
+    >
+      {loading ? <Spinner color={brand} size={14} /> : null}
+      <Text style={[type.bodyMd, { color: textHi }]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+export function DeviceDetailScreen({ route }: Props) {
+  const theme = useApprovalTheme('dark');
+  const { device } = route.params;
+  const [metrics, setMetrics] = useState<Device['metrics']>(device.metrics);
+  const [loadingMetrics, setLoadingMetrics] = useState(false);
+  const [metricsError, setMetricsError] = useState<string | null>(null);
+  const [actionLoading, setActionLoading] = useState<DeviceAction | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoadingMetrics(true);
+    setMetricsError(null);
+    getDeviceMetrics(device.id)
+      .then((data) => {
+        if (mounted) setMetrics(data);
+      })
+      .catch((err: unknown) => {
+        // The raw message is internal (function name + HTTP status) — report it
+        // to Sentry and keep only a static string in UI state (issue #3141).
+        reportInternalError(err, 'device-metrics');
+        if (mounted) setMetricsError('Could not load metrics.');
+      })
+      .finally(() => {
+        if (mounted) setLoadingMetrics(false);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [device.id]);
+
+  async function handleAction(action: DeviceAction) {
+    try {
+      setActionLoading(action);
+      if (action === 'wake') {
+        const wake = await sendWakeAction(device.id);
+        Alert.alert(
+          'Wake sent',
+          `Magic packet sent to ${wake.broadcast} via ${wake.relay.hostname}. Wait up to 5 min for the device to come online.`,
+        );
+      } else {
+        await sendDeviceAction(device.id, action);
+        Alert.alert('Sent', `${action} command sent.`);
+      }
+    } catch (err) {
+      const apiErr = err as { message?: string; code?: WakeFailureCode | string };
+      const msg = (action === 'wake' ? wakeFriendlyMessage(apiErr.code) : null)
+        || apiErr?.message
+        || 'Could not send command.';
+      Alert.alert('Failed', msg);
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
+  function wakeFriendlyMessage(code: WakeFailureCode | string | undefined): string | null {
+    switch (code) {
+      case 'NO_MACS':
+        return 'No MAC address on file. The agent must check in at least once before Wake-on-LAN is available.';
+      case 'NO_SUBNET':
+        return 'No IPv4 record with a subnet mask is in this device\'s history.';
+      case 'IPV6_ONLY':
+        return 'Device only has IPv6 history. Wake-on-LAN requires IPv4.';
+      case 'NO_RELAY':
+        return 'No online peer agent at the same site and subnet to relay the packet.';
+      case 'RELAY_OVERRIDE_INVALID':
+        return 'Selected relay is not eligible (must be online and at the target site and subnet).';
+      case 'WS_SEND_FAILED':
+        return 'Relay agent dropped connection during dispatch. Try again.';
+      case 'TARGET_NOT_FOUND':
+        return 'Device not found.';
+      default:
+        return null;
+    }
+  }
+
+  const offline = device.status === 'offline';
+
+  return (
+    <ScrollView
+      style={{ flex: 1, backgroundColor: theme.bg0 }}
+      contentContainerStyle={{
+        padding: spacing[6],
+        paddingBottom: spacing[10],
+      }}
+    >
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing[2] }}>
+        <View
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: 4,
+            backgroundColor: statusDotColor(device.status),
+          }}
+        />
+        <Text style={[type.metaCaps, { color: theme.textLo }]}>
+          {statusLabel(device.status)}
+        </Text>
+      </View>
+
+      <Text style={[type.title, { color: theme.textHi, marginTop: spacing[3] }]}>
+        {device.name}
+      </Text>
+
+      <View style={{ marginTop: spacing[5] }}>
+        {device.hostname ? (
+          <DetailRow
+            label="HOSTNAME"
+            value={device.hostname}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            border={theme.border}
+          />
+        ) : null}
+        {/* Device Details v1 fields (#5140, decision #5117-2): IP,
+            logged-in user, OS version and the open alert/ticket counts
+            always render — "—" for absent values — unlike the rows above,
+            which hide entirely when the underlying field is unset. */}
+        <DetailRow
+          label="IP ADDRESS"
+          value={formatIpValue(device.lanIp, device.publicIp)}
+          textHi={theme.textHi}
+          textLo={theme.textLo}
+          border={theme.border}
+        />
+        <DetailRow
+          label="LOGGED-IN USER"
+          value={formatDetailValue(device.lastUser)}
+          textHi={theme.textHi}
+          textLo={theme.textLo}
+          border={theme.border}
+        />
+        {device.os ? (
+          <DetailRow
+            label="OPERATING SYSTEM"
+            value={formatOsVersionValue(osLabel(device.os), device.osVersion)}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            border={theme.border}
+          />
+        ) : null}
+        <SummaryRow
+          text={formatCountLabel('Open alerts', device.openAlertCount)}
+          textHi={theme.textHi}
+          border={theme.border}
+        />
+        <SummaryRow
+          text={formatCountLabel('Open tickets', device.openTicketCount)}
+          textHi={theme.textHi}
+          border={theme.border}
+        />
+        {device.agentVersion ? (
+          <DetailRow
+            label="AGENT VERSION"
+            value={device.agentVersion}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            border={theme.border}
+          />
+        ) : null}
+        {device.lastSeen ? (
+          <DetailRow
+            label="LAST SEEN"
+            value={formatTimestamp(device.lastSeen)}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            border={theme.border}
+          />
+        ) : null}
+        {device.organizationName ? (
+          <DetailRow
+            label="ORGANIZATION"
+            value={device.organizationName}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            border={theme.border}
+          />
+        ) : null}
+        {device.siteName ? (
+          <DetailRow
+            label="SITE"
+            value={device.siteName}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            border={theme.border}
+          />
+        ) : null}
+      </View>
+
+      <View
+        style={{
+          flexDirection: 'row',
+          justifyContent: 'space-between',
+          alignItems: 'baseline',
+          marginTop: spacing[8],
+        }}
+      >
+        <Text style={[type.metaCaps, { color: theme.textLo }]}>METRICS</Text>
+        {metricsError ? (
+          <Text style={[type.meta, { color: palette.deny.base }]}>
+            Couldn't refresh
+          </Text>
+        ) : null}
+      </View>
+
+      {loadingMetrics ? (
+        <View style={{ paddingVertical: spacing[4] }}>
+          <ActivityIndicator color={theme.brand} />
+        </View>
+      ) : metrics ? (
+        <View
+          style={{
+            flexDirection: 'row',
+            gap: spacing[3],
+            marginTop: spacing[3],
+          }}
+        >
+          <MetricTile
+            label="CPU"
+            value={`${metrics.cpuUsage?.toFixed(0) ?? '–'}%`}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            bg={theme.bg2}
+          />
+          <MetricTile
+            label="MEMORY"
+            value={`${metrics.memoryUsage?.toFixed(0) ?? '–'}%`}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            bg={theme.bg2}
+          />
+          <MetricTile
+            label="DISK"
+            value={`${metrics.diskUsage?.toFixed(0) ?? '–'}%`}
+            textHi={theme.textHi}
+            textLo={theme.textLo}
+            bg={theme.bg2}
+          />
+        </View>
+      ) : (
+        <Text style={[type.body, { color: theme.textMd, marginTop: spacing[3] }]}>
+          No metrics available.
+        </Text>
+      )}
+
+      <Text
+        style={[type.metaCaps, { color: theme.textLo, marginTop: spacing[8] }]}
+      >
+        ACTIONS
+      </Text>
+      <View
+        style={{
+          flexDirection: 'row',
+          flexWrap: 'wrap',
+          gap: spacing[3],
+          marginTop: spacing[3],
+        }}
+      >
+        <ActionButton
+          label="Reboot"
+          onPress={() => handleAction('reboot')}
+          loading={actionLoading === 'reboot'}
+          disabled={offline || actionLoading !== null}
+          textHi={theme.textHi}
+          bg={theme.bg2}
+          border={theme.border}
+          brand={theme.brand}
+        />
+        <ActionButton
+          label="Shutdown"
+          onPress={() => handleAction('shutdown')}
+          loading={actionLoading === 'shutdown'}
+          disabled={offline || actionLoading !== null}
+          textHi={theme.textHi}
+          bg={theme.bg2}
+          border={theme.border}
+          brand={theme.brand}
+        />
+        <ActionButton
+          label="Wake"
+          onPress={() => handleAction('wake')}
+          loading={actionLoading === 'wake'}
+          disabled={actionLoading !== null}
+          textHi={theme.textHi}
+          bg={theme.bg2}
+          border={theme.border}
+          brand={theme.brand}
+        />
+      </View>
+    </ScrollView>
+  );
+}

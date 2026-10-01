@@ -1,0 +1,345 @@
+// Package rebuild implements the bare-metal recovery engine (spec §6): given
+// a snapshot id, its recorded disk layout, a target (block device or raw
+// image file), and an identity mode, it provisions GPT partitions, restores
+// the whole-machine file snapshot, applies Linux system state offline,
+// installs/refreshes the bootloader, writes the identity marker, validates,
+// and returns a structured Result. All OS interaction goes through the
+// System seam (system.go) so the engine is fully testable without root.
+package rebuild
+
+import (
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/backup/layout"
+	"github.com/breeze-rmm/agent/internal/backup/providers"
+)
+
+// TargetKind selects what rebuild.Run writes to.
+type TargetKind string
+
+const (
+	TargetDisk  TargetKind = "disk"
+	TargetImage TargetKind = "image"
+	// TargetVHDX (W05a) stages a raw image at <Path>.raw, runs the seven
+	// W03 phases against it exactly like TargetImage, then the convert
+	// phase turns it into a dynamic VHDX at Path with qemu-img and deletes
+	// the raw file. Path should end in .vhdx.
+	TargetVHDX TargetKind = "vhdx"
+)
+
+// Target is where the engine provisions and restores the machine.
+type Target struct {
+	Kind TargetKind `json:"kind"`
+	Path string     `json:"path"`
+	// ImageSizeBytes is used for TargetImage and TargetVHDX: the size to
+	// create the (raw) file at when it does not already exist (sparse).
+	ImageSizeBytes int64 `json:"imageSizeBytes,omitempty"`
+}
+
+// RawPath is the file the engine actually attaches as a loop device: the
+// image itself for TargetImage, the raw staging file (Path + ".raw") for
+// TargetVHDX, and "" for TargetDisk (a block device is attached directly).
+func (t Target) RawPath() string {
+	switch t.Kind {
+	case TargetImage:
+		return t.Path
+	case TargetVHDX:
+		return t.Path + ".raw"
+	}
+	return ""
+}
+
+// IdentityMode selects whether the rebuilt machine keeps the source
+// machine's identity (bound to a pending recovery via Marker) or becomes a
+// fresh, unenrolled machine.
+type IdentityMode string
+
+const (
+	IdentityOriginal IdentityMode = "original"
+	IdentityNew      IdentityMode = "new"
+)
+
+// Marker binds the restored device to a pending server-side recovery (W04).
+type Marker struct {
+	RecoveryID string `json:"recoveryId"`
+	Nonce      string `json:"nonce"`
+}
+
+// Phase is one of the eight engine phases, always run and reported in the
+// same order. The eighth (convert) only does work for TargetVHDX; every
+// other target records it as PhaseSkipped so the phase table stays
+// fixed-length for every caller.
+type Phase string
+
+const (
+	PhasePreflight  Phase = "preflight"
+	PhaseProvision  Phase = "provision"
+	PhaseRestore    Phase = "restore"
+	PhaseBoot       Phase = "boot"
+	PhaseIdentity   Phase = "identity"
+	PhaseEncryption Phase = "encryption"
+	PhaseValidate   Phase = "validate"
+	PhaseConvert    Phase = "convert" // raw staging image → VHDX (TargetVHDX only)
+)
+
+// AllPhases is the fixed phase order every rebuild.Run reports.
+var AllPhases = []Phase{PhasePreflight, PhaseProvision, PhaseRestore, PhaseBoot, PhaseIdentity, PhaseEncryption, PhaseValidate, PhaseConvert}
+
+// PhaseStatus is the outcome of one phase within a single Run call.
+type PhaseStatus string
+
+const (
+	PhaseCompleted PhaseStatus = "completed"
+	PhaseSkipped   PhaseStatus = "skipped" // resumed run: already done by an earlier call; or a phase with nothing to do for this target
+	PhaseFailed    PhaseStatus = "failed"
+	PhaseRefused   PhaseStatus = "refused"
+)
+
+// PhaseResult records one phase's outcome and timing within Result.Phases.
+type PhaseResult struct {
+	Phase       Phase       `json:"phase"`
+	Status      PhaseStatus `json:"status"`
+	StartedAt   time.Time   `json:"startedAt"`
+	CompletedAt time.Time   `json:"completedAt"`
+	Message     string      `json:"message,omitempty"`
+}
+
+// PlannedPartition is one partition PlanPartitions laid out on the target.
+type PlannedPartition struct {
+	Number     int    `json:"number"`
+	Role       string `json:"role"`
+	TypeGUID   string `json:"typeGuid"`
+	PartUUID   string `json:"partUuid,omitempty"`
+	Name       string `json:"name,omitempty"`
+	StartBytes int64  `json:"startBytes"`
+	SizeBytes  int64  `json:"sizeBytes"`
+	Filesystem string `json:"filesystem,omitempty"`
+	FSUUID     string `json:"fsUuid,omitempty"`
+	Label      string `json:"label,omitempty"`
+	MountPoint string `json:"mountPoint,omitempty"`
+	Grown      bool   `json:"grown"` // absorbed the target's extra (or short) space
+}
+
+// Plan is PlanPartitions' output: the partition table the engine will
+// provision on the target.
+type Plan struct {
+	SourceDisk      string             `json:"sourceDisk"`
+	SourceSizeBytes int64              `json:"sourceSizeBytes"`
+	TargetPath      string             `json:"targetPath"`
+	TargetSizeBytes int64              `json:"targetSizeBytes"`
+	SectorSize      int                `json:"sectorSize"`
+	Partitions      []PlannedPartition `json:"partitions"`
+	MinimumBytes    int64              `json:"minimumBytes"`       // what the target must offer
+	Warnings        []string           `json:"warnings,omitempty"` // non-fatal planning issues, e.g. a partition with no recorded filesystem UUID
+}
+
+// Options configures a single Run call.
+type Options struct {
+	SnapshotID  string
+	Provider    providers.BackupProvider
+	Target      Target
+	Identity    IdentityMode
+	Marker      *Marker          // original identity only
+	Layout      *layout.Manifest // nil → downloaded from snapshots/<id>/layout.json
+	StateDir    string           // default /var/lib/breeze/rebuild
+	StagingRoot string           // default <StateDir>/mnt/<snapshotID>
+
+	DryRun              bool // preflight only; returns the Plan
+	ForceReprovision    bool
+	AllowPartialRestore bool
+	// RegenerateInitramfs is NOT defaulted by Run() — a bare Options{} leaves
+	// it false (Go's zero value), same as any other bool field. "Default
+	// true" is a CLI-level convention: breeze-backup rebuild always passes
+	// this explicitly (RegenerateInitramfs: !noInitramfs), so an operator
+	// who never touches --no-initramfs gets regeneration without asking for
+	// it — but Run() itself cannot distinguish "caller left it unset,
+	// wants the default" from "caller explicitly wants no regen" (both are
+	// the zero value), so a direct Options caller (tests, a future W04
+	// console) must set it explicitly to get initramfs regeneration.
+	RegenerateInitramfs bool
+	SkipBoot            bool // tests/CI only: synthetic roots have no bootloader
+	// ExpectSystemState says the snapshot MUST carry system state
+	// (system-state/manifest.json with at least one artifact) and the run
+	// must apply it: preflight refuses when it is missing, and the run is
+	// never "completed" unless Result.StateApplied is true (#5412). Callers
+	// derive it from what they know about the snapshot — backupType ==
+	// "system_image" or a bootstrap advertising a state manifest (see
+	// bmr.SnapshotExpectsSystemState) — never from the snapshot's own
+	// contents, which is exactly what a broken capture would misreport.
+	// False keeps the soft path: a file-only snapshot rebuilds with a
+	// warning and StateApplied=false.
+	ExpectSystemState bool `json:"expectSystemState"`
+
+	System   System // nil → real system (system_linux.go)
+	Progress func(phase Phase, message string, current, total int64)
+}
+
+// Result is Run's structured outcome.
+type Result struct {
+	SnapshotID    string        `json:"snapshotId"`
+	Target        Target        `json:"target"`
+	Identity      IdentityMode  `json:"identity"`
+	Status        string        `json:"status"` // completed | refused | failed
+	PhaseReached  Phase         `json:"phaseReached"`
+	Phases        []PhaseResult `json:"phases"`
+	Plan          *Plan         `json:"plan,omitempty"`
+	Refusal       string        `json:"refusal,omitempty"`
+	Error         string        `json:"error,omitempty"`
+	Warnings      []string      `json:"warnings,omitempty"`
+	FilesRestored int           `json:"filesRestored"`
+	BytesRestored int64         `json:"bytesRestored"`
+	DurationMs    int64         `json:"durationMs"`
+	Resumed       bool          `json:"resumed"`
+	// FilesFailed is the total count of files the restore phase could not
+	// place. FailedFilesSample is a deterministic (sorted) prefix of those
+	// paths, capped at 50 entries so a mass-failure run never balloons the
+	// reported result; FailedFilesOmitted is how many more there were
+	// beyond the sample. The agent's internal failedFiles set (used by
+	// validate.go) is never truncated — only this reported summary is.
+	FilesFailed        int      `json:"filesFailed"`
+	FailedFilesSample  []string `json:"failedFilesSample,omitempty"`
+	FailedFilesOmitted int      `json:"failedFilesOmitted,omitempty"`
+	// StateManifestFound is true once preflight downloaded and verified
+	// system-state/manifest.json; StateApplied only once
+	// bmr.RestoreSystemStateOffline returned nil for it (persisted across
+	// resumed runs). With Options.ExpectSystemState, Status is never
+	// "completed" while StateApplied is false (#5412).
+	StateManifestFound bool `json:"stateManifestFound"`
+	StateApplied       bool `json:"stateApplied"`
+}
+
+// FailedFilesLen and CloneWithTrimmedFailedFiles satisfy bmr's
+// boundedFailures interface (bmr/progress.go) so BoundProgressUpdate can
+// trim a *Result's FailedFilesSample before posting progress, without bmr
+// importing rebuild (rebuild already imports bmr, so the reverse would be
+// a cycle). Both have nil-receiver-safe guards: a ProgressUpdate.Result
+// can carry a typed nil *Result (e.g. a caller passes a *Result variable
+// that was never assigned), and Go's type switch matches the concrete
+// type regardless of a nil pointer value, so BoundProgressUpdate's
+// `case boundedFailures:` branch would otherwise call these on a nil
+// receiver and panic (caught by cmd/breeze-backup's rebuild_cmd_test.go).
+func (r *Result) FailedFilesLen() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.FailedFilesSample)
+}
+
+// Caps mirror the server schema and w09-part0.md's Global Constraint
+// "Bounded reporting" (agent-side caps mirror the server schema): warnings
+// <= 64 entries x 2000 chars, reason/error strings <= 2000 chars. Mirrored
+// independently from bmr's own maxProgress* constants (progress.go) —
+// rebuild cannot import bmr's unexported constants, and bmr cannot import
+// rebuild (rebuild already imports bmr, so the reverse would be a cycle).
+const (
+	maxResultWarnings     = 64
+	maxResultWarningRunes = 2000
+	maxResultReasonRunes  = 2000
+)
+
+func truncateResultRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+// CloneWithTrimmedFailedFiles returns a shallow copy of r with
+// FailedFilesSample trimmed to max entries (FailedFilesOmitted increased
+// to account for the newly-trimmed entries), Warnings trimmed to
+// maxResultWarnings entries of at most maxResultWarningRunes runes each,
+// and Error/Refusal capped to maxResultReasonRunes runes. r itself is
+// never mutated — trimmed slices/strings are always freshly built, never
+// aliased against r's own backing arrays. A nil receiver returns nil
+// unchanged (nothing to trim).
+//
+// Warnings is uncapped at every call site that populates it (restore.go
+// appends one entry per failed file placement; restore_tree.go forwards
+// that slice into Result.Warnings verbatim) — unlike FailedFilesSample,
+// which restore_tree.go already caps to 50 entries at construction. A
+// mass-failure restore (e.g. 98k files) can therefore carry ~98k
+// Warnings entries, which alone blows the 768 KiB progress body limit
+// even though FailedFilesSample stays small — this method is the only
+// place that bounds it (review finding #2, w09-part0.md R18).
+func (r *Result) CloneWithTrimmedFailedFiles(max int) any {
+	if r == nil {
+		return r
+	}
+	clone := *r
+
+	if n := len(clone.FailedFilesSample); n > max {
+		clone.FailedFilesOmitted += n - max
+		clone.FailedFilesSample = append([]string(nil), clone.FailedFilesSample[:max]...)
+	}
+
+	warnKeep := len(r.Warnings)
+	if warnKeep > maxResultWarnings {
+		warnKeep = maxResultWarnings
+	}
+	if warnKeep > 0 {
+		warnings := make([]string, warnKeep)
+		for i := 0; i < warnKeep; i++ {
+			warnings[i] = truncateResultRunes(r.Warnings[i], maxResultWarningRunes)
+		}
+		clone.Warnings = warnings
+	} else {
+		clone.Warnings = nil
+	}
+
+	clone.Error = truncateResultRunes(clone.Error, maxResultReasonRunes)
+	clone.Refusal = truncateResultRunes(clone.Refusal, maxResultReasonRunes)
+
+	return &clone
+}
+
+// SummaryFields satisfies bmr's resultSummaryFields seam (bmr/progress.go)
+// so the last-resort progress fallback — used when even the trimmed clone
+// from CloneWithTrimmedFailedFiles doesn't fit under the body limit — can
+// still surface filesFailed/failedFilesOmitted/error/refusal from a typed
+// *Result instead of degrading to a bare {"status","truncated":true} (the
+// map[string]any branch it previously only supported). A nil receiver
+// returns nil (nothing to summarize).
+func (r *Result) SummaryFields() map[string]any {
+	if r == nil {
+		return nil
+	}
+	m := map[string]any{}
+	if r.FilesFailed > 0 {
+		m["filesFailed"] = r.FilesFailed
+	}
+	if r.FailedFilesOmitted > 0 {
+		m["failedFilesOmitted"] = r.FailedFilesOmitted
+	}
+	if r.Error != "" {
+		m["error"] = r.Error
+	}
+	if r.Refusal != "" {
+		m["refusal"] = r.Refusal
+	}
+	return m
+}
+
+// ObjectAdmission is implemented by a token-mode recovery provider
+// (bmr.recoveryDownloadProvider) to let preflight refuse a manifest entry
+// the provider would refuse to download anyway — the belt to
+// bmr.ApplyManifestScope's braces (Options.Provider is already confined via
+// WidenScopeFromManifest/RunRecoveryContext's own scope check before
+// preflight runs; this is a second, independent check inside the engine
+// itself so provision can never run ahead of it on any call path). A
+// provider that does not implement it (plain S3/local) is never confined
+// here either — see preflight's type assertion.
+type ObjectAdmission interface {
+	Admits(key string) bool
+}
+
+// RefusalError carries an operator-facing reason; Run maps it to Status
+// "refused" without touching the target.
+type RefusalError struct{ Reason string }
+
+func (e *RefusalError) Error() string { return "refused: " + e.Reason }
+
+const (
+	MiB = int64(1) << 20
+	GiB = int64(1) << 30
+)

@@ -1,0 +1,264 @@
+package agentapp
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/hostpolicy"
+	"github.com/breeze-rmm/agent/internal/logging"
+	"github.com/breeze-rmm/agent/pkg/api"
+)
+
+var errNoBootstrapInput = errors.New("no bootstrap token from filename or properties")
+
+// gateBootstrapServer refuses, in a hosted build, to contact a control-plane host
+// outside the compiled allowlist — called BEFORE the token is redeemed so a
+// bootstrap token is never disclosed to a non-allowlisted server. No-op in
+// self-host builds.
+func gateBootstrapServer(server string) error {
+	return hostpolicy.AllowedURL(server)
+}
+
+// gateRedeemResponse refuses a redeem response that tries to re-point the agent
+// at a non-allowlisted primary or backup control plane (design constraint 2:
+// the redeem-response redirect must be gated, not just the filename host).
+func gateRedeemResponse(res bootstrapResult) error {
+	if err := hostpolicy.AllowedURL(res.ServerURL); err != nil {
+		return err
+	}
+	if res.BackupServerURL != "" {
+		if err := hostpolicy.AllowedURL(res.BackupServerURL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// bootstrapInstallData arrives via --install-data on the BootstrapEnroll
+// deferred CA's command line, formatted directly from
+// "[OriginalDatabase]|[BOOTSTRAP_TOKEN]|[SERVER_URL]" at MSI schedule time.
+// (The old SetBootstrapData/CustomActionData indirection was removed — an
+// EXE CA cannot read CustomActionData, so it delivered an empty string on
+// every install; see the BootstrapEnroll comment in installer/breeze.wxs.)
+var bootstrapInstallData string
+
+type bootstrapResult struct {
+	ServerURL        string `json:"serverUrl"`
+	BackupServerURL  string `json:"backupServerUrl"`
+	EnrollmentKey    string `json:"enrollmentKey"`
+	EnrollmentSecret string `json:"enrollmentSecret"`
+	SiteID           string `json:"siteId"`
+}
+
+// resolveBootstrapInputs decides which token/server to use. Property token +
+// server take precedence (explicit silent-install intent); otherwise the
+// [TOKEN@HOST] in the installer filename is used, with the host (which may
+// carry a decoded `host:port`) promoted to an https:// server URL. The
+// promotion is unconditionally https; servers running the #2341 fix refuse
+// to emit a filename-token download for a non-https URL, but an MSI from an
+// older self-hosted server may still embed an http-only host — redemption
+// then fails loudly (install rollback), never silently. Mirrors the macOS
+// payload-then-filename precedence.
+func resolveBootstrapInputs(data string) (token, server string, err error) {
+	parts := strings.SplitN(data, "|", 3)
+	var installerPath, propToken, propServer string
+	if len(parts) > 0 {
+		installerPath = parts[0]
+	}
+	if len(parts) > 1 {
+		propToken = strings.TrimSpace(parts[1])
+	}
+	if len(parts) > 2 {
+		propServer = strings.TrimSpace(parts[2])
+	}
+
+	if propToken != "" && propServer != "" {
+		return propToken, propServer, nil
+	}
+
+	if tok, host, ferr := parseInstallerFilenameToken(installerPath); ferr == nil {
+		return tok, "https://" + host, nil
+	}
+	return "", "", errNoBootstrapInput
+}
+
+// redeemBootstrapToken exchanges a single-use token for a child enrollment key.
+func redeemBootstrapToken(server, token string) (*bootstrapResult, error) {
+	url := strings.TrimRight(server, "/") + "/api/v1/installer/bootstrap"
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Breeze-Bootstrap-Token", token)
+	initialURL := *req.URL
+	initialRequest := &http.Request{URL: &initialURL}
+
+	client := &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: api.RefuseUntrustedRedirect,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	// CheckRedirect rejects every untrusted hop before the bootstrap capability
+	// can leave the initial host. Re-check the final request against the initial
+	// request as defense in depth so a future transport/client refactor cannot
+	// silently accept a response from a different authority.
+	if err := api.RefuseUntrustedRedirect(resp.Request, []*http.Request{initialRequest}); err != nil {
+		return nil, fmt.Errorf("bootstrap redeem: untrusted final response URL: %w", err)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bootstrap redeem failed: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out bootstrapResult
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("bootstrap redeem: bad response: %w", err)
+	}
+	if out.EnrollmentKey == "" {
+		return nil, errors.New("bootstrap redeem: response missing enrollmentKey")
+	}
+	if out.ServerURL == "" {
+		out.ServerURL = server
+	}
+	return &out, nil
+}
+
+// cancelBootstrapIfRefundable calls POST /installer/bootstrap/cancel with
+// the RAW CHILD ENROLLMENT KEY (the `enrollmentKey` field of the redeem
+// response) when cat is a definitive 4xx rejection
+// (enrollErrCategory.isRefundable4xx) — the bootstrap-redeemed slot behind
+// childKey is provably unused and safe to refund. The server hashes what it
+// receives and looks it up against enrollment_keys.key, so the child key —
+// NOT the org-shared `enrollmentSecret` (which is frequently null and is
+// never a key row) — is the only value that resolves. Does
+// nothing for any other category (catNetwork/catServer/catConfig/
+// catUnknown): the enroll request may have reached the server and created
+// a device despite the failure the agent observed, and refunding then
+// could double-free a slot that now backs a live device.
+//
+// This is a best-effort courtesy call: any error from CancelBootstrap
+// itself (network failure, non-2xx, bad JSON) is logged and swallowed,
+// never fatal — matching enrollError's existing "never returns without
+// exiting" contract. Worst case on failure is one stranded bootstrap-token
+// slot, which is recoverable (the token still has other uses left, or it
+// simply expires) and must never additionally block an install that is
+// already failing.
+func cancelBootstrapIfRefundable(cat enrollErrCategory, server, childKey string, bsLog *slog.Logger) {
+	if !cat.isRefundable4xx() {
+		return
+	}
+	res, err := api.CancelBootstrap(server, childKey)
+	if err != nil {
+		bsLog.Warn("bootstrap slot cancel failed after rejected enrollment; slot may be stranded until it expires",
+			"error", err.Error())
+		return
+	}
+	bsLog.Info("bootstrap slot cancel completed after rejected enrollment",
+		"refunded", res.Refunded, "reason", res.Reason)
+}
+
+// runBootstrap resolves enrollment inputs, redeems the token, and enrolls.
+// Soft-exits 0 when there is genuinely no token (manual install with no token
+// and no properties), so the install completes with an unenrolled agent that
+// idles in the wait-for-enrollment loop. A present-but-bad token is a real
+// error and exits non-zero so the MSI rolls back cleanly.
+func runBootstrap() {
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		cfg = config.Default()
+	}
+	initEnrollLogging(cfg, quietEnroll)
+	bsLog := logging.L("bootstrap")
+
+	// The MSI BootstrapEnroll CA runs on major upgrades too (NOT Installed is
+	// true for the new product). Bail out before redeeming: enrollDevice would
+	// skip anyway (same cfg.AgentID check), but by then redeemBootstrapToken
+	// has already consumed the SINGLE-USE bootstrap token for nothing and
+	// spent up to 30s on the redeem HTTP call inside a blocking deferred CA.
+	// Worse: upgrading with an MSI whose filename token was ALREADY redeemed
+	// (the original install's downloaded file, re-run later) makes the redeem
+	// 4xx and os.Exit(1) — Return="check" would roll back the whole upgrade.
+	if cfg.AgentID != "" {
+		bsLog.Info("agent already enrolled; skipping bootstrap", "agent_id", cfg.AgentID)
+		if !quietEnroll {
+			fmt.Println("Agent already enrolled; skipping bootstrap enrollment.")
+		}
+		return // exit 0 — upgrade over an enrolled agent must never burn the token
+	}
+
+	token, server, err := resolveBootstrapInputs(bootstrapInstallData)
+	if err != nil {
+		bsLog.Info("no bootstrap token present; skipping enrollment (agent will idle until enrolled)")
+		if !quietEnroll {
+			fmt.Println("No enrollment token found; install will complete unenrolled.")
+		}
+		return // exit 0 — soft
+	}
+
+	if err := gateBootstrapServer(server); err != nil {
+		bsLog.Error("bootstrap refused: control-plane host not allowed", "error", err.Error())
+		fmt.Fprintf(os.Stderr, "Bootstrap failed: %v\n", err)
+		osExit(1) // hard — roll back the install; token NOT sent to this host
+		return
+	}
+
+	bsLog.Info("redeeming bootstrap token", "server", server)
+	res, err := redeemBootstrapToken(server, token)
+	if err != nil {
+		bsLog.Error("bootstrap token redemption failed", "error", err.Error())
+		fmt.Fprintf(os.Stderr, "Bootstrap failed: %v\n", err)
+		osExit(1) // hard — roll back the install (osExit: test seam, enroll_error.go)
+		return    // under a noop osExit test seam, don't fall through to a nil res
+	}
+
+	if err := gateRedeemResponse(*res); err != nil {
+		bsLog.Error("bootstrap refused: redeem response host not allowed", "error", err.Error())
+		fmt.Fprintf(os.Stderr, "Bootstrap failed: %v\n", err)
+		osExit(1) // hard — roll back; do not adopt a non-allowlisted redirect
+		return
+	}
+
+	// Hand off to the existing enroll path via the package globals it reads.
+	// siteId is NOT forwarded here: enrollDevice does not read enrollSiteID for
+	// the resolved key — the server derives the site from the (child) key and
+	// returns it in the enroll response (cfg.SiteID = enrollResp.SiteID).
+	serverURL = res.ServerURL
+	backupServerURL = res.BackupServerURL
+	enrollmentSecret = res.EnrollmentSecret
+
+	// Wire the bootstrap-cancel hook for the duration of this enrollDevice
+	// call only (Task 6, #2764): if the enroll it's about to attempt gets
+	// rejected with a definitive 4xx, enrollError calls this closure — which
+	// closes over the raw child enrollment KEY — immediately before exiting.
+	// Cleared unconditionally afterward so a stale hook (with a now-stale
+	// key) can never leak into a later enrollDevice call in the same
+	// process — reachable only in tests, since enrollError's osExit never
+	// returns in production.
+	//
+	// res.EnrollmentKey, NOT res.EnrollmentSecret: the cancel endpoint hashes
+	// the value it receives and looks it up against enrollment_keys.key, so
+	// only the child key resolves. (Naming wart: the server's request body
+	// field is still called `enrollmentSecret` even though it carries the
+	// child KEY — see the doc comment on POST /installer/bootstrap/cancel in
+	// apps/api/src/routes/installer.ts. Renaming the wire field would break
+	// already-shipped agents, so the wart stays for now.)
+	cancelBootstrapOnEnrollFailure = func(cat enrollErrCategory) {
+		cancelBootstrapIfRefundable(cat, res.ServerURL, res.EnrollmentKey, bsLog)
+	}
+	defer func() { cancelBootstrapOnEnrollFailure = nil }()
+
+	enrollDevice(res.EnrollmentKey)
+}

@@ -1,0 +1,518 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mockState = vi.hoisted(() => ({
+  columns: [] as Array<{
+    tableName: string;
+    columnName: string;
+    dataType: string;
+    udtName: string;
+    ordinalPosition: number;
+  }>,
+}));
+
+vi.mock('../db', () => ({
+  db: {
+    execute: vi.fn(async () => mockState.columns),
+  },
+}));
+
+import { db } from '../db';
+import { findTenantExportPolicyIssues } from '../../scripts/check-tenant-export-policy';
+import {
+  buildTenantExportPlan,
+  type TenantExportPolicyRegistry,
+} from './tenantExportPolicy';
+import {
+  CORE_TENANT_EXPORT_POLICY,
+  getTenantExportPolicyRegistry,
+  tablePolicy,
+} from './tenantExportPolicyRegistry';
+
+function column(
+  tableName: string,
+  columnName: string,
+  dataType = 'text',
+  ordinalPosition = 1,
+  udtName = dataType,
+) {
+  return { tableName, columnName, dataType, udtName, ordinalPosition };
+}
+
+function policy(
+  organizationKey: 'id' | 'org_id',
+  columns: TenantExportPolicyRegistry[string]['columns'],
+): TenantExportPolicyRegistry[string] {
+  return { organizationKey, columns };
+}
+
+describe('buildTenantExportPlan', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockState.columns = [];
+  });
+
+  it('fails closed when an existing table has no policy', async () => {
+    mockState.columns = [column('widgets', 'org_id')];
+
+    await expect(buildTenantExportPlan(['widgets'], {})).rejects.toThrow(
+      /widgets.*policy/i,
+    );
+  });
+
+  it('reports live columns missing from policy and stale policy columns', async () => {
+    mockState.columns = [
+      column('widgets', 'id', 'uuid', 1),
+      column('widgets', 'org_id', 'uuid', 2),
+      column('widgets', 'name', 'text', 3),
+    ];
+    const registry: TenantExportPolicyRegistry = {
+      widgets: policy('org_id', {
+        id: { decision: 'include', rationale: 'Stable row identifier.' },
+        org_id: { decision: 'include', rationale: 'Tenant ownership identifier.' },
+        removed_column: { decision: 'exclude', rationale: 'No longer present.' },
+      }),
+    };
+
+    await expect(buildTenantExportPlan(['widgets'], registry)).rejects.toThrow(
+      /name.*removed_column|removed_column.*name/i,
+    );
+  });
+
+  it('rejects duplicate requested tables and duplicate live column rows', async () => {
+    await expect(buildTenantExportPlan(['widgets', 'widgets'], {})).rejects.toThrow(
+      /duplicate.*widgets/i,
+    );
+
+    mockState.columns = [
+      column('widgets', 'org_id', 'uuid', 1),
+      column('widgets', 'org_id', 'uuid', 1),
+    ];
+    const registry: TenantExportPolicyRegistry = {
+      widgets: policy('org_id', {
+        org_id: { decision: 'include', rationale: 'Tenant ownership identifier.' },
+      }),
+    };
+
+    await expect(buildTenantExportPlan(['widgets'], registry)).rejects.toThrow(
+      /duplicate.*org_id/i,
+    );
+  });
+
+  it('requires explicit review before including a suspiciously named column', async () => {
+    mockState.columns = [
+      column('widgets', 'org_id', 'uuid', 1),
+      column('widgets', 'access_token_hash', 'text', 2),
+    ];
+    const registry: TenantExportPolicyRegistry = {
+      widgets: policy('org_id', {
+        org_id: { decision: 'include', rationale: 'Tenant ownership identifier.' },
+        access_token_hash: {
+          decision: 'include',
+          rationale: 'Needed for a reviewed portability workflow.',
+        },
+      }),
+    };
+
+    await expect(buildTenantExportPlan(['widgets'], registry)).rejects.toThrow(
+      /access_token_hash.*reviewedSensitiveName/i,
+    );
+  });
+
+  const enrollmentEpochs = [
+    ['enrollment_keys', 'credential_generation', ['key', 'key_secret_hash', 'short_code']],
+    ['installer_bootstrap_tokens', 'parent_credential_generation', ['token']],
+  ] as const;
+
+  it.each(enrollmentEpochs)(
+    'exports the reviewed integer epoch for %s while excluding credentials',
+    async (tableName, epoch, secrets) => {
+      const table = CORE_TENANT_EXPORT_POLICY[tableName]!;
+      mockState.columns = Object.keys(table.columns).map((name, index) =>
+        column(tableName, name, name === epoch ? 'integer' : 'text', index + 1),
+      );
+
+      expect(table.columns[epoch]).toMatchObject({
+        decision: 'include', reviewedSensitiveName: true,
+      });
+      expect(table.columns[epoch]!.rationale).toMatch(/positive integer/i);
+      const [plan] = await buildTenantExportPlan([tableName], CORE_TENANT_EXPORT_POLICY);
+      expect(plan!.includedColumns).toContain(epoch);
+      for (const secret of secrets) {
+        expect(table.columns[secret]!.decision).toBe('exclude');
+        expect(plan!.includedColumns).not.toContain(secret);
+      }
+    },
+  );
+
+  it.each(enrollmentEpochs)(
+    'rejects an unreviewed integer epoch for %s without relaxing the name guard',
+    async (tableName, epoch) => {
+      const table = CORE_TENANT_EXPORT_POLICY[tableName]!;
+      mockState.columns = Object.keys(table.columns).map((name, index) =>
+        column(tableName, name, name === epoch ? 'integer' : 'text', index + 1),
+      );
+      const registry: TenantExportPolicyRegistry = {
+        [tableName]: {
+          ...table,
+          columns: {
+            ...table.columns,
+            [epoch]: { decision: 'include', rationale: 'Unreviewed integer epoch.' },
+          },
+        },
+      };
+      await expect(buildTenantExportPlan([tableName], registry)).rejects.toThrow(
+        new RegExp(`${epoch}.*reviewedSensitiveName`),
+      );
+    },
+  );
+
+  it.each([
+    ['jsonb type', column('widgets', 'preferences', 'jsonb', 2, 'jsonb')],
+    ['bytea type', column('widgets', 'document', 'bytea', 2, 'bytea')],
+    ['open-container name', column('widgets', 'metadata', 'text', 2, 'text')],
+  ])('requires explicit open-container review for a %s', async (_label, openColumn) => {
+    mockState.columns = [
+      column('widgets', 'org_id', 'uuid', 1),
+      openColumn,
+    ];
+    const registry: TenantExportPolicyRegistry = {
+      widgets: policy('org_id', {
+        org_id: { decision: 'include', rationale: 'Tenant ownership identifier.' },
+        [openColumn.columnName]: {
+          decision: 'exclude',
+          rationale: 'Container content is not part of the portable contract.',
+        },
+      }),
+    };
+
+    await expect(buildTenantExportPlan(['widgets'], registry)).rejects.toThrow(
+      new RegExp(`${openColumn.columnName}.*openContainerReviewed`, 'i'),
+    );
+  });
+
+  it('rejects an organization key that does not match the table shape', async () => {
+    mockState.columns = [
+      column('widgets', 'id', 'uuid', 1),
+      column('widgets', 'org_id', 'uuid', 2),
+      column('organizations', 'id', 'uuid', 1),
+    ];
+    const registry: TenantExportPolicyRegistry = {
+      widgets: policy('id', {
+        id: { decision: 'include', rationale: 'Stable row identifier.' },
+        org_id: { decision: 'include', rationale: 'Tenant ownership identifier.' },
+      }),
+      organizations: policy('org_id', {
+        id: { decision: 'include', rationale: 'Organization identifier.' },
+      }),
+    };
+
+    await expect(
+      buildTenantExportPlan(['widgets', 'organizations'], registry),
+    ).rejects.toThrow(/organization key/i);
+  });
+
+  it('infers an id-keyed table structurally without hardcoding a table name', async () => {
+    mockState.columns = [
+      column('tenant_accounts', 'id', 'uuid', 1),
+      column('tenant_accounts', 'name', 'text', 2),
+    ];
+    const registry: TenantExportPolicyRegistry = {
+      tenant_accounts: policy('id', {
+        id: { decision: 'include', rationale: 'Tenant account identifier.' },
+        name: { decision: 'include', rationale: 'Customer-owned account name.' },
+      }),
+    };
+
+    await expect(
+      buildTenantExportPlan(['tenant_accounts'], registry),
+    ).resolves.toEqual([
+      {
+        table: 'tenant_accounts',
+        organizationKey: 'id',
+        includedColumns: ['id', 'name'],
+      },
+    ]);
+  });
+
+  it('rejects unsafe table and live-column identifiers', async () => {
+    await expect(buildTenantExportPlan(['widgets;drop'], {})).rejects.toThrow(
+      /unsafe identifier/i,
+    );
+
+    mockState.columns = [column('widgets', 'bad-column')];
+    const registry: TenantExportPolicyRegistry = {
+      widgets: policy('org_id', {
+        'bad-column': { decision: 'exclude', rationale: 'Unsafe identifier fixture.' },
+      }),
+    };
+    await expect(buildTenantExportPlan(['widgets'], registry)).rejects.toThrow(
+      /unsafe identifier/i,
+    );
+  });
+
+  it('returns only explicitly included columns in live ordinal order', async () => {
+    mockState.columns = [
+      column('widgets', 'id', 'uuid', 1),
+      column('widgets', 'org_id', 'uuid', 2),
+      column('widgets', 'name', 'text', 3),
+      column('widgets', 'credentials', 'jsonb', 4, 'jsonb'),
+      column('organizations', 'id', 'uuid', 1),
+      column('organizations', 'name', 'text', 2),
+    ];
+    const registry: TenantExportPolicyRegistry = {
+      widgets: policy('org_id', {
+        id: { decision: 'include', rationale: 'Stable row identifier.' },
+        org_id: { decision: 'include', rationale: 'Tenant ownership identifier.' },
+        name: { decision: 'include', rationale: 'Customer-owned display name.' },
+        credentials: {
+          decision: 'exclude',
+          rationale: 'Credential containers are prohibited from tenant exports.',
+          reviewedSensitiveName: true,
+          openContainerReviewed: true,
+        },
+      }),
+      organizations: policy('id', {
+        id: { decision: 'include', rationale: 'Organization identifier.' },
+        name: { decision: 'include', rationale: 'Customer-owned organization name.' },
+      }),
+    };
+
+    await expect(
+      buildTenantExportPlan(['widgets', 'organizations'], registry),
+    ).resolves.toEqual([
+      {
+        table: 'widgets',
+        organizationKey: 'org_id',
+        includedColumns: ['id', 'org_id', 'name'],
+      },
+      {
+        table: 'organizations',
+        organizationKey: 'id',
+        includedColumns: ['id', 'name'],
+      },
+    ]);
+    expect(db.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits cascade tables that do not exist in this deployment', async () => {
+    mockState.columns = [column('organizations', 'id', 'uuid', 1)];
+    const registry: TenantExportPolicyRegistry = {
+      optional_widgets: policy('org_id', {
+        org_id: { decision: 'include', rationale: 'Tenant ownership identifier.' },
+      }),
+      organizations: policy('id', {
+        id: { decision: 'include', rationale: 'Organization identifier.' },
+      }),
+    };
+
+    await expect(
+      buildTenantExportPlan(['optional_widgets', 'organizations'], registry),
+    ).resolves.toEqual([
+      {
+        table: 'organizations',
+        organizationKey: 'id',
+        includedColumns: ['id'],
+      },
+    ]);
+  });
+});
+
+describe('CORE_TENANT_EXPORT_POLICY migration-era columns', () => {
+  it('exports deployment dependency fingerprints as reviewed integrity provenance', () => {
+    expect(
+      CORE_TENANT_EXPORT_POLICY.software_deployments!.columns.dependency_fingerprint,
+    ).toMatchObject({
+      decision: 'include',
+      reviewedSensitiveName: true,
+    });
+  });
+
+  it('classifies the portal auth epoch but omits it from the export plan', async () => {
+    const portalPolicy = CORE_TENANT_EXPORT_POLICY.portal_users!;
+    mockState.columns = Object.keys(portalPolicy.columns).map((columnName, index) =>
+      column('portal_users', columnName, 'text', index + 1),
+    );
+
+    const [plan] = await buildTenantExportPlan(
+      ['portal_users'],
+      CORE_TENANT_EXPORT_POLICY,
+    );
+
+    expect(portalPolicy.columns.auth_epoch).toMatchObject({
+      decision: 'exclude',
+      reviewedSensitiveName: true,
+    });
+    expect(plan?.includedColumns).not.toContain('auth_epoch');
+    expect(plan?.includedColumns).toContain('status');
+  });
+
+  it('exports portal report definitions and contact-bound recipients', () => {
+    expect(
+      CORE_TENANT_EXPORT_POLICY.reports!.columns.portal_self_service!.decision,
+    ).toBe('include');
+
+    expect(
+      Object.fromEntries(
+        Object.entries(
+          CORE_TENANT_EXPORT_POLICY.report_schedule_recipients!.columns,
+        ).map(([name, value]) => [name, value.decision]),
+      ),
+    ).toEqual({
+      id: 'include',
+      report_id: 'include',
+      org_id: 'include',
+      contact_id: 'include',
+      created_at: 'include',
+    });
+
+    expect(CORE_TENANT_EXPORT_POLICY).not.toHaveProperty('report_runs');
+  });
+
+  // #2787 wave 04 — `devices` is in CORE_ORG_CASCADE_DELETE_ORDER, so EVERY
+  // column of it must carry an export classification; an unclassified one
+  // fails the tenant-export contract suites. `decommissioned_at` is a plain
+  // timestamp (when the device was removed), not credential material.
+  it('classifies the device removal timestamp as ordinary exportable tenant data', () => {
+    expect(
+      CORE_TENANT_EXPORT_POLICY.devices!.columns.decommissioned_at,
+    ).toBeDefined();
+    expect(
+      CORE_TENANT_EXPORT_POLICY.devices!.columns.decommissioned_at!.decision,
+    ).toBe('include');
+    expect(
+      CORE_TENANT_EXPORT_POLICY.devices!.columns.decommissioned_at!.reviewedSensitiveName,
+    ).toBeUndefined();
+  });
+
+  it('rejects a column classified in both a shared group and a specific decision', () => {
+    expect(() =>
+      tablePolicy('org_id', {
+        included: ['search_vector'],
+        reviewedIncluded: [],
+        excludedSensitive: [],
+        excludedOpen: [],
+        specific: {
+          search_vector: {
+            decision: 'exclude',
+            rationale: 'Derived search data is excluded.',
+          },
+        },
+      }),
+    ).toThrow(/duplicate classification.*search_vector/i);
+  });
+
+  it('classifies derived search vectors and versioned discriminator columns explicitly', () => {
+    const tables = ['device_event_logs', 'restore_jobs'] as const;
+    const liveColumns = tables.flatMap((tableName) => [
+      ...Object.keys(CORE_TENANT_EXPORT_POLICY[tableName]!.columns).map(
+        (columnName) => ({ tableName, columnName }),
+      ),
+      {
+        tableName,
+        columnName:
+          tableName === 'device_event_logs'
+            ? 'search_vector'
+            : 'restore_type_v2',
+      },
+    ]);
+
+    expect(
+      findTenantExportPolicyIssues(
+        tables,
+        liveColumns,
+        CORE_TENANT_EXPORT_POLICY,
+      ),
+    ).toEqual([]);
+    expect(
+      CORE_TENANT_EXPORT_POLICY.device_event_logs!.columns.search_vector,
+    ).toMatchObject({ decision: 'exclude' });
+    expect(
+      CORE_TENANT_EXPORT_POLICY.restore_jobs!.columns.restore_type_v2,
+    ).toMatchObject({ decision: 'include' });
+  });
+
+  it('fails closed for a future neutral derived column', () => {
+    const tableName = 'device_event_logs';
+    const liveColumns = [
+      ...Object.keys(CORE_TENANT_EXPORT_POLICY[tableName]!.columns).map(
+        (columnName) => ({ tableName, columnName }),
+      ),
+      { tableName, columnName: 'future_derived_projection' },
+    ];
+
+    expect(
+      findTenantExportPolicyIssues(
+        [tableName],
+        liveColumns,
+        CORE_TENANT_EXPORT_POLICY,
+      ),
+    ).toEqual([
+      'device_event_logs.future_derived_projection: unclassified',
+    ]);
+  });
+});
+describe('m365 tenant sync export classifications', () => {
+  const registry = getTenantExportPolicyRegistry();
+
+  it('classifies every m365 sync table', () => {
+    for (const table of [
+      'm365_sync_state', 'm365_users', 'm365_intune_devices', 'm365_ca_policies',
+      'm365_license_skus', 'm365_secure_score_snapshots', 'm365_posture_rollups',
+    ]) {
+      expect(registry[table], `${table} unclassified`).toBeDefined();
+      expect(registry[table]!.organizationKey).toBe('org_id');
+    }
+  });
+
+  it('excludes every open container and the executor continuation', () => {
+    const excluded = (table: string, column: string) =>
+      registry[table]!.columns[column]?.decision;
+    expect(excluded('m365_sync_state', 'sources')).toBe('exclude');
+    expect(excluded('m365_sync_state', 'last_counts')).toBe('exclude');
+    expect(excluded('m365_sync_state', 'continuation')).toBe('exclude');
+    expect(excluded('m365_users', 'assigned_sku_ids')).toBe('exclude');
+    expect(excluded('m365_users', 'admin_roles')).toBe('exclude');
+    expect(excluded('m365_ca_policies', 'conditions')).toBe('exclude');
+    expect(excluded('m365_ca_policies', 'grant_controls')).toBe('exclude');
+    expect(excluded('m365_ca_policies', 'session_controls')).toBe('exclude');
+    expect(excluded('m365_secure_score_snapshots', 'control_scores')).toBe('exclude');
+    expect(excluded('m365_posture_rollups', 'domains_fresh')).toBe('exclude');
+  });
+
+  it('marks every mfa/hash column reviewed rather than plain-included', () => {
+    for (const [table, column] of [
+      ['m365_users', 'core_hash'],
+      ['m365_users', 'mfa_registered'],
+      ['m365_users', 'mfa_capable'],
+      ['m365_users', 'default_mfa_method'],
+      ['m365_ca_policies', 'definition_hash'],
+      ['m365_posture_rollups', 'users_mfa_registered'],
+      ['m365_posture_rollups', 'users_mfa_unknown'],
+      ['m365_posture_rollups', 'admins_without_mfa'],
+      ['m365_posture_rollups', 'admins_mfa_unknown'],
+    ] as const) {
+      const decision = registry[table]!.columns[column];
+      expect(decision, `${table}.${column} unclassified`).toBeDefined();
+      expect(decision!.decision).toBe('include');
+      expect(decision!.reviewedSensitiveName, `${table}.${column} needs review`).toBe(true);
+    }
+  });
+});
+
+describe('AI origin columns are classified (#5022 W01)', () => {
+  it('classifies the three script_executions AI columns as included', () => {
+    const cols = CORE_TENANT_EXPORT_POLICY['script_executions']!.columns;
+    for (const name of ['ai_initiator_kind', 'ai_session_id', 'ai_agent_run_id']) {
+      expect(cols[name], `script_executions.${name} unclassified`).toBeDefined();
+      expect(cols[name]!.decision).toBe('include');
+    }
+  });
+
+  it('classifies the three action_intents AI origin columns as included', () => {
+    const cols = CORE_TENANT_EXPORT_POLICY['action_intents']!.columns;
+    for (const name of ['ai_origin_kind', 'ai_origin_session_id', 'ai_origin_agent_run_id']) {
+      expect(cols[name], `action_intents.${name} unclassified`).toBeDefined();
+      expect(cols[name]!.decision).toBe('include');
+    }
+  });
+});

@@ -1,0 +1,78 @@
+---
+title: Extensions
+description: First-party extension modules compiled into the API image, off by default and enabled per deployment via flags, currently the Workspace extension.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Extensions are **first-party modules compiled into the API image**. They are
+not downloaded, installed, or provisioned — the code is already in the image
+you run. Breeze currently ships one: **Workspace**.
+
+Compiled in is not the same as loaded. Every built-in is **off by default** and
+loads at boot only when its deployment enable flag is set. A built-in that is
+switched off costs nothing: no migrations run, no tables are created, and none
+of its infrastructure requirements apply.
+
+| Extension | Enable flag | Notes |
+| --- | --- | --- |
+| Workspace (file/email indexing and content search) | `BREEZE_WORKSPACE_ENABLED` | Requires a Postgres image with `pgvector` available |
+
+The flag is strict: only the exact string `true` enables the extension.
+
+<Aside type="note">
+  This page covers **built-in extensions** (`installed_extensions`, the
+  manifest-declared modules under `ee/`). It is unrelated to the separate,
+  older [Plugins](/features/plugins/) catalog (`plugin_catalog` /
+  `plugin_installations`).
+</Aside>
+
+---
+
+## What an enabled extension contributes
+
+When its flag is set, the extension's migrations are applied at API startup and
+its manifest-declared contributions become active:
+
+- **HTTP routes**, mounted at `/api/v1/ext/<name>/…` with an alias at
+  `/api/v1/<routeNamespace>/…`. They run in-process against the same
+  request-scoped, RLS-bounded database handle core routes use.
+- **Web surfaces** — pages, navigation entries, and slot elements — discovered
+  by the web app through `GET /api/v1/extensions/registry`.
+- **Background jobs and AI tools**, where the manifest declares them.
+
+A built-in is required code shipped inside the image, so any failure while
+loading one (migration, staging, validation, activation) **aborts API startup**
+rather than degrading silently.
+
+## What Breeze does not have
+
+- **No third-party extension mechanism.** There is no way to add an extension
+  to a running deployment; the set of extensions is whatever the image was
+  built with.
+- **No signed runtime bundles.** There is no artifact format, no packing or
+  signing tool, no `extensions.yaml`, and no extensions directory to mount.
+- **No per-organization activation.** An enabled extension serves every
+  organization on the server. There are no per-org install or activation
+  endpoints.
+
+## Enabling Workspace
+
+Set the flag on the API service and restart:
+
+```bash
+BREEZE_WORKSPACE_ENABLED=true
+```
+
+Workspace's migrations run `CREATE EXTENSION vector` on boot, so the database
+must be a `pgvector`-capable Postgres. The `POSTGRES_IMAGE_REF` that Breeze
+ships by default (`pgvector/pgvector:pg16`) already includes it; if you supply
+your own Postgres image, provide `pgvector` before setting the flag or the API
+will fail to start with `extension "vector" is not available`. See
+[Production deployment](/deploy/production/) for the database details,
+including the upgrade caveat about swapping images over an existing data
+volume.
+
+### Who can use Workspace
+
+Since v0.112.0, Workspace administration is gated by four dedicated permissions rather than the general device permissions: **`workspace:read`** (view sources and processing status), **`workspace:write`** (configure sources and settings), **`workspace:credentials`** (manage source credentials) and **`workspace:execute`** (run crawling and content processing). Partner Admin holds all four through its full-access grant and the built-in Org Admin is granted them on upgrade; **any other role, including custom roles, must be granted the keys in Settings → Roles** before its users can open or operate Workspace. Workspace is administered from a partner-scope session.

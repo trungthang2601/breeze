@@ -1,0 +1,388 @@
+/**
+ * Third-party ring auto-approve severity exemption (#2218) — real Postgres.
+ *
+ * Winget/chocolatey/homebrew patches are ingested with severity='unknown' and
+ * no releaseDate, so the ring auto-approve severity gate (fail-closed on the
+ * configured severity set) could NEVER approve them — enabling third-party
+ * sources on a ring was dead configuration. When the policy explicitly opts
+ * into 'third_party' sources, a third-party candidate is exempt from the
+ * severity MEMBERSHIP check (OS patches keep full severity gating, and the
+ * source gate, empty-severities kill-switch, app rules, and deferral windows
+ * all still apply).
+ *
+ * Prerequisites:
+ *   docker compose -f docker-compose.test.yml up -d
+ * Run:
+ *   pnpm test:integration -- src/__tests__/integration/patchThirdPartyRingAutoApprove.integration.test.ts
+ */
+import './setup';
+
+import { randomUUID } from 'node:crypto';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { getTestDb } from './setup';
+import { withDbAccessContext } from '../../db';
+import { devices, patches, devicePatches } from '../../db/schema';
+import { resolveApprovedPatchesForDevice } from '../../services/patchEligibility';
+import type { ApprovalEvaluationConfig } from '../../services/patchApprovalEvaluator';
+import { setupTestEnvironment } from './db-utils';
+
+let agentSeq = 0;
+async function seedDevice(orgId: string, siteId: string, hostname: string): Promise<string> {
+  const tdb = getTestDb();
+  agentSeq++;
+  const [row] = await tdb
+    .insert(devices)
+    .values({
+      orgId,
+      siteId,
+      agentId: `agent-3p-${agentSeq}-${Date.now()}`,
+      hostname,
+      displayName: hostname,
+      osType: 'windows',
+      osVersion: '10.0.22631',
+      osBuild: '22631',
+      architecture: 'x86_64',
+      agentVersion: '0.0.0-test',
+      status: 'online',
+      enrolledAt: new Date(),
+    })
+    .returning({ id: devices.id });
+  if (!row) throw new Error('seedDevice: no row');
+  return row.id;
+}
+
+/** Seed a pending device patch. No manual approval — auto-approve is what's under test. */
+async function seedPendingPatch(opts: {
+  orgId: string;
+  deviceId: string;
+  source: 'third_party' | 'microsoft';
+  severity: 'critical' | 'important' | 'moderate' | 'low' | 'unknown';
+  packageId?: string;
+  /**
+   * Overrides device_patches.createdAt (the first-seen anchor for the deferral
+   * fallback). Omit to let the column default to now(). Backdate it to place a
+   * third-party patch outside a deferral window.
+   */
+  firstSeenAt?: Date;
+}): Promise<string> {
+  const tdb = getTestDb();
+  const [patch] = await tdb
+    .insert(patches)
+    .values({
+      source: opts.source,
+      externalId: `${opts.source}:${randomUUID()}`,
+      title: opts.source === 'third_party' ? 'Mozilla Firefox 121.0' : 'Cumulative Update',
+      severity: opts.severity,
+      category: opts.source === 'third_party' ? 'application' : 'security',
+      packageId: opts.packageId ?? null,
+      version: opts.source === 'third_party' ? '121.0' : null,
+      // releaseDate deliberately omitted (NULL) — the winget shape.
+    })
+    .returning({ id: patches.id });
+  if (!patch) throw new Error('seedPendingPatch: no patch');
+  await tdb.insert(devicePatches).values({
+    deviceId: opts.deviceId,
+    orgId: opts.orgId,
+    patchId: patch.id,
+    status: 'pending',
+    lastCheckedAt: new Date(),
+    ...(opts.firstSeenAt ? { createdAt: opts.firstSeenAt } : {}),
+  });
+  return patch.id;
+}
+
+/**
+ * Shape of the ring's raw `autoApprove` JSONB as accepted by
+ * parseRingAutoApprove — deliberately loose (deferralDays/thirdPartyApps/
+ * thirdPartyDeferralDays all optional) so tests can exercise legacy/compat
+ * shapes (e.g. omitting thirdPartyApps entirely) the same way a real stored
+ * row could.
+ */
+interface RingConfigAutoApprove {
+  enabled: boolean;
+  severities: string[];
+  deferralDays?: number;
+  thirdPartyApps?: boolean;
+  thirdPartyDeferralDays?: number | null;
+}
+
+function ringConfig(
+  partnerId: string,
+  sources: string[] | undefined,
+  deferralDays = 0,
+  autoApprove: RingConfigAutoApprove = {
+    enabled: true,
+    severities: ['critical'],
+    deferralDays: deferralDays ?? 0,
+    thirdPartyApps: true,
+    thirdPartyDeferralDays: null,
+  },
+): ApprovalEvaluationConfig {
+  return {
+    ringId: randomUUID(),
+    ringPartnerId: partnerId,
+    categoryRules: [],
+    autoApprove,
+    deferralDays: 0,
+    sources,
+  };
+}
+
+describe('third-party ring auto-approve (#2218) — end-to-end against Postgres', () => {
+  let orgId: string;
+  let partnerId: string;
+  let siteId: string;
+
+  beforeEach(async () => {
+    const env = await setupTestEnvironment({ scope: 'organization' });
+    orgId = env.organization.id;
+    partnerId = env.partner.id;
+    siteId = env.site.id;
+  });
+
+  async function evaluate(deviceId: string, config: ApprovalEvaluationConfig) {
+    return withDbAccessContext(
+      {
+        scope: 'organization',
+        orgId,
+        accessibleOrgIds: [orgId],
+        // patch_approvals is partner-scoped (RLS: breeze_has_partner_access);
+        // the evaluator queries it by the device-org's partner.
+        accessiblePartnerIds: [partnerId],
+        userId: null,
+      },
+      () => resolveApprovedPatchesForDevice(deviceId, orgId, config),
+    );
+  }
+
+  it('auto-approves a winget-shaped patch (severity=unknown, releaseDate=null) on a third_party-enabled ring', async () => {
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-a');
+    const patchId = await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+    });
+
+    const approved = await evaluate(deviceId, ringConfig(partnerId, ['third_party']));
+
+    expect(approved).toHaveLength(1);
+    expect(approved[0]!.patchId).toBe(patchId);
+    expect(approved[0]!.approvalReason).toBe('ring_auto_approve');
+  });
+
+  it('does NOT approve the same winget-shaped patch when the ring only enables OS sources', async () => {
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-b');
+    await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+    });
+
+    const approved = await evaluate(deviceId, ringConfig(partnerId, ['os']));
+
+    expect(approved).toEqual([]);
+  });
+
+  it('keeps OS severity gating unchanged on a third_party-enabled ring', async () => {
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-c');
+    const unknownOsPatch = await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'microsoft',
+      severity: 'unknown',
+    });
+    const criticalOsPatch = await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'microsoft',
+      severity: 'critical',
+    });
+
+    const approved = await evaluate(deviceId, ringConfig(partnerId, ['os', 'third_party']));
+
+    expect(approved.map((p) => p.patchId)).toEqual([criticalOsPatch]);
+    expect(approved.map((p) => p.patchId)).not.toContain(unknownOsPatch);
+  });
+
+  it('HOLDS a freshly-seen third-party patch under a deferral window (real device_patches.createdAt anchors it)', async () => {
+    // The winget shape has releaseDate=NULL, so the deferral window anchors on
+    // device_patches.createdAt — a column that only reaches the evaluator via
+    // the real SELECT projection. A just-seeded patch is created ~now, well
+    // inside a 7-day window, so it must be held. This exercises the first-seen
+    // fallback end-to-end (unit tests hand-feed firstSeenAt through the mock).
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-d');
+    await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+    });
+
+    const approved = await evaluate(deviceId, ringConfig(partnerId, ['third_party'], 7));
+
+    expect(approved).toEqual([]);
+  });
+
+  it('APPROVES a third-party patch first seen before the deferral window (real createdAt past the hold)', async () => {
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-e');
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 3600 * 1000);
+    const patchId = await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+      firstSeenAt: tenDaysAgo,
+    });
+
+    const approved = await evaluate(deviceId, ringConfig(partnerId, ['third_party'], 7));
+
+    expect(approved).toHaveLength(1);
+    expect(approved[0]!.patchId).toBe(patchId);
+    expect(approved[0]!.approvalReason).toBe('ring_auto_approve');
+  });
+
+  it('does NOT approve third-party when the ring toggle is off, even with sources third_party', async () => {
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-f');
+    await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+    });
+
+    const approved = await evaluate(
+      deviceId,
+      ringConfig(partnerId, ['os', 'third_party'], 0, {
+        enabled: true,
+        severities: ['critical'],
+        thirdPartyApps: false,
+      }),
+    );
+
+    expect(approved).toEqual([]);
+  });
+
+  it('does NOT approve third-party for a legacy snapshot with absent sources, even with the toggle on', async () => {
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-g');
+    await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+    });
+
+    const approved = await evaluate(
+      deviceId,
+      ringConfig(partnerId, undefined, 0, {
+        enabled: true,
+        severities: ['critical'],
+        thirdPartyApps: true,
+      }),
+    );
+
+    expect(approved).toEqual([]);
+  });
+
+  it('approves third-party on a third-party-only ring (empty severities)', async () => {
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-h');
+    const thirdPartyPatchId = await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+    });
+    const osPatchId = await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'microsoft',
+      severity: 'critical',
+    });
+
+    const approved = await evaluate(
+      deviceId,
+      ringConfig(partnerId, ['third_party'], 0, {
+        enabled: true,
+        severities: [],
+        thirdPartyApps: true,
+      }),
+    );
+
+    expect(approved.map((p) => p.patchId)).toEqual([thirdPartyPatchId]);
+    expect(approved.map((p) => p.patchId)).not.toContain(osPatchId);
+  });
+
+  it('legacy autoApprove without thirdPartyApps still approves 3P when severities were set (compat rule)', async () => {
+    const deviceId = await seedDevice(orgId, siteId, '3p-device-i');
+    const patchId = await seedPendingPatch({
+      orgId,
+      deviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+    });
+
+    const approved = await evaluate(
+      deviceId,
+      // No thirdPartyApps key at all — parseRingAutoApprove must derive it
+      // from severities.length > 0 (the pre-2026-08 compat rule).
+      ringConfig(partnerId, ['os', 'third_party'], 0, {
+        enabled: true,
+        severities: ['critical'],
+      }),
+    );
+
+    expect(approved).toHaveLength(1);
+    expect(approved[0]!.patchId).toBe(patchId);
+    expect(approved[0]!.approvalReason).toBe('ring_auto_approve');
+  });
+
+  it('applies thirdPartyDeferralDays over deferralDays using the first-seen anchor', async () => {
+    // autoApprove.deferralDays is deliberately set to a DIFFERENT value (1)
+    // than thirdPartyDeferralDays (7) so a bug that fell back to deferralDays
+    // instead of the third-party override would flip the "3 days ago" case.
+    const config = ringConfig(partnerId, ['third_party'], 0, {
+      enabled: true,
+      severities: ['critical'],
+      deferralDays: 1,
+      thirdPartyApps: true,
+      thirdPartyDeferralDays: 7,
+    });
+
+    const heldDeviceId = await seedDevice(orgId, siteId, '3p-device-j');
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 3600 * 1000);
+    await seedPendingPatch({
+      orgId,
+      deviceId: heldDeviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+      firstSeenAt: threeDaysAgo,
+    });
+    const heldApproved = await evaluate(heldDeviceId, config);
+    expect(heldApproved).toEqual([]);
+
+    const approvedDeviceId = await seedDevice(orgId, siteId, '3p-device-k');
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 3600 * 1000);
+    const patchId = await seedPendingPatch({
+      orgId,
+      deviceId: approvedDeviceId,
+      source: 'third_party',
+      severity: 'unknown',
+      packageId: 'Mozilla.Firefox',
+      firstSeenAt: eightDaysAgo,
+    });
+    const approved = await evaluate(approvedDeviceId, config);
+    expect(approved).toHaveLength(1);
+    expect(approved[0]!.patchId).toBe(patchId);
+    expect(approved[0]!.approvalReason).toBe('ring_auto_approve');
+  });
+});

@@ -1,0 +1,228 @@
+import { defineMiddleware } from 'astro:middleware';
+import { resolveConnectSrcDirective, resolveFrameSrcDirective, resolveUnsafeInlineCspOptions } from './lib/csp';
+import { LOCALE_COOKIE_NAME } from './lib/appearance';
+import { resolveLocaleFromCookie, resolveServerLocale } from './lib/i18n/serverLocale';
+
+/** Re-exported for direct unit testing alongside the CSP helpers below. */
+export { resolveLocaleFromCookie };
+
+function readFlag(name: string): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  return raw === '1' || raw === 'true';
+}
+
+export function buildFallbackCspDirectives(options: {
+  allowInlineScript: boolean;
+  allowInlineStyle: boolean;
+  isDev: boolean;
+}): string {
+  const directives: string[] = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'self'",
+    "object-src 'none'",
+    options.allowInlineScript
+      ? "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com"
+      : "script-src 'self' https://static.cloudflareinsights.com",
+    options.allowInlineStyle
+      ? "style-src 'self' 'unsafe-inline'"
+      : "style-src 'self'",
+    "worker-src 'self' blob:",
+    // The bare `https:` scheme-source is load-bearing, not laziness: the public
+    // /quick landing page renders the minting MSP's logo from a partner-supplied
+    // https URL (partner_login_branding.logo_url), so narrowing this to
+    // 'self' data: blob: would break partner branding on that page.
+    // ACCEPTED RISK: a partner-controlled logo host is a privacy beacon — it
+    // sees the IP, UA and Referer of every end user who loads the page. The MSP
+    // already knows the end user (it is their customer being supported), the
+    // API only ever emits an https: URL, and the page carries no session
+    // cookie, so the exposure is bounded to a third party the MSP chose.
+    "img-src 'self' data: blob: https:",
+    "font-src 'self' data:",
+    resolveFrameSrcDirective({}),
+    resolveConnectSrcDirective({ isDev: options.isDev })
+  ];
+
+  // Monaco Editor and xterm.js inject both inline style attributes and <style>
+  // elements at runtime (cursor positioning, syntax highlighting, terminal cell
+  // colors/themes).  Astro's experimental.csp auto-generates sha256 hashes for
+  // build-time <style> blocks, which per CSP Level 3 causes 'unsafe-inline' in
+  // style-src to be silently ignored.  The granular style-src-elem and
+  // style-src-attr directives are evaluated independently and don't inherit the
+  // hashes from style-src, so 'unsafe-inline' works in both.
+  directives.push("style-src-elem 'self' 'unsafe-inline'");
+  directives.push("style-src-attr 'unsafe-inline'");
+
+  if (!options.allowInlineScript) {
+    directives.push("script-src-attr 'none'");
+  }
+
+  return directives.join('; ');
+}
+
+const strictFallbackCspDirectives = buildFallbackCspDirectives({
+  allowInlineScript: false,
+  allowInlineStyle: false,
+  isDev: import.meta.env.DEV
+});
+
+export function relaxExistingCsp(
+  csp: string,
+  options: { allowInlineScript: boolean; allowInlineStyle: boolean }
+): string {
+  const directives = csp
+    .split(';')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  const patchDirective = (name: string, token: string): void => {
+    const index = directives.findIndex((directive) => directive.toLowerCase().startsWith(`${name} `));
+    if (index === -1) {
+      directives.push(`${name} ${token}`);
+      return;
+    }
+
+    const current = directives[index];
+    if (!new RegExp(`(^|\\s)${token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`).test(current)) {
+      directives[index] = `${current} ${token}`.trim();
+    }
+  };
+
+  if (options.allowInlineScript) {
+    patchDirective('script-src', "'unsafe-inline'");
+  }
+
+  if (options.allowInlineStyle) {
+    patchDirective('style-src', "'unsafe-inline'");
+  }
+
+  if (options.allowInlineScript) {
+    const filtered = directives.filter((directive) => !directive.toLowerCase().startsWith('script-src-attr '));
+    directives.length = 0;
+    directives.push(...filtered);
+  } else if (!directives.some((directive) => directive.toLowerCase().startsWith('script-src-attr '))) {
+    directives.push("script-src-attr 'none'");
+  }
+
+  // Monaco Editor and xterm.js require both inline style attributes and <style>
+  // elements.  Always ensure style-src-elem and style-src-attr are set with
+  // 'unsafe-inline' (see buildFallbackCspDirectives comment for rationale).
+  const filteredStyleGranular = directives.filter(
+    (directive) =>
+      !directive.toLowerCase().startsWith('style-src-elem ') &&
+      !directive.toLowerCase().startsWith('style-src-attr ')
+  );
+  directives.length = 0;
+  directives.push(...filteredStyleGranular);
+  directives.push("style-src-elem 'self' 'unsafe-inline'");
+  directives.push("style-src-attr 'unsafe-inline'");
+
+  return directives.join('; ');
+}
+
+export const onRequest = defineMiddleware(async (context, next) => {
+  // Explicit cookie wins; Accept-Language is a per-request fallback only — it
+  // is never written back into the cookie (that would let browser detection
+  // masquerade as a stored choice). See lib/i18n/serverLocale.ts.
+  context.locals.locale = resolveServerLocale({
+    cookieValue: context.cookies.get(LOCALE_COOKIE_NAME)?.value,
+    acceptLanguage: context.request.headers.get('accept-language'),
+  });
+
+  const response = await next();
+  const headers = new Headers(response.headers);
+  const strictDevCsp = import.meta.env.DEV && readFlag('CSP_STRICT_DEV');
+
+  // Default dev behavior: do not enforce CSP so Vite/HMR styles and scripts work.
+  // Use CSP_STRICT_DEV=1 when you explicitly want CSP enforcement in local dev.
+  if (import.meta.env.DEV && !strictDevCsp) {
+    headers.delete('Content-Security-Policy');
+    headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+    headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    headers.set('X-Frame-Options', 'SAMEORIGIN');
+    headers.set('X-Content-Type-Options', 'nosniff');
+
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
+  }
+
+  const {
+    allowInlineScript: allowUnsafeInlineScript,
+    allowInlineStyle: allowUnsafeInlineStyle,
+  } = resolveUnsafeInlineCspOptions({
+    isDev: import.meta.env.DEV,
+    strictDevCsp,
+  });
+
+  // Production is strict by default. Dev allows inline by default because Vite/Astro
+  // inject inline script/style for HMR and hydration bootstrap.
+  // Set CSP_STRICT_DEV=1 to force strict CSP locally, or use CSP_ALLOW_* flags to opt out.
+  if (allowUnsafeInlineScript || allowUnsafeInlineStyle) {
+    const existingCsp = headers.get('Content-Security-Policy');
+    if (existingCsp) {
+      headers.set(
+        'Content-Security-Policy',
+        relaxExistingCsp(existingCsp, {
+          allowInlineScript: allowUnsafeInlineScript,
+          allowInlineStyle: allowUnsafeInlineStyle
+        })
+      );
+    } else {
+      headers.set(
+        'Content-Security-Policy',
+        buildFallbackCspDirectives({
+          allowInlineScript: allowUnsafeInlineScript,
+          allowInlineStyle: allowUnsafeInlineStyle,
+          isDev: import.meta.env.DEV
+        })
+      );
+    }
+    headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+    headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    headers.set('X-Frame-Options', 'SAMEORIGIN');
+    headers.set('X-Content-Type-Options', 'nosniff');
+
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
+  }
+
+  const existingCsp = headers.get('Content-Security-Policy');
+
+  // Astro experimental.csp sets hash-based CSP for HTML responses.
+  // Keep this strict fallback for non-HTML responses or routes without Astro rendering.
+  if (!existingCsp) {
+    headers.set('Content-Security-Policy', strictFallbackCspDirectives);
+  } else {
+    let patchedCsp = existingCsp;
+    if (!/\bscript-src-attr\b/i.test(patchedCsp)) {
+      patchedCsp = `${patchedCsp}; script-src-attr 'none'`;
+    }
+    // Monaco Editor and xterm.js inject <style> elements and inline style
+    // attributes at runtime.  Astro's hashes in style-src nullify 'unsafe-inline'
+    // there, but these granular directives are evaluated independently.
+    if (!/\bstyle-src-elem\b/i.test(patchedCsp)) {
+      patchedCsp = `${patchedCsp}; style-src-elem 'self' 'unsafe-inline'`;
+    }
+    if (!/\bstyle-src-attr\b/i.test(patchedCsp)) {
+      patchedCsp = `${patchedCsp}; style-src-attr 'unsafe-inline'`;
+    }
+    headers.set('Content-Security-Policy', patchedCsp);
+  }
+  headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+  headers.set('X-Frame-Options', 'DENY');
+  headers.set('X-Content-Type-Options', 'nosniff');
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+});

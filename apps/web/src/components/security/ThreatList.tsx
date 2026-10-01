@@ -1,0 +1,532 @@
+import { useTranslation } from "react-i18next";
+import "@/lib/i18n";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Filter,
+  Loader2,
+  Search,
+  ShieldAlert,
+  ShieldCheck,
+} from "lucide-react";
+import { cn, friendlyFetchError } from "@/lib/utils";
+import { errorKindOf, throwIfNotOk, type LoadErrorKind } from "@/lib/httpError";
+import { fetchWithAuth } from "@/stores/auth";
+import { formatDateTime } from "@/lib/dateTimeFormat";
+import { runAction, ActionError } from "@/lib/runAction";
+import { showToast } from "../shared/Toast";
+import AccessDenied from "../shared/AccessDenied";
+import {
+  ResponsiveTable,
+  DataCard,
+  CardField,
+} from "../shared/ResponsiveTable";
+type ThreatSeverity = "low" | "medium" | "high" | "critical";
+type ThreatStatus = "active" | "quarantined" | "removed";
+type Threat = {
+  id: string;
+  deviceId: string;
+  deviceName: string;
+  name: string;
+  category: string;
+  severity: ThreatSeverity;
+  status: ThreatStatus;
+  detectedAt: string;
+  filePath: string;
+};
+const severityBadge: Record<ThreatSeverity, string> = {
+  low: "bg-blue-500/20 text-blue-700 border-blue-500/30",
+  medium: "bg-yellow-500/20 text-yellow-800 border-yellow-500/40",
+  high: "bg-orange-500/20 text-orange-700 border-orange-500/40",
+  critical: "bg-red-500/20 text-red-700 border-red-500/40",
+};
+const statusBadge: Record<ThreatStatus, string> = {
+  active: "bg-red-500/15 text-red-700 border-red-500/30",
+  quarantined: "bg-amber-500/20 text-amber-800 border-amber-500/40",
+  removed: "bg-emerald-500/20 text-emerald-700 border-emerald-500/40",
+};
+function formatDetectedAt(value: string, timezone?: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return formatDateTime(date, { timeZone: timezone });
+}
+interface ThreatListProps {
+  timezone?: string;
+  /**
+   * Selects a threat for the detail view (#MSA-3 — `ThreatDetail` shipped in
+   * #6573 but was never mounted, so a quarantined threat had no UI path to
+   * restore). The whole row is a mouse target; keyboard and screen-reader
+   * users get a real <button> on the threat name, so the row keeps its
+   * table-row role and the select checkbox keeps Space.
+   */
+  onSelectThreat?: (threatId: string) => void;
+}
+export default function ThreatList({ timezone, onSelectThreat }: ThreatListProps) {
+  const { t } = useTranslation("security");
+  const [query, setQuery] = useState("");
+  const [severityFilter, setSeverityFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState<string>("all");
+  const [deviceFilter, setDeviceFilter] = useState<string>("all");
+  const [startDate, setStartDate] = useState<string>("");
+  const [endDate, setEndDate] = useState<string>("");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [threats, setThreats] = useState<Threat[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [acting, setActing] = useState(false);
+  const [error, setError] = useState<string>();
+  const [errorKind, setErrorKind] = useState<LoadErrorKind>("none");
+  const abortRef = useRef<AbortController | null>(null);
+  const fetchThreats = useCallback(async () => {
+    setError(undefined);
+    setErrorKind("none");
+    setLoading(true);
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      const params = new URLSearchParams({ limit: "100" });
+      if (query.trim()) params.set("search", query.trim());
+      if (severityFilter !== "all") params.set("severity", severityFilter);
+      if (statusFilter !== "all") params.set("status", statusFilter);
+      if (startDate) params.set("startDate", new Date(startDate).toISOString());
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        params.set("endDate", end.toISOString());
+      }
+      const response = await fetchWithAuth(
+        `/security/threats?${params.toString()}`,
+        { signal: controller.signal },
+      );
+      // HttpError (not a bare Error) so a 403 survives the throw and the render
+      // can tell "you may not see this" from "this broke, try again" (#2472).
+      throwIfNotOk(response);
+      const payload = await response.json();
+      let nextThreats: Threat[] = Array.isArray(payload.data)
+        ? payload.data
+        : [];
+      if (deviceFilter !== "all") {
+        nextThreats = nextThreats.filter(
+          (threat) => threat.deviceName === deviceFilter,
+        );
+      }
+      setThreats(nextThreats);
+      setSelectedIds(new Set());
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      const kind = errorKindOf(err);
+      setErrorKind(kind);
+      // 'denied' renders AccessDenied, which supplies its own copy.
+      if (kind === "other") setError(friendlyFetchError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [deviceFilter, endDate, query, severityFilter, startDate, statusFilter]);
+  useEffect(() => {
+    fetchThreats();
+    return () => abortRef.current?.abort();
+  }, [fetchThreats]);
+  const deviceOptions = useMemo(
+    () =>
+      Array.from(new Set(threats.map((threat) => threat.deviceName))).sort(),
+    [threats],
+  );
+  const handleSelectAll = (checked: boolean) => {
+    if (checked) {
+      setSelectedIds(new Set(threats.map((threat) => threat.id)));
+    } else {
+      setSelectedIds(new Set());
+    }
+  };
+  const handleSelectOne = (id: string, checked: boolean) => {
+    const next = new Set(selectedIds);
+    if (checked) next.add(id);
+    else next.delete(id);
+    setSelectedIds(next);
+  };
+  // Sequential runAction per id (rather than Promise.all + one throw) so each
+  // failure surfaces its own toast instead of one call silently masking the
+  // rest, and a single aggregate success toast fires once at the end instead
+  // of N toasts for an N-device bulk action.
+  const handleBulkAction = async (action: "quarantine" | "remove") => {
+    if (selectedIds.size === 0) return;
+    setActing(true);
+    setError(undefined);
+    const ids = Array.from(selectedIds);
+    let succeeded = 0;
+    try {
+      for (const id of ids) {
+        try {
+          await runAction({
+            request: () =>
+              fetchWithAuth(`/security/threats/${id}/${action}`, { method: "POST" }),
+            errorFallback: t("securityThreatList.actionFailed"),
+          });
+          succeeded += 1;
+        } catch (err) {
+          if (err instanceof ActionError && err.status === 401) return; // let the auth redirect handle it
+          // Non-401 ActionErrors were already toasted by runAction; keep going
+          // so one failing device doesn't block the rest of the batch.
+        }
+      }
+      if (succeeded > 0) {
+        showToast({
+          message: t("securityThreatList.actionQueuedCount", { count: succeeded }),
+          type: "success",
+        });
+      }
+      await fetchThreats();
+    } finally {
+      setActing(false);
+    }
+  };
+  // A 403 is terminal for this user — a retry hits the same permission gate. Stop
+  // before the filter bar and table: falling through would paint an empty
+  // threats list and tell someone who may not see the data that there are no
+  // threats. Fabricated emptiness is worse than an error. (#2472)
+  if (errorKind === "denied") {
+    return (
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        <AccessDenied testId="security-threat-list-denied" />
+      </div>
+    );
+  }
+  const allSelected =
+    threats.length > 0 && threats.every((threat) => selectedIds.has(threat.id));
+  const someSelected = threats.some((threat) => selectedIds.has(threat.id));
+  // Row pieces shared by the desktop table and the mobile cards.
+  const renderSelectCheckbox = (threat: Threat) => (
+    <input
+      type="checkbox"
+      data-testid={`threat-row-select-${threat.id}`}
+      checked={selectedIds.has(threat.id)}
+      onChange={(event) => handleSelectOne(threat.id, event.target.checked)}
+      onClick={(event) => event.stopPropagation()}
+      className="h-4 w-4 rounded border-border"
+    />
+  );
+  const handleRowActivate = (threat: Threat) => {
+    onSelectThreat?.(threat.id);
+  };
+  const rowInteractionProps = (threat: Threat) =>
+    onSelectThreat
+      ? {
+          "data-testid": `threat-row-${threat.id}`,
+          onClick: () => handleRowActivate(threat),
+        }
+      : {};
+  const renderThreatName = (threat: Threat) =>
+    onSelectThreat ? (
+      <button
+        type="button"
+        data-testid={`threat-open-${threat.id}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          handleRowActivate(threat);
+        }}
+        className="text-left font-medium text-primary hover:underline focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
+      >
+        {threat.name}
+      </button>
+    ) : (
+      threat.name
+    );
+  const renderSeverityBadge = (threat: Threat) => (
+    <span
+      className={cn(
+        "inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold",
+        severityBadge[threat.severity],
+      )}
+    >
+      {threat.severity}
+    </span>
+  );
+  const renderStatusBadge = (threat: Threat) => (
+    <span
+      className={cn(
+        "inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold",
+        statusBadge[threat.status],
+      )}
+    >
+      {threat.status}
+    </span>
+  );
+  return (
+    <div className="rounded-lg border bg-card p-6 shadow-xs">
+      {error && (
+        <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {t("securityThreatList.threats")}
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            {t("securityThreatList.threatsMatchYourFilters", {
+              count: threats.length,
+            })}
+          </p>
+        </div>
+        <div className="flex flex-1 flex-col gap-2 lg:flex-row lg:items-center lg:justify-end">
+          <div className="relative w-full lg:w-64">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="search"
+              placeholder={t("securityThreatList.searchByThreatName")}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <select
+              value={severityFilter}
+              onChange={(event) => setSeverityFilter(event.target.value)}
+              className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            >
+              <option value="all">
+                {t("securityThreatList.allSeverities")}
+              </option>
+              <option value="low">{t("securityThreatList.low")}</option>
+              <option value="medium">{t("securityThreatList.medium")}</option>
+              <option value="high">{t("securityThreatList.high")}</option>
+              <option value="critical">
+                {t("securityThreatList.critical")}
+              </option>
+            </select>
+            <select
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value)}
+              className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            >
+              <option value="all">{t("securityThreatList.allStatuses")}</option>
+              <option value="active">{t("securityThreatList.active")}</option>
+              <option value="quarantined">
+                {t("securityThreatList.quarantined")}
+              </option>
+              <option value="removed">{t("securityThreatList.removed")}</option>
+            </select>
+            <select
+              value={deviceFilter}
+              onChange={(event) => setDeviceFilter(event.target.value)}
+              className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            >
+              <option value="all">{t("securityThreatList.allDevices")}</option>
+              {deviceOptions.map((device) => (
+                <option key={device} value={device}>
+                  {device}
+                </option>
+              ))}
+            </select>
+            <div className="flex items-center gap-2 rounded-md border bg-background px-3 py-2 text-sm">
+              <Filter className="h-4 w-4 text-muted-foreground" />
+              <input
+                type="date"
+                value={startDate}
+                onChange={(event) => setStartDate(event.target.value)}
+                className="bg-transparent text-sm focus:outline-hidden"
+              />
+              <span className="text-muted-foreground">to</span>
+              <input
+                type="date"
+                value={endDate}
+                onChange={(event) => setEndDate(event.target.value)}
+                className="bg-transparent text-sm focus:outline-hidden"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={fetchThreats}
+              className="h-10 rounded-md border bg-background px-3 text-sm hover:bg-muted"
+            >
+              {t("securityThreatList.refresh")}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {selectedIds.size > 0 && (
+        <div className="mt-4 flex flex-wrap items-center gap-3 rounded-md border bg-muted/40 px-4 py-3">
+          <span className="text-sm font-medium">
+            {t("securityThreatList.selectedCount", { count: selectedIds.size })}
+          </span>
+          <button
+            type="button"
+            data-testid="threat-bulk-quarantine"
+            onClick={() => handleBulkAction("quarantine")}
+            disabled={acting}
+            className="flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-muted disabled:opacity-60"
+          >
+            {acting ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <ShieldAlert className="h-4 w-4" />
+            )}
+            {t("securityThreatList.quarantineSelected")}
+          </button>
+          <button
+            type="button"
+            data-testid="threat-bulk-remove"
+            onClick={() => handleBulkAction("remove")}
+            disabled={acting}
+            className="flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-muted disabled:opacity-60"
+          >
+            <ShieldCheck className="h-4 w-4" />
+            {t("securityThreatList.removeSelected")}
+          </button>
+          <button
+            type="button"
+            onClick={() => setSelectedIds(new Set())}
+            className="text-sm text-muted-foreground hover:text-foreground"
+          >
+            {t("securityThreatList.clearSelection")}
+          </button>
+        </div>
+      )}
+
+      <ResponsiveTable
+        className="mt-6"
+        table={
+          <table className="min-w-full divide-y">
+            <thead className="bg-muted/40">
+              <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                <th className="px-4 py-3">
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    ref={(element) => {
+                      if (element)
+                        element.indeterminate = someSelected && !allSelected;
+                    }}
+                    onChange={(event) => handleSelectAll(event.target.checked)}
+                    className="h-4 w-4 rounded border-border"
+                  />
+                </th>
+                <th className="px-4 py-3">{t("securityThreatList.device")}</th>
+                <th className="px-4 py-3">{t("securityThreatList.threat")}</th>
+                <th className="px-4 py-3">{t("securityThreatList.type")}</th>
+                <th className="px-4 py-3">
+                  {t("securityThreatList.severity")}
+                </th>
+                <th className="px-4 py-3">{t("securityThreatList.status")}</th>
+                <th className="px-4 py-3">
+                  {t("securityThreatList.detected")}
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {loading ? (
+                <tr>
+                  <td
+                    colSpan={7}
+                    className="px-4 py-8 text-center text-sm text-muted-foreground"
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {t("securityThreatList.loadingThreats")}
+                    </span>
+                  </td>
+                </tr>
+              ) : threats.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={7}
+                    className="px-4 py-8 text-center text-sm text-muted-foreground"
+                  >
+                    {t("securityThreatList.noThreatsFound")}
+                  </td>
+                </tr>
+              ) : (
+                threats.map((threat) => (
+                  <tr
+                    key={threat.id}
+                    className={cn(
+                      "text-sm",
+                      onSelectThreat && "cursor-pointer hover:bg-muted/40",
+                    )}
+                    {...rowInteractionProps(threat)}
+                  >
+                    <td className="px-4 py-3">
+                      {renderSelectCheckbox(threat)}
+                    </td>
+                    <td className="px-4 py-3 font-medium">
+                      {threat.deviceName}
+                    </td>
+                    <td className="px-4 py-3">{renderThreatName(threat)}</td>
+                    <td className="px-4 py-3 capitalize text-muted-foreground">
+                      {threat.category}
+                    </td>
+                    <td className="px-4 py-3">{renderSeverityBadge(threat)}</td>
+                    <td className="px-4 py-3">{renderStatusBadge(threat)}</td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">
+                      {formatDetectedAt(threat.detectedAt, timezone)}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        }
+        cards={
+          loading ? (
+            <DataCard>
+              <p className="inline-flex items-center justify-center gap-2 py-2 text-center text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t("securityThreatList.loadingThreats")}
+              </p>
+            </DataCard>
+          ) : threats.length === 0 ? (
+            <DataCard>
+              <p className="py-2 text-center text-sm text-muted-foreground">
+                {t("securityThreatList.noThreatsFound")}
+              </p>
+            </DataCard>
+          ) : (
+            threats.map((threat) => (
+              <DataCard
+                key={threat.id}
+                onClick={onSelectThreat ? () => handleRowActivate(threat) : undefined}
+              >
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 shrink-0">
+                    {renderSelectCheckbox(threat)}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate font-semibold">
+                          {renderThreatName(threat)}
+                        </div>
+                        <div className="truncate text-xs capitalize text-muted-foreground">
+                          {threat.category}
+                        </div>
+                      </div>
+                      <div className="shrink-0">
+                        {renderSeverityBadge(threat)}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-3 space-y-2 border-t pt-3">
+                  <CardField label={t("securityThreatList.device")}>
+                    <span className="font-medium">{threat.deviceName}</span>
+                  </CardField>
+                  <CardField label={t("securityThreatList.status")}>
+                    {renderStatusBadge(threat)}
+                  </CardField>
+                  <CardField label={t("securityThreatList.detected")}>
+                    <span className="text-xs text-muted-foreground">
+                      {formatDetectedAt(threat.detectedAt, timezone)}
+                    </span>
+                  </CardField>
+                </div>
+              </DataCard>
+            ))
+          )
+        }
+      />
+    </div>
+  );
+}

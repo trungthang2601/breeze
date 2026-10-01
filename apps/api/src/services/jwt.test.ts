@@ -1,0 +1,467 @@
+import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from 'vitest';
+import { SignJWT } from 'jose';
+import {
+  createAccessToken,
+  createRefreshToken,
+  verifyToken,
+  createTokenPair,
+  createViewerAccessToken,
+  verifyViewerAccessToken,
+  VIEWER_ACCESS_TOKEN_EXPIRY_SECONDS,
+} from './jwt';
+
+describe('jwt service', () => {
+  const testPayload = {
+    sub: 'user-123',
+    email: 'test@example.com',
+    roleId: 'role-123',
+    orgId: 'org-123',
+    partnerId: 'partner-123',
+    scope: 'organization' as const,
+    mfa: false
+  };
+
+  describe('createAccessToken', () => {
+    it('should create a valid JWT access token', async () => {
+      const token = await createAccessToken(testPayload);
+
+      expect(token).toBeDefined();
+      expect(typeof token).toBe('string');
+      expect(token.split('.')).toHaveLength(3); // JWT has 3 parts
+    });
+  });
+
+  describe('createRefreshToken', () => {
+    it('should create a valid JWT refresh token', async () => {
+      const token = await createRefreshToken(testPayload);
+
+      expect(token).toBeDefined();
+      expect(typeof token).toBe('string');
+      expect(token.split('.')).toHaveLength(3);
+    });
+  });
+
+  describe('verifyToken', () => {
+    it('should verify and decode an access token', async () => {
+      const token = await createAccessToken(testPayload);
+      const decoded = await verifyToken(token);
+
+      expect(decoded).not.toBeNull();
+      expect(decoded?.sub).toBe(testPayload.sub);
+      expect(decoded?.email).toBe(testPayload.email);
+      expect(decoded?.type).toBe('access');
+    });
+
+    it('should verify and decode a refresh token', async () => {
+      const token = await createRefreshToken(testPayload);
+      const decoded = await verifyToken(token);
+
+      expect(decoded).not.toBeNull();
+      expect(decoded?.sub).toBe(testPayload.sub);
+      expect(decoded?.type).toBe('refresh');
+      expect(decoded?.jti).toBeDefined();
+    });
+
+    it('should return null for invalid token', async () => {
+      const decoded = await verifyToken('invalid-token');
+      expect(decoded).toBeNull();
+    });
+
+    it('should return null for tampered token', async () => {
+      const token = await createAccessToken(testPayload);
+      const tamperedToken = token.slice(0, -5) + 'xxxxx';
+
+      const decoded = await verifyToken(tamperedToken);
+      expect(decoded).toBeNull();
+    });
+
+    // G2 — explicit HS256-only allowlist
+    it('rejects a token signed with a non-allowlisted alg (G2)', async () => {
+      const secret = new TextEncoder().encode(process.env.JWT_SECRET!);
+      // Sign a token with HS384 — correct issuer/audience but wrong alg.
+      // With an explicit algorithms: ['HS256'] allowlist, jose must reject this.
+      const hs384Token = await new SignJWT({
+        ...testPayload,
+        type: 'access'
+      })
+        .setProtectedHeader({ alg: 'HS384' })
+        .setIssuedAt()
+        .setExpirationTime('15m')
+        .setIssuer('breeze')
+        .setAudience('breeze-api')
+        .sign(secret);
+
+      const decoded = await verifyToken(hs384Token);
+      expect(decoded).toBeNull();
+    });
+
+    // Non-JWT bearer tokens (API keys, agent tokens, enrollment tokens) routinely
+    // hit verifyToken when a route accepts multiple credential formats. Logging
+    // "Token verification failed" for those is misleading — stderr aggregators
+    // surface it as a warning right next to a successful 200 from the fallback.
+    it('does not log when the input is structurally not a JWT', async () => {
+      const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      try {
+        expect(await verifyToken('brz_some_api_key_not_a_jwt')).toBeNull();
+        expect(await verifyToken('not-a-jwt-at-all')).toBeNull();
+        expect(await verifyToken('')).toBeNull();
+        expect(debugSpy).not.toHaveBeenCalled();
+      } finally {
+        debugSpy.mockRestore();
+      }
+    });
+
+    it('still logs when a real JWT fails verification (tampered signature)', async () => {
+      const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+      try {
+        const token = await createAccessToken(testPayload);
+        const tamperedToken = token.slice(0, -5) + 'xxxxx';
+        expect(await verifyToken(tamperedToken)).toBeNull();
+        expect(debugSpy).toHaveBeenCalled();
+      } finally {
+        debugSpy.mockRestore();
+      }
+    });
+  });
+
+  describe('mobile device binding claim (mdid) — SR-001', () => {
+    it('round-trips an mdid claim through an access token', async () => {
+      const token = await createAccessToken({ ...testPayload, mdid: 'install-abc-123' });
+      const decoded = await verifyToken(token);
+      expect(decoded?.mdid).toBe('install-abc-123');
+    });
+
+    it('round-trips an mdid claim through a refresh token', async () => {
+      const token = await createRefreshToken({ ...testPayload, mdid: 'install-abc-123' });
+      const decoded = await verifyToken(token);
+      expect(decoded?.mdid).toBe('install-abc-123');
+    });
+
+    it('leaves mdid undefined when not bound (web / MCP / OAuth tokens)', async () => {
+      const decoded = await verifyToken(await createAccessToken(testPayload));
+      expect(decoded?.mdid).toBeUndefined();
+    });
+  });
+
+  describe('mfa assurance-source claim (mfa_src) — spec D6', () => {
+    it('round-trips mfa_src through access and refresh tokens', async () => {
+      const access = await verifyToken(await createAccessToken({ ...testPayload, mfa: true, mfa_src: 'factor' }));
+      const refresh = await verifyToken(await createRefreshToken({ ...testPayload, mfa: true, mfa_src: 'idp' }));
+      expect(access?.mfa_src).toBe('factor');
+      expect(refresh?.mfa_src).toBe('idp');
+    });
+
+    it('leaves mfa_src undefined on a token minted without it (legacy = policy by contract)', async () => {
+      const decoded = await verifyToken(await createAccessToken(testPayload));
+      expect(decoded?.mfa_src).toBeUndefined();
+      expect('mfa_src' in (decoded ?? {})).toBe(true); // key present, value undefined — same shape as mdid
+    });
+
+    it('drops an unknown mfa_src value instead of typing it through', async () => {
+      const secret = new TextEncoder().encode(process.env.JWT_SECRET!);
+      const forged = await new SignJWT({ ...testPayload, mfa: true, mfa_src: 'bogus', type: 'access' })
+        .setProtectedHeader({ alg: 'HS256' })
+        .setIssuedAt()
+        .setExpirationTime('15m')
+        .setIssuer('breeze')
+        .setAudience('breeze-api')
+        .sign(secret);
+      const decoded = await verifyToken(forged);
+      expect(decoded).not.toBeNull();
+      expect(decoded?.mfa).toBe(true);
+      expect(decoded?.mfa_src).toBeUndefined();
+    });
+  });
+
+  describe('createTokenPair', () => {
+    it('should create both access and refresh tokens', async () => {
+      const result = await createTokenPair(testPayload);
+
+      expect(result.accessToken).toBeDefined();
+      expect(result.refreshToken).toBeDefined();
+      expect(result.expiresInSeconds).toBe(15 * 60);
+    });
+
+    it('should create tokens with correct types', async () => {
+      const result = await createTokenPair(testPayload);
+
+      const accessDecoded = await verifyToken(result.accessToken);
+      const refreshDecoded = await verifyToken(result.refreshToken);
+
+      expect(accessDecoded?.type).toBe('access');
+      expect(refreshDecoded?.type).toBe('refresh');
+      expect(accessDecoded?.jti).toBeUndefined();
+      expect(refreshDecoded?.jti).toBeDefined();
+    });
+
+    it('embeds an explicitly supplied refresh JTI for guarded family currentness', async () => {
+      const refreshJti = '33333333-3333-4333-8333-333333333333';
+
+      const result = await createTokenPair(testPayload, { refreshJti });
+
+      expect(result.refreshJti).toBe(refreshJti);
+      await expect(verifyToken(result.refreshToken)).resolves.toMatchObject({
+        type: 'refresh',
+        jti: refreshJti,
+      });
+    });
+
+    it('still generates a fresh refresh JTI when no override is supplied', async () => {
+      const first = await createTokenPair(testPayload);
+      const second = await createTokenPair(testPayload);
+
+      expect(first.refreshJti).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(second.refreshJti).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(second.refreshJti).not.toBe(first.refreshJti);
+    });
+  });
+
+  describe('signing keyring + kid header — zero-downtime rotation', () => {
+    let envBackup: Record<string, string | undefined>;
+    const k1Secret = 'k1-secret-must-be-at-least-32-characters-long-aaaaa';
+    const k2Secret = 'k2-secret-must-be-at-least-32-characters-long-bbbbb';
+
+    beforeEach(() => {
+      envBackup = {
+        JWT_SECRET: process.env.JWT_SECRET,
+        JWT_SIGNING_KEYRING: process.env.JWT_SIGNING_KEYRING,
+        JWT_ACTIVE_KID: process.env.JWT_ACTIVE_KID
+      };
+    });
+
+    afterEach(() => {
+      for (const [k, v] of Object.entries(envBackup)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+
+    function decodeHeader(token: string): Record<string, unknown> {
+      const headerB64 = token.split('.')[0] ?? '';
+      return JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
+    }
+
+    it('signs with active kid in protected header', async () => {
+      delete process.env.JWT_SECRET;
+      process.env.JWT_SIGNING_KEYRING = JSON.stringify({ k1: k1Secret, k2: k2Secret });
+      process.env.JWT_ACTIVE_KID = 'k2';
+
+      const token = await createAccessToken(testPayload);
+      const header = decodeHeader(token);
+
+      expect(header.kid).toBe('k2');
+      expect(header.alg).toBe('HS256');
+
+      const decoded = await verifyToken(token);
+      expect(decoded?.sub).toBe(testPayload.sub);
+    });
+
+    it('verifies a token signed under a prior kid (rotation)', async () => {
+      process.env.JWT_SECRET = 'legacy-secret-must-be-at-least-32-chars-long-zzzz';
+      process.env.JWT_SIGNING_KEYRING = JSON.stringify({ k1: k1Secret, k2: k2Secret });
+      process.env.JWT_ACTIVE_KID = 'k1';
+
+      // Mint under k1
+      const oldToken = await createAccessToken(testPayload);
+      expect(decodeHeader(oldToken).kid).toBe('k1');
+
+      // Operator rotates: active flips to k2 (k1 stays in keyring for verify)
+      process.env.JWT_ACTIVE_KID = 'k2';
+
+      const decoded = await verifyToken(oldToken);
+      expect(decoded).not.toBeNull();
+      expect(decoded?.sub).toBe(testPayload.sub);
+
+      const newToken = await createAccessToken(testPayload);
+      expect(decodeHeader(newToken).kid).toBe('k2');
+    });
+
+    it('rejects tokens whose kid is not in the keyring', async () => {
+      process.env.JWT_SECRET = 'legacy-secret-must-be-at-least-32-chars-long-zzzz';
+      process.env.JWT_SIGNING_KEYRING = JSON.stringify({ k1: k1Secret, k2: k2Secret });
+      process.env.JWT_ACTIVE_KID = 'k1';
+
+      // Manually craft a token with an unknown kid signed with k1's bytes —
+      // a verifier must reject it because its kid is not in the keyring.
+      const rogue = await new SignJWT({ ...testPayload, type: 'access' })
+        .setProtectedHeader({ alg: 'HS256', kid: 'unknown-kid' })
+        .setIssuedAt()
+        .setExpirationTime('15m')
+        .setIssuer('breeze')
+        .setAudience('breeze-api')
+        .sign(new TextEncoder().encode(k1Secret));
+
+      const decoded = await verifyToken(rogue);
+      expect(decoded).toBeNull();
+    });
+
+    it('verifies legacy JWT_SECRET tokens (no keyring set)', async () => {
+      delete process.env.JWT_SIGNING_KEYRING;
+      delete process.env.JWT_ACTIVE_KID;
+      // JWT_SECRET inherited from the test runner env.
+
+      const token = await createAccessToken(testPayload);
+      // Single-secret mode: no kid header.
+      expect(decodeHeader(token).kid).toBeUndefined();
+
+      const decoded = await verifyToken(token);
+      expect(decoded).not.toBeNull();
+      expect(decoded?.sub).toBe(testPayload.sub);
+    });
+
+    it('verifies legacy-signed token after keyring is added (transition window)', async () => {
+      // Step 1: mint a token in legacy single-secret mode (no kid).
+      delete process.env.JWT_SIGNING_KEYRING;
+      delete process.env.JWT_ACTIVE_KID;
+      process.env.JWT_SECRET = 'legacy-secret-must-be-at-least-32-chars-long-zzzz';
+
+      const legacyToken = await createAccessToken(testPayload);
+      expect(decodeHeader(legacyToken).kid).toBeUndefined();
+
+      // Step 2: operator deploys keyring, keeps JWT_SECRET as fallback.
+      process.env.JWT_SIGNING_KEYRING = JSON.stringify({ k1: k1Secret });
+      process.env.JWT_ACTIVE_KID = 'k1';
+      // JWT_SECRET unchanged.
+
+      const decoded = await verifyToken(legacyToken);
+      expect(decoded).not.toBeNull();
+      expect(decoded?.sub).toBe(testPayload.sub);
+    });
+  });
+
+  describe('epoch + sid claims', () => {
+    beforeAll(() => {
+      process.env.JWT_SECRET = process.env.JWT_SECRET ?? 'test-secret-at-least-32-chars-long-xxxxx';
+    });
+
+    it('carries aep/mep on both tokens and sid on the access token', async () => {
+      const pair = await createTokenPair(
+        {
+          sub: '11111111-1111-1111-1111-111111111111',
+          email: 'a@b.com',
+          roleId: null,
+          orgId: null,
+          partnerId: null,
+          scope: 'system',
+          mfa: true,
+          aep: 4,
+          mep: 2,
+        },
+        { refreshFam: '22222222-2222-2222-2222-222222222222' }
+      );
+
+      const access = await verifyToken(pair.accessToken);
+      const refresh = await verifyToken(pair.refreshToken);
+      expect(access?.aep).toBe(4);
+      expect(access?.mep).toBe(2);
+      expect(access?.sid).toBe('22222222-2222-2222-2222-222222222222');
+      expect(access?.fam).toBeUndefined();
+      expect(refresh?.aep).toBe(4);
+      expect(refresh?.mep).toBe(2);
+      expect(refresh?.fam).toBe('22222222-2222-2222-2222-222222222222');
+    });
+  });
+});
+
+describe('Wave 4 viewer-token MFA lineage', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('roots an assured viewer token with one signed absolute expiry boundary', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-25T12:00:00.000Z'));
+
+    const token = await createViewerAccessToken({
+      sub: 'viewer-user',
+      email: 'viewer@example.com',
+      sessionId: 'viewer-session',
+      mfaSatisfied: true,
+    });
+    const payload = await verifyViewerAccessToken(token);
+
+    expect(payload).toMatchObject({
+      mfaSatisfied: true,
+      assuranceAbsoluteExpiresAt: expect.any(Number),
+      exp: expect.any(Number),
+    });
+    expect(payload?.assuranceAbsoluteExpiresAt).toBe(payload?.exp);
+    expect(payload?.exp! - payload?.iat!).toBe(VIEWER_ACCESS_TOKEN_EXPIRY_SECONDS);
+  });
+
+  it('keeps descendants assured without extending the parent or root expiry', async () => {
+    vi.useFakeTimers();
+    const t0 = new Date('2026-07-25T12:00:00.000Z');
+    vi.setSystemTime(t0);
+    const rootToken = await createViewerAccessToken({
+      sub: 'viewer-user',
+      email: 'viewer@example.com',
+      sessionId: 'root-session',
+      mfaSatisfied: true,
+    });
+    const root = await verifyViewerAccessToken(rootToken);
+    expect(root).not.toBeNull();
+
+    vi.setSystemTime(new Date(t0.getTime() + 60_000));
+    const jwtModule = await import('./jwt');
+    const descendantToken = await jwtModule.createViewerDescendantAccessToken(root!, {
+      sessionId: 'descendant-session',
+    });
+    const descendant = await verifyViewerAccessToken(descendantToken);
+
+    expect(descendant).toMatchObject({
+      sessionId: 'descendant-session',
+      mfaSatisfied: true,
+      assuranceAbsoluteExpiresAt: root?.assuranceAbsoluteExpiresAt,
+    });
+    expect(descendant?.exp).toBeLessThanOrEqual(root!.exp!);
+    expect(descendant?.exp).toBeLessThanOrEqual(root!.assuranceAbsoluteExpiresAt!);
+  });
+
+  it('rejects unassured, malformed, or exhausted parents before descendant issuance', async () => {
+    const jwtModule = await import('./jwt');
+    const base = {
+      sub: 'viewer-user',
+      email: 'viewer@example.com',
+      sessionId: 'root-session',
+      purpose: 'viewer' as const,
+      jti: 'viewer-jti',
+      iat: 1_000,
+      exp: 2_000,
+    };
+
+    await expect(
+      jwtModule.createViewerDescendantAccessToken(base, { sessionId: 'next' }),
+    ).rejects.toThrow('MFA');
+    await expect(
+      jwtModule.createViewerDescendantAccessToken(
+        { ...base, mfaSatisfied: true, assuranceAbsoluteExpiresAt: Number.NaN },
+        { sessionId: 'next' },
+      ),
+    ).rejects.toThrow('absolute');
+    await expect(
+      jwtModule.createViewerDescendantAccessToken(
+        { ...base, mfaSatisfied: true, assuranceAbsoluteExpiresAt: 2_000, exp: 1 },
+        { sessionId: 'next' },
+      ),
+    ).rejects.toThrow('expired');
+  });
+
+  it('accepts the token until its last millisecond and rejects it at expiry', async () => {
+    vi.useFakeTimers();
+    const t0 = new Date('2026-07-25T12:00:00.000Z');
+    vi.setSystemTime(t0);
+    const token = await createViewerAccessToken({
+      sub: 'viewer-user',
+      email: 'viewer@example.com',
+      sessionId: 'viewer-session',
+      mfaSatisfied: true,
+    });
+
+    vi.setSystemTime(new Date(t0.getTime() + VIEWER_ACCESS_TOKEN_EXPIRY_SECONDS * 1000 - 1));
+    expect(await verifyViewerAccessToken(token)).not.toBeNull();
+
+    vi.setSystemTime(new Date(t0.getTime() + VIEWER_ACCESS_TOKEN_EXPIRY_SECONDS * 1000));
+    expect(await verifyViewerAccessToken(token)).toBeNull();
+  });
+});

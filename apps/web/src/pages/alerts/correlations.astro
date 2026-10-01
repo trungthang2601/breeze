@@ -1,0 +1,22 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import AlertsTabStrip from '../../components/alerts/AlertsTabStrip';
+import CorrelatedAlertGroups from '../../components/alerts/CorrelatedAlertGroups';
+import { tServer } from '../../lib/i18n/server';
+
+const currentPath = Astro.url.pathname;
+const locale = Astro.locals.locale;
+---
+
+<DashboardLayout titleKey="titles.alertsCorrelations">
+  <div class="space-y-5">
+    <AlertsTabStrip currentPath={currentPath} client:load />
+    <div>
+      <h1 class="text-xl font-bold tracking-tight">{tServer(locale, 'alertsCorrelationsPage.heading')}</h1>
+      <p class="mt-1 text-sm text-muted-foreground">
+        {tServer(locale, 'alertsCorrelationsPage.description')}
+      </p>
+    </div>
+    <CorrelatedAlertGroups client:load />
+  </div>
+</DashboardLayout>

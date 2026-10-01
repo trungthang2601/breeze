@@ -1,0 +1,138 @@
+import { Hono } from 'hono';
+import { db } from '../../db';
+import { deviceHardware, deviceMetrics, alerts } from '../../db/schema';
+import { eq, and, desc } from 'drizzle-orm';
+import { authMiddleware, requireMfa, requireScope, requirePermission } from '../../middleware/auth';
+import { PERMISSIONS } from '../../services/permissions';
+import { executeCommand } from '../../services/commandQueue';
+import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './helpers';
+
+const diagnoseRoutes = new Hono();
+
+diagnoseRoutes.use('*', authMiddleware);
+
+diagnoseRoutes.post(
+  '/:id/diagnose',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const deviceId = c.req.param('id')!;
+
+    try {
+      const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
+      if (device === SITE_ACCESS_DENIED) {
+        return c.json({ error: 'Access to this site denied' }, 403);
+      }
+      if (!device) {
+        return c.json({ error: 'Device not found or access denied' }, 404);
+      }
+
+      if (device.status !== 'online') {
+        return c.json({ error: `Device is ${device.status}, cannot capture screenshot` }, 400);
+      }
+
+      // Capture screenshot
+      const screenshotResult = await executeCommand(deviceId, 'take_screenshot', {
+        monitor: 0
+      }, { userId: auth.user.id, timeoutMs: 30000 });
+
+      if (screenshotResult.status !== 'completed') {
+        // 500, not 502: Cloudflare replaces an origin 502 body with its own
+        // branded page, which would blank the agent's reason on hosted deployments.
+        return c.json({ error: screenshotResult.error || 'Screenshot capture failed', code: 'agent_execution_failed' }, 500);
+      }
+
+      let screenshotData: { imageBase64?: string; width?: number; height?: number; capturedAt?: string };
+      try {
+        screenshotData = JSON.parse(screenshotResult.stdout ?? '{}');
+      } catch (parseErr) {
+        const rawPreview = (screenshotResult.stdout ?? '').slice(0, 200);
+        console.error(`[Diagnose] Failed to parse screenshot JSON for device ${deviceId}:`, parseErr, 'Raw stdout preview:', rawPreview);
+        return c.json({ error: 'Failed to parse screenshot data' }, 500);
+      }
+
+      // Gather device context in parallel.
+      // device_metrics' throughput columns are bigint, so Drizzle hands back
+      // native BigInt values that JSON.stringify cannot serialise — c.json()
+      // would throw and collapse the whole diagnosis into a 500. Project the
+      // snapshot columns explicitly and widen the bigint rates to number.
+      // Cumulative byte/ops counters and per-interface stats remain available
+      // on GET /devices/:id, which already converts them (see core.ts).
+      const [hardware, recentMetricsRaw, activeAlerts] = await Promise.all([
+        db.select({
+          cpuModel: deviceHardware.cpuModel,
+          cpuCores: deviceHardware.cpuCores,
+          ramTotalMb: deviceHardware.ramTotalMb,
+          diskTotalGb: deviceHardware.diskTotalGb,
+          gpuModel: deviceHardware.gpuModel,
+        }).from(deviceHardware).where(eq(deviceHardware.deviceId, deviceId)).limit(1),
+        db.select({
+          timestamp: deviceMetrics.timestamp,
+          cpuPercent: deviceMetrics.cpuPercent,
+          ramPercent: deviceMetrics.ramPercent,
+          ramUsedMb: deviceMetrics.ramUsedMb,
+          diskPercent: deviceMetrics.diskPercent,
+          diskUsedGb: deviceMetrics.diskUsedGb,
+          diskActivityAvailable: deviceMetrics.diskActivityAvailable,
+          processCount: deviceMetrics.processCount,
+          diskReadBps: deviceMetrics.diskReadBps,
+          diskWriteBps: deviceMetrics.diskWriteBps,
+          bandwidthInBps: deviceMetrics.bandwidthInBps,
+          bandwidthOutBps: deviceMetrics.bandwidthOutBps,
+        }).from(deviceMetrics)
+          .where(eq(deviceMetrics.deviceId, deviceId))
+          .orderBy(desc(deviceMetrics.timestamp))
+          .limit(3),
+        db.select({
+          id: alerts.id,
+          severity: alerts.severity,
+          title: alerts.title,
+          message: alerts.message,
+          triggeredAt: alerts.triggeredAt,
+          status: alerts.status,
+        }).from(alerts)
+          .where(and(
+            eq(alerts.deviceId, deviceId),
+            eq(alerts.status, 'active')
+          ))
+          .orderBy(desc(alerts.triggeredAt))
+          .limit(5),
+      ]);
+
+      // Convert BigInt fields to numbers for JSON serialization
+      const recentMetrics = recentMetricsRaw.map(m => ({
+        ...m,
+        diskReadBps: m.diskReadBps != null ? Number(m.diskReadBps) : null,
+        diskWriteBps: m.diskWriteBps != null ? Number(m.diskWriteBps) : null,
+        bandwidthInBps: m.bandwidthInBps != null ? Number(m.bandwidthInBps) : null,
+        bandwidthOutBps: m.bandwidthOutBps != null ? Number(m.bandwidthOutBps) : null,
+      }));
+
+      return c.json({
+        screenshot: {
+          imageBase64: screenshotData.imageBase64,
+          width: screenshotData.width,
+          height: screenshotData.height,
+          capturedAt: screenshotData.capturedAt,
+        },
+        device: {
+          id: device.id,
+          hostname: device.hostname,
+          osType: device.osType,
+          osVersion: device.osVersion,
+          status: device.status,
+        },
+        hardware: hardware[0] ?? null,
+        recentMetrics,
+        activeAlerts,
+      });
+    } catch (err) {
+      console.error(`[Diagnose] Failed to diagnose device ${deviceId}:`, err);
+      return c.json({ error: 'Diagnosis failed. Please try again.' }, 500);
+    }
+  }
+);
+
+export { diagnoseRoutes };

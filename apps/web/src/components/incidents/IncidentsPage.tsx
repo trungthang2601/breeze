@@ -1,0 +1,292 @@
+import { useState, useEffect, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { fetchWithAuth } from '../../stores/auth';
+import { navigateTo } from '@/lib/navigation';
+import { formatDateTime } from '@/lib/dateTimeFormat';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+type IncidentSeverity = 'p1' | 'p2' | 'p3' | 'p4';
+type IncidentStatus = 'detected' | 'analyzing' | 'contained' | 'recovering' | 'closed';
+type IncidentKind = 'tracked' | 'finding';
+type IncidentSource = 'breeze' | 'huntress' | 's1';
+type FeedFilter = '' | IncidentKind;
+
+interface IncidentFeedRow {
+  kind: IncidentKind;
+  source: IncidentSource;
+  sourceId: string;
+  title: string;
+  severity: IncidentSeverity;
+  edrStatus: string | null;
+  status: string | null;
+  deviceId: string | null;
+  detectedAt: string;
+  trackedIncidentId: string | null;
+  linkOut: string | null;
+}
+
+interface Pagination {
+  page: number;
+  limit: number;
+  total: number;
+}
+
+const severityColors: Record<IncidentSeverity, string> = {
+  p1: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300',
+  p2: 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300',
+  p3: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
+  p4: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
+};
+
+const sourceLabels: Record<IncidentSource, string> = {
+  breeze: 'Breeze',
+  huntress: 'Huntress',
+  s1: 'SentinelOne',
+};
+
+const sourceBadge: Record<IncidentSource, string> = {
+  breeze: 'bg-gray-100 text-gray-800 dark:bg-gray-700/40 dark:text-gray-200',
+  huntress: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300',
+  s1: 'bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-300',
+};
+
+const statusColors: Record<IncidentStatus, string> = {
+  detected: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300',
+  analyzing: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
+  contained: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
+  recovering: 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300',
+  closed: 'bg-gray-100 text-gray-800 dark:bg-gray-700/30 dark:text-gray-300',
+};
+
+const fallbackStatusBadge = 'bg-gray-100 text-gray-800 dark:bg-gray-700/40 dark:text-gray-200';
+
+export default function IncidentsPage() {
+  const { t } = useTranslation('common');
+  const [rows, setRows] = useState<IncidentFeedRow[]>([]);
+  const [pagination, setPagination] = useState<Pagination>({ page: 1, limit: 25, total: 0 });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [kindFilter, setKindFilter] = useState<FeedFilter>('');
+
+  const fetchFeed = useCallback(async (page = 1) => {
+    try {
+      setLoading(true);
+      setError(undefined);
+      const params = new URLSearchParams({ page: String(page), limit: '25' });
+      if (kindFilter) params.set('kind', kindFilter);
+
+      const response = await fetchWithAuth(`/incidents/feed?${params.toString()}`);
+      if (!response.ok) {
+        if (response.status === 401) {
+          void navigateTo('/login', { replace: true });
+          return;
+        }
+        throw new Error(t('longTail.incidents.IncidentsPage.errors.fetchFailed'));
+      }
+      const data = await response.json();
+      setRows(data.data ?? []);
+      setPagination(data.pagination ?? { page: 1, limit: 25, total: 0 });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('common:states.error'));
+    } finally {
+      setLoading(false);
+    }
+  }, [kindFilter, t]);
+
+  useEffect(() => {
+    fetchFeed();
+  }, [fetchFeed]);
+
+  const handleRowClick = (row: IncidentFeedRow) => {
+    if (row.kind === 'tracked' && row.trackedIncidentId) {
+      void navigateTo(`/incidents/${row.trackedIncidentId}`);
+    }
+  };
+
+  const handlePrevious = () => {
+    if (pagination.page > 1) fetchFeed(pagination.page - 1);
+  };
+
+  const handleNext = () => {
+    const totalPages = Math.ceil(pagination.total / pagination.limit);
+    if (pagination.page < totalPages) fetchFeed(pagination.page + 1);
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('longTail.incidents.IncidentsPage.loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && rows.length === 0) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        <button
+          type="button"
+          onClick={() => fetchFeed()}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          {t('longTail.incidents.IncidentsPage.tryAgain')}
+        </button>
+      </div>
+    );
+  }
+
+  const totalPages = Math.ceil(pagination.total / pagination.limit);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">{t('longTail.incidents.IncidentsPage.title')}</h1>
+          <p className="text-muted-foreground">
+            {t('longTail.incidents.IncidentsPage.description')}
+          </p>
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      {/* Filters */}
+      <div className="flex gap-3">
+        <select
+          value={kindFilter}
+          onChange={(e) => setKindFilter(e.target.value as FeedFilter)}
+          className="rounded-md border bg-background px-3 py-2 text-sm text-foreground"
+        >
+          <option value="">{t('common:labels.all')}</option>
+          <option value="tracked">{t('longTail.incidents.IncidentsPage.filters.tracked')}</option>
+          <option value="finding">{t('longTail.incidents.IncidentsPage.filters.findings')}</option>
+        </select>
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <h2 className="text-lg font-semibold text-foreground mb-1">{t('longTail.incidents.IncidentsPage.emptyTitle')}</h2>
+          <p className="text-sm text-muted-foreground max-w-md">
+            {kindFilter
+              ? t('longTail.incidents.IncidentsPage.emptyFiltered')
+              : t('longTail.incidents.IncidentsPage.emptyDescription')}
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="overflow-x-auto rounded-lg border">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b bg-muted/50">
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">{t('longTail.incidents.IncidentsPage.table.title')}</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">{t('longTail.incidents.IncidentsPage.table.source')}</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">{t('longTail.incidents.IncidentsPage.table.severity')}</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">{t('common:labels.status')}</th>
+                  <th className="px-4 py-3 text-left font-medium text-muted-foreground">{t('longTail.incidents.IncidentsPage.table.detected')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => {
+                  const isTracked = row.kind === 'tracked';
+                  return (
+                    <tr
+                      key={`${row.source}:${row.sourceId}`}
+                      onClick={() => handleRowClick(row)}
+                      className={`border-b transition-colors ${
+                        isTracked ? 'cursor-pointer hover:bg-muted/30' : ''
+                      }`}
+                    >
+                      <td className="px-4 py-3 font-medium text-foreground">{row.title}</td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${sourceBadge[row.source]}`}>
+                          {sourceLabels[row.source]}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${severityColors[row.severity]}`}>
+                          {row.severity.toUpperCase()}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3">
+                        {isTracked ? (
+                          row.status ? (
+                            <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium capitalize ${statusColors[row.status as IncidentStatus] ?? fallbackStatusBadge}`}>
+                              {t(/* i18n-dynamic */ `longTail.incidents.IncidentsPage.status.${row.status}`)}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">-</span>
+                          )
+                        ) : (
+                          <div className="flex flex-col gap-0.5">
+                            <span className="capitalize text-muted-foreground">{row.edrStatus ?? '-'}</span>
+                            {row.linkOut ? (
+                              <a
+                                href={row.linkOut}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-xs text-primary hover:underline"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                {t('longTail.incidents.IncidentsPage.viewInSource', { source: sourceLabels[row.source] })}
+                              </a>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">{t('longTail.incidents.IncidentsPage.promoteFromEdr')}</span>
+                            )}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-muted-foreground">
+                        {formatDateTime(row.detectedAt)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-muted-foreground">
+                {t('longTail.incidents.IncidentsPage.pagination', {
+                  page: pagination.page,
+                  totalPages,
+                  total: pagination.total,
+                })}
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={handlePrevious}
+                  disabled={pagination.page <= 1}
+                  className="rounded-md border px-3 py-1.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-muted"
+                >
+                  {t('longTail.incidents.IncidentsPage.previous')}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleNext}
+                  disabled={pagination.page >= totalPages}
+                  className="rounded-md border px-3 py-1.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-muted"
+                >
+                  {t('common:actions.next')}
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

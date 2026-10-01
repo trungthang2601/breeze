@@ -1,0 +1,1304 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { Hono } from 'hono';
+import { deviceRoutes } from './devices';
+
+const { evaluateCapability, partnerTrustMode, requireCapability } = vi.hoisted(() => {
+  const evaluateCapability = vi.fn(async (_cap?: string, _ctx?: unknown): Promise<any> => ({ allow: true }));
+  return {
+    evaluateCapability,
+    partnerTrustMode: vi.fn((): 'off' | 'shadow' | 'enforce' => 'off'),
+    requireCapability: vi.fn((capability: string) => async (c: any, next: any) => {
+      const auth = c.get('auth');
+      if (!auth?.partnerId) return next();
+      const decision = await evaluateCapability(capability, {
+        partnerId: auth.partnerId,
+        userId: auth.user?.id,
+        orgId: auth.orgId ?? undefined,
+      });
+      if (!decision.allow) {
+        return c.json({
+          error: decision.code,
+          capability: decision.capability,
+          reason: decision.reason,
+          reviewRequested: false,
+          meetingUrl: null,
+        }, 403);
+      }
+      return next();
+    }),
+  };
+});
+
+vi.mock('../services/partnerTrust', () => ({ evaluateCapability, requireCapability }));
+vi.mock('../config/partnerTrustMode', () => ({ partnerTrustMode }));
+
+vi.mock('../services', () => ({}));
+
+// core.ts (decommission handler) imports both terminateDeviceRemoteSessions and
+// TEARDOWN_FAILED (#1283). The mock must export both, or the DELETE /devices/:id
+// path runs the real teardown service and 500s. Mirrors core.decommission.test.ts.
+vi.mock('../services/remoteSessionTeardown', () => ({
+  terminateDeviceRemoteSessions: vi.fn().mockResolvedValue(0),
+  TEARDOWN_FAILED: -1,
+}));
+
+vi.mock('../services/auditEvents', () => ({
+  requestLikeFromSnapshot: vi.fn(() => ({ req: { header: () => undefined } })),
+  writeAuditEvent: vi.fn(),
+  writeRouteAudit: vi.fn()
+}));
+
+vi.mock('../services/enrollmentKeySecurity', () => ({
+  hashEnrollmentKey: vi.fn((key: string) => `hashed-${key}`),
+  hashEnrollmentKeyCandidates: vi.fn((key: string) => [`hashed-${key}`]),
+  generateEnrollmentKey: vi.fn(() => 'ek_test123')
+}));
+
+// Partner-cap enforcement (#2776 task 3.4). Mocked at the wiring level — see
+// enrollmentKeys.test.ts's identically-named helper for rationale.
+const assertTtlWithinCapMock = vi.fn(
+  async (_orgId: string, _ttlMinutes: number | undefined) => null as string | null,
+);
+const permissionSiteScope = vi.hoisted(() => ({
+  allowedSiteIds: undefined as string[] | undefined,
+}));
+vi.mock('../services/enrollmentDefaults', () => ({
+  assertTtlWithinCap: (...args: [string, number | undefined]) =>
+    assertTtlWithinCapMock(...args),
+}));
+
+/**
+ * Configure the mocked partner-cap gate for the current test. Mirrors the
+ * real assertTtlWithinCap contract: null when ttlMinutes is undefined or at/
+ * under the cap, an error string naming the cap when it's exceeded. Default
+ * (set in the outer beforeEach) models "no partner cap configured" — the
+ * product-default ceiling of 525_600 minutes.
+ */
+function mockEnrollmentDefaults(opts: { maxTtlMinutes: number }) {
+  assertTtlWithinCapMock.mockImplementation(
+    async (_orgId: string, ttlMinutes: number | undefined) => {
+      if (ttlMinutes === undefined) return null;
+      return ttlMinutes > opts.maxTtlMinutes
+        ? `ttlMinutes exceeds the partner maximum of ${opts.maxTtlMinutes} minutes`
+        : null;
+    },
+  );
+}
+
+vi.mock('../services/permissions', () => ({
+  PERMISSIONS: new Proxy({} as Record<string, { resource: string; action: string }>, {
+    get(_target, prop: string) {
+      // Auto-generate permission objects like DEVICES_WRITE -> { resource: 'devices', action: 'write' }
+      const parts = prop.toLowerCase().split('_');
+      return { resource: parts[0], action: parts.slice(1).join('_') };
+    }
+  })
+}));
+
+vi.mock('drizzle-orm', () => {
+  // drizzle-orm's `sql` is a callable tag with attached statics (sql.join,
+  // sql.raw, etc.). The /devices LATERAL query uses sql.join() to build a
+  // VALUES tuple list, so the mock has to expose that as a function.
+  const sqlTag: any = vi.fn(() => ({
+    as: vi.fn(() => 'latestTimestamp'),
+    // Cleanup history maps its module-level SQL aggregates to numbers.
+    mapWith: vi.fn().mockReturnThis(),
+  }));
+  sqlTag.join = vi.fn((parts: unknown[]) => ({ join: parts }));
+  sqlTag.raw = vi.fn((s: unknown) => ({ raw: s }));
+  return {
+    eq: vi.fn((...args: unknown[]) => ({ eq: args })),
+    and: vi.fn((...args: unknown[]) => ({ and: args })),
+    gte: vi.fn((...args: unknown[]) => ({ gte: args })),
+    like: vi.fn((...args: unknown[]) => ({ like: args })),
+    sql: sqlTag,
+    desc: vi.fn((col: unknown) => ({ desc: col })),
+    inArray: vi.fn((...args: unknown[]) => ({ inArray: args })),
+    // #5128: the decommission transaction cancels the device's pending
+    // commands EXCEPT self_uninstall, so it needs `ne`.
+    ne: vi.fn((...args: unknown[]) => ({ ne: args })),
+    isNull: vi.fn((...args: unknown[]) => ({ isNull: args })),
+    isNotNull: vi.fn((...args: unknown[]) => ({ isNotNull: args })),
+    gt: vi.fn((...args: unknown[]) => ({ gt: args })),
+    lt: vi.fn((...args: unknown[]) => ({ lt: args })),
+    or: vi.fn((...args: unknown[]) => ({ or: args })),
+    count: vi.fn()
+  };
+});
+
+// #5128: the generic device-command routes now enqueue through the single
+// seam instead of a raw insert. Mocked here so this harness keeps testing the
+// ROUTE (auth, site scoping, response shape) rather than the seam, which has
+// its own suite in services/dispatchDeviceCommand.test.ts.
+const dispatchDeviceCommandMock = vi.hoisted(() => vi.fn());
+vi.mock('../services/dispatchDeviceCommand', () => ({
+  dispatchDeviceCommand: (...args: unknown[]) => dispatchDeviceCommandMock(...(args as [])),
+}));
+
+// #3986 task 7 follow-up — this harness previously had NO `db.transaction`
+// stub at all (not merely unimplemented: the property didn't exist), so the
+// decommission route's new `db.transaction(async (tx) => ...)` call threw
+// "db.transaction is not a function" and every DELETE /devices/:id request
+// 500'd. `transaction` resolves by invoking the callback with the SAME `db`
+// object as `tx` — every mocked db method (select/update/insert/...) is
+// therefore reachable identically whether the route calls it via `db.x` or
+// the transaction's `tx.x`, which is enough for a mock harness that doesn't
+// otherwise distinguish "inside a tx" from "outside one".
+//
+// Built INSIDE the factory (not as an outer top-level const): `vi.mock(...)`
+// calls are hoisted above top-level variable initializers, so a `dbMock`
+// declared outside this factory and merely referenced inside it would throw
+// "Cannot access 'dbMock' before initialization" at import time.
+vi.mock('../db', () => {
+  const dbMock: Record<string, ReturnType<typeof vi.fn>> = {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          limit: vi.fn(() => Promise.resolve([]))
+        }))
+      }))
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn(() => ({
+        returning: vi.fn(() => Promise.resolve([]))
+      }))
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => Promise.resolve([]))
+        }))
+      }))
+    })),
+    delete: vi.fn(() => ({
+      where: vi.fn(() => Promise.resolve())
+    })),
+    // db.execute() is used for the latest-metrics LATERAL query in
+    // /devices and for any raw sql template. Returns an empty array
+    // by default; tests override via vi.mocked(db.execute).mockResolvedValueOnce.
+    execute: vi.fn(() => Promise.resolve([]))
+  };
+  dbMock.transaction = vi.fn((cb: (tx: unknown) => unknown) => cb(dbMock));
+
+  return {
+    // `getCurrentDbAccessContext` is listed even though no test here currently
+    // reaches it: GET /devices/:id resolves the remote-access launcher through
+    // `readWithPartnerAxisVisibility` (db/partnerAxisRead.ts), which imports
+    // all four context helpers BY NAME. A factory missing one throws
+    // "No <name> export is defined on the mock" at call time — and the route
+    // swallows that into `remoteAccessLaunchSkipReason: 'config_error'`, so a
+    // test could go on passing while silently exercising the failure branch
+    // instead of the real path. `undefined` models a request-scoped (non-system)
+    // caller, which is the shape these routes actually run in. See #3419.
+    getCurrentDbAccessContext: vi.fn(() => undefined),
+    runOutsideDbContext: vi.fn((fn) => fn()),
+    withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+    withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    db: dbMock
+  };
+});
+
+// DELETE /devices/:id conditionally calls queueDeviceUninstall(tx, ...) when
+// uninstallAgent is true. Its predicate/insert SQL is already covered on
+// compiled SQL by deviceUninstallDrain.test.ts; this file only needs the
+// route-level wiring stubbed so it doesn't hit the real service (which would
+// issue further un-mocked tx.select/tx.insert calls against dbMock's
+// generic chains and likely throw or behave unpredictably).
+vi.mock('../services/deviceUninstallDrain', () => ({
+  queueDeviceUninstall: vi.fn(),
+}));
+
+vi.mock('../db/schema', async (importOriginal) => ({
+  // routes/devices/actuateElevation.ts calls drizzle's alias(users, …) at
+  // import time (#4913), which needs a real table, not a plain-object stub.
+  users: (await importOriginal<typeof import('../db/schema')>()).users,
+  // routes/devices/events.ts builds module-level SQL fragments from auditLogs at import time (#4835).
+  auditLogs: { actorType: 'actorType', details: 'details', timestamp: 'timestamp', action: 'action' },
+  devices: { id: 'id', orgId: 'orgId', siteId: 'siteId', status: 'status', hostname: 'hostname', displayName: 'displayName', osType: 'osType', lastSeenAt: 'lastSeenAt', createdAt: 'createdAt', updatedAt: 'updatedAt', tags: 'tags', agentVersion: 'agentVersion' },
+  deviceHardware: { deviceId: 'deviceId' },
+  deviceReliability: { deviceId: 'deviceId', reliabilityScore: 'reliabilityScore', trendDirection: 'trendDirection' },
+  deviceNetwork: { deviceId: 'deviceId' },
+  deviceMetrics: { deviceId: 'deviceId', timestamp: 'timestamp' },
+  deviceSoftware: { deviceId: 'deviceId' },
+  deviceGroups: { id: 'id', name: 'name' },
+  deviceGroupMemberships: { deviceId: 'deviceId', groupId: 'groupId' },
+  deviceCommands: { id: 'id', deviceId: 'deviceId', type: 'type', status: 'status', createdAt: 'createdAt' },
+  deviceDisks: { deviceId: 'deviceId', mountPoint: 'mountPoint', fsType: 'fsType', totalGb: 'totalGb', usedGb: 'usedGb', freeGb: 'freeGb', usedPercent: 'usedPercent' },
+  // filesystemCleanupRuns builds module-level SQL fragments from these columns.
+  deviceFilesystemCleanupRuns: {
+    id: 'id', deviceId: 'deviceId', kind: 'kind', status: 'status', scanPath: 'scanPath',
+    requestedAt: 'requestedAt', approvedAt: 'approvedAt', bytesReclaimed: 'bytesReclaimed',
+    error: 'error', plan: 'plan', executedActions: 'executedActions',
+  },
+  sites: { id: 'id', orgId: 'orgId' },
+  organizations: { id: 'id' },
+  enrollmentKeys: { id: 'id', key: 'key', orgId: 'orgId' },
+  deviceStatusEnum: { enumValues: ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending'] },
+  osTypeEnum: { enumValues: ['windows', 'macos', 'linux'] },
+  discoveredAssetTypeEnum: { enumValues: ['workstation', 'server', 'printer', 'unknown'] },
+  patchPolicies: {},
+  alertRules: {},
+  backupConfigs: {},
+  securityPolicies: {},
+  automationPolicies: {},
+  maintenanceWindows: {},
+  softwarePolicies: {},
+  sensitiveDataPolicies: {},
+  peripheralPolicies: {},
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+      scope: 'organization',
+      orgId: 'org-123',
+      partnerId: null,
+      accessibleOrgIds: ['org-123'],
+      canAccessOrg: (orgId: string) => orgId === 'org-123',
+      orgCondition: vi.fn()
+    });
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
+    // Populate the `permissions` context value so getDeviceWithOrgAndSiteCheck
+    // doesn't trip its "called without requirePermission" 500 safety throw.
+    // No allowedSiteIds → unrestricted, mirrors a role with full site access.
+    c.set('permissions', {
+      permissions: [{ resource, action }],
+      partnerId: null,
+      orgId: 'org-123',
+      roleId: 'role-123',
+      scope: 'organization',
+      allowedSiteIds: permissionSiteScope.allowedSiteIds,
+    });
+    return next();
+  }),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  // Stubbed like the other gates: this suite's auth context carries no
+  // principal. The real gate is covered in middleware/auth.test.ts and
+  // routes/devices/{commands,moveOrg}.test.ts.
+  requireInteractiveSession: vi.fn(() => async (_c: any, next: any) => next())
+}));
+
+import { db } from '../db';
+import { queueDeviceUninstall } from '../services/deviceUninstallDrain';
+
+describe('device routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    partnerTrustMode.mockReturnValue('off');
+    evaluateCapability.mockResolvedValue({ allow: true });
+    // resetAllMocks clears mockReturnValueOnce queues, preventing test pollution
+    vi.resetAllMocks();
+    // Restore factory default chains
+    vi.mocked(db.select).mockImplementation(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => Object.assign(Promise.resolve([]), {
+          limit: vi.fn(() => Promise.resolve([])),
+          orderBy: vi.fn(() => ({
+            limit: vi.fn(() => ({
+              offset: vi.fn(() => Promise.resolve([]))
+            }))
+          })),
+          groupBy: vi.fn(() => ({
+            as: vi.fn(() => ({ deviceId: 'deviceId', latestTimestamp: 'latestTimestamp' }))
+          }))
+        })),
+        // Two chained leftJoins (deviceHardware, then deviceReliability #1720):
+        // each leftJoin returns an object exposing both the next leftJoin and
+        // the terminal where(), so .leftJoin(...).leftJoin(...).where(...) works.
+        leftJoin: vi.fn(function leftJoinMock(): any {
+          return {
+            leftJoin: leftJoinMock,
+            where: vi.fn(() => Object.assign(Promise.resolve([]), {
+              orderBy: vi.fn(() => ({
+                limit: vi.fn(() => ({
+                  offset: vi.fn(() => Promise.resolve([]))
+                }))
+              }))
+            }))
+          };
+        }),
+        innerJoin: vi.fn(() => ({
+          where: vi.fn(() => Promise.resolve([]))
+        }))
+      }))
+    }) as any);
+    vi.mocked(db.insert).mockImplementation(() => ({
+      values: vi.fn(() => ({
+        returning: vi.fn(() => Promise.resolve([]))
+      }))
+    }) as any);
+    vi.mocked(db.update).mockImplementation(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => Promise.resolve([]))
+        }))
+      }))
+    }) as any);
+    vi.mocked(db.delete).mockImplementation(() => ({
+      where: vi.fn(() => Promise.resolve())
+    }) as any);
+    vi.mocked(db.execute).mockImplementation(() => Promise.resolve([]) as any);
+    // resetAllMocks above also wipes db.transaction's implementation — restore
+    // the "tx === db" default (see the dbMock comment above the vi.mock('../db')
+    // call) so DELETE /devices/:id's `db.transaction(async (tx) => ...)` still
+    // resolves instead of throwing "db.transaction is not a function".
+    vi.mocked(db.transaction).mockImplementation((cb: any) => cb(db));
+    // resetAllMocks above also wipes assertTtlWithinCapMock's implementation —
+    // restore the permissive default (mirrors "no partner cap configured",
+    // i.e. the product-default 525_600-minute ceiling from resolveEnrollmentDefaults).
+    mockEnrollmentDefaults({ maxTtlMinutes: 525_600 });
+    permissionSiteScope.allowedSiteIds = undefined;
+    app = new Hono();
+    app.route('/devices', deviceRoutes);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  describe('POST /devices/onboarding-token', () => {
+    it('denies an empty site allowlist before selecting a site or minting a key', async () => {
+      permissionSiteScope.allowedSiteIds = [];
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.select).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('limits automatic site selection to the caller site allowlist', async () => {
+      const allowedSiteId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      permissionSiteScope.allowedSiteIds = [allowedSiteId];
+      const where = vi.fn().mockReturnValue({
+        limit: vi.fn().mockResolvedValue([{ id: allowedSiteId }]),
+      });
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({ where }),
+      } as any);
+      const values = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(where.mock.calls[0]![0])).toContain(allowedSiteId);
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({ siteId: allowedSiteId }));
+    });
+
+    it('returns 403 for probation before minting an onboarding token', async () => {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: 'org-123',
+          partnerId: 'partner-1',
+          accessibleOrgIds: ['org-123'],
+          canAccessOrg: (orgId: string) => orgId === 'org-123',
+          orgCondition: vi.fn(),
+        });
+        return next();
+      });
+      evaluateCapability.mockResolvedValueOnce({
+        allow: false,
+        code: 'TRUST_PROBATION',
+        capability: 'installer_distribute',
+        reason: 'probation_default_deny',
+      });
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual(expect.objectContaining({
+        error: 'TRUST_PROBATION',
+        capability: 'installer_distribute',
+      }));
+      expect(evaluateCapability).toHaveBeenCalledWith('installer_distribute', expect.objectContaining({
+        partnerId: 'partner-1',
+      }));
+      expect(db.select).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('should require orgId for partner/system contexts with multiple accessible orgs', async () => {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'partner',
+          orgId: null,
+          partnerId: 'partner-1',
+          accessibleOrgIds: ['org-1', 'org-2'],
+          canAccessOrg: (orgId: string) => ['org-1', 'org-2'].includes(orgId),
+          orgCondition: vi.fn()
+        });
+        return next();
+      });
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('Organization ID required');
+    });
+
+    it('should use explicit orgId when provided and accessible', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'partner',
+          orgId: null,
+          partnerId: 'partner-1',
+          accessibleOrgIds: ['org-1', 'org-2'],
+          canAccessOrg: (orgId: string) => ['org-1', 'org-2'].includes(orgId),
+          orgCondition: vi.fn()
+        });
+        return next();
+      });
+
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockResolvedValue(undefined)
+      } as any);
+
+      const res = await app.request('/devices/onboarding-token?orgId=org-2', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.token).toContain('enroll_');
+      expect(body.expiresAt).toBeTypeOf('string');
+      expect(body.enrollmentSecretMode).toBe('none');
+      expect(body.additionalSecretRequired).toBe(false);
+      expect(body.enrollmentSecret).toBeUndefined();
+      expect(vi.mocked(db.insert)).toHaveBeenCalled();
+    });
+
+    it('returns the configured global enrollment secret when one is active', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', 'global-secret');
+
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockResolvedValue(undefined)
+      } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.enrollmentSecretMode).toBe('global_env');
+      expect(body.additionalSecretRequired).toBe(true);
+      expect(body.enrollmentSecret).toBe('global-secret');
+    });
+
+    it('defaults to a single-use token when no count is supplied (#1108)', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      const valuesMock = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.maxUsage).toBe(1);
+      expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ maxUsage: 1 }));
+    });
+
+    it('honors a caller-supplied count as maxUsage for multi-machine installs (#1108)', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      const valuesMock = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 5, ttlMinutes: 1440 })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.maxUsage).toBe(5);
+      expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ maxUsage: 5 }));
+    });
+
+    it('clamps an out-of-range count to the allowed bounds (#1108)', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      const valuesMock = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 999999 })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.maxUsage).toBe(1000);
+      expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ maxUsage: 1000 }));
+    });
+
+    it('floors a zero/negative/garbage count to a single use (#1108)', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      for (const badCount of [0, -5, 'abc']) {
+        const valuesMock = vi.fn().mockResolvedValue(undefined);
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            })
+          })
+        } as any);
+        vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+
+        const res = await app.request('/devices/onboarding-token', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ count: badCount })
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.maxUsage).toBe(1);
+        expect(valuesMock).toHaveBeenCalledWith(expect.objectContaining({ maxUsage: 1 }));
+      }
+    });
+
+    it('defaults the token TTL to 30 days and honors a supplied ttlMinutes (#1108)', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+
+      const captureExpiry = () => {
+        const valuesMock = vi.fn().mockResolvedValue(undefined);
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+            })
+          })
+        } as any);
+        vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+        return valuesMock;
+      };
+
+      const expiryMinutesFrom = (valuesMock: ReturnType<typeof vi.fn>): number => {
+        const { expiresAt } = valuesMock.mock.calls[0]![0] as { expiresAt: Date };
+        return Math.round((expiresAt.getTime() - Date.now()) / 60000);
+      };
+
+      // Default (no ttlMinutes) → the ENROLLMENT_KEY_DEFAULT_TTL_MINUTES
+      // fallback, 30 days. This route mints a real `enrollment_keys` row, so it
+      // moved with the rest of the enrollment defaults: a token pasted into
+      // deployment tooling has to outlive the download day, which the old
+      // 60-minute window did not (US trial mass deploy, 2026-08-26).
+      let valuesMock = captureExpiry();
+      let res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' }
+      });
+      expect(res.status).toBe(200);
+      expect(expiryMinutesFrom(valuesMock)).toBeGreaterThanOrEqual(43_199);
+      expect(expiryMinutesFrom(valuesMock)).toBeLessThanOrEqual(43_201);
+
+      // Supplied 1440 → ~24h.
+      valuesMock = captureExpiry();
+      res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttlMinutes: 1440 })
+      });
+      expect(res.status).toBe(200);
+      expect(expiryMinutesFrom(valuesMock)).toBeGreaterThanOrEqual(1439);
+      expect(expiryMinutesFrom(valuesMock)).toBeLessThanOrEqual(1441);
+    });
+
+    // #2776 task 3.4 (CRITICAL follow-up): this route used to silently clamp
+    // an over-cap ttlMinutes down to ENROLL_TOKEN_MAX_TTL_MINUTES (365 days)
+    // instead of rejecting it — exactly the silent-discard bypass the
+    // enrollment-defaults plan was written to close. It must now 400 and
+    // name the cap, same as the enrollment-keys mint routes. Since #2777 the
+    // rejection is issued by the request schema itself, before the handler.
+    it('rejects an over-cap ttlMinutes instead of silently clamping it (#2776)', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      const valuesMock = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttlMinutes: 99_999_999 })
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('525600');
+      // Rejected before the site lookup / insert ever fire.
+      expect(valuesMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects an explicit ttlMinutes above a partner-configured cap (#2776)', async () => {
+      mockEnrollmentDefaults({ maxTtlMinutes: 1440 });
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      const valuesMock = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttlMinutes: 43200 })
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('1440');
+      expect(assertTtlWithinCapMock).toHaveBeenCalledWith('org-123', 43200);
+      expect(valuesMock).not.toHaveBeenCalled();
+    });
+
+    it('allows an explicit ttlMinutes at exactly a partner-configured cap (#2776)', async () => {
+      mockEnrollmentDefaults({ maxTtlMinutes: 1440 });
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      const valuesMock = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttlMinutes: 1440 })
+      });
+
+      expect(res.status).toBe(200);
+      expect(valuesMock).toHaveBeenCalled();
+    });
+
+    it('honours ttlMinutes from the request body', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockResolvedValue(undefined)
+      } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 1, ttlMinutes: 10080 })
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      const ttlMs = new Date(body.expiresAt).getTime() - Date.now();
+      // 7 days, allowing 60s of test-execution drift
+      expect(ttlMs).toBeGreaterThan(10080 * 60 * 1000 - 60_000);
+      expect(ttlMs).toBeLessThan(10080 * 60 * 1000 + 60_000);
+    });
+
+    it('rejects ttlMinutes above the 525_600 cap', async () => {
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttlMinutes: 525_601 })
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('rejects a non-numeric ttlMinutes instead of silently defaulting', async () => {
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttlMinutes: 'forever' })
+      });
+      expect(res.status).toBe(400);
+    });
+
+    // Regression (#2777): first-run guided setup (web setup/EnrollDeviceStep)
+    // POSTs with NO body, while fetchWithAuth still sets
+    // `Content-Type: application/json` unconditionally. Under a plain
+    // zValidator('json', ...) that combination 400s with a plain-text
+    // "Malformed JSON in request body" and onboarding dies at the last step.
+    // The route must still mint a default-TTL single-use token.
+    it('accepts a bodyless POST that still carries a JSON content-type (#2777)', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      const valuesMock = vi.fn().mockResolvedValue(undefined);
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({ values: valuesMock } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.token).toContain('enroll_');
+      const { expiresAt, maxUsage } = valuesMock.mock.calls[0]![0] as {
+        expiresAt: Date;
+        maxUsage: number;
+      };
+      expect(maxUsage).toBe(1);
+      const minutes = Math.round((expiresAt.getTime() - Date.now()) / 60000);
+      expect(minutes).toBeGreaterThanOrEqual(43_199);
+      expect(minutes).toBeLessThanOrEqual(43_201);
+    });
+
+    // Same shape, but with an explicitly empty string body (what a
+    // `curl -X POST -H 'Content-Type: application/json'` script client sends).
+    it('accepts an empty-string body with a JSON content-type (#2777)', async () => {
+      vi.stubEnv('AGENT_ENROLLMENT_SECRET', '');
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'site-1' }])
+          })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockResolvedValue(undefined)
+      } as any);
+
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: ''
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    // A body that is present but genuinely malformed must still 400 — and the
+    // failure body must be JSON, not Hono's plain-text HTTPException text, so
+    // `await res.json()` in the client's error path doesn't throw.
+    it('returns a JSON 400 for a genuinely malformed body (#2777)', async () => {
+      const res = await app.request('/devices/onboarding-token', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: '{not json'
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.headers.get('content-type')).toContain('application/json');
+      const body = await res.json();
+      expect(body.error).toContain('Malformed JSON');
+    });
+  });
+
+  describe('GET /devices', () => {
+    it('should list devices with filters and pagination', async () => {
+      const deviceList = [
+        {
+          id: '11111111-2222-4333-8444-555555555555',
+          orgId: 'org-123',
+          siteId: '11111111-1111-1111-1111-111111111111',
+          agentId: 'agent-1',
+          hostname: 'host-1',
+          displayName: 'Host One',
+          osType: 'linux',
+          osVersion: '1.0',
+          osBuild: 'build',
+          architecture: 'x86_64',
+          agentVersion: '2.0',
+          status: 'online',
+          lastSeenAt: new Date(),
+          enrolledAt: new Date(),
+          tags: ['prod'],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          cpuModel: 'Xeon',
+          cpuCores: 8,
+          ramTotalMb: 16384,
+          diskTotalGb: 512
+        },
+        {
+          id: '22222222-3333-4444-8555-666666666666',
+          orgId: 'org-123',
+          siteId: '11111111-1111-1111-1111-111111111111',
+          agentId: 'agent-2',
+          hostname: 'host-2',
+          displayName: 'Host Two',
+          osType: 'linux',
+          osVersion: '1.1',
+          osBuild: 'build2',
+          architecture: 'arm64',
+          agentVersion: '2.1',
+          status: 'online',
+          lastSeenAt: new Date(),
+          enrolledAt: new Date(),
+          tags: ['edge'],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          cpuModel: 'M2',
+          cpuCores: 10,
+          ramTotalMb: 8192,
+          diskTotalGb: 256
+        }
+      ];
+
+      vi.mocked(db.select)
+        // 1st: count query
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ count: 2 }])
+          })
+        } as any)
+        // 2nd: device list query — two chained leftJoins now (deviceHardware,
+        // then deviceReliability #1720), so the leftJoin mock returns itself
+        // before resolving to the terminal where().
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            leftJoin: vi.fn(function leftJoinMock(): any {
+              return {
+                leftJoin: leftJoinMock,
+                where: vi.fn().mockReturnValue({
+                  orderBy: vi.fn().mockReturnValue({
+                    limit: vi.fn().mockReturnValue({
+                      offset: vi.fn().mockResolvedValue(deviceList)
+                    })
+                  })
+                })
+              };
+            })
+          })
+        } as any);
+
+      // Latest-metrics LATERAL query goes through db.execute() with a
+      // raw sql template — return one row per device so the response
+      // mapping (cpuPercent / ramPercent / metrics.timestamp) exercises
+      // the per-device latest lookup path.
+      const metricsTimestamp = new Date('2026-05-16T17:00:00Z');
+      vi.mocked(db.execute).mockResolvedValueOnce([
+        { device_id: '11111111-2222-4333-8444-555555555555', cpu_percent: 12.5, ram_percent: 33, timestamp: metricsTimestamp },
+        { device_id: '22222222-3333-4444-8555-666666666666', cpu_percent: 4.2, ram_percent: 18, timestamp: metricsTimestamp },
+      ] as any);
+
+      const res = await app.request('/devices?status=online&osType=linux&search=host&page=1&limit=2', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(2);
+      expect(body.pagination.total).toBe(2);
+      expect(body.data[0].hardware).toBeDefined();
+      // LATERAL metrics row → response: snake_case columns map to
+      // camelCase metrics.cpuPercent / ramPercent. Each device matches
+      // by uuid, so 11111111-2222-4333-8444-555555555555's metrics row sticks to 11111111-2222-4333-8444-555555555555.
+      expect(body.data[0].cpuPercent).toBe(12.5);
+      expect(body.data[0].ramPercent).toBe(33);
+      expect(body.data[1].cpuPercent).toBe(4.2);
+      expect(body.data[1].ramPercent).toBe(18);
+      expect(body.data[0].metrics).toEqual({
+        cpuPercent: 12.5,
+        ramPercent: 33,
+        timestamp: metricsTimestamp.toISOString(),
+      });
+
+      // Regression guard: the LATERAL replaces what used to be two
+      // db.select() chains (a GROUP BY MAX subquery + an innerJoin on
+      // the max timestamp). If a future refactor reverts to those, the
+      // db.select call count here will jump from 2 to 4.
+      expect(vi.mocked(db.select).mock.calls.length).toBe(2);
+      // Two db.execute laterals per page, both batched over the whole page:
+      // latest metrics, then the LAN-IP lookup added for the opt-in WAN/LAN
+      // IP columns (#2503). The point of the guard is that neither degrades
+      // into per-device queries — if this number starts scaling with the row
+      // count, something has moved inside the map().
+      expect(vi.mocked(db.execute).mock.calls.length).toBe(2);
+    });
+  });
+
+  describe('GET /devices/:id', () => {
+    it('should return device details', async () => {
+      const device = {
+        id: '11111111-2222-4333-8444-555555555555',
+        orgId: 'org-123',
+        siteId: '11111111-1111-1111-1111-111111111111',
+        status: 'online'
+      };
+      const hardware = { id: 'hw-1', deviceId: '11111111-2222-4333-8444-555555555555' };
+      const networkInterfaces = [{ id: 'net-1', deviceId: '11111111-2222-4333-8444-555555555555' }];
+      const recentMetrics = [{ id: 'metric-1', deviceId: '11111111-2222-4333-8444-555555555555' }];
+      const groups = [{ groupId: 'group-1', groupName: 'Ops' }];
+
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([device])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([hardware])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue(networkInterfaces)
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockResolvedValue(recentMetrics)
+              })
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            innerJoin: vi.fn().mockReturnValue({
+              where: vi.fn().mockResolvedValue(groups)
+            })
+          })
+        } as any);
+
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.id).toBe('11111111-2222-4333-8444-555555555555');
+      expect(body.hardware).toBeDefined();
+      expect(body.networkInterfaces).toHaveLength(1);
+      expect(body.recentMetrics).toHaveLength(1);
+      expect(body.groups).toHaveLength(1);
+    });
+
+    it('should return 404 when device is missing', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([])
+          })
+        })
+      } as any);
+
+      // Deliberately a well-formed uuid that simply has no row. The id must pass
+      // the #2968 guard so this still exercises the ordinary "queried, found
+      // nothing" branch — a malformed id here would short-circuit at the guard
+      // and this test would silently become a duplicate of helpers.test.ts.
+      const res = await app.request('/devices/99999999-8888-4777-8666-555555555555', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(404);
+      expect(db.select).toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /devices/:id/commands', () => {
+    it('should queue a command for a device', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: '11111111-2222-4333-8444-555555555555', orgId: 'org-123', status: 'online' }])
+          })
+        })
+      } as any);
+      // #5128: the row is created by the enqueue seam, not a raw insert here.
+      const deliverBy = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      dispatchDeviceCommandMock.mockResolvedValue({
+        ok: true,
+        command: {
+          id: 'cmd-1',
+          deviceId: '11111111-2222-4333-8444-555555555555',
+          type: 'reboot',
+          status: 'pending',
+          createdAt: new Date()
+        },
+        delivery: 'delivered',
+        deliverBy,
+      });
+
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555/commands', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ type: 'reboot' })
+      });
+
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.id).toBe('cmd-1');
+      expect(body.status).toBe('pending');
+      // #5128: the response now tells the caller how the command was handed
+      // over and when it expires if the device never comes back.
+      expect(body.delivery).toBe('delivered');
+      expect(body.deliverBy).toBe(deliverBy.toISOString());
+      expect(dispatchDeviceCommandMock).toHaveBeenCalledWith(
+        expect.objectContaining({ deviceId: '11111111-2222-4333-8444-555555555555', type: 'reboot' })
+      );
+    });
+
+    it('reports an offline device as queued rather than failing the request', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: '11111111-2222-4333-8444-555555555555', orgId: 'org-123', status: 'offline' }])
+          })
+        })
+      } as any);
+      dispatchDeviceCommandMock.mockResolvedValue({
+        ok: true,
+        command: {
+          id: 'cmd-2',
+          deviceId: '11111111-2222-4333-8444-555555555555',
+          type: 'reboot',
+          status: 'pending',
+          createdAt: new Date()
+        },
+        delivery: 'queued_offline',
+        deliverBy: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      });
+
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555/commands', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ type: 'reboot' })
+      });
+
+      expect(res.status).toBe(201);
+      expect((await res.json()).delivery).toBe('queued_offline');
+    });
+
+    it('should reject generic script commands', async () => {
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555/commands', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          type: 'script',
+          payload: {
+            scriptId: '11111111-1111-1111-1111-111111111111',
+            content: 'echo bypass'
+          }
+        })
+      });
+
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('PATCH /devices/:id', () => {
+    it('should update a device', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{
+              id: '11111111-2222-4333-8444-555555555555',
+              orgId: 'org-123',
+              siteId: '11111111-1111-1111-1111-111111111111'
+            }])
+          })
+        })
+      } as any);
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{
+              id: '11111111-2222-4333-8444-555555555555',
+              displayName: 'New Name'
+            }])
+          })
+        })
+      } as any);
+
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ displayName: 'New Name' })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.displayName).toBe('New Name');
+    });
+
+    it('should reject empty updates', async () => {
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({})
+      });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('should reject invalid site moves', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{
+                id: '11111111-2222-4333-8444-555555555555',
+                orgId: 'org-123',
+                siteId: '11111111-1111-1111-1111-111111111111'
+              }])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any);
+
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ siteId: '22222222-2222-2222-2222-222222222222' })
+      });
+
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('DELETE /devices/:id', () => {
+    it('should decommission a device', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{
+              id: '11111111-2222-4333-8444-555555555555',
+              orgId: 'org-123',
+              status: 'online'
+            }])
+          })
+        })
+      } as any);
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{
+              id: '11111111-2222-4333-8444-555555555555',
+              status: 'decommissioned'
+            }])
+          })
+        })
+      } as any);
+
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555', {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(body.device.status).toBe('decommissioned');
+
+      // #3986 task 7's default-false safety invariant, exercised here because
+      // this call sends NO body at all (the bulk-remove call shape) — must
+      // NOT queue an uninstall, and the response must say so explicitly.
+      expect(body.uninstallQueued).toBe(false);
+      expect(queueDeviceUninstall).not.toHaveBeenCalled();
+    });
+
+    it('should reject decommissioning an already decommissioned device', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{
+              id: '11111111-2222-4333-8444-555555555555',
+              orgId: 'org-123',
+              status: 'decommissioned'
+            }])
+          })
+        })
+      } as any);
+
+      const res = await app.request('/devices/11111111-2222-4333-8444-555555555555', {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(400);
+    });
+  });
+});

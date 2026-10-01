@@ -1,0 +1,296 @@
+import { z } from 'zod';
+import type { SecurityPostureItem } from '../../services/securityPosture';
+
+export const providerCatalog = {
+  windows_defender: { id: 'windows_defender', name: 'Microsoft Defender', vendor: 'Microsoft' },
+  bitdefender: { id: 'bitdefender', name: 'Bitdefender', vendor: 'Bitdefender' },
+  sophos: { id: 'sophos', name: 'Sophos', vendor: 'Sophos' },
+  sentinelone: { id: 'sentinelone', name: 'SentinelOne Singularity', vendor: 'SentinelOne' },
+  crowdstrike: { id: 'crowdstrike', name: 'CrowdStrike Falcon', vendor: 'CrowdStrike' },
+  malwarebytes: { id: 'malwarebytes', name: 'Malwarebytes', vendor: 'Malwarebytes' },
+  eset: { id: 'eset', name: 'ESET', vendor: 'ESET' },
+  kaspersky: { id: 'kaspersky', name: 'Kaspersky', vendor: 'Kaspersky' },
+  elastic_defend: { id: 'elastic_defend', name: 'Elastic Defend', vendor: 'Elastic' },
+  other: { id: 'other', name: 'Other', vendor: 'Other' }
+} as const;
+
+export type ProviderKey = keyof typeof providerCatalog;
+export type SecurityState = 'protected' | 'at_risk' | 'unprotected' | 'offline';
+export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
+export type ThreatStatus = 'active' | 'quarantined' | 'removed';
+
+export type StatusRow = {
+  deviceId: string;
+  orgId: string;
+  deviceName: string;
+  os: 'windows' | 'macos' | 'linux';
+  deviceState: 'online' | 'offline' | 'maintenance' | 'decommissioned' | 'quarantined' | 'updating' | 'pending';
+  provider: ProviderKey;
+  providerVersion: string | null;
+  definitionsVersion: string | null;
+  definitionsDate: Date | null;
+  realTimeProtection: boolean;
+  threatCount: number;
+  firewallEnabled: boolean;
+  encryptionStatus: string;
+  encryptionDetails: unknown;
+  localAdminSummary: unknown;
+  passwordPolicySummary: unknown;
+  gatekeeperEnabled: boolean | null;
+  lastScan: Date | null;
+  lastScanType: string | null;
+};
+
+export type ThreatRow = {
+  id: string;
+  deviceId: string;
+  orgId: string;
+  deviceName: string;
+  provider: ProviderKey;
+  threatName: string;
+  threatType: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  status: ThreatStatus;
+  filePath: string;
+  detectedAt: Date;
+  resolvedAt: Date | null;
+};
+
+export type PostureFactorKey = keyof SecurityPostureItem['factors'];
+
+export type PolicyCheckResponse = {
+  rule: string;
+  key: string;
+  pass: boolean;
+  current?: string;
+  required?: string;
+};
+
+export type ParsedPasswordPolicy = {
+  checks: PolicyCheckResponse[];
+  compliant: boolean;
+};
+
+export type ParsedAdminAccount = {
+  username: string;
+  isBuiltIn: boolean;
+  enabled: boolean;
+  lastLogin: string;
+  passwordAgeDays: number;
+  issues: Array<'default_account' | 'weak_password' | 'stale_account'>;
+};
+
+export type ParsedAdminSummary = {
+  accounts: ParsedAdminAccount[];
+  totalAdmins: number;
+  localAccounts: number;
+  issueTypes: Array<'default_account' | 'weak_password' | 'stale_account'>;
+  issueCounts: {
+    defaultAccounts: number;
+    weakPasswords: number;
+    staleAccounts: number;
+  };
+};
+
+export type Be9Recommendation = {
+  id: string;
+  title: string;
+  description: string;
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  category: string;
+  impact: 'high' | 'medium' | 'low';
+  effort: 'low' | 'medium' | 'high';
+  affectedDevices: number;
+  steps: string[];
+};
+
+export const postureComponentModel: Array<{ category: PostureFactorKey; label: string; weight: number }> = [
+  { category: 'patch_compliance', label: 'Patch Compliance', weight: 25 },
+  { category: 'encryption', label: 'Disk Encryption', weight: 15 },
+  { category: 'av_health', label: 'AV Health', weight: 15 },
+  { category: 'firewall', label: 'Firewall Status', weight: 10 },
+  { category: 'open_ports', label: 'Open Ports Exposure', weight: 10 },
+  { category: 'password_policy', label: 'Password Policy', weight: 10 },
+  { category: 'os_currency', label: 'OS Currency', weight: 10 },
+  { category: 'admin_exposure', label: 'Admin Exposure', weight: 5 }
+];
+
+export const priorityRank: Record<'critical' | 'high' | 'medium' | 'low', number> = {
+  critical: 4,
+  high: 3,
+  medium: 2,
+  low: 1
+};
+
+export const listStatusQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  providerId: z.string().optional(),
+  status: z.enum(['protected', 'at_risk', 'unprotected', 'offline']).optional(),
+  riskLevel: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+  os: z.enum(['windows', 'macos', 'linux']).optional(),
+  orgId: z.string().guid().optional(),
+  search: z.string().optional()
+});
+
+export const listThreatsQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  severity: z.enum(['critical', 'high', 'medium', 'low']).optional(),
+  status: z.enum(['active', 'quarantined', 'removed']).optional(),
+  category: z.enum(['trojan', 'pup', 'malware', 'ransomware', 'spyware']).optional(),
+  providerId: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  startDate: z.string().optional(),
+  endDate: z.string().optional(),
+  search: z.string().optional()
+});
+
+export const scanRequestSchema = z.object({
+  scanType: z.enum(['quick', 'full', 'custom']),
+  paths: z.array(z.string().min(1)).optional()
+});
+
+export const listScansQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  // 'timed_out' (#6263 W01): a scan that hit its policy deadline. Threats found
+  // before the deadline are still ingested, so it is an outcome, not a failure.
+  status: z.enum(['queued', 'running', 'completed', 'failed', 'timed_out']).optional(),
+  scanType: z.enum(['quick', 'full', 'custom']).optional(),
+  startDate: z.string().optional(),
+  endDate: z.string().optional()
+});
+
+export const listPoliciesQuerySchema = z.object({
+  providerId: z.string().optional(),
+  scanSchedule: z.enum(['daily', 'weekly', 'monthly', 'manual']).optional(),
+  search: z.string().optional()
+});
+
+export const createPolicySchema = z.object({
+  name: z.string().min(1).max(255),
+  // Ownership axis (#2127, mirrors software/config policies). 'organization'
+  // (default) = classic org-scoped policy. 'partner' = partner-wide / all-orgs
+  // template; the server derives the partner from the caller's own token — a
+  // client-supplied partner id is NEVER trusted. Create-only: ownership is
+  // immutable, so updatePolicySchema omits it (which also keeps it out of the
+  // settings JSONB the PUT handler spreads the payload into).
+  ownerScope: z.enum(['organization', 'partner']).optional(),
+  description: z.string().optional(),
+  providerId: z.string().optional(),
+  scanSchedule: z.enum(['daily', 'weekly', 'monthly', 'manual']).default('weekly'),
+  realTimeProtection: z.boolean().default(true),
+  autoQuarantine: z.boolean().default(true),
+  severityThreshold: z.enum(['low', 'medium', 'high', 'critical']).default('medium'),
+  exclusions: z.array(z.string().min(1)).optional().default([])
+});
+
+// PATCH body. v4's .partial() applies child .default()s on absent keys (unlike
+// v3), which would silently reset protection settings (realTimeProtection,
+// autoQuarantine, …) whenever a client patches an unrelated field. Strip the
+// create-time defaults from the defaulted fields so omitted keys stay absent.
+// ownerScope is omitted: ownership is create-only (see createPolicySchema).
+export const updatePolicySchema = createPolicySchema.omit({ ownerScope: true }).partial().extend({
+  scanSchedule: createPolicySchema.shape.scanSchedule.removeDefault().optional(),
+  realTimeProtection: createPolicySchema.shape.realTimeProtection.removeDefault().optional(),
+  autoQuarantine: createPolicySchema.shape.autoQuarantine.removeDefault().optional(),
+  severityThreshold: createPolicySchema.shape.severityThreshold.removeDefault().optional(),
+  exclusions: createPolicySchema.shape.exclusions.removeDefault().optional(),
+});
+
+export const dashboardQuerySchema = z.object({
+  orgId: z.string().guid().optional()
+});
+
+export const deviceIdParamSchema = z.object({
+  deviceId: z.string().guid()
+});
+
+export const recoveryKeyRevealParamSchema = z.object({
+  deviceId: z.string().guid(),
+  keyId: z.string().guid()
+});
+
+export const rotateRecoveryKeySchema = z.object({
+  volumeMount: z.string().regex(/^[A-Za-z]:$/).optional(),
+  username: z.string().min(1).max(255).optional(),
+  password: z.string().min(1).max(1024).optional(),
+  currentRecoveryKey: z.string().min(8).max(128).optional()
+});
+
+export const threatIdParamSchema = z.object({
+  id: z.string().guid()
+});
+
+export const policyIdParamSchema = z.object({
+  id: z.string().guid()
+});
+
+export const recommendationActionSchema = z.object({
+  id: z.string()
+});
+
+export const trendsQuerySchema = z.object({
+  period: z.enum(['7d', '30d', '90d']).optional().default('30d')
+});
+
+export const postureQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  minScore: z.string().optional(),
+  maxScore: z.string().optional(),
+  riskLevel: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+  search: z.string().optional()
+});
+
+export const firewallQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  status: z.enum(['enabled', 'disabled']).optional(),
+  os: z.enum(['windows', 'macos', 'linux']).optional(),
+  search: z.string().optional(),
+  // Optional org narrowing — partner-scope callers can pass orgId to narrow
+  // an otherwise-cross-org view to a single org. listStatusRows() already
+  // supports this; the schema previously stripped it before the handler
+  // could read it, so the matrix saw 201 always regardless of orgId.
+  orgId: z.string().guid().optional()
+});
+
+export const encryptionQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  status: z.enum(['encrypted', 'partial', 'unencrypted']).optional(),
+  os: z.enum(['windows', 'macos', 'linux']).optional(),
+  search: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  escrow: z.enum(['escrowed', 'missing']).optional()
+});
+
+export const passwordPolicyQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  compliance: z.enum(['compliant', 'non_compliant']).optional(),
+  os: z.enum(['windows', 'macos', 'linux']).optional(),
+  search: z.string().optional(),
+  orgId: z.string().guid().optional()
+});
+
+export const adminAuditQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  issue: z.enum(['default_account', 'weak_password', 'stale_account', 'no_issues']).optional(),
+  os: z.enum(['windows', 'macos', 'linux']).optional(),
+  search: z.string().optional(),
+  orgId: z.string().guid().optional()
+});
+
+export const recommendationsQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  priority: z.enum(['critical', 'high', 'medium', 'low']).optional(),
+  category: z.string().optional(),
+  status: z.enum(['open', 'dismissed', 'completed']).optional(),
+  orgId: z.string().guid().optional()
+});

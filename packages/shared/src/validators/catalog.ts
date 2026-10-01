@@ -1,0 +1,253 @@
+import { z } from 'zod';
+import { currencyCodeSchema } from './currency';
+
+export const catalogItemTypeSchema = z.enum(['hardware', 'software', 'service']);
+export type CatalogItemType = z.infer<typeof catalogItemTypeSchema>;
+
+export const catalogBillingTypeSchema = z.enum(['one_time', 'recurring']);
+export type CatalogBillingType = z.infer<typeof catalogBillingTypeSchema>;
+
+export const catalogBillingFrequencySchema = z.enum(['monthly', 'annual']);
+export type CatalogBillingFrequency = z.infer<typeof catalogBillingFrequencySchema>;
+
+// Bounded to numeric(12,2) (max 9,999,999,999.99) so out-of-range inputs fail
+// fast with a 400 rather than overflowing at insert (DB-layer 500).
+const money = z.number().nonnegative().max(9_999_999_999.99).multipleOf(0.01);
+
+// markup_percent is numeric(6,2) in the schema (max 9999.99). Cap here so values
+// in the 10000+ range are rejected up front instead of overflowing on insert.
+const markupPercent = z.number().min(0).max(9999.99).multipleOf(0.01);
+
+// Bundle component quantity is numeric(12,2) (max 9,999,999,999.99) in the schema.
+// Match the money ceiling so an oversized quantity is rejected with a 400 rather
+// than overflowing at insert (DB-layer 500).
+const bundleQuantity = z.number().positive().max(9_999_999_999.99).multipleOf(0.01);
+
+// AI enrichment provenance stored on a catalog item as `attributes.enrichment`.
+// Defined here (above createCatalogItemSchema) so the create boundary can
+// validate the known sub-key's shape; also reused on the enrich response path.
+export const enrichmentProvenanceSchema = z.object({
+  source: z.literal('ai_enrich'),
+  model: z.string().max(100),
+  query: z.string().max(200),
+  // Bounded passthrough of exactly what the AI returned (the "suggestion").
+  suggestion: z.record(z.string(), z.unknown()).refine(
+    (v) => JSON.stringify(v).length <= 20_000,
+    { message: 'enrichment suggestion is too large' }
+  ),
+  enrichedAt: z.string().max(40),
+  enrichedBy: z.string().max(100),
+});
+export type EnrichmentProvenance = z.infer<typeof enrichmentProvenanceSchema>;
+
+export const itemPriceInputSchema = z.object({
+  currencyCode: currencyCodeSchema,
+  unitPrice: money,
+});
+export type ItemPriceInput = z.infer<typeof itemPriceInputSchema>;
+
+export const createCatalogItemSchema = z.object({
+  itemType: catalogItemTypeSchema,
+  name: z.string().min(1).max(255),
+  sku: z.string().max(100).nullable().optional(),
+  description: z.string().max(10_000).nullable().optional(),
+  billingType: catalogBillingTypeSchema.default('one_time'),
+  billingFrequency: catalogBillingFrequencySchema.nullable().optional(),
+  commitmentTermMonths: z.number().int().min(1).max(120).nullable().optional(),
+  /**
+   * Legacy single-price input alias. NOT the dropped `catalog_items.unit_price`
+   * mirror (#3812 removed that column): the service maps this value into the
+   * PARTNER-currency row of `catalog_item_prices`, exactly as `prices` does for
+   * an explicit currency. It stays because the TD SYNNEX, EC Express and Pax8
+   * import seams (and their web drawers) still post a bare `unitPrice` with no
+   * `sellCurrency`; removing it would silently drop the imported sell price.
+   * Retire it only once every caller sends `prices[]`.
+   */
+  unitPrice: money.optional(),
+  prices: z.array(itemPriceInputSchema).max(40).optional(),
+  costBasis: money.nullable().optional(),
+  costCurrency: currencyCodeSchema.optional(),
+  markupPercent: markupPercent.nullable().optional(),
+  unitOfMeasure: z.string().max(50).default('each'),
+  taxable: z.boolean().default(true),
+  taxCategory: z.string().max(100).nullable().optional(),
+  isBundle: z.boolean().default(false),
+  // AI provenance is stored as attributes.enrichment (see CatalogItemEditorDrawer).
+  // Validate that known sub-key's shape at the write boundary so a malformed
+  // provenance object can't be persisted, while still allowing forward-compatible
+  // extra keys via .catchall(). The serialized-size refine bounds the whole map
+  // (the enrichmentProvenanceSchema's own 20k suggestion cap also applies here).
+  attributes: z.object({
+    enrichment: enrichmentProvenanceSchema.optional(),
+  })
+    .catchall(z.unknown())
+    .refine((v) => JSON.stringify(v).length <= 60_000, { message: 'attributes payload is too large' })
+    .default({})
+}).superRefine((v, ctx) => {
+  if (v.prices) {
+    const currencies = new Set(v.prices.map((price) => price.currencyCode));
+    if (currencies.size !== v.prices.length) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Duplicate currency in prices',
+        path: ['prices'],
+      });
+    }
+  }
+
+  const hasPriceSource = v.unitPrice !== undefined
+    || (v.prices?.length ?? 0) > 0
+    || (v.costBasis != null && v.markupPercent != null);
+  if (!hasPriceSource) {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'A price is required: provide unitPrice, prices, or costBasis + markupPercent',
+      path: ['unitPrice'],
+    });
+  }
+});
+export type CreateCatalogItemInput = z.infer<typeof createCatalogItemSchema>;
+
+export const updateCatalogItemSchema = z.object({
+  itemType: catalogItemTypeSchema.optional(),
+  name: z.string().min(1).max(255).optional(),
+  sku: z.string().max(100).nullable().optional(),
+  description: z.string().max(10_000).nullable().optional(),
+  billingType: catalogBillingTypeSchema.optional(),
+  billingFrequency: catalogBillingFrequencySchema.nullable().optional(),
+  commitmentTermMonths: z.number().int().min(1).max(120).nullable().optional(),
+  /** Legacy single-price alias — writes the PARTNER-currency `catalog_item_prices`
+   *  row (see createCatalogItemSchema.unitPrice). */
+  unitPrice: money.optional(),
+  costBasis: money.nullable().optional(),
+  costCurrency: currencyCodeSchema.optional(),
+  markupPercent: markupPercent.nullable().optional(),
+  unitOfMeasure: z.string().max(50).optional(),
+  taxable: z.boolean().optional(),
+  taxCategory: z.string().max(100).nullable().optional(),
+  isBundle: z.boolean().optional(),
+  attributes: z.record(z.string(), z.unknown()).optional(),
+  isActive: z.boolean().optional()
+}).refine((v) => Object.keys(v).length > 0, { message: 'At least one field is required' });
+export type UpdateCatalogItemInput = z.infer<typeof updateCatalogItemSchema>;
+
+export const orgPriceOverrideSchema = z.object({
+  unitPrice: money,
+  currencyCode: currencyCodeSchema.optional(),
+});
+export type OrgPriceOverrideInput = z.infer<typeof orgPriceOverrideSchema>;
+
+export const setItemPriceSchema = z.object({ unitPrice: money });
+export type SetItemPriceInput = z.infer<typeof setItemPriceSchema>;
+
+export const bundleComponentSchema = z.object({
+  componentItemId: z.string().guid(),
+  quantity: bundleQuantity,
+  showOnInvoice: z.boolean().default(false),
+  revenueAllocation: money.nullable().optional()
+});
+export type BundleComponentInput = z.infer<typeof bundleComponentSchema>;
+
+// A revenueAllocation is money, so the set names the currency it was authored
+// in (#3775 review #7) — the bundle price currency being edited. Required
+// whenever any component carries an allocation; the service stamps it on
+// those rows and only ever uses an allocation in that same currency.
+export const setBundleComponentsSchema = z.object({
+  components: z.array(bundleComponentSchema).max(200),
+  allocationCurrency: currencyCodeSchema.optional()
+}).refine(
+  (v) => v.allocationCurrency !== undefined || v.components.every((c) => c.revenueAllocation == null),
+  { message: 'allocationCurrency is required when any component carries a revenueAllocation', path: ['allocationCurrency'] }
+);
+export type SetBundleComponentsInput = z.infer<typeof setBundleComponentsSchema>;
+
+export const listCatalogQuerySchema = z.object({
+  itemType: catalogItemTypeSchema.optional(),
+  // Tri-state boolean query params: z.coerce.boolean() uses JS truthiness, so the
+  // strings "false"/"0" would coerce to true. Use the repo's enum-string idiom
+  // (see apps/api/src/routes/alerts/schemas.ts) and transform to a real boolean so
+  // ?isActive=false correctly filters for inactive items.
+  isActive: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
+  isBundle: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
+  search: z.string().max(200).optional(),
+  currencyCode: currencyCodeSchema.optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  cursor: z.string().guid().optional()
+});
+export type ListCatalogQuery = z.infer<typeof listCatalogQuerySchema>;
+
+export const enrichRequestSchema = z.object({
+  query: z.string().min(1).max(200),
+  hint: catalogItemTypeSchema.optional(),
+});
+export type EnrichRequest = z.infer<typeof enrichRequestSchema>;
+
+export const enrichDraftSchema = z.object({
+  name: z.string().min(1).max(255),
+  description: z.string().max(10_000).nullable(),
+  itemType: catalogItemTypeSchema,
+  unitOfMeasure: z.string().max(50),
+  taxable: z.boolean(),
+  taxCategory: z.string().max(100).nullable(),
+});
+export type EnrichDraft = z.infer<typeof enrichDraftSchema>;
+
+// enrichmentProvenanceSchema / EnrichmentProvenance are defined above
+// createCatalogItemSchema so the create boundary can reference them.
+
+export const enrichResponseSchema = z.object({
+  draft: enrichDraftSchema,
+  priceGuidance: z.string().max(120).nullable(),
+  // Best-effort single-unit acquisition-cost estimate (what the MSP would pay,
+  // not MSRP). Advisory: hosts may pre-fill an internal cost field with it, but
+  // it must never be committed anywhere without the user able to review it.
+  estimatedCost: z.number().min(0).nullable(),
+  provenance: enrichmentProvenanceSchema,
+});
+export type EnrichResponse = z.infer<typeof enrichResponseSchema>;
+
+// "Polish with AI": presentation-only clean-up of a name and/or description the
+// user already has. Unlike enrich, this does NO web search and is contractually
+// forbidden from changing any factual detail — it only fixes grammar, casing,
+// spacing, structure, and strips distributor noise. Used by the catalog item
+// editor, quote line editor, and invoice line editor.
+export const polishTextRequestSchema = z.object({
+  name: z.string().max(255).nullable().optional(),
+  description: z.string().max(10_000).nullable().optional(),
+}).refine(
+  (d) => Boolean(d.name?.trim()) || Boolean(d.description?.trim()),
+  { message: 'Provide a name or description to polish' },
+);
+export type PolishTextRequest = z.infer<typeof polishTextRequestSchema>;
+
+// A before/after diff of the numeric "fact" tokens (numbers, measurements,
+// prices, and the digit runs inside model/part numbers). `added` are tokens the
+// polished text has that the input did not — the genuinely risky, over-claiming
+// direction. `removed` are tokens the input had that the polished text dropped —
+// usually stripped distributor noise (order codes, pack counts). Canonicalized
+// (lowercased, unit-normalized) so they read as hints, not exact source spans.
+// FACT_CHANGE_MAX is the single source of truth for the cap; the service imports
+// it so the enforcement point (multisetDiff) and this schema bound can't drift.
+export const FACT_CHANGE_MAX = 50;
+export const polishFactChangesSchema = z.object({
+  added: z.array(z.string()).max(FACT_CHANGE_MAX),
+  removed: z.array(z.string()).max(FACT_CHANGE_MAX),
+});
+export type PolishFactChanges = z.infer<typeof polishFactChangesSchema>;
+
+export const polishTextResponseSchema = z.object({
+  name: z.string().max(255).nullable(),
+  description: z.string().max(10_000).nullable(),
+  // True when the polished text differs from the input (lets the UI skip a
+  // no-op "nothing changed" preview).
+  changed: z.boolean(),
+  // Non-null exactly when the fact guard tripped: the polish may have altered a
+  // numeric/unit spec, or stripped a digit-bearing distributor code the AI could
+  // not avoid. Its PRESENCE is the advisory warning — the polished text is still
+  // returned (the guard is ADVISORY, not blocking), but the UI must surface the
+  // before/after when this is set. null = facts verified clean, no warning. One
+  // nullable field (not a separate boolean flag) so "warning" and "what changed"
+  // can't disagree.
+  factChanges: polishFactChangesSchema.nullable(),
+});
+export type PolishTextResponse = z.infer<typeof polishTextResponseSchema>;

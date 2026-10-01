@@ -1,0 +1,807 @@
+/**
+ * #3089 — the chat turn must not block indefinitely on pending approvals.
+ *
+ * Covers the shared per-cycle approval-wait budget (beginApprovalWait via the
+ * tier-3/tier-2 flows), settleApprovalWaits (new-user-message / interrupt
+ * settling), and waitForTurnToSettle. Mock scaffolding mirrors
+ * aiAgentSdk.test.ts.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  createSessionPreToolUse,
+  settleApprovalWaits,
+  waitForTurnToSettle,
+  APPROVAL_WAIT_BUDGET_MS,
+  TERMINAL_READBACK_BUDGET_MS,
+} from './aiAgentSdk';
+import { db } from '../db';
+import { actionIntents } from '../db/schema/actionIntents';
+import { checkGuardrails, checkToolPermission, checkToolRateLimit } from './aiGuardrails';
+import { waitForApproval } from './aiAgent';
+import type { ActionIntentSnapshot } from './actionIntents/intentService';
+
+// ============================================
+// Mocks (mirrors aiAgentSdk.test.ts)
+// ============================================
+
+vi.mock('../db', () => ({
+  runOutsideDbContext: vi.fn((fn) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  db: {
+    update: vi.fn(),
+    insert: vi.fn(),
+    select: vi.fn(),
+  },
+}));
+
+vi.mock('../db/schema', () => ({
+  aiSessions: { id: 'id', status: 'status', orgId: 'orgId' },
+  aiMessages: {},
+  aiToolExecutions: { id: 'id', status: 'status' },
+  aiActionPlans: {},
+  devices: {},
+  deviceSessions: {},
+  approvalRequests: { id: 'approval_requests.id', status: 'approval_requests.status' },
+}));
+
+// Spread the real module rather than replacing it: schema modules evaluate
+// other drizzle-orm exports (notably `sql`) at import time.
+vi.mock('drizzle-orm', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('drizzle-orm')>()),
+  eq: vi.fn((...args: unknown[]) => ({ _eq: args })),
+  and: vi.fn((...args: unknown[]) => ({ _and: args })),
+  isNull: vi.fn((...args: unknown[]) => ({ _isNull: args })),
+}));
+
+vi.mock('./aiAgent', () => ({
+  getSession: vi.fn(),
+  buildSystemPrompt: vi.fn(),
+  waitForApproval: vi.fn(),
+}));
+
+vi.mock('./aiCostTracker', () => ({
+  checkAiRateLimit: vi.fn(),
+  checkBudget: vi.fn(),
+  getRemainingBudgetUsd: vi.fn(),
+}));
+
+vi.mock('./aiInputSanitizer', () => ({
+  sanitizeUserMessage: vi.fn(),
+  sanitizePageContext: vi.fn(),
+}));
+
+vi.mock('./aiGuardrails', () => ({
+  checkGuardrails: vi.fn(),
+  checkToolPermission: vi.fn(),
+  checkToolRateLimit: vi.fn(),
+}));
+
+vi.mock('./auditEvents', () => ({
+  writeAuditEvent: vi.fn(),
+  requestLikeFromSnapshot: vi.fn(),
+}));
+
+vi.mock('./aiAgentSdkTools', () => ({
+  TOOL_TIERS: {
+    execute_command: 3,
+    take_screenshot: 2,
+  },
+  BREEZE_MCP_TOOL_NAMES: [],
+}));
+
+const mockGetUserPushTokens = vi.fn();
+const mockDispatchApprovalPushToTokens = vi.fn();
+vi.mock('./expoPush', () => ({
+  getUserPushTokens: (...args: unknown[]) => mockGetUserPushTokens(...args),
+  dispatchApprovalPushToTokens: (...args: unknown[]) => mockDispatchApprovalPushToTokens(...args),
+}));
+
+vi.mock('./pamToolActionGovernance', () => ({
+  decideHelperToolAction: vi.fn(),
+}));
+
+const mockCreateActionIntent = vi.fn();
+const mockWaitForIntentDecision = vi.fn();
+const mockWaitForIntentTerminalOutcome = vi.fn();
+const mockTransitionIntent = vi.fn();
+vi.mock('./actionIntents/intentService', () => ({
+  createActionIntent: (...args: unknown[]) => mockCreateActionIntent(...args),
+  waitForIntentDecision: (...args: unknown[]) => mockWaitForIntentDecision(...args),
+  waitForIntentTerminalOutcome: (...args: unknown[]) => mockWaitForIntentTerminalOutcome(...args),
+  transitionIntent: (...args: unknown[]) => mockTransitionIntent(...args),
+}));
+
+const mockRequiresDurableRelease = vi.fn(() => false);
+vi.mock('./actionIntents/durableRelease', () => ({
+  requiresDurableRelease: (...args: unknown[]) => mockRequiresDurableRelease(...(args as [])),
+  DURABLE_RELEASE_ONLY_TOOLS: new Set<string>(),
+}));
+
+// W04 (#5612): the lane's restore-checkpoint release precondition (its own
+// truth table: actionIntents/laneCheckpoint.test.ts). Mocked so its
+// transitive scriptDispatch/schema imports never reach the partial schema
+// mock above.
+const mockLaneCheckpoint = vi.fn(async () => ({ ok: true as boolean, checkpointRef: null as string | null, reason: undefined as string | undefined }));
+vi.mock('./actionIntents/laneCheckpoint', () => ({
+  ensureLaneCheckpointBeforeRelease: (...a: unknown[]) => mockLaneCheckpoint(...(a as [])),
+}));
+const mockPublishTerminal = vi.fn(async () => {});
+vi.mock('./aiOperator/taskOutbox', () => ({
+  publishIntentTerminalOutbox: (...a: unknown[]) => mockPublishTerminal(...(a as [])),
+}));
+
+vi.mock('./actionIntents/revalidateRelease', () => ({
+  revalidateApprovedIntentForRelease: vi.fn(() => Promise.resolve({ ok: true, auth: {} })),
+}));
+
+vi.mock('../db/schema/actionIntents', () => ({
+  actionIntents: { id: 'id', status: 'status' },
+}));
+
+vi.mock('./sentry', () => ({
+  captureException: vi.fn(),
+}));
+
+// ============================================
+// Test helpers
+// ============================================
+
+function makeAuth() {
+  return {
+    user: { id: 'user-1', email: 'test@example.com', name: 'Test User' },
+    orgId: 'org-1',
+    scope: 'organization',
+    accessibleOrgIds: ['org-1'],
+    canAccessOrg: () => true,
+    orgCondition: () => null,
+  } as any;
+}
+
+function makeActiveSession(overrides: Record<string, unknown> = {}) {
+  return {
+    breezeSessionId: 'session-1',
+    orgId: 'org-1',
+    auth: makeAuth(),
+    approvalMode: 'per_step',
+    isPaused: false,
+    state: 'processing',
+    eventBus: { publish: vi.fn() },
+    abortController: new AbortController(),
+    activePlanId: null,
+    approvedPlanSteps: new Map(),
+    currentPlanStepIndex: 0,
+    toolUseIdQueue: ['tool-use-1'],
+    auditSnapshot: null,
+    allowedTools: undefined,
+    approvalWaitDeadline: null,
+    approvalWaitAbort: null,
+    pendingApprovalWaits: 0,
+    ...overrides,
+  } as any;
+}
+
+function makeIntentSnapshot(overrides: Partial<ActionIntentSnapshot> = {}): ActionIntentSnapshot {
+  return {
+    id: 'intent-1',
+    status: 'pending_approval',
+    actionName: 'execute_command',
+    argumentDigest: 'digest-1',
+    source: 'chat',
+    expiresAt: new Date(Date.now() + 300_000),
+    result: null,
+    errorCode: null,
+    approvalRequestIds: ['appr-1'],
+    requesterApprovalRequestId: null,
+    approvalExpiresAt: new Date(Date.now() + 300_000),
+    fanOutUserIds: [],
+    ...overrides,
+  };
+}
+
+function mockInsertReturning(row: Record<string, unknown>) {
+  const returning = vi.fn().mockResolvedValue([row]);
+  const values = vi.fn().mockReturnValue({ returning });
+  vi.mocked(db.insert).mockReturnValue({ values } as any);
+  return { values, returning };
+}
+
+function mockUpdateChain() {
+  const where = vi.fn().mockResolvedValue(undefined);
+  const set = vi.fn(() => ({ where }));
+  vi.mocked(db.update).mockReturnValue({ set } as any);
+  return { set, where };
+}
+
+/** Poll until `fn()` is true (waits blocked inside preToolUse are async). */
+async function until(fn: () => boolean, ms = 2000): Promise<void> {
+  const start = Date.now();
+  while (!fn()) {
+    if (Date.now() - start > ms) throw new Error('until(): condition not met in time');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function tier3Guardrail(approvalScope: 'supervised' | 'four_eyes' = 'four_eyes') {
+  vi.mocked(checkGuardrails).mockReturnValue({
+    allowed: true,
+    tier: 3,
+    requiresApproval: true,
+    description: 'Execute command',
+    approvalScope,
+  } as any);
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(checkToolPermission).mockResolvedValue(null as any);
+  vi.mocked(checkToolRateLimit).mockResolvedValue(null as any);
+  mockGetUserPushTokens.mockResolvedValue([]);
+  mockDispatchApprovalPushToTokens.mockResolvedValue(undefined);
+  mockRequiresDurableRelease.mockReturnValue(false);
+  // Default: the handoff read-back (#6022) observes nothing terminal.
+  mockWaitForIntentTerminalOutcome.mockResolvedValue(null);
+});
+
+// ============================================
+// Shared per-cycle budget
+// ============================================
+
+describe('shared approval-wait budget (#3089)', () => {
+  it('first tier-3 wait of a cycle gets the full budget and sets the shared deadline', async () => {
+    tier3Guardrail();
+    mockInsertReturning({ id: 'exec-1' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot());
+    mockWaitForIntentDecision.mockResolvedValue('rejected');
+    const session = makeActiveSession();
+    const before = Date.now();
+
+    await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    expect(mockWaitForIntentDecision).toHaveBeenCalledWith(
+      'intent-1',
+      APPROVAL_WAIT_BUDGET_MS,
+      expect.any(AbortSignal),
+    );
+    // Deadline is shared session state for the rest of the cycle.
+    expect(session.approvalWaitDeadline).toBeGreaterThanOrEqual(before + APPROVAL_WAIT_BUDGET_MS);
+    // The in-flight counter is balanced once the wait ends.
+    expect(session.pendingApprovalWaits).toBe(0);
+  });
+
+  it('a sibling wait in the same cycle gets zero budget once exhausted and returns pending immediately', async () => {
+    tier3Guardrail();
+    mockInsertReturning({ id: 'exec-2' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-2', approvalRequestIds: ['appr-2'] }));
+    mockWaitForIntentDecision.mockResolvedValue('pending_approval');
+    // A sibling approval earlier in this cycle already burned the budget.
+    const session = makeActiveSession({ approvalWaitDeadline: Date.now() - 1_000 });
+
+    const result = await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    expect(mockWaitForIntentDecision).toHaveBeenCalledWith('intent-2', 0, expect.any(AbortSignal));
+    expect(result).toEqual({
+      allowed: false,
+      error: 'Approval still pending; this action will complete once approved.',
+    });
+    // The intent is untouched — it stays pending_approval for the durable
+    // release worker to execute once an approver decides.
+    expect(mockTransitionIntent).not.toHaveBeenCalled();
+    // The approval card was still surfaced to the user.
+    expect(session.eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'approval_required', executionId: 'exec-2' }),
+    );
+  });
+});
+
+// ============================================
+// Tier-3 approval scope propagation (2026-08-05 tier3-supervised-four-eyes)
+// ============================================
+
+describe('tier-3 approval scope propagation to the chat SSE approval event', () => {
+  it('supervised: approval event carries approvalScope + selfApprovalRequestId; aiAgentSdk never dispatches push itself', async () => {
+    tier3Guardrail('supervised');
+    mockInsertReturning({ id: 'exec-supervised' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(
+      makeIntentSnapshot({ id: 'intent-supervised', requesterApprovalRequestId: 'appr-self' }),
+    );
+    mockWaitForIntentDecision.mockResolvedValue('rejected');
+    const session = makeActiveSession();
+
+    await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    expect(session.eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'approval_required',
+        executionId: 'exec-supervised',
+        approvalScope: 'supervised',
+        selfApprovalRequestId: 'appr-self',
+        intentBacked: true,
+      }),
+    );
+    // NOT asserted here: that push is skipped for supervised. Push for the
+    // durable intent path is dispatched — and gated on scope — entirely
+    // inside createActionIntent, which is mocked wholesale in this file, so
+    // there is no call site either way and
+    // `expect(mockDispatchApprovalPushToTokens).not.toHaveBeenCalled()`
+    // could not fail regardless of the gating. That assertion used to sit
+    // here and has been removed as false confidence. The real gate is proved
+    // against the real implementation in
+    // services/actionIntents/intentService.test.ts
+    // ('createActionIntent — supervised/four_eyes scope').
+  });
+
+  it('four_eyes: approval event carries approvalScope; aiAgentSdk still never dispatches push itself', async () => {
+    tier3Guardrail('four_eyes');
+    mockInsertReturning({ id: 'exec-four-eyes' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(
+      makeIntentSnapshot({ id: 'intent-four-eyes', requesterApprovalRequestId: null }),
+    );
+    mockWaitForIntentDecision.mockResolvedValue('rejected');
+    const session = makeActiveSession();
+
+    await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    expect(session.eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'approval_required',
+        executionId: 'exec-four-eyes',
+        approvalScope: 'four_eyes',
+        selfApprovalRequestId: undefined,
+        intentBacked: true,
+      }),
+    );
+    // Same as the supervised case above: the four_eyes push fan-out is real
+    // production behavior, but it lives inside the mocked createActionIntent,
+    // so no assertion in this file can observe it. Covered for real in
+    // services/actionIntents/intentService.test.ts.
+  });
+
+  it('aiAgentSdk itself never dispatches an approval push on the tier-3 path', async () => {
+    // The one assertion in this area that IS meaningful here, stated once
+    // instead of twice: aiAgentSdk.ts does have a push call site (the legacy
+    // Tier-2 per_step bridge), so "no push from this module" is a real,
+    // falsifiable property of the tier-3 branch — it would fail if that
+    // bridge were ever reused for tier 3, producing a second, ungated
+    // dispatch alongside createActionIntent's.
+    tier3Guardrail('four_eyes');
+    mockInsertReturning({ id: 'exec-no-push' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-no-push' }));
+    mockWaitForIntentDecision.mockResolvedValue('rejected');
+    const session = makeActiveSession();
+
+    await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    // Proof the tier-3 branch actually ran (without it the two assertions
+    // below would be trivially true for a call that never got that far).
+    expect(mockCreateActionIntent).toHaveBeenCalled();
+    expect(mockGetUserPushTokens).not.toHaveBeenCalled();
+    expect(mockDispatchApprovalPushToTokens).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================
+// settleApprovalWaits
+// ============================================
+
+describe('settleApprovalWaits (#3089)', () => {
+  it('is a no-op returning false when no approval wait is in flight', () => {
+    const session = makeActiveSession();
+    expect(settleApprovalWaits(session)).toBe(false);
+    expect(session.approvalWaitAbort).toBeNull();
+  });
+
+  it('settles an in-flight tier-3 wait: the turn unblocks with an approval-pending result and the intent is left for the worker', async () => {
+    tier3Guardrail();
+    mockInsertReturning({ id: 'exec-3' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-3', approvalRequestIds: ['appr-3'] }));
+    // Simulate a real DB-polling wait that only ends when the signal fires.
+    mockWaitForIntentDecision.mockImplementation(
+      (_id: string, _timeoutMs: number, signal: AbortSignal) =>
+        new Promise((resolve) => {
+          if (signal.aborted) return resolve('pending_approval');
+          signal.addEventListener('abort', () => resolve('pending_approval'), { once: true });
+        }),
+    );
+    const session = makeActiveSession();
+
+    const resultPromise = createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+    await until(() => session.pendingApprovalWaits === 1);
+
+    expect(settleApprovalWaits(session)).toBe(true);
+
+    const result = await resultPromise;
+    expect(result).toEqual({
+      allowed: false,
+      error: 'Approval still pending; this action will complete once approved.',
+    });
+    expect(mockTransitionIntent).not.toHaveBeenCalled();
+    expect(session.pendingApprovalWaits).toBe(0);
+    // Budget is exhausted for the rest of the cycle so a sibling cannot
+    // immediately re-block the turn.
+    expect(session.approvalWaitDeadline).toBeLessThanOrEqual(Date.now());
+    // Nothing left to settle.
+    expect(settleApprovalWaits(session)).toBe(false);
+  });
+
+  it('settles an in-flight tier-2 wait and closes out the pending execution row so a later approve cannot strand it', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true,
+      tier: 2,
+      requiresApproval: true,
+      description: 'Take screenshot',
+    } as any);
+    mockInsertReturning({ id: 'exec-4' });
+    const { set, where } = mockUpdateChain();
+    vi.mocked(waitForApproval).mockImplementation(
+      (_id: string, _timeoutMs: number, signal?: AbortSignal) =>
+        new Promise((resolve) => {
+          if (signal?.aborted) return resolve(false);
+          signal?.addEventListener('abort', () => resolve(false), { once: true });
+        }),
+    );
+    const session = makeActiveSession();
+
+    const resultPromise = createSessionPreToolUse(session)('take_screenshot', { deviceId: 'd-1' });
+    await until(() => session.pendingApprovalWaits === 1);
+
+    expect(settleApprovalWaits(session)).toBe(true);
+
+    const result = await resultPromise;
+    expect(result).toEqual({ allowed: false, error: 'Tool execution was rejected or timed out' });
+    // The still-pending ledger row was closed out — WITH the status='pending'
+    // CAS guard, so a genuine reject/timeout row is never overwritten — and a
+    // later Approve click cannot flip it to a stranded 'approved' this legacy
+    // bridge would never execute.
+    expect(set).toHaveBeenCalledWith({
+      status: 'rejected',
+      errorMessage: 'Approval wait ended before a decision was made',
+    });
+    expect(where).toHaveBeenCalledWith({
+      _and: [{ _eq: ['id', 'exec-4'] }, { _eq: ['status', 'pending'] }],
+    });
+    // The linked mobile approval_requests row is CAS'd out of 'pending' too,
+    // closing the mobile decide → stranded-'approved' race at the source.
+    expect(set).toHaveBeenCalledWith({ status: 'expired' });
+    expect(where).toHaveBeenCalledWith({
+      _and: [
+        { _eq: ['approval_requests.id', 'exec-4'] },
+        { _eq: ['approval_requests.status', 'pending'] },
+      ],
+    });
+    expect(session.pendingApprovalWaits).toBe(0);
+  });
+
+  it('a zero-budget tier-2 approval never runs the ceremony (no mobile push, no UI card) and self-closes honestly', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true,
+      tier: 2,
+      requiresApproval: true,
+      description: 'Take screenshot',
+    } as any);
+    const { values } = mockInsertReturning({ id: 'exec-5' });
+    const { set, where } = mockUpdateChain();
+    // A sibling approval (or a settle) already exhausted this cycle's budget.
+    const session = makeActiveSession({ approvalWaitDeadline: Date.now() - 1_000 });
+
+    const result = await createSessionPreToolUse(session)('take_screenshot', { deviceId: 'd-1' });
+
+    expect(result.allowed).toBe(false);
+    expect((result as { error: string }).error).toMatch(/approval window for this turn has ended/);
+    // No dead-on-arrival ceremony: only the ledger-row insert ran — no
+    // approval_requests row, no push, no approval_required card, no wait.
+    expect(values).toHaveBeenCalledTimes(1);
+    expect(mockDispatchApprovalPushToTokens).not.toHaveBeenCalled();
+    expect(session.eventBus.publish).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'approval_required' }),
+    );
+    expect(waitForApproval).not.toHaveBeenCalled();
+    // The ledger row is closed out honestly (CAS on status='pending').
+    expect(set).toHaveBeenCalledWith({
+      status: 'rejected',
+      errorMessage: "Approval not requested — this turn's approval wait budget was already exhausted",
+    });
+    expect(where).toHaveBeenCalledWith({
+      _and: [{ _eq: ['id', 'exec-5'] }, { _eq: ['status', 'pending'] }],
+    });
+    expect(session.pendingApprovalWaits).toBe(0);
+  });
+
+  it('helper/PAM approvals draw from the same shared budget (zero remaining → zero wait)', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true,
+      tier: 3,
+      requiresApproval: true,
+      description: 'Execute command',
+    } as any);
+    mockInsertReturning({ id: 'exec-h9' });
+    mockUpdateChain();
+    const { decideHelperToolAction } = await import('./pamToolActionGovernance');
+    vi.mocked(decideHelperToolAction).mockResolvedValue('prompt' as any);
+    vi.mocked(waitForApproval).mockResolvedValue(false);
+    const session = makeActiveSession({
+      auth: { ...makeAuth(), helperDeviceId: 'dev-9' },
+      approvalWaitDeadline: Date.now() - 1_000,
+    });
+
+    const result = await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    expect(result.allowed).toBe(false);
+    expect(waitForApproval).toHaveBeenCalledWith('exec-h9', 0, expect.any(AbortSignal));
+    expect(session.pendingApprovalWaits).toBe(0);
+  });
+});
+
+// ============================================
+// waitForTurnToSettle
+// ============================================
+
+describe('waitForTurnToSettle (#3089)', () => {
+  it('resolves true once the session leaves processing', async () => {
+    const session = makeActiveSession({ state: 'processing' });
+    setTimeout(() => { session.state = 'idle'; }, 250);
+
+    await expect(waitForTurnToSettle(session, 3_000)).resolves.toBe(true);
+  });
+
+  it('resolves false when the session is still processing at the deadline', async () => {
+    const session = makeActiveSession({ state: 'processing' });
+
+    await expect(waitForTurnToSettle(session, 300)).resolves.toBe(false);
+  });
+});
+
+// ============================================
+// W04 (#5612): an intent approved AT CREATION (script_reviewer / ticket
+// autonomy) has no approval row — the session gets an informational
+// `unattended_release` event, never an approval card.
+// ============================================
+
+describe('approved-at-creation intent (unattended lane, #5612 W04)', () => {
+  it('publishes unattended_release and NO approval_required when the intent is already approved', async () => {
+    tier3Guardrail('supervised');
+    mockInsertReturning({ id: 'exec-lane' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(
+      makeIntentSnapshot({ id: 'intent-lane', status: 'approved', approvalRequestIds: [], requesterApprovalRequestId: null }),
+    );
+    // The wait returns the row's status on its first poll; the release CAS
+    // is stubbed to lose so the (mocked-out) execution path is not entered.
+    mockWaitForIntentDecision.mockResolvedValue('approved');
+    mockTransitionIntent.mockResolvedValue(false);
+    const session = makeActiveSession();
+
+    await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    const types = vi.mocked(session.eventBus.publish).mock.calls.map((c: unknown[]) => (c[0] as { type: string }).type);
+    expect(types).not.toContain('approval_required');
+    expect(session.eventBus.publish).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'unattended_release', executionId: 'exec-lane', intentId: 'intent-lane' }),
+    );
+    // The wait/CAS path is still taken for the approved intent.
+    expect(mockWaitForIntentDecision).toHaveBeenCalledWith('intent-lane', expect.any(Number), expect.anything());
+    expect(mockTransitionIntent).toHaveBeenCalledWith('intent-lane', 'approved', 'executing', expect.anything(), expect.anything());
+  });
+
+  it('a lane intent whose restore checkpoint cannot be taken is CASed to failed:checkpoint_unavailable and never executed', async () => {
+    tier3Guardrail('supervised');
+    mockInsertReturning({ id: 'exec-lane-cp' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(
+      makeIntentSnapshot({ id: 'intent-lane-cp', status: 'approved', approvalRequestIds: [], requesterApprovalRequestId: null }),
+    );
+    mockWaitForIntentDecision.mockResolvedValue('approved');
+    // approved -> executing CAS won; executing -> failed CAS won.
+    mockTransitionIntent.mockResolvedValue(true);
+    // The post-CAS read: the intent row (no pinned digest) and no approval row.
+    const laneRow = {
+      id: 'intent-lane-cp', orgId: 'org-1', actionName: 'run_script', arguments: { proposalId: 'prop-1', deviceIds: ['dev-1'] },
+      argumentDigest: 'd', decidedVia: 'script_reviewer', effectDigest: null,
+      scriptReviewerEvidence: { proposalId: 'prop-1', reviewId: 'rev-1', checkpointRequired: true },
+      requestingAgentRunId: null, requestedByUserId: 'user-1', riskTier: 3,
+    };
+    // Keyed on the table: the intent row for action_intents, nothing for
+    // approval_requests (a lane intent has no approval row).
+    vi.mocked(db.select).mockImplementation((() => ({
+      from: (table: unknown) => ({
+        where: () => ({ limit: async () => (table === actionIntents ? [laneRow] : []) }),
+      }),
+    })) as never);
+    mockLaneCheckpoint.mockResolvedValueOnce({ ok: false, checkpointRef: null, reason: 'checkpoint_failed' });
+    const session = makeActiveSession();
+
+    const result = await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    expect(mockLaneCheckpoint).toHaveBeenCalledWith(expect.objectContaining({ id: 'intent-lane-cp' }));
+    expect(mockTransitionIntent).toHaveBeenCalledWith(
+      'intent-lane-cp', 'executing', 'failed', expect.objectContaining({ errorCode: 'checkpoint_unavailable' }),
+    );
+    expect(mockPublishTerminal).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ id: 'intent-lane-cp' }), 'intent_failed');
+    // The tool never ran: the pre-tool hook denied.
+    expect(result).toMatchObject({ allowed: false });
+    expect(String((result as { error?: string }).error)).toContain('System Restore checkpoint');
+  });
+
+  it('still publishes approval_required for an ordinary pending intent', async () => {
+    tier3Guardrail('supervised');
+    mockInsertReturning({ id: 'exec-pending' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-pending' }));
+    mockWaitForIntentDecision.mockResolvedValue('rejected');
+    const session = makeActiveSession();
+
+    await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    const types = vi.mocked(session.eventBus.publish).mock.calls.map((c: unknown[]) => (c[0] as { type: string }).type);
+    expect(types).toContain('approval_required');
+    expect(types).not.toContain('unattended_release');
+  });
+});
+
+// ============================================
+// Post-approval terminal read-back (#6022)
+// ============================================
+
+/**
+ * The bug: after a human approved, the session handed the action to the
+ * durable release worker and answered "Approved · running" unconditionally.
+ * The worker then ran it, the #5934 autoInstall guardrail refused, the intent
+ * ended `failed` / `tool_returned_error` — and the model told the operator the
+ * arming had succeeded.
+ *
+ * Both handoff exits now read the intent's terminal outcome back first. These
+ * tests pin the WIRING (each exit reads back, with a bounded budget, without
+ * touching the intent); the outcome mapping itself is pinned in
+ * `aiToolHandoff.test.ts` and the poll in
+ * `actionIntents/terminalOutcome.test.ts`.
+ */
+describe('handoff terminal read-back (#6022)', () => {
+  const guardrail =
+    'Arming autoInstall requires a human operator with devices.execute and MFA; the AI agent cannot arm software installation.';
+
+  /** Approved, then the durable worker wins the approved -> executing CAS. */
+  function casLostAfterApproval(intentId: string) {
+    tier3Guardrail('supervised');
+    mockInsertReturning({ id: `exec-${intentId}` });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: intentId }));
+    mockWaitForIntentDecision.mockResolvedValue('approved');
+    mockTransitionIntent.mockResolvedValue(false);
+  }
+
+  it('reports the worker FAILURE instead of "approved and running" (the issue repro)', async () => {
+    casLostAfterApproval('intent-readback-failed');
+    mockWaitForIntentTerminalOutcome.mockResolvedValue({
+      status: 'failed',
+      errorCode: 'tool_returned_error',
+      result: { error: guardrail },
+    });
+    const session = makeActiveSession();
+
+    const result = (await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' })) as {
+      allowed: boolean;
+      error: string;
+      handoff?: string;
+    };
+
+    expect(result.allowed).toBe(false);
+    expect(result.handoff).toBe('approved_failed');
+    expect(result.error).toContain(guardrail);
+    expect(result.error).not.toContain('is being carried out by the approval worker now');
+    // Bounded by the small read-back budget, not the 300s approval budget.
+    expect(mockWaitForIntentTerminalOutcome).toHaveBeenCalledWith(
+      'intent-readback-failed',
+      TERMINAL_READBACK_BUDGET_MS,
+      expect.any(AbortSignal),
+    );
+    // OBSERVER ONLY: the lost CAS was the last write attempt; the read-back
+    // never terminalizes or re-claims the intent.
+    expect(mockTransitionIntent).toHaveBeenCalledTimes(1);
+    expect(mockTransitionIntent).toHaveBeenCalledWith(
+      'intent-readback-failed',
+      'approved',
+      'executing',
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(session.pendingApprovalWaits).toBe(0);
+  });
+
+  it('keeps "approved and running" when the worker has not finished inside the budget', async () => {
+    casLostAfterApproval('intent-readback-running');
+    mockWaitForIntentTerminalOutcome.mockResolvedValue({
+      status: 'executing',
+      errorCode: null,
+      result: null,
+    });
+    const session = makeActiveSession();
+
+    const result = (await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' })) as {
+      error: string;
+      handoff?: string;
+    };
+
+    expect(result.handoff).toBe('approved_executing');
+    // ...and it no longer promises a separate report that never arrives.
+    expect(result.error).toMatch(/not.*confirmed/i);
+    expect(result.error).not.toMatch(/reported separately/i);
+  });
+
+  it('reports COMPLETED distinctly from still-running', async () => {
+    casLostAfterApproval('intent-readback-done');
+    mockWaitForIntentTerminalOutcome.mockResolvedValue({
+      status: 'completed',
+      errorCode: null,
+      result: { ok: true },
+    });
+    const session = makeActiveSession();
+
+    const result = (await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' })) as {
+      handoff?: string;
+    };
+
+    expect(result.handoff).toBe('approved_completed');
+  });
+
+  it('reads back on the DURABLE_RELEASE_ONLY exit too — without ever attempting the CAS', async () => {
+    tier3Guardrail('supervised');
+    mockInsertReturning({ id: 'exec-durable-only' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-durable-only' }));
+    mockWaitForIntentDecision.mockResolvedValue('approved');
+    mockRequiresDurableRelease.mockReturnValue(true);
+    mockWaitForIntentTerminalOutcome.mockResolvedValue({
+      status: 'failed',
+      errorCode: 'rbac_denied',
+      result: null,
+    });
+    const session = makeActiveSession();
+
+    const result = (await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' })) as {
+      error: string;
+      handoff?: string;
+    };
+
+    expect(result.handoff).toBe('approved_failed');
+    expect(result.error).toContain('rbac_denied');
+    expect(mockWaitForIntentTerminalOutcome).toHaveBeenCalledWith(
+      'intent-durable-only',
+      TERMINAL_READBACK_BUDGET_MS,
+      expect.any(AbortSignal),
+    );
+    // The worker-only exit must never claim the intent.
+    expect(mockTransitionIntent).not.toHaveBeenCalled();
+  });
+
+  it('clamps the read-back to the REMAINING shared budget so it cannot extend the turn', async () => {
+    casLostAfterApproval('intent-readback-clamped');
+    const session = makeActiveSession({ approvalWaitDeadline: Date.now() - 1_000 });
+
+    await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' });
+
+    expect(mockWaitForIntentTerminalOutcome).toHaveBeenCalledWith(
+      'intent-readback-clamped',
+      0,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('falls back to "still running" — never a fabricated failure — if the read-back throws', async () => {
+    casLostAfterApproval('intent-readback-throws');
+    mockWaitForIntentTerminalOutcome.mockRejectedValue(new Error('db down'));
+    const session = makeActiveSession();
+
+    const result = (await createSessionPreToolUse(session)('execute_command', { deviceId: 'd-1' })) as {
+      handoff?: string;
+    };
+
+    expect(result.handoff).toBe('approved_executing');
+    expect(session.pendingApprovalWaits).toBe(0);
+  });
+});

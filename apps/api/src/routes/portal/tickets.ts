@@ -1,0 +1,722 @@
+import { Hono } from 'hono';
+import type { MiddlewareHandler } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { tickets, ticketComments, ticketStatuses, organizations, portalBranding } from '../../db/schema';
+import {
+  listSchema,
+  createTicketSchema,
+  ticketParamSchema,
+  ticketCommentParamSchema,
+  portalAttachmentParamSchema,
+  commentSchema,
+  supportUsageQuerySchema,
+} from './schemas';
+import {
+  applyPortalCacheHeaders,
+  buildWeakEtag,
+  getPagination,
+  isEtagFresh,
+  validatePortalCookieCsrfRequest,
+  writePortalAudit,
+} from './helpers';
+import { portalTicketOwnership } from './ticketOwnership';
+import { createTicket, TicketServiceError, portalCommentMutable, editTicketComment, deleteTicketComment } from '../../services/ticketService';
+import { listTicketFormsForOrg } from '../../services/ticketFormService';
+import { editCommentSchema, PORTAL_TICKET_COMMENT_MAX_CHARS } from '@breeze/shared';
+import type { TicketAttachmentMeta } from '@breeze/shared';
+import { ATTACHMENT_META_COLUMNS, ticketAttachments } from '../../db/schema/ticketAttachments';
+import { AttachmentExpiredError, openBytes } from '../../services/ticketAttachmentStorage';
+import { captureException } from '../../services/sentry';
+// `contentDispositionFor` lives in services/attachmentFilename.ts. It used to be
+// imported from routes/tickets/attachments.ts, which merely RE-EXPORTS it —
+// that pulled the whole technician ticket route surface into this module's
+// graph and put it in an import cycle, so under Vite's SSR transform the
+// re-exported binding could still be uninitialised when this handler ran
+// (TypeError: contentDispositionFor is not a function). Import the source.
+import { contentDispositionFor } from '../../services/attachmentFilename';
+import { Readable } from 'node:stream';
+import { ticketSla } from '../../services/portal/ticketReadModel';
+import { supportUsageForOrg } from '../../services/portal/supportUsage';
+
+export const ticketRoutes = new Hono();
+
+function currentMonthIn(timezone: string, now = new Date()): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+  }).formatToParts(now);
+  const value = (type: string) =>
+    parts.find((part) => part.type === type)!.value;
+  return `${value('year')}-${value('month')}`;
+}
+
+const PORTAL_TICKET_SLA_COLUMNS = {
+  responseSlaMinutes: tickets.responseSlaMinutes,
+  resolutionSlaMinutes: tickets.resolutionSlaMinutes,
+  slaBreachedAt: tickets.slaBreachedAt,
+  slaPausedAt: tickets.slaPausedAt,
+  slaPausedMinutes: tickets.slaPausedMinutes,
+  firstResponseAt: tickets.firstResponseAt,
+  resolvedAt: tickets.resolvedAt,
+};
+
+// #2345 — per-org portal ticketing kill switch. `portal_branding.enable_tickets`
+// (toggled in the web UI's org portal settings) was stored and surfaced but never
+// enforced. Registered in routes/portal/index.ts on the `/tickets/*` prefix AFTER
+// portalAuthMiddleware, so it covers EVERY portal ticket surface in one place
+// (list/detail/create/comments AND the Phase 2 `/tickets/forms` intake endpoint)
+// and runs inside the session org's RLS context — portal_branding is org-forced,
+// so the session org's row is visible here without a system context.
+//
+// Fail-OPEN on a missing row: the column defaults to true and most orgs have no
+// portal_branding row at all — ticketing must stay enabled for them. Only an
+// explicit `enable_tickets = false` blocks, with a consistent 403 (the resource
+// class exists but is administratively disabled; 404 would misread as a bug).
+export const portalTicketsEnabledMiddleware: MiddlewareHandler = async (c, next) => {
+  const auth = c.get('portalAuth');
+  // Defensive: only meaningful when mounted AFTER portalAuthMiddleware (index.ts
+  // registers it that way). If a refactor ever reorders the use() calls or mounts
+  // this on an unauthenticated prefix, fail closed with an explicit 401 instead
+  // of an opaque TypeError 500.
+  if (!auth) {
+    return c.json({ error: 'Authentication required' }, 401);
+  }
+
+  const [row] = await db
+    .select({ enableTickets: portalBranding.enableTickets })
+    .from(portalBranding)
+    .where(eq(portalBranding.orgId, auth.user.orgId))
+    .limit(1);
+
+  if (row?.enableTickets === false) {
+    // `code` lets the portal pages distinguish this 403 from other 403s on the
+    // same routes (e.g. portalAuthMiddleware's "Account is not active") and only
+    // redirect for THIS one. Keep in sync with apps/portal/src/pages/tickets/*.
+    return c.json({ error: 'Ticketing is not enabled for this portal', code: 'PORTAL_TICKETS_DISABLED' }, 403);
+  }
+
+  return next();
+};
+
+// GET /tickets/forms — MUST live under the `/tickets/` prefix: portal auth is
+// applied per-prefix in routes/portal/index.ts (`use('/tickets/*', ...)`), so
+// a sibling path like `/ticket-forms` would ship with NO auth at all (the
+// prefix matcher does not cover it). MOUNT ORDER: this literal route is
+// registered BEFORE `GET /tickets/:id` below — Hono matches in registration
+// order, so registering it later would let the :id matcher swallow `forms`
+// (and 400 on the guid param). Same mount-order convention as Phase 1's
+// staff ticket router.
+// Portal runs under an org-scoped RLS context where partner-wide
+// ticket_forms rows are invisible (#1105 pattern), so the org's partnerId is
+// resolved under a system context first — mirrors routes/portal/quotes.ts:70
+// exactly. Slim payload only: no titleTemplate (the server composes
+// subjects, never the portal client).
+ticketRoutes.get('/tickets/forms', async (c) => {
+  const auth = c.get('portalAuth');
+
+  const [org] = await runOutsideDbContext(() =>
+    withSystemDbAccessContext(() =>
+      db
+        .select({ partnerId: organizations.partnerId })
+        .from(organizations)
+        .where(eq(organizations.id, auth.user.orgId))
+        .limit(1)
+    )
+  );
+  if (!org) {
+    // Should never happen: portalAuth already resolved this org for the
+    // session, so a miss here means the org row vanished mid-request (or a
+    // deeper data-integrity bug). Degrade to an empty form list rather than
+    // 500ing the New Ticket page, but leave a breadcrumb — this is not a
+    // normal "no forms configured" case.
+    console.error('[portal] ticket-forms: session org not found', { orgId: auth.user.orgId });
+    return c.json({ data: [] });
+  }
+
+  const forms = await listTicketFormsForOrg({ id: auth.user.orgId, partnerId: org.partnerId }, { portalOnly: true });
+  const data = forms.map((f) => ({
+    id: f.id,
+    name: f.name,
+    description: f.description,
+    categoryId: f.categoryId,
+    fields: f.fields,
+    defaultPriority: f.defaultPriority,
+  }));
+  return c.json({ data });
+});
+
+ticketRoutes.get(
+  '/tickets/usage',
+  zValidator('query', supportUsageQuerySchema),
+  async (c) => {
+    const auth = c.get('portalAuth');
+    const month = c.req.valid('query').month ?? currentMonthIn(auth.timezone);
+    const payload = await supportUsageForOrg({
+      orgId: auth.user.orgId,
+      month,
+      timezone: auth.timezone,
+      portalUserId: auth.user.id,
+    });
+
+    applyPortalCacheHeaders(c, {
+      scope: 'private',
+      browserMaxAgeSeconds: 30,
+      staleWhileRevalidateSeconds: 0,
+      vary: ['Authorization', 'Cookie'],
+    });
+    const etag = buildWeakEtag(payload);
+    c.header('ETag', etag);
+    if (isEtagFresh(c.req.header('if-none-match'), etag)) {
+      return new Response(null, {
+        status: 304,
+        headers: c.res.headers,
+      });
+    }
+    return c.json(payload);
+  },
+);
+
+ticketRoutes.get('/tickets', zValidator('query', listSchema), async (c) => {
+  const auth = c.get('portalAuth');
+  const query = c.req.valid('query');
+  const { page, limit, offset } = getPagination(query);
+
+  const conditions = and(
+    eq(tickets.orgId, auth.user.orgId),
+    portalTicketOwnership(auth.user),
+    isNull(tickets.deletedAt) // soft-deleted tickets are invisible to portal customers
+  );
+
+  const ticketCountResult = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(tickets)
+    .where(conditions);
+  const ticketCount = ticketCountResult[0]?.count ?? 0;
+
+  const data = await db
+    .select({
+      id: tickets.id,
+      ticketNumber: tickets.ticketNumber,
+      subject: tickets.subject,
+      status: tickets.status,
+      priority: tickets.priority,
+      createdAt: tickets.createdAt,
+      updatedAt: tickets.updatedAt,
+      statusName: ticketStatuses.name,
+      ...PORTAL_TICKET_SLA_COLUMNS,
+    })
+    .from(tickets)
+    .leftJoin(ticketStatuses, eq(tickets.statusId, ticketStatuses.id))
+    .where(conditions)
+    .orderBy(desc(tickets.createdAt), desc(tickets.id))
+    .limit(limit)
+    .offset(offset);
+
+  const now = new Date();
+  const ticketDtos = data.map((row) => ({
+    id: row.id,
+    ticketNumber: row.ticketNumber,
+    subject: row.subject,
+    status: row.status,
+    priority: row.priority,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    statusName: row.statusName,
+    sla: ticketSla(row, now),
+  }));
+  const payload = {
+    data: ticketDtos,
+    pagination: { page, limit, total: Number(ticketCount) }
+  };
+
+  applyPortalCacheHeaders(c, {
+    scope: 'private',
+    browserMaxAgeSeconds: 15,
+    staleWhileRevalidateSeconds: 90,
+    vary: ['Authorization', 'Cookie']
+  });
+  const etag = buildWeakEtag(payload);
+  c.header('ETag', etag);
+
+  if (isEtagFresh(c.req.header('if-none-match'), etag)) {
+    return new Response(null, { status: 304, headers: c.res.headers });
+  }
+
+  return c.json(payload);
+});
+
+ticketRoutes.post('/tickets', zValidator('json', createTicketSchema), async (c) => {
+  const csrfError = validatePortalCookieCsrfRequest(c);
+  if (csrfError) {
+    return c.json({ error: csrfError }, 403);
+  }
+
+  const auth = c.get('portalAuth');
+  const payload = c.req.valid('json');
+
+  let created: Awaited<ReturnType<typeof createTicket>>;
+  try {
+    // NOTE: the actor `userId` here is a portal_users id, NOT a users.id. The
+    // ticket service only uses it for audit/event metadata (no FK). It must
+    // never be routed into a column that FKs users.id — in particular, do NOT
+    // call addTicketComment from portal handlers (it writes actor.userId →
+    // ticket_comments.user_id). Portal comments set portal_user_id directly
+    // (see the POST /tickets/:id/comments handler below).
+    created = await createTicket(
+      {
+        orgId: auth.user.orgId,
+        subject: payload.subject,
+        description: payload.description,
+        priority: payload.priority,
+        formId: payload.formId,
+        formResponses: payload.formResponses,
+        source: 'portal',
+        submittedBy: auth.user.id,
+        submitterEmail: auth.user.email,
+        submitterName: auth.user.name ?? auth.user.email,
+      },
+      { userId: auth.user.id, name: auth.user.name ?? auth.user.email, email: auth.user.email }
+    );
+  } catch (err) {
+    if (err instanceof TicketServiceError) {
+      return c.json({ error: err.message }, err.status);
+    }
+    throw err;
+  }
+
+  const ticket = {
+    id: created.id,
+    ticketNumber: created.ticketNumber,
+    subject: created.subject,
+    description: created.description,
+    status: created.status,
+    priority: created.priority,
+    createdAt: created.createdAt,
+    updatedAt: created.updatedAt,
+  };
+
+  writePortalAudit(c, {
+    orgId: auth.user.orgId,
+    actorType: 'user',
+    actorId: auth.user.id,
+    actorEmail: auth.user.email,
+    action: 'portal.ticket.create',
+    resourceType: 'ticket',
+    resourceId: ticket.id,
+    resourceName: ticket.subject,
+    details: {
+      priority: ticket.priority,
+      ticketNumber: ticket.ticketNumber,
+    },
+  });
+
+  return c.json({ ticket }, 201);
+});
+
+ticketRoutes.get('/tickets/:id', zValidator('param', ticketParamSchema), async (c) => {
+  const auth = c.get('portalAuth');
+  const { id } = c.req.valid('param');
+
+  const [ticket] = await db
+    .select({
+      id: tickets.id,
+      ticketNumber: tickets.ticketNumber,
+      subject: tickets.subject,
+      description: tickets.description,
+      status: tickets.status,
+      priority: tickets.priority,
+      createdAt: tickets.createdAt,
+      updatedAt: tickets.updatedAt,
+      statusName: ticketStatuses.name,
+      ...PORTAL_TICKET_SLA_COLUMNS,
+    })
+    .from(tickets)
+    .leftJoin(ticketStatuses, eq(tickets.statusId, ticketStatuses.id))
+    .where(
+      and(
+        eq(tickets.id, id),
+        eq(tickets.orgId, auth.user.orgId),
+        portalTicketOwnership(auth.user),
+        isNull(tickets.deletedAt)
+      )
+    )
+    .limit(1);
+
+  if (!ticket) {
+    return c.json({ error: 'Ticket not found' }, 404);
+  }
+
+  const comments = await db
+    .select({
+      id: ticketComments.id,
+      authorName: ticketComments.authorName,
+      authorType: ticketComments.authorType,
+      // authorType 'email' alone does NOT mean "the customer wrote this": a
+      // technician's own reply linked through the Outlook add-in is stored the
+      // same way (routes/officeAddin/tickets.ts -> insertEmailAuthoredComment,
+      // which hardcodes author_type 'email'). Only a resolved portal sender
+      // identifies a customer-authored email, so the portal needs this column
+      // to label the two apart instead of showing the IT team's reply back to
+      // the customer as their own.
+      senderPortalUserId: ticketComments.portalUserId,
+      content: ticketComments.content,
+      createdAt: ticketComments.createdAt
+    })
+    .from(ticketComments)
+    .where(and(
+      eq(ticketComments.ticketId, ticket.id),
+      eq(ticketComments.isPublic, true),
+      isNull(ticketComments.deletedAt)
+    ))
+    .orderBy(desc(ticketComments.createdAt));
+
+  // W08 #3902 — attachments on PUBLIC, non-deleted comments only. The id set
+  // comes from the already-filtered `comments` query above, so an internal or
+  // soft-deleted comment has no id here for an attachment to hang off, and a
+  // pending row (comment_id NULL) can never match. Render-only: the portal
+  // cannot upload in v1 (spec open question 3).
+  const commentIds = comments.map((row) => row.id);
+  const attachmentsByComment = new Map<string, TicketAttachmentMeta[]>();
+  if (commentIds.length > 0) {
+    const attachmentRows = await db
+      .select(ATTACHMENT_META_COLUMNS)
+      .from(ticketAttachments)
+      .where(and(
+        eq(ticketAttachments.ticketId, ticket.id),
+        inArray(ticketAttachments.commentId, commentIds)
+      ));
+    for (const row of attachmentRows) {
+      if (!row.commentId) continue;
+      const list = attachmentsByComment.get(row.commentId);
+      if (list) list.push(row as unknown as TicketAttachmentMeta);
+      else attachmentsByComment.set(row.commentId, [row as unknown as TicketAttachmentMeta]);
+    }
+  }
+  const commentsWithAttachments = comments.map((row) => ({
+    ...row,
+    attachments: attachmentsByComment.get(row.id) ?? [],
+  }));
+
+  const ticketDto = {
+    id: ticket.id,
+    ticketNumber: ticket.ticketNumber,
+    subject: ticket.subject,
+    description: ticket.description,
+    status: ticket.status,
+    priority: ticket.priority,
+    createdAt: ticket.createdAt,
+    updatedAt: ticket.updatedAt,
+    statusName: ticket.statusName,
+    sla: ticketSla(ticket, new Date()),
+  };
+  const payload = {
+    ticket: {
+      ...ticketDto,
+      comments: commentsWithAttachments,
+    },
+  };
+
+  applyPortalCacheHeaders(c, {
+    scope: 'private',
+    browserMaxAgeSeconds: 15,
+    staleWhileRevalidateSeconds: 90,
+    vary: ['Authorization', 'Cookie']
+  });
+  const etag = buildWeakEtag(payload);
+  c.header('ETag', etag);
+
+  if (isEtagFresh(c.req.header('if-none-match'), etag)) {
+    return new Response(null, { status: 304, headers: c.res.headers });
+  }
+
+  return c.json(payload);
+});
+
+ticketRoutes.post(
+  '/tickets/:id/comments',
+  zValidator('param', ticketParamSchema),
+  zValidator('json', commentSchema),
+  async (c) => {
+    const csrfError = validatePortalCookieCsrfRequest(c);
+    if (csrfError) {
+      return c.json({ error: csrfError }, 403);
+    }
+
+    const auth = c.get('portalAuth');
+    const { id } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    const [ticket] = await db
+      .select({ id: tickets.id })
+      .from(tickets)
+      .where(
+        and(
+          eq(tickets.id, id),
+          eq(tickets.orgId, auth.user.orgId),
+          portalTicketOwnership(auth.user),
+          isNull(tickets.deletedAt)
+        )
+      )
+      .limit(1);
+
+    if (!ticket) {
+      return c.json({ error: 'Ticket not found' }, 404);
+    }
+
+    const [comment] = await db
+      .insert(ticketComments)
+      .values({
+        ticketId: ticket.id,
+        portalUserId: auth.user.id,
+        authorName: auth.user.name ?? auth.user.email,
+        authorType: 'portal',
+        content: payload.content,
+        isPublic: true,
+        createdAt: new Date()
+      })
+      .returning({
+        id: ticketComments.id,
+        authorName: ticketComments.authorName,
+        // authorType (sweep 2026-09-08 G5-5) — GET /tickets/:id's comments
+        // query selects it (used by the portal UI's `c.authorType !== 'portal'`
+        // "Your IT team" badge check), but this insert's `.returning()` used
+        // to omit it, so a customer's own reply showed that badge until the
+        // next full reload re-fetched the comment from GET.
+        authorType: ticketComments.authorType,
+        // Same reason as the GET projection above: the optimistic row the pane
+        // renders must carry the same author signal the next full reload will.
+        senderPortalUserId: ticketComments.portalUserId,
+        content: ticketComments.content,
+        createdAt: ticketComments.createdAt
+      });
+    if (!comment) {
+      // Near-impossible (an insert that neither throws nor returns a row), but
+      // every other failure on this route flows through onError+Sentry — make
+      // this branch visible too rather than returning a silent 500.
+      console.error('[portal] ticket_comments insert returned no row', {
+        ticketId: ticket.id,
+        orgId: auth.user.orgId,
+      });
+      return c.json({ error: 'Failed to create ticket comment' }, 500);
+    }
+
+    writePortalAudit(c, {
+      orgId: auth.user.orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      actorEmail: auth.user.email,
+      action: 'portal.ticket.comment.create',
+      resourceType: 'ticket_comment',
+      resourceId: comment.id,
+      details: {
+        ticketId: ticket.id,
+      },
+    });
+
+    return c.json({ comment }, 201);
+  }
+);
+
+ticketRoutes.patch(
+  '/tickets/:id/comments/:commentId',
+  zValidator('param', ticketCommentParamSchema),
+  zValidator('json', editCommentSchema),
+  async (c) => {
+    const csrfError = validatePortalCookieCsrfRequest(c);
+    if (csrfError) return c.json({ error: csrfError }, 403);
+
+    const auth = c.get('portalAuth');
+    const { id, commentId } = c.req.valid('param');
+    const body = c.req.valid('json');
+
+    // Portal edit uses the shared editCommentSchema (50k), but portal CREATE caps
+    // content at 5,000 chars (commentSchema). Enforce the same 5k limit here so
+    // portal customers can't bypass it by editing instead of creating.
+    if (body.content.length > PORTAL_TICKET_COMMENT_MAX_CHARS) {
+      return c.json({ error: `Comment content must be ${PORTAL_TICKET_COMMENT_MAX_CHARS} characters or fewer` }, 400);
+    }
+
+    const mutable = await portalCommentMutable(commentId, auth.user.id);
+    if (!mutable.ok) {
+      if (mutable.reason === 'staff_replied') {
+        return c.json({ error: 'This reply can no longer be edited — support has already responded.' }, 409);
+      }
+      return c.json({ error: 'Ticket not found' }, 404); // not_author / not_found
+    }
+
+    // Ownership already proven by portalCommentMutable (portal_user_id match).
+    // Pass canManageAny so the service's staff-author rule (keyed on user_id,
+    // which is NULL for portal rows) does not reject the legitimate edit.
+    //
+    // NOTE: audit_logs.actor_id has NO FK to users(id) — it is a plain NOT NULL
+    // uuid column. Passing a portal user id here is safe; the service audit row
+    // is supplementary (authoritative trail is writePortalAudit below).
+    const updated = await editTicketComment(
+      commentId,
+      body,
+      { userId: auth.user.id, name: auth.user.name ?? auth.user.email },
+      { canManageAny: true, expectedTicketId: id }
+    );
+
+    writePortalAudit(c, {
+      orgId: auth.user.orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      actorEmail: auth.user.email,
+      action: 'portal.ticket.comment.edit',
+      resourceType: 'ticket_comment',
+      resourceId: commentId,
+      details: { ticketId: id },
+    });
+
+    return c.json({ comment: { id: updated.id, content: updated.content, editedAt: updated.editedAt } });
+  }
+);
+
+ticketRoutes.delete(
+  '/tickets/:id/comments/:commentId',
+  zValidator('param', ticketCommentParamSchema),
+  async (c) => {
+    const csrfError = validatePortalCookieCsrfRequest(c);
+    if (csrfError) return c.json({ error: csrfError }, 403);
+
+    const auth = c.get('portalAuth');
+    const { id, commentId } = c.req.valid('param');
+
+    const mutable = await portalCommentMutable(commentId, auth.user.id);
+    if (!mutable.ok) {
+      if (mutable.reason === 'staff_replied') {
+        return c.json({ error: 'This reply can no longer be deleted — support has already responded.' }, 409);
+      }
+      return c.json({ error: 'Ticket not found' }, 404); // not_author / not_found
+    }
+
+    // Same audit_logs.actor_id FK caveat as PATCH above — no FK, portal id is safe.
+    await deleteTicketComment(
+      commentId,
+      { userId: auth.user.id },
+      { canManageAny: true, expectedTicketId: id }
+    );
+
+    writePortalAudit(c, {
+      orgId: auth.user.orgId,
+      actorType: 'user',
+      actorId: auth.user.id,
+      actorEmail: auth.user.email,
+      action: 'portal.ticket.comment.delete',
+      resourceType: 'ticket_comment',
+      resourceId: commentId,
+      details: { ticketId: id },
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+/**
+ * GET /portal/tickets/:id/attachments/:attachmentId/content (W08 #3902).
+ *
+ * Render-only customer read. There is deliberately NO tickets:manage escape
+ * hatch here — every rung of the ladder returns a bare 404:
+ *   - the ticket must be this org's, submitted by THIS portal session, and not
+ *     soft-deleted;
+ *   - the attachment must be on THIS ticket;
+ *   - its parent comment must exist (inner join excludes pending rows), be
+ *     public and not soft-deleted.
+ */
+ticketRoutes.get(
+  '/tickets/:id/attachments/:attachmentId/content',
+  zValidator('param', portalAttachmentParamSchema),
+  async (c) => {
+    const auth = c.get('portalAuth');
+    const { id, attachmentId } = c.req.valid('param');
+
+    const [ticket] = await db
+      .select({ id: tickets.id })
+      .from(tickets)
+      .where(and(
+        eq(tickets.id, id),
+        eq(tickets.orgId, auth.user.orgId),
+        portalTicketOwnership(auth.user),
+        isNull(tickets.deletedAt)
+      ))
+      .limit(1);
+    if (!ticket) return c.json({ error: 'Attachment not found' }, 404);
+
+    const rows = await db
+      .select({
+        attachment: {
+          id: ticketAttachments.id,
+          contentType: ticketAttachments.contentType,
+          byteSize: ticketAttachments.byteSize,
+          originalFilename: ticketAttachments.originalFilename,
+          sha256: ticketAttachments.sha256,
+          storageBackend: ticketAttachments.storageBackend,
+          storageKey: ticketAttachments.storageKey,
+          data: ticketAttachments.data,
+          // Execution plane W05 (#5716): an artifact-backed row resolves its
+          // bytes against the ATTACHMENT's own org. Both columns are required —
+          // without them `openBytes` reads undefined for each and raises
+          // AttachmentExpiredError unconditionally, so every artifact download
+          // 503s at the customer while the file is perfectly alive.
+          orgId: ticketAttachments.orgId,
+          artifactId: ticketAttachments.artifactId,
+        },
+      })
+      .from(ticketAttachments)
+      // INNER join: a pending row (comment_id NULL) matches nothing.
+      .innerJoin(ticketComments, eq(ticketComments.id, ticketAttachments.commentId))
+      .where(and(
+        eq(ticketAttachments.id, attachmentId),
+        eq(ticketAttachments.ticketId, id),
+        eq(ticketComments.isPublic, true),
+        isNull(ticketComments.deletedAt)
+      ))
+      .limit(1);
+    const att = rows[0]?.attachment;
+    if (!att) return c.json({ error: 'Attachment not found' }, 404);
+
+    const etag = `"${att.sha256}"`;
+    const headers: Record<string, string> = {
+      ETag: etag,
+      'Cache-Control': 'private, max-age=300',
+      'X-Content-Type-Options': 'nosniff',
+    };
+    if (c.req.header('If-None-Match') === etag) {
+      return c.body(null, 304, headers);
+    }
+
+    // Mirrors the technician route (routes/tickets/attachments.ts): a transport
+    // fault is a RETRYABLE 503, not a 500. Unguarded, an S3 blip surfaced to
+    // the customer as a generic 500 and was never attributed to this route in
+    // Sentry (W08A review).
+    let opened: Awaited<ReturnType<typeof openBytes>>;
+    try {
+      opened = await openBytes(att, { orgId: att.orgId });
+    } catch (err) {
+      // Execution plane W05 (#5716): an artifact whose 30-day TTL elapsed is a
+      // 410, not a 503. Checked BEFORE the transport branch, which would
+      // otherwise tell the customer to retry something that will never work and
+      // fire a Sentry exception on every attempt. Mirrors the technician route.
+      if (err instanceof AttachmentExpiredError) {
+        return c.json({ error: 'This attachment has expired and is no longer available' }, 410);
+      }
+      captureException(err);
+      return c.json({ error: 'Attachment storage is unavailable — try again shortly' }, 503);
+    }
+    if (!opened.body) return c.json({ error: 'Attachment not found' }, 404);
+
+    headers['Content-Type'] = att.contentType;
+    headers['Content-Disposition'] = contentDispositionFor(att.contentType, att.originalFilename);
+    const length = opened.contentLength ?? att.byteSize;
+    if (typeof length === 'number') headers['Content-Length'] = String(length);
+
+    if (Buffer.isBuffer(opened.body)) {
+      return c.body(new Uint8Array(opened.body), 200, headers);
+    }
+    return c.body(Readable.toWeb(opened.body) as ReadableStream, 200, headers);
+  }
+);

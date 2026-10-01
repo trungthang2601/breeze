@@ -1,0 +1,356 @@
+import { useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
+import { EditorContent, useEditor, useEditorState, type Editor } from '@tiptap/react';
+import StarterKit from '@tiptap/starter-kit';
+import Underline from '@tiptap/extension-underline';
+import Link from '@tiptap/extension-link';
+import { Table, TableCell, TableHeader, TableRow } from '@tiptap/extension-table';
+
+export interface RichTextEditorProps {
+  /** Current HTML value (already constrained to the sanitizer subset). */
+  value: string;
+  /** Fired with `editor.getHTML()` whenever the document changes. */
+  onChange: (html: string) => void;
+  /** Accessible label for the editable region. */
+  ariaLabel: string;
+  /** `data-testid` applied to the editable region. */
+  testId: string;
+}
+
+// Only http/https (or scheme-less relative) URLs are accepted — matching the API
+// sanitizer (richTextSanitize.ts). TipTap's `protocols` option only EXTENDS the
+// default allowlist (which includes mailto:/tel:/ftp:), so those would be
+// accepted here and then silently stripped server-side; a custom isAllowedUri is
+// the only way to actually reject them in the editor.
+function isHttpOrHttpsUri(uri: string): boolean {
+  const trimmed = uri.trim();
+  // Protocol-relative (`//evil.example`) carries no scheme but still navigates
+  // off-origin under the page's own scheme. The server rejects it
+  // (richTextSanitize.ts allowProtocolRelative:false), so reject it here too —
+  // otherwise the editor accepts a link the sanitizer would silently strip.
+  if (trimmed.startsWith('//')) return false;
+  const scheme = trimmed.match(/^([a-z][a-z0-9+.-]*):/i)?.[1]?.toLowerCase();
+  if (!scheme) return true; // scheme-less relative URL (e.g. /path) — the sanitizer permits these
+  return scheme === 'http' || scheme === 'https';
+}
+
+// The editor's table nodes are trimmed to exactly what the sanitizer keeps
+// (issue #3484): bare `<table><tbody><tr><td>`, no attributes, cells inline-only.
+//
+// Every deviation below exists because the sanitizer would rewrite TipTap's
+// default output, and `getHTML()` that doesn't round-trip byte-for-byte leaves
+// the block permanently "unsaved" — it re-PATCHes on every blur, and (since
+// #3520) toasts a spurious "markup removed" warning each time. Specifically:
+// TipTap renders `<table style="min-width:…">` with a `<colgroup>`, and cells
+// carry `colspan`/`rowspan`/`colwidth` attributes even at their defaults.
+//
+// The attributes stay in the SCHEMA (prosemirror-tables' TableMap needs
+// colspan/rowspan to exist) but are pinned to their unmerged defaults on PARSE
+// and emitted by nobody on render.
+//
+// Pinning on parse is not belt-and-braces: TipTap's TableCell gives colspan and
+// rowspan no parseHTML override, so a pasted `<td colspan="2">` — routine in a
+// Word/Google-Docs table, the case this whole feature exists for — sets a real
+// span on the ProseMirror node. Suppressing it at render only would then leave
+// the row drawing FEWER <td> elements than the model believes it spans: the
+// table visibly misaligns inside the editor, and tableEditing's DOM-based cell
+// hit-testing (drag-select, Tab) desyncs from the TableMap. Clamping on parse
+// makes the merge split into ordinary cells instead, which prosemirror-tables
+// then pads out to a rectangular grid — the honest outcome, since merges are
+// unsupported end to end (see RICH_TEXT_TABLE_TAGS in richTextSanitize.ts).
+const unmergedSpan = { parseHTML: () => 1, renderHTML: () => ({}) };
+const noColumnWidth = { parseHTML: () => null, renderHTML: () => ({}) };
+const CELL_ATTRIBUTE_OVERRIDES: Record<string, object> = {
+  colspan: unmergedSpan,
+  rowspan: unmergedSpan,
+  colwidth: noColumnWidth,
+};
+
+function inlineOnlyCell<T extends typeof TableCell | typeof TableHeader>(node: T) {
+  return node.extend({
+    // Cells hold inline marks only, matching the sanitizer's cell contract and
+    // the structured table block's Spec A decision #4. Default is 'block+',
+    // which would emit `<td><p>x</p></td>` for the sanitizer to flatten.
+    content: 'inline*',
+    addAttributes() {
+      const inherited: Record<string, unknown> = this.parent?.() ?? {};
+      const overridden = Object.fromEntries(
+        Object.entries(CELL_ATTRIBUTE_OVERRIDES)
+          .filter(([name]) => name in inherited)
+          .map(([name, override]) => [name, { ...(inherited[name] as object), ...override }]),
+      );
+      return { ...inherited, ...overridden };
+    },
+  });
+}
+
+const PlainTable = Table.extend({
+  // Drop the inline width style and the <colgroup>; emit the plain
+  // `<table><tbody>…` shape the sanitizer allows.
+  renderHTML() {
+    return ['table', ['tbody', 0]];
+  },
+});
+
+// The editor is deliberately constrained to the rich-text subset the API
+// sanitizer accepts: p, br, strong, em, u, h3, h4, ul, ol, li, a[href], plus
+// table/tbody/tr/th/td. Anything StarterKit would otherwise add (code, code
+// blocks, blockquotes, strike, horizontal rules) is disabled so the editor can
+// never emit markup the server would strip. Link + Underline are added
+// standalone (StarterKit's own copies are disabled below to avoid
+// duplicate-extension registration) so we can pin safe protocols and
+// non-navigating links.
+function buildExtensions() {
+  return [
+    PlainTable.configure({
+      // No column resizing: a resized column stores `colwidth`, which the
+      // sanitizer drops — and there is no width to honour in the PDF renderer,
+      // which infers column widths from content.
+      resizable: false,
+    }),
+    TableRow,
+    inlineOnlyCell(TableHeader),
+    inlineOnlyCell(TableCell),
+    StarterKit.configure({
+      heading: { levels: [3, 4] },
+      code: false,
+      codeBlock: false,
+      blockquote: false,
+      strike: false,
+      horizontalRule: false,
+      // Configured explicitly below.
+      link: false,
+      underline: false,
+    }),
+    Underline,
+    Link.configure({
+      openOnClick: false,
+      protocols: ['http', 'https'],
+      autolink: false,
+      // Emit exactly the rel the server sanitizer settles on (richTextSanitize.ts
+      // forces rel="noopener noreferrer"). TipTap's default adds a trailing
+      // `nofollow`, so its output would never string-equal the stored/sanitized
+      // HTML — leaving a link-bearing rich_text block permanently "unsaved" and
+      // re-PATCHing on every blur. Overriding rel here closes that gap; target
+      // keeps TipTap's `_blank` default (which the sanitizer also forces).
+      HTMLAttributes: { rel: 'noopener noreferrer' },
+      // Actually enforce the allowlist — protocols alone doesn't reject extras.
+      isAllowedUri: (uri) => isHttpOrHttpsUri(uri),
+    }),
+  ];
+}
+
+interface ToolbarButtonProps {
+  testId: string;
+  label: string;
+  isActive: boolean;
+  onClick: () => void;
+}
+
+function ToolbarButton({ testId, label, isActive, onClick }: ToolbarButtonProps) {
+  return (
+    <button
+      type="button"
+      data-testid={testId}
+      aria-label={label}
+      aria-pressed={isActive}
+      title={label}
+      // Keep the editor selection intact: a plain click would blur the
+      // contenteditable before the command runs, collapsing the selection.
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+      className={`inline-flex h-7 min-w-7 items-center justify-center rounded px-2 text-sm font-medium transition-colors ${
+        isActive
+          ? 'bg-primary text-primary-foreground'
+          : 'text-muted-foreground hover:bg-muted'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function Toolbar({ editor }: { editor: Editor }) {
+  const { t } = useTranslation('common');
+  // `useEditor` does not re-render on every transaction in TipTap 3, so reading
+  // `editor.isActive(...)` straight in the render body leaves the toolbar
+  // showing the state as of the last React render — which for the table
+  // controls means they never appear. `useEditorState` subscribes properly.
+  const active = useEditorState({
+    editor,
+    selector: ({ editor: e }) => ({
+      bold: e.isActive('bold'),
+      italic: e.isActive('italic'),
+      underline: e.isActive('underline'),
+      heading3: e.isActive('heading', { level: 3 }),
+      heading4: e.isActive('heading', { level: 4 }),
+      bulletList: e.isActive('bulletList'),
+      orderedList: e.isActive('orderedList'),
+      link: e.isActive('link'),
+      table: e.isActive('table'),
+    }),
+  });
+  const inTable = active.table;
+  const setLink = () => {
+    const previous = editor.getAttributes('link').href as string | undefined;
+    const input = window.prompt(t('richTextEditor.linkPrompt'), previous ?? 'https://');
+    if (input === null) return; // cancelled
+    const url = input.trim();
+    if (url === '') {
+      editor.chain().focus().extendMarkRange('link').unsetLink().run();
+      return;
+    }
+    // Reject anything the sanitizer would strip (mailto:/tel:/ftp:/javascript:…)
+    // with a clear message instead of silently dropping the link server-side.
+    if (!isHttpOrHttpsUri(url)) {
+      window.alert(t('richTextEditor.linkInvalid'));
+      return;
+    }
+    editor.chain().focus().extendMarkRange('link').setLink({ href: url }).run();
+  };
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-1 border-b bg-muted/40 px-2 py-1"
+      role="toolbar"
+      aria-label={t('richTextEditor.toolbarAria')}
+    >
+      <ToolbarButton
+        testId="rte-bold"
+        label={t('richTextEditor.bold')}
+        isActive={active.bold}
+        onClick={() => editor.chain().focus().toggleBold().run()}
+      />
+      <ToolbarButton
+        testId="rte-italic"
+        label={t('richTextEditor.italic')}
+        isActive={active.italic}
+        onClick={() => editor.chain().focus().toggleItalic().run()}
+      />
+      <ToolbarButton
+        testId="rte-underline"
+        label={t('richTextEditor.underline')}
+        isActive={active.underline}
+        onClick={() => editor.chain().focus().toggleUnderline().run()}
+      />
+      <span className="mx-1 h-4 w-px bg-border" aria-hidden="true" />
+      <ToolbarButton
+        testId="rte-h3"
+        label={t('richTextEditor.heading3')}
+        isActive={active.heading3}
+        onClick={() => editor.chain().focus().toggleHeading({ level: 3 }).run()}
+      />
+      <ToolbarButton
+        testId="rte-h4"
+        label={t('richTextEditor.heading4')}
+        isActive={active.heading4}
+        onClick={() => editor.chain().focus().toggleHeading({ level: 4 }).run()}
+      />
+      <span className="mx-1 h-4 w-px bg-border" aria-hidden="true" />
+      <ToolbarButton
+        testId="rte-bullet-list"
+        label={t('richTextEditor.bulletList')}
+        isActive={active.bulletList}
+        onClick={() => editor.chain().focus().toggleBulletList().run()}
+      />
+      <ToolbarButton
+        testId="rte-ordered-list"
+        label={t('richTextEditor.orderedList')}
+        isActive={active.orderedList}
+        onClick={() => editor.chain().focus().toggleOrderedList().run()}
+      />
+      <span className="mx-1 h-4 w-px bg-border" aria-hidden="true" />
+      <ToolbarButton
+        testId="rte-link"
+        label={t('richTextEditor.link')}
+        isActive={active.link}
+        onClick={setLink}
+      />
+      <span className="mx-1 h-4 w-px bg-border" aria-hidden="true" />
+      <ToolbarButton
+        testId="rte-insert-table"
+        label={t('richTextEditor.insertTable')}
+        isActive={inTable}
+        onClick={() =>
+          editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()
+        }
+      />
+      {/* Row/column controls only mean anything with the caret inside a table,
+          and the toolbar is already dense — keep them out of the way until then. */}
+      {inTable && (
+        <>
+          <ToolbarButton
+            testId="rte-table-add-row"
+            label={t('richTextEditor.addRow')}
+            isActive={false}
+            onClick={() => editor.chain().focus().addRowAfter().run()}
+          />
+          <ToolbarButton
+            testId="rte-table-delete-row"
+            label={t('richTextEditor.deleteRow')}
+            isActive={false}
+            onClick={() => editor.chain().focus().deleteRow().run()}
+          />
+          <ToolbarButton
+            testId="rte-table-add-column"
+            label={t('richTextEditor.addColumn')}
+            isActive={false}
+            onClick={() => editor.chain().focus().addColumnAfter().run()}
+          />
+          <ToolbarButton
+            testId="rte-table-delete-column"
+            label={t('richTextEditor.deleteColumn')}
+            isActive={false}
+            onClick={() => editor.chain().focus().deleteColumn().run()}
+          />
+          <ToolbarButton
+            testId="rte-table-delete"
+            label={t('richTextEditor.deleteTable')}
+            isActive={false}
+            onClick={() => editor.chain().focus().deleteTable().run()}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+export default function RichTextEditor({ value, onChange, ariaLabel, testId }: RichTextEditorProps) {
+  const editor = useEditor({
+    extensions: buildExtensions(),
+    content: value,
+    // React island: never render immediately on the server, and match jsdom
+    // where document is present at mount.
+    immediatelyRender: false,
+    editorProps: {
+      attributes: {
+        'aria-label': ariaLabel,
+        'data-testid': testId,
+        role: 'textbox',
+        'aria-multiline': 'true',
+        class:
+          'prose prose-sm max-w-none min-h-24 px-3 py-2 text-sm focus:outline-hidden',
+      },
+    },
+    onUpdate: ({ editor: e }) => {
+      onChange(e.getHTML());
+    },
+  });
+
+  // Keep the editor in sync when the value prop changes from outside (e.g. a
+  // server refresh resets the persisted HTML). Skip when the incoming value
+  // already matches to avoid clobbering the user's cursor mid-edit.
+  useEffect(() => {
+    if (!editor) return;
+    if (value !== editor.getHTML()) {
+      editor.commands.setContent(value, { emitUpdate: false });
+    }
+  }, [value, editor]);
+
+  return (
+    <div className="rounded-md border bg-background focus-within:ring-2 focus-within:ring-ring">
+      {editor && <Toolbar editor={editor} />}
+      <EditorContent editor={editor} />
+    </div>
+  );
+}

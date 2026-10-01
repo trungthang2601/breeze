@@ -1,0 +1,8 @@
+---
+// Standalone URL retired (M1) — the org settings page's own Billing tab is now
+// the single entry point (audit finding A2: "two URLs, no redirect between
+// them").
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/organizations');
+return Astro.redirect(`/settings/organizations/${id}#billing`, 301);
+---

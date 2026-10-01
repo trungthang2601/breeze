@@ -1,0 +1,692 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { z } from 'zod';
+import { db } from '../db';
+import {
+  discoveryProfiles,
+  networkBaselines,
+  networkChangeEvents,
+  sites,
+  type NetworkBaselineScanSchedule
+} from '../db/schema';
+import { authMiddleware, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { enqueueBaselineScan } from '../jobs/networkBaselineWorker';
+import {
+  normalizeBaselineAlertSettings,
+  normalizeBaselineScanSchedule
+} from '../services/networkBaseline';
+import { isRedisAvailable } from '../services/redis';
+import { writeRouteAudit } from '../services/auditEvents';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
+import {
+  BaselineAuthorityUnsupportedError,
+  buildBaselineAuthorityEnvelope,
+  type BaselineAuthorityEnvelope
+} from '../services/networkBaselineAuthority';
+import {
+  networkEventTypes,
+  optionalQueryBooleanSchema,
+  mapNetworkChangeRow,
+  resolveOrgId
+} from './networkShared';
+import { pgErrorCode } from '../utils/pgErrors';
+
+export const networkBaselineRoutes = new Hono();
+
+const cidrSchema = z.string().trim().regex(/^\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}$/, 'Invalid CIDR subnet');
+
+const scanScheduleSchema = z.object({
+  enabled: z.boolean().optional(),
+  intervalHours: z.number().int().min(1).max(168).optional(),
+  nextScanAt: z.string().datetime().optional()
+});
+
+const alertSettingsSchema = z.object({
+  newDevice: z.boolean().optional(),
+  disappeared: z.boolean().optional(),
+  changed: z.boolean().optional(),
+  rogueDevice: z.boolean().optional()
+});
+
+const listBaselinesSchema = z.object({
+  orgId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
+  subnet: cidrSchema.optional(),
+  limit: z.coerce.number().int().positive().max(200).optional(),
+  offset: z.coerce.number().int().min(0).optional()
+});
+
+const createBaselineSchema = z.object({
+  orgId: z.string().guid().optional(),
+  siteId: z.string().guid(),
+  subnet: cidrSchema,
+  profileId: z.string().guid().optional(),
+  scanSchedule: scanScheduleSchema.optional(),
+  alertSettings: alertSettingsSchema.optional()
+});
+
+const updateBaselineSchema = z.object({
+  scanSchedule: scanScheduleSchema.optional(),
+  alertSettings: alertSettingsSchema.optional()
+}).refine((value) => value.scanSchedule || value.alertSettings, {
+  message: 'At least one of scanSchedule or alertSettings is required'
+});
+
+const baselineChangesQuerySchema = z.object({
+  eventType: z.enum(networkEventTypes).optional(),
+  acknowledged: optionalQueryBooleanSchema,
+  limit: z.coerce.number().int().positive().max(200).optional(),
+  offset: z.coerce.number().int().min(0).optional()
+});
+
+const deleteBaselineQuerySchema = z.object({
+  deleteChanges: optionalQueryBooleanSchema
+});
+
+/**
+ * SEC-2026-09-05-146: an explicit allowlist, not a spread.
+ *
+ * These handlers are gated on `devices:read`, which every device-viewing role
+ * holds, so spreading the row handed all of them the arming user's
+ * permission/MFA epochs, the effect fingerprint and the arm-time site ceiling.
+ * That envelope is an internal enforcement record — the client needs only what
+ * renders the re-approval banner (why the schedule is held, when it was armed,
+ * by whom, and which generation is current).
+ *
+ * Exported for the exposure contract test; adding a column to
+ * `network_baselines` does NOT publish it — extend this function deliberately.
+ */
+export function mapBaselineRow(row: typeof networkBaselines.$inferSelect) {
+  return {
+    id: row.id,
+    orgId: row.orgId,
+    siteId: row.siteId,
+    subnet: row.subnet,
+    knownDevices: row.knownDevices,
+    scanSchedule: row.scanSchedule,
+    alertSettings: row.alertSettings,
+    lastScanJobId: row.lastScanJobId,
+    authorityUserId: row.authorityUserId,
+    authorityGeneration: row.authorityGeneration,
+    authorityArmedAt: row.authorityArmedAt?.toISOString() ?? null,
+    scheduleBlockedReason: row.scheduleBlockedReason,
+    lastScanAt: row.lastScanAt?.toISOString() ?? null,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString()
+  };
+}
+
+async function getBaselineWithAccess(
+  baselineId: string,
+  auth: AuthContext
+): Promise<typeof networkBaselines.$inferSelect | null> {
+  const conditions: SQL[] = [eq(networkBaselines.id, baselineId)];
+  const orgCondition = auth.orgCondition(networkBaselines.orgId);
+  if (orgCondition) {
+    conditions.push(orgCondition);
+  }
+
+  const [baseline] = await db
+    .select()
+    .from(networkBaselines)
+    .where(and(...conditions))
+    .limit(1);
+
+  return baseline ?? null;
+}
+
+/**
+ * Site-axis (sub-org) gate for a single baseline. Site scope is app-layer-only
+ * (RLS does NOT enforce it) and the by-id handlers (unlike GET /, POST /)
+ * historically skipped it, so a site-restricted org user could read/update/
+ * scan/delete baselines outside their allowed sites. Mirrors the GET /
+ * narrowing (`inArray(networkBaselines.siteId, allowedSiteIds)`): a restricted
+ * caller is denied for a baseline in a site outside the allowlist. No-op for
+ * unrestricted callers (`perms` undefined / `allowedSiteIds` unset). Returns
+ * true when access is permitted.
+ */
+function baselineInSiteScope(
+  perms: UserPermissions | undefined,
+  baseline: typeof networkBaselines.$inferSelect
+): boolean {
+  if (!perms?.allowedSiteIds) return true;
+  return canAccessSite(perms, baseline.siteId);
+}
+
+/**
+ * SEC-2026-09-05-146 — arm the creator-bound authority envelope for a schedule
+ * that is (or stays) enabled. A disabled schedule dispatches nothing, so it
+ * needs no authority; an enabled one must name the live principal that owns it.
+ * Returns null when no envelope is needed.
+ */
+async function armScheduleAuthority(
+  auth: AuthContext,
+  effect: { orgId: string; siteId: string; subnet: string; scanSchedule: NetworkBaselineScanSchedule }
+): Promise<BaselineAuthorityEnvelope | null> {
+  if (!effect.scanSchedule.enabled) return null;
+  return buildBaselineAuthorityEnvelope(auth, effect);
+}
+
+networkBaselineRoutes.use('*', authMiddleware);
+
+networkBaselineRoutes.get(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` so the site narrowing below is live (only
+  // requirePermission sets it). DEVICES_READ is granted to every device-viewing role.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('query', listBaselinesSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    const orgResult = resolveOrgId(auth, query.orgId);
+    if ('error' in orgResult) {
+      return c.json({ error: orgResult.error }, orgResult.status);
+    }
+
+    const conditions: SQL[] = [];
+    if (orgResult.orgId) {
+      conditions.push(eq(networkBaselines.orgId, orgResult.orgId));
+    } else {
+      const orgCondition = auth.orgCondition(networkBaselines.orgId);
+      if (orgCondition) {
+        conditions.push(orgCondition);
+      }
+    }
+
+    if (query.siteId) {
+      // Validate that siteId belongs to the resolved org (same pattern as POST /)
+      if (orgResult.orgId) {
+        const [site] = await db
+          .select({ id: sites.id })
+          .from(sites)
+          .where(
+            and(
+              eq(sites.id, query.siteId),
+              eq(sites.orgId, orgResult.orgId)
+            )
+          )
+          .limit(1);
+
+        if (!site) {
+          return c.json({ error: 'Site not found for this organization' }, 404);
+        }
+      }
+      if (perms?.allowedSiteIds && !canAccessSite(perms, query.siteId)) {
+        return c.json({ error: 'Access to this site denied' }, 403);
+      }
+      conditions.push(eq(networkBaselines.siteId, query.siteId));
+    } else if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({
+          data: [],
+          pagination: {
+            limit: query.limit ?? 100,
+            offset: query.offset ?? 0,
+            total: 0
+          }
+        });
+      }
+      conditions.push(inArray(networkBaselines.siteId, perms.allowedSiteIds));
+    }
+
+    if (query.subnet) {
+      conditions.push(eq(networkBaselines.subnet, query.subnet));
+    }
+
+    const where = conditions.length > 0 ? and(...conditions) : undefined;
+    const limit = query.limit ?? 100;
+    const offset = query.offset ?? 0;
+
+    const [countRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(networkBaselines)
+      .where(where);
+
+    const rows = await db
+      .select()
+      .from(networkBaselines)
+      .where(where)
+      .orderBy(desc(networkBaselines.createdAt), desc(networkBaselines.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: rows.map(mapBaselineRow),
+      pagination: {
+        limit,
+        offset,
+        total: Number(countRow?.count ?? 0)
+      }
+    });
+  }
+);
+
+networkBaselineRoutes.post(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission('devices', 'write'),
+  zValidator('json', createBaselineSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const body = c.req.valid('json');
+
+    const orgResult = resolveOrgId(auth, body.orgId, true);
+    if ('error' in orgResult) {
+      return c.json({ error: orgResult.error }, orgResult.status);
+    }
+
+    const orgId = orgResult.orgId;
+    if (!orgId) {
+      return c.json({ error: 'orgId is required' }, 400);
+    }
+
+    const [site] = await db
+      .select({ id: sites.id })
+      .from(sites)
+      .where(
+        and(
+          eq(sites.id, body.siteId),
+          eq(sites.orgId, orgId)
+        )
+      )
+      .limit(1);
+
+    if (!site) {
+      return c.json({ error: 'Site not found for this organization' }, 404);
+    }
+
+    // Site-scope is an app-layer-only authz axis (RLS does not defend it). A
+    // site-restricted caller must not create a baseline for a site outside
+    // their allowlist. No-op when `allowedSiteIds` is unset (unrestricted).
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && !canAccessSite(perms, body.siteId)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (body.profileId) {
+      const [profile] = await db
+        .select({ id: discoveryProfiles.id, subnets: discoveryProfiles.subnets })
+        .from(discoveryProfiles)
+        .where(
+          and(
+            eq(discoveryProfiles.id, body.profileId),
+            eq(discoveryProfiles.orgId, orgId),
+            eq(discoveryProfiles.siteId, body.siteId)
+          )
+        )
+        .limit(1);
+
+      if (!profile) {
+        return c.json({ error: 'Discovery profile not found for this organization/site' }, 404);
+      }
+
+      if (!(profile.subnets ?? []).includes(body.subnet)) {
+        return c.json({ error: 'Discovery profile does not include the requested subnet' }, 400);
+      }
+    }
+
+    const schedule = normalizeBaselineScanSchedule(body.scanSchedule);
+    const alertSettings = normalizeBaselineAlertSettings(body.alertSettings);
+
+    // ON CONFLICT DO NOTHING instead of catch-and-map: the request runs inside
+    // the withDbAccessContext transaction, and postgres.js re-throws a raised
+    // unique violation at commit time even after it's caught here, turning the
+    // mapped 409 back into a raw 500 (see createCatalogItem in catalogService.ts).
+    // Zero returned rows means a baseline already exists for this org/site/subnet.
+    // SEC-146: an enabled recurring schedule is armed with the CURRENT user's
+    // authority in the same statement that creates it. System-scope contexts
+    // cannot own a recurring effect (nothing would ever revoke it) — they may
+    // still create a baseline whose schedule is disabled.
+    let envelope: BaselineAuthorityEnvelope | null;
+    try {
+      envelope = await armScheduleAuthority(auth, {
+        orgId,
+        siteId: body.siteId,
+        subnet: body.subnet,
+        scanSchedule: schedule
+      });
+    } catch (error) {
+      if (error instanceof BaselineAuthorityUnsupportedError) {
+        return c.json({ error: error.message }, 403);
+      }
+      throw error;
+    }
+
+    const [created] = await db
+      .insert(networkBaselines)
+      .values({
+        orgId,
+        siteId: body.siteId,
+        subnet: body.subnet,
+        knownDevices: [],
+        scanSchedule: schedule,
+        alertSettings,
+        lastScanAt: null,
+        lastScanJobId: null,
+        ...(envelope ?? {}),
+        authorityGeneration: envelope ? 1 : 0,
+        scheduleBlockedReason: null,
+        updatedAt: new Date()
+      })
+      .onConflictDoNothing()
+      .returning();
+
+    if (!created) {
+      return c.json({ error: 'Baseline already exists for this org/site/subnet' }, 409);
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'network.baseline.create',
+      resourceType: 'network_baseline',
+      resourceId: created.id,
+      resourceName: created.subnet,
+      details: {
+        siteId: created.siteId,
+        profileId: body.profileId ?? null,
+        scanSchedule: created.scanSchedule,
+        alertSettings: created.alertSettings
+      }
+    });
+
+    return c.json(mapBaselineRow(created), 201);
+  }
+);
+
+networkBaselineRoutes.get(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  // Populates c.get('permissions') so the allowedSiteIds site narrowing below runs (dead under requireScope alone — #1051 detector).
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const baselineId = c.req.param('id')!;
+
+    const baseline = await getBaselineWithAccess(baselineId, auth);
+    if (!baseline || !baselineInSiteScope(perms, baseline)) {
+      return c.json({ error: 'Baseline not found' }, 404);
+    }
+
+    return c.json(mapBaselineRow(baseline));
+  }
+);
+
+networkBaselineRoutes.patch(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission('devices', 'write'),
+  zValidator('json', updateBaselineSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const baselineId = c.req.param('id')!;
+    const body = c.req.valid('json');
+
+    const baseline = await getBaselineWithAccess(baselineId, auth);
+    if (!baseline || !baselineInSiteScope(perms, baseline)) {
+      return c.json({ error: 'Baseline not found' }, 404);
+    }
+
+    const currentSchedule = normalizeBaselineScanSchedule(baseline.scanSchedule);
+    const currentAlertSettings = normalizeBaselineAlertSettings(baseline.alertSettings);
+
+    // `nextScanAt` must NOT be carried forward from `currentSchedule` when the
+    // interval itself changes: normalizeBaselineScanSchedule only recomputes it
+    // when the field is absent, so naively spreading currentSchedule first froze
+    // "Next run" on every interval edit — it kept re-echoing the pre-edit value
+    // (#6103). Recompute unless the caller supplied an explicit nextScanAt.
+    const intervalChanged = typeof body.scanSchedule?.intervalHours === 'number'
+      && body.scanSchedule.intervalHours !== currentSchedule.intervalHours;
+    const nextSchedule = body.scanSchedule
+      ? normalizeBaselineScanSchedule(
+          {
+            ...currentSchedule,
+            ...body.scanSchedule,
+            nextScanAt: body.scanSchedule.nextScanAt
+              ?? (intervalChanged ? undefined : currentSchedule.nextScanAt)
+          },
+          currentSchedule.intervalHours
+        )
+      : currentSchedule;
+    const nextAlertSettings = body.alertSettings
+      ? normalizeBaselineAlertSettings({ ...currentAlertSettings, ...body.alertSettings })
+      : currentAlertSettings;
+
+    // SEC-146: any change to the schedule re-arms the envelope from the CURRENT
+    // user and bumps the generation, which also invalidates any tick already
+    // issued against the previous envelope. This is the re-approval path for a
+    // legacy row: re-saving the schedule is what makes it dispatchable again.
+    // An alert-settings-only edit is not an authority change and leaves the
+    // envelope (and generation) untouched.
+    let envelope: BaselineAuthorityEnvelope | null = null;
+    if (body.scanSchedule) {
+      try {
+        envelope = await armScheduleAuthority(auth, {
+          orgId: baseline.orgId,
+          siteId: baseline.siteId,
+          subnet: baseline.subnet,
+          scanSchedule: nextSchedule
+        });
+      } catch (error) {
+        if (error instanceof BaselineAuthorityUnsupportedError) {
+          return c.json({ error: error.message }, 403);
+        }
+        throw error;
+      }
+    }
+
+    const [updated] = await db
+      .update(networkBaselines)
+      .set({
+        scanSchedule: nextSchedule,
+        alertSettings: nextAlertSettings,
+        ...(body.scanSchedule
+          ? {
+              ...(envelope ?? {}),
+              authorityGeneration: baseline.authorityGeneration + 1,
+              scheduleBlockedReason: null
+            }
+          : {}),
+        updatedAt: new Date()
+      })
+      .where(eq(networkBaselines.id, baseline.id))
+      .returning();
+
+    if (!updated) {
+      return c.json({ error: 'Failed to update baseline' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: updated.orgId,
+      action: 'network.baseline.update',
+      resourceType: 'network_baseline',
+      resourceId: updated.id,
+      resourceName: updated.subnet,
+      details: {
+        changedFields: [
+          ...(body.scanSchedule ? ['scanSchedule'] : []),
+          ...(body.alertSettings ? ['alertSettings'] : [])
+        ]
+      }
+    });
+
+    return c.json(mapBaselineRow(updated));
+  }
+);
+
+networkBaselineRoutes.post(
+  '/:id/scan',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission('devices', 'write'),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const baselineId = c.req.param('id')!;
+
+    const baseline = await getBaselineWithAccess(baselineId, auth);
+    if (!baseline || !baselineInSiteScope(perms, baseline)) {
+      return c.json({ error: 'Baseline not found' }, 404);
+    }
+
+    if (!isRedisAvailable()) {
+      return c.json({ error: 'Background job service unavailable. Redis is required.' }, 503);
+    }
+
+    const queueJobId = await enqueueBaselineScan(
+      baseline.id,
+      baseline.orgId,
+      baseline.siteId,
+      baseline.subnet
+    );
+
+    writeRouteAudit(c, {
+      orgId: baseline.orgId,
+      action: 'network.baseline.scan.trigger',
+      resourceType: 'network_baseline',
+      resourceId: baseline.id,
+      resourceName: baseline.subnet,
+      details: { queueJobId }
+    });
+
+    return c.json({
+      success: true,
+      baselineId: baseline.id,
+      queueJobId
+    });
+  }
+);
+
+networkBaselineRoutes.get(
+  '/:id/changes',
+  requireScope('organization', 'partner', 'system'),
+  // Populates c.get('permissions') so the allowedSiteIds site narrowing below runs (dead under requireScope alone — #1051 detector).
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('query', baselineChangesQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const baselineId = c.req.param('id')!;
+    const query = c.req.valid('query');
+
+    const baseline = await getBaselineWithAccess(baselineId, auth);
+    if (!baseline || !baselineInSiteScope(perms, baseline)) {
+      return c.json({ error: 'Baseline not found' }, 404);
+    }
+
+    const conditions: SQL[] = [eq(networkChangeEvents.baselineId, baseline.id)];
+
+    if (query.eventType) {
+      conditions.push(eq(networkChangeEvents.eventType, query.eventType));
+    }
+
+    if (query.acknowledged !== undefined) {
+      conditions.push(eq(networkChangeEvents.acknowledged, query.acknowledged));
+    }
+
+    const where = and(...conditions);
+    const limit = query.limit ?? 50;
+    const offset = query.offset ?? 0;
+
+    const [countRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(networkChangeEvents)
+      .where(where);
+
+    const rows = await db
+      .select()
+      .from(networkChangeEvents)
+      .where(where)
+      .orderBy(desc(networkChangeEvents.detectedAt), desc(networkChangeEvents.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: rows.map(mapNetworkChangeRow),
+      pagination: {
+        limit,
+        offset,
+        total: Number(countRow?.count ?? 0)
+      }
+    });
+  }
+);
+
+networkBaselineRoutes.delete(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission('devices', 'write'),
+  zValidator('query', deleteBaselineQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const baselineId = c.req.param('id')!;
+    const query = c.req.valid('query');
+
+    const baseline = await getBaselineWithAccess(baselineId, auth);
+    if (!baseline || !baselineInSiteScope(perms, baseline)) {
+      return c.json({ error: 'Baseline not found' }, 404);
+    }
+
+    const deleteChanges = query.deleteChanges ?? true;
+
+    try {
+      if (deleteChanges) {
+        await db.transaction(async (tx) => {
+          await tx
+            .delete(networkChangeEvents)
+            .where(eq(networkChangeEvents.baselineId, baseline.id));
+
+          await tx
+            .delete(networkBaselines)
+            .where(eq(networkBaselines.id, baseline.id));
+        });
+      } else {
+        await db
+          .delete(networkBaselines)
+          .where(eq(networkBaselines.id, baseline.id));
+      }
+    } catch (error) {
+      // Read the SQLSTATE through `pgErrorCode` (utils/pgErrors.ts, which owns
+      // the unwrap contract): Drizzle hides the real code behind `.cause`, so
+      // reading `error.code` directly -- as this did until #4020 -- made the
+      // branch unreachable for every Drizzle-issued delete. The 409 and its
+      // `hint` below were never actually delivered.
+      //
+      // Bare code check rather than a constraint-scoped one because
+      // network_change_events.baseline_id is currently the ONLY FK referencing
+      // network_baselines(id), so a 23503 escaping this delete can only mean
+      // what the hint says. If a second table ever references
+      // network_baselines, narrow this to that constraint name -- otherwise the
+      // new violation inherits this hint, `?deleteChanges=true` will not clear
+      // it, and the caller retries into the same wall.
+      if (!deleteChanges && pgErrorCode(error) === '23503') {
+        return c.json({
+          error: 'Cannot delete baseline without deleting associated change events',
+          hint: 'Use ?deleteChanges=true to delete events with the baseline'
+        }, 409);
+      }
+
+      throw error;
+    }
+
+    writeRouteAudit(c, {
+      orgId: baseline.orgId,
+      action: 'network.baseline.delete',
+      resourceType: 'network_baseline',
+      resourceId: baseline.id,
+      resourceName: baseline.subnet,
+      details: { deleteChanges }
+    });
+
+    return c.json({
+      success: true,
+      baselineId: baseline.id,
+      deletedChanges: deleteChanges
+    });
+  }
+);

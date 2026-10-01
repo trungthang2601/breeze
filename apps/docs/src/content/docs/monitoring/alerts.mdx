@@ -1,0 +1,166 @@
+---
+title: Infrastructure Alerts
+description: Prometheus and Alertmanager rules that monitor the Breeze platform itself, covering API health, PostgreSQL, Redis, disk usage, and agent heartbeats.
+sidebar:
+  order: 1
+  label: "Infrastructure Alerts"
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+These alerts monitor the Breeze platform itself -- API health, database, Redis, and disk usage. For alerts about your managed devices, see [RMM Alerts](/features/alerts/).
+
+If you deploy the optional observability stack (`docker-compose.monitoring.yml`), Breeze supports infrastructure-level alerting through Prometheus and Alertmanager.
+
+<Aside type="tip">
+  In-app alerts monitor your managed devices. Infrastructure alerts (this page) monitor the Breeze servers, database, and queue. Most organizations use both.
+</Aside>
+
+## Pre-Configured Infrastructure Alert Rules
+
+The file `monitoring/rules/breeze-rules.yml` ships with these rules:
+
+### API Alerts
+
+| Alert | Severity | Condition |
+|---|---|---|
+| `HighErrorRate` | critical | Error rate > 5% for 5 minutes |
+| `SlowResponseTime` | warning | P95 latency > 2s for 10 minutes |
+| `APIServiceDown` | critical | API target down for 2 minutes |
+| `EndpointLatencyHigh` | warning | Any endpoint P95 > 5s for 5 minutes |
+| `High4xxRate` | warning | 4xx rate > 20% for 10 minutes |
+
+### Infrastructure Alerts
+
+| Alert | Severity | Condition |
+|---|---|---|
+| `RedisDown` | critical | Redis exporter down for 2 minutes |
+| `RedisMemoryHigh` | warning | Redis memory > 80% of max |
+| `PostgresDown` | critical | Postgres exporter down for 2 minutes |
+| `PostgresConnectionPoolSaturated` | warning | Connections > 80% of max |
+| `DiskSpaceLow` | warning | Disk usage > 85% |
+
+### Business Alerts
+
+| Alert | Severity | Condition |
+|---|---|---|
+| `NoAgentHeartbeats` | critical | Zero heartbeats received for 5 minutes |
+| `AlertProcessingBacklog` | warning | Alert queue depth > 100 for 10 minutes |
+| `BackupDispatchFailuresDetected` | warning | Backup, restore, or verification start failures in the last 15 minutes |
+| `RestoreTimeoutsDetected` | critical | Restore command timeouts in the last 15 minutes |
+| `ScheduledVerificationSkipsDetected` | warning | Scheduled backup verification runs skipped in the last hour |
+| `CapacityMetricsMissing` | critical | One of the core capacity series (`http_requests_total`, `http_request_duration_seconds_count`, `agent_heartbeat_total`, `breeze_active_devices`) has no producer. This is a deadman guard: an absent series makes every alert built on it evaluate against an empty vector, which never fires — `up` alone can't catch this, since the scrape itself still succeeds. |
+| `FleetGaugesStale` | warning | `breeze_active_devices` and the organization-count gauge haven't refreshed in over 5 minutes, or have never succeeded. These gauges hold their last value on a failed refresh, so a dead refresher otherwise looks like a perfectly stable fleet. |
+
+### Anomaly Detection Alerts
+
+| Alert | Severity | Condition |
+|---|---|---|
+| `FailedLoginSpike` | warning | More than 50 failed logins in 5 minutes for one tenant — possible credential stuffing or brute force |
+| `EnrollmentSpike` | warning | More than 100 agent enrollments in 10 minutes for one tenant — verify it matches an expected rollout before assuming a leaked enrollment key |
+| `CommandDispatchSpike` | warning | More than 200 commands dispatched in 5 minutes for one tenant — possible compromised account fanning out commands |
+| `AuthenticatorL4BasisDenied` | warning | A sustained non-zero rate of critical-tier (L4) approval denials on a given platform-bound basis for 15 minutes — technicians on that basis are stuck unable to approve privileged-access or destructive-action requests from mobile until they update the app and re-enroll. See [Approval Security](/features/approval-security/#enrolling-an-approver-device) for the "Not attested" badge this tracks. |
+
+<Aside type="tip">
+  These thresholds are deliberately coarse starting points — tune them once you have real production baselines. The `tenant` label collapses to a single series unless `METRICS_INCLUDE_ORG_ID` is enabled; the alerts still fire on the aggregate either way.
+</Aside>
+
+## Alertmanager Routing
+
+Alertmanager routes infrastructure alerts by severity. Edit `monitoring/alertmanager.yml` to configure receivers:
+
+```yaml
+route:
+  receiver: default
+  group_by: ['alertname', 'severity', 'job']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+  routes:
+    - match:
+        severity: critical
+      receiver: critical-alerts
+      group_wait: 10s
+      repeat_interval: 1h
+
+    - match:
+        severity: warning
+      receiver: warning-alerts
+
+    - match_re:
+        alertname: '^(Redis|Postgres|DiskSpace).*'
+      receiver: infrastructure-alerts
+```
+
+When a critical alert fires, related warning alerts for the same alert name are automatically suppressed via inhibition rules.
+
+## Configuring Infrastructure Notification Channels
+
+Uncomment and edit the receiver blocks in `monitoring/alertmanager.yml` to enable Slack, PagerDuty, or email for infrastructure alerts:
+
+<Tabs>
+  <TabItem label="Slack">
+```yaml
+receivers:
+  - name: critical-alerts
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
+        channel: '#alerts-critical'
+        send_resolved: true
+        title: '{{ .Status | toUpper }}: {{ .GroupLabels.alertname }}'
+```
+  </TabItem>
+  <TabItem label="PagerDuty">
+```yaml
+receivers:
+  - name: critical-alerts
+    pagerduty_configs:
+      - service_key: 'YOUR_PAGERDUTY_SERVICE_KEY'
+        severity: 'critical'
+```
+  </TabItem>
+  <TabItem label="Email">
+```yaml
+receivers:
+  - name: warning-alerts
+    email_configs:
+      - to: 'ops@yourdomain.com'
+        from: 'alerts@yourdomain.com'
+        smarthost: 'smtp.yourdomain.com:587'
+        auth_username: 'alerts@yourdomain.com'
+        auth_password: 'password'
+```
+  </TabItem>
+</Tabs>
+
+After editing, restart Alertmanager:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml restart alertmanager
+```
+
+## Custom Infrastructure Alert Rules
+
+Add custom Prometheus rules in `monitoring/rules/`:
+
+```yaml
+# monitoring/rules/custom-rules.yml
+groups:
+  - name: custom-alerts
+    rules:
+      - alert: HighAgentChurn
+        expr: rate(breeze_device_enrollments_total[1h]) > 10
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High agent enrollment rate"
+          description: "More than 10 new enrollments per hour for 30 minutes"
+```
+
+Prometheus automatically picks up new rule files. Reload the config without restarting:
+
+```bash
+curl -X POST http://localhost:9090/-/reload
+```

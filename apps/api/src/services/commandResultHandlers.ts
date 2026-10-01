@@ -1,0 +1,1177 @@
+/**
+ * Shared agent command-result handlers (#3097).
+ *
+ * These handlers were defined inside `routes/agentWs.ts`, where only the
+ * WebSocket transport could reach them. Results submitted over the HTTP path
+ * (`routes/agents/commands.ts`) therefore never ran them at all — most visibly,
+ * `script` results never reached `script_executions`, leaving rows pending until
+ * the stale reaper stamped them `timeout`.
+ *
+ * Nothing here is new: the handler bodies below are the ones that were in
+ * `agentWs.ts`, moved verbatim so both transports dispatch the same code. The
+ * module boundary is the only thing that changed.
+ */
+
+import { z } from 'zod';
+import { requestLikeFromSnapshot, writeAuditEvent } from './auditEvents';
+import {
+  AGENT_UPDATE_REQUIRED_ERROR,
+  isUnknownCommandTypeError,
+  parseAgentJson,
+  systemCleanupRunResultSchema,
+} from './systemCleanup';
+
+import { eq, ne, and, inArray, isNull, sql } from 'drizzle-orm';
+import { db, runOutsideDbContext } from '../db';
+import {
+  deviceCommands,
+  deviceFilesystemCleanupRuns,
+  devices,
+  discoveryJobs,
+  scriptExecutions,
+  scriptExecutionBatches,
+  backupJobs,
+} from '../db/schema';
+import { enqueueDiscoveryResults, type DiscoveredHostResult, type DeviceAdjacency } from '../jobs/discoveryWorker';
+import { enqueueSnmpPollResults, type SnmpMetricResult } from '../jobs/snmpWorker';
+import { isRedisAvailable } from './redis';
+import { processBackupVerificationResult } from '../routes/backup/verificationService';
+import { applyBackupCommandResultToJob } from './backupResultPersistence';
+import { applyVaultSyncCommandResult } from './vaultSyncPersistence';
+import { backupCommandResultSchema } from '../routes/backup/resultSchemas';
+import { describeZodIssues } from '../lib/zodIssues';
+import { redactSecretsFromOutput, redactOptionalSecretText } from './secretRedaction';
+import { updateRestoreJobByCommandId } from './restoreResultPersistence';
+import { applyRebuildCommandResult } from './bareMetalRecoveryService';
+import { captureException } from './sentry';
+import { applyScriptCustomFieldWrites } from './customFields/scriptWriteBack';
+import type { ScriptCustomFieldWriteSummary } from '../db/schema/scripts';
+import { PG_UUID_REGEX, UUID_REGEX } from '../utils/uuid';
+// #3097: one definition of the agent command-result shape for BOTH transports.
+// `schemas.ts` measures the 1 MB cap with `Buffer.byteLength` (bytes); the copy
+// that used to live in `agentWs.ts` used `.length` (UTF-16 code units), so the
+// websocket path accepted roughly 3x the intended budget for CJK-heavy output
+// while the REST path rejected at 1 MB. The byte-accurate one wins.
+import { commandResultSchema } from '../routes/agents/schemas';
+import { applyAutomationActionTerminal } from './automationActionResults';
+import { enqueueScriptVerify } from './scriptProposals/verify';
+import { handlePeripheralPolicyResultV2 } from './peripheralPolicyState';
+import {
+  pamAgentResultV2Schema,
+  recordPamActuationResult,
+  type PamActuationResultClassification,
+} from './pamActuationResult';
+// #5128 W3: patch installs can now be delivered days after the per-device BullMQ
+// task exited, so the agent's result must close the device out here rather than
+// through the executor's poll.
+import { handleInstallPatchesResult } from './patchJobFinalizer';
+
+export type CommandResultHandlerOutcome =
+  | { kind: 'pam'; classification: PamActuationResultClassification }
+  | void;
+
+export type CommandResultHandler = (params: {
+  agentId: string;
+  command: typeof deviceCommands.$inferSelect;
+  /**
+   * #3097: supplied by the transport, never read off the payload.
+   *
+   * The websocket envelope carries `commandId` inline; the REST route takes it
+   * from the path (`/:id/commands/:commandId/result`) and authorizes against
+   * that path value. Accepting an agent-supplied id in the body would let a
+   * handler act on one command while ownership was checked against another —
+   * so there is exactly one id here, and the transport that authorized it is
+   * the transport that passes it.
+   */
+  commandId: string;
+  result: z.infer<typeof commandResultSchema>;
+  resolvedDeviceId: string;
+  stdout: string | undefined;
+}) => Promise<CommandResultHandlerOutcome>;
+
+// ---------------------------------------------------------------------------
+// Per-command-type result handlers (used by the dispatch map in processCommandResult)
+// ---------------------------------------------------------------------------
+
+/** Coerce Date instances in host firstSeen/lastSeen to ISO strings so Zod datetime validation passes. */
+export function normalizeDiscoveryHosts(hosts: DiscoveredHostResult[]): DiscoveredHostResult[] {
+  return hosts.map(h => ({
+    ...h,
+    firstSeen: (h.firstSeen as any) instanceof Date ? (h.firstSeen as any).toISOString() : h.firstSeen,
+    lastSeen: (h.lastSeen as any) instanceof Date ? (h.lastSeen as any).toISOString() : h.lastSeen,
+  }));
+}
+
+async function handleDiscoveryResult({ agentId, command, result, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const payload = command.payload as Record<string, unknown> | null;
+  const expectedJobId = typeof payload?.jobId === 'string' ? payload.jobId : null;
+  try {
+    const discoveryData = result.result as {
+      jobId?: string;
+      hosts?: DiscoveredHostResult[];
+      hostsScanned?: number;
+      hostsDiscovered?: number;
+      adjacency?: DeviceAdjacency[];
+    } | undefined;
+
+    if (discoveryData?.hosts) {
+      if (!expectedJobId || discoveryData.jobId !== expectedJobId) {
+        console.warn(
+          `[AgentWs] Rejecting mismatched discovery result ${commandId} from agent ${agentId}: ` +
+          `sentJob=${discoveryData.jobId ?? 'none'} expected=${expectedJobId ?? 'none'}`
+        );
+        return;
+      }
+    }
+
+    if (expectedJobId && discoveryData?.hosts) {
+      // Look up the job to get orgId and siteId
+      const [job] = await db
+        .select({ orgId: discoveryJobs.orgId, siteId: discoveryJobs.siteId })
+        .from(discoveryJobs)
+        .where(eq(discoveryJobs.id, expectedJobId))
+        .limit(1);
+
+      if (job && isRedisAvailable()) {
+        const normalizedHosts = normalizeDiscoveryHosts(discoveryData.hosts);
+        // Exit the held org-scoped transaction context for the Redis
+        // round-trips (#1105) — see the note on the monitor-result branch.
+        await runOutsideDbContext(() => enqueueDiscoveryResults(
+          expectedJobId,
+          job.orgId,
+          job.siteId,
+          normalizedHosts,
+          discoveryData.hostsScanned ?? 0,
+          discoveryData.hostsDiscovered ?? 0,
+          undefined,
+          discoveryData.adjacency ?? [],
+          {
+            actorType: 'agent',
+            actorId: agentId,
+            source: 'route:agentWs:script-network-scan',
+          }
+        ));
+      } else if (job) {
+        // Redis not available — mark job failed so user knows results weren't processed
+        console.warn(`[AgentWs] Redis unavailable, cannot process ${discoveryData.hosts.length} discovery hosts for job ${expectedJobId}`);
+        await db
+          .update(discoveryJobs)
+          .set({
+            status: 'failed',
+            completedAt: new Date(),
+            hostsDiscovered: discoveryData.hostsDiscovered ?? 0,
+            hostsScanned: discoveryData.hostsScanned ?? 0,
+            errors: { message: 'Results received but could not be processed: job queue unavailable' },
+            updatedAt: new Date()
+          })
+          .where(eq(discoveryJobs.id, expectedJobId));
+      } else {
+        console.warn(
+          `[AgentWs] Discovery job ${expectedJobId} not found in DB — ` +
+          `discarding ${discoveryData.hosts.length} host(s) from agent ${agentId}`
+        );
+      }
+    }
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process discovery results for ${agentId}:`, err);
+    captureException(err);
+    if (expectedJobId) {
+      try {
+        await db
+          .update(discoveryJobs)
+          .set({
+            status: 'failed',
+            completedAt: new Date(),
+            errors: { message: err instanceof Error ? err.message : 'Failed to enqueue discovery results' },
+            updatedAt: new Date()
+          })
+          .where(eq(discoveryJobs.id, expectedJobId));
+      } catch (dbErr) {
+        console.error(`[AgentWs] Additionally failed to mark discovery job ${expectedJobId} as failed:`, dbErr);
+      }
+    }
+  }
+}
+
+async function handleBackupVerificationResult({ agentId, result, stdout, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    await processBackupVerificationResult(commandId, {
+      status: result.status,
+      stdout,
+      error: result.error,
+    });
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process backup verification result for ${agentId}:`, err);
+    captureException(err);
+  }
+}
+
+async function handleVmRestoreResult({ agentId, command, result, resolvedDeviceId, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    await updateRestoreJobByCommandId({
+      commandId: commandId,
+      deviceId: resolvedDeviceId,
+      commandType: command.type,
+      result,
+    });
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process queued restore result for ${agentId}:`, err);
+    captureException(err);
+  }
+}
+
+/**
+ * W05a `bare_metal_rebuild`: close the restore_jobs row by the
+ * transport-authorized command id (same as every queued restore), then apply
+ * the terminal status to the recovery row for a rebuild host whose
+ * /bmr/recover/progress posts never reached the server. The progress route
+ * stays the primary path — applyRebuildCommandResult is idempotent on a row
+ * it already terminalised.
+ */
+async function handleBareMetalRebuildResult({ agentId, command, result, resolvedDeviceId, commandId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    await updateRestoreJobByCommandId({
+      commandId,
+      deviceId: resolvedDeviceId,
+      commandType: command.type,
+      result,
+    });
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process bare-metal rebuild restore job for ${agentId}:`, err);
+    captureException(err);
+  }
+
+  const payload =
+    command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
+      ? (command.payload as Record<string, unknown>)
+      : {};
+  const recoveryId = typeof payload.recoveryId === 'string' && UUID_REGEX.test(payload.recoveryId) ? payload.recoveryId : null;
+  // The recovery was created in the host's org (queueBareMetalRebuild passes
+  // expectedOrgId), so the enqueue-time org is the scope for this write.
+  const orgId = typeof command.submittedOrgId === 'string' ? command.submittedOrgId : null;
+  if (!recoveryId || !orgId) return;
+
+  try {
+    await applyRebuildCommandResult({ recoveryId, orgId, result: result as unknown as Record<string, unknown> });
+  } catch (err) {
+    console.error(`[AgentWs] Failed to apply bare-metal rebuild result to recovery ${recoveryId} for ${agentId}:`, err);
+    captureException(err);
+  }
+}
+
+async function handleProviderBackedBackupResult({ agentId, command, result, resolvedDeviceId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    const payload =
+      command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
+        ? command.payload as Record<string, unknown>
+        : {};
+    const backupJobId =
+      typeof payload.backupJobId === 'string'
+        ? payload.backupJobId
+        : typeof payload.jobId === 'string' && UUID_REGEX.test(payload.jobId)
+          ? payload.jobId
+          : null;
+
+    if (backupJobId) {
+      const [backupJob] = await db
+        .select({
+          id: backupJobs.id,
+          orgId: backupJobs.orgId,
+          deviceId: backupJobs.deviceId,
+        })
+        .from(backupJobs)
+        .where(
+          and(
+            eq(backupJobs.id, backupJobId),
+            eq(backupJobs.deviceId, resolvedDeviceId)
+          )
+        )
+        .limit(1);
+
+      if (backupJob) {
+        const parsedBackup = backupCommandResultSchema.safeParse(result.result ?? {});
+        if (!parsedBackup.success) {
+          await applyBackupCommandResultToJob({
+            jobId: backupJob.id,
+            orgId: backupJob.orgId,
+            deviceId: backupJob.deviceId,
+            resultStatus: 'failed',
+            result: {
+              error: `Malformed backup result payload: ${describeZodIssues(parsedBackup.error)}`,
+            },
+          });
+        } else {
+          await applyBackupCommandResultToJob({
+            jobId: backupJob.id,
+            orgId: backupJob.orgId,
+            deviceId: backupJob.deviceId,
+            resultStatus: result.status,
+            // Provider-backed backups do not report `partial` today, but this
+            // path parses the agent's status and must not be the one place
+            // that silently discards it.
+            agentStatus: parsedBackup.data.status,
+            result: {
+              ...parsedBackup.data,
+              error: result.error || result.stderr,
+            },
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process ${command.type} backup result for ${agentId}:`, err);
+    captureException(err);
+  }
+}
+
+async function handleVaultSyncResult({ agentId, command, result, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    await applyVaultSyncCommandResult({
+      deviceId: resolvedDeviceId,
+      command,
+      resultStatus: result.status,
+      stdout,
+      stderr: result.stderr,
+      error: result.error,
+    });
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process vault sync result for ${agentId}:`, err);
+    captureException(err);
+  }
+}
+
+/** Called only after the transport has bound the result to its dispatched target.
+ * The update stays in the agent's org-scoped DB context; RETURNING supplies the
+ * authoritative org for the log, never an agent-supplied organization id.
+ */
+export async function recordSnmpPollFailure(snmpDeviceId: string, deviceId: string, error: string): Promise<void> {
+  const { snmpDevices } = await import('../db/schema');
+  const lastError = redactSecretsFromOutput(error).slice(0, 500);
+  const [updated] = await db.update(snmpDevices)
+    .set({ lastError, lastErrorAt: new Date(), lastStatus: 'warning' })
+    .where(eq(snmpDevices.id, snmpDeviceId))
+    .returning({ orgId: snmpDevices.orgId });
+  if (updated) {
+    console.warn('[AgentWs] SNMP poll failed', { deviceId, orgId: updated.orgId, snmpDeviceId, error: lastError });
+  }
+}
+
+async function handleSnmpPollResult({ agentId, command, result, commandId, resolvedDeviceId }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    const payload = command.payload as Record<string, unknown> | null;
+    const expectedDeviceId = typeof payload?.deviceId === 'string' ? payload.deviceId : null;
+    const snmpData = result.result as {
+      deviceId?: string;
+      metrics?: SnmpMetricResult[];
+      protocol?: number;
+      success?: boolean;
+    } | undefined;
+
+    if (!expectedDeviceId || (snmpData?.deviceId && snmpData.deviceId !== expectedDeviceId)) {
+      console.warn(
+        `[AgentWs] Rejecting mismatched SNMP result ${commandId} from agent ${agentId}: ` +
+        `sentDevice=${snmpData?.deviceId ?? 'none'} expected=${expectedDeviceId ?? 'none'}`
+      );
+      return;
+    }
+    if (result.status !== 'completed' || snmpData?.success === false) {
+      await recordSnmpPollFailure(expectedDeviceId, resolvedDeviceId, result.error || 'SNMP poll failed');
+      return;
+    }
+    if (snmpData?.deviceId && Array.isArray(snmpData.metrics)) {
+      if (isRedisAvailable() || snmpData.metrics.length === 0) {
+        const { snmpDevices } = await import('../db/schema');
+        await db.update(snmpDevices)
+          .set({ lastError: null, lastErrorAt: null })
+          .where(eq(snmpDevices.id, expectedDeviceId));
+        if (snmpData.metrics.length === 0) return;
+        const metrics = snmpData.metrics;
+        // Exit the held org-scoped transaction context for the Redis
+        // round-trips (#1105) — see the note on the monitor-result branch.
+        await runOutsideDbContext(() => enqueueSnmpPollResults(expectedDeviceId, metrics, undefined, snmpData.protocol));
+      } else {
+        // Redis not available — log warning about dropped metrics and mark status
+        console.warn(`[AgentWs] Redis unavailable, dropping ${snmpData.metrics.length} SNMP metrics for device ${expectedDeviceId}`);
+        const { snmpDevices } = await import('../db/schema');
+        await db
+          .update(snmpDevices)
+          .set({
+            lastPolled: new Date(),
+            // The device answered; only our own pipeline failed. Clear the
+            // failure backoff (#3217) so a Redis outage doesn't march every
+            // healthy SNMP target to 'offline' and a one-hour interval.
+            lastPollAttemptedAt: new Date(),
+            consecutiveFailures: 0,
+            lastStatus: 'warning',
+            lastError: null,
+            lastErrorAt: null
+          })
+          .where(eq(snmpDevices.id, expectedDeviceId));
+      }
+    }
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process SNMP poll results for ${agentId}:`, err);
+    captureException(err);
+  }
+}
+
+/** W03 (#5612): `proposalId` rides every CAS rung's RETURNING so the terminal
+ *  convergence point below can enqueue verification without a second read.
+ *  A function, not a module-level const: many route suites mock `../db/schema`
+ *  with a narrow table set, and a const would dereference `scriptExecutions`
+ *  at import time and fail every one of them. */
+function terminalExecutionProjection() {
+  return {
+    id: scriptExecutions.id,
+    scriptId: scriptExecutions.scriptId,
+    proposalId: scriptExecutions.proposalId,
+  } as const;
+}
+
+async function handleScriptResult({ agentId, command, result, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  // Which write we are on, for the shared catch below. This function now runs a
+  // five-step compare-and-swap ladder inside ONE try; without a phase tag every
+  // failure reaches Sentry with the same three context fields and the same
+  // grouping, so "the cancel-confirm CAS threw" is indistinguishable from "the
+  // batch counter threw" without reading the stack by hand.
+  let phase = 'custom-fields';
+  try {
+    const payload = command.payload as Record<string, unknown> | null;
+    const executionId = payload?.executionId as string | undefined;
+
+    // #2698 — a script may write its own device's custom fields by emitting
+    // `::breeze:custom-fields:: {...}` on stdout (or, from agent Wave 3, a
+    // versioned `result.customFieldWrites` envelope). Deliberately placed
+    // ahead of the executionId guards and outside the exit-code branch: a
+    // script that discovers a fact and then exits non-zero, or that was
+    // dispatched without a (valid) executionId, has still discovered it.
+    //
+    // Its own try/catch: losing a custom-field write must never cost the
+    // stdout persistence this handler exists for. That is exactly the
+    // regression class documented at length below (#3162, #3607).
+    let customFieldResult: ScriptCustomFieldWriteSummary | null = null;
+    try {
+      customFieldResult = await applyScriptCustomFieldWrites({
+        deviceId: resolvedDeviceId,
+        agentId,
+        commandId: command.id,
+        stdout,
+        resultEnvelope: result.result,
+      });
+      if (customFieldResult && customFieldResult.rejected.length > 0) {
+        console.warn('[AgentWs] script custom-field write-back rejected entries', {
+          commandId: command.id,
+          deviceId: resolvedDeviceId,
+          rejected: customFieldResult.rejected,
+        });
+      }
+    } catch (err) {
+      // The summary is discarded rather than partially persisted: a half-built
+      // summary would misreport what actually landed. Engineering still sees
+      // the failure via Sentry; the operator sees a run with no write-back,
+      // which is the honest reading of "we do not know what happened".
+      console.error(`[AgentWs] Custom-field write-back failed for command ${command.id}:`, err);
+      captureException(err, undefined, { commandId: command.id, agentId });
+      customFieldResult = null;
+    }
+
+    // #3162: `script_executions.id` is a uuid column, so a non-uuid
+    // executionId makes the UPDATE below throw with `invalid input syntax for
+    // type uuid` — swallowed by the catch at the bottom of this function,
+    // taking the agent's stdout with it.
+    //
+    // Nothing should mint a non-uuid executionId any more (the automation
+    // `execute_command` action, the only producer, now omits the field
+    // entirely). This guard is for commands queued BEFORE that deploy and still
+    // in flight, so it reports rather than silently skipping: a fresh non-uuid
+    // id means an unknown producer is sending garbage.
+    if (executionId && !PG_UUID_REGEX.test(executionId)) {
+      console.warn(
+        `[AgentWs] Skipping script_executions update for non-uuid executionId ${executionId} (command ${command.id})`
+      );
+      captureException(
+        new Error('Non-uuid executionId in script command payload'),
+        undefined,
+        { commandId: command.id, agentId, executionId },
+      );
+      return;
+    }
+    if (executionId) {
+      let scriptStatus: 'completed' | 'failed' | 'timeout';
+      if (result.status === 'completed') {
+        scriptStatus = result.exitCode && result.exitCode !== 0 ? 'failed' : 'completed';
+      } else if (result.status === 'timeout') {
+        scriptStatus = 'timeout';
+      } else {
+        scriptStatus = 'failed';
+      }
+
+      const executionValues = {
+        status: scriptStatus,
+        completedAt: new Date(),
+        exitCode: result.exitCode ?? null,
+        // #2434: script output/errors surface to scripts:read users in the
+        // web UI — redact secrets before persistence (idempotent when the
+        // ingest chokepoint already redacted error/stderr).
+        stdout: stdout != null ? redactSecretsFromOutput(stdout) : null,
+        stderr: redactOptionalSecretText(result.stderr) ?? null,
+        errorMessage: redactOptionalSecretText(result.error) ?? null,
+        // #2698 — null for every run that wrote nothing, the vast majority.
+        customFieldResult,
+      };
+
+      // #3525 closer 1 of 5 — the ORIGINAL script's own result closing a
+      // `cancelling` execution. This MUST run before both branches below:
+      // the primary CAS matches `pending|queued|running` and the #3607 branch
+      // matches swept `timeout|failed` rows, so a `cancelling` row matches
+      // neither and the agent's real output would fall through to the
+      // "matched nothing" path at the bottom and be discarded.
+      //
+      // Two writes, not one, because the honesty contract splits here:
+      //
+      //  1. PROVEN — the agent marked the result as cancelled AND named the
+      //     cancel command it acted on. Pinning `cancel_command_id` is what
+      //     stops a stale or retried cancel being credited with a kill it did
+      //     not do. `cancelled: true` with no id is what a pre-#3525 agent
+      //     answers after a non-blocking signal: a request, not a receipt, so
+      //     it is deliberately NOT enough to reach this write (same rule as
+      //     `resolveCancelAckOutcome`).
+      //  2. UNPROVEN — everything else that arrives while `cancelling`. The
+      //     process reached a real outcome, so keep it (OD9-C) and record the
+      //     losing cancel request in `cancel_state` alone. `status` is never
+      //     `cancelled` here: we cannot prove the stop.
+      const cancelledMarker = (result as Record<string, unknown> | null)?.cancelled === true;
+      const rawMarkerCommandId = (result as Record<string, unknown> | null)?.cancelledByCommandId;
+      const markerCommandId = typeof rawMarkerCommandId === 'string' ? rawMarkerCommandId : null;
+
+      phase = 'cancel-confirm-cas';
+      let cancelClosed: Array<{ id: string; scriptId: string | null; proposalId: string | null }> = [];
+      let cancelConfirmed = false;
+      if (cancelledMarker && markerCommandId) {
+        cancelClosed = await db
+          .update(scriptExecutions)
+          .set({ ...executionValues, status: 'cancelled' as const, cancelState: 'confirmed' as const })
+          .where(and(
+            eq(scriptExecutions.id, executionId),
+            eq(scriptExecutions.deviceId, resolvedDeviceId),
+            eq(scriptExecutions.status, 'cancelling'),
+            eq(scriptExecutions.cancelCommandId, markerCommandId),
+          ))
+          .returning(terminalExecutionProjection());
+        cancelConfirmed = cancelClosed.length > 0;
+      }
+      if (cancelClosed.length === 0) {
+        phase = 'cancel-unconfirmed-cas';
+        cancelClosed = await db
+          .update(scriptExecutions)
+          .set({ ...executionValues, cancelState: 'unconfirmed' as const })
+          .where(and(
+            eq(scriptExecutions.id, executionId),
+            eq(scriptExecutions.deviceId, resolvedDeviceId),
+            eq(scriptExecutions.status, 'cancelling'),
+          ))
+          .returning(terminalExecutionProjection());
+      }
+
+      let updatedExecutions: Array<{ id: string; scriptId: string | null; proposalId: string | null }> = [];
+      let effectiveExecution = cancelClosed[0] ?? null;
+
+      if (cancelClosed.length === 0) {
+        phase = 'primary-cas';
+        updatedExecutions = await db
+          .update(scriptExecutions)
+          .set(executionValues)
+          .where(and(
+            eq(scriptExecutions.id, executionId),
+            eq(scriptExecutions.deviceId, resolvedDeviceId),
+            inArray(scriptExecutions.status, ['pending', 'queued', 'running'])
+          ))
+          .returning(terminalExecutionProjection());
+        effectiveExecution = updatedExecutions[0] ?? null;
+
+        // #3607 — second chance for an execution a server-side sweep already
+        // stamped terminal.
+        //
+        // Widening the device_commands acceptance predicate lets a result that
+        // arrives after the 60s `waitForCommandResult` deadline reach this
+        // handler at all, but the execution row can meanwhile have been stamped
+        // by `jobs/staleCommandReaper.ts`. The guard above would then drop the
+        // real stdout at the last step — the same defect one table over.
+        //
+        // The predicate is NOT `status = 'timeout'`. The reaper derives the
+        // execution status from the COMMAND row, and in exactly the #3607
+        // scenario that row is `failed` with `result.status = 'timeout'`, so the
+        // reaper stamps the execution **'failed'** (with its "#3097 delivered but
+        // never recorded" message), not 'timeout'. Keying on 'timeout' alone
+        // would leave the dominant path still losing output.
+        //
+        // So the discriminator is "this execution never received the agent's
+        // output": no exit code and no stdout. Every server-side sweep leaves
+        // both NULL; the only writer that fills them is this function, and it is
+        // only reachable once the caller's compare-and-set has already
+        // transitioned the command row — so a duplicate frame cannot get here to
+        // overwrite a genuine earlier result.
+        //
+        // Deliberately does NOT touch the batch counters. Every writer of a
+        // terminal execution status already incremented one of them for this
+        // device, so the batch's slot is spent — bumping again would push
+        // devicesCompleted + devicesFailed past devicesTargeted and corrupt the
+        // batch's completion accounting. The cost is that a recovered success
+        // stays attributed to devicesFailed in the batch summary, which is the
+        // approximation the reaper already made; the per-execution row (the one
+        // the UI and the AI read) is now correct.
+        if (updatedExecutions.length === 0) {
+            phase = 'recovery-3607';
+          const recovered = await db
+            .update(scriptExecutions)
+            .set(executionValues)
+            .where(and(
+              eq(scriptExecutions.id, executionId),
+              eq(scriptExecutions.deviceId, resolvedDeviceId),
+              inArray(scriptExecutions.status, ['timeout', 'failed']),
+              isNull(scriptExecutions.exitCode),
+              isNull(scriptExecutions.stdout)
+            ))
+            .returning(terminalExecutionProjection());
+
+          if (recovered.length > 0) {
+            effectiveExecution = recovered[0] ?? null;
+            console.warn(
+              `[AgentWs] #3607 recovered late script result onto swept execution ${executionId} (command ${command.id})`
+            );
+          } else {
+            // Both updates matched nothing. Before this PR that outcome was
+            // unreachable for a late result — the command lookup rejected it
+            // upstream and `processOrphanedCommandResult` logged the drop. Now
+            // that acceptance is widened, this is the ONE remaining way an
+            // agent's real output can be discarded here, so it must not be
+            // silent (the #3162 lesson, two blocks down: report, never skip
+            // quietly).
+            const [current] = await db
+              .select({
+                status: scriptExecutions.status,
+                exitCode: scriptExecutions.exitCode,
+                deviceId: scriptExecutions.deviceId,
+              })
+              .from(scriptExecutions)
+              .where(eq(scriptExecutions.id, executionId))
+              .limit(1);
+            const currentStatus = current?.status ?? 'row-missing';
+
+            // #3525 closer 3 — a late original result after the cancellation
+            // already terminalised the row.
+            //
+            // This block used to drop the output on the floor, with a comment
+            // asserting that was the CORRECT outcome because "the operator asked
+            // for the run to be abandoned". That is the design bug written down:
+            // an operator who stops a script wants to see how far it got, and
+            // the partial stdout is the only record of that. So fill the output
+            // columns and NOTHING else — no status change, no cancel_state
+            // change, no batch accounting, no automation-action closure, since
+            // whichever closer terminalised this row already consumed all four.
+            //
+            // Deliberately NOT gated on `cancel_state`: a *confirmed* cancel has
+            // partial output worth keeping just as much as an unconfirmed one.
+            // `exit_code IS NULL` is the idempotency guard — it is the marker
+            // every server-side sweep leaves behind and this is its only writer,
+            // so a duplicate frame cannot overwrite a genuine earlier recovery.
+            if (currentStatus === 'cancelled') {
+              phase = 'late-output-3525';
+              const outputRecovered = await db
+                .update(scriptExecutions)
+                .set({
+                  stdout: executionValues.stdout,
+                  stderr: executionValues.stderr,
+                  exitCode: executionValues.exitCode,
+                })
+                .where(and(
+                  eq(scriptExecutions.id, executionId),
+                  eq(scriptExecutions.status, 'cancelled'),
+                  isNull(scriptExecutions.exitCode),
+                ))
+                .returning({ id: scriptExecutions.id });
+              // The write is CHECKED, not assumed — the #3607 block above does
+              // the same. Logging "recovered" unconditionally would print a
+              // success line for a frame whose output was in fact discarded,
+              // which is precisely what makes a later "why is this execution's
+              // output truncated" report un-debuggable.
+              if (outputRecovered.length > 0) {
+                // No captureException: this is an expected race, not a defect.
+                console.warn('[AgentWs] #3525 recovered late output onto a cancelled execution', {
+                  executionId,
+                  commandId: command.id,
+                  resolvedDeviceId,
+                });
+              } else {
+                // A duplicate or second late frame; the first one already filled
+                // the output. Still not a defect — but it is a DROP, and saying
+                // so is the difference between a trail and a lie.
+                console.warn('[AgentWs] #3525 discarded late output for a cancelled execution that already has an exit code', {
+                  executionId,
+                  commandId: command.id,
+                  resolvedDeviceId,
+                  currentExitCode: current?.exitCode ?? null,
+                });
+              }
+              return;
+            }
+
+            const message = 'Late script result matched no script_executions row';
+            console.warn(`[AgentWs] ${message}`, {
+              executionId,
+              commandId: command.id,
+              resolvedDeviceId,
+              currentStatus,
+              currentExitCode: current?.exitCode ?? null,
+              currentDeviceId: current?.deviceId ?? null,
+            });
+            // The `cancelled` carve-out that used to live here is gone: that
+            // case now returns above, having actually kept the output.
+            captureException(new Error(message), undefined, {
+              executionId,
+              commandId: command.id,
+              resolvedDeviceId,
+              currentStatus,
+            });
+          }
+        }
+      }
+
+      if (effectiveExecution) {
+        await applyAutomationActionTerminal({
+          source: 'script_execution',
+          scriptExecutionId: effectiveExecution.id,
+          // #3525: a proven cancel closes the automation action as `cancelled`,
+          // never `failed`. The agent reports a killed process as `failed` with
+          // exit -1, so passing `scriptStatus` straight through would make an
+          // automation step read "failed" when the operator stopped it — the
+          // same dishonesty the execution row itself now avoids. An UNPROVEN
+          // cancel keeps the real outcome here too, for the same reason.
+          terminalStatus: cancelConfirmed
+            ? 'cancelled'
+            : scriptStatus === 'completed' ? 'succeeded' : 'failed',
+          output: executionValues.stdout,
+          error: executionValues.errorMessage ?? executionValues.stderr,
+          completedAt: executionValues.completedAt,
+        });
+
+        if (effectiveExecution.proposalId) {
+          // W03 (#5612, spec §4.9): the proposal's verification claim is
+          // evaluated AFTER the execution reaches a terminal state, by an
+          // independent device read — never inferred from this result frame,
+          // which is why a failed run still enqueues. Wrapped: a Redis hiccup
+          // must not fail result ingestion, which is the durable record. The
+          // proposal simply stays `executed` and the card shows "verification
+          // pending" rather than losing the output.
+          try {
+            // #1105: never hold the ambient DB context across a Redis round-trip.
+            await runOutsideDbContext(() => enqueueScriptVerify({
+              proposalId: effectiveExecution.proposalId as string,
+              executionId: effectiveExecution.id,
+              attempt: 1,
+            }));
+          } catch (err) {
+            console.error(`[AgentWs] script-verify enqueue failed for execution ${effectiveExecution.id}:`, err);
+            captureException(err, undefined, { area: 'script_verify_enqueue', executionId: effectiveExecution.id });
+          }
+        }
+      }
+
+      // Update batch counters if this is part of a batch.
+      //
+      // The #3607 recovery is excluded for the reason documented there: the
+      // sweep that stamped that row terminal already spent its batch slot, so
+      // counting again would push devicesCompleted + devicesFailed past
+      // devicesTargeted.
+      //
+      // #3525: the cancellation CAS is the OPPOSITE case and MUST count. It is
+      // the writer that terminalises the row, and no earlier writer spent the
+      // slot — `applyScriptCancelAck` never touches the batch, the cancel
+      // request only moves the row to the transient `cancelling`, and once this
+      // handler lands the row is terminal (`cancelled`, or the real outcome)
+      // and therefore outside BOTH reapers' predicates forever. Skipping it
+      // meant `devicesCompleted + devicesFailed` could never reach
+      // `devicesTargeted`, so the batch's completion check never fired and
+      // every multi-device run containing one cancelled device stayed `pending`
+      // permanently — the same never-terminal defect this wave exists to kill,
+      // one level up. There is no `devicesCancelled` column (batch cancel is
+      // out of scope, OD5-B), so a cancel counts through the same
+      // completed/failed mapping every other writer uses.
+      const countedExecution = updatedExecutions[0] ?? cancelClosed[0] ?? null;
+      const batchId = payload?.batchId as string | undefined;
+      phase = 'batch-counters';
+      // A proposal-backed execution has no library script and is never part of
+      // a batch (script_execution_batches.script_id is NOT NULL), so the
+      // counter update only applies to rows that carry a script_id.
+      if (batchId && countedExecution && countedExecution.scriptId) {
+        const counterField = scriptStatus === 'completed' ? 'devicesCompleted' : 'devicesFailed';
+        await db
+          .update(scriptExecutionBatches)
+          .set({
+            [counterField]: sql`${scriptExecutionBatches[counterField]} + 1`
+          })
+          .where(and(
+            eq(scriptExecutionBatches.id, batchId),
+            eq(scriptExecutionBatches.scriptId, countedExecution.scriptId)
+          ));
+      }
+    }
+  } catch (err) {
+    // #3162 lived undetected because this catch logged to the container and
+    // nothing else — a swallowed 22P02 silently discarded every automation's
+    // script output. Report it like the SNMP handler does so the next failure
+    // in here (schema drift, a redaction throw, a batch-counter FK violation)
+    // surfaces instead of quietly eating results.
+    console.error(`[AgentWs] Failed to process script result for ${agentId}:`, err);
+    captureException(err, undefined, {
+      commandId: command.id,
+      agentId,
+      executionId: String((command.payload as Record<string, unknown> | null)?.executionId ?? ''),
+      phase,
+    });
+  }
+}
+
+async function handleSensitiveDataResult({ agentId, command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    const { handleSensitiveDataCommandResult } = await import('../routes/agents/helpers');
+    await handleSensitiveDataCommandResult(command, {
+      status: result.status,
+      exitCode: result.exitCode,
+      stdout,
+      stderr: result.stderr,
+      durationMs: result.durationMs,
+      error: result.error,
+    } as any);
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process sensitive data result for ${agentId}:`, err);
+  }
+}
+
+async function handleCisResult({ agentId, command, result, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    const { handleCisCommandResult } = await import('../routes/agents/helpers');
+    await handleCisCommandResult(command, {
+      status: result.status,
+      exitCode: result.exitCode,
+      stdout,
+      stderr: result.stderr,
+      durationMs: result.durationMs,
+      error: result.error,
+    } as any);
+  } catch (err) {
+    console.error(`[AgentWs] Failed to process CIS result for ${agentId}:`, err);
+  }
+}
+
+const peripheralPolicyResultV2Schema = z.object({
+  schemaVersion: z.literal(2),
+  phase: z.enum(['clear_legacy', 'enforce']),
+  revision: z.number().int().positive(),
+  digest: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  outcome: z.enum(['applied', 'rejected']),
+  reasonCode: z.enum([
+    'wrong_identity',
+    'lower_revision',
+    'revision_digest_conflict',
+    'malformed_digest',
+    'invalid_payload',
+    'detection_failed',
+    'enforcement_failed',
+    'persistence_failed',
+  ]).optional(),
+});
+
+async function handlePeripheralPolicyV2Result({
+  commandId,
+  result,
+  resolvedDeviceId,
+}: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const parsed = peripheralPolicyResultV2Schema.safeParse(result.result);
+  if (!parsed.success) {
+    console.warn(`[AgentWs] Ignoring malformed peripheral v2 result for command ${commandId}`);
+    return;
+  }
+  await handlePeripheralPolicyResultV2(resolvedDeviceId, commandId, parsed.data);
+}
+
+async function handlePamActuationV2Result({
+  agentId,
+  commandId,
+  result,
+  resolvedDeviceId,
+}: Parameters<CommandResultHandler>[0]): Promise<CommandResultHandlerOutcome> {
+  const parsed = pamAgentResultV2Schema.safeParse(result.result);
+  if (!parsed.success) {
+    console.warn(`[AgentWs] Ignoring malformed PAM v2 result for command ${commandId}`);
+    return;
+  }
+  const classification = await recordPamActuationResult({
+    agentId,
+    deviceId: resolvedDeviceId,
+    commandId,
+    result: parsed.data,
+  });
+  return { kind: 'pam', classification };
+}
+
+/**
+ * #3525 closer 2 of 5. The agent's `script_cancel` ack is the ONLY evidence
+ * that lets an execution terminalise as `cancelled`, so it must never be
+ * silently dropped on either transport. Imported dynamically for the same
+ * reason the route-level dispatch is: `scriptCancellation` pulls the scripts
+ * schema module into the graph, and several suites here partially mock
+ * `db/schema`.
+ */
+async function handleScriptCancelResult({ agentId, commandId, result }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  try {
+    const { applyScriptCancelAck } = await import('./scriptCancellation');
+    await applyScriptCancelAck({
+      // The transport-authorized id, never one read off the payload — same
+      // invariant as every other handler in this file.
+      cancelCommandId: commandId,
+      result: (result ?? null) as Record<string, unknown> | null,
+    });
+  } catch (err) {
+    // Both transports CAS the device_commands row to a terminal status BEFORE
+    // dispatching here, so the agent will never resend this ack — losing it
+    // leaves the execution in `cancelling` until the sweep (closer 5) gives up
+    // and records `unconfirmed`. Degraded but not stranded, so this is
+    // reported rather than rethrown; the tags are what let an on-call engineer
+    // find the affected row from the alert. Matches handleScriptResult.
+    console.error(`[AgentWs] Failed to apply script cancel ack for ${agentId}:`, err);
+    captureException(err, undefined, { commandId, agentId });
+  }
+}
+
+/**
+ * §13 row 9: filesystem_analysis results delivered over the WebSocket were
+ * never persisted. The scan is dispatched with `preferHeartbeat: false`, so the
+ * socket is the NORMAL leg — the handler existed only on the HTTP route
+ * (routes/agents/commands.ts:525), and a completed scan silently wrote nothing.
+ *
+ * The HTTP leg keeps its direct call: its registry dispatch is gated on the
+ * separate REGISTRY_DISPATCHED_COMMAND_TYPES allowlist, which this type is
+ * deliberately NOT added to, so nothing is saved twice.
+ *
+ * `orgId` is not a handler parameter, so it is read from the device the
+ * transport already authorized — the same shape handleDiscoveryResult uses for
+ * its job lookup.
+ */
+async function handleFilesystemAnalysisResult({
+  command,
+  result,
+  resolvedDeviceId,
+  commandId,
+}: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const { handleFilesystemAnalysisCommandResult } = await import('../routes/agents/helpers');
+  const [device] = await db
+    .select({ orgId: devices.orgId })
+    .from(devices)
+    .where(eq(devices.id, resolvedDeviceId))
+    .limit(1);
+  if (!device) {
+    const message = `[commandResultHandlers] filesystem_analysis result for unknown device ${resolvedDeviceId}`;
+    console.warn(message);
+    // A dropped scan result is silent data loss otherwise: nothing but this
+    // console line (which most deployments don't ship) ever showed it.
+    captureException(new Error(message), undefined, { commandId, resolvedDeviceId });
+    return;
+  }
+  await handleFilesystemAnalysisCommandResult(command, result, device.orgId);
+}
+
+/** Both transports authorize the command before invoking this registry. */
+async function handleFileDeleteResult({ command, commandId, result }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  const payload = command.payload as Record<string, unknown> | null;
+  if (typeof payload?.cleanupRunId !== 'string' || !payload.cleanupRunId) return;
+  const { recordLateCleanupResult } = await import('./filesystemCleanupRuns');
+  await recordLateCleanupResult({
+    cleanupRunId: payload.cleanupRunId,
+    commandId,
+    path: typeof payload.path === 'string' ? payload.path : '',
+    status: result.status,
+    error: result.error,
+    completedAt: new Date(),
+  });
+}
+
+/**
+ * Close an OS-native cleanup run (Disk Cleanup v2 §5.3).
+ *
+ * Registered HERE rather than mirrored off handleFilesystemAnalysisCommandResult
+ * in routes/agents/helpers.ts, which is dispatched only by the HTTP leg
+ * (routes/agents/commands.ts). agentWs.ts dispatches this registry and nothing
+ * else, so a run whose result arrives over the live socket would otherwise
+ * stay `running` until the stored run deadline — a failure that depends on
+ * which transport the device happened to be using.
+ */
+export async function handleSystemCleanupRunResult(
+  { command, result, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0],
+): Promise<void> {
+  const payload = (command.payload ?? {}) as Record<string, unknown>;
+  const runId = typeof payload.runId === 'string' ? payload.runId : null;
+  if (!runId || !PG_UUID_REGEX.test(runId)) {
+    console.warn(`[commandResultHandlers] system_cleanup_run ${command.id} has no usable runId; nothing to close`);
+    return;
+  }
+
+  const [run] = await db
+    .select({
+      id: deviceFilesystemCleanupRuns.id,
+      orgId: deviceFilesystemCleanupRuns.orgId,
+      requestedBy: deviceFilesystemCleanupRuns.requestedBy,
+      status: deviceFilesystemCleanupRuns.status,
+    })
+    .from(deviceFilesystemCleanupRuns)
+    .where(and(
+      eq(deviceFilesystemCleanupRuns.id, runId),
+      eq(deviceFilesystemCleanupRuns.deviceId, resolvedDeviceId),
+      eq(deviceFilesystemCleanupRuns.kind, 'system'),
+    ))
+    .limit(1);
+
+  if (!run) return;
+
+  // LATE RESULT (spec §13 #13). The run is already terminal — closed by the
+  // lazy timeout, by an org-move cancel, or by a racing duplicate. The answer
+  // is recorded, not applied: flipping a `failed` row back to `executed`
+  // would contradict what the operator was already told and what the audit
+  // already says, while dropping it silently would erase the only evidence
+  // that the work DID happen (which matters when the freed bytes show up on
+  // the next scan and nobody can explain them).
+  // ONE representation of late evidence, whichever window the race lands in
+  // (here, or below when the timeout commits between this read and the finish
+  // CAS): the poll projection reads `executedActions.actions` and
+  // `bytesReclaimed` for the run's own outcome, so late evidence must sit
+  // beside them under `lateResult`, never replace them.
+  const recordLateResult = (late: z.infer<typeof systemCleanupRunResultSchema> | null) =>
+    db
+      .update(deviceFilesystemCleanupRuns)
+      .set({
+        executedActions: sql`jsonb_set(
+          COALESCE(${deviceFilesystemCleanupRuns.executedActions}, '{}'::jsonb),
+          '{lateResult}',
+          ${JSON.stringify({
+            receivedAt: new Date().toISOString(),
+            commandId: command.id,
+            commandStatus: result.status,
+            ...(late ? { actions: late.actions, volumes: late.volumes, freedBytes: late.freedBytes } : { unreadable: true }),
+          })}::jsonb,
+          true
+        )`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(deviceFilesystemCleanupRuns.id, runId),
+        eq(deviceFilesystemCleanupRuns.deviceId, resolvedDeviceId),
+        ne(deviceFilesystemCleanupRuns.status, 'running'),
+      ));
+
+  if (run.status !== 'running') {
+    await recordLateResult(parseAgentJson(systemCleanupRunResultSchema, stdout));
+    console.warn(
+      `[commandResultHandlers] system_cleanup_run ${command.id} answered a ${run.status} run ${runId}; recorded as lateResult without changing its status`,
+    );
+    return;
+  }
+
+  const now = new Date();
+  const finish = async (fields: Record<string, unknown>) => {
+    const rows = await db
+      .update(deviceFilesystemCleanupRuns)
+      .set({ ...fields, updatedAt: now })
+      .where(and(
+        eq(deviceFilesystemCleanupRuns.id, runId),
+        eq(deviceFilesystemCleanupRuns.status, 'running'),
+      ))
+      .returning({ id: deviceFilesystemCleanupRuns.id });
+    return rows.length > 0;
+  };
+
+  if (result.status !== 'completed') {
+    const agentError = result.error ?? result.stderr ?? null;
+    await finish({
+      status: 'failed',
+      error: isUnknownCommandTypeError(agentError) ? AGENT_UPDATE_REQUIRED_ERROR : (agentError ?? 'the cleanup run failed'),
+    });
+    return;
+  }
+
+  const parsed = parseAgentJson(systemCleanupRunResultSchema, stdout);
+  if (!parsed) {
+    // Never `executed`: claiming a successful cleanup on output we could not
+    // read is the one outcome a tech cannot act on.
+    await finish({ status: 'failed', error: 'the agent returned an unreadable cleanup result' });
+    return;
+  }
+
+  const succeeded = parsed.actions.filter((action) => action.status === 'completed').length;
+  const status = succeeded > 0 ? 'executed' : 'failed';
+  const failedCount = parsed.actions.length - succeeded;
+
+  const finished = await finish({
+    status,
+    approvedAt: now,
+    bytesReclaimed: parsed.freedBytes,
+    executedActions: parsed,
+    error: failedCount > 0 ? `${failedCount} cleanup action(s) did not complete` : null,
+  });
+
+  if (!finished) {
+    // A timeout may win after the initial read. Preserve what ran without
+    // contradicting the terminal status already shown to the operator — in
+    // the SAME shape as the branch above.
+    await recordLateResult(parsed);
+  }
+
+  // No Hono context on this path, so the actor is attributed explicitly —
+  // the pattern jobs/quoteSendQueue.ts uses for the same reason.
+  writeAuditEvent(requestLikeFromSnapshot({}), {
+    orgId: run.orgId,
+    action: finished ? 'device.filesystem.system_cleanup.run' : 'device.filesystem.system_cleanup.late_result',
+    resourceType: 'device',
+    resourceId: resolvedDeviceId,
+    actorId: run.requestedBy,
+    details: {
+      cleanupRunId: runId,
+      commandId: command.id,
+      bytesReclaimed: parsed.freedBytes,
+      actions: parsed.actions.map((action) => ({ id: action.id, status: action.status })),
+      volumes: parsed.volumes,
+    },
+    // On `late_result` this describes the agent's answer, not the run's
+    // status, which whoever finalised the run already decided.
+    result: status === 'executed' ? 'success' : 'failure',
+  });
+}
+
+export const commandResultHandlers: Record<string, CommandResultHandler> = {
+  network_discovery: handleDiscoveryResult,
+  backup_verify: handleBackupVerificationResult,
+  backup_test_restore: handleBackupVerificationResult,
+  backup_restore: handleVmRestoreResult,
+  vm_restore_from_backup: handleVmRestoreResult,
+  vm_instant_boot: handleVmRestoreResult,
+  bmr_recover: handleVmRestoreResult,
+  bare_metal_rebuild: handleBareMetalRebuildResult,
+  hyperv_backup: handleProviderBackedBackupResult,
+  mssql_backup: handleProviderBackedBackupResult,
+  vault_sync: handleVaultSyncResult,
+  snmp_poll: handleSnmpPollResult,
+  script: handleScriptResult,
+  script_cancel: handleScriptCancelResult,
+  sensitive_data_scan: handleSensitiveDataResult,
+  encrypt_file: handleSensitiveDataResult,
+  secure_delete_file: handleSensitiveDataResult,
+  quarantine_file: handleSensitiveDataResult,
+  cis_benchmark: handleCisResult,
+  apply_cis_remediation: handleCisResult,
+  peripheral_policy_sync_v2: handlePeripheralPolicyV2Result,
+  pam_apply_v2: handlePamActuationV2Result,
+  pam_cleanup_v2: handlePamActuationV2Result,
+  install_patches: handleInstallPatchesResult,
+  system_cleanup_run: handleSystemCleanupRunResult,
+  filesystem_analysis: handleFilesystemAnalysisResult,
+  file_delete: handleFileDeleteResult,
+};

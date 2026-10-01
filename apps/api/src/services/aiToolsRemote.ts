@@ -1,0 +1,426 @@
+/**
+ * AI Remote Tools
+ *
+ * Tools for remote device control and session management.
+ * - take_screenshot (Tier 3): Capture a screenshot of the device screen (allowlist-gated)
+ * - analyze_screen (Tier 3): Take a screenshot and analyze what is visible (allowlist-gated)
+ * - computer_control (Tier 3): Control a device by sending mouse/keyboard input
+ * - list_remote_sessions (Tier 1): List active and recent remote sessions
+ * - create_remote_session (Tier 3): Create a new remote session
+ *
+ * Screen-capture tools are Tier 3 because screen contents are the most sensitive
+ * RMM output (credentials, customer data on display, etc). Tier 3 requires
+ * `ai:execute` scope AND, in production, an explicit entry in
+ * `MCP_EXECUTE_TOOL_ALLOWLIST`. See `apps/api/src/routes/mcpServer.ts`.
+ */
+
+import { db } from '../db';
+import { devices, remoteSessions } from '../db/schema';
+import { eq, and, desc, inArray, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { deviceScopeCondition, resolveSiteAllowedDeviceIds, SITE_SCOPE_EMPTY_NOTE } from './aiToolsSiteScope';
+import { getToolTimeout } from './toolTimeouts';
+import { createRemoteSession, RemoteSessionDeniedError } from './remoteSessionCreate';
+import { aiExecuteCommand } from './aiDispatch';
+
+type AiToolTier = 1 | 2 | 3 | 4;
+
+async function verifyDeviceAccess(
+  deviceId: string,
+  auth: AuthContext,
+  requireOnline = false
+): Promise<{ device: typeof devices.$inferSelect } | { error: string }> {
+  if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
+    return { error: 'Device not found or access denied' };
+  }
+  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const orgCond = auth.orgCondition(devices.orgId);
+  if (orgCond) conditions.push(orgCond);
+  const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
+  if (!device) return { error: 'Device not found or access denied' };
+  // Site axis: deny devices outside the caller's site allowlist (no-op when unrestricted).
+  if (auth.canAccessSite && !auth.canAccessSite(device.siteId)) {
+    return { error: 'Device not found or access denied' };
+  }
+  if (requireOnline && device.status !== 'online')
+    return {
+      error: `Device ${device.hostname} is not online (status: ${device.status}). This tool needs a live connection; to run when the device reconnects use the Run Script / deployment tools instead.`,
+    };
+  return { device };
+}
+
+export function registerRemoteTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+  // ============================================
+  // take_screenshot - Tier 3 (requires ai:execute + allowlist in prod)
+  // ============================================
+
+  registerTool({
+    tier: 3 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'device screen capture, screenshot of the current display',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'take_screenshot',
+      description: 'Capture a screenshot of the device screen. Returns the image for visual analysis. Use this when you need to see what is displayed on the device screen.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          monitor: { type: 'number', description: 'Monitor index to capture (default: 0 = primary)' }
+        },
+        required: ['deviceId']
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+
+      const access = await verifyDeviceAccess(deviceId, auth, true);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+
+      const result = await aiExecuteCommand(auth, 'take_screenshot', deviceId, 'take_screenshot', {
+        monitor: input.monitor ?? 0
+      }, { userId: auth.user.id, timeoutMs: getToolTimeout('take_screenshot') });
+
+      if (result.status !== 'completed') {
+        return JSON.stringify({ error: result.error || 'Screenshot capture failed' });
+      }
+
+      try {
+        const screenshotData = JSON.parse(result.stdout ?? '{}');
+        if (!screenshotData.imageBase64) {
+          console.error(`[AiTools] take_screenshot returned no imageBase64 data for device ${deviceId}`);
+          return JSON.stringify({ error: 'Screenshot captured but no image data returned by agent' });
+        }
+        return JSON.stringify({
+          imageBase64: screenshotData.imageBase64,
+          width: screenshotData.width,
+          height: screenshotData.height,
+          format: screenshotData.format,
+          sizeBytes: screenshotData.sizeBytes,
+          monitor: screenshotData.monitor,
+          capturedAt: screenshotData.capturedAt
+        });
+      } catch (err) {
+        const rawPreview = (result.stdout ?? '').slice(0, 200);
+        console.error(`[AiTools] Failed to parse take_screenshot response:`, err, 'Raw stdout preview:', rawPreview);
+        return JSON.stringify({ error: 'Failed to parse screenshot response' });
+      }
+    }
+  });
+
+  // ============================================
+  // analyze_screen - Tier 3 (requires ai:execute + allowlist in prod)
+  // ============================================
+
+  registerTool({
+    tier: 3 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'device screen analysis, visual troubleshooting of what the user sees',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'analyze_screen',
+      description: 'Take a screenshot and analyze what is visible on the device screen. Combines screenshot capture with device context for AI visual analysis. Use this for troubleshooting what the user sees.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          context: { type: 'string', description: 'What to look for or analyze on screen (e.g., "error dialogs", "performance issues", "application state")' },
+          monitor: { type: 'number', description: 'Monitor index to capture (default: 0 = primary)' }
+        },
+        required: ['deviceId']
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+
+      const access = await verifyDeviceAccess(deviceId, auth, true);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+
+      const result = await aiExecuteCommand(auth, 'analyze_screen', deviceId, 'take_screenshot', {
+        monitor: input.monitor ?? 0
+      }, { userId: auth.user.id, timeoutMs: getToolTimeout('analyze_screen') });
+
+      if (result.status !== 'completed') {
+        return JSON.stringify({ error: result.error || 'Screenshot capture failed' });
+      }
+
+      try {
+        const screenshotData = JSON.parse(result.stdout ?? '{}');
+        if (!screenshotData.imageBase64) {
+          console.error(`[AiTools] analyze_screen returned no imageBase64 data for device ${deviceId}`);
+          return JSON.stringify({ error: 'Screenshot captured but no image data returned by agent' });
+        }
+        return JSON.stringify({
+          imageBase64: screenshotData.imageBase64,
+          width: screenshotData.width,
+          height: screenshotData.height,
+          format: screenshotData.format,
+          sizeBytes: screenshotData.sizeBytes,
+          capturedAt: screenshotData.capturedAt,
+          analysisContext: input.context || 'general screen analysis',
+          device: {
+            id: access.device.id,
+            hostname: access.device.hostname,
+            osType: access.device.osType,
+            osVersion: access.device.osVersion,
+            status: access.device.status
+          }
+        });
+      } catch (err) {
+        const rawPreview = (result.stdout ?? '').slice(0, 200);
+        console.error(`[AiTools] Failed to parse analyze_screen response:`, err, 'Raw stdout preview:', rawPreview);
+        return JSON.stringify({ error: 'Failed to parse screenshot response' });
+      }
+    }
+  });
+
+  // ============================================
+  // computer_control - Tier 3 (requires approval)
+  // ============================================
+
+  registerTool({
+    tier: 3 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'mouse and keyboard: screenshot, click, double-click, move, scroll, press key, type',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'computer_control',
+      description: 'Control a device by sending mouse/keyboard input and capturing screenshots. Returns a screenshot after each action by default (configurable via captureAfter). Actions: screenshot, left_click, right_click, middle_click, double_click, mouse_move, scroll, key, type.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          action: {
+            type: 'string',
+            enum: ['screenshot', 'left_click', 'right_click', 'middle_click', 'double_click', 'mouse_move', 'scroll', 'key', 'type'],
+            description: 'The input action to perform'
+          },
+          x: { type: 'number', description: 'X coordinate (required for click/move/scroll actions)' },
+          y: { type: 'number', description: 'Y coordinate (required for click/move/scroll actions)' },
+          text: { type: 'string', description: 'Text to type (required for type action)' },
+          key: { type: 'string', description: 'Key to press (required for key action, e.g., "Enter", "Tab", "Escape")' },
+          modifiers: { type: 'array', items: { type: 'string', enum: ['ctrl', 'alt', 'shift', 'meta'] }, description: 'Modifier keys to hold during key press' },
+          scrollDelta: { type: 'number', description: 'Scroll amount (negative=up, positive=down)' },
+          monitor: { type: 'number', description: 'Monitor index to capture (default: 0)' },
+          captureAfter: { type: 'boolean', description: 'Whether to capture a screenshot after the action (default: true)' },
+          captureDelayMs: { type: 'number', description: 'Milliseconds to wait before capturing screenshot (default: 500, max: 3000)' }
+        },
+        required: ['deviceId', 'action']
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+
+      const access = await verifyDeviceAccess(deviceId, auth, true);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+
+      const result = await aiExecuteCommand(auth, 'computer_control', deviceId, 'computer_action', {
+        action: input.action,
+        x: input.x,
+        y: input.y,
+        text: input.text,
+        key: input.key,
+        modifiers: input.modifiers,
+        scrollDelta: input.scrollDelta,
+        monitor: input.monitor ?? 0,
+        captureAfter: input.captureAfter ?? true,
+        captureDelayMs: input.captureDelayMs ?? 500,
+      }, { userId: auth.user.id, timeoutMs: getToolTimeout('computer_control') });
+
+      if (result.status !== 'completed') {
+        return JSON.stringify({ error: result.error || 'Computer action failed' });
+      }
+
+      try {
+        const data = JSON.parse(result.stdout ?? '{}');
+        return JSON.stringify({
+          actionExecuted: data.actionExecuted,
+          imageBase64: data.screenshot?.imageBase64,
+          width: data.screenshot?.width,
+          height: data.screenshot?.height,
+          format: data.screenshot?.format,
+          sizeBytes: data.screenshot?.sizeBytes,
+          monitor: data.screenshot?.monitor,
+          capturedAt: data.screenshot?.capturedAt,
+          screenshotError: data.screenshotError || undefined,
+        });
+      } catch (err) {
+        const rawPreview = (result.stdout ?? '').slice(0, 200);
+        console.error(`[AiTools] Failed to parse computer_control response:`, err, 'Raw stdout preview:', rawPreview);
+        return JSON.stringify({ error: 'Failed to parse computer action response' });
+      }
+    }
+  });
+
+  // ============================================
+  // list_remote_sessions - Tier 1 (auto-execute)
+  // ============================================
+
+  registerTool({
+    tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'remote sessions, active and recent terminals, desktops and file transfers',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'list_remote_sessions',
+      description: 'List active and recent remote sessions (terminal, desktop, file transfer).',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          status: {
+            type: 'string',
+            enum: ['pending', 'connecting', 'active', 'disconnected', 'failed'],
+            description: 'Filter by session status',
+          },
+          type: {
+            type: 'string',
+            enum: ['terminal', 'desktop', 'file_transfer'],
+            description: 'Filter by session type',
+          },
+          deviceId: {
+            type: 'string',
+            description: 'Filter by device UUID',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default 25, max 100)',
+          },
+        },
+      },
+    },
+    handler: async (input, auth) => {
+      const limit = Math.min((input.limit as number) || 25, 100);
+
+      const conditions: SQL[] = [];
+      const orgCond = auth.orgCondition(devices.orgId);
+      if (orgCond) conditions.push(orgCond);
+
+      // Per-user ownership: a non-system caller may only see their OWN sessions
+      // (mirrors the REST GET /remote/sessions gate). System scope is unrestricted.
+      if (auth.scope !== 'system') {
+        conditions.push(eq(remoteSessions.userId, auth.user.id));
+      }
+
+      // Exact-device axis: applies on its own, with no site axis in play. A
+      // device-LESS analysis run carries only `allowedDeviceIds`, so the
+      // site-gated block below never runs for it and the list would otherwise be
+      // org-wide (#6096 RC3). No-op for an unrestricted caller.
+      const deviceCond = deviceScopeCondition(auth, remoteSessions.deviceId);
+      if (deviceCond) conditions.push(deviceCond);
+
+      // Site axis (app-layer only; RLS does NOT enforce it): a site-restricted
+      // caller may only list sessions for devices in their allowed sites. Narrow
+      // to that device set; short-circuit to empty when there are none in scope.
+      // A site-restricted caller is org-scoped, so resolve against auth.orgId;
+      // fail closed to empty if it is somehow absent.
+      if (auth.allowedSiteIds) {
+        if (!auth.orgId) {
+          return JSON.stringify({ sessions: [], total: 0, note: SITE_SCOPE_EMPTY_NOTE });
+        }
+        const allowed = await resolveSiteAllowedDeviceIds(auth.orgId, auth);
+        if (!allowed || allowed.length === 0) {
+          return JSON.stringify({ sessions: [], total: 0, note: SITE_SCOPE_EMPTY_NOTE });
+        }
+        conditions.push(inArray(remoteSessions.deviceId, allowed));
+      }
+
+      if (input.status) {
+        conditions.push(eq(remoteSessions.status, input.status as typeof remoteSessions.status.enumValues[number]));
+      }
+      if (input.type) {
+        conditions.push(eq(remoteSessions.type, input.type as typeof remoteSessions.type.enumValues[number]));
+      }
+      if (input.deviceId) {
+        conditions.push(eq(remoteSessions.deviceId, input.deviceId as string));
+      }
+
+      const sessions = await db
+        .select({
+          id: remoteSessions.id,
+          deviceHostname: devices.hostname,
+          type: remoteSessions.type,
+          status: remoteSessions.status,
+          startedAt: remoteSessions.startedAt,
+          endedAt: remoteSessions.endedAt,
+          durationSeconds: remoteSessions.durationSeconds,
+          bytesTransferred: remoteSessions.bytesTransferred,
+        })
+        .from(remoteSessions)
+        .innerJoin(devices, eq(remoteSessions.deviceId, devices.id))
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(remoteSessions.createdAt))
+        .limit(limit);
+
+      return JSON.stringify({ sessions, total: sessions.length }, (_, v) => typeof v === 'bigint' ? Number(v) : v);
+    },
+  });
+
+  // ============================================
+  // create_remote_session - Tier 3 (requires approval)
+  // ============================================
+
+  registerTool({
+    tier: 3 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'remote access: create a terminal or file transfer session',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'create_remote_session',
+      description: 'Create a new remote terminal or file transfer session to a device.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: {
+            type: 'string',
+            description: 'Device UUID to connect to',
+          },
+          type: {
+            type: 'string',
+            enum: ['terminal', 'file_transfer'],
+            description: 'Session type',
+          },
+        },
+        required: ['deviceId', 'type'],
+      },
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const sessionType = input.type as string;
+
+      // Verify device access and require online status
+      const access = await verifyDeviceAccess(deviceId, auth, true);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+
+      // Insert new remote session
+      let session: { id: string; status: string };
+      try {
+        session = await createRemoteSession('remote', {
+          deviceId,
+          orgId: access.device.orgId,
+          userId: auth.user.id,
+          type: sessionType as 'terminal' | 'file_transfer',
+        });
+      } catch (e) {
+        if (e instanceof RemoteSessionDeniedError) {
+          return JSON.stringify({
+            error: e.code,
+            message: 'Remote control is not available until this account is verified.',
+          });
+        }
+        throw e;
+      }
+
+      return JSON.stringify({
+        id: session.id,
+        status: session.status,
+        deviceId,
+        type: sessionType,
+      });
+    },
+  });
+}

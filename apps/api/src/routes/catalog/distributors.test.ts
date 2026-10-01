@@ -1,0 +1,396 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+
+// ── Pax8 service mocks ─────────────────────────────────────────────────────────
+
+const pax8Svc = vi.hoisted(() => ({
+  getPax8CatalogStatus: vi.fn(),
+  searchPax8Products: vi.fn(),
+  getPax8ProductPricing: vi.fn(),
+  importPax8CatalogItem: vi.fn(),
+}));
+
+const { Pax8CatalogError } = vi.hoisted(() => {
+  class Pax8CatalogError extends Error {
+    constructor(public override message: string, public status = 400, public code?: string) { super(message); }
+  }
+  return { Pax8CatalogError };
+});
+
+vi.mock('../../services/pax8CatalogService', () => ({
+  ...pax8Svc,
+  Pax8CatalogError,
+}));
+
+// ── Auth middleware mock — requireMfa uses a gate so individual tests can block ─
+
+const mfaGate = vi.hoisted(() => ({ block: false }));
+
+vi.mock('../../middleware/auth', () => ({
+  requireScope: () => async (_c: any, next: any) => next(),
+  requirePermission: () => async (_c: any, next: any) => next(),
+  requireMfa: () => async (c: any, next: any) => {
+    if (mfaGate.block) return c.json({ error: 'MFA required' }, 403);
+    return next();
+  },
+  // #2190 — the import routes rebuild a DbAccessContext from `auth` since they
+  // opt out of the ambient request transaction; a trivial pass-through is
+  // enough here since the underlying import services are themselves mocked.
+  dbAccessContextFromAuth: (auth: any) => ({
+    scope: auth.scope,
+    orgId: auth.orgId,
+    accessibleOrgIds: auth.accessibleOrgIds,
+    accessiblePartnerIds: auth.scope === 'partner' && auth.partnerId ? [auth.partnerId] : null,
+    userId: auth.user?.id ?? null,
+    currentPartnerId: auth.partnerId ?? null,
+  }),
+}));
+
+vi.mock('../../services/permissions', () => ({
+  PERMISSIONS: {
+    CATALOG_READ: { resource: 'catalog', action: 'read' },
+    CATALOG_WRITE: { resource: 'catalog', action: 'write' },
+  },
+}));
+
+vi.mock('../../services/ssrfGuard', () => ({
+  checkSsrfSafe: () => ({ ok: true }),
+}));
+
+vi.mock('../../services/catalogService', () => ({
+  CatalogServiceError: class CatalogServiceError extends Error {
+    constructor(public override message: string, public status = 400, public code?: string) { super(message); }
+  },
+}));
+
+vi.mock('./catalog', () => ({
+  catalogActorFrom: (_c: any) => ({ userId: 'u1', partnerId: 'p1', orgId: null, accessibleOrgIds: null }),
+}));
+
+// Stub sibling distributor services (also imported by distributors.ts)
+vi.mock('../../services/tdSynnexDigitalBridge', () => ({
+  getTdSynnexDigitalBridgeStatus: vi.fn(),
+  saveTdSynnexDigitalBridgeConfig: vi.fn(),
+  testTdSynnexDigitalBridgeConnection: vi.fn(),
+  searchTdSynnexProducts: vi.fn(),
+  importTdSynnexCatalogItem: vi.fn(),
+  TdSynnexDigitalBridgeError: class TdSynnexDigitalBridgeError extends Error {
+    constructor(public override message: string, public status = 400, public code?: string) { super(message); }
+  },
+}));
+
+vi.mock('../../services/tdSynnexEcExpress', () => ({
+  REGION_ENDPOINTS: { US: 'https://ws.synnex.com/webservice/pnaserviceV05' },
+  getEcExpressStatus: vi.fn(),
+  saveEcExpressConfig: vi.fn(),
+  testEcExpressConnection: vi.fn(),
+  lookupEcExpressProducts: vi.fn(),
+  importEcExpressCatalogItem: vi.fn(),
+  TdSynnexEcExpressError: class TdSynnexEcExpressError extends Error {
+    public status: number;
+    constructor(public override message: string, public code = 'EC_PROVIDER_ERROR') {
+      super(message);
+      const statusMap: Record<string, number> = {
+        EC_AUTH_FAILED: 422, EC_NOT_CONFIGURED: 404, EC_NO_RESULTS: 404,
+        EC_DUPLICATE_SKU: 409, EC_PROVIDER_ERROR: 502, EC_PARTNER_REQUIRED: 400,
+        EC_DISABLED: 400, EC_CREDENTIALS_INVALID: 400, EC_UNSUPPORTED_REGION: 400,
+      };
+      this.status = statusMap[code] ?? 400;
+    }
+  },
+}));
+
+import { importTdSynnexCatalogItem } from '../../services/tdSynnexDigitalBridge';
+import { importEcExpressCatalogItem } from '../../services/tdSynnexEcExpress';
+import { catalogDistributorRoutes } from './distributors';
+
+const importTdSynnexCatalogItemMock = vi.mocked(importTdSynnexCatalogItem);
+const importEcExpressCatalogItemMock = vi.mocked(importEcExpressCatalogItem);
+
+function app() {
+  const a = new Hono();
+  a.use('*', async (c: any, next: any) => { c.set('auth', { user: { id: 'u1' }, partnerId: 'p1', orgId: null, scope: 'partner', accessibleOrgIds: null }); await next(); });
+  a.route('/', catalogDistributorRoutes);
+  return a;
+}
+
+beforeEach(() => {
+  Object.values(pax8Svc).forEach((f) => f.mockReset());
+  importTdSynnexCatalogItemMock.mockReset();
+  importEcExpressCatalogItemMock.mockReset();
+  mfaGate.block = false;
+});
+
+// ── GET /distributors/pax8/status ─────────────────────────────────────────────
+
+describe('GET /distributors/pax8/status', () => {
+  it('returns configured/enabled flags', async () => {
+    pax8Svc.getPax8CatalogStatus.mockResolvedValue({ configured: true, enabled: true });
+    const res = await app().request('/distributors/pax8/status');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.configured).toBe(true);
+    expect(pax8Svc.getPax8CatalogStatus).toHaveBeenCalledOnce();
+  });
+
+  it('maps Pax8CatalogError to its status code', async () => {
+    pax8Svc.getPax8CatalogStatus.mockRejectedValue(
+      new Pax8CatalogError('Pax8 is not connected', 400, 'PAX8_NOT_CONFIGURED'),
+    );
+    const res = await app().request('/distributors/pax8/status');
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('PAX8_NOT_CONFIGURED');
+  });
+});
+
+// ── GET /distributors/pax8/search ─────────────────────────────────────────────
+
+describe('GET /distributors/pax8/search', () => {
+  it('returns matched products', async () => {
+    pax8Svc.searchPax8Products.mockResolvedValue([{
+      pax8ProductId: 'p1', name: 'Microsoft 365', vendorName: 'Microsoft',
+      vendorSku: 'CFQ7', shortDescription: null, raw: {},
+    }]);
+    const res = await app().request('/distributors/pax8/search?q=micro&limit=20');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toHaveLength(1);
+    expect(pax8Svc.searchPax8Products).toHaveBeenCalledWith(
+      { q: 'micro', limit: 20 },
+      expect.anything(),
+    );
+  });
+
+  it('rejects q shorter than 2 chars (400)', async () => {
+    const res = await app().request('/distributors/pax8/search?q=m');
+    expect(res.status).toBe(400);
+    expect(pax8Svc.searchPax8Products).not.toHaveBeenCalled();
+  });
+
+  it('forwards optional vendor filter', async () => {
+    pax8Svc.searchPax8Products.mockResolvedValue([]);
+    const res = await app().request('/distributors/pax8/search?q=office&vendor=Microsoft');
+    expect(res.status).toBe(200);
+    expect(pax8Svc.searchPax8Products).toHaveBeenCalledWith(
+      { q: 'office', vendor: 'Microsoft', limit: 20 },
+      expect.anything(),
+    );
+  });
+});
+
+// ── GET /distributors/pax8/pricing ────────────────────────────────────────────
+
+describe('GET /distributors/pax8/pricing', () => {
+  it('returns pricing tiers for a product', async () => {
+    pax8Svc.getPax8ProductPricing.mockResolvedValue([{ priceRangeStart: 1, partnerBuyRate: '10.00' }]);
+    const res = await app().request('/distributors/pax8/pricing?productId=prod-abc-123');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toHaveLength(1);
+    expect(pax8Svc.getPax8ProductPricing).toHaveBeenCalledWith('prod-abc-123', expect.anything());
+  });
+
+  it('rejects a missing productId (400)', async () => {
+    const res = await app().request('/distributors/pax8/pricing');
+    expect(res.status).toBe(400);
+    expect(pax8Svc.getPax8ProductPricing).not.toHaveBeenCalled();
+  });
+});
+
+// ── POST /distributors/pax8/import ────────────────────────────────────────────
+
+const validProduct = {
+  source: 'pax8',
+  pax8ProductId: 'prod-123',
+  name: 'Microsoft 365 Business Basic',
+  vendorName: 'Microsoft',
+  vendorSku: 'CFQ7TTC0LH18',
+  commitmentTerm: 'P1Y',
+  billingTerm: 'Annual',
+  partnerBuyRate: '6.00',
+  currency: 'USD',
+  raw: {},
+};
+
+const validTdSynnexProduct = {
+  source: 'td_synnex_digital_bridge',
+  sourceProductId: 'td-product-123',
+  sku: 'TD-SKU-123',
+  manufacturerPartNumber: 'TD-MPN-123',
+  vendor: 'TD Vendor',
+  name: 'TD SYNNEX Product',
+  description: null,
+  cost: '10.00',
+  currency: 'USD',
+  availability: 12,
+  warehouses: [],
+  raw: {},
+  lastRefreshedAt: '2026-08-22T00:00:00.000Z',
+};
+
+const validEcExpressProduct = {
+  source: 'td_synnex_ec_express',
+  synnexSku: 'EC-SKU-123',
+  mfgPartNo: 'EC-MPN-123',
+  manufacturer: 'EC Vendor',
+  status: 'Active',
+  name: 'EC Express Product',
+  description: null,
+  currency: 'USD',
+  cost: 10,
+  msrp: 12,
+  discount: null,
+  totalQty: 8,
+  weight: null,
+  parcelShippable: null,
+  warehouses: [],
+  raw: {},
+};
+
+async function requestImport(path: string, product: Record<string, unknown>) {
+  return app().request(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ product, item: { name: 'Imported product', unitPrice: 12 } }),
+  });
+}
+
+describe.each([
+  {
+    feed: 'TD SYNNEX Digital Bridge',
+    path: '/distributors/td-synnex/import',
+    product: validTdSynnexProduct,
+    importMock: importTdSynnexCatalogItemMock,
+  },
+  {
+    feed: 'TD SYNNEX EC Express',
+    path: '/distributors/td-synnex-ec/import',
+    product: validEcExpressProduct,
+    importMock: importEcExpressCatalogItemMock,
+  },
+  {
+    feed: 'Pax8',
+    path: '/distributors/pax8/import',
+    product: validProduct,
+    importMock: pax8Svc.importPax8CatalogItem,
+  },
+])('$feed import currency validation', ({ path, product, importMock }) => {
+  it('normalizes a lowercase ISO currency code before calling the import service', async () => {
+    const res = await requestImport(path, { ...product, currency: 'cad' });
+
+    expect(res.status).toBe(200);
+    expect(importMock).toHaveBeenCalledOnce();
+    expect(importMock.mock.calls[0]?.[0]).toMatchObject({
+      product: expect.objectContaining({ currency: 'CAD' }),
+    });
+  });
+
+  it('normalizes item.sellCurrency and passes it to the import service', async () => {
+    const res = await app().request(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ product, item: { name: 'Imported product', unitPrice: 12, sellCurrency: 'eur' } }),
+    });
+    expect(res.status).toBe(200);
+    expect(importMock.mock.calls[0]?.[0]).toMatchObject({ item: expect.objectContaining({ sellCurrency: 'EUR' }) });
+  });
+
+  it('rejects a non-ISO item.sellCurrency', async () => {
+    const res = await app().request(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ product, item: { name: 'Imported product', unitPrice: 12, sellCurrency: 'EU' } }),
+    });
+    expect(res.status).toBe(400);
+    expect(importMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-ISO currency code', async () => {
+    const res = await requestImport(path, { ...product, currency: 'CA$' });
+
+    expect(res.status).toBe(400);
+    expect(importMock).not.toHaveBeenCalled();
+  });
+
+  it('accepts a null currency', async () => {
+    const res = await requestImport(path, { ...product, currency: null });
+
+    expect(res.status).toBe(200);
+    expect(importMock).toHaveBeenCalledOnce();
+    expect(importMock.mock.calls[0]?.[0]).toMatchObject({
+      product: expect.objectContaining({ currency: null }),
+    });
+  });
+});
+
+describe('POST /distributors/pax8/import', () => {
+  it('creates a catalog item from a Pax8 product', async () => {
+    pax8Svc.importPax8CatalogItem.mockResolvedValue({ id: 'ci-1', name: 'Microsoft 365 Business Basic' });
+    const res = await app().request('/distributors/pax8/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        product: validProduct,
+        item: { name: 'Microsoft 365 Business Basic', unitPrice: 8.00 },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.id).toBe('ci-1');
+    expect(pax8Svc.importPax8CatalogItem).toHaveBeenCalledOnce();
+    // #2190 — a third arg (the rebuilt DbAccessContext) is passed alongside actor,
+    // since the route opts out of the ambient request transaction.
+    const call = pax8Svc.importPax8CatalogItem.mock.calls[0]!;
+    expect(call).toHaveLength(3);
+    expect(call[2]).toMatchObject({ scope: 'partner', currentPartnerId: 'p1' });
+  });
+
+  it('requires MFA — returns 403 without it', async () => {
+    mfaGate.block = true;
+    const res = await app().request('/distributors/pax8/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ product: validProduct, item: { name: 'X', unitPrice: 1 } }),
+    });
+    expect(res.status).toBe(403);
+    expect(pax8Svc.importPax8CatalogItem).not.toHaveBeenCalled();
+  });
+
+  it('rejects an oversized raw payload (400)', async () => {
+    const res = await app().request('/distributors/pax8/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        product: { ...validProduct, raw: { blob: 'x'.repeat(200_001) } },
+        item: { name: 'X', unitPrice: 1 },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(pax8Svc.importPax8CatalogItem).not.toHaveBeenCalled();
+  });
+
+  it('rejects a negative unitPrice (400)', async () => {
+    const res = await app().request('/distributors/pax8/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ product: validProduct, item: { name: 'X', unitPrice: -1 } }),
+    });
+    expect(res.status).toBe(400);
+    expect(pax8Svc.importPax8CatalogItem).not.toHaveBeenCalled();
+  });
+
+  it('maps Pax8CatalogError to its status code', async () => {
+    pax8Svc.importPax8CatalogItem.mockRejectedValue(
+      new Pax8CatalogError('Pax8 is not connected', 400, 'PAX8_NOT_CONFIGURED'),
+    );
+    const res = await app().request('/distributors/pax8/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ product: validProduct, item: { name: 'M365', unitPrice: 8 } }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('PAX8_NOT_CONFIGURED');
+  });
+});

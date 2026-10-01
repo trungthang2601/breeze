@@ -1,0 +1,336 @@
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { zValidator } from '../../lib/validation';
+import { authMiddleware, requireScope } from '../../middleware/auth';
+import { executeCommand, CommandTypes } from '../../services/commandQueue';
+import { createAuditLog } from '../../services/auditService';
+import { getTrustedClientIpOrUndefined } from '../../services/clientIp';
+import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED, getPagination, asRecord, asString } from './helpers';
+import { deviceIdParamSchema, serviceNameParamSchema, paginationQuerySchema } from './schemas';
+import {
+  isCommandFailure,
+  buildCommandFailureResponse,
+  auditErrorMessage,
+} from './fileBrowserHelpers';
+import type { ServiceInfo } from './types';
+
+const serviceListQuerySchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  search: z.string().max(500).optional(),
+  status: z.string().max(100).optional(),
+});
+
+function normalizeServiceStatus(value?: string): ServiceInfo['status'] {
+  switch ((value ?? '').toLowerCase()) {
+    case 'running':
+      return 'running';
+    case 'stopped':
+      return 'stopped';
+    case 'paused':
+      return 'paused';
+    case 'startpending':
+    case 'starting':
+    case 'continuepending':
+      return 'starting';
+    case 'stoppending':
+    case 'stopping':
+      return 'stopping';
+    default:
+      return 'stopped';
+  }
+}
+
+function normalizeServiceStartType(value?: string): ServiceInfo['startType'] {
+  const raw = (value ?? '').toLowerCase();
+  if (raw.includes('delayed')) return 'auto_delayed';
+  if (raw.includes('automatic') || raw === 'enabled' || raw === 'auto') return 'auto';
+  if (raw.includes('disabled') || raw === 'masked') return 'disabled';
+  if (raw.includes('manual')) return 'manual';
+  return 'manual';
+}
+
+function mapServiceFromAgent(service: unknown): ServiceInfo | null {
+  const record = asRecord(service);
+  if (!record) return null;
+
+  const name = asString(record.name);
+  if (!name) return null;
+
+  const displayName = asString(record.displayName) ?? name;
+  const status = normalizeServiceStatus(asString(record.status));
+  const startType = normalizeServiceStartType(asString(record.startType) ?? asString(record.startupType));
+  const account = asString(record.account) ?? '';
+  const description = asString(record.description) ?? '';
+  const path = asString(record.path) ?? '';
+  const dependencies = Array.isArray(record.dependencies)
+    ? record.dependencies.map((value) => String(value))
+    : [];
+
+  return {
+    name,
+    displayName,
+    status,
+    startType,
+    account,
+    description,
+    path,
+    dependencies
+  };
+}
+
+export const servicesRoutes = new Hono();
+
+// GET /devices/:deviceId/services - List all services
+servicesRoutes.get(
+  '/devices/:deviceId/services',
+  authMiddleware,
+  requireScope('system', 'partner', 'organization'),
+  zValidator('param', deviceIdParamSchema),
+  zValidator('query', serviceListQuerySchema),
+  async (c) => {
+    const { deviceId } = c.req.valid('param');
+    const auth = c.get('auth');
+
+    const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
+    if (device === SITE_ACCESS_DENIED) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if (!device) {
+      return c.json({ error: 'Device not found or access denied' }, 404);
+    }
+
+    const query = c.req.valid('query');
+    // The Services UI paginates client-side, so it fetches the list in one
+    // request with a high limit. Allow up to 500 (the agent's max accepted page
+    // size, matching the Processes tab) instead of the default cap of 100 — this
+    // covers realistic Windows service counts. The agent hard-caps the full list
+    // at 512 (maxServiceListEntries), so devices with >500 services are not paged
+    // through here; 500 is intentionally the single-request ceiling.
+    const { page, limit } = getPagination(query, 500);
+    const search = query.search || '';
+    const status = query.status || '';
+
+    const result = await executeCommand(deviceId, CommandTypes.LIST_SERVICES, {
+      page,
+      limit,
+      search,
+      status
+    }, { userId: auth.user?.id, timeoutMs: 30000 });
+
+    if (isCommandFailure(result)) {
+      const failure = buildCommandFailureResponse(result, 'Failed to get services');
+      return c.json(failure.body, failure.status);
+    }
+
+    try {
+      const data = JSON.parse(result.stdout || '{}');
+      const services = (Array.isArray(data.services) ? data.services : [])
+        .map(mapServiceFromAgent)
+        .filter((service: ServiceInfo | null): service is ServiceInfo => Boolean(service));
+      return c.json({
+        data: services,
+        meta: {
+          total: typeof data.total === 'number' ? data.total : services.length,
+          page: data.page || page,
+          limit: data.limit || limit,
+          totalPages: data.totalPages || 1
+        }
+      });
+    } catch (parseError) {
+      console.error('Failed to parse agent response for service listing:', parseError);
+      // 500, not 502: Cloudflare replaces an origin 502 body with its own
+      // branded page, blanking this message on hosted deployments.
+      return c.json({ error: 'Failed to parse agent response for service listing', code: 'invalid_agent_response' }, 500);
+    }
+  }
+);
+
+// GET /devices/:deviceId/services/:name - Get service details
+servicesRoutes.get(
+  '/devices/:deviceId/services/:name',
+  authMiddleware,
+  requireScope('system', 'partner', 'organization'),
+  zValidator('param', serviceNameParamSchema),
+  async (c) => {
+    const { deviceId, name } = c.req.valid('param');
+    const auth = c.get('auth');
+
+    const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
+    if (device === SITE_ACCESS_DENIED) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if (!device) {
+      return c.json({ error: 'Device not found or access denied' }, 404);
+    }
+
+    const result = await executeCommand(deviceId, CommandTypes.GET_SERVICE, {
+      name
+    }, { userId: auth.user?.id, timeoutMs: 30000 });
+
+    if (isCommandFailure(result)) {
+      const failure = buildCommandFailureResponse(result, 'Failed to get service');
+      return c.json(failure.body, failure.status);
+    }
+
+    try {
+      const payload = JSON.parse(result.stdout || '{}');
+      const service = mapServiceFromAgent(payload);
+      if (!service) {
+        // 500, not 502: Cloudflare replaces an origin 502 body with its own
+        // branded page, blanking this message on hosted deployments.
+        return c.json({ error: 'Invalid service payload from agent', code: 'invalid_agent_response' }, 500);
+      }
+      return c.json({ data: service });
+    } catch (error) {
+      console.error('Failed to parse agent response for service details:', error);
+      // 500, not 502: Cloudflare replaces an origin 502 body with its own
+      // branded page, blanking this message on hosted deployments.
+      return c.json({ error: 'Failed to parse agent response for service details', code: 'invalid_agent_response' }, 500);
+    }
+  }
+);
+
+// POST /devices/:deviceId/services/:name/start - Start service
+servicesRoutes.post(
+  '/devices/:deviceId/services/:name/start',
+  authMiddleware,
+  requireScope('system', 'partner', 'organization'),
+  zValidator('param', serviceNameParamSchema),
+  async (c) => {
+    const { deviceId, name } = c.req.valid('param');
+    const auth = c.get('auth');
+
+    const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
+    if (device === SITE_ACCESS_DENIED) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if (!device) {
+      return c.json({ error: 'Device not found or access denied' }, 404);
+    }
+
+    const result = await executeCommand(deviceId, CommandTypes.START_SERVICE, {
+      name
+    }, { userId: auth.user?.id, timeoutMs: 30000 });
+
+    await createAuditLog({
+      orgId: device.orgId,
+      actorId: auth.user.id,
+      actorEmail: auth.user.email,
+      action: 'start_service',
+      resourceType: 'device',
+      resourceId: deviceId,
+      resourceName: device.hostname ?? device.id,
+      details: { name },
+      ipAddress: getTrustedClientIpOrUndefined(c),
+      result: isCommandFailure(result) ? 'failure' : 'success',
+      errorMessage: auditErrorMessage(result)
+    });
+
+    if (isCommandFailure(result)) {
+      const failure = buildCommandFailureResponse(result, 'Failed to start service', { mutating: true });
+      return c.json(failure.body, failure.status);
+    }
+
+    return c.json({
+      success: true,
+      message: `Service ${name} started successfully`
+    });
+  }
+);
+
+// POST /devices/:deviceId/services/:name/stop - Stop service
+servicesRoutes.post(
+  '/devices/:deviceId/services/:name/stop',
+  authMiddleware,
+  requireScope('system', 'partner', 'organization'),
+  zValidator('param', serviceNameParamSchema),
+  async (c) => {
+    const { deviceId, name } = c.req.valid('param');
+    const auth = c.get('auth');
+
+    const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
+    if (device === SITE_ACCESS_DENIED) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if (!device) {
+      return c.json({ error: 'Device not found or access denied' }, 404);
+    }
+
+    const result = await executeCommand(deviceId, CommandTypes.STOP_SERVICE, {
+      name
+    }, { userId: auth.user?.id, timeoutMs: 30000 });
+
+    await createAuditLog({
+      orgId: device.orgId,
+      actorId: auth.user.id,
+      actorEmail: auth.user.email,
+      action: 'stop_service',
+      resourceType: 'device',
+      resourceId: deviceId,
+      resourceName: device.hostname ?? device.id,
+      details: { name },
+      ipAddress: getTrustedClientIpOrUndefined(c),
+      result: isCommandFailure(result) ? 'failure' : 'success',
+      errorMessage: auditErrorMessage(result)
+    });
+
+    if (isCommandFailure(result)) {
+      const failure = buildCommandFailureResponse(result, 'Failed to stop service', { mutating: true });
+      return c.json(failure.body, failure.status);
+    }
+
+    return c.json({
+      success: true,
+      message: `Service ${name} stopped successfully`
+    });
+  }
+);
+
+// POST /devices/:deviceId/services/:name/restart - Restart service
+servicesRoutes.post(
+  '/devices/:deviceId/services/:name/restart',
+  authMiddleware,
+  requireScope('system', 'partner', 'organization'),
+  zValidator('param', serviceNameParamSchema),
+  async (c) => {
+    const { deviceId, name } = c.req.valid('param');
+    const auth = c.get('auth');
+
+    const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
+    if (device === SITE_ACCESS_DENIED) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if (!device) {
+      return c.json({ error: 'Device not found or access denied' }, 404);
+    }
+
+    const result = await executeCommand(deviceId, CommandTypes.RESTART_SERVICE, {
+      name
+    }, { userId: auth.user?.id, timeoutMs: 30000 });
+
+    await createAuditLog({
+      orgId: device.orgId,
+      actorId: auth.user.id,
+      actorEmail: auth.user.email,
+      action: 'restart_service',
+      resourceType: 'device',
+      resourceId: deviceId,
+      resourceName: device.hostname ?? device.id,
+      details: { name },
+      ipAddress: getTrustedClientIpOrUndefined(c),
+      result: isCommandFailure(result) ? 'failure' : 'success',
+      errorMessage: auditErrorMessage(result)
+    });
+
+    if (isCommandFailure(result)) {
+      const failure = buildCommandFailureResponse(result, 'Failed to restart service', { mutating: true });
+      return c.json(failure.body, failure.status);
+    }
+
+    return c.json({
+      success: true,
+      message: `Service ${name} restarted successfully`
+    });
+  }
+);

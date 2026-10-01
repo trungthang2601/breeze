@@ -1,0 +1,133 @@
+import { Hono } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { z } from 'zod';
+import { and, count, eq, isNull } from 'drizzle-orm';
+import { db } from '../../db';
+import { ticketParts, timeEntries } from '../../db/schema';
+import { requireScope, requirePermission } from '../../middleware/auth';
+import { PERMISSIONS } from '../../services/permissions';
+import { ticketPartSchema, updateTicketPartSchema, listTimeEntriesQuerySchema } from '@breeze/shared';
+
+const idParam = z.object({ id: z.string().guid() });
+const partIdParam = z.object({ id: z.string().guid() });
+import {
+  addTicketPart, updateTicketPart, deleteTicketPart,
+  listTimeEntries, getTicketBillingSummary, getTicketTimeEntryDefaults, TimeEntryServiceError
+} from '../../services/timeEntryService';
+import { getScopedTicketOr404 } from './tickets';
+import { timeActorFrom } from '../timeEntries/timeEntries';
+
+// Internal-only (spec D4): parts + per-ticket time data never reach org scope.
+export const ticketPartsRoutes = new Hono();
+
+const scopes = requireScope('partner', 'system');
+const readPerm = requirePermission(PERMISSIONS.TICKETS_READ.resource, PERMISSIONS.TICKETS_READ.action);
+const writePerm = requirePermission(PERMISSIONS.TICKETS_WRITE.resource, PERMISSIONS.TICKETS_WRITE.action);
+
+function handleServiceError(c: { json: (b: unknown, s: number) => Response }, err: unknown): Response {
+  if (err instanceof TimeEntryServiceError) {
+    return c.json({ error: err.message, code: err.code }, err.status);
+  }
+  throw err;
+}
+
+// /parts/:id BEFORE the hub's /:id routes — this router mounts first in index.ts.
+ticketPartsRoutes.patch('/parts/:id', scopes, writePerm, zValidator('param', partIdParam), zValidator('json', updateTicketPartSchema), async (c) => {
+  const auth = c.get('auth');
+  const rows = await db.select().from(ticketParts).where(eq(ticketParts.id, c.req.valid('param').id)).limit(1);
+  const part = rows[0];
+  if (!part || !(await getScopedTicketOr404(auth, part.ticketId))) {
+    return c.json({ error: 'Part not found' }, 404);
+  }
+  try {
+    const updated = await updateTicketPart(part.id, c.req.valid('json'), timeActorFrom(c));
+    return c.json({ data: updated });
+  } catch (err) {
+    return handleServiceError(c, err);
+  }
+});
+
+ticketPartsRoutes.delete('/parts/:id', scopes, writePerm, zValidator('param', partIdParam), async (c) => {
+  const auth = c.get('auth');
+  const rows = await db.select().from(ticketParts).where(eq(ticketParts.id, c.req.valid('param').id)).limit(1);
+  const part = rows[0];
+  if (!part || !(await getScopedTicketOr404(auth, part.ticketId))) {
+    return c.json({ error: 'Part not found' }, 404);
+  }
+  try {
+    await deleteTicketPart(part.id, timeActorFrom(c));
+    return c.json({ data: { deleted: true } });
+  } catch (err) {
+    return handleServiceError(c, err);
+  }
+});
+
+ticketPartsRoutes.get('/:id/parts', scopes, readPerm, zValidator('param', idParam), async (c) => {
+  const auth = c.get('auth');
+  const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
+  if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+  const parts = await db.select().from(ticketParts).where(eq(ticketParts.ticketId, ticket.id));
+  return c.json({ data: parts });
+});
+
+ticketPartsRoutes.post('/:id/parts', scopes, writePerm, zValidator('param', idParam), zValidator('json', ticketPartSchema), async (c) => {
+  const auth = c.get('auth');
+  const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
+  if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+  try {
+    const part = await addTicketPart(ticket.id, c.req.valid('json'), timeActorFrom(c));
+    return c.json({ data: part }, 201);
+  } catch (err) {
+    return handleServiceError(c, err);
+  }
+});
+
+ticketPartsRoutes.get('/:id/time-entries', scopes, readPerm, zValidator('param', idParam), zValidator('query', listTimeEntriesQuerySchema), async (c) => {
+  const auth = c.get('auth');
+  const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
+  if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+  const q = c.req.valid('query');
+  const { entries, total } = await listTimeEntries({ ...q, ticketId: ticket.id });
+  return c.json({ data: entries, total });
+});
+
+ticketPartsRoutes.get('/:id/billing-summary', scopes, readPerm, zValidator('param', idParam), async (c) => {
+  const auth = c.get('auth');
+  const ticket = await getScopedTicketOr404(auth, c.req.valid('param').id);
+  if (!ticket) return c.json({ error: 'Ticket not found' }, 404);
+  const summary = await getTicketBillingSummary(ticket.id);
+  // #6466: getTicketBillingSummary's billableMinutes counts every billable row
+  // (COALESCE(billable_minutes, duration_minutes) FILTER (WHERE is_billable)),
+  // but the money aggregate beside it additionally filters hourlyRate IS NOT
+  // NULL — so a rate-less billable entry inflates the hours next to a blank
+  // amount with no explanation. This is a route-local read-only count (not a
+  // change to timeEntryService.ts, owned separately by #6568) so the panel can
+  // show an explicit "N entries have no rate" indicator instead.
+  const [missingRateRow] = await db
+    .select({ n: count() })
+    .from(timeEntries)
+    .where(and(eq(timeEntries.ticketId, ticket.id), eq(timeEntries.isBillable, true), isNull(timeEntries.hourlyRate)));
+  const summaryWithMissingRate = {
+    ...summary,
+    time: { ...summary.time, missingRateCount: missingRateRow?.n ?? 0 }
+  };
+  // `defaults` (#5321) is what the server would stamp on a new entry for this
+  // ticket. The quick-add prefills its rate from it and warns when it is null —
+  // a rate-less billable entry is only refused much later, at invoice assembly
+  // (ALL_MISSING_RATE 409), by which point the tech has moved on.
+  //
+  // Advisory only, so it is best-effort: the summary itself never depended on
+  // organizations/partner data, and a ticket whose org or partner cannot be
+  // resolved must not take the whole panel down. The client then sees
+  // `defaults: null` and the quick-add falls back to a blank rate plus its
+  // missing-rate warning. An UNEXPECTED fault still propagates as a 500 — only
+  // a typed service error is downgraded, and it is logged either way.
+  let defaults: Awaited<ReturnType<typeof getTicketTimeEntryDefaults>> | null = null;
+  try {
+    defaults = await getTicketTimeEntryDefaults(ticket.id, timeActorFrom(c));
+  } catch (err) {
+    if (!(err instanceof TimeEntryServiceError)) throw err;
+    console.error('[tickets.billing-summary] time-entry defaults unavailable', ticket.id, err.code, err.message);
+  }
+  return c.json({ data: { ...summaryWithMissingRate, defaults } });
+});

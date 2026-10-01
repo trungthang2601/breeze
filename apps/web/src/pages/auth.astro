@@ -1,0 +1,15 @@
+---
+import AuthShellBranded from '../layouts/AuthShellBranded.astro';
+import AuthPage from '../components/auth/AuthPage';
+import { tServer } from '../lib/i18n/server';
+
+const next = Astro.url.searchParams.get('next') ?? undefined;
+---
+
+<AuthShellBranded
+  titleKey="titles.auth"
+  description={tServer(Astro.locals.locale, 'authPage.description')}
+  tagline={tServer(Astro.locals.locale, 'authPage.tagline')}
+>
+  <AuthPage client:load next={next} />
+</AuthShellBranded>

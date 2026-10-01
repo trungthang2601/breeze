@@ -1,0 +1,664 @@
+import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, integer, real, bigint, date, primaryKey, index, unique, uniqueIndex, foreignKey } from 'drizzle-orm/pg-core';
+import { ipClassEnum, organizations, sites } from './orgs';
+import { users } from './users';
+import { aiInitiatorKindEnum } from './aiInitiator';
+import type { BatteryStatus, DesktopAccessState, InterfaceBandwidth, TCCPermissions, VpnPresence } from '@breeze/shared';
+
+export const osTypeEnum = pgEnum('os_type', ['windows', 'macos', 'linux']);
+export const deviceStatusEnum = pgEnum('device_status', ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending']);
+export const deviceGroupTypeEnum = pgEnum('device_group_type', ['static', 'dynamic']);
+export const membershipSourceEnum = pgEnum('membership_source', ['manual', 'dynamic_rule', 'policy']);
+export const ipAssignmentTypeEnum = pgEnum('ip_assignment_type', ['dhcp', 'static', 'vpn', 'link-local', 'unknown']);
+export const watchdogStatusEnum = pgEnum('watchdog_status', ['connected', 'failover', 'offline']);
+
+export const devices = pgTable('devices', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  siteId: uuid('site_id').notNull().references(() => sites.id),
+  agentId: varchar('agent_id', { length: 64 }).notNull().unique(),
+  agentTokenHash: varchar('agent_token_hash', { length: 64 }),
+  tokenIssuedAt: timestamp('token_issued_at', { withTimezone: true }),
+  previousTokenHash: varchar('previous_token_hash', { length: 64 }),
+  previousTokenExpiresAt: timestamp('previous_token_expires_at', { withTimezone: true }),
+  watchdogTokenHash: varchar('watchdog_token_hash', { length: 64 }),
+  watchdogTokenIssuedAt: timestamp('watchdog_token_issued_at', { withTimezone: true }),
+  previousWatchdogTokenHash: varchar('previous_watchdog_token_hash', { length: 64 }),
+  previousWatchdogTokenExpiresAt: timestamp('previous_watchdog_token_expires_at', { withTimezone: true }),
+  helperTokenHash: varchar('helper_token_hash', { length: 64 }),
+  helperTokenIssuedAt: timestamp('helper_token_issued_at', { withTimezone: true }),
+  previousHelperTokenHash: varchar('previous_helper_token_hash', { length: 64 }),
+  previousHelperTokenExpiresAt: timestamp('previous_helper_token_expires_at', { withTimezone: true }),
+  // Issue #2621 — staged credentials for a two-phase rotation. These hashes are
+  // accepted for auth while pending, but only become current once the agent
+  // confirms it durably persisted the matching plaintext.
+  pendingTokenHash: varchar('pending_token_hash', { length: 64 }),
+  pendingWatchdogTokenHash: varchar('pending_watchdog_token_hash', { length: 64 }),
+  pendingHelperTokenHash: varchar('pending_helper_token_hash', { length: 64 }),
+  pendingTokenExpiresAt: timestamp('pending_token_expires_at', { withTimezone: true }),
+  mtlsCertSerialNumber: varchar('mtls_cert_serial_number', { length: 128 }),
+  mtlsCertExpiresAt: timestamp('mtls_cert_expires_at'),
+  mtlsCertIssuedAt: timestamp('mtls_cert_issued_at'),
+  mtlsCertCfId: varchar('mtls_cert_cf_id', { length: 128 }),
+  quarantinedAt: timestamp('quarantined_at'),
+  quarantinedReason: varchar('quarantined_reason', { length: 255 }),
+  // Task 18: Auto-suspend agent tokens after repeated cross-tenant probe
+  // attempts. Suspension is sticky (DB-backed) — reconnects with the same
+  // token fail at the auth gate until an operator clears these columns.
+  agentTokenSuspendedAt: timestamp('agent_token_suspended_at'),
+  agentTokenSuspendedReason: varchar('agent_token_suspended_reason', { length: 100 }),
+  // Task 19: Track the last source IP seen on an authenticated agent request.
+  // A sudden change (legit agent → different IP) is a strong compromise signal.
+  // We audit-log the transition (once per IP per device per 24h via Redis
+  // dedup) and update this column fire-and-forget so the next request can
+  // compare.
+  lastSeenIp: varchar('last_seen_ip', { length: 45 }),
+  // Public IP the agent enrolled from (point-in-time; lastSeenIp above tracks
+  // the ongoing value). Feeds the abuse-signals sweep's IP-spread heuristics.
+  enrollmentIp: varchar('enrollment_ip', { length: 45 }),
+  enrollmentIpClass: ipClassEnum('enrollment_ip_class').notNull().default('unknown'),
+  enrollmentIpAsn: integer('enrollment_ip_asn'),
+  enrollmentIpClassifiedAt: timestamp('enrollment_ip_classified_at', { withTimezone: true }),
+  hostname: varchar('hostname', { length: 255 }).notNull(),
+  displayName: varchar('display_name', { length: 255 }),
+  osType: osTypeEnum('os_type').notNull(),
+  deviceRole: varchar('device_role', { length: 30 }).notNull().default('unknown'),
+  deviceRoleSource: varchar('device_role_source', { length: 20 }).notNull().default('auto'),
+  // Fleet Designer W02 (#5652) — projection of the ACTIVE
+  // device_function_assessments row ("what is this device for"), written ONLY
+  // by services/deviceFunction.ts in the same transaction as the assessment.
+  // Both NULL, or both set, pinned by devices_device_function_source_chk.
+  deviceFunction: text('device_function'),
+  deviceFunctionSource: text('device_function_source').$type<'ai' | 'manual'>(),
+  // Orthogonal virtualization attribute (issue #1387): is this box running on a
+  // hypervisor, and which one. Set by the agent from SMBIOS hardware identity
+  // strings. Distinct from device_role — a virtual workstation is still a
+  // workstation and keeps matching role-based policies; virtualization is a
+  // second policy-targeting axis. virtualization_platform is one of
+  // VIRTUALIZATION_PLATFORMS (vmware/hyperv/virtualbox/qemu/kvm/xen/bochs/
+  // parallels), or null when physical or undetermined.
+  isVirtual: boolean('is_virtual').notNull().default(false),
+  virtualizationPlatform: varchar('virtualization_platform', { length: 30 }),
+  osVersion: varchar('os_version', { length: 100 }).notNull(),
+  // Hardware Lifecycle report: when the device was bought. Source is 'manual'
+  // (operator-entered, never overwritten by sync) or 'vendor' (derived from the
+  // warranty provider's ship date). Both NULL or both set —
+  // devices_purchase_date_source_chk.
+  purchaseDate: date('purchase_date'),
+  purchaseDateSource: varchar('purchase_date_source', { length: 20 }).$type<'manual' | 'vendor'>(),
+  osBuild: varchar('os_build', { length: 100 }),
+  architecture: varchar('architecture', { length: 20 }).notNull(),
+  agentVersion: varchar('agent_version', { length: 50 }).notNull(),
+  // Resolved helper spawn mode reported by the agent ("always-on" |
+  // "on-demand"); on-demand marks RD Session Hosts, where the web UI offers
+  // per-session targeting. Null for old agents / non-Windows.
+  helperLifecycleMode: varchar('helper_lifecycle_mode', { length: 20 }),
+  status: deviceStatusEnum('status').notNull().default('offline'),
+  // Quick Support ephemeral device: enrolled for one ad-hoc support session in
+  // the hidden per-partner org, purged by the reaper 6h after the session ends.
+  // Excluded from license counts, device listings, billing rollups and alert
+  // evaluation — but NOT from the status-upkeep path, which the reaper's
+  // end-user-stop detection depends on.
+  isEphemeral: boolean('is_ephemeral').notNull().default(false),
+  // RMM-QA-176: manual maintenance lease. `maintenance_until > now()` — not
+  // `status` — is the truth of "a technician put this device into maintenance":
+  // the heartbeat overwrites status to 'online' on every beat, so a status read
+  // cannot distinguish entry from extension. started_at / started_by are
+  // IMMUTABLE across extensions (the original actor stays on the row; each
+  // extension's actor is on its audit event). See services/deviceMaintenanceLease.ts.
+  maintenanceStartedAt: timestamp('maintenance_started_at', { withTimezone: true }),
+  maintenanceUntil: timestamp('maintenance_until', { withTimezone: true }),
+  maintenanceReason: varchar('maintenance_reason', { length: 500 }),
+  maintenanceStartedBy: uuid('maintenance_started_by').references(() => users.id, { onDelete: 'set null' }),
+  lastSeenAt: timestamp('last_seen_at'),
+  enrolledAt: timestamp('enrolled_at').defaultNow().notNull(),
+  // Bare-metal recovery W04a: stamped by the heartbeat check-in that completes
+  // a recovery. recoveredFromSnapshotId is a soft reference to
+  // backup_snapshots.id (no FK, like possibleReplacementOfDeviceId above) —
+  // a real FK would create a devices <-> backup_snapshots cascade cycle
+  // (backup_snapshots.device_id already points the other way), which
+  // topologicalCascadeOrder() in tenantCascade.ts rejects outright.
+  recoveredAt: timestamp('recovered_at', { withTimezone: true }),
+  recoveredFromSnapshotId: uuid('recovered_from_snapshot_id'),
+  enrolledBy: uuid('enrolled_by').references(() => users.id),
+  // Linked device profiles for multi-boot systems (#2138). NULL => unlinked.
+  // When set, the device is one boot profile of a physical machine grouped in
+  // `device_link_groups`. A composite FK (link_group_id, org_id) ->
+  // device_link_groups(id, org_id) — declared in the migration, not here,
+  // matching the users(org_id, partner_id) composite-FK convention — pins every
+  // member of a group to the group's org (same-org invariant).
+  linkGroupId: uuid('link_group_id'),
+  // Member role within an ASYMMETRIC link group (#2308). NULL for unlinked
+  // devices and for members of symmetric kinds (multiboot — all peers). For a
+  // kind='vm_host' group exactly one member is 'host' (the hypervisor/server
+  // record) and the rest are 'guest' (its VMs). Values are app-enforced
+  // ('host' | 'guest'), matching kind's varchar-without-CHECK convention.
+  // Invariant: link_group_id IS NULL => link_group_role IS NULL (every unlink
+  // path clears both together).
+  linkGroupRole: varchar('link_group_role', { length: 16 }),
+  tags: text('tags').array().default([]),
+  customFields: jsonb('custom_fields').default({}),
+  managementPosture: jsonb('management_posture'),
+  tccPermissions: jsonb('tcc_permissions').$type<TCCPermissions | null>(),
+  desktopAccess: jsonb('desktop_access').$type<DesktopAccessState | null>(),
+  lastUser: varchar('last_user', { length: 255 }),
+  uptimeSeconds: integer('uptime_seconds'),
+  isHeadless: boolean('is_headless').notNull().default(false),
+  // OS-level pending-reboot flag from the agent heartbeat (Windows registry
+  // checks; Linux reboot-required markers / needs-restarting). Self-clears
+  // on the first post-reboot heartbeat. Backs the system.rebootRequired
+  // filter and the "Reboot pending" UI badge.
+  pendingReboot: boolean('pending_reboot').notNull().default(false),
+  // Scheduled-restart status denormalized from the agent heartbeat (#3207 W5).
+  //
+  // Distinct from pendingReboot above: that is the OS saying "a restart is
+  // required at some point", these are the agent's RebootManager saying "a
+  // restart is booked for this instant, and the end user has postponed it N
+  // times". Scalars, not one jsonb column, because `devices` is an org-cascade
+  // table and CLAUDE.md forces any open container into the export policy's
+  // `excludedOpen` bucket — which would keep reboot status out of tenant
+  // exports entirely.
+  //
+  // All nullable, and NULL is load-bearing: it means "this agent has never
+  // reported reboot status" (a pre-#3207 build), which the console must be
+  // able to tell apart from "a restart is scheduled that cannot be postponed"
+  // (rebootMaxDeferrals === 0). Written from the heartbeat's `rebootStatus`,
+  // where an ABSENT field means "no news" (old agents must not wipe the
+  // console's view) and an explicit null means "cancelled, or already fired".
+  rebootScheduledAt: timestamp('reboot_scheduled_at', { withTimezone: true }),
+  rebootDeadline: timestamp('reboot_deadline', { withTimezone: true }),
+  rebootSource: varchar('reboot_source', { length: 32 }),
+  rebootDeferralsUsed: integer('reboot_deferrals_used'),
+  // The deferral budget in force for THIS schedule, read from the agent rather
+  // than re-derived from the patch policy: the policy can be edited after a
+  // restart is already booked, and the console must show the budget the end
+  // user actually has, not the one a tech just saved.
+  rebootMaxDeferrals: integer('reboot_max_deferrals'),
+  // Current-state power/battery snapshot from the agent heartbeat (#2142).
+  // Latest value only — dynamic per-heartbeat state, stored next to uptime /
+  // pendingReboot rather than in the device_metrics time-series. null when the
+  // agent has never reported (old agent); { present: false } for a real
+  // no-battery desktop. Backs the optional "Power" list column and the
+  // device-detail Power section.
+  batteryStatus: jsonb('battery_status').$type<BatteryStatus | null>(),
+  // Active-VPN-client presence snapshot from the agent's periodic network
+  // inventory (#2139). Latest value only — fully replaced each network report,
+  // stored next to batteryStatus rather than in a time-series/child table.
+  // null when the agent has never reported (old agent); [] when reported with
+  // no active VPN. Backs the optional "VPN" list column and the device-detail
+  // VPN section. Read-only telemetry — no secrets/peers/keys.
+  activeVpns: jsonb('active_vpns').$type<VpnPresence[] | null>(),
+  watchdogStatus: watchdogStatusEnum('watchdog_status'),
+  watchdogLastSeen: timestamp('watchdog_last_seen'),
+  watchdogVersion: varchar('watchdog_version', { length: 50 }),
+  // Installed breeze-backup version, reported by the agent's heartbeat.
+  // Nullable: old agents and devices without the backup binary installed
+  // never report one.
+  backupVersion: varchar('backup_version', { length: 50 }),
+  // #2288 — the control-plane URL the agent last heartbeated to. Reported by
+  // the agent; shows fleet position during a server URL migration.
+  agentServerUrl: varchar('agent_server_url', { length: 512 }),
+  // Asymmetry detector (#800): set when the watchdog is still reporting
+  // in but the main agent has gone silent past the offline threshold.
+  // Cleared when the main agent next heartbeats. Distinct from
+  // status='offline' which only reflects main-agent silence — operators
+  // need to know "box alive, only the BreezeAgent service is wedged" so
+  // their support workflow is "remote restart" not "physical visit."
+  mainAgentSilentSince: timestamp('main_agent_silent_since'),
+  // Wave 6 Task 4 (security remediation) — outbound-network-policy capability
+  // handshake. 0 (default) = unknown/not enforcing: every pre-existing row
+  // and every heartbeat from an agent build that omits `securityCapabilities`
+  // entirely. Only the recognized integer version 1 (agent/internal/netpolicy
+  // enforcement, Tasks 1-3) is ever written as anything other than 0. Written
+  // unconditionally every heartbeat (not sticky), so a downgrade to an older
+  // build correctly reports back down to 0. Task 5 gates managed-software
+  // dispatch on this value.
+  outboundNetworkPolicyVersion: integer('outbound_network_policy_version').notNull().default(0),
+  // #3409 PR4 — agent capability for encrypted secret-env delivery. 0 for every
+  // agent build predating PR4b and for any heartbeat omitting the field; only
+  // the recognized integer version 1 is written as anything else. Non-sticky
+  // (written every beat), so a downgrade reports back down and the PR4c
+  // dispatch gate stops trusting a stale claim. An agent that ignores
+  // `secretEnv` would run the script with the credential UNSET, which is why
+  // this gates on a declared capability rather than on agentVersion.
+  scriptSecretEnvVersion: integer('script_secret_env_version').notNull().default(0),
+  // Explicit device-control protocol capabilities. These are rewritten from
+  // the current heartbeat rather than accumulated, so old agents and agent
+  // downgrades clear stale claims back to zero.
+  peripheralPolicyProtocolVersion: integer('peripheral_policy_protocol_version').notNull().default(0),
+  rollbackProtocolVersion: integer('rollback_protocol_version').notNull().default(0),
+  pamLifetimeProtocolVersion: integer('pam_lifetime_protocol_version').notNull().default(0),
+  // Revocation-lease capability. 1 = this agent build renews a per-session
+  // revocation lease over the command WebSocket and stops the desktop stream
+  // when the lease is revoked or expires past its grace window. 0 (default,
+  // and every agent that omits the field) means the API has no way to end a
+  // live desktop session it can no longer authorize, so all three
+  // desktop-start dispatch sites refuse with 503 agent_upgrade_required.
+  // Non-sticky, same contract as the versions above: rewritten every beat so a
+  // downgrade clears the claim.
+  revocationLeaseProtocolVersion: integer('revocation_lease_protocol_version').notNull().default(0),
+  // SEC-038 W06 desktop start/terminal fence capability. 1 = this agent build
+  // keeps the durable per-session generation fence (W04/W05) and refuses stale
+  // or post-terminal starts. 0 (default, and every agent that omits the field)
+  // means unfenced; behind REMOTE_DESKTOP_FENCE_REQUIRED the three
+  // desktop-start dispatch sites refuse with 503 agent_upgrade_required, same
+  // shape as the revocation-lease gate above. Non-sticky: rewritten every beat.
+  desktopFenceProtocolVersion: integer('desktop_fence_protocol_version').notNull().default(0),
+  rollbackComponentVersions: jsonb('rollback_component_versions').$type<Record<string, string> | null>(),
+  // Agent-reported build edition + migration-needed flag (heartbeat telemetry).
+  // Non-sensitive; drives the self-hosted migration banner. Written unconditionally
+  // every heartbeat (self-healing), so a resolved condition clears next beat.
+  agentEdition: varchar('agent_edition', { length: 20 }),
+  migrationRequired: boolean('migration_required').notNull().default(false),
+  // #4072 auto edition migration: once-per-device dispatch claim. Stamped
+  // atomically (WHERE ... IS NULL) before the migration script is dispatched;
+  // never cleared on a dispatched-but-failed dance so a broken device is
+  // handled by an operator, not an uninstall/reinstall retry loop.
+  editionMigrationDispatchedAt: timestamp('edition_migration_dispatched_at', { withTimezone: true }),
+  // Enrollment idempotency (#2764): uninstall intent stamped by the agent's
+  // graceful-uninstall notify path (Task 5/6); reaper decommissions once past
+  // grace with no re-enrollment heartbeat. possibleReplacementOfDeviceId links
+  // a newly enrolled device back to a prior device it may be replacing
+  // (collision detection, Task 4) for operator review (Task 7).
+  uninstallIntentAt: timestamp('uninstall_intent_at', { withTimezone: true }),
+  possibleReplacementOfDeviceId: uuid('possible_replacement_of_device_id'),
+  // #2787 item 4 — WHEN this device was removed (status flipped to
+  // 'decommissioned'). NULL for every device that is not removed, and cleared
+  // again on Restore. `updated_at` cannot stand in for it: it moves on every
+  // unrelated write after removal, so a retention window built on it would
+  // silently extend itself. NULL on a decommissioned row means "removal time
+  // unknown" and the purge job treats that as NEVER PURGE (fail closed).
+  decommissionedAt: timestamp('decommissioned_at', { withTimezone: true }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
+}, (table) => ({
+  idOrgSiteUnique: uniqueIndex('devices_id_org_id_site_id_uniq').on(table.id, table.orgId, table.siteId),
+  idOrgUnique: uniqueIndex('devices_id_org_id_uniq').on(table.id, table.orgId),
+}));
+
+// Linked device profiles for multi-boot systems (#2138). One row per physical
+// machine whose OS boot profiles are surfaced as separate device records. This
+// is a NON-destructive UI/monitoring overlay — the linked device rows keep all
+// of their own inventory/software/scripts/history/audit. Shape 1 (direct
+// org_id): auto-discovered by the rls-coverage contract test. Membership lives
+// on `devices.link_group_id` (one group per device), not a child table.
+export const deviceLinkGroups = pgTable('device_link_groups', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  // What the link MEANS. 'multiboot' (v1, #2138): members are peer boot
+  // profiles of one physical machine. 'vm_host' (#2308): asymmetric — one
+  // member is the host server (devices.link_group_role = 'host') and the rest
+  // are its guest VMs ('guest'), nested under the host in the device list.
+  kind: varchar('kind', { length: 32 }).notNull().default('multiboot'),
+  name: varchar('name', { length: 255 }),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  orgIdIdx: index('device_link_groups_org_id_idx').on(table.orgId),
+  // UNIQUE INDEX (not a constraint) to match the migration's
+  // `CREATE UNIQUE INDEX` and satisfy db:check-drift — same convention as the
+  // pax8/ticketMailbox composite-(id, axis) FK targets. Backs the composite FK
+  // devices(link_group_id, org_id) -> device_link_groups(id, org_id).
+  idOrgUnique: uniqueIndex('device_link_groups_id_org_id_uniq').on(table.id, table.orgId),
+}));
+
+export const deviceHardware = pgTable('device_hardware', {
+  deviceId: uuid('device_id').primaryKey().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  cpuModel: varchar('cpu_model', { length: 255 }),
+  cpuCores: integer('cpu_cores'),
+  cpuThreads: integer('cpu_threads'),
+  ramTotalMb: integer('ram_total_mb'),
+  diskTotalGb: integer('disk_total_gb'),
+  gpuModel: varchar('gpu_model', { length: 255 }),
+  serialNumber: varchar('serial_number', { length: 100 }),
+  manufacturer: varchar('manufacturer', { length: 255 }),
+  model: varchar('model', { length: 255 }),
+  motherboardManufacturer: varchar('motherboard_manufacturer', { length: 255 }),
+  motherboardProduct: varchar('motherboard_product', { length: 255 }),
+  motherboardVersion: varchar('motherboard_version', { length: 255 }),
+  biosVersion: varchar('bios_version', { length: 100 }),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
+});
+
+// Resource-specific material fingerprints for reconstruction exports. Deferred
+// database triggers refresh these only when the final durable child state has
+// actually changed, so periodic delete/reinsert inventory collection and
+// heartbeat fields do not create false incremental changes.
+export const partnerExportDeviceMaterialState = pgTable('partner_export_device_material_state', {
+  deviceId: uuid('device_id').primaryKey().references(() => devices.id, { onDelete: 'cascade' }),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  inventoryUpdatedAt: timestamp('inventory_updated_at', { precision: 3 }).defaultNow().notNull(),
+  softwareUpdatedAt: timestamp('software_updated_at', { precision: 3 }).defaultNow().notNull(),
+  relationshipsUpdatedAt: timestamp('relationships_updated_at', { precision: 3 }).defaultNow().notNull(),
+}, (table) => ({
+  orgIdIdx: index('partner_export_device_material_state_org_id_idx').on(table.orgId),
+  orgDeviceUnique: uniqueIndex('partner_export_device_material_state_org_device_uniq').on(table.orgId, table.deviceId),
+}));
+
+export const partnerExportSiteMaterialState = pgTable('partner_export_site_material_state', {
+  siteId: uuid('site_id').primaryKey().references(() => sites.id, { onDelete: 'cascade' }),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  inventoryUpdatedAt: timestamp('inventory_updated_at', { precision: 3 }).defaultNow().notNull(),
+  relationshipsUpdatedAt: timestamp('relationships_updated_at', { precision: 3 }).defaultNow().notNull(),
+}, (table) => ({
+  orgIdIdx: index('partner_export_site_material_state_org_id_idx').on(table.orgId),
+  orgSiteUnique: uniqueIndex('partner_export_site_material_state_org_site_uniq').on(table.orgId, table.siteId),
+}));
+
+export const deviceNetwork = pgTable('device_network', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  interfaceName: text('interface_name').notNull(),
+  // 64 (not 17) to fit Windows pseudo-interface (Teredo/ISATAP) and
+  // InfiniBand EUI-64 / tunnel MACs — matches the agent payload schema's
+  // z.string().max(64) (see routes/agents/schemas.ts). See migration
+  // 2026-08-04-widen-device-mac-address-columns.sql (Sentry BREEZE-3).
+  macAddress: varchar('mac_address', { length: 64 }),
+  ipAddress: varchar('ip_address', { length: 45 }),
+  ipType: varchar('ip_type', { length: 4 }).notNull().default('ipv4'),
+  isPrimary: boolean('is_primary').notNull().default(false),
+  // NOTE: never written. The inventory ingest (routes/agents/inventory.ts)
+  // omits it and no other writer exists, so this column is always NULL.
+  // The device's public/WAN address lives on devices.last_seen_ip instead.
+  publicIp: varchar('public_ip', { length: 45 }),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  // Every reader of this table filters by device_id (device-detail /network,
+  // cascade delete, the Devices-list LAN IP lookup). See migration
+  // 2026-08-07-device-network-device-id-index.sql.
+  deviceIdIdx: index('device_network_device_id_idx').on(table.deviceId),
+}));
+
+export const deviceIpHistory = pgTable('device_ip_history', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id, { onDelete: 'cascade' }),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  interfaceName: text('interface_name').notNull(),
+  ipAddress: varchar('ip_address', { length: 45 }).notNull(),
+  ipType: varchar('ip_type', { length: 4 }).notNull().default('ipv4'),
+  assignmentType: ipAssignmentTypeEnum('assignment_type').notNull().default('unknown'),
+  // 64 to match device_network.mac_address — same agent-reported hardware
+  // addresses (Teredo/ISATAP/InfiniBand can exceed 17 chars). See migration
+  // 2026-08-04-widen-device-mac-address-columns.sql.
+  macAddress: varchar('mac_address', { length: 64 }),
+  subnetMask: varchar('subnet_mask', { length: 45 }),
+  gateway: varchar('gateway', { length: 45 }),
+  dnsServers: text('dns_servers').array(),
+  firstSeen: timestamp('first_seen').notNull().defaultNow(),
+  lastSeen: timestamp('last_seen').notNull().defaultNow(),
+  isActive: boolean('is_active').notNull().default(true),
+  deactivatedAt: timestamp('deactivated_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  deviceIdIdx: index('device_ip_history_device_id_idx').on(table.deviceId),
+  orgIdIdx: index('device_ip_history_org_id_idx').on(table.orgId),
+  ipAddressIdx: index('device_ip_history_ip_address_idx').on(table.ipAddress),
+  firstSeenIdx: index('device_ip_history_first_seen_idx').on(table.firstSeen),
+  lastSeenIdx: index('device_ip_history_last_seen_idx').on(table.lastSeen),
+  isActiveIdx: index('device_ip_history_is_active_idx').on(table.isActive),
+  ipAddressTimeIdx: index('device_ip_history_ip_time_idx').on(table.ipAddress, table.firstSeen, table.lastSeen),
+}));
+
+export const deviceDisks = pgTable('device_disks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  mountPoint: varchar('mount_point', { length: 255 }).notNull(),
+  device: varchar('device', { length: 255 }),
+  fsType: varchar('fs_type', { length: 50 }),
+  totalGb: real('total_gb').notNull(),
+  usedGb: real('used_gb').notNull(),
+  freeGb: real('free_gb').notNull(),
+  usedPercent: real('used_percent').notNull(),
+  health: varchar('health', { length: 50 }).default('healthy'),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+});
+
+export const deviceMetrics = pgTable('device_metrics', {
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  timestamp: timestamp('timestamp').notNull(),
+  cpuPercent: real('cpu_percent').notNull(),
+  ramPercent: real('ram_percent').notNull(),
+  ramUsedMb: integer('ram_used_mb').notNull(),
+  diskPercent: real('disk_percent').notNull(),
+  diskUsedGb: real('disk_used_gb').notNull(),
+  diskActivityAvailable: boolean('disk_activity_available'),
+  diskReadBytes: bigint('disk_read_bytes', { mode: 'bigint' }),
+  diskWriteBytes: bigint('disk_write_bytes', { mode: 'bigint' }),
+  diskReadBps: bigint('disk_read_bps', { mode: 'bigint' }),
+  diskWriteBps: bigint('disk_write_bps', { mode: 'bigint' }),
+  diskReadOps: bigint('disk_read_ops', { mode: 'bigint' }),
+  diskWriteOps: bigint('disk_write_ops', { mode: 'bigint' }),
+  networkInBytes: bigint('network_in_bytes', { mode: 'bigint' }),
+  networkOutBytes: bigint('network_out_bytes', { mode: 'bigint' }),
+  bandwidthInBps: bigint('bandwidth_in_bps', { mode: 'bigint' }),
+  bandwidthOutBps: bigint('bandwidth_out_bps', { mode: 'bigint' }),
+  interfaceStats: jsonb('interface_stats').$type<InterfaceBandwidth[]>(),
+  processCount: integer('process_count'),
+  customMetrics: jsonb('custom_metrics')
+}, (table) => ({
+  pk: primaryKey({ columns: [table.deviceId, table.timestamp] })
+}));
+
+export type TopProcess = {
+  name: string;
+  pid: number;
+  cpu: number;
+  ramMb: number;
+  diskBps?: number;
+  netBps?: number;
+};
+
+export const deviceProcessSamples = pgTable('device_process_samples', {
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  timestamp: timestamp('timestamp', { withTimezone: true }).notNull(),
+  agentTimestamp: timestamp('agent_timestamp', { withTimezone: true }),
+  topProcesses: jsonb('top_processes').$type<TopProcess[]>().notNull()
+}, (table) => ({
+  pk: primaryKey({ columns: [table.deviceId, table.timestamp] })
+}));
+
+export const deviceSoftware = pgTable('device_software', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  name: varchar('name', { length: 500 }).notNull(),
+  version: varchar('version', { length: 100 }),
+  publisher: varchar('publisher', { length: 255 }),
+  installDate: date('install_date'),
+  installLocation: text('install_location'),
+  isSystem: boolean('is_system').notNull().default(false),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+});
+
+export const deviceRegistryState = pgTable('device_registry_state', {
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  registryPath: text('registry_path').notNull(),
+  valueName: text('value_name').notNull(),
+  valueData: text('value_data'),
+  valueType: varchar('value_type', { length: 64 }),
+  collectedAt: timestamp('collected_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  pk: primaryKey({ columns: [table.deviceId, table.registryPath, table.valueName] })
+}));
+
+export const deviceConfigState = pgTable('device_config_state', {
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  filePath: text('file_path').notNull(),
+  configKey: text('config_key').notNull(),
+  configValue: text('config_value'),
+  collectedAt: timestamp('collected_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  pk: primaryKey({ columns: [table.deviceId, table.filePath, table.configKey] })
+}));
+
+export const deviceGroups = pgTable('device_groups', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  siteId: uuid('site_id').references(() => sites.id),
+  name: varchar('name', { length: 255 }).notNull(),
+  type: deviceGroupTypeEnum('type').notNull().default('static'),
+  rules: jsonb('rules'),
+  filterConditions: jsonb('filter_conditions'),
+  filterFieldsUsed: text('filter_fields_used').array().default([]),
+  parentId: uuid('parent_id'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  // Composite-FK target for contract_lines(device_group_id, org_id) (#3205 W02).
+  // Created in SQL migration 2026-10-06-100100; declared here for db:check-drift.
+  idOrgUnique: uniqueIndex('device_groups_id_org_id_uniq').on(table.id, table.orgId),
+}));
+
+export const deviceGroupMemberships = pgTable('device_group_memberships', {
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  groupId: uuid('group_id').notNull().references(() => deviceGroups.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  isPinned: boolean('is_pinned').notNull().default(false),
+  addedAt: timestamp('added_at').defaultNow().notNull(),
+  addedBy: membershipSourceEnum('added_by').notNull().default('manual')
+}, (table) => ({
+  pk: primaryKey({ columns: [table.deviceId, table.groupId] }),
+  // #3182 — the row's org_id alone is what RLS gates on, so without these the
+  // group_id and device_id are free to name a DIFFERENT org's group/device.
+  // Together they pin the triangle: group.org_id = membership.org_id =
+  // device.org_id. Created in SQL migration
+  // 2026-10-09-000200-device-group-memberships-composite-tenant-fks.sql, which
+  // also declares them DEFERRABLE INITIALLY IMMEDIATE (drizzle-orm's
+  // foreignKey() builder has no deferrable option, so that detail lives in the
+  // migration only) and adds the detach — to breeze_cascade_device_org_id(),
+  // an AFTER trigger — that drops these rows on a cross-org device move.
+  // Declared here for db:check-drift.
+  groupOrgFk: foreignKey({
+    columns: [table.groupId, table.orgId],
+    foreignColumns: [deviceGroups.id, deviceGroups.orgId],
+    name: 'device_group_memberships_group_org_fk',
+  }),
+  deviceOrgFk: foreignKey({
+    columns: [table.deviceId, table.orgId],
+    foreignColumns: [devices.id, devices.orgId],
+    name: 'device_group_memberships_device_org_fk',
+  }),
+}));
+
+// Audit log for group membership changes
+export const groupMembershipLogActionEnum = pgEnum('group_membership_log_action', ['added', 'removed']);
+export const groupMembershipLogReasonEnum = pgEnum('group_membership_log_reason', [
+  'manual',
+  'filter_match',
+  'filter_unmatch',
+  'pinned',
+  'unpinned'
+]);
+
+export const groupMembershipLog = pgTable('group_membership_log', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  groupId: uuid('group_id').notNull().references(() => deviceGroups.id),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  action: groupMembershipLogActionEnum('action').notNull(),
+  reason: groupMembershipLogReasonEnum('reason').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+});
+
+export const deviceCommands = pgTable('device_commands', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  type: varchar('type', { length: 50 }).notNull(),
+  payload: jsonb('payload'),
+  status: varchar('status', { length: 20 }).notNull().default('pending'),
+  targetRole: varchar('target_role', { length: 20 }).notNull().default('agent'),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  executedAt: timestamp('executed_at'),
+  completedAt: timestamp('completed_at'),
+  result: jsonb('result'),
+  // Provenance for self_uninstall commands: WHY this uninstall was queued.
+  // NULL on existing rows and on commands queued by callers that don't set
+  // it -- NULL means "no exemption, no widened auth", fail-closed by
+  // construction. See 2026-09-10-device-command-uninstall-provenance.sql.
+  uninstallReasons: text('uninstall_reasons').array(),
+  deviceRemoveExpiresAt: timestamp('device_remove_expires_at', { withTimezone: true }),
+  // #5128 -- deadline by which an agent must CLAIM this row (the DELIVERY
+  // clock). NULL = legacy rule (execution timeout measured from created_at).
+  // See services/commandOfflinePolicy.ts and jobs/staleCommandReaper.ts.
+  deliverBy: timestamp('deliver_by', { withTimezone: true }),
+  // #5128 -- the device's org at enqueue. PROVENANCE, not tenancy: compared at
+  // claim time to cancel rows whose device has since moved org. Deliberately
+  // NOT named org_id so the RLS/cascade auto-discovery keeps device_commands
+  // system-scoped (agent WS path, no RLS -- see CLAUDE.md).
+  submittedOrgId: uuid('submitted_org_id').references(() => organizations.id, { onDelete: 'set null' }),
+  // --- AI origin attribution (#5022 W01) ---------------------------------
+  // Bare uuids, no FK: a system-scoped command row must never be blockable or
+  // mutable by the lifecycle of an ai_sessions / ai_agent_runs row. Neither
+  // name is `org_id`, so the RLS and cascade auto-discovery still treat this
+  // table as system-scoped (both key on the literal column name).
+  aiInitiatorKind: aiInitiatorKindEnum('ai_initiator_kind'),
+  aiSessionId: uuid('ai_session_id'),
+  aiAgentRunId: uuid('ai_agent_run_id')
+});
+
+export const connectionProtocolEnum = pgEnum('connection_protocol', ['tcp', 'tcp6', 'udp', 'udp6']);
+
+export const deviceConnections = pgTable('device_connections', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  protocol: connectionProtocolEnum('protocol').notNull(),
+  localAddr: text('local_addr').notNull(),
+  localPort: integer('local_port').notNull(),
+  remoteAddr: text('remote_addr'),
+  remotePort: integer('remote_port'),
+  state: varchar('state', { length: 20 }),
+  pid: integer('pid'),
+  processName: varchar('process_name', { length: 255 }),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  devicePortStateIdx: index('device_connections_device_port_state_idx').on(
+    table.deviceId,
+    table.localPort,
+    table.state
+  ),
+  deviceUpdatedIdx: index('device_connections_device_updated_idx').on(table.deviceId, table.updatedAt)
+}));
+
+// Boot performance metrics - stores boot time history and startup item analysis per device
+export interface BootStartupItem {
+  itemId?: string;
+  name: string;
+  type: 'service' | 'run_key' | 'startup_folder' | 'login_item' | 'launch_agent' | 'launch_daemon' | 'systemd' | 'cron' | 'init_d';
+  path: string;
+  enabled: boolean;
+  cpuTimeMs: number;
+  diskIoBytes: number;
+  impactScore: number;
+}
+
+export const deviceBootMetrics = pgTable('device_boot_metrics', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  bootTimestamp: timestamp('boot_timestamp').notNull(),
+  biosSeconds: real('bios_seconds'),
+  osLoaderSeconds: real('os_loader_seconds'),
+  desktopReadySeconds: real('desktop_ready_seconds'),
+  totalBootSeconds: real('total_boot_seconds').notNull(),
+  startupItemCount: integer('startup_item_count').notNull(),
+  startupItems: jsonb('startup_items').notNull().$type<BootStartupItem[]>(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => ({
+  deviceBootIdx: index('device_boot_metrics_device_boot_idx').on(table.deviceId, table.bootTimestamp),
+  deviceCreatedIdx: index('device_boot_metrics_device_created_idx').on(table.deviceId, table.createdAt),
+  orgDeviceIdx: index('device_boot_metrics_org_device_idx').on(table.orgId, table.deviceId),
+  deviceBootUnique: unique('device_boot_metrics_device_boot_uniq').on(table.deviceId, table.bootTimestamp),
+}));

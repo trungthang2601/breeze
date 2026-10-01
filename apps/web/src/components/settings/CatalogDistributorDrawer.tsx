@@ -1,0 +1,136 @@
+import '@/lib/i18n';
+import { useTranslation } from 'react-i18next';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { runAction, handleActionError } from '../../lib/runAction';
+import { showToast } from '../shared/Toast';
+import { navigateTo } from '@/lib/navigation';
+import { loginPathWithNext } from '../../lib/authScope';
+import { ecExpressImport, type EcProduct } from '../../lib/api/distributors';
+import type { CatalogItem } from '../../lib/api/catalog';
+import DistributorLookup from '../billing/quotes/DistributorLookup';
+import { feedCurrencyCode } from './marginMath';
+import { usePartnerCurrency } from '../../lib/usePartnerCurrency';
+
+const UNAUTHORIZED = () => void navigateTo(loginPathWithNext(), { replace: true });
+
+interface Props {
+  open: boolean;
+  onClose: () => void;
+  /** Called after a successful import with the new catalog item, so the host can
+   *  reload its list and/or pre-fill a line from the imported item. */
+  onImported: (item: CatalogItem) => void;
+}
+
+/**
+ * Modal that brings the quote editor's TD SYNNEX EC Express lookup into the
+ * catalog itself, so distributor items can be added to the catalog directly
+ * (the import endpoint already existed; only the catalog entry point was
+ * missing). Imports run the same best-effort AI enrichment as the quote flow
+ * (aiCleanup), so the saved item gets a clean, readable name + a real,
+ * web-sourced technical description rather than the raw distributor title.
+ */
+export default function CatalogDistributorDrawer({ open, onClose, onImported }: Props) {
+  const { t } = useTranslation('settings');
+  const [busy, setBusy] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  // The sell price typed in the lookup is posted as a bare `unitPrice`, which
+  // the API stores as the PARTNER-currency price-book row — so the lookup's
+  // currency gate must be the partner currency (#3775 review #3). No 'USD'
+  // fallback: while it is unresolved the lookup is not rendered at all.
+  const { currency: partnerCurrency, failed: partnerCurrencyFailed, retry: retryPartnerCurrency } = usePartnerCurrency(open);
+
+  useEffect(() => {
+    if (!open) return;
+    document.body.style.overflow = 'hidden';
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => { document.body.style.overflow = ''; document.removeEventListener('keydown', onKey); };
+  }, [open, onClose, busy]);
+
+  const importAdd = useCallback((product: EcProduct, sellPrice: number) => {
+    void (async () => {
+      setBusy(true);
+      try {
+        const saved = await runAction<CatalogItem>({
+          request: () => ecExpressImport({
+            // Trimmed uppercase ISO or explicit null — never coerced to USD.
+            product: { ...product, currency: feedCurrencyCode(product.currency) },
+            item: {
+              name: product.name,
+              sku: product.synnexSku || product.mfgPartNo || null,
+              description: product.description ?? null,
+              unitPrice: sellPrice,
+              costBasis: product.cost != null && Number.isFinite(product.cost) ? Number(product.cost.toFixed(2)) : null,
+            },
+            // Tidy the raw distributor title into a readable name + description
+            // server-side (best-effort; falls back to the raw values).
+            aiCleanup: true,
+          }),
+          errorFallback: t('catalogDistributorDrawer.couldNotImportTheDistributorItem'),
+          onUnauthorized: UNAUTHORIZED,
+          parseSuccess: (d) => (d as { data: CatalogItem }).data,
+        });
+        // We always request aiCleanup; if the server couldn't run it (budget,
+        // rate limit, timeout) it stores aiEnriched:false and keeps the raw
+        // title — tell the user rather than imply the AI tidied it.
+        const aiEnriched = (saved as { attributes?: { distributor?: { aiEnriched?: boolean } } })
+          .attributes?.distributor?.aiEnriched === true;
+        showToast(aiEnriched
+          ? { message: t('catalogDistributorDrawer.imported', { name: saved.name }), type: 'success' }
+          : { message: t('catalogDistributorDrawer.importedWithoutCleanup', { name: saved.name }), type: 'warning' });
+        onImported(saved);
+        onClose();
+      } catch (err) {
+        handleActionError(err, 'Could not import the distributor item.');
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }, [onImported, onClose]);
+
+  if (!open || typeof document === 'undefined') return null;
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 sm:p-8"
+      onClick={(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}
+      data-testid="catalog-distributor-modal"
+    >
+      <div ref={panelRef} className="mt-8 w-full max-w-2xl rounded-lg border bg-card shadow-xl">
+        <div className="flex items-center justify-between border-b px-5 py-4">
+          <div>
+            <h2 className="text-base font-semibold">{t('catalogDistributorDrawer.importFromTDSYNNEX')}</h2>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {t('catalogDistributorDrawer.searchECExpressBySKUOrMfgPartSetYourSellPriceAndAddItToT')}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => { if (!busy) onClose(); }}
+            className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label={t('catalogDistributorDrawer.close')}
+            data-testid="catalog-distributor-close"
+          >
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6 6 18M6 6l12 12" strokeLinecap="round" /></svg>
+          </button>
+        </div>
+        <div className="p-5">
+          {partnerCurrency == null ? (
+            partnerCurrencyFailed ? (
+              <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive" data-testid="catalog-distributor-currency-error">
+                {t('catalogItemEditorDrawer.partnerCurrencyUnavailable')}{' '}
+                <button type="button" onClick={retryPartnerCurrency} className="underline hover:text-foreground">{t('catalogItemEditorDrawer.retry')}</button>
+              </p>
+            ) : (
+              <p className="py-2 text-center text-xs text-muted-foreground" data-testid="catalog-distributor-currency-loading">
+                {t('catalogItemEditorDrawer.loadingPartnerCurrency')}</p>
+            )
+          ) : (
+            <DistributorLookup blockId="catalog-import" busy={busy} currencyCode={partnerCurrency} onImportAdd={importAdd} />
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}

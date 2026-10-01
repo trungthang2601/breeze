@@ -1,0 +1,564 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+import { groupRoutes } from './groups';
+
+const GROUP_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const GROUP_ID_2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const ORG_ID = '11111111-1111-1111-1111-111111111111';
+const ORG_ID_2 = '22222222-2222-2222-2222-222222222222';
+const PARTNER_ID = '33333333-3333-3333-3333-333333333333';
+const DEVICE_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const DEVICE_ID_2 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const SITE_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+
+vi.mock('../services', () => ({}));
+
+vi.mock('../services/auditEvents', () => ({
+  writeRouteAudit: vi.fn()
+}));
+
+vi.mock('../services/filterEngine', () => ({
+  evaluateFilterWithPreview: vi.fn().mockResolvedValue({
+    totalCount: 1,
+    devices: [{
+      id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      hostname: 'host-1',
+      displayName: 'Host One',
+      osType: 'windows',
+      status: 'online',
+      lastSeenAt: new Date('2026-01-01')
+    }],
+    evaluatedAt: new Date('2026-01-01')
+  }),
+  extractFieldsFromFilter: vi.fn().mockReturnValue(['osType']),
+  validateFilter: vi.fn().mockReturnValue({ valid: true, errors: [] })
+}));
+
+vi.mock('../services/groupMembership', () => ({
+  evaluateGroupMembership: vi.fn().mockResolvedValue(undefined),
+  pinDeviceToGroup: vi.fn().mockResolvedValue(undefined)
+}));
+
+vi.mock('../db', () => ({
+  db: {
+    select: vi.fn(),
+    insert: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn()
+  }
+,
+  runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+}));
+
+vi.mock('../db/schema', () => ({
+  deviceGroups: {
+    id: 'id',
+    orgId: 'orgId',
+    siteId: 'siteId',
+    name: 'name',
+    type: 'type',
+    rules: 'rules',
+    filterConditions: 'filterConditions',
+    filterFieldsUsed: 'filterFieldsUsed',
+    parentId: 'parentId',
+    createdAt: 'createdAt',
+    updatedAt: 'updatedAt'
+  },
+  deviceGroupMemberships: {
+    deviceId: 'deviceId',
+    groupId: 'groupId',
+    isPinned: 'isPinned',
+    addedAt: 'addedAt',
+    addedBy: 'addedBy'
+  },
+  devices: {
+    id: 'id',
+    orgId: 'orgId',
+    hostname: 'hostname',
+    displayName: 'displayName',
+    status: 'status',
+    osType: 'osType'
+  },
+  configPolicyAssignments: {
+    id: 'id',
+    configPolicyId: 'configPolicyId',
+    level: 'level',
+    targetId: 'targetId',
+    priority: 'priority',
+    createdAt: 'createdAt',
+  },
+  configurationPolicies: {
+    id: 'id',
+    name: 'name',
+    status: 'status',
+  },
+  groupMembershipLog: {
+    id: 'id',
+    groupId: 'groupId',
+    deviceId: 'deviceId',
+    action: 'action',
+    reason: 'reason',
+    createdAt: 'createdAt'
+  }
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+      scope: 'organization',
+      orgId: '11111111-1111-1111-1111-111111111111',
+      partnerId: null,
+      accessibleOrgIds: ['11111111-1111-1111-1111-111111111111'],
+      canAccessOrg: (orgId: string) => orgId === '11111111-1111-1111-1111-111111111111'
+    });
+    return next();
+  }),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next())
+}));
+
+import { db } from '../db';
+import { authMiddleware } from '../middleware/auth';
+import { validateFilter } from '../services/filterEngine';
+
+function makeGroup(overrides: Record<string, unknown> = {}) {
+  return {
+    id: GROUP_ID,
+    orgId: ORG_ID,
+    siteId: null,
+    name: 'Test Group',
+    type: 'static',
+    rules: null,
+    filterConditions: null,
+    filterFieldsUsed: [],
+    parentId: null,
+    createdAt: new Date('2026-01-01'),
+    updatedAt: new Date('2026-01-01'),
+    ...overrides
+  };
+}
+
+const mockPolicySelect = (rows: any[] = []) => ({
+  from: vi.fn().mockReturnValue({
+    innerJoin: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        orderBy: vi.fn().mockResolvedValue(rows)
+      })
+    })
+  })
+});
+
+/**
+ * Flattens a drizzle condition to its static text, same approach as
+ * jobs/enrollmentKeyCleanup.test.ts's `sqlText` / enrollmentKeys_get_rotate_delete.test.ts's
+ * — needed because `deviceGroups`/`inArray` build a real drizzle SQL object
+ * even though the table itself is mocked to plain string column refs.
+ */
+function sqlText(q: unknown): string {
+  if (q == null) return '';
+  if (typeof q === 'string') return q;
+  if (typeof q === 'number') return String(q);
+  if (q instanceof Date) return q.toISOString();
+  if (Array.isArray(q)) return q.map(sqlText).join(' ');
+  const obj = q as { queryChunks?: unknown[]; value?: unknown; getSQL?: () => unknown };
+  if (Array.isArray(obj.queryChunks)) return obj.queryChunks.map(sqlText).join(' ');
+  if (Array.isArray(obj.value)) return (obj.value as unknown[]).map(sqlText).join('');
+  if (obj.value instanceof Date) return obj.value.toISOString();
+  if (typeof obj.value === 'string' || typeof obj.value === 'number') return String(obj.value);
+  if (typeof obj.getSQL === 'function') return sqlText(obj.getSQL());
+  return '';
+}
+
+/** Captures the condition handed to `db.select().from().where(...)` for the
+ *  groups list query, so a test can inspect which org ids actually made it
+ *  into the WHERE clause. */
+function mockGroupsSelectCaptureWhere(rows: any[]): () => unknown {
+  let captured: unknown;
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn((cond: unknown) => {
+        captured = cond;
+        return { orderBy: vi.fn().mockResolvedValue(rows) };
+      })
+    })
+  } as any);
+  return () => captured;
+}
+
+
+describe('groups routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+        scope: 'organization',
+        orgId: ORG_ID,
+        partnerId: null,
+        accessibleOrgIds: [ORG_ID],
+        canAccessOrg: (orgId: string) => orgId === ORG_ID
+      });
+      return next();
+    });
+    app = new Hono();
+    app.route('/groups', groupRoutes);
+  });
+
+  // ----------------------------------------------------------------
+  // GET / - List groups
+  // ----------------------------------------------------------------
+  describe('GET /groups', () => {
+    it('should list groups for the org', async () => {
+      const groups = [makeGroup(), makeGroup({ id: GROUP_ID_2, name: 'Second Group' })];
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockResolvedValue(groups)
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([
+                { groupId: GROUP_ID, count: 3 },
+                { groupId: GROUP_ID_2, count: 1 }
+              ])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce(mockPolicySelect([]) as any);
+
+      const res = await app.request('/groups', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(2);
+      expect(body.total).toBe(2);
+    });
+
+    it('should include policy information when group has policy assigned', async () => {
+      const groups = [makeGroup()];
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockResolvedValue(groups)
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([{ groupId: GROUP_ID, count: 1 }])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce(mockPolicySelect([
+          { groupId: GROUP_ID, policyId: 'policy-123', policyName: 'Server Baseline' }
+        ]) as any);
+
+      const res = await app.request('/groups', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].policy).toEqual({ id: 'policy-123', name: 'Server Baseline' });
+    });
+
+    it('should filter groups by type', async () => {
+      const groups = [makeGroup({ type: 'dynamic' })];
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockResolvedValue(groups)
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce(mockPolicySelect([]) as any);
+
+      const res = await app.request('/groups?type=dynamic', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+    });
+
+    it('should filter groups by search term', async () => {
+      const groups = [
+        makeGroup({ name: 'Production Servers' }),
+        makeGroup({ id: GROUP_ID_2, name: 'Dev Machines' })
+      ];
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockResolvedValue(groups)
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce(mockPolicySelect([]) as any);
+
+      const res = await app.request('/groups?search=prod', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].name).toBe('Production Servers');
+    });
+
+    it('should return empty for org user with no orgId', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: null,
+          partnerId: null,
+          accessibleOrgIds: [],
+          canAccessOrg: () => false
+        });
+        return next();
+      });
+
+      const res = await app.request('/groups', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toEqual([]);
+      expect(body.total).toBe(0);
+    });
+
+    it('should return deviceIds when includeMemberships=true', async () => {
+      const groups = [makeGroup(), makeGroup({ id: GROUP_ID_2, name: 'Second Group' })];
+      vi.mocked(db.select)
+        // First call: fetch groups
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockResolvedValue(groups)
+            })
+          })
+        } as any)
+        // Second call: device counts
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([
+                { groupId: GROUP_ID, count: 2 },
+                { groupId: GROUP_ID_2, count: 1 }
+              ])
+            })
+          })
+        } as any)
+        // Third call: membership deviceIds
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              { groupId: GROUP_ID, deviceId: DEVICE_ID },
+              { groupId: GROUP_ID, deviceId: DEVICE_ID_2 },
+              { groupId: GROUP_ID_2, deviceId: DEVICE_ID }
+            ])
+          })
+        } as any)
+        // Fourth call: policy assignments
+        .mockReturnValueOnce(mockPolicySelect([]) as any);
+
+      const res = await app.request('/groups?includeMemberships=true', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(2);
+      expect(body.data[0].deviceIds).toEqual([DEVICE_ID, DEVICE_ID_2]);
+      expect(body.data[1].deviceIds).toEqual([DEVICE_ID]);
+    });
+
+    it('should not return deviceIds when includeMemberships is not set', async () => {
+      const groups = [makeGroup()];
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockResolvedValue(groups)
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([{ groupId: GROUP_ID, count: 3 }])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce(mockPolicySelect([]) as any);
+
+      const res = await app.request('/groups', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data[0].deviceIds).toBeUndefined();
+    });
+
+    it('should not return deviceIds when includeMemberships=false', async () => {
+      const groups = [makeGroup()];
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockResolvedValue(groups)
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([{ groupId: GROUP_ID, count: 3 }])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce(mockPolicySelect([]) as any);
+
+      const res = await app.request('/groups?includeMemberships=false', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data[0].deviceIds).toBeUndefined();
+    });
+
+    it('should return empty data when includeMemberships=true and no groups exist', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any);
+
+      const res = await app.request('/groups?includeMemberships=true', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(0);
+      expect(body.total).toBe(0);
+    });
+
+    it('paper cut #10: a partner-scoped ?orgId= narrows the WHERE to that org only, not every accessible org', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'partner',
+          orgId: null,
+          partnerId: PARTNER_ID,
+          accessibleOrgIds: [ORG_ID, ORG_ID_2],
+          canAccessOrg: (orgId: string) => orgId === ORG_ID || orgId === ORG_ID_2
+        });
+        return next();
+      });
+
+      vi.mocked(db.select).mockReset();
+      const getWhereArg = mockGroupsSelectCaptureWhere([makeGroup()]);
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([{ groupId: GROUP_ID, count: 1 }])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce(mockPolicySelect([]) as any);
+
+      const res = await app.request(`/groups?orgId=${ORG_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const where = sqlText(getWhereArg());
+      expect(where).toContain(ORG_ID);
+      expect(where).not.toContain(ORG_ID_2);
+    });
+
+    it('paper cut #10: a partner-scoped ?orgId= outside the accessible set returns empty, never a 403', async () => {
+      const OUTSIDE_ORG_ID = '99999999-9999-4999-8999-999999999999';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'partner',
+          orgId: null,
+          partnerId: PARTNER_ID,
+          accessibleOrgIds: [ORG_ID, ORG_ID_2],
+          canAccessOrg: (orgId: string) => orgId === ORG_ID || orgId === ORG_ID_2
+        });
+        return next();
+      });
+
+      const res = await app.request(`/groups?orgId=${OUTSIDE_ORG_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toEqual([]);
+      expect(body.total).toBe(0);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+  });
+
+});

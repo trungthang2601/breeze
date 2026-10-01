@@ -1,0 +1,278 @@
+//go:build windows
+
+package mssql
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// validateSQLIdentifier ensures a SQL identifier (database or instance name) contains
+// only safe characters: alphanumeric, underscore, hyphen, dot, space.
+// This prevents T-SQL injection via crafted identifiers.
+func validateSQLIdentifier(name string) error {
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' || r == ' ') {
+			return fmt.Errorf("invalid character %q in SQL identifier %q", r, name)
+		}
+	}
+	return nil
+}
+
+// RunBackup executes a SQL Server backup via sqlcmd.
+//
+// Supported backupType values: "full", "differential", "log".
+//
+// outputPath is accepted for source compatibility with existing callers
+// (it used to be the directory the Breeze helper's own process wrote the
+// backup file into) but is no longer used to place the file: BACKUP
+// DATABASE/LOG is executed by the SQL Server service, not the Breeze
+// helper, so the file has to land somewhere that service's own account can
+// open — which the helper's process-local staging directory generally is
+// not (D23: the helper runs as SYSTEM, whose os.TempDir() resolves to
+// C:\Windows\SystemTemp, closed to the SQL Server service account). See
+// resolveBackupTargetDir, which RunBackup uses instead.
+//
+// Returns a BackupResult with file location and LSN chain info.
+func RunBackup(instance, database, backupType, outputPath string) (*BackupResult, error) {
+	if instance == "" {
+		return nil, fmt.Errorf("%w: instance name is required", ErrBackupFailed)
+	}
+	if database == "" {
+		return nil, fmt.Errorf("%w: database name is required", ErrBackupFailed)
+	}
+	if err := validateSQLIdentifier(instance); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBackupFailed, err)
+	}
+	if err := validateSQLIdentifier(database); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBackupFailed, err)
+	}
+
+	start := time.Now()
+	serverName := buildServerName(instance)
+
+	var ext string
+	switch backupType {
+	case "full":
+		ext = ".bak"
+	case "differential":
+		ext = ".bak"
+	case "log":
+		ext = ".trn"
+	default:
+		return nil, fmt.Errorf("%w: unsupported backup type %q", ErrBackupFailed, backupType)
+	}
+
+	targetDir, err := resolveBackupTargetDir(instance, serverName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve backup target directory: %v", ErrBackupFailed, err)
+	}
+
+	timestamp := time.Now().Format("20060102_150405")
+	filename := fmt.Sprintf("%s_%s_%s%s", database, backupType, timestamp, ext)
+	backupFile := filepath.Join(targetDir, filename)
+
+	edition, editionErr := queryEdition(serverName)
+	if editionErr != nil {
+		slog.Warn("mssql: failed to determine edition for compression decision; will attempt WITH COMPRESSION and fall back on Msg 1844",
+			"instance", instance, "error", editionErr.Error())
+	}
+	includeCompression := !isExpressEdition(edition)
+
+	slog.Info("mssql backup starting",
+		"instance", instance,
+		"database", database,
+		"type", backupType,
+		"file", backupFile,
+		"edition", edition,
+		"compression", includeCompression,
+	)
+
+	out, compressed, err := executeBackupStatement(serverName, database, backupFile, backupType, includeCompression)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBackupFailed, err)
+	}
+
+	// Check for errors in output
+	if containsSqlError(out) {
+		return nil, fmt.Errorf("%w: %s", ErrBackupFailed, extractSqlError(out))
+	}
+
+	duration := time.Since(start)
+
+	// Get file size
+	var sizeBytes int64
+	if info, statErr := os.Stat(backupFile); statErr == nil {
+		sizeBytes = info.Size()
+	}
+
+	result := &BackupResult{
+		InstanceName: instance,
+		DatabaseName: database,
+		BackupType:   backupType,
+		BackupFile:   backupFile,
+		SizeBytes:    sizeBytes,
+		Compressed:   compressed,
+		DurationMs:   duration.Milliseconds(),
+	}
+
+	// Query LSN information from backup header
+	lsnQuery := fmt.Sprintf(
+		`RESTORE HEADERONLY FROM DISK='%s'`,
+		strings.ReplaceAll(backupFile, "'", "''"),
+	)
+	lsnOut, lsnErr := runSqlcmd(serverName, lsnQuery)
+	if lsnErr != nil {
+		slog.Warn("mssql: failed to retrieve LSN info", "error", lsnErr.Error())
+	} else {
+		parseLSNInfo(lsnOut, result)
+	}
+
+	slog.Info("mssql backup completed",
+		"instance", instance,
+		"database", database,
+		"type", backupType,
+		"file", backupFile,
+		"sizeBytes", sizeBytes,
+		"compressed", compressed,
+		"durationMs", duration.Milliseconds(),
+	)
+
+	return result, nil
+}
+
+// containsSqlError and extractSqlError (generic sqlcmd-output error
+// detection, used by backup.go and restore.go) now live in sqlcmd.go, tag-
+// neutral like the rest of the sqlcmd output-parsing helpers, since
+// backuptarget.go needs them too to tell a real SERVERPROPERTY value apart
+// from a T-SQL error message riding in on the same successful-exit output.
+
+// parseLSNInfo extracts LSN values from RESTORE HEADERONLY output.
+func parseLSNInfo(output string, result *BackupResult) {
+	// RESTORE HEADERONLY returns a wide row; we parse by column header position.
+	// The key columns: FirstLSN, LastLSN, DatabaseBackupLSN
+	lines := strings.Split(output, "\n")
+	if len(lines) < 2 {
+		return
+	}
+
+	// With -s "|" separator, find column indices from header row
+	// Simplified: just look for numeric LSN patterns in the data line
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "-") || strings.HasPrefix(line, "(") {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) < 30 {
+			continue
+		}
+		// HEADERONLY standard column positions (0-indexed):
+		// FirstLSN=18, LastLSN=19, DatabaseBackupLSN=28
+		if len(parts) > 19 {
+			result.FirstLSN = strings.TrimSpace(parts[18])
+			result.LastLSN = strings.TrimSpace(parts[19])
+		}
+		if len(parts) > 28 {
+			result.DatabaseLSN = strings.TrimSpace(parts[28])
+		}
+		break
+	}
+}
+
+// ListBackups queries msdb for backup history of a given database.
+func ListBackups(instance, database string, limit int) ([]BackupResult, error) {
+	if instance == "" {
+		return nil, fmt.Errorf("%w: instance name is required", ErrBackupFailed)
+	}
+
+	serverName := buildServerName(instance)
+
+	if limit <= 0 {
+		limit = 20
+	}
+
+	escapedDB := strings.ReplaceAll(database, "'", "''")
+	whereClause := ""
+	if database != "" {
+		whereClause = fmt.Sprintf("WHERE bs.database_name = '%s'", escapedDB)
+	}
+
+	query := fmt.Sprintf(`SELECT TOP %d
+		bs.database_name,
+		CASE bs.type WHEN 'D' THEN 'full' WHEN 'I' THEN 'differential' WHEN 'L' THEN 'log' ELSE 'other' END,
+		bmf.physical_device_name,
+		CAST(bs.backup_size AS BIGINT),
+		bs.compressed_backup_size,
+		CAST(bs.first_lsn AS VARCHAR(50)),
+		CAST(bs.last_lsn AS VARCHAR(50)),
+		CAST(bs.database_backup_lsn AS VARCHAR(50)),
+		DATEDIFF(ms, bs.backup_start_date, bs.backup_finish_date)
+	FROM msdb.dbo.backupset bs
+	JOIN msdb.dbo.backupmediafamily bmf ON bs.media_set_id = bmf.media_set_id
+	%s
+	ORDER BY bs.backup_start_date DESC`,
+		limit, whereClause,
+	)
+
+	out, err := runSqlcmd(serverName, query)
+	if err != nil {
+		return nil, fmt.Errorf("list backups: %w", err)
+	}
+
+	var results []BackupResult
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "-") || strings.HasPrefix(line, "(") {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) < 9 {
+			continue
+		}
+
+		sizeBytes, parseErr := strconv.ParseInt(strings.TrimSpace(parts[3]), 10, 64)
+		if parseErr != nil {
+			slog.Warn("mssql: failed to parse backup size", "value", strings.TrimSpace(parts[3]), "error", parseErr.Error())
+		}
+		compressedSize, parseErr := strconv.ParseInt(strings.TrimSpace(parts[4]), 10, 64)
+		if parseErr != nil {
+			slog.Warn("mssql: failed to parse compressed size", "value", strings.TrimSpace(parts[4]), "error", parseErr.Error())
+		}
+		durationMs, parseErr := strconv.ParseInt(strings.TrimSpace(parts[8]), 10, 64)
+		if parseErr != nil {
+			slog.Warn("mssql: failed to parse duration", "value", strings.TrimSpace(parts[8]), "error", parseErr.Error())
+		}
+
+		results = append(results, BackupResult{
+			InstanceName: instance,
+			DatabaseName: strings.TrimSpace(parts[0]),
+			BackupType:   strings.TrimSpace(parts[1]),
+			BackupFile:   strings.TrimSpace(parts[2]),
+			SizeBytes:    sizeBytes,
+			Compressed:   compressedSize > 0 && compressedSize < sizeBytes,
+			FirstLSN:     strings.TrimSpace(parts[5]),
+			LastLSN:      strings.TrimSpace(parts[6]),
+			DatabaseLSN:  strings.TrimSpace(parts[7]),
+			DurationMs:   durationMs,
+		})
+	}
+
+	return results, nil
+}
+
+// queryEdition (windows-only caller side, kept here so non-Windows lint does not
+// flag it unused) returns the instance's SERVERPROPERTY('Edition') value,
+// e.g. "Express Edition (64-bit)".
+func queryEdition(serverName string) (string, error) {
+	out, err := runSqlcmd(serverName, "SELECT SERVERPROPERTY('Edition')")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(parseSqlcmdSingleValue(out)), nil
+}

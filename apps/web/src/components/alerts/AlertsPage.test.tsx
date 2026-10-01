@@ -1,0 +1,881 @@
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import AlertsPage from './AlertsPage';
+import { fetchWithAuth } from '../../stores/auth';
+
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn()
+}));
+
+const showToast = vi.fn();
+vi.mock('../shared/Toast', () => ({ showToast: (a: unknown) => showToast(a) }));
+
+const navigateTo = vi.fn();
+vi.mock('@/lib/navigation', () => ({ navigateTo: (...args: unknown[]) => navigateTo(...args) }));
+
+// The device filter bar issues its own fetches; stub it out so the page's
+// alert/device fetches are the only traffic under test.
+vi.mock('../filters/DeviceFilterBar', () => ({
+  DeviceFilterBar: ({ onChange }: { onChange: (filter: unknown) => void }) => <button data-testid="apply-device-filter"
+    onClick={() => onChange({ operator: 'AND', conditions: [{ field: 'status', operator: 'equals', value: 'online' }] })}>Apply</button>
+}));
+
+// Pin the org-scope selectors so the page doesn't try to read a real store.
+// `mockCurrentOrgId` is mutable so a test can simulate an org switch (a rerender
+// re-runs the selector and picks up the new value); it resets to 'org-1' before
+// every test via the file-level beforeEach below.
+let mockCurrentOrgId: string | null = 'org-1';
+vi.mock('../../stores/orgStore', () => ({
+  useOrgStore: (selector: (s: { orgScope: string; currentOrgId: string | null }) => unknown) =>
+    selector({ orgScope: 'current', currentOrgId: mockCurrentOrgId })
+}));
+
+beforeEach(() => {
+  mockCurrentOrgId = 'org-1';
+});
+
+const fetchMock = vi.mocked(fetchWithAuth);
+
+const ALERT_ID = '5d4c3b2a-1111-4222-8333-444455556666';
+
+const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
+  ({
+    ok,
+    status,
+    statusText: ok ? 'OK' : 'ERROR',
+    json: vi.fn().mockResolvedValue(payload)
+  }) as unknown as Response;
+
+const activeAlert = {
+  id: ALERT_ID,
+  title: 'High CPU on SRV-01',
+  message: 'CPU above 95% for 5 minutes',
+  severity: 'critical',
+  status: 'active',
+  deviceId: 'device-1',
+  deviceName: 'SRV-01',
+  triggeredAt: new Date().toISOString()
+};
+
+const remediationFlags = (enabled: boolean, alertCorrelationEnabled = true) => ({
+  mlFeatureFlags: {
+    'ml.alert_correlation.enabled': {
+      flag: 'ml.alert_correlation.enabled',
+      enabled: alertCorrelationEnabled,
+      defaultEnabled: false,
+      source: 'org_settings',
+    },
+    'ml.remediation_suggestions.enabled': {
+      flag: 'ml.remediation_suggestions.enabled',
+      enabled,
+      defaultEnabled: false,
+      source: 'org_settings',
+    },
+  },
+});
+
+/** A promise we can resolve from the test body to simulate a slow ack. */
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe('AlertsPage — acknowledge in-flight feedback', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('shows an in-flight spinner on the acked row while the request is pending, then a success toast', async () => {
+    const ackDeferred = deferred<Response>();
+
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [activeAlert] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === `/alerts/${ALERT_ID}/acknowledge` && method === 'POST') {
+        // Deliberately do NOT resolve yet — this models the ~19s ack.
+        return ackDeferred.promise;
+      }
+      return Promise.resolve(makeJsonResponse({ error: 'unexpected' }, false, 404));
+    });
+
+    render(<AlertsPage />);
+
+    // Wait for the alert row to render.
+    const ackButton = await screen.findByRole('button', { name: /Acknowledge: High CPU on SRV-01/i });
+    const row = ackButton.closest('tr')!;
+
+    // Click Ack — the request is now in flight (deferred, unresolved).
+    fireEvent.click(ackButton);
+
+    // While in flight, the row must surface a spinner and hide the action buttons.
+    await waitFor(() => {
+      expect(within(row).queryByRole('button', { name: /Acknowledge:/i })).not.toBeInTheDocument();
+    });
+    expect(row.querySelector('.animate-spin')).toBeInTheDocument();
+
+    // No success toast yet — the request hasn't returned.
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+
+    // Resolve the ack.
+    ackDeferred.resolve(makeJsonResponse({ success: true }));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+    });
+  });
+
+  it('disables the AlertDetails Acknowledge button and shows a spinner while the request is pending', async () => {
+    const ackDeferred = deferred<Response>();
+
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [activeAlert] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === `/alerts/${ALERT_ID}` && method === 'GET') {
+        // Detail-panel fetch (status/notification history).
+        return Promise.resolve(makeJsonResponse({ statusHistory: [], notificationHistory: [] }));
+      }
+      if (url === '/config/ml-feature-flags' && method === 'GET') {
+        return Promise.resolve(makeJsonResponse(remediationFlags(true)));
+      }
+      if (url === `/remediation-suggestions?sourceType=alert&sourceId=${ALERT_ID}&limit=5` && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === `/alerts/${ALERT_ID}/acknowledge` && method === 'POST') {
+        return ackDeferred.promise;
+      }
+      return Promise.resolve(makeJsonResponse({ error: 'unexpected' }, false, 404));
+    });
+
+    render(<AlertsPage />);
+
+    // Open the slide-over by clicking the row (the title cell).
+    const titleCell = await screen.findByText('High CPU on SRV-01');
+    fireEvent.click(titleCell);
+
+    // The detail panel's Acknowledge button (full word, distinct from the row "Ack").
+    const dialog = await screen.findByRole('dialog');
+    const detailAck = within(dialog).getByRole('button', { name: /^Acknowledge$/i });
+    expect(detailAck).not.toBeDisabled();
+
+    fireEvent.click(detailAck);
+
+    // In flight: button disabled + spinner present in the dialog footer.
+    await waitFor(() => expect(detailAck).toBeDisabled());
+    expect(dialog.querySelector('.animate-spin')).toBeInTheDocument();
+
+    ackDeferred.resolve(makeJsonResponse({ success: true }));
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+    });
+  });
+
+  it('loads and generates suggested fixes from the selected alert', async () => {
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [activeAlert] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === `/alerts/${ALERT_ID}` && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ statusHistory: [], notificationHistory: [] }));
+      }
+      if (url === '/config/ml-feature-flags' && method === 'GET') {
+        return Promise.resolve(makeJsonResponse(remediationFlags(true)));
+      }
+      if (url === `/remediation-suggestions?sourceType=alert&sourceId=${ALERT_ID}&limit=5` && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === '/remediation-suggestions/generate' && method === 'POST') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+    render(<AlertsPage />);
+
+    fireEvent.click(await screen.findByText('High CPU on SRV-01'));
+
+    const dialog = await screen.findByRole('dialog');
+    await within(dialog).findByText('Suggested Fixes');
+    expect(fetchMock).toHaveBeenCalledWith(`/remediation-suggestions?sourceType=alert&sourceId=${ALERT_ID}&limit=5`);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /^Generate$/i }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/remediation-suggestions/generate',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ sourceType: 'alert', sourceId: ALERT_ID, limit: 3 }),
+        }),
+      );
+    });
+  });
+
+  it('surfaces an error toast when the acknowledge request fails', async () => {
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [activeAlert] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === `/alerts/${ALERT_ID}/acknowledge` && method === 'POST') {
+        return Promise.resolve(makeJsonResponse({ error: 'boom' }, false, 500));
+      }
+      return Promise.resolve(makeJsonResponse({ error: 'unexpected' }, false, 404));
+    });
+
+    render(<AlertsPage />);
+    const ackButton = await screen.findByRole('button', { name: /Acknowledge: High CPU on SRV-01/i });
+    fireEvent.click(ackButton);
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }));
+    });
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+  });
+
+  it('shows grouped incident count and noise reduction in the alert list', async () => {
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({
+          data: [{
+            ...activeAlert,
+            deviceName: undefined,
+            deviceHostname: 'SRV-01',
+            correlationGroupId: '6f5e4d3c-2222-4333-8444-555566667777',
+            correlationRole: 'root',
+            correlationGroupStatus: 'open',
+            correlationMemberCount: 4,
+            correlationChildCount: 3,
+            noiseReductionPercent: 75,
+          }]
+        }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: 'unexpected' }, false, 404));
+    });
+
+    render(<AlertsPage />);
+
+    expect(await screen.findByText('Grouped incident: 3 related · 75% noise cut')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /SRV-01/i })).toHaveAttribute('href', '/devices/device-1');
+  });
+
+  it('labels grouped incidents without linking when alert correlation is disabled', async () => {
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/config/ml-feature-flags' && method === 'GET') {
+        return Promise.resolve(makeJsonResponse(remediationFlags(true, false)));
+      }
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({
+          data: [{
+            ...activeAlert,
+            correlationGroupId: '6f5e4d3c-2222-4333-8444-555566667777',
+            correlationRole: 'root',
+            correlationGroupStatus: 'open',
+            correlationMemberCount: 4,
+            correlationChildCount: 3,
+            noiseReductionPercent: 75,
+          }]
+        }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+    render(<AlertsPage />);
+
+    const disabledBadge = (await screen.findByText('Grouped incident unavailable: alert correlation disabled')).closest('[aria-disabled]');
+    expect(disabledBadge).toHaveAttribute('aria-disabled', 'true');
+    expect(screen.queryByRole('link', { name: /Grouped incident/i })).toBeNull();
+  });
+
+  it('renders promoted metric anomaly context in the alert list and details panel', async () => {
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({
+          data: [{
+            ...activeAlert,
+            context: {
+              source: 'metric_anomaly',
+              anomalyId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+              metricName: 'cpu.usage',
+              metricType: 'gauge',
+              anomalyType: 'spike',
+              observedValue: 97.3,
+              baselineValue: 42.1,
+              confidence: 0.92,
+              score: 8.4,
+              modelVersion: 'rollup-v0',
+            },
+          }]
+        }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === `/alerts/${ALERT_ID}` && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ statusHistory: [], notificationHistory: [] }));
+      }
+      if (url === '/config/ml-feature-flags' && method === 'GET') {
+        return Promise.resolve(makeJsonResponse(remediationFlags(true)));
+      }
+      if (url === `/remediation-suggestions?sourceType=alert&sourceId=${ALERT_ID}&limit=5` && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+    render(<AlertsPage />);
+
+    expect(await screen.findByText('ML anomaly: cpu.usage · spike · 92%')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('High CPU on SRV-01'));
+    const dialog = await screen.findByRole('dialog');
+
+    expect(within(dialog).getByText('ML Anomaly Evidence')).toBeInTheDocument();
+    expect(within(dialog).getByText('cpu.usage')).toBeInTheDocument();
+    expect(within(dialog).getByText('spike')).toBeInTheDocument();
+    expect(within(dialog).getByText('97.30')).toBeInTheDocument();
+    expect(within(dialog).getByText('42.10')).toBeInTheDocument();
+    expect(within(dialog).getByText('92%')).toBeInTheDocument();
+    expect(within(dialog).getByRole('link', { name: /Open device anomalies/i })).toHaveAttribute(
+      'href',
+      '/devices/device-1#anomalies/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    );
+  });
+});
+
+describe('AlertsPage — empty state distinguishes no-devices from a healthy fleet', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const emptyStateMock = (devices: unknown[]) =>
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: devices, page: { nextCursor: null, returned: devices.length, total: devices.length, hasMore: false, observedAt: '2026-08-24T00:00:00.000Z' } }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+  it('shows an install-your-first-device prompt (not "fleet is healthy") when there are zero devices', async () => {
+    emptyStateMock([]);
+    render(<AlertsPage />);
+
+    // With no devices enrolled, "all clear / your fleet is healthy" would be a
+    // false health signal — the page must instead point at enrollment.
+    expect(await screen.findByText('No devices reporting yet')).toBeInTheDocument();
+    const installLink = screen.getByRole('link', { name: /Install your first device/i });
+    expect(installLink).toHaveAttribute('href', '/devices#add-device');
+    expect(screen.queryByText('No active alerts. Your fleet is healthy.')).not.toBeInTheDocument();
+  });
+
+  it('shows the healthy "all clear" state when at least one device is reporting but no alerts exist', async () => {
+    emptyStateMock([{ id: 'device-1', hostname: 'SRV-01' }]);
+    render(<AlertsPage />);
+
+    expect(await screen.findByText('No active alerts. Your fleet is healthy.')).toBeInTheDocument();
+    expect(screen.queryByText('No devices reporting yet')).not.toBeInTheDocument();
+  });
+
+  it('makes NO health claim while the devices request is still pending, then resolves to no-devices', async () => {
+    const devicesDeferred = deferred<Response>();
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return devicesDeferred.promise; // stays pending
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+    render(<AlertsPage />);
+
+    // Alerts have resolved empty, but devices are still in flight. The neutral
+    // device-status spinner must be showing (targeted by test id so it can't be
+    // confused with the initial "Loading alerts" spinner), and neither the
+    // "no devices" prompt nor the false "fleet is healthy" claim may appear.
+    expect(await screen.findByTestId('alerts-device-status-loading')).toBeInTheDocument();
+    expect(screen.queryByText('No devices reporting yet')).not.toBeInTheDocument();
+    expect(screen.queryByText('No active alerts. Your fleet is healthy.')).not.toBeInTheDocument();
+
+    // Devices come back empty -> now the enrollment prompt is correct.
+    devicesDeferred.resolve(makeJsonResponse({ data: [], page: { nextCursor: null, returned: 0, total: 0, hasMore: false, observedAt: '2026-08-24T00:00:00.000Z' } }));
+    expect(await screen.findByText('No devices reporting yet')).toBeInTheDocument();
+  });
+
+  it('shows a neutral "device status unavailable" state (never a health claim) when the devices request fails', async () => {
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ error: 'boom' }, false, 500));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+    render(<AlertsPage />);
+
+    // A failed devices fetch means we can prove neither "no devices" NOR
+    // "fleet is healthy" — the page must state only the fact it has (no active
+    // alerts) and flag the unknown device status.
+    expect(await screen.findByText("We couldn't load your device status. Refresh to try again.")).toBeInTheDocument();
+    expect(screen.queryByText('No devices reporting yet')).not.toBeInTheDocument();
+    expect(screen.queryByText('No active alerts. Your fleet is healthy.')).not.toBeInTheDocument();
+  });
+
+  it('drops a superseded devices response even on switch-back to the same org (A->B->A, the ABA case)', async () => {
+    // The hard case a value/org-id guard cannot catch: a slow FIRST org-A
+    // request resolving AFTER a newer org-A request. Only a monotonic per-fetch
+    // token distinguishes them, so the stale one must be dropped.
+    const staleA1 = deferred<Response>();
+    let devicesCall = 0;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        devicesCall += 1;
+        if (devicesCall === 1) return staleA1.promise;                              // A1: slow, resolves last
+        if (devicesCall === 2) return Promise.resolve(makeJsonResponse({ data: [], page: { nextCursor: null, returned: 0, total: 0, hasMore: false, observedAt: '2026-08-24T00:00:00.000Z' } })); // B: empty
+        return Promise.resolve(makeJsonResponse({ data: [{ id: 'a-1', hostname: 'A-SRV', displayName: null, osType: 'windows', status: 'online', siteId: null, siteName: null }], page: { nextCursor: null, returned: 1, total: 1, hasMore: false, observedAt: '2026-08-24T00:00:00.000Z' } })); // A2: has a device
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+    mockCurrentOrgId = 'org-A';
+    const { rerender } = render(<AlertsPage />);
+    expect(await screen.findByTestId('alerts-device-status-loading')).toBeInTheDocument(); // A1 pending
+
+    mockCurrentOrgId = 'org-B';
+    rerender(<AlertsPage />);
+    expect(await screen.findByText('No devices reporting yet')).toBeInTheDocument(); // B empty
+
+    mockCurrentOrgId = 'org-A';
+    rerender(<AlertsPage />);
+    // A2 has a device -> healthy is the correct, current state.
+    expect(await screen.findByText('No active alerts. Your fleet is healthy.')).toBeInTheDocument();
+
+    // A1 (the original, superseded request) now resolves carrying ZERO devices.
+    // Its org id still matches ('org-A'), so a value guard would wrongly commit
+    // it and flip the page to "No devices reporting yet". The generation token
+    // must drop it, leaving A2's healthy state intact.
+    await act(async () => {
+      staleA1.resolve(makeJsonResponse({ data: [] }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText('No active alerts. Your fleet is healthy.')).toBeInTheDocument();
+    expect(screen.queryByText('No devices reporting yet')).not.toBeInTheDocument();
+  });
+});
+
+describe('AlertsPage — suppress duration picker', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const listOnlyMock = (suppressResponse: () => Promise<Response>) =>
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [activeAlert] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === `/alerts/${ALERT_ID}/suppress` && method === 'POST') {
+        return suppressResponse();
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+  it('opens the duration picker instead of firing a blind POST (the original bug)', async () => {
+    listOnlyMock(() => Promise.resolve(makeJsonResponse({ id: ALERT_ID, status: 'suppressed' })));
+
+    render(<AlertsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i }));
+
+    // The dialog is shown and NO suppress request has been sent yet.
+    expect(await screen.findByTestId('suppress-confirm')).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `/alerts/${ALERT_ID}/suppress`,
+      expect.anything(),
+    );
+  });
+
+  it('sends the default 24h "until" timestamp in the body when confirmed', async () => {
+    listOnlyMock(() => Promise.resolve(makeJsonResponse({ id: ALERT_ID, status: 'suppressed' })));
+
+    render(<AlertsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i }));
+    const before = Date.now();
+    fireEvent.click(await screen.findByTestId('suppress-confirm'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/alerts/${ALERT_ID}/suppress`,
+        expect.objectContaining({ method: 'POST', body: expect.any(String) }),
+      );
+    });
+
+    const call = fetchMock.mock.calls.find(([url]) => url === `/alerts/${ALERT_ID}/suppress`)!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(typeof body.until).toBe('string');
+    // Default preset is 24h — guard the value, not just "in the future", so a
+    // regression to a different default is caught.
+    const untilMs = new Date(body.until).getTime();
+    expect(untilMs).toBeGreaterThanOrEqual(before + 24 * 60 * 60 * 1000 - 2000);
+    expect(untilMs).toBeLessThanOrEqual(Date.now() + 24 * 60 * 60 * 1000 + 2000);
+  });
+
+  it('sends no "until" in the body when Forever is chosen', async () => {
+    listOnlyMock(() => Promise.resolve(makeJsonResponse({ id: ALERT_ID, status: 'suppressed' })));
+
+    render(<AlertsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i }));
+    fireEvent.click(await screen.findByTestId('suppress-duration-forever'));
+    fireEvent.click(await screen.findByTestId('suppress-confirm'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/alerts/${ALERT_ID}/suppress`,
+        expect.objectContaining({ method: 'POST', body: expect.any(String) }),
+      );
+    });
+
+    const call = fetchMock.mock.calls.find(([url]) => url === `/alerts/${ALERT_ID}/suppress`)!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    // Forever == no deadline: the body carries no `until` key at all.
+    expect(body).not.toHaveProperty('until');
+  });
+
+  it('reverts the optimistic update and surfaces the server error when suppression fails', async () => {
+    listOnlyMock(() => Promise.resolve(makeJsonResponse({ error: 'Cannot suppress a resolved alert' }, false, 400)));
+
+    render(<AlertsPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i }));
+    fireEvent.click(await screen.findByTestId('suppress-confirm'));
+
+    // The server's specific reason is shown, not a generic message.
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error', message: 'Cannot suppress a resolved alert' }),
+      );
+    });
+    // Optimistic suppression is rolled back: the row's Suppress button returns.
+    expect(await screen.findByRole('button', { name: /Suppress: High CPU on SRV-01/i })).toBeInTheDocument();
+  });
+
+  it('hides the Mute button on resolved alerts (the suppress endpoint rejects them)', async () => {
+    const resolvedAlert = { ...activeAlert, status: 'resolved' };
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [resolvedAlert] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+    render(<AlertsPage />);
+    // The row renders...
+    expect(await screen.findByText('High CPU on SRV-01')).toBeInTheDocument();
+    // ...but with no Mute/Suppress action, since the backend returns
+    // "Cannot suppress a resolved alert" for resolved alerts.
+    expect(screen.queryByRole('button', { name: /Suppress: High CPU on SRV-01/i })).not.toBeInTheDocument();
+  });
+});
+
+describe('AlertsPage — bulk suppress', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const bulkMock = () =>
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [activeAlert] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === '/alerts/bulk' && method === 'POST') {
+        return Promise.resolve(makeJsonResponse({ updated: 1, skipped: 0, failed: 0 }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+  it('opens the duration picker and POSTs /alerts/bulk with action:suppress + until on confirm', async () => {
+    bulkMock();
+    render(<AlertsPage />);
+
+    // Select the alert, open the bulk menu, choose Suppress.
+    fireEvent.click(await screen.findByRole('checkbox', { name: /Select High CPU on SRV-01/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Bulk Actions/i }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /Suppress/i }));
+
+    // The duration picker opens; no bulk POST has fired yet.
+    expect(await screen.findByTestId('suppress-confirm')).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith('/alerts/bulk', expect.anything());
+
+    const before = Date.now();
+    fireEvent.click(screen.getByTestId('suppress-confirm'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/alerts/bulk',
+        expect.objectContaining({ method: 'POST', body: expect.any(String) }),
+      );
+    });
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/alerts/bulk')!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.action).toBe('suppress');
+    expect(body.alertIds).toEqual([ALERT_ID]);
+    const untilMs = new Date(body.until).getTime();
+    expect(untilMs).toBeGreaterThanOrEqual(before + 24 * 60 * 60 * 1000 - 2000);
+    expect(untilMs).toBeLessThanOrEqual(Date.now() + 24 * 60 * 60 * 1000 + 2000);
+
+    // Past-tense success copy ("suppressed", not "suppressd").
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ message: '1 alert suppressed' }),
+      );
+    });
+  });
+
+  it('sends no "until" in the /alerts/bulk body when Forever is chosen', async () => {
+    bulkMock();
+    render(<AlertsPage />);
+
+    // Select the alert, open the bulk menu, choose Suppress.
+    fireEvent.click(await screen.findByRole('checkbox', { name: /Select High CPU on SRV-01/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Bulk Actions/i }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /Suppress/i }));
+
+    expect(await screen.findByTestId('suppress-confirm')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('suppress-duration-forever'));
+    fireEvent.click(screen.getByTestId('suppress-confirm'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/alerts/bulk',
+        expect.objectContaining({ method: 'POST', body: expect.any(String) }),
+      );
+    });
+
+    const call = fetchMock.mock.calls.find(([url]) => url === '/alerts/bulk')!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.action).toBe('suppress');
+    // Forever == no deadline: the body carries no `until` key at all.
+    expect(body).not.toHaveProperty('until');
+  });
+
+  it('warns (not success) when the bulk suppress changes nothing (all skipped)', async () => {
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if ((url === '/alerts' || url.startsWith('/alerts?')) && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [activeAlert] }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === '/alerts/bulk' && method === 'POST') {
+        // Server processed the request but nothing changed (e.g. every selected
+        // alert was already resolved, so suppress skipped them all).
+        return Promise.resolve(makeJsonResponse({ updated: 0, skipped: 1, failed: 0 }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+    render(<AlertsPage />);
+
+    fireEvent.click(await screen.findByRole('checkbox', { name: /Select High CPU on SRV-01/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Bulk Actions/i }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /Suppress/i }));
+    fireEvent.click(await screen.findByTestId('suppress-confirm'));
+
+    // A truthful warning, NOT a green "1 suppressed".
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'warning', message: 'No alerts suppressed — 1 skipped' }),
+      );
+    });
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+  });
+});
+
+describe('AlertsPage — dismiss', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const resolvedAlert = { ...activeAlert, status: 'resolved' };
+
+  const dismissMock = (rows: unknown[]) =>
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url.startsWith('/alerts?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: rows }));
+      }
+      if (url.startsWith('/devices/options?') && method === 'GET') {
+        return Promise.resolve(makeJsonResponse({ data: [] }));
+      }
+      if (url === '/alerts/bulk' && method === 'POST') {
+        return Promise.resolve(makeJsonResponse({ updated: 1, skipped: 0, failed: 0 }));
+      }
+      return Promise.resolve(makeJsonResponse({ error: `unexpected ${method} ${url}` }, false, 404));
+    });
+
+  it('offers Dismiss on a RESOLVED alert (which has no other row actions)', async () => {
+    dismissMock([resolvedAlert]);
+    render(<AlertsPage />);
+
+    // Resolved alerts have no Ack/Resolve/Mute, but Dismiss must still be there —
+    // this is the exact dead-end the feature exists to fix.
+    expect(await screen.findByRole('button', { name: /Dismiss: High CPU on SRV-01/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Suppress: High CPU on SRV-01/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Resolve: High CPU on SRV-01/i })).not.toBeInTheDocument();
+  });
+
+  it('shows the confirm bar for a SINGLE dismiss (unlike ack/resolve) and POSTs action:dismiss', async () => {
+    dismissMock([resolvedAlert]);
+    render(<AlertsPage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Dismiss: High CPU on SRV-01/i }));
+
+    // A single dismiss must still confirm (permanent, no un-dismiss) — the
+    // "Permanently dismiss" confirm bar appears and no POST has fired yet.
+    expect(await screen.findByText(/Permanently dismiss 1 alert\?/i)).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith('/alerts/bulk', expect.anything());
+
+    fireEvent.click(screen.getByRole('button', { name: /^Confirm$/i }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/alerts/bulk',
+        expect.objectContaining({ method: 'POST', body: expect.any(String) }),
+      );
+    });
+    const call = fetchMock.mock.calls.find(([url]) => url === '/alerts/bulk')!;
+    const body = JSON.parse((call[1] as RequestInit).body as string);
+    expect(body.action).toBe('dismiss');
+    expect(body.alertIds).toEqual([ALERT_ID]);
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ message: '1 alert dismissed' }));
+    });
+  });
+
+  it('hides a dismissed alert from the default view, and shows it without a Dismiss button under the Dismissed filter', async () => {
+    dismissMock([{ ...activeAlert, status: 'dismissed' }]);
+    render(<AlertsPage />);
+
+    // Default "All Status" view excludes dismissed alerts entirely.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(screen.queryByText('High CPU on SRV-01')).not.toBeInTheDocument();
+
+    // Select the Dismissed filter: the row now shows, but with no Dismiss action
+    // (it's already dismissed — terminal).
+    fireEvent.click(screen.getByRole('button', { name: /Filters/i }));
+    // The status filter is the first <select> in the filter panel.
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'dismissed' } });
+
+    expect(await screen.findByText('High CPU on SRV-01')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Dismiss: High CPU on SRV-01/i })).not.toBeInTheDocument();
+  });
+});
+
+
+describe('AlertsPage complete device filter scope (RMM-QA-153)', () => {
+  it.each([401, 403, 503])('blocks captured bulk dismiss on %s, hides device-less alerts and retries with idsOnly', async status => {
+    vi.clearAllMocks();
+    let previews = 0;
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.startsWith('/alerts') && (!init?.method || init.method === 'GET')) {
+        return makeJsonResponse({ data: [activeAlert, { ...activeAlert, id: 'no-device', deviceId: null, title: 'Organization alert' }] });
+      }
+      if (url === '/filters/preview') {
+        previews++;
+        expect(JSON.parse(init!.body as string)).toEqual(expect.objectContaining({ idsOnly: true }));
+        return previews === 1 ? makeJsonResponse({}, false, status)
+          : makeJsonResponse({ data: { totalCount: 1, deviceIds: ['device-1'] } });
+      }
+      return makeJsonResponse({ data: [] });
+    });
+    render(<AlertsPage />);
+    await screen.findByText(activeAlert.title);
+    fireEvent.click(screen.getAllByRole('checkbox')[0]!);
+    fireEvent.click(screen.getByRole('button', { name: /bulk actions/i }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /dismiss/i }));
+    expect(screen.getByRole('button', { name: 'Confirm' })).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('apply-device-filter'));
+    expect(screen.queryByRole('button', { name: 'Confirm' })).not.toBeInTheDocument();
+    await screen.findByTestId('alert-device-filter-error');
+    expect(screen.queryByText(activeAlert.title)).not.toBeInTheDocument();
+    expect(screen.queryByText('Organization alert')).not.toBeInTheDocument();
+    expect(screen.getAllByRole('checkbox').every(input => (input as HTMLInputElement).disabled)).toBe(true);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/alerts/bulk'))).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await screen.findByText(activeAlert.title);
+    expect(screen.queryByText('Organization alert')).not.toBeInTheDocument();
+    expect(previews).toBe(2);
+  });
+});

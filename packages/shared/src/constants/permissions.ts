@@ -1,0 +1,251 @@
+// Canonical permission registry — the single source of truth for resource:action
+// grants. Shared so the API (requirePermission, role seeding) and the web UI
+// (permission-aware nav/action gating) type their permission references against
+// the same closed set. The API re-exports this as `PERMISSIONS` from
+// `services/permissions.ts`; the web derives `PermissionGrant`/`PermissionResource`/
+// `PermissionAction` for its gate literals.
+//
+// Adding a permission: add it here (and to DEFAULT_PERMISSIONS in the API seed +
+// a migration that inserts the row). A typo'd resource/action in any gate then
+// fails to compile instead of silently never matching.
+//
+// NB: named PERMISSION_GRANTS (not PERMISSIONS) to avoid colliding with the
+// older nested PERMISSIONS constant in this package.
+export const PERMISSION_GRANTS = {
+  // Backup / recovery
+  BACKUP_READ: { resource: 'backup', action: 'read' },
+  BACKUP_WRITE: { resource: 'backup', action: 'write' },
+  BACKUP_CROSS_SITE_RESTORE: { resource: 'backup', action: 'cross_site_restore' },
+
+  // Devices
+  DEVICES_READ: { resource: 'devices', action: 'read' },
+  DEVICES_WRITE: { resource: 'devices', action: 'write' },
+  DEVICES_DELETE: { resource: 'devices', action: 'delete' },
+  DEVICES_EXECUTE: { resource: 'devices', action: 'execute' },
+
+  // Signed, resource-bound rollback of customer-machine agent components.
+  AGENT_ROLLBACK_CREATE: { resource: 'agent_rollback', action: 'create' },
+
+  // Built-in Workspace extension. Keep content/source administration and
+  // credential use distinct from read-only visibility and crawl execution.
+  WORKSPACE_READ: { resource: 'workspace', action: 'read' },
+  WORKSPACE_WRITE: { resource: 'workspace', action: 'write' },
+  WORKSPACE_CREDENTIALS: { resource: 'workspace', action: 'credentials' },
+  WORKSPACE_EXECUTE: { resource: 'workspace', action: 'execute' },
+
+  // Network topology (discovery topology view + saved layout — #1728)
+  TOPOLOGY_READ: { resource: 'topology', action: 'read' },
+  TOPOLOGY_WRITE: { resource: 'topology', action: 'write' },
+
+  // Scripts
+  SCRIPTS_READ: { resource: 'scripts', action: 'read' },
+  SCRIPTS_WRITE: { resource: 'scripts', action: 'write' },
+  SCRIPTS_DELETE: { resource: 'scripts', action: 'delete' },
+  SCRIPTS_EXECUTE: { resource: 'scripts', action: 'execute' },
+
+  // Tenant variables (#3409). These gate MANAGEMENT of variable definitions
+  // only. Holding scripts:execute already implies USE of any variable
+  // reachable from a script (a script can echo its own $BREEZE_VAR_X), so this
+  // is deliberately not an exposure boundary — see the threat model in the
+  // #3409 scope comment.
+  VARIABLES_READ: { resource: 'variables', action: 'read' },
+  VARIABLES_MANAGE: { resource: 'variables', action: 'manage' },
+
+  // Alerts
+  ALERTS_READ: { resource: 'alerts', action: 'read' },
+  ALERTS_WRITE: { resource: 'alerts', action: 'write' },
+  ALERTS_ACKNOWLEDGE: { resource: 'alerts', action: 'acknowledge' },
+
+  // Tickets
+  TICKETS_READ: { resource: 'tickets', action: 'read' },
+  TICKETS_WRITE: { resource: 'tickets', action: 'write' },
+  TICKETS_MANAGE: { resource: 'tickets', action: 'manage' },
+
+  // Microsoft 365 partner-global ticket mailbox administration
+  TICKET_MAILBOX_READ: { resource: 'ticket_mailbox', action: 'read' },
+  TICKET_MAILBOX_ADMIN: { resource: 'ticket_mailbox', action: 'admin' },
+
+  // Catalog (billing/invoicing program)
+  CATALOG_READ: { resource: 'catalog', action: 'read' },
+  CATALOG_WRITE: { resource: 'catalog', action: 'write' },
+  CATALOG_DELETE: { resource: 'catalog', action: 'delete' },
+
+  // Invoices (billing/invoicing program — sub-project 2)
+  INVOICES_READ: { resource: 'invoices', action: 'read' },
+  INVOICES_WRITE: { resource: 'invoices', action: 'write' },
+  INVOICES_SEND: { resource: 'invoices', action: 'send' },
+  INVOICES_EXPORT: { resource: 'invoices', action: 'export' },
+
+  // Contracts (recurring-contracts — sub-project 3)
+  CONTRACTS_READ: { resource: 'contracts', action: 'read' },
+  CONTRACTS_WRITE: { resource: 'contracts', action: 'write' },
+  CONTRACTS_MANAGE: { resource: 'contracts', action: 'manage' },
+  // Organization document library + key dates (service deliverables, spec §10).
+  // Deliberately NOT folded into `contracts`: a runbook or an onboarding
+  // baseline is org-record content that outlives any contract, and a partner
+  // may want a technician who can file documents without touching billing.
+  DOCUMENTS_READ: { resource: 'documents', action: 'read' },
+  DOCUMENTS_WRITE: { resource: 'documents', action: 'write' },
+
+  // Agreement templates + signed agreements (agreements vocabulary & IA split,
+  // spec §4). Deliberately NOT folded into `contracts`: a billing contract and
+  // the MSA a customer signs are different objects with different audiences —
+  // an MSP may want a technician who can pull up the signed MSA without
+  // touching recurring billing, and a billing clerk who runs contracts without
+  // authoring legal terms. No `manage` action: publish and archive are write
+  // operations on a template, so there is nothing left for a third verb to gate.
+  AGREEMENTS_READ: { resource: 'agreements', action: 'read' },
+  AGREEMENTS_WRITE: { resource: 'agreements', action: 'write' },
+
+  // Quotes / Proposals (billing program — sub-project 4)
+  QUOTES_READ: { resource: 'quotes', action: 'read' },
+  QUOTES_WRITE: { resource: 'quotes', action: 'write' },
+  QUOTES_SEND: { resource: 'quotes', action: 'send' },
+  // Recording a customer's acceptance on their behalf (2026-09-21 spec §7).
+  // Separate from `send` because it is the money-committing act: it numbers and
+  // issues an invoice, drafts contracts and stages a Pax8 order. It is
+  // back-filled to every role that already holds `send` (no new authority for
+  // anyone), so an MSP that wants acceptance narrower than sending revokes it.
+  QUOTES_ACCEPT: { resource: 'quotes', action: 'accept' },
+  QUOTES_FULFILL: { resource: 'quotes', action: 'fulfill' },
+
+  // Time entries (ticketing Phase 3)
+  TIME_ENTRIES_READ: { resource: 'time_entries', action: 'read' },
+  TIME_ENTRIES_WRITE: { resource: 'time_entries', action: 'write' },
+  TIME_ENTRIES_MANAGE_BILLING: { resource: 'time_entries', action: 'manage_billing' },
+
+  // Rate cards (#4628 / #4615, spec 2026-09-17 §6). One resource for work types
+  // AND billing profiles, because they are one screen (Settings → Billing →
+  // Rates) and one route file. `write` covers create/update/archive of both.
+  BILLING_PROFILES_READ: { resource: 'billing_profiles', action: 'read' },
+  BILLING_PROFILES_WRITE: { resource: 'billing_profiles', action: 'write' },
+
+  // Users
+  USERS_READ: { resource: 'users', action: 'read' },
+  USERS_WRITE: { resource: 'users', action: 'write' },
+  USERS_DELETE: { resource: 'users', action: 'delete' },
+  USERS_INVITE: { resource: 'users', action: 'invite' },
+
+  // Organizations
+  ORGS_READ: { resource: 'organizations', action: 'read' },
+  ORGS_WRITE: { resource: 'organizations', action: 'write' },
+  ORGS_DELETE: { resource: 'organizations', action: 'delete' },
+
+  // Partner-wide OAuth/MCP connected applications. These are deliberately
+  // separate from organization administration: one disconnect revokes every
+  // grant for the shared client under the partner.
+  CONNECTED_APPS_READ: { resource: 'connected_apps', action: 'read' },
+  CONNECTED_APPS_MANAGE: { resource: 'connected_apps', action: 'manage' },
+
+  // SSO administration: configure providers + manage verified domains. A
+  // higher-trust capability than organizations:write (security review #2 H-2).
+  SSO_ADMIN: { resource: 'sso', action: 'admin' },
+
+  // Sites
+  SITES_READ: { resource: 'sites', action: 'read' },
+  SITES_WRITE: { resource: 'sites', action: 'write' },
+  SITES_DELETE: { resource: 'sites', action: 'delete' },
+
+  // Automations
+  AUTOMATIONS_READ: { resource: 'automations', action: 'read' },
+  AUTOMATIONS_WRITE: { resource: 'automations', action: 'write' },
+  AUTOMATIONS_DELETE: { resource: 'automations', action: 'delete' },
+
+  // Remote access
+  REMOTE_ACCESS: { resource: 'remote', action: 'access' },
+
+  // Audit
+  AUDIT_READ: { resource: 'audit', action: 'read' },
+  AUDIT_EXPORT: { resource: 'audit', action: 'export' },
+  // Manage the org's audit-log retention policy (audit_retention_policies —
+  // issue #4633). Distinct from AUDIT_READ: reading the audit trail and
+  // configuring how long it is kept are different levels of trust — lowering
+  // retention shortens the forensic window, so this rides with Org Admin only,
+  // not every audit:read holder.
+  AUDIT_MANAGE: { resource: 'audit', action: 'manage' },
+
+  // Reports
+  REPORTS_READ: { resource: 'reports', action: 'read' },
+  REPORTS_WRITE: { resource: 'reports', action: 'write' },
+  REPORTS_DELETE: { resource: 'reports', action: 'delete' },
+  REPORTS_EXPORT: { resource: 'reports', action: 'export' },
+
+  // Billing
+  BILLING_MANAGE: { resource: 'billing', action: 'manage' },
+
+  // Vulnerability management (BE-16) — risk-acceptance governance capability.
+  // Gates accept-risk + reopen above devices:write so a default technician
+  // cannot unilaterally waive a critical/KEV finding.
+  VULN_RISK_ACCEPT: { resource: 'vulnerabilities', action: 'accept_risk' },
+
+  // AI session audit (SR5-09) — read OTHER users' AI session history via the
+  // admin dashboard. A dedicated, higher-trust capability: ordinary AI reads use
+  // organizations:read and only ever return the caller's OWN sessions, so the
+  // cross-user admin/audit surface must NOT be gated on organizations:read.
+  AI_SESSIONS_READ_ALL: { resource: 'ai_sessions', action: 'read_all' },
+  // Open and drive your OWN chat sessions (#6396). Was organizations:write,
+  // which no seeded org-scope role holds, so org users could never reach chat.
+  // Per-tool authorization inside a session is route-parity (aiGuardrails
+  // TOOL_PERMISSIONS), so this gate only opens the conversation — it does not
+  // widen what the role can do through it. Org budget settings stay on
+  // organizations:write.
+  AI_SESSIONS_USE: { resource: 'ai_sessions', action: 'use' },
+
+  // AI agents (#3821) — authoring an agent policy is what will eventually
+  // authorize autonomous action on customer machines, so it gets its own
+  // capability rather than riding on organizations:write. Sharing that grant
+  // would mean every existing org admin silently acquired agent-authoring
+  // authority the day wave 4 enabled `act` mode, with no deliberate decision
+  // by the partner who granted it. Same reasoning as AI_SESSIONS_READ_ALL.
+  AI_AGENTS_READ: { resource: 'ai_agents', action: 'read' },
+  AI_AGENTS_WRITE: { resource: 'ai_agents', action: 'write' },
+
+  // Tool sources (BYO MCP/OpenAPI, spec 2026-09-07 §5): manage registrations…
+  TOOL_SOURCES_READ: { resource: 'tool_sources', action: 'read' },
+  TOOL_SOURCES_WRITE: { resource: 'tool_sources', action: 'write' },
+  // …and call the tools they expose. `use` gates Tier 1, `write` gates Tier 2/3.
+  EXTERNAL_TOOLS_USE: { resource: 'external_tools', action: 'use' },
+  EXTERNAL_TOOLS_WRITE: { resource: 'external_tools', action: 'write' },
+
+  // Action intents / durable approvals — gates who may decide (approve/deny) a
+  // pending action-intent approval, distinct from creating/reading intents.
+  APPROVALS_DECIDE: { resource: 'approvals', action: 'decide' },
+
+  // Privileged Access Management (PAM) — dedicated capabilities split off the
+  // generic device grants (security review wave 7, SR1-13/SR1-14). Approving/
+  // denying an elevation and authoring PAM policy are both HIGH-TRUST actions
+  // that must not ride on devices:execute/devices:write — an ordinary
+  // technician holding those (to run scripts, remote in, etc.) must not
+  // thereby gain the authority to grant standing admin or write the rules
+  // that decide who gets it automatically. Only Org Admin (and Partner Admin
+  // via its `*:*` wildcard) hold these by default; existing custom roles gain
+  // neither automatically.
+  PAM_APPROVE: { resource: 'pam', action: 'approve' },
+  PAM_MANAGE_POLICY: { resource: 'pam', action: 'manage_policy' },
+
+  // Accounting / QuickBooks integration (SEC-2026-09-05-057). The interactive
+  // QuickBooks routes used to gate on partner authority alone, so any
+  // full-partner member — however low their role — could read the shared
+  // provider realm (customers, entity mappings, income accounts, remote
+  // candidates) and, with MFA, reach realm lifecycle and settings mutations.
+  // These two capabilities make that authority explicit and separately
+  // grantable: `accounting:read` for provider reads, `accounting:manage` for
+  // connect/disconnect, settings, mapping writes and synchronization.
+  // Route-specific requirements (organizations:write + sites:write on customer
+  // import, invoices:write on invoice push, catalog:write on item mappings,
+  // and MFA) remain cumulative on top. Only Org Admin (and Partner Admin via
+  // its `*:*` wildcard) hold these by default; existing custom roles gain
+  // neither automatically.
+  ACCOUNTING_READ: { resource: 'accounting', action: 'read' },
+  ACCOUNTING_MANAGE: { resource: 'accounting', action: 'manage' },
+
+  // Admin
+  ADMIN_ALL: { resource: '*', action: '*' },
+} as const;
+
+/** Union of the exact `{ resource, action }` literal pairs in the registry. */
+export type PermissionGrant = (typeof PERMISSION_GRANTS)[keyof typeof PERMISSION_GRANTS];
+/** Union of every known resource (includes the `*` wildcard). */
+export type PermissionResource = PermissionGrant['resource'];
+/** Union of every known action (includes the `*` wildcard). */
+export type PermissionAction = PermissionGrant['action'];

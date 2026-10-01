@@ -1,0 +1,76 @@
+---
+title: First-Login Setup Wizard
+description: Guided four-step setup wizard covering account security, organization setup, regional settings, and device enrollment for new administrators on their first Breeze login.
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The first-login setup wizard guides new Breeze administrators through essential platform configuration immediately after their initial sign-in. It covers account security, organization setup, regional settings, and device enrollment in a four-step workflow. Once finished, you are taken to the main dashboard and the wizard does not appear again.
+
+---
+
+## When the Wizard Appears
+
+The setup wizard appears automatically the first time the default `admin@breeze.local` account signs in, before the password has been changed and before setup has been completed or skipped. Users created through invitations or the admin panel will never see the wizard.
+
+<Aside type="tip">
+  If you have already changed your password or completed the wizard once, it will not appear again. To re-trigger it, a database administrator would need to reset the the setup status and password-changed flag on the admin account.
+</Aside>
+
+---
+
+## Setup Steps
+
+The wizard presents four sequential steps.
+
+<Steps>
+1. **Account** -- Set a new password (and optionally a new email) to replace the default `admin@breeze.local` credentials. This step can be skipped.
+
+2. **Organization** -- Create your organization and first site. This sets up the multi-tenant hierarchy (organization and site) that structures your Breeze deployment. Enter your organization name and create your first site (e.g., "Main Office").
+
+3. **Regional** -- Set your default language, time zone, and currency for your partner, your first site, and your own user preferences. This step can be skipped.
+
+4. **Install Agent** -- Install the Breeze agent on your first endpoint. The wizard displays enrollment instructions and an enrollment key you can copy. Follow the on-screen instructions to install the agent and verify connectivity.
+</Steps>
+
+After completing or skipping the remaining steps, click **Go to Dashboard** to finish setup and open the main dashboard.
+
+---
+
+## Skipping and Resuming
+
+### Skipping Individual Steps
+
+The **Account** and **Regional** steps have a **Skip** button that advances to the next step without making any changes. You can always configure these settings later from the dashboard. The **Organization** step cannot be skipped -- you need at least one organization and site before the wizard can continue.
+
+### Skipping the Entire Wizard
+
+A **Skip Setup** link appears below the step card on the first step. Clicking it marks setup as complete and takes you directly to the dashboard. The wizard will not appear again.
+
+### Resuming After Interruption
+
+If you close your browser or navigate away before finishing, the wizard remembers which step you were on. When you sign in again, it picks up where you left off.
+
+<Aside>
+  If you sign out before completing the wizard, you will be redirected back to it on your next sign-in as long as setup is still pending.
+</Aside>
+
+---
+
+## Troubleshooting
+
+**The wizard does not appear after first login.**
+The wizard only activates for the seeded `admin@breeze.local` account before setup is completed and before the password has been changed. If you have already done either, the wizard will not appear. Verify the admin account has not already completed setup by checking with your database administrator.
+
+**The wizard keeps appearing after completion.**
+The completion step may have failed to save. Check the API logs for errors on the setup-complete endpoint. Verify that the database is healthy and the API container logs show no errors.
+
+**The page shows a loading spinner indefinitely.**
+The wizard checks your authentication status on load. If the API server is unreachable or CORS is misconfigured, this check will hang. Verify that the API server is running and that CORS allows requests from your frontend domain. Check the browser developer console for network errors.
+
+<details>
+<summary>Technical details</summary>
+
+The wizard is rendered at the `/setup` route as a React component. It checks the `requiresSetup` flag from `GET /users/me` to determine whether to display. Completion calls `POST /system/setup-complete`, which sets the `setupCompletedAt` timestamp on the user record. Progress is persisted to `localStorage` under the key `breeze-setup-step`.
+
+</details>

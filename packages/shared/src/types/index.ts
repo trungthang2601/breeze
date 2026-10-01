@@ -1,0 +1,922 @@
+// ============================================
+// Auth Types
+// ============================================
+
+import type { EmailTemplateId } from '../utils/emailTemplates';
+
+export * from './auth';
+export * from './deviceOptions';
+export * from './agentHealth';
+export * from './scriptAdmission';
+export * from './softwareInventoryObservation';
+export * from './scriptProposals';
+export * from './backupHealth';
+
+// ============================================
+// Multi-Tenancy Types
+// ============================================
+
+export type PartnerType = 'msp' | 'enterprise' | 'internal';
+export type PlanType = 'free' | 'pro' | 'enterprise' | 'unlimited';
+export type OrgType = 'customer' | 'internal';
+// `offboarding` (#2774): terminal-intent drain state — users locked out, agents
+// kept authenticated (self_uninstall-only) until drained, then auto-`churned`.
+export type OrgStatus = 'active' | 'suspended' | 'trial' | 'churned' | 'offboarding';
+export type SupportedLocale = 'en' | 'pt-BR' | 'es-419' | 'fr-FR' | 'fr-CA' | 'de-DE' | 'it-IT' | 'tr-TR';
+
+export interface Partner {
+  id: string;
+  name: string;
+  slug: string;
+  type: PartnerType;
+  plan: PlanType;
+  maxOrganizations: number | null;
+  maxDevices: number | null;
+  /** First-class partner timezone (#1318); canonical tz default. */
+  timezone?: string;
+  settings: Record<string, unknown>;
+  billingEmail: string;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}
+
+export interface Organization {
+  id: string;
+  partnerId: string;
+  name: string;
+  slug: string;
+  type: OrgType;
+  status: OrgStatus;
+  maxDevices: number | null;
+  settings: Record<string, unknown>;
+  contractStart: Date | null;
+  contractEnd: Date | null;
+  billingContact: Record<string, unknown> | null;
+  createdAt: Date;
+  updatedAt: Date;
+  deletedAt: Date | null;
+}
+
+export interface Site {
+  id: string;
+  orgId: string;
+  name: string;
+  address: Record<string, unknown> | null;
+  timezone: string;
+  contact: Record<string, unknown> | null;
+  settings: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// ============================================
+// User & Access Control Types
+// ============================================
+
+export type UserStatus = 'active' | 'invited' | 'disabled';
+export type RoleScope = 'system' | 'partner' | 'organization';
+export type OrgAccessLevel = 'all' | 'selected' | 'none';
+
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+  passwordHash: string | null;
+  mfaSecret: string | null;
+  mfaEnabled: boolean;
+  status: UserStatus;
+  avatarUrl: string | null;
+  lastLoginAt: Date | null;
+  passwordChangedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type UserPublic = Omit<User, 'passwordHash' | 'mfaSecret'>;
+
+export interface Role {
+  id: string;
+  partnerId: string | null;
+  orgId: string | null;
+  scope: RoleScope;
+  name: string;
+  description: string | null;
+  isSystem: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface Permission {
+  id: string;
+  resource: string;
+  action: string;
+  description: string | null;
+}
+
+export interface PartnerUser {
+  id: string;
+  partnerId: string;
+  userId: string;
+  roleId: string;
+  orgAccess: OrgAccessLevel;
+  orgIds: string[] | null;
+  createdAt: Date;
+}
+
+export interface OrganizationUser {
+  id: string;
+  orgId: string;
+  userId: string;
+  roleId: string;
+  siteIds: string[] | null;
+  deviceGroupIds: string[] | null;
+  createdAt: Date;
+}
+
+// ============================================
+// Device Types
+// ============================================
+
+export type OSType = 'windows' | 'macos' | 'linux';
+export type DeviceStatus = 'online' | 'offline' | 'maintenance' | 'decommissioned' | 'quarantined' | 'updating' | 'pending';
+export type DeviceGroupType = 'static' | 'dynamic';
+export type GroupMembershipSource = 'manual' | 'dynamic_rule' | 'policy';
+
+export interface Device {
+  id: string;
+  orgId: string;
+  siteId: string;
+  agentId: string;
+  hostname: string;
+  displayName: string | null;
+  osType: OSType;
+  osVersion: string;
+  osBuild: string | null;
+  architecture: string;
+  agentVersion: string;
+  status: DeviceStatus;
+  lastSeenAt: Date | null;
+  enrolledAt: Date;
+  enrolledBy: string | null;
+  tags: string[];
+  isHeadless: boolean;
+  pendingReboot: boolean;
+  batteryStatus: BatteryStatus | null;
+  activeVpns: VpnPresence[] | null;
+  createdAt: Date;
+  updatedAt: Date;
+  // RMM-QA-176 manual maintenance lease. Serialised from the API as ISO
+  // strings. `maintenanceUntil > now` — not `status` — is the truth of "a
+  // technician put this device into maintenance": the heartbeat overwrites
+  // status on every beat.
+  maintenanceStartedAt?: string | null;
+  maintenanceUntil?: string | null;
+  maintenanceReason?: string | null;
+  maintenanceStartedBy?: string | null;
+}
+
+// Current-state power/battery telemetry for portable devices (#2142). Reported
+// by the agent every heartbeat and stored as the latest snapshot on the
+// `devices` table (jsonb), so it lives next to other per-heartbeat current
+// state (uptime, pendingReboot, status). `present` distinguishes a real
+// no-battery desktop (false) from an old agent that never reported (the column
+// is null). Battery HEALTH (design/full capacity, cycle count, condition) is
+// intentionally out of scope for v1 — this is operational current state only.
+export type BatteryChargingState = 'charging' | 'discharging' | 'full' | 'not_charging' | 'unknown';
+
+export interface BatteryStatus {
+  /** Whether the device has a battery at all. false = desktop/no battery. */
+  present: boolean;
+  /** Current charge, 0-100. Omitted when the OS doesn't report it. */
+  percent?: number;
+  chargingState?: BatteryChargingState;
+  /** On external/AC power. Equivalent to power source = AC. */
+  pluggedIn?: boolean;
+  /** Estimated runtime left on battery, in minutes, when the OS reports it. */
+  timeRemainingMinutes?: number;
+  /** Estimated time to full charge, in minutes, when the OS reports it. */
+  timeToFullMinutes?: number;
+  /** ISO timestamp the API stamped when it ingested this snapshot. */
+  reportedAt: string;
+}
+
+// Active-VPN-client presence telemetry (#2139). Read-only current state: the
+// agent detects which VPN overlay clients have an active tunnel from local
+// interface / adapter-description heuristics plus per-OS service/process
+// signals, and the API stores the latest snapshot as a jsonb array on the
+// `devices` row (next to batteryStatus / pendingReboot). Fully replaced every
+// network-inventory report — a null column means the agent has never reported
+// (old agent); an empty array means "reported, no active VPN". No secrets, peer
+// lists, keys, or VPN management are ever collected — provider/state/interface/
+// IPs/DNS name only.
+export type VpnProvider =
+  | 'wireguard'
+  | 'tailscale'
+  | 'netbird'
+  | 'zerotier'
+  | 'openvpn'
+  | 'cloudflare-warp'
+  | 'generic';
+
+/** How the agent recognized the VPN — a raw signal, not a trust ranking. */
+export type VpnDetectionSource = 'interface' | 'service' | 'process' | 'adapter';
+
+export interface VpnPresence {
+  /** Normalized provider id; 'generic' = unknown tunnel adapter fallback. */
+  provider: VpnProvider;
+  /**
+   * Whether the tunnel interface is currently up / connected. `false` means the
+   * VPN client is installed and running but has no tunnel up — those entries
+   * carry no interface or IPs, only the provider and detection source (#2139).
+   */
+  active: boolean;
+  /**
+   * OS interface/adapter name backing the tunnel (e.g. utun3, wg0, ztabc123).
+   * Empty string on an inactive entry — there is no tunnel to name.
+   */
+  interfaceName: string;
+  /** Overlay IPv4 assigned on the tunnel, when present. */
+  ipv4?: string;
+  /** Overlay IPv6 assigned on the tunnel, when present. */
+  ipv6?: string;
+  /** VPN DNS / device name when safely available (e.g. Tailscale MagicDNS). */
+  dnsName?: string;
+  /** Which local signal surfaced this VPN. */
+  detectionSource: VpnDetectionSource;
+  /** ISO timestamp the API stamped when it ingested this snapshot. */
+  reportedAt: string;
+}
+
+export interface DeviceHardware {
+  deviceId: string;
+  cpuModel: string | null;
+  cpuCores: number | null;
+  cpuThreads: number | null;
+  ramTotalMb: number | null;
+  diskTotalGb: number | null;
+  gpuModel: string | null;
+  serialNumber: string | null;
+  manufacturer: string | null;
+  model: string | null;
+  motherboardManufacturer: string | null;
+  motherboardProduct: string | null;
+  motherboardVersion: string | null;
+  biosVersion: string | null;
+  updatedAt: Date;
+}
+
+export interface InterfaceBandwidth {
+  name: string;
+  inBytesPerSec: number;
+  outBytesPerSec: number;
+  inBytes: number;
+  outBytes: number;
+  inPackets: number;
+  outPackets: number;
+  inErrors: number;
+  outErrors: number;
+  speed?: number;
+}
+
+export interface DeviceMetrics {
+  deviceId: string;
+  timestamp: Date;
+  cpuPercent: number;
+  ramPercent: number;
+  ramUsedMb: number;
+  diskPercent: number;
+  diskUsedGb: number;
+  diskActivityAvailable: boolean | null;
+  diskReadBytes: bigint | null;
+  diskWriteBytes: bigint | null;
+  diskReadBps: bigint | null;
+  diskWriteBps: bigint | null;
+  diskReadOps: bigint | null;
+  diskWriteOps: bigint | null;
+  networkInBytes: bigint | null;
+  networkOutBytes: bigint | null;
+  bandwidthInBps: bigint | null;
+  bandwidthOutBps: bigint | null;
+  interfaceStats: InterfaceBandwidth[] | null;
+  processCount: number | null;
+  customMetrics: Record<string, unknown> | null;
+}
+
+export interface DeviceGroup {
+  id: string;
+  orgId: string;
+  siteId: string | null;
+  name: string;
+  type: DeviceGroupType;
+  rules: Record<string, unknown> | null;
+  parentId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// ============================================
+// TCC (macOS Permissions) Types
+// ============================================
+
+export interface TCCPermissions {
+  screenRecording: boolean;
+  accessibility: boolean;
+  fullDiskAccess: boolean;
+  remoteDesktop?: boolean | null;
+  checkedAt: string;
+}
+
+export type DesktopAccessMode = 'user_session' | 'login_window' | 'unavailable';
+
+export type DesktopAccessReason =
+  | 'missing_permission'
+  | 'missing_entitlement'
+  | 'helper_not_connected'
+  | 'virtual_display_unavailable'
+  | 'unsupported_os'
+  | 'manual_install'
+  | 'no_display_session'
+  | 'wayland_unsupported'
+  | 'x11_connect_failed'
+  | 'x11_auth_failed';
+
+export interface DesktopAccessState {
+  mode: DesktopAccessMode;
+  loginUiReachable: boolean;
+  virtualDisplayReady: boolean;
+  reason?: DesktopAccessReason | null;
+  remoteDesktopPermission?: boolean | null;
+  checkedAt: string;
+}
+
+// ============================================
+// Remote Access Policy
+// ============================================
+
+export interface RemoteAccessPolicy {
+  webrtcDesktop: boolean;
+  vncRelay: boolean;
+  remoteTools: boolean;
+  // Clipboard sync over the WebRTC desktop channel, gated per direction.
+  // `clipboardHostToViewer` (remote machine → operator's viewer) is the
+  // data-egress direction and defaults off on hosted SaaS; `clipboardViewerToHost`
+  // (operator paste → remote machine) is operator-initiated and defaults on.
+  // Enforced agent-side. Mirrors the API's RemoteAccessSettings.
+  clipboardHostToViewer: boolean;
+  clipboardViewerToHost: boolean;
+  enableProxy: boolean;
+  policyName: string | null;
+  policyId: string | null;
+}
+
+// ============================================
+// mTLS Types
+// ============================================
+
+export interface OrgMtlsSettings {
+  certLifetimeDays: number;
+  expiredCertPolicy: 'auto_reissue' | 'quarantine';
+}
+
+export interface MtlsCertData {
+  certificate: string;
+  privateKey: string;
+  expiresAt: string;
+  serialNumber: string;
+}
+
+// ============================================
+// Script Types
+// ============================================
+
+export type ScriptLanguage = 'powershell' | 'bash' | 'python' | 'cmd';
+export type ScriptRunAs = 'system' | 'user' | 'elevated';
+export const EXECUTION_STATUSES = [
+  'pending', 'queued', 'running', 'cancelling',
+  'completed', 'failed', 'timeout', 'cancelled',
+] as const;
+export type ExecutionStatus = typeof EXECUTION_STATUSES[number];
+
+export const CANCEL_STATES = ['requested', 'confirmed', 'unconfirmed', 'failed'] as const;
+export type CancelState = typeof CANCEL_STATES[number];
+// 'automation' is read-only provenance: only the automation runtime mints it
+// (#3162), never an API caller — the execute-script request schema deliberately
+// still accepts only the first four.
+export type TriggerType = 'manual' | 'scheduled' | 'alert' | 'policy' | 'automation';
+
+export interface Script {
+  id: string;
+  orgId: string | null;
+  name: string;
+  description: string | null;
+  category: string | null;
+  osTypes: OSType[];
+  language: ScriptLanguage;
+  content: string;
+  parameters: Record<string, unknown> | null;
+  timeoutSeconds: number;
+  runAs: ScriptRunAs;
+  isSystem: boolean;
+  version: number;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface ScriptExecution {
+  id: string;
+  scriptId: string;
+  deviceId: string;
+  triggeredBy: string | null;
+  triggerType: TriggerType;
+  parameters: Record<string, unknown> | null;
+  status: ExecutionStatus;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  exitCode: number | null;
+  stdout: string | null;
+  stderr: string | null;
+  errorMessage: string | null;
+  createdAt: Date;
+  cancelRequestedAt?: string | null;
+  cancelState?: CancelState | null;
+  cancelledBy?: string | null;
+  cancelCommandId?: string | null;
+}
+
+// ============================================
+// Automation Types
+// ============================================
+
+export type AutomationTriggerType = 'schedule' | 'event' | 'webhook' | 'manual';
+export type AutomationOnFailure = 'stop' | 'continue' | 'notify';
+export const AUTOMATION_RUN_STATUSES = [
+  'running', 'completed', 'failed', 'partial', 'cancelled',
+] as const;
+export type AutomationRunStatus = typeof AUTOMATION_RUN_STATUSES[number];
+export type PolicyEnforcement = 'monitor' | 'warn' | 'enforce';
+export type ComplianceStatus = 'compliant' | 'non_compliant' | 'pending' | 'error';
+
+export interface Automation {
+  id: string;
+  orgId: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  trigger: Record<string, unknown>;
+  conditions: Record<string, unknown> | null;
+  actions: Record<string, unknown>[];
+  onFailure: AutomationOnFailure;
+  notificationTargets: Record<string, unknown> | null;
+  lastRunAt: Date | null;
+  runCount: number;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface Policy {
+  id: string;
+  orgId: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  targets: Record<string, unknown>;
+  rules: Record<string, unknown>[];
+  enforcement: PolicyEnforcement;
+  checkIntervalMinutes: number;
+  remediationScriptId: string | null;
+  lastEvaluatedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// ============================================
+// Alert Types
+// ============================================
+
+import { ACTOR_TYPES, AUDIT_RESULTS, NOTIFICATION_CHANNEL_TYPES } from '../constants';
+
+export type AlertSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+export type AlertStatus = 'active' | 'acknowledged' | 'resolved' | 'suppressed' | 'dismissed';
+export type NotificationChannelType = (typeof NOTIFICATION_CHANNEL_TYPES)[number];
+
+export interface AlertRule {
+  id: string;
+  orgId: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  severity: AlertSeverity;
+  targets: Record<string, unknown>;
+  conditions: Record<string, unknown>;
+  cooldownMinutes: number;
+  escalationPolicyId: string | null;
+  notificationChannels: Record<string, unknown>[];
+  autoResolve: boolean;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface Alert {
+  id: string;
+  ruleId: string;
+  deviceId: string;
+  orgId: string;
+  status: AlertStatus;
+  severity: AlertSeverity;
+  title: string;
+  message: string | null;
+  context: Record<string, unknown> | null;
+  triggeredAt: Date;
+  acknowledgedAt: Date | null;
+  acknowledgedBy: string | null;
+  resolvedAt: Date | null;
+  resolvedBy: string | null;
+  resolutionNote: string | null;
+  createdAt: Date;
+}
+
+// ============================================
+// Remote Access Types
+// ============================================
+
+export type RemoteSessionType = 'terminal' | 'desktop' | 'file_transfer';
+export type RemoteSessionStatus = 'pending' | 'connecting' | 'active' | 'disconnected' | 'failed';
+
+export interface RemoteSession {
+  id: string;
+  deviceId: string;
+  userId: string;
+  type: RemoteSessionType;
+  status: RemoteSessionStatus;
+  startedAt: Date | null;
+  endedAt: Date | null;
+  durationSeconds: number | null;
+  bytesTransferred: bigint | null;
+  recordingUrl: string | null;
+  createdAt: Date;
+}
+
+// ============================================
+// Audit Types
+// ============================================
+
+export type ActorType = (typeof ACTOR_TYPES)[number];
+export type AuditResult = (typeof AUDIT_RESULTS)[number];
+
+export interface AuditLog {
+  id: string;
+  orgId: string;
+  timestamp: Date;
+  actorType: ActorType;
+  actorId: string;
+  actorEmail: string | null;
+  action: string;
+  resourceType: string;
+  resourceId: string | null;
+  resourceName: string | null;
+  details: Record<string, unknown> | null;
+  ipAddress: string | null;
+  userAgent: string | null;
+  result: AuditResult;
+  errorMessage: string | null;
+  checksum: string | null;
+}
+
+// ============================================
+// Partner Settings Types
+// ============================================
+
+export type DateFormat = 'MM/DD/YYYY' | 'DD/MM/YYYY' | 'YYYY-MM-DD';
+export type TimeFormat = '12h' | '24h';
+export type BusinessHoursPreset = '24/7' | 'business' | 'extended' | 'custom';
+
+export interface DaySchedule {
+  start: string;
+  end: string;
+  closed?: boolean;
+}
+
+export interface InheritableSecuritySettings {
+  minLength?: number;
+  complexity?: 'standard' | 'strict' | 'passphrase';
+  expirationDays?: number;
+  requireMfa?: boolean;
+  allowedMethods?: { totp?: boolean; sms?: boolean };
+  sessionTimeout?: number;
+  maxSessions?: number;
+  ipAllowlist?: string[];
+}
+
+/**
+ * Server-derived status of the partner IP allowlist, returned by
+ * `GET /partners/me/ip-allowlist/status`. All booleans are computed by the API
+ * (the authority on proxy trust); the client never recomputes them:
+ *   proxyTrustOk === (currentIp !== null)
+ *   active === (enforced && proxyTrustOk)
+ */
+export interface IpAllowlistStatus {
+  /** The caller's detected trusted client IP, or null if not trustable. */
+  currentIp: string | null;
+  /** Whether the API can see a real client IP (proxy trust configured). */
+  proxyTrustOk: boolean;
+  /** Allowlist is non-empty and enforcement mode is 'enforce'. */
+  enforced: boolean;
+  /** Enforcement is both configured and currently effective. */
+  active: boolean;
+}
+
+export interface InheritableNotificationSettings {
+  fromAddress?: string;
+  replyTo?: string;
+  useCustomSmtp?: boolean;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpUsername?: string;
+  smtpEncryption?: 'tls' | 'ssl' | 'none';
+  slackWebhookUrl?: string;
+  slackChannel?: string;
+  webhooks?: string[];
+  preferences?: Record<string, Record<string, boolean>>;
+  pushoverAppToken?: string;
+  pushoverDefaultUser?: string;
+  pushoverDefaultSound?: string;
+  pushoverDefaultPriority?: -2 | -1 | 0 | 1 | 2;
+}
+
+export interface InheritableEventLogSettings {
+  enabled?: boolean;
+  elasticsearchUrl?: string;
+  elasticsearchApiKey?: string;
+  elasticsearchUsername?: string;
+  elasticsearchPassword?: string;
+  indexPrefix?: string;
+}
+
+export interface InheritableDefaultSettings {
+  policyDefaults?: Record<string, string>;
+  deviceGroup?: string;
+  alertThreshold?: string;
+  autoEnrollment?: {
+    enabled: boolean;
+    requireApproval: boolean;
+    sendWelcome: boolean;
+  };
+  agentUpdatePolicy?: string;
+  maintenanceWindow?: string;
+  // Per-component update version pins (issue #2124). Each value is a registered
+  // version string or the 'latest' sentinel (= no pin → global promoted latest).
+  // INHERIT-WITH-OVERRIDE (NOT partner-locked, unlike the other fields here): a
+  // partner-set pin is an inherited default; an org may override it (including
+  // back to 'latest'). getOrgAgentUpdateConfig resolves org-over-partner, and
+  // agentVersionPins is deliberately exempt from assertNotLocked — see the note
+  // in apps/api/src/routes/orgs.ts. Do NOT "fix" this into a lock. Agent and
+  // watchdog are independent knobs.
+  agentVersionPins?: {
+    agent?: string;
+    watchdog?: string;
+  };
+  /** Pre-selected link TTL in the Add Device modal. Inherit-with-override. */
+  defaultEnrollmentTtlMinutes?: number;
+  /** Pre-selected device count in the Add Device modal. Inherit-with-override. */
+  defaultEnrollmentDeviceCount?: number;
+  /** Hard ceiling on link TTL. Partner-only — orgs cannot raise it. */
+  maxEnrollmentLinkTtlMinutes?: number;
+}
+
+export interface InheritableBrandingSettings {
+  logoUrl?: string;
+  primaryColor?: string;
+  secondaryColor?: string;
+  theme?: 'light' | 'dark' | 'system';
+  customCss?: string;
+}
+
+export interface InheritableAiBudgetSettings {
+  enabled?: boolean;
+  monthlyBudgetCents?: number | null;
+  dailyBudgetCents?: number | null;
+  maxTurnsPerSession?: number;
+  messagesPerMinutePerUser?: number;
+  messagesPerHourPerOrg?: number;
+  approvalMode?: 'per_step' | 'action_plan' | 'auto_approve' | 'hybrid_plan';
+  /** #4388 — pre-cap alert rungs (1–99). Empty = off. Omit = inherit. */
+  alertThresholdPercents?: number[];
+}
+
+// A pluggable remote-desktop launcher (e.g. RustDesk, ScreenConnect, TeamViewer).
+// The Connect Desktop button on the device detail page consults the partner's
+// configured providers and, when a default is set, builds a launch URL by
+// substituting `{id}` (device.custom_fields[customFieldKey]) and `{password}`
+// placeholders into urlTemplate. URL building happens server-side so the
+// password never ships to the browser unless the user is launching a session.
+//
+// Examples of urlTemplate:
+//   'rustdesk://{id}?password={password}'
+//     — custom protocol handler hand-off (RustDesk, TeamViewer desktop, AnyDesk)
+//   'https://acme.screenconnect.com/Host#Access///{id}/Join'
+//     — HTTPS launcher; the button opens it in a new browser tab
+//
+// The browser button auto-detects the launch mode by URL prefix: anything
+// starting with http(s):// opens in a new tab; anything else is handed to the
+// OS as a custom-scheme deep link.
+export interface RemoteAccessProvider {
+  id: string;
+  name: string;
+  urlTemplate: string;
+  customFieldKey: string;
+  password?: string;
+  enabled: boolean;
+}
+
+export interface InheritableRemoteAccessSettings {
+  providers?: RemoteAccessProvider[];
+  defaultProviderId?: string;
+}
+
+export interface EffectiveOrgSettings {
+  security?: InheritableSecuritySettings;
+  notifications?: InheritableNotificationSettings;
+  eventLogs?: InheritableEventLogSettings;
+  defaults?: InheritableDefaultSettings;
+  branding?: InheritableBrandingSettings;
+  aiBudgets?: InheritableAiBudgetSettings;
+  locked: string[];
+}
+
+export interface PartnerSettings {
+  timezone?: string;
+  dateFormat?: DateFormat;
+  timeFormat?: TimeFormat;
+  language?: SupportedLocale;
+  businessHours?: {
+    preset: BusinessHoursPreset;
+    custom?: Record<string, DaySchedule>;
+  };
+  contact?: {
+    name?: string;
+    email?: string;
+    phone?: string;
+    website?: string;
+  };
+  address?: {
+    street1?: string;
+    street2?: string;
+    city?: string;
+    region?: string;
+    postalCode?: string;
+    country?: string;
+  };
+  // NEW inheritable categories
+  security?: InheritableSecuritySettings;
+  notifications?: InheritableNotificationSettings;
+  eventLogs?: InheritableEventLogSettings;
+  defaults?: InheritableDefaultSettings;
+  branding?: InheritableBrandingSettings;
+  aiBudgets?: InheritableAiBudgetSettings;
+  // Partner-level preferred order of organization IDs. The org list endpoint
+  // returns matching orgs in this order; orgs not present in the array
+  // (newly created or stale entries) are appended in createdAt order.
+  organizationOrder?: string[];
+  remoteAccessProviders?: InheritableRemoteAccessSettings;
+  emailTemplates?: Partial<Record<EmailTemplateId, {
+    subject?: string | null;
+    heading?: string | null;
+    buttonLabel?: string | null;
+    html?: string | null;
+  }>>;
+}
+
+// ============================================
+// SNMP Types
+// ============================================
+
+export * from './snmp';
+
+// ============================================
+// Network Discovery Types
+// ============================================
+
+export * from './discovery';
+
+// ============================================
+// Filter System Types
+// ============================================
+
+export * from './filters';
+
+// ============================================
+// AI Types
+// ============================================
+
+export * from './ai';
+export * from './aiAgents';
+export * from './aiAgentGraduation';
+export * from './aiAgentRuns';
+export * from './aiAgentSchedules';
+export * from './aiToolDomains';
+export * from './aiOperator';
+export * from './aiOrigin';
+export * from './orgNarrativeReport';
+export * from './fleetDesign';
+export * from './fleetDesignApply';
+export * from './aiPatchPlan';
+export * from './deviceFunction';
+export * from './sendingDomains';
+export * from './ticketTriage';
+export * from './aiAgentImpact';
+export * from './aiAgentImpactMeasured';
+
+// ============================================
+// Billing Enum SSOT
+// ============================================
+
+export * from './billing-enums';
+export * from './pax8-enums';
+
+// ============================================
+// Tenant Variables (#3409)
+// ============================================
+
+export * from './tenantVariables';
+
+// ============================================
+// Vulnerability fleet-triage SSOT
+// ============================================
+
+export * from './vulnerability';
+
+// ============================================
+// Security & Compliance Posture Report
+// ============================================
+
+export * from './postureReport';
+export * from './executiveSummaryReport';
+export * from './hardwareLifecycleReport';
+export * from './identityAccessReport';
+export * from './threatDetectionReport';
+export * from './endpointManagementReport';
+export * from './vulnerabilityManagementReport';
+
+// ============================================
+// Portal Visibility DTOs (Wave 1 - #4562)
+// ============================================
+
+export * from './portalVisibility';
+export * from './portalChromeAccent';
+export * from './portalService';
+
+// ============================================
+// Public login-context wire contract (#2183)
+// ============================================
+
+export * from './loginContext';
+export * from './ssoDiscovery';
+export * from './publicQuote';
+
+// ============================================
+// Office add-in tech-persona wire shapes
+// ============================================
+
+export * from './officeAddin';
+
+// ============================================
+// Stripe account / multi-currency checkout (#3777)
+// ============================================
+
+export * from './stripeAccount';
+
+// ============================================
+// Ticket comment attachments (W08 #3902)
+// ============================================
+
+export * from './tickets';
+
+// ============================================
+// AI run artifacts (execution plane, spec 2026-09-13)
+// ============================================
+
+export * from './aiArtifacts';
+
+// ============================================
+// Tool sources (BYO MCP/OpenAPI, spec 2026-09-07)
+// ============================================
+
+export * from './toolSources';
+
+// Intelligent network topology canonical wire contracts (#5996)
+export * from './topology';
+
+export * from './topologyCollection';
+
+export * from './topologyConfiguration';
+
+export * from './topologyDiagnostics';
+
+export * from './securityScan';
+
+// Metric anomaly episodes (spec 2026-09-21)
+export * from './metricAnomalyEpisodes';

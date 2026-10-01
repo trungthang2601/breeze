@@ -1,0 +1,836 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Terminal, RefreshCw, Eye, X, ChevronDown, ChevronUp, Copy, Check, Loader2, AlertOctagon, RotateCcw, Square } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { cn } from '@/lib/utils';
+import { formatDateTime as formatUserDateTime } from '@/lib/dateTimeFormat';
+import { fetchWithAuth } from '../../stores/auth';
+import { extractApiError } from '@/lib/apiError';
+import { navigateTo } from '@/lib/navigation';
+import { handleActionError } from '@/lib/runAction';
+import {
+  requestScriptExecutionCancel,
+  SCRIPT_CANCEL_DEFAULT_GRACE_SECONDS,
+} from '@/lib/cancelScriptExecution';
+import { usePermissions } from '@/lib/permissions';
+import { showToast } from '../shared/Toast';
+import { ConfirmDialog } from '../shared/ConfirmDialog';
+import ScriptExecutionModal from '../scripts/ScriptExecutionModal';
+import {
+  executionRowStatusConfig,
+  executionDetailStatusConfig,
+  resolveExecutionStatusLabel,
+} from '../scripts/executionStatus';
+import type { Script } from '../scripts/ScriptList';
+import type { ScriptParameter } from '../scripts/ScriptForm';
+import type { CancelState, ExecutionStatus, ScriptAdmissionResult } from '@breeze/shared';
+import { RunContextChip, type RunContextValue } from '../common/RunContext';
+import { AiInitiatorChip } from '../common/AiInitiatorChip';
+import type { AiInitiatorKind, AiOriginSummaryDto } from '@breeze/shared';
+
+type ScriptExecution = {
+  id?: string;
+  scriptId?: string;
+  scriptName?: string;
+  name?: string;
+  status?: string;
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  errorMessage?: string;
+  startedAt?: string;
+  completedAt?: string;
+  createdAt?: string;
+  durationMs?: number;
+  durationSeconds?: number;
+  // #4885 — the runtime values this execution was submitted with. See the
+  // same field on ExecutionHistory's ScriptExecution; the API's SELECT was
+  // extended for this device-scoped endpoint alongside this change.
+  parameters?: Record<string, string | number | boolean> | null;
+  // #4888 — the run context this execution actually used. NULL/absent means
+  // the row predates the column and is genuinely unknown; RunContextChip
+  // renders that as "Not recorded" rather than guessing "System".
+  runAs?: RunContextValue | null;
+  targetSessionId?: number | null;
+  // #4767 — set once a stop was requested; qualifies the terminal label
+  // ("your stop request arrived too late" / "stop failed"). Absent/null means
+  // no cancel was ever requested.
+  cancelState?: CancelState | null;
+  // #5022 W02 — who DECIDED this run, projected by GET /devices/:id/scripts.
+  // null/absent means "AI initiation not recorded", never "a human did this".
+  aiInitiatorKind?: AiInitiatorKind | null;
+  hasAiOrigin?: boolean;
+};
+
+type ScriptWithDetails = Script & {
+  parameters?: ScriptParameter[];
+  content?: string;
+};
+
+type DeviceScriptHistoryProps = {
+  deviceId: string;
+  timezone?: string;
+  // #4886 — highlight (and auto-open) the execution a post-run redirect sent
+  // the operator here to watch. Comes from the `#scripts/<executionId>` hash
+  // (DeviceDetails.tsx); undefined for an ordinary tab visit.
+  highlightExecutionId?: string;
+};
+
+// #5318 — the DB enum has 8 values; this tab used to print the raw lowercase
+// enum in the table and index a private 5-member map in the detail panel.
+// Status presentation now comes from the single shared source of truth
+// (components/scripts/executionStatus.ts) that the scripts pages already use.
+function toExecutionStatus(raw: string | undefined): ExecutionStatus | null {
+  const status = (raw ?? '').toLowerCase();
+  return status in executionRowStatusConfig ? (status as ExecutionStatus) : null;
+}
+
+// #4767 — the only statuses a Stop request is meaningful against. `cancelling`
+// gets the disabled "Stopping…" affordance instead of a new stop.
+const CANCELLABLE_STATUSES = new Set<ExecutionStatus>(['pending', 'queued', 'running']);
+
+function formatDateTime(value?: string, timezone?: string) {
+  if (!value) return 'Not reported';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : formatUserDateTime(date, timezone ? { timeZone: timezone } : undefined);
+}
+
+function formatDuration(ms?: number, seconds?: number) {
+  const totalSeconds = seconds ?? (ms ? Math.round(ms / 1000) : undefined);
+  if (!totalSeconds && totalSeconds !== 0) return 'Not reported';
+  if (totalSeconds < 1) return '<1s';
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const remaining = totalSeconds % 60;
+  return `${minutes}m ${remaining}s`;
+}
+
+function computeDurationSeconds(startedAt?: string, completedAt?: string): number | undefined {
+  if (!startedAt || !completedAt) return undefined;
+  const start = new Date(startedAt).getTime();
+  const end = new Date(completedAt).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end)) return undefined;
+  return Math.max(0, Math.round((end - start) / 1000));
+}
+
+function normalizeOutput(raw: string): string {
+  let s = raw;
+  // Strip surrounding quotes from double-serialized JSON strings
+  if (s.startsWith('"') && s.endsWith('"')) {
+    try { s = JSON.parse(s); } catch { /* not valid JSON, leave as-is */ }
+  }
+  // Convert literal escape sequences to actual characters
+  s = s.replace(/\\r\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+  return s;
+}
+
+function OutputSection({
+  title,
+  content,
+  icon: Icon,
+  defaultOpen = true,
+  variant = 'default'
+}: {
+  title: string;
+  content?: string;
+  icon: typeof Terminal;
+  defaultOpen?: boolean;
+  variant?: 'default' | 'error';
+}) {
+  const { t } = useTranslation('devices');
+  const [isOpen, setIsOpen] = useState(defaultOpen);
+  const [copied, setCopied] = useState(false);
+  const normalized = content ? normalizeOutput(content) : content;
+
+  const handleCopy = async () => {
+    if (!normalized) return;
+    try {
+      await navigator.clipboard.writeText(normalized);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
+  };
+
+  const isEmpty = !normalized || normalized.trim() === '';
+
+  return (
+    <div className={cn(
+      'rounded-md border',
+      variant === 'error' && normalized && 'border-red-500/40'
+    )}>
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => setIsOpen(!isOpen)}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setIsOpen(!isOpen); } }}
+        className={cn(
+          'flex w-full items-center justify-between px-4 py-3 text-left transition cursor-pointer',
+          isOpen ? 'border-b' : '',
+          variant === 'error' && normalized ? 'bg-red-500/5' : 'bg-muted/20'
+        )}
+      >
+        <div className="flex items-center gap-2">
+          <Icon className={cn(
+            'h-4 w-4',
+            variant === 'error' && normalized ? 'text-red-600' : 'text-muted-foreground'
+          )} />
+          <span className={cn(
+            'text-sm font-medium',
+            variant === 'error' && normalized && 'text-red-700'
+          )}>
+            {title}
+          </span>
+          {isEmpty && (
+            <span className="text-xs text-muted-foreground">{t('deviceScriptHistory.emptyOutputBadge')}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {!isEmpty && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleCopy();
+              }}
+              className="flex h-7 w-7 items-center justify-center rounded hover:bg-muted"
+              title={t('deviceScriptHistory.copyToClipboard')}
+            >
+              {copied ? (
+                <Check className="h-4 w-4 text-green-600" />
+              ) : (
+                <Copy className="h-4 w-4 text-muted-foreground" />
+              )}
+            </button>
+          )}
+          {isOpen ? (
+            <ChevronUp className="h-4 w-4 text-muted-foreground" />
+          ) : (
+            <ChevronDown className="h-4 w-4 text-muted-foreground" />
+          )}
+        </div>
+      </div>
+      {isOpen && (
+        <div className="p-4">
+          {isEmpty ? (
+            <p className="text-sm text-muted-foreground italic">{t('deviceScriptHistory.noOutput')}</p>
+          ) : (
+            <pre className={cn(
+              'max-h-80 overflow-auto rounded-md p-4 text-sm font-mono whitespace-pre-wrap wrap-break-word',
+              variant === 'error' ? 'bg-red-500/5 text-red-800' : 'bg-muted/40 text-foreground'
+            )}>
+              {normalized}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * #5318 — table badge, keyed on the SHARED status config so a new enum member
+ * is a tsc error here instead of a raw lowercase enum leaking into the UI.
+ * `status` is null only when the API sends something outside the enum, in
+ * which case the raw value is shown rather than a wrong label.
+ */
+function ExecutionStatusBadge({
+  executionId,
+  status,
+  rawStatus,
+  cancelState,
+}: {
+  executionId: string;
+  status: ExecutionStatus | null;
+  rawStatus: string;
+  cancelState?: CancelState | null;
+}) {
+  const { t } = useTranslation('scripts');
+  if (!status) {
+    return (
+      <span
+        data-testid={`device-execution-status-${executionId}`}
+        className="inline-flex items-center rounded-full border border-muted bg-muted/40 px-2.5 py-1 text-xs font-medium text-muted-foreground"
+      >
+        {rawStatus}
+      </span>
+    );
+  }
+  const config = executionRowStatusConfig[status];
+  const StatusIcon = config.icon;
+  return (
+    <span
+      data-testid={`device-execution-status-${executionId}`}
+      className={cn('inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium', config.color)}
+    >
+      <StatusIcon className={cn('h-3 w-3', (status === 'running' || status === 'cancelling') && 'animate-spin')} />
+      {t(/* i18n-dynamic */ `executionHistory.${resolveExecutionStatusLabel(status, cancelState)}`)}
+    </span>
+  );
+}
+
+export default function DeviceScriptHistory({ deviceId, timezone, highlightExecutionId }: DeviceScriptHistoryProps) {
+  const { t } = useTranslation('devices');
+  const { t: tScripts } = useTranslation('scripts');
+  const [executions, setExecutions] = useState<ScriptExecution[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string>();
+  const [siteTimezone, setSiteTimezone] = useState<string | undefined>(timezone);
+  const [selectedExecutionSnapshot, setSelectedExecution] = useState<ScriptExecution | null>(null);
+  // Follow refreshed results while details are open, retaining the last
+  // selected row if it falls outside the history endpoint's latest 50 runs.
+  const selectedExecution = selectedExecutionSnapshot && (
+    executions.find(item => item.id && item.id === selectedExecutionSnapshot.id) ?? selectedExecutionSnapshot
+  );
+  // #4885 "Run again" — the fetched script definition (parameters, OS types,
+  // runAs) needed to open ScriptExecutionModal, plus the loading/error state
+  // for that fetch. Cleared on close so a stale script never lingers across
+  // two different "Run again" clicks.
+  const [runAgainScript, setRunAgainScript] = useState<ScriptWithDetails | null>(null);
+  const [runAgainParameters, setRunAgainParameters] = useState<Record<string, string | number | boolean>>({});
+  const [runAgainLoading, setRunAgainLoading] = useState(false);
+  // #4886 — only auto-open the highlighted execution once per id, so closing
+  // it (or a routine 10s poll refresh) doesn't keep re-opening it in the
+  // operator's face.
+  const autoOpenedHighlightRef = useRef<string | undefined>(undefined);
+  // #5318 — Stop, wired to the same POST /scripts/executions/:id/cancel path
+  // the scripts pages use (lib/cancelScriptExecution.ts). `confirmingCancel`
+  // is the execution in the confirm dialog; `cancelSubmittingId` the one whose
+  // request is in flight.
+  const { can } = usePermissions();
+  const canCancel = can('scripts', 'execute');
+  const [confirmingCancel, setConfirmingCancel] = useState<ScriptExecution | null>(null);
+  const [cancelSubmittingId, setCancelSubmittingId] = useState<string | null>(null);
+
+  const effectiveTimezone = timezone ?? siteTimezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  // #5022 W02 — resolves one execution's authorized AI origin summary on
+  // demand (the chip calls this once, when opened). Read-only, so no
+  // runAction. A 404/non-OK response is treated the same as "no origin" --
+  // the chip's popover renders "origin not available" rather than throwing.
+  const fetchOrigin = useCallback(
+    async (source: 'execution' | 'command', sourceId: string): Promise<AiOriginSummaryDto | null> => {
+      try {
+        const response = await fetchWithAuth(
+          `/devices/${deviceId}/ai-origin?source=${source}&sourceId=${sourceId}`,
+        );
+        if (!response.ok) return null;
+        const json = await response.json();
+        return json?.data ?? null;
+      } catch {
+        return null;
+      }
+    },
+    [deviceId],
+  );
+
+  const fetchHistory = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    setError(undefined);
+    try {
+      const response = await fetchWithAuth(`/devices/${deviceId}/scripts`);
+      if (!response.ok) throw new Error('Failed to fetch script history');
+      const json = await response.json();
+      const payload = json?.data ?? json;
+      setExecutions(Array.isArray(payload) ? payload : []);
+      if (json?.timezone || json?.siteTimezone) {
+        setSiteTimezone(json.timezone ?? json.siteTimezone);
+      }
+    } catch (err) {
+      if (!silent) setError(err instanceof Error ? err.message : 'Failed to fetch script history');
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [deviceId]);
+
+  // #5318 — while a run is still going (or a Stop is in flight) poll every 2s,
+  // mirroring ScriptExecutionsPage, so "Stopping…" resolves promptly instead
+  // of sitting for up to 10s. Keyed on a boolean so the interval isn't torn
+  // down and recreated on every tick.
+  const hasActiveExecutions = useMemo(
+    () => executions.some(item => {
+      const status = (item.status ?? '').toLowerCase();
+      return status === 'running' || status === 'cancelling';
+    }),
+    [executions],
+  );
+
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
+
+  useEffect(() => {
+    const interval = setInterval(() => fetchHistory(true), hasActiveExecutions ? 2000 : 10000);
+    return () => clearInterval(interval);
+  }, [fetchHistory, hasActiveExecutions]);
+
+  const rows = useMemo(() => {
+    return executions.map((item, index) => {
+      const status = (item.status || 'unknown').toLowerCase();
+      const executionStatus = toExecutionStatus(item.status);
+      const duration = computeDurationSeconds(item.startedAt ?? item.createdAt, item.completedAt);
+      return {
+        id: item.id ?? `${item.scriptName ?? item.name ?? 'script'}-${index}`,
+        name: item.scriptName ?? item.name ?? t('deviceScriptHistory.unnamedScript'),
+        status,
+        executionStatus,
+        startedAt: formatDateTime(item.startedAt ?? item.createdAt, effectiveTimezone),
+        completedAt: formatDateTime(item.completedAt, effectiveTimezone),
+        duration: formatDuration(item.durationMs, item.durationSeconds ?? duration),
+        raw: item,
+      };
+    });
+  }, [executions, effectiveTimezone]);
+
+  // #4886 — once the highlighted execution shows up in the fetched list, open
+  // its details automatically so a post-run redirect actually lands the
+  // operator watching the result, not just staring at a list.
+  useEffect(() => {
+    if (!highlightExecutionId) {
+      autoOpenedHighlightRef.current = undefined;
+      return;
+    }
+    if (autoOpenedHighlightRef.current === highlightExecutionId) return;
+    const match = executions.find(item => item.id === highlightExecutionId);
+    if (!match) return;
+    autoOpenedHighlightRef.current = highlightExecutionId;
+    setSelectedExecution(match);
+  }, [highlightExecutionId, executions]);
+
+  // #5318 — one cancel path shared with ScriptExecutionsPage; the API
+  // re-checks scripts:execute, so `canCancel` above is UX only.
+  const handleCancel = async (execution: ScriptExecution, graceSeconds: number) => {
+    if (!execution.id) return;
+    setCancelSubmittingId(execution.id);
+    try {
+      await requestScriptExecutionCancel({
+        executionId: execution.id,
+        graceSeconds,
+        errorFallback: tScripts('executionHistory.errors.cancelFailed'),
+        noLongerCancellableMessage: tScripts('executionHistory.errors.noLongerCancellable'),
+        onUnauthorized: () => void navigateTo('/login', { replace: true }),
+      });
+      await fetchHistory(true);
+    } catch (err) {
+      handleActionError(err, tScripts('executionHistory.errors.cancelFailed'));
+    } finally {
+      setCancelSubmittingId(null);
+      setConfirmingCancel(null);
+    }
+  };
+
+  // #4885 "Run again" — fetch the script's current parameter definitions
+  // (osTypes/runAs/parameters) so ScriptExecutionModal has what it needs, then
+  // open it pre-filled with this device and the execution's runtime values.
+  const handleRunAgain = async (execution: ScriptExecution) => {
+    if (!execution.scriptId) return;
+    setSelectedExecution(null);
+    setRunAgainLoading(true);
+    try {
+      const response = await fetchWithAuth(`/scripts/${execution.scriptId}`);
+      if (!response.ok) {
+        throw new Error(tScripts('scriptExecutionsPage.errors.fetchScript'));
+      }
+      const data = await response.json();
+      setRunAgainScript(data.script ?? data);
+      setRunAgainParameters(execution.parameters ?? {});
+    } catch (err) {
+      showToast({
+        type: 'error',
+        message: err instanceof Error ? err.message : tScripts('scriptExecutionsPage.errors.fetchScript'),
+      });
+    } finally {
+      setRunAgainLoading(false);
+    }
+  };
+
+  const handleCloseRunAgain = () => {
+    setRunAgainScript(null);
+    setRunAgainParameters({});
+  };
+
+  const handleExecuteRunAgain = async (
+    scriptId: string,
+    deviceIds: string[],
+    parameters: Record<string, string | number | boolean>,
+    runAs: 'system' | 'user'
+  ): Promise<ScriptAdmissionResult> => {
+    const response = await fetchWithAuth(`/scripts/${scriptId}/execute`, {
+      method: 'POST',
+      body: JSON.stringify({ deviceIds, parameters, runAs })
+    });
+
+    const data = await response.json().catch(() => ({})) as ScriptAdmissionResult & { error?: string };
+
+    if (!response.ok) {
+      throw new Error(extractApiError(data, tScripts('scriptExecutionsPage.errors.execute')));
+    }
+
+    if (data.targets.some(target => target.admission === 'admitted')) {
+      await fetchHistory(true);
+    }
+    return data;
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center rounded-lg border bg-card py-12 shadow-xs">
+        <div className="text-center">
+          <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+          <p className="mt-3 text-sm text-muted-foreground">{t('deviceScriptHistory.loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        <button
+          type="button"
+          onClick={() => {
+            void fetchHistory();
+          }}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          {t('common:actions.retry')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Terminal className="h-4 w-4 text-muted-foreground" />
+            <h3 className="text-lg font-semibold">{t('deviceScriptHistory.title')}</h3>
+          </div>
+          <button
+            type="button"
+            disabled={refreshing}
+            onClick={async () => {
+              setRefreshing(true);
+              await fetchHistory(true);
+              setRefreshing(false);
+            }}
+            className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground transition disabled:opacity-50"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+            {refreshing ? t('deviceScriptHistory.refreshing') : t('common:actions.refresh')}
+          </button>
+        </div>
+        <div className="mt-4 overflow-hidden rounded-md border">
+          <table className="min-w-full divide-y">
+            <thead className="bg-muted/40">
+              <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                <th className="px-4 py-3">{t('deviceScriptHistory.table.script')}</th>
+                <th className="px-4 py-3">{t('deviceScriptHistory.table.status')}</th>
+                <th className="px-4 py-3">{t('deviceScriptHistory.table.started')}</th>
+                <th className="px-4 py-3">{t('deviceScriptHistory.table.completed')}</th>
+                <th className="px-4 py-3">{t('deviceScriptHistory.table.duration')}</th>
+                <th className="px-4 py-3 w-10" />
+                <th className="px-4 py-3 w-10" />
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {rows.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-6 text-center text-sm text-muted-foreground">
+                    {t('deviceScriptHistory.empty')}
+                  </td>
+                </tr>
+              ) : (
+                rows.map(row => (
+                  <tr
+                    key={row.id}
+                    className={cn(
+                      'text-sm cursor-pointer hover:bg-muted/40 transition',
+                      // #4886 — the row a post-run redirect sent the operator
+                      // here to watch, so it's findable even after they close
+                      // the auto-opened details modal.
+                      row.id === highlightExecutionId && 'bg-primary/5 ring-1 ring-inset ring-primary/40'
+                    )}
+                    onClick={() => setSelectedExecution(row.raw)}
+                  >
+                    <td className="px-4 py-3 font-medium">{row.name}</td>
+                    <td className="px-4 py-3">
+                      <ExecutionStatusBadge
+                        executionId={row.id}
+                        status={row.executionStatus}
+                        rawStatus={row.status}
+                        cancelState={row.raw.cancelState}
+                      />
+                    </td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">{row.startedAt}</td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">{row.completedAt}</td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">{row.duration}</td>
+                    <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                      <AiInitiatorChip
+                        kind={row.raw.aiInitiatorKind ?? null}
+                        loadOrigin={
+                          row.raw.hasAiOrigin && row.raw.id
+                            ? () => fetchOrigin('execution', row.raw.id!)
+                            : undefined
+                        }
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center justify-end gap-1">
+                        {canCancel && row.raw.id && row.executionStatus
+                          && (CANCELLABLE_STATUSES.has(row.executionStatus) || row.executionStatus === 'cancelling') && (
+                          <button
+                            type="button"
+                            data-testid={`device-script-stop-${row.raw.id}`}
+                            disabled={row.executionStatus === 'cancelling'}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (row.executionStatus !== 'cancelling') setConfirmingCancel(row.raw);
+                            }}
+                            className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                            title={row.executionStatus === 'cancelling'
+                              ? tScripts('executionHistory.status.cancelling')
+                              : tScripts('executionHistory.actions.stop')}
+                          >
+                            {row.executionStatus === 'cancelling'
+                              ? <Loader2 className="h-4 w-4 animate-spin" />
+                              : <Square className="h-4 w-4" />}
+                          </button>
+                        )}
+                        <Eye className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Execution Details Modal */}
+      {selectedExecution && (() => {
+        const selectedStatus = toExecutionStatus(selectedExecution.status) ?? 'pending';
+        const config = executionDetailStatusConfig[selectedStatus];
+        const StatusIcon = config.icon;
+        const showStop = canCancel && !!selectedExecution.id
+          && (CANCELLABLE_STATUSES.has(selectedStatus) || selectedStatus === 'cancelling');
+        return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
+          <div className="w-full max-w-4xl max-h-[90vh] overflow-hidden rounded-lg border bg-card shadow-lg flex flex-col">
+            {/* Header */}
+            <div className="flex items-center justify-between border-b px-6 py-4">
+              <div>
+                <h2 className="text-lg font-semibold">{t('deviceScriptHistory.detailsTitle')}</h2>
+                <p className="text-sm text-muted-foreground">{selectedExecution.scriptName ?? selectedExecution.name ?? t('deviceScriptHistory.scriptFallback')}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedExecution(null)}
+                className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-6">
+              {/* Status Banner */}
+              <div className={cn('rounded-md p-4', config.bgColor)}>
+                <div className="flex items-center gap-3">
+                  <StatusIcon className={cn(
+                    'h-6 w-6',
+                    config.color,
+                    (selectedStatus === 'running' || selectedStatus === 'cancelling') && 'animate-spin'
+                  )} />
+                  <div>
+                    <p className={cn('text-lg font-semibold', config.color)}>
+                      {tScripts(/* i18n-dynamic */ `executionDetails.${resolveExecutionStatusLabel(selectedStatus, selectedExecution.cancelState)}`)}
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      {selectedStatus === 'failed' && selectedExecution.errorMessage
+                        ? selectedExecution.errorMessage
+                        : tScripts(/* i18n-dynamic */ `executionDetails.statusDescription.${selectedStatus}`)}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Metadata Grid */}
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <div className="rounded-md border bg-muted/20 p-4">
+                  <p className="text-xs font-medium text-muted-foreground">{t('deviceScriptHistory.metadata.startedAt')}</p>
+                  <p className="text-sm font-medium mt-1">
+                    {formatDateTime(selectedExecution.startedAt ?? selectedExecution.createdAt, effectiveTimezone)}
+                  </p>
+                </div>
+                <div className="rounded-md border bg-muted/20 p-4">
+                  <p className="text-xs font-medium text-muted-foreground">{t('deviceScriptHistory.metadata.completedAt')}</p>
+                  <p className="text-sm font-medium mt-1">
+                    {formatDateTime(selectedExecution.completedAt, effectiveTimezone)}
+                  </p>
+                </div>
+                <div className="rounded-md border bg-muted/20 p-4">
+                  <p className="text-xs font-medium text-muted-foreground">{t('deviceScriptHistory.metadata.duration')}</p>
+                  <p className="text-sm font-medium mt-1">
+                    {selectedStatus === 'running' ? (
+                      <span className="flex items-center gap-1">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        {t('deviceScriptHistory.running')}
+                      </span>
+                    ) : (
+                      formatDuration(
+                        selectedExecution.durationMs,
+                        selectedExecution.durationSeconds ?? computeDurationSeconds(selectedExecution.startedAt ?? selectedExecution.createdAt, selectedExecution.completedAt)
+                      )
+                    )}
+                  </p>
+                </div>
+                <div className="rounded-md border bg-muted/20 p-4">
+                  <p className="text-xs font-medium text-muted-foreground">{t('deviceScriptHistory.metadata.exitCode')}</p>
+                  <p className="text-sm font-medium mt-1">
+                    {selectedExecution.exitCode !== undefined && selectedExecution.exitCode !== null ? (
+                      <span className={cn(
+                        'inline-flex items-center rounded px-2 py-0.5 font-mono',
+                        selectedExecution.exitCode === 0
+                          ? 'bg-success/15 text-success'
+                          : 'bg-destructive/15 text-destructive'
+                      )}>
+                        {selectedExecution.exitCode}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">-</span>
+                    )}
+                  </p>
+                </div>
+                <div className="rounded-md border bg-muted/20 p-4">
+                  <p className="text-xs font-medium text-muted-foreground">{t('deviceScriptHistory.metadata.runAs')}</p>
+                  <p className="mt-1 flex flex-wrap items-center gap-1.5 text-sm font-medium">
+                    {/* #5022 W02 — the AI initiator chip renders BESIDE the
+                        run-context chip, never replacing it: one encodes OS
+                        execution privilege, the other who decided the run. */}
+                    <RunContextChip runAs={selectedExecution.runAs} targetSessionId={selectedExecution.targetSessionId} />
+                    {selectedExecution.id && (
+                      <AiInitiatorChip
+                        kind={selectedExecution.aiInitiatorKind ?? null}
+                        loadOrigin={
+                          selectedExecution.hasAiOrigin
+                            ? () => fetchOrigin('execution', selectedExecution.id!)
+                            : undefined
+                        }
+                      />
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              {/* Output Sections */}
+              <div className="space-y-4">
+                <h3 className="text-sm font-semibold">{t('deviceScriptHistory.output')}</h3>
+                <OutputSection
+                  title={t('deviceScriptHistory.stdout')}
+                  content={selectedExecution.stdout}
+                  icon={Terminal}
+                  defaultOpen={true}
+                />
+                <OutputSection
+                  title={t('deviceScriptHistory.stderr')}
+                  content={selectedExecution.stderr}
+                  icon={AlertOctagon}
+                  defaultOpen={!!selectedExecution.stderr}
+                  variant="error"
+                />
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="flex items-center justify-end gap-3 border-t px-6 py-4">
+              {showStop && (
+                <button
+                  type="button"
+                  data-testid="device-script-stop-details"
+                  disabled={selectedStatus === 'cancelling'}
+                  onClick={() => setConfirmingCancel(selectedExecution)}
+                  className="inline-flex h-10 items-center gap-1.5 rounded-md border px-4 text-sm font-medium text-destructive transition hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {selectedStatus === 'cancelling'
+                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                    : <Square className="h-4 w-4" />}
+                  {selectedStatus === 'cancelling'
+                    ? tScripts('executionHistory.status.cancelling')
+                    : tScripts('executionHistory.actions.stop')}
+                </button>
+              )}
+              {selectedExecution.scriptId && (
+                <button
+                  type="button"
+                  data-testid="device-script-run-again"
+                  disabled={runAgainLoading}
+                  onClick={() => void handleRunAgain(selectedExecution)}
+                  className="inline-flex h-10 items-center gap-1.5 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {runAgainLoading ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <RotateCcw className="h-4 w-4" />
+                  )}
+                  {t('deviceScriptHistory.runAgain')}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setSelectedExecution(null)}
+                className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+              >
+                {t('common:actions.close')}
+              </button>
+            </div>
+          </div>
+        </div>
+        );
+      })()}
+
+      {/* #5318 — Stop confirmation, same grace/force contract as the scripts page */}
+      {confirmingCancel && (
+        <ConfirmDialog
+          open={true}
+          onClose={() => setConfirmingCancel(null)}
+          onConfirm={() => void handleCancel(confirmingCancel, SCRIPT_CANCEL_DEFAULT_GRACE_SECONDS)}
+          title={tScripts('executionHistory.actions.confirmStopTitle')}
+          message={tScripts('executionHistory.actions.confirmStopMessage', {
+            script: confirmingCancel.scriptName ?? confirmingCancel.name ?? t('deviceScriptHistory.scriptFallback'),
+          })}
+          variant="warning"
+          confirmLabel={tScripts('executionHistory.actions.stop')}
+          confirmTestId="confirm-stop"
+          isLoading={cancelSubmittingId === confirmingCancel.id}
+        >
+          <button
+            type="button"
+            data-testid="confirm-force-stop"
+            disabled={cancelSubmittingId === confirmingCancel.id}
+            onClick={() => void handleCancel(confirmingCancel, 0)}
+            className="text-sm font-medium text-destructive hover:underline disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {tScripts('executionHistory.actions.forceStop')}
+          </button>
+        </ConfirmDialog>
+      )}
+
+      {/* #4885 "Run again" — pre-filled execute flow */}
+      {runAgainScript && (
+        <ScriptExecutionModal
+          script={runAgainScript}
+          isOpen
+          onClose={handleCloseRunAgain}
+          onExecute={handleExecuteRunAgain}
+          initialDeviceIds={[deviceId]}
+          initialParameters={runAgainParameters}
+        />
+      )}
+    </>
+  );
+}

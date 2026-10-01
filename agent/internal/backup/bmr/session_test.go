@@ -1,0 +1,658 @@
+package bmr
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/breeze-rmm/agent/internal/backup/providers"
+)
+
+func TestAuthenticateRecoverySession(t *testing.T) {
+	var gotToken string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/backup/bmr/recover/authenticate" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_ = json.Unmarshal(body["token"], &gotToken)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"bootstrap": BootstrapResponse{
+				Version:      BootstrapResponseVersion,
+				TokenID:      "token-1",
+				DeviceID:     "device-1",
+				SnapshotID:   "db-snapshot-1",
+				TargetConfig: map[string]any{},
+				Download: &AuthenticatedDownloadDescriptor{
+					Type:              "breeze_proxy",
+					Method:            "GET",
+					URL:               server.URL + "/api/v1/backup/bmr/recover/download",
+					PathQueryParam:    "path",
+					TokenHeaderName:   "authorization",
+					TokenHeaderFormat: "Bearer <recovery-token>",
+					PathPrefix:        "snapshots/provider-snapshot-1",
+				},
+				Snapshot: &AuthenticatedSnapshot{
+					ID:         "snapshot-db-id",
+					SnapshotID: "provider-snapshot-1",
+					Size:       2048,
+					FileCount:  2,
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	resp, err := authenticateRecoverySession(server.URL, "brz_rec_test")
+	if err != nil {
+		t.Fatalf("authenticateRecoverySession: %v", err)
+	}
+	if gotToken != "brz_rec_test" {
+		t.Fatalf("token = %q, want brz_rec_test", gotToken)
+	}
+	if resp.Snapshot == nil || resp.Snapshot.SnapshotID != "provider-snapshot-1" {
+		t.Fatalf("snapshot = %+v, want provider snapshot id", resp.Snapshot)
+	}
+	if resp.Download == nil || resp.Download.PathPrefix != "snapshots/provider-snapshot-1" {
+		t.Fatalf("download descriptor = %+v, want snapshot-scoped download access", resp.Download)
+	}
+}
+
+func TestDecodeBootstrapResponseLegacyFallback(t *testing.T) {
+	data, err := json.Marshal(AuthenticateResponse{
+		TokenID:    "token-legacy",
+		DeviceID:   "device-legacy",
+		SnapshotID: "snapshot-legacy",
+		TargetConfig: map[string]any{
+			"provider": "local",
+			"path":     "/var/lib/breeze-backups",
+		},
+		Snapshot: &AuthenticatedSnapshot{
+			ID:         "snapshot-db-id",
+			SnapshotID: "provider-snapshot-legacy",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal legacy response: %v", err)
+	}
+
+	resp, err := decodeBootstrapResponse(data)
+	if err != nil {
+		t.Fatalf("decodeBootstrapResponse: %v", err)
+	}
+	if resp.Version != BootstrapResponseVersion {
+		t.Fatalf("version = %d, want %d", resp.Version, BootstrapResponseVersion)
+	}
+	if resp.Snapshot == nil || resp.Snapshot.SnapshotID != "provider-snapshot-legacy" {
+		t.Fatalf("snapshot = %+v, want legacy provider snapshot id", resp.Snapshot)
+	}
+}
+
+func TestReportRecoveryCompletion(t *testing.T) {
+	var gotStatus string
+	var gotToken string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/backup/bmr/recover/complete" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotToken = body["token"].(string)
+		gotStatus = body["result"].(map[string]any)["status"].(string)
+		_ = json.NewEncoder(w).Encode(map[string]any{"restoreJobId": "job-1", "status": "completed"})
+	}))
+	defer server.Close()
+
+	err := reportRecoveryCompletion(server.URL, "brz_rec_test", &RecoveryResult{Status: "completed"})
+	if err != nil {
+		t.Fatalf("reportRecoveryCompletion: %v", err)
+	}
+	if gotToken != "brz_rec_test" {
+		t.Fatalf("token = %q, want brz_rec_test", gotToken)
+	}
+	if gotStatus != "completed" {
+		t.Fatalf("status = %q, want completed", gotStatus)
+	}
+}
+
+func TestRunRecoveryWithToken_UsesAuthenticatedBootstrap(t *testing.T) {
+	var completeStatus atomic.Value
+	var seenRecoveryToken string
+	origRunRecovery := runRecovery
+	defer func() { runRecovery = origRunRecovery }()
+	runRecovery = func(ctx context.Context, cfg RecoveryConfig, provider providers.BackupProvider) (*RecoveryResult, error) {
+		if ctx == nil {
+			t.Fatal("expected context to be provided")
+		}
+		destPath := filepath.Join(t.TempDir(), "manifest.json")
+		if err := provider.Download("snapshots/provider-snapshot-1/manifest.json", destPath); err != nil {
+			t.Fatalf("provider download failed: %v", err)
+		}
+		downloaded, err := os.ReadFile(destPath)
+		if err != nil {
+			t.Fatalf("read downloaded manifest: %v", err)
+		}
+		if string(downloaded) != `{"ok":true}` {
+			t.Fatalf("downloaded payload = %q, want manifest json", string(downloaded))
+		}
+		if cfg.SnapshotID != "provider-snapshot-1" {
+			t.Fatalf("snapshotId = %q, want provider-snapshot-1", cfg.SnapshotID)
+		}
+		if cfg.TargetPaths["/src/data"] != "/dst/data" {
+			t.Fatalf("target override missing: %+v", cfg.TargetPaths)
+		}
+		if _, ok := provider.(*recoveryDownloadProvider); !ok {
+			t.Fatalf("provider type = %T, want authenticated recovery download provider", provider)
+		}
+		return &RecoveryResult{Status: "completed", FilesRestored: 1}, nil
+	}
+
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/backup/bmr/recover/authenticate":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			seenRecoveryToken = body["token"]
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"bootstrap": BootstrapResponse{
+					Version:    BootstrapResponseVersion,
+					TokenID:    "token-1",
+					DeviceID:   "device-1",
+					SnapshotID: "db-snapshot-1",
+					TargetConfig: map[string]any{
+						"targetPaths": map[string]any{
+							"/src/data": "/dst/data",
+						},
+					},
+					Download: &AuthenticatedDownloadDescriptor{
+						Type:              "breeze_proxy",
+						Method:            "GET",
+						URL:               server.URL + "/api/v1/backup/bmr/recover/download",
+						PathQueryParam:    "path",
+						TokenHeaderName:   "authorization",
+						TokenHeaderFormat: "Bearer <recovery-token>",
+						PathPrefix:        "snapshots/provider-snapshot-1",
+					},
+					Snapshot: &AuthenticatedSnapshot{
+						ID:         "snapshot-db-id",
+						SnapshotID: "provider-snapshot-1",
+					},
+				},
+			})
+		case "/api/v1/backup/bmr/recover/download":
+			if got := r.Header.Get("Authorization"); got != "Bearer brz_rec_test" {
+				http.Error(w, "missing token", http.StatusUnauthorized)
+				return
+			}
+			if got := r.URL.Query().Get("token"); got != "" {
+				http.Error(w, "token must not be in query", http.StatusBadRequest)
+				return
+			}
+			if got := r.URL.Query().Get("path"); got != "snapshots/provider-snapshot-1/manifest.json" {
+				http.Error(w, "unexpected path", http.StatusBadRequest)
+				return
+			}
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case "/api/v1/backup/bmr/recover/complete":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			completeStatus.Store(body["result"].(map[string]any)["status"].(string))
+			_ = json.NewEncoder(w).Encode(map[string]any{"restoreJobId": "job-1", "status": "completed"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := RunRecoveryWithToken(RecoveryConfig{
+		RecoveryToken: "brz_rec_test",
+		ServerURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("RunRecoveryWithToken: %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("result status = %q, want completed", result.Status)
+	}
+	if seenRecoveryToken != "brz_rec_test" {
+		t.Fatalf("token = %q, want brz_rec_test", seenRecoveryToken)
+	}
+	if status, _ := completeStatus.Load().(string); status != "completed" {
+		t.Fatalf("completion status = %q, want completed", status)
+	}
+}
+
+func TestRunRecoveryWithToken_RequiresServerAuthentication(t *testing.T) {
+	origRunRecovery := runRecovery
+	defer func() { runRecovery = origRunRecovery }()
+
+	calledRecovery := false
+	runRecovery = func(ctx context.Context, cfg RecoveryConfig, provider providers.BackupProvider) (*RecoveryResult, error) {
+		if ctx == nil {
+			t.Fatal("expected context to be provided")
+		}
+		calledRecovery = true
+		return &RecoveryResult{Status: "completed"}, nil
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/backup/bmr/recover/authenticate":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "/api/v1/backup/bmr/recover/complete":
+			t.Fatal("complete should not be called after auth failure")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	_, err := RunRecoveryWithToken(RecoveryConfig{
+		RecoveryToken: "brz_rec_test",
+		ServerURL:     server.URL,
+	})
+	if err == nil {
+		t.Fatal("expected RunRecoveryWithToken to fail when authenticate is rejected")
+	}
+	if calledRecovery {
+		t.Fatal("expected recovery runner not to be invoked without server authentication")
+	}
+}
+
+// TestRunRecoveryWithToken_RewritesUnreachableDescriptorOrigin reproduces
+// D10: `--server http://10.0.2.2:33933` authenticates fine, but the
+// bootstrap's download descriptor carries the server's configured public
+// URL (e.g. `http://localhost/...`), which may be unreachable from the
+// operator's vantage point. The helper must rewrite the descriptor to the
+// --server origin it actually authenticated against rather than dialing the
+// descriptor's URL verbatim.
+func TestRunRecoveryWithToken_RewritesUnreachableDescriptorOrigin(t *testing.T) {
+	origRunRecovery := runRecovery
+	defer func() { runRecovery = origRunRecovery }()
+	runRecovery = func(ctx context.Context, cfg RecoveryConfig, provider providers.BackupProvider) (*RecoveryResult, error) {
+		destPath := filepath.Join(t.TempDir(), "manifest.json")
+		if err := provider.Download("snapshots/provider-snapshot-1/manifest.json", destPath); err != nil {
+			t.Fatalf("provider download failed: %v (descriptor origin was not rewritten to --server)", err)
+		}
+		return &RecoveryResult{Status: "completed", FilesRestored: 1}, nil
+	}
+
+	var server *httptest.Server                                                                 //nolint:staticcheck // S1021: the handler closure refers to server, so it must be declared first
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { //nolint:staticcheck
+		switch r.URL.Path {
+		case "/api/v1/backup/bmr/recover/authenticate":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"bootstrap": BootstrapResponse{
+					Version:    BootstrapResponseVersion,
+					TokenID:    "token-1",
+					DeviceID:   "device-1",
+					SnapshotID: "db-snapshot-1",
+					Download: &AuthenticatedDownloadDescriptor{
+						Type: "breeze_proxy",
+						// The server's configured public URL, unreachable
+						// from the operator's --server vantage point.
+						URL:            "http://localhost/api/v1/backup/bmr/recover/download",
+						PathQueryParam: "path",
+						PathPrefix:     "snapshots/provider-snapshot-1",
+					},
+					Snapshot: &AuthenticatedSnapshot{
+						ID:         "snapshot-db-id",
+						SnapshotID: "provider-snapshot-1",
+					},
+				},
+			})
+		case "/api/v1/backup/bmr/recover/download":
+			if got := r.URL.Query().Get("path"); got != "snapshots/provider-snapshot-1/manifest.json" {
+				http.Error(w, "unexpected path", http.StatusBadRequest)
+				return
+			}
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		case "/api/v1/backup/bmr/recover/complete":
+			_ = json.NewEncoder(w).Encode(map[string]any{"restoreJobId": "job-1", "status": "completed"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := RunRecoveryWithToken(RecoveryConfig{
+		RecoveryToken: "brz_rec_test",
+		ServerURL:     server.URL,
+	})
+	if err != nil {
+		t.Fatalf("RunRecoveryWithToken: %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("result status = %q, want completed", result.Status)
+	}
+}
+
+// TestHasSystemStateManifest proves the three raw-JSON shapes
+// bootstrap.Snapshot.SystemStateManifest (json.RawMessage) can actually take
+// coming off the wire: absent entirely (nil/empty), an explicit JSON null
+// (a SQL NULL jsonb column decoded by encoding/json), and a real object —
+// only the last one means "this snapshot has system state".
+func TestHasSystemStateManifest(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  json.RawMessage
+		want bool
+	}{
+		{name: "nil", raw: nil, want: false},
+		{name: "empty", raw: json.RawMessage(``), want: false},
+		{name: "whitespace_only", raw: json.RawMessage("   "), want: false},
+		{name: "json_null", raw: json.RawMessage(`null`), want: false},
+		{name: "real_manifest", raw: json.RawMessage(`{"platform":"linux","schemaVersion":1}`), want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasSystemStateManifest(tt.raw); got != tt.want {
+				t.Errorf("hasSystemStateManifest(%q) = %v, want %v", string(tt.raw), got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRunRecoveryWithToken_SetsExpectSystemStateFromBootstrap proves
+// session.go's wiring (RunRecoveryWithTokenContext): the effective
+// RecoveryConfig handed to runRecovery must carry ExpectSystemState=true
+// when the bootstrap's Snapshot.SystemStateManifest is a real (non-null)
+// manifest, so applySystemState (bmr.go) can tell "state was captured for
+// this snapshot" apart from "no state was ever captured" (see
+// RecoveryConfig.ExpectSystemState's doc comment).
+func TestRunRecoveryWithToken_SetsExpectSystemStateFromBootstrap(t *testing.T) {
+	origRunRecovery := runRecovery
+	defer func() { runRecovery = origRunRecovery }()
+
+	var gotExpectSystemState bool
+	runRecovery = func(ctx context.Context, cfg RecoveryConfig, provider providers.BackupProvider) (*RecoveryResult, error) {
+		gotExpectSystemState = cfg.ExpectSystemState
+		return &RecoveryResult{Status: "completed"}, nil
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/backup/bmr/recover/authenticate":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"bootstrap": BootstrapResponse{
+					Version:    BootstrapResponseVersion,
+					TokenID:    "token-1",
+					DeviceID:   "device-1",
+					SnapshotID: "db-snapshot-1",
+					Snapshot: &AuthenticatedSnapshot{
+						ID:                  "snapshot-db-id",
+						SnapshotID:          "provider-snapshot-1",
+						SystemStateManifest: json.RawMessage(`{"platform":"linux","schemaVersion":1}`),
+					},
+					BackupConfig: &AuthenticatedProviderConfig{
+						Provider:       "local",
+						ProviderConfig: map[string]any{"path": t.TempDir()},
+					},
+				},
+			})
+		case "/api/v1/backup/bmr/recover/complete":
+			_ = json.NewEncoder(w).Encode(map[string]any{"restoreJobId": "job-1", "status": "completed"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	if _, err := RunRecoveryWithToken(RecoveryConfig{RecoveryToken: "brz_rec_test", ServerURL: server.URL}); err != nil {
+		t.Fatalf("RunRecoveryWithToken: %v", err)
+	}
+	if !gotExpectSystemState {
+		t.Fatal("expected ExpectSystemState=true when the bootstrap's snapshot carries a real SystemStateManifest")
+	}
+}
+
+// TestRunRecoveryWithToken_ExpectSystemStateFalseWithoutManifest is the
+// negative half of the above: a bootstrap snapshot with no
+// SystemStateManifest at all (an ordinary, non-system-image snapshot) must
+// leave ExpectSystemState false.
+func TestRunRecoveryWithToken_ExpectSystemStateFalseWithoutManifest(t *testing.T) {
+	origRunRecovery := runRecovery
+	defer func() { runRecovery = origRunRecovery }()
+
+	gotExpectSystemState := true // start true so a no-op wiring bug would be caught
+	runRecovery = func(ctx context.Context, cfg RecoveryConfig, provider providers.BackupProvider) (*RecoveryResult, error) {
+		gotExpectSystemState = cfg.ExpectSystemState
+		return &RecoveryResult{Status: "completed"}, nil
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/backup/bmr/recover/authenticate":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"bootstrap": BootstrapResponse{
+					Version:    BootstrapResponseVersion,
+					TokenID:    "token-1",
+					DeviceID:   "device-1",
+					SnapshotID: "db-snapshot-1",
+					Snapshot: &AuthenticatedSnapshot{
+						ID:         "snapshot-db-id",
+						SnapshotID: "provider-snapshot-1",
+					},
+					BackupConfig: &AuthenticatedProviderConfig{
+						Provider:       "local",
+						ProviderConfig: map[string]any{"path": t.TempDir()},
+					},
+				},
+			})
+		case "/api/v1/backup/bmr/recover/complete":
+			_ = json.NewEncoder(w).Encode(map[string]any{"restoreJobId": "job-1", "status": "completed"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	if _, err := RunRecoveryWithToken(RecoveryConfig{RecoveryToken: "brz_rec_test", ServerURL: server.URL}); err != nil {
+		t.Fatalf("RunRecoveryWithToken: %v", err)
+	}
+	if gotExpectSystemState {
+		t.Fatal("expected ExpectSystemState=false when the bootstrap's snapshot has no SystemStateManifest")
+	}
+}
+
+func TestExchangeRecoveryCode_SendsClientCapabilities(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		writeTestBootstrapEnvelope(t, w, "gen-1", true)
+	}))
+	defer server.Close()
+
+	_, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "ABC-DEF-GHJ")
+	if err != nil {
+		t.Fatalf("ExchangeRecoveryCode: %v", err)
+	}
+
+	caps, ok := gotBody["capabilities"].([]any)
+	if !ok {
+		t.Fatalf("request body missing capabilities: %v", gotBody)
+	}
+	if !containsAny(caps, CapabilitySnapshotFileMembershipV1) {
+		t.Fatalf("capabilities = %v, want to contain %q", caps, CapabilitySnapshotFileMembershipV1)
+	}
+}
+
+func TestAuthenticateRecoverySession_SendsClientCapabilities(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		writeTestBootstrapEnvelope(t, w, "gen-1", false)
+	}))
+	defer server.Close()
+
+	_, err := AuthenticateRecoverySession(context.Background(), server.URL, "token-1")
+	if err != nil {
+		t.Fatalf("AuthenticateRecoverySession: %v", err)
+	}
+
+	caps, ok := gotBody["capabilities"].([]any)
+	if !ok {
+		t.Fatalf("request body missing capabilities: %v", gotBody)
+	}
+	if !containsAny(caps, CapabilitySnapshotFileMembershipV1) {
+		t.Fatalf("capabilities = %v, want to contain %q", caps, CapabilitySnapshotFileMembershipV1)
+	}
+}
+
+func TestBootstrapResponse_RoundTripsFileIndexAndDownloadCapabilities(t *testing.T) {
+	raw := []byte(`{
+		"version": 1,
+		"snapshot": {"id": "s1", "snapshotId": "gen-2", "backupType": "system_image",
+			"fileIndex": {"status": "complete", "manifestSha256": "` + strings.Repeat("a", 64) + `",
+				"externalCount": 3, "originSnapshotIds": ["gen-1"]}},
+		"download": {"type": "breeze_proxy", "url": "https://example.invalid/download",
+			"pathQueryParam": "path", "pathPrefix": "snapshots/gen-2",
+			"capabilities": ["snapshot-file-membership-v1"]}
+	}`)
+	var bs BootstrapResponse
+	if err := json.Unmarshal(raw, &bs); err != nil {
+		t.Fatalf("unmarshal bootstrap response: %v", err)
+	}
+	if bs.Snapshot.FileIndex == nil {
+		t.Fatal("Snapshot.FileIndex = nil, want non-nil")
+	}
+	if bs.Snapshot.FileIndex.Status != "complete" {
+		t.Fatalf("FileIndex.Status = %q, want complete", bs.Snapshot.FileIndex.Status)
+	}
+	if len(bs.Snapshot.FileIndex.OriginSnapshotIDs) != 1 || bs.Snapshot.FileIndex.OriginSnapshotIDs[0] != "gen-1" {
+		t.Fatalf("FileIndex.OriginSnapshotIDs = %v, want [gen-1]", bs.Snapshot.FileIndex.OriginSnapshotIDs)
+	}
+	if len(bs.Download.Capabilities) != 1 || bs.Download.Capabilities[0] != CapabilitySnapshotFileMembershipV1 {
+		t.Fatalf("Download.Capabilities = %v, want [%s]", bs.Download.Capabilities, CapabilitySnapshotFileMembershipV1)
+	}
+}
+
+// containsAny reports whether list (decoded from JSON as []any, so each
+// element is a string) contains s.
+func containsAny(list []any, s string) bool {
+	for _, v := range list {
+		if str, ok := v.(string); ok && str == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAuthenticateRecoverySession_NonJSON409DegradesToUnknownNegotiationError
+// is the regression test for review finding #4: a 409 response whose body
+// is not JSON (or is JSON but has no non-empty "error" field) fell through
+// authenticateRecoverySessionContext's dedicated StatusConflict branch
+// entirely (json.Unmarshal failed or body.Error was empty) into the
+// generic `resp.StatusCode < 200 || >= 300` branch, returning a bare
+// *authenticateStatusError instead of a *RecoveryNegotiationError. A
+// caller that errors.As's for *RecoveryNegotiationError (the recovery
+// console's classification, refreshAfterUnauthorized's terminal-refusal
+// switch) never recognizes it as a negotiation refusal and burns a full
+// reactive-refresh attempt cycle on it. The fix must still surface it as a
+// *RecoveryNegotiationError (Code "unknown") so those callers behave
+// correctly even against a malformed or non-conforming 409.
+func TestAuthenticateRecoverySession_NonJSON409DegradesToUnknownNegotiationError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, "<html>upstream proxy error</html>")
+	}))
+	defer server.Close()
+
+	_, err := authenticateRecoverySessionContext(context.Background(), server.URL, "brz_rec_test")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var negErr *RecoveryNegotiationError
+	if !errors.As(err, &negErr) {
+		t.Fatalf("expected errors.As to find a *RecoveryNegotiationError, got %T: %v", err, err)
+	}
+	if negErr.Code != "unknown" {
+		t.Fatalf("negErr.Code = %q, want %q", negErr.Code, "unknown")
+	}
+	if !strings.Contains(negErr.Message, "upstream proxy error") {
+		t.Fatalf("negErr.Message = %q, want it to carry the response body", negErr.Message)
+	}
+}
+
+// TestExchangeRecoveryCode_NonJSON409DegradesToUnknownNegotiationError is
+// TestAuthenticateRecoverySession_NonJSON409DegradesToUnknownNegotiationError's
+// counterpart for POST /bmr/recover/exchange — the same fallthrough bug
+// exists in ExchangeRecoveryCode's own StatusConflict branch (review
+// finding #4).
+func TestExchangeRecoveryCode_NonJSON409DegradesToUnknownNegotiationError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, "<html>upstream proxy error</html>")
+	}))
+	defer server.Close()
+
+	_, _, err := ExchangeRecoveryCode(context.Background(), server.URL, "some-code")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	var negErr *RecoveryNegotiationError
+	if !errors.As(err, &negErr) {
+		t.Fatalf("expected errors.As to find a *RecoveryNegotiationError, got %T: %v", err, err)
+	}
+	if negErr.Code != "unknown" {
+		t.Fatalf("negErr.Code = %q, want %q", negErr.Code, "unknown")
+	}
+	if !strings.Contains(negErr.Message, "upstream proxy error") {
+		t.Fatalf("negErr.Message = %q, want it to carry the response body", negErr.Message)
+	}
+}
+
+// writeTestBootstrapEnvelope writes a response body shaped like the server's
+// real /bmr/recover/exchange or /bmr/recover/authenticate response. Before
+// relying on this in a real PR, grep session.go for the decode target next
+// to authenticateRecoverySessionContext (~line 260-288) and ExchangeRecoveryCode
+// (~line 180-201) and confirm the envelope field names/nesting match exactly —
+// this helper was written from the exchange envelope confirmed in this
+// research pass (`struct{ Token string; Bootstrap json.RawMessage }`); the
+// authenticate envelope was not independently re-verified byte-for-byte.
+func writeTestBootstrapEnvelope(t *testing.T, w http.ResponseWriter, snapshotID string, withToken bool) {
+	t.Helper()
+	bootstrap := map[string]any{
+		"version": 1,
+		"snapshot": map[string]any{
+			"id": "s1", "snapshotId": snapshotID, "backupType": "file",
+		},
+		"download": map[string]any{
+			"type": "breeze_proxy", "url": "https://example.invalid/download",
+			"pathQueryParam": "path", "pathPrefix": "snapshots/" + snapshotID,
+		},
+	}
+	body := map[string]any{"bootstrap": bootstrap}
+	if withToken {
+		body["token"] = "recv-token-1"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		t.Fatalf("encode bootstrap envelope: %v", err)
+	}
+}

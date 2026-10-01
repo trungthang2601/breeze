@@ -1,0 +1,343 @@
+// Stub authMiddleware so the suite can inject its own auth context, exactly as
+// admin/abuse.test.ts does. platformAdminMiddleware still runs for real on top
+// of the stub, so the `isPlatformAdmin === true` gate is genuinely exercised.
+import { describe, expect, it, vi, beforeEach, type Mock } from 'vitest';
+
+vi.mock('../middleware/auth', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../middleware/auth')>()),
+  authMiddleware: vi.fn(async (_c: unknown, next: () => Promise<void>) => next()),
+  requirePermission: vi.fn(() => async (_c: unknown, next: () => Promise<void>) => next()),
+}));
+
+vi.mock('../services/auditService', () => ({
+  createAuditLogAsync: vi.fn(),
+  createAuditLog: vi.fn(),
+}));
+
+import { Hono } from 'hono';
+import { createExtensionsAdminRoutes, type ExtensionsAdminDeps } from './extensionsAdmin';
+import { ExtensionContributionRegistry, type StagedExtensionContributions } from '../extensions/contributionRegistry';
+import type { ExtensionStateRecord } from '../extensions/stateStore';
+import type { ExtensionHostDescriptor } from '../extensions/compatibility';
+import { createAuditLogAsync } from '../services/auditService';
+
+type FakeAuth = {
+  user: { id: string; email: string; name: string; isPlatformAdmin: boolean };
+  token: { mfa: boolean };
+};
+
+const platformAdmin: FakeAuth = {
+  user: { id: 'admin-1', email: 'admin@breeze.test', name: 'PA', isPlatformAdmin: true },
+  token: { mfa: true },
+};
+
+const platformAdminNoMfa: FakeAuth = {
+  ...platformAdmin,
+  token: { mfa: false },
+};
+
+const nonAdmin: FakeAuth = {
+  user: { id: 'user-1', email: 'user@partner.test', name: 'U', isPlatformAdmin: false },
+  token: { mfa: true },
+};
+
+const HOST: ExtensionHostDescriptor = {
+  apiVersions: ['1'],
+  breezeVersion: '1.2.3',
+  serverSdkVersion: '1.0.0',
+  webSdkVersion: '1.0.0',
+  capabilities: ['devices.read'] as never,
+  slots: { 'device.detail.tab': [1] },
+};
+
+function record(over: Partial<ExtensionStateRecord> = {}): ExtensionStateRecord {
+  return {
+    name: 'demo',
+    configuredVersion: '1.0.0',
+    activeVersion: '1.0.0',
+    artifactDigest: `sha256:${'a'.repeat(64)}`,
+    publisherId: 'lanternops',
+    manifestApiVersion: '1',
+    serverSdkVersion: '^1.0.0',
+    webSdkVersion: null,
+    enabled: true,
+    lifecycleState: 'active',
+    lastErrorCategory: null,
+    lastErrorMessage: null,
+    migratedAt: null,
+    activatedAt: new Date('2026-01-01T00:00:00.000Z'),
+    updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+    ...over,
+  };
+}
+
+/** A minimal manifest good enough for the compatibility checker. */
+function manifest(over: Record<string, unknown> = {}) {
+  return {
+    name: 'demo',
+    version: '1.0.0',
+    apiVersion: '1',
+    routeNamespace: 'demo',
+    requires: {
+      breeze: '^1.0.0',
+      serverSdk: '^1.0.0',
+      capabilities: [] as string[],
+    },
+    tenancy: {},
+    server: { entry: 'server.js' },
+    ...over,
+  } as never;
+}
+
+function snapshot(over: Partial<StagedExtensionContributions> = {}): StagedExtensionContributions {
+  return {
+    name: 'demo',
+    version: '1.0.0',
+    manifest: manifest(),
+    routeApp: null,
+    jobs: new Map([['nightly', { name: 'nightly', cron: '0 3 * * *', handler: async () => {} }]]),
+    aiTools: new Map(),
+    enabled: true,
+    ...over,
+  } as StagedExtensionContributions;
+}
+
+interface Harness {
+  app: Hono;
+  setEnabled: Mock<(name: string, enabled: boolean) => Promise<void>>;
+  storeCalls: string[];
+  registry: ExtensionContributionRegistry;
+}
+
+function buildHarness(opts: {
+  auth?: FakeAuth | null;
+  rows?: ExtensionStateRecord[];
+  registrySnapshots?: StagedExtensionContributions[];
+  roots?: Map<string, string>;
+} = {}): Harness {
+  const rows = opts.rows ?? [record()];
+  const storeCalls: string[] = [];
+  const setEnabled = vi.fn(async (name: string, enabled: boolean) => {
+    storeCalls.push('setEnabled');
+    const row = rows.find((r) => r.name === name);
+    if (row) row.enabled = enabled;
+  });
+
+  const registry = new ExtensionContributionRegistry();
+  for (const staged of opts.registrySnapshots ?? []) registry.activate(staged);
+
+  const deps: ExtensionsAdminDeps = {
+    stateStore: {
+      listAll: async () => {
+        storeCalls.push('listAll');
+        return rows.map((r) => ({ ...r }));
+      },
+      get: async (name: string) => {
+        storeCalls.push('get');
+        const row = rows.find((r) => r.name === name);
+        return row ? { ...row } : null;
+      },
+      setEnabled,
+    },
+    registry,
+    hostDescriptor: HOST,
+    extensionRoots: () => opts.roots ?? new Map(),
+  };
+
+  const app = new Hono();
+  const auth = opts.auth === undefined ? platformAdmin : opts.auth;
+  app.use('*', async (c, next) => {
+    if (auth) c.set('auth', auth as never);
+    await next();
+  });
+  app.route('/api/v1/admin/extensions', createExtensionsAdminRoutes(deps));
+  return { app, setEnabled, storeCalls, registry };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe('extensions admin authorization', () => {
+  it.each(['enable', 'disable'])('requires platform admin for %s', async (verb) => {
+    const { app, setEnabled } = buildHarness({ auth: nonAdmin });
+    const res = await app.request(`/api/v1/admin/extensions/demo/${verb}`, { method: 'POST' });
+    expect(res.status).toBe(403);
+    expect(setEnabled).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unauthenticated caller', async () => {
+    const { app } = buildHarness({ auth: null });
+    expect((await app.request('/api/v1/admin/extensions')).status).toBe(403);
+    for (const verb of ['enable', 'disable']) {
+      expect(
+        (await app.request(`/api/v1/admin/extensions/demo/${verb}`, { method: 'POST' })).status,
+      ).toBe(403);
+    }
+  });
+
+  it.each([
+    { verb: 'enable', initiallyEnabled: false },
+    { verb: 'disable', initiallyEnabled: true },
+  ])('requires MFA before $verb reads or mutates extension state', async ({ verb, initiallyEnabled }) => {
+    const staged = snapshot({ enabled: initiallyEnabled });
+    const { app, setEnabled, storeCalls, registry } = buildHarness({
+      auth: platformAdminNoMfa,
+      registrySnapshots: [staged],
+      rows: [record({ enabled: initiallyEnabled })],
+    });
+
+    const res = await app.request(`/api/v1/admin/extensions/demo/${verb}`, { method: 'POST' });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'MFA required', code: 'MFA_REQUIRED' });
+    expect(storeCalls).toEqual([]);
+    expect(setEnabled).not.toHaveBeenCalled();
+    expect(registry.get('demo')?.enabled).toBe(initiallyEnabled);
+    expect(createAuditLogAsync).toHaveBeenCalledWith(expect.objectContaining({
+      action: `platform_admin.extensions.demo.${verb}`,
+      result: 'failure',
+    }));
+  });
+
+  it('keeps platform-admin list and doctor reads available without MFA', async () => {
+    const { app, setEnabled } = buildHarness({ auth: platformAdminNoMfa });
+
+    expect((await app.request('/api/v1/admin/extensions')).status).toBe(200);
+    expect((await app.request('/api/v1/admin/extensions/demo/doctor')).status).toBe(200);
+    expect(setEnabled).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET / (list)', () => {
+  it('returns sanitized observed and config state', async () => {
+    const { app } = buildHarness({
+      rows: [
+        record({
+          name: 'demo',
+          lifecycleState: 'failed',
+          lastErrorCategory: 'verify',
+          lastErrorMessage: 'ENOENT /srv/keys/lanternops.pem token=s3cr3t-value',
+        }),
+      ],
+    });
+    const res = await app.request('/api/v1/admin/extensions');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const text = JSON.stringify(body);
+
+    expect(body.extensions).toHaveLength(1);
+    const entry = body.extensions[0];
+    expect(entry.name).toBe('demo');
+    expect(entry.lifecycleState).toBe('failed');
+    expect(entry.errorCategory).toBe('verify');
+    // The persisted raw message must NEVER reach the operator surface.
+    expect(text).not.toContain('s3cr3t-value');
+    expect(text).not.toContain('/srv/keys');
+    expect(text).not.toContain('lastErrorMessage');
+    // A fixed, category-derived explanation is served instead.
+    expect(entry.errorSummary).toBe('extension bundle verification failed');
+  });
+
+  it('reports whether each extension is live in this replica', async () => {
+    const { app } = buildHarness({ registrySnapshots: [snapshot()] });
+    const res = await app.request('/api/v1/admin/extensions');
+    const body = await res.json();
+    expect(body.extensions[0].loadedInThisReplica).toBe(true);
+  });
+});
+
+describe('GET /:name/doctor', () => {
+  it('composes lifecycle, digest, compatibility and fault attribution', async () => {
+    const { app } = buildHarness({
+      rows: [record({ lifecycleState: 'incompatible', lastErrorCategory: 'incompatible' })],
+      registrySnapshots: [
+        snapshot({
+          manifest: manifest({
+            requires: { breeze: '^9.0.0', serverSdk: '^1.0.0', capabilities: ['nope'] },
+          }),
+        }),
+      ],
+      roots: new Map([['demo', '/var/lib/breeze/extensions/extracted/sha256-abc']]),
+    });
+    const res = await app.request('/api/v1/admin/extensions/demo/doctor');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.name).toBe('demo');
+    expect(body.lifecycleState).toBe('incompatible');
+    expect(body.artifactDigest).toBe(`sha256:${'a'.repeat(64)}`);
+    expect(body.errorCategory).toBe('incompatible');
+    expect(body.compatibility.compatible).toBe(false);
+    expect(body.compatibility.reasons.join(' ')).toMatch(/unsupported Breeze range/);
+    expect(body.compatibility.reasons.join(' ')).toMatch(/missing capability nope/);
+    // Fault attribution is reported as a BOOLEAN — never the on-disk path.
+    expect(body.faultAttribution.codeLoaded).toBe(true);
+    expect(JSON.stringify(body)).not.toContain('/var/lib/breeze');
+  });
+
+  it('reports compatibility as unresolvable when the bundle is not loaded here', async () => {
+    const { app } = buildHarness({ rows: [record()], registrySnapshots: [] });
+    const body = await (await app.request('/api/v1/admin/extensions/demo/doctor')).json();
+    expect(body.compatibility).toBeNull();
+    expect(body.faultAttribution.codeLoaded).toBe(false);
+  });
+
+  it('404s an unknown extension', async () => {
+    const { app } = buildHarness();
+    expect((await app.request('/api/v1/admin/extensions/nope/doctor')).status).toBe(404);
+  });
+});
+
+describe('POST enable / disable', () => {
+  it.each([
+    { verb: 'enable', expected: true, initiallyEnabled: false },
+    { verb: 'disable', expected: false, initiallyEnabled: true },
+  ])('allows an MFA-satisfied platform admin to $verb', async ({ verb, expected, initiallyEnabled }) => {
+    const { app, setEnabled, registry } = buildHarness({
+      rows: [record({ enabled: initiallyEnabled })],
+      registrySnapshots: [snapshot({ enabled: initiallyEnabled })],
+    });
+
+    const res = await app.request(`/api/v1/admin/extensions/demo/${verb}`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ name: 'demo', enabled: expected });
+    expect(setEnabled).toHaveBeenCalledExactlyOnceWith('demo', expected);
+    expect(registry.get('demo')?.enabled).toBe(expected);
+  });
+
+  it('flips only the database enabled flag', async () => {
+    const { app, setEnabled, storeCalls } = buildHarness({
+      registrySnapshots: [snapshot()],
+    });
+    const res = await app.request('/api/v1/admin/extensions/demo/disable', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ name: 'demo', enabled: false });
+    expect(setEnabled).toHaveBeenCalledExactlyOnceWith('demo', false);
+    // No observed/desired state (version, digest, uri, trust) is ever written.
+    expect(storeCalls.filter((c) => c === 'setEnabled')).toHaveLength(1);
+    expect(storeCalls).not.toContain('upsertObserved');
+    expect(storeCalls).not.toContain('recordActive');
+  });
+
+  it('withdraws from and restores the in-process registry', async () => {
+    const { app, registry } = buildHarness({ registrySnapshots: [snapshot()] });
+
+    await app.request('/api/v1/admin/extensions/demo/disable', { method: 'POST' });
+    expect(registry.get('demo')?.enabled).toBe(false);
+    expect(registry.listActive()).toHaveLength(0);
+
+    await app.request('/api/v1/admin/extensions/demo/enable', { method: 'POST' });
+    expect(registry.get('demo')?.enabled).toBe(true);
+    expect(registry.listActive()).toHaveLength(1);
+  });
+
+  it('404s an unknown extension', async () => {
+    const { app, setEnabled } = buildHarness();
+    expect(
+      (await app.request('/api/v1/admin/extensions/nope/disable', { method: 'POST' })).status,
+    ).toBe(404);
+    expect(setEnabled).not.toHaveBeenCalled();
+  });
+});

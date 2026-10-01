@@ -1,0 +1,533 @@
+import { randomUUID } from 'node:crypto';
+import { and, asc, eq, gt, inArray, sql } from 'drizzle-orm';
+import { db, withSystemDbAccessContext } from '../db';
+import { deviceCommands, remoteSessions } from '../db/schema';
+import {
+  getRemoteWsSharedLeaseManager,
+  REMOTE_WS_SHARED_LEASE_TTL_MS,
+} from './remoteWsSharedLease';
+import {
+  canonicalizeDesktopFinalization,
+  finalizeDesktopSessionOnce,
+  releaseDesktopFinalizationIntent,
+  type DesktopSessionFinalizationInput,
+} from './desktopSessionFinalization';
+import {
+  enqueueDesktopSessionFinalization,
+} from '../jobs/desktopSessionFinalizationWorker';
+import { captureException } from './sentry';
+
+/**
+ * How long a persisted finalization intent may sit in `stop_pending` before
+ * the scanner escalates it (#3945).
+ *
+ * `drivePersistedIntent` re-adds the same stable BullMQ jobId every scan when
+ * the agent has not acked the stop command yet. Once that job hash exists in
+ * a terminal state, BullMQ's `queue.add({ jobId })` is a silent no-op
+ * (`removeOnFail` retains the failed hash) -- no new job, no new attempts, no
+ * further BullMQ-side signal. Recovery still happens (this scanner re-drives
+ * `finalize` directly on every pass), so a short-lived disconnect resolves
+ * fine; the gap is purely observability for the case where the agent never
+ * comes back: before this, that produced exactly one warning and then silence
+ * for as long as the row stayed non-terminal. 10 minutes is well past any
+ * ordinary reconnect blip (the scan cadence is REMOTE_WS_SHARED_LEASE_TTL_MS,
+ * 30s) but short enough that a genuinely abandoned session pages promptly.
+ */
+export const STALLED_STOP_PENDING_ESCALATION_MS = 10 * 60 * 1000;
+
+/**
+ * Upper bound on how long a "we already reported this one" marker survives
+ * (review follow-up on #3945).
+ *
+ * The natural clear point -- `drivePersistedIntent` observing the intent
+ * resolve off `stop_pending` -- does NOT reliably fire: per
+ * jobs/desktopSessionFinalizationWorker.ts, the BullMQ finalization worker
+ * resolves most stop_pending intents directly, on a retry cadence much
+ * faster than this scanner's 30s sweep. Once that happens the session goes
+ * terminal and drops out of scanDesktopSessionOrphans's query entirely, so
+ * `recover()` is never called for that finalizationId again and the "resolved"
+ * branch here never runs. Relying solely on that branch would make this map
+ * grow for the lifetime of the process. Pruning by age on every observation
+ * bounds it independent of whether that branch ever fires: a still-genuinely-
+ * stalled episode simply re-populates its own entry on the next scan, so
+ * pruning can never suppress a real escalation.
+ */
+const REPORTED_STALLED_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
+
+export class StalledStopPendingFinalizationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StalledStopPendingFinalizationError';
+  }
+}
+
+/**
+ * A persisted finalization intent could not be parsed/canonicalized back into
+ * shape (#3945). Named per the BREEZE-1J convention (see
+ * jobs/desktopSessionFinalizationWorker.ts) so this is triageable in Sentry
+ * by exception type alone -- `scrubEvent` deletes `message` from every
+ * outbound event.
+ */
+export class PersistedFinalizationIntentParseError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'PersistedFinalizationIntentParseError';
+  }
+}
+
+export interface DesktopOrphanSession {
+  id: string;
+  /**
+   * Session type from the remote_sessions row. Orphan recovery is a
+   * DESKTOP-ONLY mechanism: it observes the desktop lease keyspace
+   * (`remote:ws:{desktop:<id>}:*`), so a live terminal session always looks
+   * "absent" to it and would be falsely finalized (revoking its viewer
+   * session ~30-60s after it goes active — issue #2871). Every entry point
+   * must refuse non-desktop rows.
+   */
+  type: string;
+  deviceId: string;
+  orgId: string;
+  userId: string;
+  status: string;
+  startedAt: Date | null;
+  createdAt: Date;
+}
+
+export interface DesktopOrphanRecoveryDependencies {
+  now(): number;
+  setNow?(value: number): void;
+  loadSession(sessionId: string): Promise<DesktopOrphanSession | null>;
+  observeSharedState(sessionId: string): Promise<{
+    ownerPresent: boolean;
+    /** See DesktopFinalizationSharedState.everOwned. */
+    everOwned: boolean;
+    finalizationId: string | null;
+    canonicalPayload: string | null;
+    consistent: boolean;
+  }>;
+  findExistingStopIdentity(
+    session: DesktopOrphanSession,
+  ): Promise<{ finalizationId: string } | 'conflict' | null>;
+  claimOrphanIntent(
+    input: DesktopSessionFinalizationInput,
+  ): Promise<'claimed' | 'already_owned' | 'conflict' | 'unavailable'>;
+  finalize(
+    input: DesktopSessionFinalizationInput,
+  ): Promise<'stop_pending' | 'finalized' | 'already_finalized'>;
+  releaseIntent(
+    sessionId: string,
+    finalizationId: string,
+    canonicalPayload: string,
+  ): Promise<boolean>;
+  enqueue(input: {
+    sessionId: string;
+    finalizationId: string;
+  }): Promise<{ acknowledged: true; jobId: string }>;
+  randomUUID(): string;
+}
+
+type Trigger = 'admission' | 'background' | 'operator';
+type RecoveryResult = 'not_orphaned' | 'finalized' | 'already_finalized' | 'retained';
+
+export function createDesktopSessionOrphanRecoveryService(
+  deps: DesktopOrphanRecoveryDependencies,
+) {
+  const firstAbsentObservation = new Map<string, number>();
+
+  // "Already reported" markers for the stalled-stop_pending check (#3945),
+  // keyed by finalizationId (finalizationId -> when we reported, deps.now()
+  // ms) rather than sessionId so a fresh finalization attempt on the same
+  // session starts its own episode. Pruned by age on every observation (see
+  // REPORTED_STALLED_PRUNE_AGE_MS) rather than relied upon to be cleared
+  // exactly on resolution, since the resolution path frequently bypasses this
+  // service entirely (see that constant's doc comment).
+  const reportedStalledFinalizations = new Map<string, number>();
+
+  function pruneReportedStalledFinalizations(now: number): void {
+    for (const [key, reportedAt] of reportedStalledFinalizations) {
+      if (now - reportedAt > REPORTED_STALLED_PRUNE_AGE_MS) {
+        reportedStalledFinalizations.delete(key);
+      }
+    }
+  }
+
+  function noteStopPendingObservation(input: DesktopSessionFinalizationInput): void {
+    const key = input.finalizationId;
+    const now = deps.now();
+    pruneReportedStalledFinalizations(now);
+
+    // Age is derived from the persisted intent's own `endedAt` -- set once
+    // when the intent was first created and read back unchanged from Redis
+    // on every scan -- rather than from when THIS process first observed it.
+    // A local first-observation clock resets on every deploy/restart, which
+    // would silently restart the escalation window and could delay it
+    // indefinitely across repeated restarts for exactly the long-lived stall
+    // this check exists to catch (review follow-up on #3945).
+    const ageMs = now - new Date(input.endedAt).getTime();
+    if (ageMs < STALLED_STOP_PENDING_ESCALATION_MS) return;
+    if (reportedStalledFinalizations.has(key)) return;
+    reportedStalledFinalizations.set(key, now);
+    const message =
+      '[desktopSessionOrphanRecovery] finalization intent stuck in stop_pending '
+      + `past the ${STALLED_STOP_PENDING_ESCALATION_MS}ms escalation window; `
+      + 're-enqueue is a BullMQ no-op on this retained jobId, so recovery now '
+      + 'depends entirely on the agent reconnecting';
+    console.error(message, {
+      sessionId: input.sessionId,
+      finalizationId: input.finalizationId,
+      deviceId: input.deviceId,
+      ageMs,
+    });
+    captureException(new StalledStopPendingFinalizationError(message));
+  }
+
+  function clearStopPendingEscalation(finalizationId: string): void {
+    reportedStalledFinalizations.delete(finalizationId);
+  }
+
+  async function drivePersistedIntent(
+    input: DesktopSessionFinalizationInput,
+    canonicalPayload: string,
+  ): Promise<RecoveryResult> {
+    const result = await deps.finalize(input);
+    if (result === 'stop_pending') {
+      await deps.enqueue({
+        sessionId: input.sessionId,
+        finalizationId: input.finalizationId,
+      });
+      noteStopPendingObservation(input);
+      return 'retained';
+    }
+    clearStopPendingEscalation(input.finalizationId);
+    if (!await deps.releaseIntent(
+      input.sessionId,
+      input.finalizationId,
+      canonicalPayload,
+    )) {
+      await deps.enqueue({
+        sessionId: input.sessionId,
+        finalizationId: input.finalizationId,
+      });
+      return 'retained';
+    }
+    return result;
+  }
+
+  return {
+    async recover(sessionId: string, _trigger: Trigger): Promise<RecoveryResult> {
+      const session = await deps.loadSession(sessionId);
+      if (!session || !['pending', 'connecting', 'active'].includes(session.status)) {
+        firstAbsentObservation.delete(sessionId);
+        return 'not_orphaned';
+      }
+      // Never treat a non-desktop session as a desktop orphan. Terminal (and
+      // any future non-desktop) sessions keep their lease under a different
+      // keyspace, so the desktop observation below is vacuously "absent" for
+      // them and, unguarded, a healthy live terminal session gets claimed and
+      // finalized (viewer session revoked) within two scan intervals (#2871).
+      if (session.type !== 'desktop') {
+        firstAbsentObservation.delete(sessionId);
+        return 'not_orphaned';
+      }
+      if (
+        session.status === 'pending'
+        && deps.now() - session.createdAt.getTime() < 90_000
+      ) {
+        firstAbsentObservation.delete(sessionId);
+        return 'not_orphaned';
+      }
+
+      const observed = await deps.observeSharedState(sessionId);
+      if (!observed.consistent || observed.ownerPresent) {
+        firstAbsentObservation.delete(sessionId);
+        return 'retained';
+      }
+      if (
+        observed.finalizationId !== null
+        || observed.canonicalPayload !== null
+      ) {
+        firstAbsentObservation.delete(sessionId);
+        if (
+          observed.finalizationId === null
+          || observed.canonicalPayload === null
+        ) {
+          return 'retained';
+        }
+        try {
+          const persisted = canonicalizeDesktopFinalization(
+            JSON.parse(observed.canonicalPayload) as DesktopSessionFinalizationInput,
+          );
+          if (
+            persisted.input.finalizationId !== observed.finalizationId
+            || persisted.input.sessionId !== session.id
+            || persisted.input.deviceId !== session.deviceId
+            || persisted.input.orgId !== session.orgId
+            || persisted.input.userId !== session.userId
+            || persisted.canonicalPayload !== observed.canonicalPayload
+          ) {
+            return 'retained';
+          }
+          return drivePersistedIntent(
+            persisted.input,
+            persisted.canonicalPayload,
+          );
+        } catch (error) {
+          // Fail-closed behavior is unchanged (never reclaim on a parse
+          // failure), but this used to be a bare `catch { return 'retained' }`
+          // with zero logging (#3945) -- a corrupted or unparseable persisted
+          // intent left the session stuck in this branch forever with no
+          // trace of why. Log with context and report it: unlike a genuinely
+          // in-flight stop_pending (handled by the escalation above), this is
+          // a data-integrity fault that will never resolve itself.
+          console.error(
+            '[desktopSessionOrphanRecovery] failed to parse/canonicalize the persisted finalization intent; retaining (fail-closed) instead of reclaiming',
+            {
+              sessionId,
+              finalizationId: observed.finalizationId,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+          captureException(new PersistedFinalizationIntentParseError(
+            '[desktopSessionOrphanRecovery] failed to parse/canonicalize the persisted finalization intent',
+            { cause: error },
+          ));
+          return 'retained';
+        }
+      }
+
+      // No owner and no persisted intent. Before treating the absent owner as
+      // a LOST lease, check that the session ever held one. The only code
+      // that acquires the desktop owner lease is the desktop WebSocket
+      // upgrade (routes/desktopWs.ts), and the viewer's default WebRTC
+      // peer-to-peer transport never opens that WebSocket -- it only polls
+      // GET /desktop-ws/:id/viewer/session -- so a healthy P2P session looks
+      // permanently "absent" here and, unguarded, was finalized with
+      // error_message='orphan_recovery' one lease TTL after the agent's
+      // WebRTC answer flipped the row to `active`. Same bug class as the
+      // terminal-session reaping in #2871. P2P sessions are not governed by
+      // this sweeper at all: they end via the agent's peer-disconnect notice,
+      // the revocation lease (#5481), and the 12h session cap. Sessions that
+      // DID carry a persisted finalization intent are handled above and keep
+      // driving that intent regardless of ownership history.
+      if (!observed.everOwned) {
+        firstAbsentObservation.delete(sessionId);
+        return 'not_orphaned';
+      }
+
+      const first = firstAbsentObservation.get(sessionId);
+      if (first === undefined) {
+        firstAbsentObservation.set(sessionId, deps.now());
+        return 'retained';
+      }
+      if (deps.now() - first < REMOTE_WS_SHARED_LEASE_TTL_MS) return 'retained';
+
+      // Re-load after the full lease interval. A row that became terminal is
+      // never claimed as an orphan.
+      const current = await deps.loadSession(sessionId);
+      if (
+        !current
+        || current.type !== 'desktop'
+        || !['pending', 'connecting', 'active'].includes(current.status)
+      ) {
+        firstAbsentObservation.delete(sessionId);
+        return 'not_orphaned';
+      }
+
+      const existingStop = await deps.findExistingStopIdentity(current);
+      if (existingStop === 'conflict') return 'retained';
+      const finalizationId = existingStop?.finalizationId ?? deps.randomUUID();
+      const startedAt = (current.startedAt ?? current.createdAt).toISOString();
+      const input: DesktopSessionFinalizationInput = {
+        version: 1,
+        finalizationId,
+        sessionId,
+        connection: {
+          connectionId: finalizationId,
+          generation: 1,
+          instanceId: finalizationId,
+          leaseToken: finalizationId,
+        },
+        orgId: current.orgId,
+        userId: current.userId,
+        deviceId: current.deviceId,
+        reason: 'orphan_recovery',
+        terminalStatus: 'failed',
+        endedAt: new Date(deps.now()).toISOString(),
+        startedAt,
+        inputEvents: 0,
+        frameBytes: 0,
+      };
+      const claim = await deps.claimOrphanIntent(input);
+      if (claim !== 'claimed') return 'retained';
+
+      firstAbsentObservation.delete(sessionId);
+      const canonicalPayload =
+        canonicalizeDesktopFinalization(input).canonicalPayload;
+      return drivePersistedIntent(input, canonicalPayload);
+    },
+  };
+}
+
+let productionService: ReturnType<
+  typeof createDesktopSessionOrphanRecoveryService
+> | null = null;
+let recoveryInterval: ReturnType<typeof setInterval> | null = null;
+let orphanScanCursor: string | null = null;
+
+function getProductionService() {
+  if (productionService) return productionService;
+  productionService = createDesktopSessionOrphanRecoveryService({
+    now: () => Date.now(),
+    loadSession: async (sessionId) => {
+      const [row] = await withSystemDbAccessContext(() =>
+        db
+          .select({
+            id: remoteSessions.id,
+            type: remoteSessions.type,
+            deviceId: remoteSessions.deviceId,
+            orgId: remoteSessions.orgId,
+            userId: remoteSessions.userId,
+            status: remoteSessions.status,
+            startedAt: remoteSessions.startedAt,
+            createdAt: remoteSessions.createdAt,
+          })
+          .from(remoteSessions)
+          .where(eq(remoteSessions.id, sessionId))
+          .limit(1),
+      );
+      return row ?? null;
+    },
+    observeSharedState: async (sessionId) => {
+      const manager = getRemoteWsSharedLeaseManager();
+      if (!manager) throw new Error('desktop orphan observation unavailable');
+      const observed = await manager.observeDesktopFinalization(sessionId);
+      return {
+        ownerPresent: observed.ownerPresent,
+        everOwned: observed.everOwned,
+        finalizationId: observed.finalizationId,
+        canonicalPayload: observed.canonicalPayload,
+        consistent: observed.consistent,
+      };
+    },
+    findExistingStopIdentity: async (session) => {
+      const rows = await withSystemDbAccessContext(() =>
+        db
+          .select({
+            id: deviceCommands.id,
+            payload: deviceCommands.payload,
+          })
+          .from(deviceCommands)
+          .where(and(
+            eq(deviceCommands.deviceId, session.deviceId),
+            eq(deviceCommands.type, 'desktop_stream_stop'),
+            eq(deviceCommands.targetRole, 'agent'),
+            sql`${deviceCommands.payload} ->> 'sessionId' = ${session.id}`,
+          ))
+          .limit(2),
+      );
+      if (rows.length > 1) return 'conflict';
+      const row = rows[0];
+      if (!row) return null;
+      if (!row.payload || typeof row.payload !== 'object' || Array.isArray(row.payload)) {
+        return 'conflict';
+      }
+      const payload = row.payload as Record<string, unknown>;
+      if (
+        Object.keys(payload).length !== 2
+        || payload.sessionId !== session.id
+        || payload.finalizationId !== row.id
+      ) {
+        return 'conflict';
+      }
+      return { finalizationId: row.id };
+    },
+    claimOrphanIntent: async (input) => {
+      const manager = getRemoteWsSharedLeaseManager();
+      if (!manager) return 'unavailable';
+      const persisted = canonicalizeDesktopFinalization(input);
+      return manager.claimDesktopOrphan(
+        input.sessionId,
+        input.finalizationId,
+        persisted.canonicalPayload,
+      );
+    },
+    finalize: finalizeDesktopSessionOnce,
+    releaseIntent: releaseDesktopFinalizationIntent,
+    enqueue: enqueueDesktopSessionFinalization,
+    randomUUID,
+  });
+  return productionService;
+}
+
+export async function recoverDesktopFinalizationOrphan(input: {
+  sessionId: string;
+  trigger: 'admission' | 'background' | 'operator';
+}): Promise<'not_orphaned' | 'finalized' | 'already_finalized' | 'retained'> {
+  return getProductionService().recover(input.sessionId, input.trigger);
+}
+
+async function scanDesktopSessionOrphans(): Promise<void> {
+  const cursor = orphanScanCursor;
+  const rows = await withSystemDbAccessContext(() =>
+    db
+      .select({ id: remoteSessions.id })
+      .from(remoteSessions)
+      .where(and(
+        // Desktop-only: this scanner recovers desktop finalization orphans.
+        // Sweeping other session types here is what killed every live
+        // terminal session at ~60s (#2871).
+        eq(remoteSessions.type, 'desktop'),
+        inArray(remoteSessions.status, ['pending', 'connecting', 'active']),
+        cursor === null ? undefined : gt(remoteSessions.id, cursor),
+      ))
+      .orderBy(asc(remoteSessions.id))
+      .limit(50),
+  );
+  orphanScanCursor = nextScanCursor(rows.map(row => row.id), 50);
+  for (const row of rows) {
+    await recoverDesktopFinalizationOrphan({
+      sessionId: row.id,
+      trigger: 'background',
+    });
+  }
+}
+
+function nextScanCursor(ids: string[], batchSize: number): string | null {
+  return ids.length === batchSize ? ids[ids.length - 1] ?? null : null;
+}
+
+async function initializeWithScan(scan: () => Promise<void>): Promise<void> {
+  if (!recoveryInterval) {
+    recoveryInterval = setInterval(() => {
+      void scan().catch((error) => {
+        console.error('[desktopSessionOrphanRecovery] background scan failed', {
+          error: error instanceof Error ? error.message : 'unknown',
+        });
+      });
+    }, REMOTE_WS_SHARED_LEASE_TTL_MS);
+  }
+  try {
+    await scan();
+  } catch (error) {
+    console.error('[desktopSessionOrphanRecovery] initial scan failed; retry scheduled', {
+      error: error instanceof Error ? error.message : 'unknown',
+    });
+  }
+}
+
+export async function initializeDesktopSessionOrphanRecovery(): Promise<void> {
+  await initializeWithScan(scanDesktopSessionOrphans);
+}
+
+export async function shutdownDesktopSessionOrphanRecovery(): Promise<void> {
+  if (recoveryInterval) clearInterval(recoveryInterval);
+  recoveryInterval = null;
+  orphanScanCursor = null;
+}
+
+export const __desktopSessionOrphanRecoveryTestOnly = {
+  nextScanCursor,
+  initializeWithScan,
+  shutdown: shutdownDesktopSessionOrphanRecovery,
+};

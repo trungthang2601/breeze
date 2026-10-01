@@ -1,0 +1,1254 @@
+import { useState, useCallback, useEffect, useRef } from 'react';
+import {
+  Folder,
+  File,
+  Upload,
+  Download,
+  RefreshCw,
+  ChevronRight,
+  Home,
+  ArrowUp,
+  Loader2,
+  X,
+  CheckCircle,
+  AlertCircle,
+  AlertTriangle,
+  HardDrive,
+  Sparkles,
+  FileText,
+  FileCode,
+  FileImage,
+  FileArchive,
+  FileCog,
+  Trash2,
+  Copy,
+  Move,
+  History,
+  Square,
+  CheckSquare
+} from 'lucide-react';
+import { formatNumber } from '@/lib/i18n/format';
+import { cn, leftPxClass, topPxClass, widthPercentClass } from '@/lib/utils';
+import { fetchWithAuth } from '@/stores/auth';
+import { navigateTo as navigateToPage } from '@/lib/navigation';
+import { buildBreadcrumbs, getParentPath, isPathRoot, joinRemotePath } from './filePathUtils';
+import {
+  copyFiles,
+  moveFiles,
+  deleteFiles,
+  uploadFile,
+  summarizeBulkResults,
+  UnverifiedOperationError,
+} from './fileOperations';
+import FolderPickerDialog from './FolderPickerDialog';
+import DeleteConfirmDialog from './DeleteConfirmDialog';
+import TrashView from './TrashView';
+import FileActivityPanel from './FileActivityPanel';
+import type { FileActivity } from './FileActivityPanel';
+import { useTranslation } from 'react-i18next';
+import { AGENT_MAX_FILE_READ_BYTES } from '@breeze/shared';
+import '@/lib/i18n';
+
+export type FileEntry = {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  size?: number;
+  modified?: string;
+  permissions?: string;
+  /**
+   * macOS Finder alias that the agent resolved. `type` reflects the target's
+   * kind (so a folder alias navigates and a file alias downloads), while
+   * `path`/`size`/`modified` still describe the alias file itself.
+   */
+  isAlias?: boolean;
+  aliasTarget?: string;
+};
+
+export type TransferItem = {
+  id: string;
+  filename: string;
+  direction: 'upload' | 'download';
+  status: 'pending' | 'transferring' | 'completed' | 'failed' | 'unverified' | 'cancelled';
+  progress: number;
+  size: number;
+  error?: string;
+};
+
+export type DriveInfo = {
+  letter?: string;
+  mountPoint: string;
+  label?: string;
+  fileSystem?: string;
+  totalBytes: number;
+  freeBytes: number;
+  driveType?: string;
+};
+
+export type FileManagerProps = {
+  deviceId: string;
+  deviceHostname: string;
+  sessionId?: string;
+  initialPath: string;
+  osType?: string;
+  onError?: (error: string) => void;
+  className?: string;
+};
+
+// Fetch abort rejections are DOMExceptions named 'AbortError'. DOMException is
+// not `instanceof Error` in every runtime (Node/jsdom included), so match on
+// the name instead.
+function isAbortError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null
+    && (error as { name?: unknown }).name === 'AbortError';
+}
+
+// Get file icon based on extension
+function getFileIcon(filename: string) {
+  const ext = filename.split('.').pop()?.toLowerCase();
+
+  const codeExtensions = ['js', 'ts', 'jsx', 'tsx', 'py', 'rb', 'go', 'rs', 'java', 'c', 'cpp', 'h', 'cs', 'php'];
+  const imageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'svg', 'webp', 'ico', 'bmp'];
+  const archiveExtensions = ['zip', 'tar', 'gz', 'rar', '7z', 'bz2', 'xz'];
+  const configExtensions = ['json', 'yaml', 'yml', 'toml', 'ini', 'conf', 'xml'];
+
+  if (codeExtensions.includes(ext || '')) return FileCode;
+  if (imageExtensions.includes(ext || '')) return FileImage;
+  if (archiveExtensions.includes(ext || '')) return FileArchive;
+  if (configExtensions.includes(ext || '')) return FileCog;
+  if (['txt', 'md', 'log', 'csv'].includes(ext || '')) return FileText;
+
+  return File;
+}
+
+// Format file size
+function formatSize(bytes?: number): string {
+  if (bytes === undefined || bytes === null) return '-';
+  if (bytes === 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${formatNumber(bytes / 1024, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${formatNumber(bytes / (1024 * 1024), { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB`;
+  if (bytes < 1024 * 1024 * 1024 * 1024) return `${formatNumber(bytes / (1024 * 1024 * 1024), { minimumFractionDigits: 2, maximumFractionDigits: 2 })} GB`;
+  return `${formatNumber(bytes / (1024 * 1024 * 1024 * 1024), { minimumFractionDigits: 2, maximumFractionDigits: 2 })} TB`;
+}
+
+// Format date
+function formatDate(dateString?: string): string {
+  if (!dateString) return '-';
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) return dateString;
+
+  return date.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+}
+
+export default function FileManager({
+  deviceId,
+  deviceHostname,
+  initialPath,
+  osType,
+  onError,
+  className
+}: FileManagerProps) {
+  const { t } = useTranslation('remote');
+  const [currentPath, setCurrentPath] = useState(initialPath);
+  const [entries, setEntries] = useState<FileEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+  const [transfers, setTransfers] = useState<TransferItem[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [sortBy, setSortBy] = useState<'name' | 'size' | 'modified'>('name');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+  const [showFolderPicker, setShowFolderPicker] = useState(false);
+  const [folderPickerMode, setFolderPickerMode] = useState<'copy' | 'move'>('copy');
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showTrash, setShowTrash] = useState(false);
+  const [showActivity, setShowActivity] = useState(false);
+  const [operationLoading, setOperationLoading] = useState(false);
+  const [activities, setActivities] = useState<FileActivity[]>([]);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry } | null>(null);
+  const [drives, setDrives] = useState<DriveInfo[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // One AbortController per in-flight transfer so Cancel actually aborts the
+  // browser-side request instead of just hiding the row (issue #2396).
+  const transferControllersRef = useRef<Map<string, AbortController>>(new Map());
+  // Ids the user cancelled — lets the catch paths tell an intentional abort
+  // apart from a real failure (e.g. the upload watchdog timeout, which aborts
+  // the same controller but is NOT a user cancel).
+  const cancelledTransfersRef = useRef<Set<string>>(new Set());
+
+  // Fetch directory contents
+  const fetchDirectory = useCallback(async (path: string) => {
+    setLoading(true);
+    setSelectedItems(new Set());
+
+    try {
+      const params = new URLSearchParams({ path });
+      const response = await fetchWithAuth(`/system-tools/devices/${deviceId}/files?${params}`);
+      if (!response.ok) {
+        const json = await response.json().catch(() => ({ error: t('fileManager.errors.loadDirectory') }));
+        throw new Error(json.error || t('fileManager.errors.loadDirectory'));
+      }
+      const json = await response.json();
+      const entriesData = Array.isArray(json.data) ? json.data : [];
+      setEntries(entriesData);
+      // Prefer the path the agent actually listed: navigating into a macOS
+      // Finder alias lands on the alias's target, and uploads/breadcrumbs must
+      // follow it there rather than stay on the alias file.
+      setCurrentPath(typeof json.path === 'string' && json.path ? json.path : path);
+      setError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t('fileManager.errors.loadDirectory');
+      console.error('[FileManager] Failed to load directory:', err);
+      onError?.(message);
+      setError(message);
+      setEntries([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [deviceId, onError]);
+
+  // Navigate to directory
+  const navigateTo = useCallback((path: string) => {
+    fetchDirectory(path);
+  }, [fetchDirectory]);
+
+  // Go up one directory
+  const goUp = useCallback(() => {
+    const parentPath = getParentPath(currentPath);
+    navigateTo(parentPath);
+  }, [currentPath, navigateTo]);
+
+  // Go to home
+  const goHome = useCallback(() => {
+    navigateTo(initialPath);
+  }, [initialPath, navigateTo]);
+
+  // Handle item click
+  const handleItemClick = useCallback((entry: FileEntry, event: React.MouseEvent) => {
+    if (entry.type === 'directory') {
+      navigateTo(entry.path);
+    } else {
+      // Toggle selection
+      if (event.ctrlKey || event.metaKey) {
+        setSelectedItems(prev => {
+          const newSet = new Set(prev);
+          if (newSet.has(entry.path)) {
+            newSet.delete(entry.path);
+          } else {
+            newSet.add(entry.path);
+          }
+          return newSet;
+        });
+      } else if (event.shiftKey) {
+        // Range selection
+        const sortedEntries = getSortedEntries();
+        const fileEntries = sortedEntries.filter(e => e.type === 'file');
+        const currentIndex = fileEntries.findIndex(e => e.path === entry.path);
+        const lastSelected = Array.from(selectedItems).pop();
+        const lastIndex = lastSelected ? fileEntries.findIndex(e => e.path === lastSelected) : 0;
+
+        const start = Math.min(currentIndex, lastIndex);
+        const end = Math.max(currentIndex, lastIndex);
+
+        const newSelection = new Set<string>();
+        for (let i = start; i <= end; i++) {
+          const entry = fileEntries[i];
+          if (entry) {
+            newSelection.add(entry.path);
+          }
+        }
+        setSelectedItems(newSelection);
+      } else {
+        setSelectedItems(new Set([entry.path]));
+      }
+    }
+  }, [navigateTo, selectedItems]);
+
+  // Initiate file download
+  const initiateDownload = useCallback(async (entry: FileEntry) => {
+    const transferId = crypto.randomUUID();
+
+    // Pre-flight the agent's 1MB read cap. The directory listing already carries
+    // every entry's size, so an over-cap file can be refused here — with the
+    // actual numbers — instead of spending a round trip to have the device
+    // answer "file too large" in bytes.
+    //
+    // Fail OPEN on anything we cannot measure: an absent size, or a macOS alias
+    // whose `size` describes the alias file and not the target the agent
+    // resolves and reads. The agent enforces the real cap regardless; this guard
+    // exists to save a doomed round trip, not to be the enforcement point.
+    if (!entry.isAlias && typeof entry.size === 'number' && entry.size > AGENT_MAX_FILE_READ_BYTES) {
+      setTransfers(prev => [...prev, {
+        id: transferId,
+        filename: entry.name,
+        direction: 'download',
+        status: 'failed',
+        progress: 0,
+        size: entry.size ?? 0,
+        error: t('fileManager.errors.downloadTooLarge', {
+          size: formatSize(entry.size),
+          max: formatSize(AGENT_MAX_FILE_READ_BYTES),
+        }),
+      }]);
+      return;
+    }
+
+    const controller = new AbortController();
+    transferControllersRef.current.set(transferId, controller);
+
+    setTransfers(prev => [...prev, {
+      id: transferId,
+      filename: entry.name,
+      direction: 'download',
+      status: 'pending',
+      progress: 0,
+      size: entry.size || 0
+    }]);
+
+    try {
+      setTransfers(prev => prev.map(t =>
+        t.id === transferId ? { ...t, status: 'transferring', progress: 25 } : t
+      ));
+
+      const params = new URLSearchParams({ path: entry.path });
+      const response = await fetchWithAuth(`/system-tools/devices/${deviceId}/files/download?${params}`, {
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: t('fileManager.errors.download') }));
+        throw new Error(err.error || t('fileManager.errors.download'));
+      }
+
+      setTransfers(prev => prev.map(t =>
+        t.id === transferId ? { ...t, progress: 80 } : t
+      ));
+
+      const blob = await response.blob();
+      const downloadUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = downloadUrl;
+      anchor.download = entry.name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(downloadUrl);
+
+      setTransfers(prev => prev.map(t =>
+        t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
+      ));
+    } catch (error) {
+      if (cancelledTransfersRef.current.has(transferId)) {
+        // Intentional user cancel — cancelTransfer already marked the row
+        // 'cancelled'; don't overwrite it with a generic failure. Preserve
+        // the diagnostic if a real failure raced the cancel.
+        if (!isAbortError(error)) {
+          console.error('[FileManager] Download failed after cancel:', error);
+        }
+        return;
+      }
+      console.error('[FileManager] Download failed:', error);
+      setTransfers(prev => prev.map(transfer =>
+        transfer.id === transferId ? {
+          ...transfer,
+          status: 'failed',
+          error: error instanceof Error ? error.message : t('fileManager.errors.download')
+        } : transfer
+      ));
+    } finally {
+      transferControllersRef.current.delete(transferId);
+      cancelledTransfersRef.current.delete(transferId);
+    }
+  }, [deviceId]);
+
+  // Handle double click
+  const handleDoubleClick = useCallback((entry: FileEntry) => {
+    if (entry.type === 'file') {
+      initiateDownload(entry);
+    }
+  }, [initiateDownload]);
+
+  // Handle file upload
+  const handleUpload = useCallback(async (files: FileList) => {
+    for (const file of Array.from(files)) {
+      const transferId = crypto.randomUUID();
+      const controller = new AbortController();
+      transferControllersRef.current.set(transferId, controller);
+
+      setTransfers(prev => [...prev, {
+        id: transferId,
+        filename: file.name,
+        direction: 'upload',
+        status: 'pending',
+        progress: 0,
+        size: file.size
+      }]);
+
+      try {
+        // Read file content as base64
+        setTransfers(prev => prev.map(t =>
+          t.id === transferId ? { ...t, status: 'transferring', progress: 10 } : t
+        ));
+
+        const content = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const result = reader.result as string;
+            // Strip the data URL prefix (e.g., "data:text/plain;base64,")
+            const base64 = result.split(',')[1] || '';
+            resolve(base64);
+          };
+          reader.onerror = () => reject(new Error(t('fileManager.errors.readFile')));
+          reader.readAsDataURL(file);
+        });
+
+        // Bail before dispatch if the user cancelled during the local read —
+        // the write command never reaches the API in that case.
+        if (controller.signal.aborted) {
+          throw new DOMException('The transfer was cancelled.', 'AbortError');
+        }
+
+        setTransfers(prev => prev.map(t =>
+          t.id === transferId ? { ...t, progress: 40 } : t
+        ));
+
+        // Upload file content to agent via system tools API
+        const remotePath = joinRemotePath(currentPath, file.name);
+
+        // Large files transit API → DB → WS → agent → disk; allow up to 2 minutes.
+        // The watchdog shares the transfer's controller so user cancel and
+        // timeout both abort the same request.
+        const uploadTimeout = setTimeout(() => controller.abort(), 120_000);
+        try {
+          await uploadFile(
+            deviceId,
+            { path: remotePath, content, encoding: 'base64' },
+            { signal: controller.signal },
+          );
+        } finally {
+          clearTimeout(uploadTimeout);
+        }
+
+        setTransfers(prev => prev.map(t =>
+          t.id === transferId ? { ...t, status: 'completed', progress: 100 } : t
+        ));
+
+        // Refresh directory to show new file
+        fetchDirectory(currentPath);
+      } catch (error) {
+        const aborted = isAbortError(error);
+        if (cancelledTransfersRef.current.has(transferId)) {
+          // Intentional user cancel — the row is already marked 'cancelled'.
+          // Preserve the diagnostic if a real failure raced the cancel.
+          if (!aborted) {
+            console.error('[FileManager] Upload failed after cancel:', error);
+          }
+          continue;
+        }
+        console.error('[FileManager] Upload failed:', error);
+        if (aborted) {
+          // Not user-cancelled, so the 120s watchdog fired. The write command
+          // may already have reached the device, so this is 'unverified', not
+          // a plain failure — and the browser's abort boilerplate ("The user
+          // aborted a request.") would be misleading here.
+          const timeoutMessage = t('fileManager.errors.uploadTimeout');
+          setTransfers(prev => prev.map(item =>
+            item.id === transferId
+              ? { ...item, status: 'unverified', error: timeoutMessage }
+              : item
+          ));
+          continue;
+        }
+        const message = error instanceof Error ? error.message : t('fileManager.errors.upload');
+        const status: TransferItem['status'] =
+          error instanceof UnverifiedOperationError ? 'unverified' : 'failed';
+        setTransfers(prev => prev.map(t =>
+          t.id === transferId ? { ...t, status, error: message } : t
+        ));
+      } finally {
+        transferControllersRef.current.delete(transferId);
+        cancelledTransfersRef.current.delete(transferId);
+      }
+    }
+  }, [deviceId, currentPath, fetchDirectory]);
+
+  // Handle drag and drop
+  const handleDragOver = useCallback((event: React.DragEvent) => {
+    event.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((event: React.DragEvent) => {
+    event.preventDefault();
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback((event: React.DragEvent) => {
+    event.preventDefault();
+    setIsDragging(false);
+
+    if (event.dataTransfer.files.length > 0) {
+      handleUpload(event.dataTransfer.files);
+    }
+  }, [handleUpload]);
+
+  // Cancel an in-flight transfer. This aborts the browser-side request only:
+  // there is no device-side cancellation on the single-shot file_read /
+  // file_write path, so a write command that already reached the API may
+  // still complete on the device (issue #2396).
+  const cancelTransfer = useCallback((transferId: string) => {
+    // No live controller means the transfer already reached a terminal state
+    // (a stale click can land just before React swaps Cancel for Dismiss) —
+    // don't record a cancel that can't abort anything.
+    const controller = transferControllersRef.current.get(transferId);
+    if (controller) {
+      cancelledTransfersRef.current.add(transferId);
+      controller.abort();
+    }
+    setTransfers(prev => prev.map(item => {
+      if (item.id !== transferId) return item;
+      // Never relabel a row that already completed or failed.
+      if (item.status !== 'pending' && item.status !== 'transferring') return item;
+      // Progress hits 40 right before the upload request is dispatched — from
+      // then on the device may still write the file even though we aborted.
+      const note = item.direction === 'upload' && item.progress >= 40
+        ? t('fileManager.cancelledUploadNote')
+        : undefined;
+      return { ...item, status: 'cancelled', error: note };
+    }));
+  }, [t]);
+
+  // Remove completed transfer from list
+  const dismissTransfer = useCallback((transferId: string) => {
+    setTransfers(prev => prev.filter(t => t.id !== transferId));
+  }, []);
+
+  // Sort entries
+  const getSortedEntries = useCallback(() => {
+    const sorted = [...entries].sort((a, b) => {
+      // Directories first
+      if (a.type !== b.type) {
+        return a.type === 'directory' ? -1 : 1;
+      }
+
+      let comparison = 0;
+      switch (sortBy) {
+        case 'name':
+          comparison = a.name.localeCompare(b.name);
+          break;
+        case 'size':
+          comparison = (a.size || 0) - (b.size || 0);
+          break;
+        case 'modified':
+          comparison = new Date(a.modified || 0).getTime() - new Date(b.modified || 0).getTime();
+          break;
+      }
+
+      return sortOrder === 'asc' ? comparison : -comparison;
+    });
+
+    return sorted;
+  }, [entries, sortBy, sortOrder]);
+
+  // Toggle sort
+  const toggleSort = useCallback((column: 'name' | 'size' | 'modified') => {
+    if (sortBy === column) {
+      setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortBy(column);
+      setSortOrder('asc');
+    }
+  }, [sortBy]);
+
+  // Download selected files
+  const downloadSelected = useCallback(() => {
+    const selectedEntries = entries.filter(e => selectedItems.has(e.path) && e.type === 'file');
+    for (const entry of selectedEntries) {
+      initiateDownload(entry);
+    }
+  }, [entries, selectedItems, initiateDownload]);
+
+  // Add activity log entry
+  const addActivity = useCallback((action: FileActivity['action'], paths: string[], result: FileActivity['result'], error?: string) => {
+    setActivities(prev => [{
+      id: crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+      action,
+      paths,
+      result,
+      error,
+    }, ...prev]);
+  }, []);
+
+  // Handle copy to destination
+  const handleCopyTo = useCallback(async (destPath: string) => {
+    setShowFolderPicker(false);
+    setOperationLoading(true);
+    const selectedPaths = Array.from(selectedItems);
+    try {
+      const items = selectedPaths.map(sourcePath => ({
+        sourcePath,
+        destPath: joinRemotePath(destPath, sourcePath.split('/').pop() || sourcePath.split('\\').pop() || 'file'),
+      }));
+      const response = await copyFiles(deviceId, items);
+      const { result, summary } = summarizeBulkResults(response.results);
+      addActivity('copy', selectedPaths, result, summary);
+      fetchDirectory(currentPath);
+      setSelectedItems(new Set());
+    } catch (err) {
+      addActivity('copy', selectedPaths, 'failure', err instanceof Error ? err.message : t('fileManager.errors.copy'));
+    } finally {
+      setOperationLoading(false);
+    }
+  }, [deviceId, selectedItems, currentPath, fetchDirectory, addActivity]);
+
+  // Handle move to destination
+  const handleMoveTo = useCallback(async (destPath: string) => {
+    setShowFolderPicker(false);
+    setOperationLoading(true);
+    const selectedPaths = Array.from(selectedItems);
+    try {
+      const items = selectedPaths.map(sourcePath => ({
+        sourcePath,
+        destPath: joinRemotePath(destPath, sourcePath.split('/').pop() || sourcePath.split('\\').pop() || 'file'),
+      }));
+      const response = await moveFiles(deviceId, items);
+      const { result, summary } = summarizeBulkResults(response.results);
+      addActivity('move', selectedPaths, result, summary);
+      fetchDirectory(currentPath);
+      setSelectedItems(new Set());
+    } catch (err) {
+      addActivity('move', selectedPaths, 'failure', err instanceof Error ? err.message : t('fileManager.errors.move'));
+    } finally {
+      setOperationLoading(false);
+    }
+  }, [deviceId, selectedItems, currentPath, fetchDirectory, addActivity]);
+
+  // Handle delete confirmation
+  const handleDelete = useCallback(async (permanent: boolean) => {
+    setShowDeleteConfirm(false);
+    setOperationLoading(true);
+    const selectedPaths = Array.from(selectedItems);
+    try {
+      const response = await deleteFiles(deviceId, selectedPaths, permanent);
+      const { result, summary } = summarizeBulkResults(response.results);
+      addActivity('delete', selectedPaths, result, summary);
+      fetchDirectory(currentPath);
+      setSelectedItems(new Set());
+    } catch (err) {
+      addActivity('delete', selectedPaths, 'failure', err instanceof Error ? err.message : t('fileManager.errors.delete'));
+    } finally {
+      setOperationLoading(false);
+    }
+  }, [deviceId, selectedItems, currentPath, fetchDirectory, addActivity]);
+
+  // Handle context menu
+  const handleContextMenu = useCallback((e: React.MouseEvent, entry: FileEntry) => {
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY, entry });
+  }, []);
+
+  // Close context menu on any click
+  useEffect(() => {
+    const handleClick = () => setContextMenu(null);
+    document.addEventListener('click', handleClick);
+    return () => document.removeEventListener('click', handleClick);
+  }, []);
+
+  // Context menu actions
+  const contextCopyTo = useCallback(() => {
+    if (contextMenu) {
+      setSelectedItems(new Set([contextMenu.entry.path]));
+      setFolderPickerMode('copy');
+      setShowFolderPicker(true);
+      setContextMenu(null);
+    }
+  }, [contextMenu]);
+
+  const contextMoveTo = useCallback(() => {
+    if (contextMenu) {
+      setSelectedItems(new Set([contextMenu.entry.path]));
+      setFolderPickerMode('move');
+      setShowFolderPicker(true);
+      setContextMenu(null);
+    }
+  }, [contextMenu]);
+
+  const contextDelete = useCallback(() => {
+    if (contextMenu) {
+      setSelectedItems(new Set([contextMenu.entry.path]));
+      setShowDeleteConfirm(true);
+      setContextMenu(null);
+    }
+  }, [contextMenu]);
+
+  // Initial load
+  useEffect(() => {
+    fetchDirectory(initialPath);
+  }, [fetchDirectory, initialPath]);
+
+  // Fetch available drives on mount
+  useEffect(() => {
+    const fetchDrives = async () => {
+      try {
+        const response = await fetchWithAuth(`/system-tools/devices/${deviceId}/files/drives`);
+        if (response.ok) {
+          const json = await response.json();
+          setDrives(json.data || []);
+        }
+      } catch {
+        // Drive listing is non-critical; silently fail
+      }
+    };
+    fetchDrives();
+  }, [deviceId]);
+
+  const breadcrumbs = buildBreadcrumbs(currentPath);
+
+  const activeTransfers = transfers.filter(t => ['pending', 'transferring'].includes(t.status));
+
+  return (
+    <div className={cn('flex flex-col min-h-0 flex-1 rounded-lg border bg-card shadow-xs overflow-hidden', className)}>
+      {/* Header */}
+      <div className="flex items-center justify-between border-b bg-muted/40 px-4 py-2">
+        <div className="flex items-center gap-3">
+          <Folder className="h-5 w-5 text-muted-foreground" />
+          <div>
+            <h3 className="text-sm font-semibold">{deviceHostname}</h3>
+            <p className="text-xs text-muted-foreground">{t('fileManager.title')}</p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => e.target.files && handleUpload(e.target.files)}
+          />
+
+          {selectedItems.size > 0 && (
+            <>
+              <span className="text-xs text-muted-foreground">{t('fileManager.selectedCount', { count: selectedItems.size })}</span>
+              <button
+                type="button"
+                onClick={() => { setFolderPickerMode('copy'); setShowFolderPicker(true); }}
+                disabled={operationLoading}
+                className="flex h-8 items-center gap-1.5 rounded-md border px-3 text-sm font-medium hover:bg-muted disabled:opacity-50"
+              >
+                <Copy className="h-4 w-4" />
+                {t('fileManager.copyTo')}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setFolderPickerMode('move'); setShowFolderPicker(true); }}
+                disabled={operationLoading}
+                className="flex h-8 items-center gap-1.5 rounded-md border px-3 text-sm font-medium hover:bg-muted disabled:opacity-50"
+              >
+                <Move className="h-4 w-4" />
+                {t('fileManager.moveTo')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowDeleteConfirm(true)}
+                disabled={operationLoading}
+                className="flex h-8 items-center gap-1.5 rounded-md border border-red-600/30 px-3 text-sm font-medium text-red-400 hover:bg-red-600/10 disabled:opacity-50"
+              >
+                <Trash2 className="h-4 w-4" />
+                {t('common:actions.delete')}
+              </button>
+              <button
+                type="button"
+                onClick={downloadSelected}
+                disabled={operationLoading}
+                className="flex h-8 items-center gap-1.5 rounded-md border px-3 text-sm font-medium hover:bg-muted disabled:opacity-50"
+              >
+                <Download className="h-4 w-4" />
+                {t('common:actions.download')}
+              </button>
+              <div className="h-5 w-px bg-border" />
+            </>
+          )}
+
+          <button
+            type="button"
+            onClick={() => fetchDirectory(currentPath)}
+            disabled={loading}
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted disabled:opacity-50"
+            title={t('common:actions.refresh')}
+          >
+            <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
+          </button>
+
+          {/* Trash toggle */}
+          <button
+            type="button"
+            onClick={() => setShowTrash(!showTrash)}
+            className={cn(
+              'flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors',
+              showTrash ? 'bg-red-600/20 text-red-400' : 'hover:bg-muted'
+            )}
+          >
+            <Trash2 className="h-4 w-4" />
+            {t('fileManager.trash')}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:opacity-90"
+          >
+            <Upload className="h-4 w-4" />
+            {t('common:actions.upload')}
+          </button>
+        </div>
+      </div>
+
+      {/* Navigation */}
+      <div className="flex items-center gap-2 border-b px-4 py-2">
+        <button
+          type="button"
+          onClick={goHome}
+          className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+          title={t('fileManager.home')}
+        >
+          <Home className="h-4 w-4" />
+        </button>
+
+        <button
+          type="button"
+          onClick={goUp}
+          disabled={isPathRoot(currentPath)}
+          className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted disabled:opacity-50"
+          title={t('fileManager.goUp')}
+        >
+          <ArrowUp className="h-4 w-4" />
+        </button>
+
+        {drives.length > 1 && (
+          <div className="flex items-center gap-0.5 border-r pr-2 mr-1">
+            {drives.map((drive) => {
+              const label = drive.letter || drive.mountPoint;
+              const isActive = currentPath.toLowerCase().startsWith(drive.mountPoint.toLowerCase()) ||
+                (drive.letter && currentPath.toLowerCase().startsWith(drive.letter.toLowerCase()));
+              return (
+                <button
+                  key={drive.mountPoint}
+                  type="button"
+                  onClick={() => navigateTo(drive.mountPoint)}
+                  className={cn(
+                    'flex h-7 items-center gap-1 rounded px-2 text-xs font-medium transition-colors',
+                    isActive ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+                  )}
+                  title={[
+                    drive.label || label,
+                    drive.fileSystem,
+                    drive.totalBytes > 0 ? t('fileManager.freeOf', { free: formatSize(drive.freeBytes), total: formatSize(drive.totalBytes) }) : '',
+                  ].filter(Boolean).join(' — ')}
+                >
+                  <HardDrive className="h-3 w-3" />
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="flex flex-1 items-center gap-1 text-sm">
+          <button
+            type="button"
+            onClick={() => navigateTo(breadcrumbs.rootPath)}
+            className="hover:text-primary"
+          >
+            {breadcrumbs.rootLabel}
+          </button>
+          {breadcrumbs.segments.map((segment) => (
+            <span key={segment.path} className="flex items-center gap-1">
+              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+              <button
+                type="button"
+                onClick={() => navigateTo(segment.path)}
+                className="hover:text-primary"
+              >
+                {segment.label}
+              </button>
+            </span>
+          ))}
+        </div>
+
+        {/* Activity toggle */}
+        <button
+          type="button"
+          onClick={() => setShowActivity(!showActivity)}
+          className={cn(
+            'flex h-7 items-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors',
+            showActivity ? 'bg-blue-600/20 text-blue-400' : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+          )}
+        >
+          <History className="h-3.5 w-3.5" />
+          {t('fileManager.activity')}{activities.length > 0 && ` (${activities.length})`}
+        </button>
+      </div>
+
+      {/* Disk Cleanup lives on the device's own tab. */}
+      <div className="flex items-center justify-between gap-2 border-b bg-muted/20 px-4 py-2">
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-primary">{t('fileManager.disk.title')}</p>
+          <p className="truncate text-xs text-muted-foreground">{t('fileManager.disk.openHint')}</p>
+        </div>
+        <button
+          type="button"
+          data-testid="file-manager-disk-cleanup"
+          onClick={() => { void navigateToPage(`/devices/${deviceId}#filesystem`); }}
+          className="flex h-8 shrink-0 items-center gap-1.5 rounded-md border px-3 text-sm font-medium hover:bg-muted"
+        >
+          <Sparkles className="h-4 w-4" />
+          {t('fileManager.disk.openTab')}
+        </button>
+      </div>
+
+      {/* File List + Activity sidebar */}
+      <div className="flex flex-1 min-h-0">
+      {showTrash ? (
+        <TrashView deviceId={deviceId} onRestore={() => { fetchDirectory(currentPath); addActivity('restore', [], 'success'); }} />
+      ) : (
+        <div
+          className={cn(
+            'flex-1 overflow-auto',
+            isDragging && 'ring-2 ring-primary ring-inset'
+          )}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          {isDragging && (
+            <div className="absolute inset-0 flex items-center justify-center bg-primary/10 z-10">
+              <div className="flex flex-col items-center gap-2 text-primary">
+                <Upload className="h-12 w-12" />
+                <p className="font-medium">{t('fileManager.dropFiles')}</p>
+              </div>
+            </div>
+          )}
+
+          <table className="min-w-full divide-y">
+            <thead className="bg-muted/40 sticky top-0">
+              <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                <th className="px-4 py-3 w-8">
+                  {entries.length > 0 && (
+                    <div
+                      className="cursor-pointer"
+                      onClick={() => {
+                        const allPaths = getSortedEntries().map(e => e.path);
+                        setSelectedItems(prev => {
+                          if (prev.size === allPaths.length) {
+                            return new Set();
+                          }
+                          return new Set(allPaths);
+                        });
+                      }}
+                    >
+                      {selectedItems.size > 0 && selectedItems.size === entries.length ? (
+                        <CheckSquare className="w-4 h-4 text-blue-400" />
+                      ) : (
+                        <Square className="w-4 h-4 text-gray-500" />
+                      )}
+                    </div>
+                  )}
+                </th>
+                <th
+                  className="px-4 py-3 cursor-pointer hover:text-foreground"
+                  onClick={() => toggleSort('name')}
+                >
+                  {t('common:labels.name')}
+                  {sortBy === 'name' && (
+                    <span className="ml-1">{sortOrder === 'asc' ? '\u2191' : '\u2193'}</span>
+                  )}
+                </th>
+                <th
+                  className="px-4 py-3 cursor-pointer hover:text-foreground text-right"
+                  onClick={() => toggleSort('size')}
+                >
+                  {t('fileManager.size')}
+                  {sortBy === 'size' && (
+                    <span className="ml-1">{sortOrder === 'asc' ? '\u2191' : '\u2193'}</span>
+                  )}
+                </th>
+                <th
+                  className="px-4 py-3 cursor-pointer hover:text-foreground"
+                  onClick={() => toggleSort('modified')}
+                >
+                  {t('fileManager.modified')}
+                  {sortBy === 'modified' && (
+                    <span className="ml-1">{sortOrder === 'asc' ? '\u2191' : '\u2193'}</span>
+                  )}
+                </th>
+                <th className="px-4 py-3 w-20" />
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {loading ? (
+                <tr>
+                  <td colSpan={5} className="px-4 py-8 text-center">
+                    <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
+                  </td>
+                </tr>
+              ) : error ? (
+                <tr>
+                  <td colSpan={5} className="px-4 py-8 text-center">
+                    <div className="flex flex-col items-center gap-2">
+                      <AlertCircle className="h-6 w-6 text-red-500" />
+                      <p className="text-sm text-red-500">{error}</p>
+                      <button
+                        type="button"
+                        onClick={() => fetchDirectory(currentPath)}
+                        className="text-xs text-primary hover:underline"
+                      >
+                        {t('common:actions.retry')}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ) : getSortedEntries().length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                    {t('fileManager.emptyDirectory')}
+                  </td>
+                </tr>
+              ) : (
+                getSortedEntries().map((entry) => {
+                  const FileIcon = entry.type === 'directory' ? Folder : getFileIcon(entry.name);
+                  const isSelected = selectedItems.has(entry.path);
+
+                  return (
+                    <tr
+                      key={entry.path}
+                      className={cn(
+                        'group transition hover:bg-muted/40 cursor-pointer',
+                        isSelected && 'bg-primary/10'
+                      )}
+                      onClick={(e) => handleItemClick(entry, e)}
+                      onDoubleClick={() => handleDoubleClick(entry)}
+                      onContextMenu={(e) => handleContextMenu(e, entry)}
+                    >
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-2">
+                          <div
+                            className="cursor-pointer"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedItems(prev => {
+                                const newSet = new Set(prev);
+                                if (newSet.has(entry.path)) {
+                                  newSet.delete(entry.path);
+                                } else {
+                                  newSet.add(entry.path);
+                                }
+                                return newSet;
+                              });
+                            }}
+                          >
+                            {isSelected ? (
+                              <CheckSquare className="w-4 h-4 text-blue-400" />
+                            ) : (
+                              <Square className="w-4 h-4 text-gray-500 opacity-0 group-hover:opacity-100" />
+                            )}
+                          </div>
+                          <FileIcon
+                            className={cn(
+                              'h-5 w-5',
+                              entry.type === 'directory' ? 'text-blue-500' : 'text-muted-foreground'
+                            )}
+                          />
+                        </div>
+                      </td>
+                      <td className="px-4 py-2 text-sm font-medium">{entry.name}</td>
+                      <td className="px-4 py-2 text-sm text-muted-foreground text-right">
+                        {entry.type === 'file' ? formatSize(entry.size) : '-'}
+                      </td>
+                      <td className="px-4 py-2 text-sm text-muted-foreground">
+                        {formatDate(entry.modified)}
+                      </td>
+                      <td className="px-4 py-2">
+                        {entry.type === 'file' && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              initiateDownload(entry);
+                            }}
+                            className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-muted"
+                            title={t('common:actions.download')}
+                          >
+                            <Download className="h-4 w-4" />
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+
+        </div>
+      )}
+
+      {/* Activity sidebar */}
+      {showActivity && (
+        <FileActivityPanel
+          deviceId={deviceId}
+          open={showActivity}
+          onToggle={() => setShowActivity(prev => !prev)}
+          activities={activities}
+          onClear={() => setActivities([])}
+        />
+      )}
+      </div>
+
+      {/* Transfer Progress Panel */}
+      {transfers.length > 0 && (
+        <div className="border-t">
+          <div className="px-4 py-2 bg-muted/40">
+            <h4 className="text-sm font-medium">
+              {t('fileManager.transfers')}
+              {activeTransfers.length > 0 && (
+                <span className="ml-2 text-muted-foreground">
+                  ({t('fileManager.activeCount', { count: activeTransfers.length })})
+                </span>
+              )}
+            </h4>
+          </div>
+          <div className="max-h-48 overflow-auto divide-y">
+            {transfers.map((transfer) => (
+              <div key={transfer.id} className="flex items-center gap-3 px-4 py-2">
+                {transfer.direction === 'upload' ? (
+                  <Upload className="h-4 w-4 text-blue-500" />
+                ) : (
+                  <Download className="h-4 w-4 text-green-500" />
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm font-medium truncate">{transfer.filename}</p>
+                    <span className="text-xs text-muted-foreground ml-2">
+                      {formatSize(transfer.size)}
+                    </span>
+                  </div>
+                  {transfer.status === 'transferring' && (
+                    <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                      <div
+                        className={cn('h-full bg-primary transition-all', widthPercentClass(transfer.progress))}
+                      />
+                    </div>
+                  )}
+                  {transfer.error && (
+                    <p className={cn(
+                      'mt-1 text-xs',
+                      transfer.status === 'unverified'
+                        ? 'text-amber-500'
+                        : transfer.status === 'cancelled'
+                          ? 'text-muted-foreground'
+                          : 'text-red-500',
+                    )}>
+                      {transfer.error}
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  {transfer.status === 'completed' && (
+                    <CheckCircle className="h-4 w-4 text-green-500" />
+                  )}
+                  {transfer.status === 'failed' && (
+                    <AlertCircle className="h-4 w-4 text-red-500" />
+                  )}
+                  {transfer.status === 'unverified' && (
+                    <AlertTriangle className="h-4 w-4 text-amber-500" />
+                  )}
+                  {transfer.status === 'cancelled' && (
+                    <span className="text-xs text-muted-foreground">
+                      {t('fileManager.cancelled')}
+                    </span>
+                  )}
+                  {transfer.status === 'transferring' && (
+                    <span className="text-xs text-muted-foreground">
+                      {transfer.progress}%
+                    </span>
+                  )}
+                  {['pending', 'transferring'].includes(transfer.status) ? (
+                    <button
+                      type="button"
+                      onClick={() => cancelTransfer(transfer.id)}
+                      className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-muted"
+                      title={t('common:actions.cancel')}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => dismissTransfer(transfer.id)}
+                      className="flex h-6 w-6 items-center justify-center rounded-md hover:bg-muted"
+                      title={t('fileManager.dismiss')}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Context Menu */}
+      {contextMenu && (
+        <div
+          className={cn(
+            'fixed z-50 min-w-[160px] rounded-lg border border-gray-700 bg-gray-800 py-1 shadow-xl',
+            leftPxClass(contextMenu.x),
+            topPxClass(contextMenu.y)
+          )}
+        >
+          <button type="button" onClick={contextCopyTo} className="w-full px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700 flex items-center gap-2">
+            <Copy className="w-4 h-4" /> {t('fileManager.copyTo')}
+          </button>
+          <button type="button" onClick={contextMoveTo} className="w-full px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700 flex items-center gap-2">
+            <Move className="w-4 h-4" /> {t('fileManager.moveTo')}
+          </button>
+          <div className="border-t border-gray-700 my-1" />
+          <button type="button" onClick={contextDelete} className="w-full px-3 py-2 text-left text-sm text-red-400 hover:bg-gray-700 flex items-center gap-2">
+            <Trash2 className="w-4 h-4" /> {t('common:actions.delete')}
+          </button>
+          {contextMenu.entry.type === 'file' && (
+            <button type="button" onClick={() => { initiateDownload(contextMenu.entry); setContextMenu(null); }} className="w-full px-3 py-2 text-left text-sm text-gray-200 hover:bg-gray-700 flex items-center gap-2">
+              <Download className="w-4 h-4" /> {t('common:actions.download')}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Dialogs */}
+      <FolderPickerDialog
+        open={showFolderPicker}
+        title={folderPickerMode === 'copy' ? t('fileManager.copyTo') : t('fileManager.moveTo')}
+        deviceId={deviceId}
+        initialPath={currentPath}
+        onSelect={folderPickerMode === 'copy' ? handleCopyTo : handleMoveTo}
+        onClose={() => setShowFolderPicker(false)}
+      />
+      <DeleteConfirmDialog
+        open={showDeleteConfirm}
+        items={entries.filter(e => selectedItems.has(e.path)).map(e => ({ name: e.name, path: e.path, size: e.size, type: e.type }))}
+        onConfirm={handleDelete}
+        onClose={() => setShowDeleteConfirm(false)}
+      />
+    </div>
+  );
+}

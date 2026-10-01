@@ -1,0 +1,335 @@
+import type { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { and, eq, isNull, desc, ne, sql } from 'drizzle-orm';
+import { db } from '../db';
+import { organizations, partners, portalUsers, tickets, ticketComments, assetCheckouts } from '../db/schema';
+import { linkLoginToContact, type LoginContactOutcome } from '../services/contacts/loginLink';
+import { requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { PERMISSIONS } from '../services/permissions';
+import { writeRouteAudit } from '../services/auditEvents';
+import { getEmailService } from '../services/email';
+import { partnerEmailCustomFromSettings } from '../services/emailTemplates/renderPartnerEmail';
+import { getRedis } from '../services/redis';
+import { purgeClientAiSessionsForUsers } from '../services/clientAiSessionStore';
+import { storePortalInviteToken, buildPortalUrl, purgePortalSessionsForUsers } from './portal/helpers';
+import { invitePortalUserSchema, bulkInvitePortalUsersSchema, updatePortalUserSchema } from '@breeze/shared';
+
+// MSP-facing customer-portal user management (portal_users): list, invite,
+// patch (disable/reactivate), resend-invite, bulk-invite, and delete.
+// Mirrors routes/orgPortalSettings.ts for gating: partner|system scope,
+// ORGS_READ/ORGS_WRITE permission, requireMfa() on the write, and a
+// module-local resolveAccessibleOrg (duplicated rather than shared, per
+// the pattern established there).
+
+type PortalUserListRow = {
+  id: string;
+  email: string;
+  name: string | null;
+  passwordHash: string | null;
+  status: string;
+  receiveNotifications: boolean;
+  lastLoginAt: Date | null;
+  invitedAt: Date | null;
+};
+
+// A portal user is 'active' only once they've actually set a password
+// (accepted their invite) AND aren't administratively disabled. Rows
+// created by an invite sit in DB status 'invited' with passwordHash
+// null — those must read back as 'pending_setup', not 'active'.
+export function effectivePortalStatus(row: { status: string; passwordHash: string | null }): 'active' | 'disabled' | 'pending_setup' {
+  if (row.status === 'disabled') return 'disabled';
+  if (!row.passwordHash) return 'pending_setup';
+  return 'active';
+}
+
+function toListItem(row: PortalUserListRow) {
+  return {
+    id: row.id,
+    email: row.email,
+    name: row.name,
+    status: row.status,
+    effectiveStatus: effectivePortalStatus(row),
+    receiveNotifications: row.receiveNotifications,
+    lastLoginAt: row.lastLoginAt,
+    invitedAt: row.invitedAt
+  };
+}
+
+async function resolveAccessibleOrg(c: any): Promise<{ id: string } | Response> {
+  const auth = c.get('auth') as AuthContext;
+  const id = c.req.param('id')!;
+  if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
+    return c.json({ error: 'Organization not found' }, 404);
+  }
+  const rows = await db.select({ id: organizations.id }).from(organizations)
+    .where(and(eq(organizations.id, id), isNull(organizations.deletedAt))).limit(1);
+  if (!rows[0]) return c.json({ error: 'Organization not found' }, 404);
+  return { id };
+}
+
+async function getOrgScopedPortalUser(orgId: string, userId: string) {
+  const [row] = await db.select({ id: portalUsers.id, orgId: portalUsers.orgId, email: portalUsers.email, name: portalUsers.name, passwordHash: portalUsers.passwordHash, authMethod: portalUsers.authMethod, status: portalUsers.status })
+    .from(portalUsers).where(and(eq(portalUsers.id, userId), eq(portalUsers.orgId, orgId))).limit(1);
+  return row ?? null;
+}
+
+async function hasPortalUserReferences(userId: string): Promise<boolean> {
+  const [t] = await db.select({ id: tickets.id }).from(tickets).where(eq(tickets.submittedBy, userId)).limit(1);
+  if (t) return true;
+  const [cm] = await db.select({ id: ticketComments.id }).from(ticketComments).where(eq(ticketComments.portalUserId, userId)).limit(1);
+  if (cm) return true;
+  const [ck] = await db.select({ id: assetCheckouts.id }).from(assetCheckouts).where(eq(assetCheckouts.checkedOutTo, userId)).limit(1);
+  return Boolean(ck);
+}
+
+async function issueAndSendInvite(c: any, orgId: string, user: { id: string; email: string }, orgName: string | null, inviterName: string | null | undefined, message?: string): Promise<boolean> {
+  const rawToken = await storePortalInviteToken(user.id);
+  if (!rawToken) return false; // redis unavailable — do not email a dead invite link
+  const inviteUrl = buildPortalUrl(`/accept-invite?token=${encodeURIComponent(rawToken)}`);
+  const emailService = getEmailService();
+  if (!emailService) return false;
+  // Partner from the VERIFIED auth context, never request input (spec §8.1).
+  // These routes are requireScope('partner', 'system'); a system-scope caller
+  // has partnerId === null, which resolves to the platform sender.
+  const partnerId = (c.get('auth') as AuthContext | undefined)?.partnerId ?? null;
+  let partnerName: string | undefined;
+  let custom = null;
+  try {
+    const orgRows = await db.select({ partnerId: organizations.partnerId }).from(organizations).where(eq(organizations.id, orgId)).limit(1);
+    const orgRow = Array.isArray(orgRows) ? orgRows[0] : undefined;
+    if (orgRow?.partnerId) {
+      const partnerRows = await db.select({ name: partners.name, settings: partners.settings }).from(partners).where(eq(partners.id, orgRow.partnerId)).limit(1);
+      const partner = Array.isArray(partnerRows) ? partnerRows[0] : undefined;
+      partnerName = partner?.name ?? undefined;
+      custom = partnerEmailCustomFromSettings(partner?.settings, 'portal_invite');
+    }
+  } catch {
+    custom = null;
+  }
+  try {
+    await emailService.sendPortalInvite({
+      to: user.email,
+      inviteUrl,
+      orgName: orgName ?? undefined,
+      inviterName: inviterName ?? undefined,
+      message,
+      partnerId,
+      partnerName,
+      custom,
+    });
+    return true;
+  } catch (err) {
+    console.error('[orgPortalUsers] invite email failed:', err);
+    return false;
+  }
+}
+
+/**
+ * How an invite resolved to the org's contact for that address (#3258 W03).
+ *
+ * Recorded in the invite's audit details AND returned in the response body,
+ * because a null `contact_id` is not self-explaining after the fact:
+ * 'ambiguous' means we declined to guess (and the new login will not see that
+ * address's emailed tickets), 'kept' means we deliberately did not touch a
+ * link that was already there.
+ *
+ * `kept` is the one outcome the shared resolver cannot produce, because it is
+ * decided BEFORE the resolver is consulted: an existing link is never
+ * re-derived, so there is nothing to resolve.
+ */
+type InviteContactLink = LoginContactOutcome | 'kept';
+
+/**
+ * Bind an invited portal LOGIN to the org's CONTACT for that address.
+ *
+ * A thin wrapper over the shared `linkLoginToContact` (services/contacts/
+ * loginLink.ts) — the same resolution the Entra exchange and the Outlook
+ * add-in use, so all three agree on the lock, the shared-mailbox refusal and
+ * the role union.
+ *
+ * Runs in the caller's REQUEST context, so `contacts` is read and written
+ * under RLS with the acting user as `created_by` — unlike the inbound path,
+ * which is a system-context ingest side effect with no acting user.
+ */
+async function resolveInviteContact(
+  orgId: string,
+  normalizedEmail: string,
+  name: string | null,
+  actorUserId: string,
+): Promise<{ contactId: string | null; link: InviteContactLink }> {
+  const { contactId, outcome } = await linkLoginToContact(db, {
+    orgId,
+    email: normalizedEmail,
+    name,
+    actor: { userId: actorUserId },
+    // Stated explicitly rather than left to the default: an invite really is
+    // granting portal access, which is what earns the role — the add-in path
+    // deliberately passes [] because it grants none.
+    roles: ['portal'],
+    unionRoles: ['portal'],
+  });
+  return { contactId, link: outcome };
+}
+
+export function registerOrgPortalUsersRoutes(orgRoutes: Hono) {
+  const requireOrgRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
+  const requireOrgWrite = requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action);
+
+  orgRoutes.get('/organizations/:id/portal-users', requireScope('partner', 'system'), requireOrgRead, async (c) => {
+    const org = await resolveAccessibleOrg(c);
+    if (org instanceof Response) return org;
+    const rows = await db.select({
+      id: portalUsers.id,
+      email: portalUsers.email,
+      name: portalUsers.name,
+      passwordHash: portalUsers.passwordHash,
+      status: portalUsers.status,
+      receiveNotifications: portalUsers.receiveNotifications,
+      lastLoginAt: portalUsers.lastLoginAt,
+      invitedAt: portalUsers.invitedAt
+    }).from(portalUsers).where(eq(portalUsers.orgId, org.id)).orderBy(desc(portalUsers.createdAt));
+    return c.json({ data: rows.map(toListItem) });
+  });
+
+  orgRoutes.post('/organizations/:id/portal-users/invite', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), zValidator('json', invitePortalUserSchema), async (c) => {
+    const org = await resolveAccessibleOrg(c);
+    if (org instanceof Response) return org;
+    const auth = c.get('auth') as AuthContext;
+    const { email, name, message } = c.req.valid('json');
+    const normalizedEmail = email.trim().toLowerCase();
+
+    const [existing] = await db.select({ id: portalUsers.id, email: portalUsers.email, passwordHash: portalUsers.passwordHash, authMethod: portalUsers.authMethod, status: portalUsers.status, contactId: portalUsers.contactId })
+      .from(portalUsers).where(and(eq(portalUsers.orgId, org.id), eq(portalUsers.email, normalizedEmail))).limit(1);
+
+    if (existing && existing.authMethod !== 'password') {
+      return c.json({ error: 'This identity is managed by an external sign-in provider.' }, 409);
+    }
+
+    if (existing && existing.status === 'disabled') {
+      return c.json({ error: 'This user is disabled. Reactivate them before inviting.' }, 409);
+    }
+
+    if (existing && existing.passwordHash && existing.status === 'active') {
+      return c.json({ error: 'This email already has an active portal account.' }, 409);
+    }
+
+    const now = new Date();
+    let userId: string;
+    let contactLink: InviteContactLink;
+    if (existing) {
+      // An existing link is never re-derived, let alone overwritten: whoever
+      // set it (the 2026-08-19 backfill, a previous invite, a tech editing the
+      // contact) knew more than an email string does. Skipping the lookup also
+      // stops a re-invite from minting a duplicate contact.
+      //
+      // `resolveInviteContact` only ever returns a contact in `org.id`, and
+      // this row is in `org.id` too — but that is no longer the only thing
+      // keeping the pair same-org: `portal_users_contact_org_fk`
+      // (contact_id, org_id) -> contacts (id, org_id) makes a cross-org link
+      // unrepresentable, so a future writer that forgets the org bound gets a
+      // 23503 rather than a silent tenant leak (#3258 follow-up).
+      const contactPatch: { contactId?: string } = {};
+      if (existing.contactId) {
+        contactLink = 'kept';
+      } else {
+        const resolved = await resolveInviteContact(org.id, normalizedEmail, name ?? null, auth.user.id);
+        contactLink = resolved.link;
+        if (resolved.contactId) contactPatch.contactId = resolved.contactId;
+      }
+      await db.update(portalUsers).set({ name: name ?? undefined, status: 'invited', authEpoch: sql`${portalUsers.authEpoch} + 1`, invitedBy: auth.user.id, invitedAt: now, updatedAt: now, ...contactPatch }).where(eq(portalUsers.id, existing.id)).returning({ id: portalUsers.id });
+      await purgePortalSessionsForUsers([existing.id]);
+      const redis = getRedis();
+      if (redis) await purgeClientAiSessionsForUsers(redis, [existing.id]);
+      userId = existing.id;
+    } else {
+      const resolved = await resolveInviteContact(org.id, normalizedEmail, name ?? null, auth.user.id);
+      contactLink = resolved.link;
+      const [created] = await db.insert(portalUsers).values({ orgId: org.id, email: normalizedEmail, name: name ?? null, passwordHash: null, authMethod: 'password', status: 'invited', invitedBy: auth.user.id, invitedAt: now, contactId: resolved.contactId }).returning({ id: portalUsers.id });
+      userId = created!.id;
+    }
+
+    const [orgRow] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, org.id)).limit(1);
+    const emailSent = await issueAndSendInvite(c, org.id, { id: userId, email: normalizedEmail }, orgRow?.name ?? null, auth.user.name, message);
+
+    writeRouteAudit(c, { orgId: org.id, action: 'organization.portal_user.invite', resourceType: 'portal_user', resourceId: userId, details: { email: normalizedEmail, emailSent, contactLink } });
+    // `contactLink` is returned, not only audited: 'ambiguous' means the login
+    // was created WITHOUT a contact and therefore cannot see the tickets that
+    // address has emailed in (routes/portal/ticketOwnership.ts). The audit log
+    // is not somewhere an API consumer — or the invite UI — can read that from.
+    // (The UI warning itself is a follow-up; this is the field it needs.)
+    return c.json({ data: { id: userId, email: normalizedEmail, status: 'invited', contactLink }, emailSent });
+  });
+
+  orgRoutes.patch('/organizations/:id/portal-users/:userId', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), zValidator('json', updatePortalUserSchema), async (c) => {
+    const org = await resolveAccessibleOrg(c);
+    if (org instanceof Response) return org;
+    const body = c.req.valid('json');
+    if (Object.keys(body).length === 0) return c.json({ error: 'No updates provided' }, 400);
+    const target = await getOrgScopedPortalUser(org.id, c.req.param('userId')!);
+    if (!target) return c.json({ error: 'Portal user not found' }, 404);
+    const [updated] = await db.update(portalUsers).set({
+      ...body,
+      ...(body.status !== undefined ? { authEpoch: sql`${portalUsers.authEpoch} + 1` } : {}),
+      updatedAt: new Date(),
+    }).where(eq(portalUsers.id, target.id)).returning({ id: portalUsers.id, status: portalUsers.status });
+    if (body.status !== undefined) {
+      await purgePortalSessionsForUsers([target.id]);
+      const redis = getRedis();
+      if (redis) await purgeClientAiSessionsForUsers(redis, [target.id]);
+    }
+    writeRouteAudit(c, { orgId: org.id, action: 'organization.portal_user.update', resourceType: 'portal_user', resourceId: target.id, details: { changedFields: Object.keys(body) } });
+    return c.json({ data: { id: updated!.id, status: updated!.status } });
+  });
+
+  orgRoutes.post('/organizations/:id/portal-users/:userId/resend-invite', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), async (c) => {
+    const org = await resolveAccessibleOrg(c);
+    if (org instanceof Response) return org;
+    const auth = c.get('auth') as AuthContext;
+    const target = await getOrgScopedPortalUser(org.id, c.req.param('userId')!);
+    if (!target) return c.json({ error: 'Portal user not found' }, 404);
+    if (target.authMethod !== 'password') return c.json({ error: 'This identity is managed by an external sign-in provider.' }, 409);
+    if (target.status === 'disabled') return c.json({ error: 'This user is disabled. Reactivate them first.' }, 409);
+    if (target.passwordHash && target.status === 'active') return c.json({ error: 'This account is already set up.' }, 409);
+    const [orgRow] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, org.id)).limit(1);
+    const emailSent = await issueAndSendInvite(c, org.id, { id: target.id, email: target.email }, orgRow?.name ?? null, auth.user.name);
+    writeRouteAudit(c, { orgId: org.id, action: 'organization.portal_user.resend_invite', resourceType: 'portal_user', resourceId: target.id, details: { emailSent } });
+    return c.json({ data: { id: target.id }, emailSent });
+  });
+
+  orgRoutes.post('/organizations/:id/portal-users/bulk-invite', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), zValidator('json', bulkInvitePortalUsersSchema), async (c) => {
+    const org = await resolveAccessibleOrg(c);
+    if (org instanceof Response) return org;
+    const auth = c.get('auth') as AuthContext;
+    const { userIds } = c.req.valid('json');
+    // "Pending setup" = no password. Invite selected, or all pending in the org.
+    const baseWhere = and(eq(portalUsers.orgId, org.id), eq(portalUsers.authMethod, 'password'), isNull(portalUsers.passwordHash), ne(portalUsers.status, 'disabled'));
+    const candidates = await db.select({ id: portalUsers.id, email: portalUsers.email }).from(portalUsers).where(baseWhere);
+    const targets = userIds && userIds.length > 0 ? candidates.filter((u) => userIds.includes(u.id)) : candidates;
+    const [orgRow] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, org.id)).limit(1);
+    const now = new Date();
+    const results: Array<{ id: string; emailSent: boolean }> = [];
+    for (const t of targets) {
+      await db.update(portalUsers).set({ status: 'invited', authEpoch: sql`${portalUsers.authEpoch} + 1`, invitedBy: auth.user.id, invitedAt: now, updatedAt: now }).where(eq(portalUsers.id, t.id));
+      await purgePortalSessionsForUsers([t.id]);
+      const redis = getRedis();
+      if (redis) await purgeClientAiSessionsForUsers(redis, [t.id]);
+      const emailSent = await issueAndSendInvite(c, org.id, t, orgRow?.name ?? null, auth.user.name);
+      results.push({ id: t.id, emailSent });
+    }
+    writeRouteAudit(c, { orgId: org.id, action: 'organization.portal_user.bulk_invite', resourceType: 'organization', resourceId: org.id, details: { invited: results.length } });
+    return c.json({ data: results });
+  });
+
+  orgRoutes.delete('/organizations/:id/portal-users/:userId', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), async (c) => {
+    const org = await resolveAccessibleOrg(c);
+    if (org instanceof Response) return org;
+    const target = await getOrgScopedPortalUser(org.id, c.req.param('userId')!);
+    if (!target) return c.json({ error: 'Portal user not found' }, 404);
+    if (await hasPortalUserReferences(target.id)) {
+      return c.json({ error: 'This user has ticket or asset history. Disable them instead of deleting.' }, 409);
+    }
+    await db.delete(portalUsers).where(eq(portalUsers.id, target.id));
+    writeRouteAudit(c, { orgId: org.id, action: 'organization.portal_user.delete', resourceType: 'portal_user', resourceId: target.id, details: { email: target.email } });
+    return c.json({ data: { id: target.id, deleted: true } });
+  });
+}

@@ -1,0 +1,315 @@
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import '@/lib/i18n';
+
+import PatchApprovalModal from './PatchApprovalModal';
+import { fetchWithAuth } from '../../stores/auth';
+
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+}));
+
+// Every case in this file describes an already-WARM page: the scope is known
+// before the modal renders, so `useJwtClaims` simply reports the same claims as
+// resolved. The cold-load window (`status: 'unresolved'`) is what
+// PatchApprovalModal.coldLoad.test.tsx covers, driving the real auth store.
+vi.mock('../../lib/authScope', () => {
+  const getJwtClaims = vi.fn();
+  return {
+    getJwtClaims,
+    useJwtClaims: () => ({ status: 'resolved' as const, claims: getJwtClaims() }),
+  };
+});
+
+import { getJwtClaims } from '../../lib/authScope';
+const getJwtClaimsMock = vi.mocked(getJwtClaims);
+
+const fetchMock = vi.mocked(fetchWithAuth);
+
+const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
+  ({
+    ok,
+    status,
+    statusText: ok ? 'OK' : 'ERROR',
+    json: vi.fn().mockResolvedValue(payload),
+  }) as unknown as Response;
+
+const PATCH = {
+  id: 'patch-1',
+  title: 'Security Update',
+  severity: 'critical' as const,
+  source: 'Microsoft',
+  os: 'Windows',
+  releaseDate: '2026-04-01T00:00:00.000Z',
+  approvalStatus: 'pending' as const,
+};
+
+describe('PatchApprovalModal', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchMock.mockResolvedValue(makeJsonResponse({ id: 'patch-1', status: 'deferred' }));
+    // Default: partner scope
+    getJwtClaimsMock.mockReturnValue({ scope: 'partner', partnerId: 'partner-1', orgId: null });
+  });
+
+  it('sends deferUntil when deferring a patch', async () => {
+    const deferUntilLocal = '2026-04-08T09:00';
+
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId="ring-1"
+        onClose={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Defer/i }));
+    fireEvent.change(screen.getByLabelText(/Defer Until/i), {
+      target: { value: deferUntilLocal },
+    });
+    fireEvent.click(screen.getAllByRole('button', { name: /Defer/i }).at(-1)!);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/patch-1/defer',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            note: '',
+            ringId: 'ring-1',
+            deferUntil: new Date(deferUntilLocal).toISOString(),
+          }),
+        })
+      )
+    );
+  });
+
+  it('blocks org-scoped users with a partner-level message', async () => {
+    getJwtClaimsMock.mockReturnValue({ scope: 'organization', partnerId: null, orgId: 'org-1' });
+
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId={null}
+        onClose={() => {}}
+      />
+    );
+
+    // The warning is shown up-front and the submit button is disabled.
+    await screen.findByText(/patch approvals are managed at the partner level/i);
+    const submit = screen.getAllByRole('button', { name: /Approve/i }).at(-1)!;
+    expect(submit).toBeDisabled();
+
+    // Even if clicked, no request fires.
+    fireEvent.click(submit);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('confirm-fleet-action')).toBeNull();
+  });
+
+  it('partner user can approve partner-wide with no ring and no org context', async () => {
+    fetchMock.mockResolvedValue(makeJsonResponse({ id: 'patch-1', status: 'approved' }));
+    getJwtClaimsMock.mockReturnValue({ scope: 'partner', partnerId: 'partner-1', orgId: null });
+
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId={null}
+        onClose={() => {}}
+      />
+    );
+
+    const submit = screen.getAllByRole('button', { name: /Approve/i }).at(-1)!;
+    expect(submit).not.toBeDisabled();
+    fireEvent.click(submit);
+
+    // Approve opens the scope-naming confirm dialog; confirm fires the POST.
+    fireEvent.click(await screen.findByTestId('confirm-fleet-action'));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/patch-1/approve',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ note: '' }),
+        })
+      )
+    );
+  });
+
+  it('partner user can approve ring-scoped (ringId sent, no orgId in body)', async () => {
+    fetchMock.mockResolvedValue(makeJsonResponse({ id: 'patch-1', status: 'approved' }));
+
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId="ring-1"
+        onClose={() => {}}
+      />
+    );
+
+    const submit = screen.getAllByRole('button', { name: /Approve/i }).at(-1)!;
+    expect(submit).not.toBeDisabled();
+    fireEvent.click(submit);
+
+    fireEvent.click(await screen.findByTestId('confirm-fleet-action'));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/patch-1/approve',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ note: '', ringId: 'ring-1' }),
+        })
+      )
+    );
+  });
+
+  // #5585: an already-approved row opens the modal via the row-level
+  // Unapprove action, which must default straight into 'decline' rather than
+  // the ordinary 'approve' default.
+  it('opens on the decline tab when initialAction is decline', async () => {
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId={null}
+        initialAction="decline"
+        onClose={() => {}}
+      />
+    );
+
+    expect(screen.getByTestId('patch-approval-action-decline')).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('patch-approval-action-approve')).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('declining does not require the scope-naming confirm dialog', async () => {
+    fetchMock.mockResolvedValue(makeJsonResponse({ id: 'patch-1', status: 'declined' }));
+
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId="ring-1"
+        initialAction="decline"
+        onClose={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getAllByRole('button', { name: /Decline/i }).at(-1)!);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/patch-1/decline',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ note: '', ringId: 'ring-1' }),
+        })
+      )
+    );
+    expect(screen.queryByTestId('confirm-fleet-action')).toBeNull();
+  });
+
+  it('checking "clear all ring approvals" sends allRings and omits ringId', async () => {
+    fetchMock.mockResolvedValue(makeJsonResponse({ id: 'patch-1', status: 'declined', allRings: true }));
+
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId="ring-1"
+        initialAction="decline"
+        onClose={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByLabelText(/clear all ring approvals/i));
+    fireEvent.click(screen.getAllByRole('button', { name: /Decline/i }).at(-1)!);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/patch-1/decline',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ note: '', allRings: true }),
+        })
+      )
+    );
+  });
+
+  it('does not show the "clear all ring approvals" checkbox for approve/defer', () => {
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId={null}
+        onClose={() => {}}
+      />
+    );
+
+    expect(screen.queryByLabelText(/clear all ring approvals/i)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /Defer/i }));
+    expect(screen.queryByLabelText(/clear all ring approvals/i)).toBeNull();
+  });
+
+  it('resets the allRings checkbox when the modal reopens', () => {
+    const { rerender } = render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId="ring-1"
+        initialAction="decline"
+        onClose={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByLabelText(/clear all ring approvals/i));
+    expect(screen.getByLabelText(/clear all ring approvals/i)).toBeChecked();
+
+    rerender(
+      <PatchApprovalModal
+        open={false}
+        patch={PATCH}
+        ringId="ring-1"
+        initialAction="decline"
+        onClose={() => {}}
+      />
+    );
+    rerender(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId="ring-1"
+        initialAction="decline"
+        onClose={() => {}}
+      />
+    );
+
+    expect(screen.getByLabelText(/clear all ring approvals/i)).not.toBeChecked();
+  });
+
+  it('surfaces backend approval errors instead of a generic message', async () => {
+    fetchMock.mockResolvedValueOnce(makeJsonResponse({ error: 'Ring access denied' }, false, 403));
+
+    render(
+      <PatchApprovalModal
+        open
+        patch={PATCH}
+        ringId="ring-1"
+        onClose={() => {}}
+      />
+    );
+
+    // Click the main Approve submit button — this opens the scope-naming ConfirmDialog.
+    fireEvent.click(screen.getAllByRole('button', { name: /Approve/i }).at(-1)!);
+
+    // The ConfirmDialog now shows; confirm via testid to fire the actual POST.
+    fireEvent.click(await screen.findByTestId('confirm-fleet-action'));
+
+    expect(await screen.findByText('Ring access denied')).toBeTruthy();
+  });
+});

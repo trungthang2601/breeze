@@ -1,0 +1,1029 @@
+/**
+ * AI Performance Tools
+ *
+ * Tools for analyzing device performance metrics, user sessions, and boot performance.
+ * - analyze_metrics (Tier 1): Query and analyze time-series metrics
+ * - analyze_fleet_metrics (Tier 1): Aggregate a metric across the fleet from rollups
+ * - get_active_users (Tier 1): Query active user sessions
+ * - get_user_experience_metrics (Tier 1): Summarize login performance and session trends
+ * - analyze_boot_performance (Tier 1): Analyze boot performance and startup items
+ * - manage_startup_items (Tier 3): Disable or enable startup items
+ */
+
+import { db } from '../db';
+import { devices, deviceMetrics, deviceSessions, deviceBootMetrics, metricRollups } from '../db/schema';
+import { eq, and, desc, gte, inArray, SQL, sql } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { SITE_SCOPE_EMPTY_NOTE , runFrozenDeviceIds, deviceScopeCondition } from './aiToolsSiteScope';
+import {
+  mergeBootRecords,
+  parseCollectorBootMetricsFromCommandResult,
+} from './bootPerformance';
+import {
+  normalizeStartupItems,
+  resolveStartupItem,
+} from './startupItems';
+import { aiExecuteCommand } from './aiDispatch';
+
+type AiToolTier = 1 | 2 | 3 | 4;
+type MetricPoint = {
+  timestamp: Date;
+  cpuPercent: number;
+  ramPercent: number;
+  diskPercent: number;
+  ramUsedMb: number;
+  diskUsedGb: number;
+  sampleCount?: number;
+};
+
+const PERFORMANCE_ROLLUP_METRICS = [
+  'cpu_percent',
+  'ram_percent',
+  'ram_used_mb',
+  'disk_percent',
+  'disk_used_gb',
+] as const;
+
+// Real rollup metric names written by services/metricRollups.ts's
+// DERIVED_METRIC_DEFS for `device_metrics` (see analytics.ts's metricRollups
+// table). Note: the task brief's `memory_percent` does not exist as a rollup
+// name — the actual column is `ram_percent`. Using the real names here
+// avoids a tool that would silently return zero rows for every "memory"
+// query.
+const FLEET_METRIC_NAME_VALUES = ['cpu_percent', 'ram_percent', 'disk_percent'] as const;
+type FleetMetricName = (typeof FLEET_METRIC_NAME_VALUES)[number];
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * SQL aggregates come back as strings for the 64-bit types (`SUM(integer)` and
+ * `COUNT(*)` are `bigint`, `AVG(double precision)` is `numeric`), so arithmetic
+ * on them silently concatenates instead of adding. Normalizes to a number, or
+ * `null` for SQL NULL / anything unparseable.
+ */
+function toNumber(value: number | string | null | undefined): number | null {
+  if (value === null || value === undefined) return null;
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function verifyDeviceAccess(
+  deviceId: string,
+  auth: AuthContext,
+  requireOnline = false
+): Promise<{ device: typeof devices.$inferSelect } | { error: string }> {
+  if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
+    return { error: 'Device not found or access denied' };
+  }
+  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const orgCond = auth.orgCondition(devices.orgId);
+  if (orgCond) conditions.push(orgCond);
+  const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
+  if (!device) return { error: 'Device not found or access denied' };
+  // Site axis: deny devices outside the caller's site allowlist (no-op when unrestricted).
+  if (auth.canAccessSite && !auth.canAccessSite(device.siteId)) {
+    return { error: 'Device not found or access denied' };
+  }
+  if (requireOnline && device.status !== 'online')
+    return {
+      error: `Device ${device.hostname} is not online (status: ${device.status}). This tool needs a live connection; to run when the device reconnects use the Run Script / deployment tools instead.`,
+    };
+  return { device };
+}
+
+function computeStats(values: number[]): { min: number; max: number; avg: number; current: number } {
+  if (values.length === 0) return { min: 0, max: 0, avg: 0, current: 0 };
+  const min = values.reduce((a, b) => Math.min(a, b), Infinity);
+  const max = values.reduce((a, b) => Math.max(a, b), -Infinity);
+  const avg = Math.round((values.reduce((a, b) => a + b, 0) / values.length) * 100) / 100;
+  return { min, max, avg, current: values[0] ?? 0 };
+}
+
+function aggregateMetrics(
+  metrics: MetricPoint[],
+  level: 'hourly' | 'daily'
+): Array<{ period: string; cpu: number; ram: number; disk: number; count: number }> {
+  const bucketMap = new Map<string, { cpu: number[]; ram: number[]; disk: number[]; count: number }>();
+
+  for (const m of metrics) {
+    const d = new Date(m.timestamp);
+    const key = level === 'hourly'
+      ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}T${String(d.getUTCHours()).padStart(2, '0')}:00`
+      : `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+
+    if (!bucketMap.has(key)) {
+      bucketMap.set(key, { cpu: [], ram: [], disk: [], count: 0 });
+    }
+    const bucket = bucketMap.get(key)!;
+    bucket.cpu.push(m.cpuPercent);
+    bucket.ram.push(m.ramPercent);
+    bucket.disk.push(m.diskPercent);
+    bucket.count++;
+  }
+
+  return Array.from(bucketMap.entries()).map(([period, b]) => ({
+    period,
+    cpu: Math.round((b.cpu.reduce((a, v) => a + v, 0) / b.cpu.length) * 100) / 100,
+    ram: Math.round((b.ram.reduce((a, v) => a + v, 0) / b.ram.length) * 100) / 100,
+    disk: Math.round((b.disk.reduce((a, v) => a + v, 0) / b.disk.length) * 100) / 100,
+    count: b.count
+  }));
+}
+
+function periodForTimestamp(timestamp: Date, level: 'hourly' | 'daily'): string {
+  const d = new Date(timestamp);
+  return level === 'hourly'
+    ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}T${String(d.getUTCHours()).padStart(2, '0')}:00`
+    : `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+function summarizeMetrics(metrics: MetricPoint[]) {
+  return {
+    dataPoints: metrics.reduce((sum, metric) => sum + (metric.sampleCount ?? 1), 0),
+    timeRange: { from: metrics[metrics.length - 1]!.timestamp, to: metrics[0]!.timestamp },
+    cpu: computeStats(metrics.map(m => m.cpuPercent)),
+    ram: computeStats(metrics.map(m => m.ramPercent)),
+    disk: computeStats(metrics.map(m => m.diskPercent)),
+    ramUsedMb: computeStats(metrics.map(m => m.ramUsedMb)),
+    diskUsedGb: computeStats(metrics.map(m => m.diskUsedGb))
+  };
+}
+
+function rollupWeightedAvg(metricName: (typeof PERFORMANCE_ROLLUP_METRICS)[number]) {
+  return sql<number>`
+    coalesce(
+      sum(${metricRollups.avgValue} * ${metricRollups.sampleCount})
+        filter (where ${metricRollups.metricName} = ${metricName})
+      / nullif(
+        sum(${metricRollups.sampleCount})
+          filter (where ${metricRollups.metricName} = ${metricName}),
+        0
+      ),
+      0
+    )
+  `;
+}
+
+function rollupSampleCountSql() {
+  return sql<number>`
+    greatest(
+      coalesce(max(${metricRollups.sampleCount}) filter (where ${metricRollups.metricName} = 'cpu_percent'), 0),
+      coalesce(max(${metricRollups.sampleCount}) filter (where ${metricRollups.metricName} = 'ram_percent'), 0),
+      coalesce(max(${metricRollups.sampleCount}) filter (where ${metricRollups.metricName} = 'disk_percent'), 0)
+    )
+  `;
+}
+
+function rollupBucketSeconds(aggregation: 'hourly' | 'daily'): 3600 | 86400 {
+  return aggregation === 'hourly' ? 3600 : 86400;
+}
+
+async function queryMetricRollupsForAnalysis(
+  orgId: string,
+  deviceId: string,
+  since: Date,
+  aggregation: 'hourly' | 'daily'
+): Promise<MetricPoint[]> {
+  return db
+    .select({
+      timestamp: metricRollups.bucketStart,
+      cpuPercent: rollupWeightedAvg('cpu_percent'),
+      ramPercent: rollupWeightedAvg('ram_percent'),
+      ramUsedMb: rollupWeightedAvg('ram_used_mb'),
+      diskPercent: rollupWeightedAvg('disk_percent'),
+      diskUsedGb: rollupWeightedAvg('disk_used_gb'),
+      sampleCount: rollupSampleCountSql(),
+    })
+    .from(metricRollups)
+    .where(
+      and(
+        eq(metricRollups.orgId, orgId),
+        eq(metricRollups.deviceId, deviceId),
+        eq(metricRollups.sourceTable, 'device_metrics'),
+        eq(metricRollups.bucketSeconds, rollupBucketSeconds(aggregation)),
+        inArray(metricRollups.metricName, [...PERFORMANCE_ROLLUP_METRICS]),
+        sql`${metricRollups.sampleCount} > 0`,
+        gte(metricRollups.bucketStart, since)
+      )
+    )
+    .groupBy(metricRollups.bucketStart)
+    .orderBy(desc(metricRollups.bucketStart))
+    .limit(500);
+}
+
+export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+  // ============================================
+  // analyze_metrics - Tier 1 (auto-execute)
+  // ============================================
+
+  registerTool({
+    tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'device CPU, RAM, disk and network metrics over time, time ranges and aggregation',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'analyze_metrics',
+      description: 'Query and analyze time-series metrics (CPU, RAM, disk, network) for a device. Supports time range filtering and aggregation.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          metric: { type: 'string', enum: ['cpu', 'ram', 'disk', 'network', 'all'], description: 'Which metric to analyze (default: all)' },
+          hoursBack: { type: 'number', description: 'How many hours back to look (default: 24, max: 168)' },
+          aggregation: { type: 'string', enum: ['raw', 'hourly', 'daily'], description: 'Aggregation level (default: raw for <=24h, hourly for >24h)' }
+        },
+        required: ['deviceId']
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+
+      // Verify device access
+      const access = await verifyDeviceAccess(deviceId, auth);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+
+      const hoursBack = Math.min(Math.max(1, Number(input.hoursBack) || 24), 168);
+      const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
+      const aggregation = input.aggregation || (hoursBack <= 24 ? 'raw' : 'hourly');
+
+      if (aggregation === 'hourly' || aggregation === 'daily') {
+        const rollupMetrics = await queryMetricRollupsForAnalysis(access.device.orgId, deviceId, since, aggregation);
+        if (rollupMetrics.length > 0) {
+          const summary = summarizeMetrics(rollupMetrics);
+          const buckets = rollupMetrics.map((metric) => ({
+            period: periodForTimestamp(metric.timestamp, aggregation),
+            cpu: Math.round(metric.cpuPercent * 100) / 100,
+            ram: Math.round(metric.ramPercent * 100) / 100,
+            disk: Math.round(metric.diskPercent * 100) / 100,
+            count: metric.sampleCount ?? 0,
+          }));
+
+          return JSON.stringify({
+            summary,
+            aggregation,
+            source: 'metric_rollups',
+            buckets
+          }, (_, v) => typeof v === 'bigint' ? Number(v) : v);
+        }
+      }
+
+      const metrics = await db
+        .select()
+        .from(deviceMetrics)
+        .where(
+          and(
+            eq(deviceMetrics.deviceId, deviceId),
+            gte(deviceMetrics.timestamp, since)
+          )
+        )
+        .orderBy(desc(deviceMetrics.timestamp))
+        .limit(500);
+
+      if (metrics.length === 0) {
+        return JSON.stringify({ message: 'No metrics found for the specified time range', deviceId, hoursBack });
+      }
+
+      // Compute summary statistics
+      const summary = summarizeMetrics(metrics);
+
+      // For raw mode, return recent data points (limited to prevent huge responses)
+      if (aggregation === 'raw') {
+        return JSON.stringify({
+          summary,
+          metrics: metrics.slice(0, 50) // Limit raw output
+        }, (_, v) => typeof v === 'bigint' ? Number(v) : v);
+      }
+
+      // Hourly/daily aggregation
+      const buckets = aggregateMetrics(metrics, aggregation as 'hourly' | 'daily');
+
+      return JSON.stringify({
+        summary,
+        aggregation,
+        source: 'device_metrics',
+        buckets
+      }, (_, v) => typeof v === 'bigint' ? Number(v) : v);
+    }
+  });
+
+  // ============================================
+  // analyze_fleet_metrics - Tier 1 (auto-execute)
+  // ============================================
+  //
+  // Fleet-wide device metric aggregation for hygiene review (Task 8). Reads
+  // metric_rollups directly (never raw per-second samples), so a fleet-wide
+  // window is bounded by (org devices) x (buckets in window), not raw sample
+  // volume.
+  //
+  // Percentile aggregation caveat: metric_rollups stores one p95 PER BUCKET,
+  // not the underlying raw sample list, so there is no way to recompute a
+  // true percentile across multiple buckets from these rows. `p95` below is
+  // each device's PEAK per-bucket p95 across the window (a MAX, not a
+  // re-aggregated percentile) — the right choice for an offender-hunting
+  // tool (surfaces worst-case pressure moments) but not a statistically
+  // valid fleet-wide percentile. `avg` IS mathematically valid: a
+  // sample-count-weighted mean across buckets.
+
+  registerTool({
+    tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'fleet CPU, RAM and disk trends, per-device averages, peaks and ranked resource usage',
+    definition: {
+      name: 'analyze_fleet_metrics',
+      description: "Return fleet CPU/RAM/disk rollup averages, peak-p95 and maxima, ranked by device peak p95. Fleet p95ApproxAvgOfDevicePeaks is an approximation averaging device peak bucket p95s, not a true fleet percentile. Read-only.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          metricName: { type: 'string', enum: [...FLEET_METRIC_NAME_VALUES], description: 'Which rollup metric to analyze' },
+          windowHours: { type: 'number', description: 'How many hours back to look (default 24, max 168)' },
+          topN: { type: 'number', description: 'Max devices to return, ranked by peak p95 descending (default 10, max 50)' },
+          orgId: { type: 'string', description: 'Organization UUID to scope to (must be accessible to the caller). Omit to use the caller\'s own org/partner scope.' },
+        },
+        required: ['metricName']
+      }
+    },
+    handler: async (input, auth) => {
+      const metricName = input.metricName as string;
+      if (!(FLEET_METRIC_NAME_VALUES as readonly string[]).includes(metricName)) {
+        return JSON.stringify({ error: `Invalid metricName. Allowed values: ${FLEET_METRIC_NAME_VALUES.join(', ')}` });
+      }
+
+      const orgId = typeof input.orgId === 'string' ? input.orgId : undefined;
+      if (orgId && !auth.canAccessOrg(orgId)) {
+        return JSON.stringify({ error: 'Access to this organization denied' });
+      }
+
+      const windowHours = Math.min(Math.max(1, Number(input.windowHours) || 24), 168);
+      const topN = Math.min(Math.max(1, Number(input.topN) || 10), 50);
+      // <=24h windows use the 5-minute rollup tier; longer windows use the
+      // hourly tier (services/metricRollups.ts's METRIC_ROLLUP_BUCKETS: 300 /
+      // 3600 / 86400 seconds) to keep the row count bounded at 168h.
+      const bucketSeconds = windowHours <= 24 ? 300 : 3600;
+      const since = new Date(Date.now() - windowHours * 60 * 60 * 1000);
+
+      // Zero-site restricted caller: nothing is visible — short-circuit
+      // without querying (mirrors resolveSiteAllowedDeviceIds callers
+      // elsewhere in the AI tools). Both `allowedSiteIds` and `canAccessSite`
+      // are always set together by buildOrgAccessClosures — checking both
+      // matches the aiToolsSiteScope.ts helper convention.
+      const isSiteRestricted = Boolean(auth.allowedSiteIds && auth.canAccessSite);
+      if (isSiteRestricted && auth.allowedSiteIds!.length === 0) {
+        return JSON.stringify({
+          metricName,
+          windowHours,
+          bucketSeconds,
+          topN,
+          deviceCount: 0,
+          fleetSummary: { avg: null, p95ApproxAvgOfDevicePeaks: null, max: null, sampleCount: 0 },
+          topDevices: [],
+          note: SITE_SCOPE_EMPTY_NOTE,
+        });
+      }
+
+      const conditions: SQL[] = [
+        eq(metricRollups.metricName, metricName as FleetMetricName),
+        eq(metricRollups.sourceTable, 'device_metrics'),
+        eq(metricRollups.bucketSeconds, bucketSeconds),
+        gte(metricRollups.bucketStart, since),
+        sql`${metricRollups.sampleCount} > 0`,
+      ];
+      const orgCondition = orgId ? eq(metricRollups.orgId, orgId) : auth.orgCondition(metricRollups.orgId);
+      if (orgCondition) conditions.push(orgCondition);
+      // Site is an app-layer authz axis only (RLS does not cover it) — join
+      // devices and narrow by siteId for a site-restricted caller.
+      if (isSiteRestricted) conditions.push(inArray(devices.siteId, auth.allowedSiteIds!));
+      // W04 (#5715): the device-LESS analysis run's frozen set — it has no site
+      // axis, so the narrowing above does nothing for it.
+      const frozenDeviceIds = runFrozenDeviceIds(auth);
+      if (frozenDeviceIds) conditions.push(inArray(devices.id, frozenDeviceIds));
+
+      // The per-device fold runs in Postgres, not here. Selecting raw rollup
+      // rows materialized (org devices) x (buckets in window) — a 168h window
+      // at the hourly tier is 168 rows PER DEVICE, and the 24h/5-minute tier
+      // is 288 — only to collapse them to one object per device in JS. The
+      // GROUP BY below returns exactly one row per device, and the ORDER BY /
+      // LIMIT means the ranked page never leaves the database either.
+      const perDeviceSubquery = db
+        .select({
+          deviceId: metricRollups.deviceId,
+          hostname: devices.hostname,
+          // Sample-count-weighted numerator; divided by totalSamples below.
+          weightedAvgSum: sql<number | string | null>`SUM(${metricRollups.avgValue} * ${metricRollups.sampleCount})`.as('weighted_avg_sum'),
+          totalSamples: sql<number | string | null>`SUM(${metricRollups.sampleCount})`.as('total_samples'),
+          maxValue: sql<number | string | null>`MAX(${metricRollups.maxValue})`.as('max_value'),
+          // Each device's PEAK per-bucket p95 — a MAX, not a re-aggregated
+          // percentile (see the caveat comment above this tool).
+          peakP95: sql<number | string | null>`MAX(${metricRollups.p95Value})`.as('peak_p95'),
+        })
+        .from(metricRollups)
+        .innerJoin(devices, eq(metricRollups.deviceId, devices.id))
+        .where(and(...conditions))
+        .groupBy(metricRollups.deviceId, devices.hostname)
+        .as('per_device');
+
+      const topRows = await db
+        .select()
+        .from(perDeviceSubquery)
+        // NULLS LAST, not the default: Postgres sorts NULL first under DESC,
+        // so a device with no p95 at all would otherwise head the
+        // worst-offenders list.
+        .orderBy(sql`${perDeviceSubquery.peakP95} DESC NULLS LAST`)
+        .limit(topN);
+
+      // Fleet summary over EVERY device in scope, not just the topN page —
+      // aggregated from the same grouped rows so it never materializes them.
+      const [fleetRow] = await db
+        .select({
+          deviceCount: sql<number | string>`COUNT(*)`,
+          weightedAvgSum: sql<number | string | null>`SUM(${perDeviceSubquery.weightedAvgSum})`,
+          totalSamples: sql<number | string | null>`SUM(${perDeviceSubquery.totalSamples})`,
+          maxValue: sql<number | string | null>`MAX(${perDeviceSubquery.maxValue})`,
+          // AVG of the per-device peaks — the documented approximation, not a
+          // fleet-wide percentile.
+          avgPeakP95: sql<number | string | null>`AVG(${perDeviceSubquery.peakP95})`,
+        })
+        .from(perDeviceSubquery);
+
+      const perDevice = topRows.map((row) => {
+        const totalSamples = toNumber(row.totalSamples) ?? 0;
+        const weightedAvgSum = toNumber(row.weightedAvgSum);
+        const peakP95 = toNumber(row.peakP95);
+        const maxValue = toNumber(row.maxValue);
+        return {
+          deviceId: row.deviceId,
+          hostname: row.hostname,
+          avg: totalSamples > 0 && weightedAvgSum !== null ? round2(weightedAvgSum / totalSamples) : null,
+          p95: peakP95 !== null ? round2(peakP95) : null,
+          max: maxValue !== null ? round2(maxValue) : null,
+          sampleCount: totalSamples,
+        };
+      });
+
+      const fleetTotalSamples = toNumber(fleetRow?.totalSamples) ?? 0;
+      const fleetWeightedAvgSum = toNumber(fleetRow?.weightedAvgSum);
+      const fleetAvgPeakP95 = toNumber(fleetRow?.avgPeakP95);
+      const fleetMax = toNumber(fleetRow?.maxValue);
+
+      return JSON.stringify({
+        metricName,
+        windowHours,
+        bucketSeconds,
+        topN,
+        deviceCount: toNumber(fleetRow?.deviceCount) ?? 0,
+        fleetSummary: {
+          avg: fleetTotalSamples > 0 && fleetWeightedAvgSum !== null
+            ? round2(fleetWeightedAvgSum / fleetTotalSamples)
+            : null,
+          // Self-describing key (not a bare `p95`): this is the AVERAGE of
+          // each device's peak per-bucket p95, not a true recomputed
+          // fleet-wide percentile — see the aggregation-caveat comment above
+          // and the tool description. A bare `p95` name would silently read
+          // as a real percentile to a model consuming this output.
+          p95ApproxAvgOfDevicePeaks: fleetAvgPeakP95 !== null ? round2(fleetAvgPeakP95) : null,
+          max: fleetMax !== null ? round2(fleetMax) : null,
+          sampleCount: fleetTotalSamples,
+        },
+        topDevices: perDevice,
+      });
+    }
+  });
+
+  // ============================================
+  // get_active_users - Tier 1 (auto-execute)
+  // ============================================
+
+  registerTool({
+    tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'active user sessions, logged-in users and reboot safety on a device or across the fleet',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'get_active_users',
+      description: 'Query active user sessions for one device or across the fleet. Returns session state and a reboot safety signal.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'Optional device UUID. If omitted, returns active sessions across accessible devices.' },
+          limit: { type: 'number', description: 'Max sessions to return (default 100, max 200)' },
+          idleThresholdMinutes: { type: 'number', description: 'Threshold used for reboot-safety checks (default 15)' }
+        }
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string | undefined;
+      const idleThresholdMinutes = Math.min(Math.max(1, Number(input.idleThresholdMinutes) || 15), 1440);
+      const limit = Math.min(Math.max(1, Number(input.limit) || 100), 200);
+      // Site authority is app-layer only. A defined ceiling constrains even
+      // the fleet form (no deviceId); a defined-empty one denies everything.
+      const allowedSiteIds = auth.allowedSiteIds;
+      if (allowedSiteIds?.length === 0) {
+        return JSON.stringify({
+          idleThresholdMinutes,
+          totalActiveSessions: 0,
+          totalDevicesWithSessions: 0,
+          devices: [],
+          note: SITE_SCOPE_EMPTY_NOTE,
+        });
+      }
+
+      if (deviceId) {
+        const access = await verifyDeviceAccess(deviceId, auth);
+        if ('error' in access) return JSON.stringify({ error: access.error });
+      }
+
+      const conditions: SQL[] = [eq(deviceSessions.isActive, true)];
+      const orgCondition = auth.orgCondition(deviceSessions.orgId);
+      if (orgCondition) conditions.push(orgCondition);
+      if (deviceId) conditions.push(eq(deviceSessions.deviceId, deviceId));
+      if (allowedSiteIds) conditions.push(inArray(devices.siteId, allowedSiteIds));
+      // Exact-device axis (#6086): the fleet form (no deviceId) is otherwise
+      // org-wide, so a device-bound run reads sibling devices' sessions. It is
+      // independent of the site ceiling above — a device-less analysis run has
+      // `allowedDeviceIds` and no `allowedSiteIds` at all.
+      const deviceScope = deviceScopeCondition(auth, deviceSessions.deviceId);
+      if (deviceScope) conditions.push(deviceScope);
+
+      const rows = await db
+        .select({
+          sessionId: deviceSessions.id,
+          deviceId: deviceSessions.deviceId,
+          hostname: devices.hostname,
+          deviceStatus: devices.status,
+          username: deviceSessions.username,
+          sessionType: deviceSessions.sessionType,
+          osSessionId: deviceSessions.osSessionId,
+          loginAt: deviceSessions.loginAt,
+          idleMinutes: deviceSessions.idleMinutes,
+          activityState: deviceSessions.activityState,
+          loginPerformanceSeconds: deviceSessions.loginPerformanceSeconds,
+          lastActivityAt: deviceSessions.lastActivityAt,
+        })
+        .from(deviceSessions)
+        .innerJoin(devices, eq(deviceSessions.deviceId, devices.id))
+        .where(and(...conditions))
+        .orderBy(desc(deviceSessions.loginAt))
+        .limit(limit);
+
+      const byDevice = new Map<string, {
+        deviceId: string;
+        hostname: string;
+        deviceStatus: string;
+        sessions: typeof rows;
+      }>();
+
+      for (const row of rows) {
+        const existing = byDevice.get(row.deviceId);
+        if (!existing) {
+          byDevice.set(row.deviceId, {
+            deviceId: row.deviceId,
+            hostname: row.hostname,
+            deviceStatus: row.deviceStatus,
+            sessions: [row],
+          });
+        } else {
+          existing.sessions.push(row);
+        }
+      }
+
+      const devicesWithSessions = Array.from(byDevice.values()).map((entry) => {
+        const blockingSessions = entry.sessions.filter((session) => {
+          const state = session.activityState ?? 'active';
+          if (state === 'locked' || state === 'away' || state === 'disconnected') {
+            return false;
+          }
+          const idle = session.idleMinutes ?? 0;
+          return idle < idleThresholdMinutes;
+        });
+
+        return {
+          deviceId: entry.deviceId,
+          hostname: entry.hostname,
+          deviceStatus: entry.deviceStatus,
+          activeSessionCount: entry.sessions.length,
+          blockingSessionCount: blockingSessions.length,
+          safeToReboot: blockingSessions.length === 0,
+          sessions: entry.sessions,
+        };
+      });
+
+      return JSON.stringify({
+        idleThresholdMinutes,
+        totalActiveSessions: rows.length,
+        totalDevicesWithSessions: devicesWithSessions.length,
+        devices: devicesWithSessions,
+      });
+    }
+  });
+
+  // ============================================
+  // get_user_experience_metrics - Tier 1 (auto-execute)
+  // ============================================
+
+  registerTool({
+    tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'user experience, login performance and session behavior trends by device or user',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'get_user_experience_metrics',
+      description: 'Summarize login performance and session behavior trends for a device or user over time.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'Optional device UUID to scope metrics' },
+          username: { type: 'string', description: 'Optional username filter' },
+          daysBack: { type: 'number', description: 'How far back to analyze (default 30, max 365)' },
+          limit: { type: 'number', description: 'Max session rows to include in trend output (default 200, max 500)' }
+        }
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string | undefined;
+      const username = input.username as string | undefined;
+      const daysBack = Math.min(Math.max(1, Number(input.daysBack) || 30), 365);
+      const limit = Math.min(Math.max(1, Number(input.limit) || 200), 500);
+      // Apply the current device's site before ordering/LIMIT so a hidden
+      // newest session cannot starve an older visible result.
+      const allowedSiteIds = auth.allowedSiteIds;
+      if (allowedSiteIds?.length === 0) {
+        return JSON.stringify({
+          daysBack,
+          totalSessions: 0,
+          message: 'No session data found for the selected filters.',
+          note: SITE_SCOPE_EMPTY_NOTE,
+        });
+      }
+
+      if (deviceId) {
+        const access = await verifyDeviceAccess(deviceId, auth);
+        if ('error' in access) return JSON.stringify({ error: access.error });
+      }
+
+      const since = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000);
+      const conditions: SQL[] = [gte(deviceSessions.loginAt, since)];
+      const orgCondition = auth.orgCondition(deviceSessions.orgId);
+      if (orgCondition) conditions.push(orgCondition);
+      if (deviceId) conditions.push(eq(deviceSessions.deviceId, deviceId));
+      if (username) conditions.push(eq(deviceSessions.username, username));
+      if (allowedSiteIds) conditions.push(inArray(devices.siteId, allowedSiteIds));
+      // Exact-device axis (#6086) — see get_active_users above; the site axis
+      // alone does not constrain a device-less analysis run.
+      const deviceScope = deviceScopeCondition(auth, deviceSessions.deviceId);
+      if (deviceScope) conditions.push(deviceScope);
+
+      const rows = await db
+        .select({
+          deviceId: deviceSessions.deviceId,
+          hostname: devices.hostname,
+          username: deviceSessions.username,
+          loginAt: deviceSessions.loginAt,
+          logoutAt: deviceSessions.logoutAt,
+          durationSeconds: deviceSessions.durationSeconds,
+          idleMinutes: deviceSessions.idleMinutes,
+          loginPerformanceSeconds: deviceSessions.loginPerformanceSeconds,
+          activityState: deviceSessions.activityState,
+          isActive: deviceSessions.isActive,
+        })
+        .from(deviceSessions)
+        .innerJoin(devices, eq(deviceSessions.deviceId, devices.id))
+        .where(and(...conditions))
+        .orderBy(desc(deviceSessions.loginAt))
+        .limit(limit);
+
+      if (rows.length === 0) {
+        return JSON.stringify({
+          daysBack,
+          totalSessions: 0,
+          message: 'No session data found for the selected filters.',
+        });
+      }
+
+      const numericValues = (values: Array<number | null>) =>
+        values.filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0);
+      const avg = (values: number[]) => (values.length > 0 ? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2)) : null);
+
+      const durationValues = numericValues(rows.map((row) => row.durationSeconds));
+      const loginPerfValues = numericValues(rows.map((row) => row.loginPerformanceSeconds));
+      const idleValues = numericValues(rows.map((row) => row.idleMinutes));
+
+      const perUserMap = new Map<string, { sessions: number; avgLoginPerf: number[]; avgDuration: number[] }>();
+      for (const row of rows) {
+        const current = perUserMap.get(row.username) ?? { sessions: 0, avgLoginPerf: [], avgDuration: [] };
+        current.sessions += 1;
+        if (typeof row.loginPerformanceSeconds === 'number' && row.loginPerformanceSeconds >= 0) {
+          current.avgLoginPerf.push(row.loginPerformanceSeconds);
+        }
+        if (typeof row.durationSeconds === 'number' && row.durationSeconds >= 0) {
+          current.avgDuration.push(row.durationSeconds);
+        }
+        perUserMap.set(row.username, current);
+      }
+
+      const perUser = Array.from(perUserMap.entries())
+        .map(([user, data]) => ({
+          username: user,
+          sessionCount: data.sessions,
+          avgLoginPerformanceSeconds: avg(data.avgLoginPerf),
+          avgSessionDurationSeconds: avg(data.avgDuration),
+        }))
+        .sort((a, b) => b.sessionCount - a.sessionCount);
+
+      return JSON.stringify({
+        daysBack,
+        totalSessions: rows.length,
+        activeSessions: rows.filter((row) => row.isActive).length,
+        averages: {
+          loginPerformanceSeconds: avg(loginPerfValues),
+          sessionDurationSeconds: avg(durationValues),
+          idleMinutes: avg(idleValues),
+        },
+        perUser,
+        trend: rows.slice(0, 100).map((row) => ({
+          deviceId: row.deviceId,
+          hostname: row.hostname,
+          username: row.username,
+          loginAt: row.loginAt,
+          loginPerformanceSeconds: row.loginPerformanceSeconds,
+          durationSeconds: row.durationSeconds,
+          idleMinutes: row.idleMinutes,
+          activityState: row.activityState,
+        })),
+      });
+    }
+  });
+
+  // ============================================
+  // analyze_boot_performance - Tier 1 (auto-execute)
+  // ============================================
+
+  registerTool({
+    tier: 1 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'slow boot, startup impact, boot time history and optimization recommendations',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'analyze_boot_performance',
+      description: 'Analyze boot performance and startup items for a device. Returns boot time history, slowest startup items by impact score, and optimization recommendations.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          bootsBack: { type: 'number', description: 'Number of recent boots to analyze (default: 10, max: 30)' },
+          triggerCollection: { type: 'boolean', description: 'If true and device is online, trigger fresh collection before analysis (default: false)' }
+        },
+        required: ['deviceId']
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const bootsBack = Math.min(Number(input.bootsBack) || 10, 30);
+      const triggerCollection = Boolean(input.triggerCollection);
+
+      const access = await verifyDeviceAccess(deviceId, auth, false);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+      const { device } = access;
+
+      // Optionally trigger fresh collection
+      let collectionFailed = false;
+      let freshBootRecord: ReturnType<typeof parseCollectorBootMetricsFromCommandResult> = null;
+      if (triggerCollection && device.status === 'online') {
+        try {
+          const commandResult = await aiExecuteCommand(auth, 'analyze_boot_performance', deviceId, 'collect_boot_performance', {}, {
+            userId: auth.user.id,
+            timeoutMs: 15000,
+          });
+          freshBootRecord = parseCollectorBootMetricsFromCommandResult(commandResult);
+          if (!freshBootRecord) {
+            collectionFailed = true;
+          }
+        } catch (err) {
+          collectionFailed = true;
+          console.warn(`[AI] Boot performance collection trigger failed for device ${deviceId}:`, err);
+          // Non-fatal: proceed with existing data
+        }
+      }
+
+      const bootRecords = await db
+        .select()
+        .from(deviceBootMetrics)
+        .where(eq(deviceBootMetrics.deviceId, deviceId))
+        .orderBy(desc(deviceBootMetrics.bootTimestamp))
+        .limit(bootsBack);
+
+      const mergedBootRecords = mergeBootRecords(bootRecords, freshBootRecord, bootsBack);
+
+      if (mergedBootRecords.length === 0) {
+        return JSON.stringify({
+          error: collectionFailed
+            ? 'Boot performance data collection failed and no cached data exists. The device may not support this feature or may be experiencing issues.'
+            : 'No boot performance data available. Try triggerCollection: true if device is online.'
+        });
+      }
+
+      // Summary statistics
+      const totalBootTimes = mergedBootRecords
+        .map(b => b.totalBootSeconds)
+        .filter((t): t is number => t !== null);
+      const avgBootTime = totalBootTimes.length > 0
+        ? totalBootTimes.reduce((a, b) => a + b, 0) / totalBootTimes.length
+        : 0;
+      const latestBoot = mergedBootRecords[0]!;
+
+      // Top impact startup items from latest boot
+      const allStartupItems = normalizeStartupItems(
+        Array.isArray(latestBoot.startupItems) ? latestBoot.startupItems : []
+      );
+      const topImpactItems = [...allStartupItems]
+        .sort((a, b) => b.impactScore - a.impactScore)
+        .slice(0, 10);
+
+      // Recommendations
+      const recommendations: string[] = [];
+      if (avgBootTime > 120) {
+        recommendations.push('Average boot time is slow (>2 minutes). Review high-impact startup items.');
+      }
+      if (topImpactItems.some(item => item.impactScore > 60)) {
+        recommendations.push('Several startup items have high resource usage. Consider disabling non-essential items.');
+      }
+      const latestBootStartupItemCount = Number(latestBoot.startupItemCount ?? allStartupItems.length);
+      if (latestBootStartupItemCount > 50) {
+        recommendations.push(`High startup item count (${latestBootStartupItemCount}). Disable unused services.`);
+      }
+      if (totalBootTimes.length >= 3) {
+        const recent = totalBootTimes.slice(0, 3);
+        const older = totalBootTimes.slice(3);
+        if (older.length > 0) {
+          const recentAvg = recent.reduce((a, b) => a + b, 0) / recent.length;
+          const olderAvg = older.reduce((a, b) => a + b, 0) / older.length;
+          if (recentAvg > olderAvg * 1.2) {
+            recommendations.push('Boot times are trending slower. New startup items may have been added recently.');
+          }
+        }
+      }
+
+      return JSON.stringify({
+        device: { id: device.id, hostname: device.hostname, osType: device.osType },
+        bootHistory: {
+          totalBoots: mergedBootRecords.length,
+          avgBootTimeSeconds: Number(avgBootTime.toFixed(2)),
+          fastestBootSeconds: totalBootTimes.length > 0 ? Number(Math.min(...totalBootTimes).toFixed(2)) : null,
+          slowestBootSeconds: totalBootTimes.length > 0 ? Number(Math.max(...totalBootTimes).toFixed(2)) : null,
+          recentBoots: mergedBootRecords.slice(0, 5).map(b => ({
+            timestamp: b.bootTimestamp,
+            totalSeconds: b.totalBootSeconds,
+            biosSeconds: b.biosSeconds,
+            osLoaderSeconds: b.osLoaderSeconds,
+            desktopReadySeconds: b.desktopReadySeconds,
+          })),
+        },
+        latestBoot: {
+          timestamp: latestBoot.bootTimestamp,
+          totalSeconds: latestBoot.totalBootSeconds,
+          startupItemCount: latestBootStartupItemCount,
+          topImpactItems: topImpactItems.map(item => ({
+            itemId: item.itemId,
+            name: item.name,
+            type: item.type,
+            path: item.path,
+            enabled: item.enabled,
+            impactScore: Number(item.impactScore.toFixed(1)),
+            cpuTimeMs: item.cpuTimeMs,
+            diskIoMB: Number((item.diskIoBytes / 1048576).toFixed(2)),
+          })),
+        },
+        recommendations,
+        ...(collectionFailed ? { collectionWarning: 'Fresh data collection was requested but failed. The data shown may be stale.' } : {}),
+      });
+    }
+  });
+
+  // ============================================
+  // manage_startup_items - Tier 3 (requires approval)
+  // ============================================
+
+  registerTool({
+    tier: 3 as AiToolTier,
+    domain: 'devices',
+    searchHint: 'device startup items: disable, enable',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'manage_startup_items',
+      description: 'Disable or enable startup items on a device. Device must be online. Item must exist in the most recent boot performance record. Requires user approval. Use analyze_boot_performance first to identify high-impact items. Actions: disable, enable.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          itemName: { type: 'string', description: 'The exact name of the startup item to manage' },
+          itemId: { type: 'string', description: 'Stable startup item identifier. Preferred when item names are duplicated.' },
+          itemType: { type: 'string', description: 'Optional startup item type to disambiguate name collisions.' },
+          itemPath: { type: 'string', description: 'Optional startup item path to disambiguate name collisions.' },
+          action: { type: 'string', enum: ['disable', 'enable'], description: 'Action to perform' },
+          reason: { type: 'string', description: 'Justification for this change' }
+        },
+        required: ['deviceId', 'itemName', 'action']
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const itemName = input.itemName as string;
+      const itemId = input.itemId as string | undefined;
+      const itemType = input.itemType as string | undefined;
+      const itemPath = input.itemPath as string | undefined;
+      const action = input.action as 'disable' | 'enable';
+      const reason = (input.reason as string) || 'No reason provided';
+
+      const access = await verifyDeviceAccess(deviceId, auth, true);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+      const { device } = access;
+
+      // Verify item exists in latest boot record
+      const [latestBoot] = await db
+        .select()
+        .from(deviceBootMetrics)
+        .where(eq(deviceBootMetrics.deviceId, deviceId))
+        .orderBy(desc(deviceBootMetrics.bootTimestamp))
+        .limit(1);
+
+      if (!latestBoot) {
+        return JSON.stringify({ message: 'No boot performance data available for this device.' });
+      }
+
+      const allItems = normalizeStartupItems(Array.isArray(latestBoot.startupItems) ? latestBoot.startupItems : []);
+      const match = resolveStartupItem(allItems, { itemId, itemName, itemType, itemPath });
+      if (!match.item) {
+        if (match.candidates && match.candidates.length > 1) {
+          return JSON.stringify({
+            error: `Startup item selector for "${itemName}" is ambiguous. Provide itemId or itemType+itemPath.`,
+            candidates: match.candidates.slice(0, 20).map(i => ({
+              itemId: i.itemId,
+              name: i.name,
+              type: i.type,
+              path: i.path,
+              enabled: i.enabled,
+            })),
+          });
+        }
+        return JSON.stringify({
+          error: `Startup item "${itemName}" not found.`,
+          availableItems: allItems.slice(0, 20).map(i => ({
+            itemId: i.itemId,
+            name: i.name,
+            type: i.type,
+            path: i.path,
+            enabled: i.enabled,
+          })),
+        });
+      }
+      const item = match.item;
+
+      if (action === 'disable' && !item.enabled) {
+        return JSON.stringify({ error: `Startup item "${itemName}" is already disabled.` });
+      }
+      if (action === 'enable' && item.enabled) {
+        return JSON.stringify({ error: `Startup item "${itemName}" is already enabled.` });
+      }
+
+      // Note: On macOS, re-enabling login items is not supported by the agent
+      // (requires the application path which is not stored). The agent will return
+      // an error in this case.
+
+      // Send command to agent
+      const result = await aiExecuteCommand(
+        auth,
+        'manage_startup_items',
+        deviceId,
+        'manage_startup_item',
+        { itemName: item.name, itemType: item.type, itemPath: item.path, itemId: item.itemId, action, reason },
+        { userId: auth.user.id, timeoutMs: 30000 }
+      );
+
+      if (result.status !== 'completed') {
+        return JSON.stringify({
+          error: `Failed to ${action} startup item "${itemName}": ${result.error || 'unknown error'}`,
+          device: { hostname: device.hostname, osType: device.osType },
+        });
+      }
+
+      return JSON.stringify({
+        success: true,
+        message: `Startup item "${itemName}" ${action}d successfully.`,
+        device: { hostname: device.hostname, osType: device.osType },
+        item: {
+          itemId: item.itemId,
+          name: item.name,
+          type: item.type,
+          path: item.path,
+          previouslyEnabled: item.enabled,
+          newState: action === 'enable',
+        },
+      });
+    }
+  });
+}

@@ -1,0 +1,458 @@
+# Breeze RMM store-submission checklist
+
+## Current configuration
+
+- iOS bundle ID: `com.breeze.rmm`
+- Android application ID: `com.breeze.rmm`
+- Store version: `1.0.0`
+- Build numbers: iOS `buildNumber` and Android `versionCode` in `app.json` — bump the one you are shipping before every upload (Play rejects a reused `versionCode`).
+- The release path uses the local Xcode project; no Expo/EAS account is required. A committed `eas.json` exists so build-time config has a named home, but no EAS build has ever been run for this app.
+- Apple Team ID: `D8W6N2JYMA` (LanternOps LLC)
+
+## Push notifications — server side is already live
+
+iOS push uses **native APNs**, not the Expo relay (#2333), so no Expo account is
+needed. The provider credentials are configured in production on both regions
+(key `8BYB6K2AZP`, team `D8W6N2JYMA`, topic `com.breeze.rmm`,
+`APNS_ENVIRONMENT=production`).
+
+⚠️ **`APNS_ENVIRONMENT=production` accepts TestFlight/App Store tokens only.** A
+Debug build sideloaded from Xcode gets a *sandbox* token, which
+`api.push.apple.com` rejects with `BadDeviceToken` — and the sender treats that
+as permanently dead and **deletes the token from the database**. To test push
+from a local Debug build, switch the droplets to `APNS_ENVIRONMENT=sandbox`
+first.
+
+Android push uses **native FCM**, the same pattern as iOS's native APNs — no
+Expo relay, no EAS/Expo account. `registerForPushNotifications()` calls
+`Notifications.getDevicePushTokenAsync()` unconditionally on both platforms;
+on Android that returns a raw FCM registration token once
+`google-services.json` is present in the native build, and the server sends to
+it via `apps/api/src/services/fcm.ts` (mirrors `apns.ts`'s contract, #3639).
+
+`google-services.json` is Android's analogue of iOS's `.p8` APNs key and is
+**never committed** — `app.json`'s `android.googleServicesFile` points at
+`./google-services.json`, which Expo's config plugin only resolves during
+`expo prebuild --platform android` (or an Android EAS/Gradle build), so it
+needs to exist on disk at build time, not in git. Generate it with:
+
+```bash
+GOOGLE_SERVICES_JSON=<content of the file downloaded from the Firebase Console> \
+  pnpm --filter breeze-mobile write-google-services
+```
+
+Accepts either the raw JSON or base64-encoded JSON (same tolerance as the
+server's `FIREBASE_SERVICE_ACCOUNT`). Download the source file from the
+Firebase Console: Project Settings → your Android app (package
+`com.breeze.rmm`) → "Download google-services.json" — this must be the same
+Firebase project backing the droplets' `FIREBASE_SERVICE_ACCOUNT`, or every
+Android token will fail with a credential-mismatch error even though the
+sender reports itself configured. See `scripts/write-google-services.mjs` and
+`.gitignore` for the injection contract, and `google-services.json.example`
+for the file's shape. Registering the Firebase Android app itself (if one
+doesn't already exist) and confirming `FIREBASE_SERVICE_ACCOUNT` on both
+droplets is tracked separately (#4717 Wave 3) — this repo's build tooling is
+ready before that operational step lands.
+
+FCM has no sandbox/production split the way APNs does — there is no equivalent
+to the `APNS_ENVIRONMENT` gotcha above to watch for.
+
+## Google Play — build, sign, and submit
+
+Android ships from the same `app.json` and the same `1.0.0` store version as
+iOS. There is no EAS, no Expo account, and no Play-managed CI: the AAB is
+built locally with Gradle. Everything below has been exercised end-to-end on
+2026-09-15 (release APK installed on an API 36 emulator, signed in against US
+prod with the reviewer demo account, all four tabs and Settings rendered).
+
+### Upload key (Play App Signing)
+
+The app uses **Play App Signing**: Google holds the app signing key; we hold an
+**upload key** and sign every AAB with it.
+
+- Keystore: `apps/mobile/credentials/breeze-upload.jks` (gitignored via `*.jks`),
+  alias `breeze-upload`, RSA 2048, valid 10,000 days. Cert SHA-256
+  `20:B2:5B:45:97:EC:06:E7:4C:D3:A8:97:4F:98:15:C7:72:3B:63:6D:7D:EA:EA:AF:A7:09:60:48:45:32:F4:8D`.
+- Credentials live in `~/.gradle/gradle.properties` as `BREEZE_UPLOAD_STORE_FILE`,
+  `BREEZE_UPLOAD_STORE_PASSWORD`, `BREEZE_UPLOAD_KEY_ALIAS`, `BREEZE_UPLOAD_KEY_PASSWORD`.
+- **Back the `.jks` and the password up in 1Password now.** Losing the upload key
+  means a key-reset request through Play Console support before the next
+  release can be uploaded.
+- `src/config/androidUploadSigning.js` is an Expo config plugin (registered in
+  `app.json`) that re-adds the `signingConfigs.release` block to the generated
+  `android/app/build.gradle` on every `expo prebuild`. When the Gradle property
+  is absent it silently falls back to the debug keystore, so a contributor
+  without the key can still build; Play rejects a debug-signed AAB, so that
+  cannot ship by accident.
+
+### Build sequence
+
+```bash
+cd apps/mobile
+export ANDROID_HOME=~/Library/Android/sdk
+# 1. bump android.versionCode in app.json (and version if it is a new release)
+# 2. release gates: EXPO_PUBLIC_API_URL and EXPO_PUBLIC_SENTRY_DSN in .env
+# 3. google-services.json on disk (see "Push notifications" above)
+GOOGLE_SERVICES_JSON=... pnpm write-google-services
+npx expo prebuild --platform android --clean --no-install
+cd android && ./gradlew bundleRelease          # -> app/build/outputs/bundle/release/app-release.aab
+keytool -printcert -jarfile app/build/outputs/bundle/release/app-release.aab | grep Owner
+```
+
+- `SENTRY_AUTH_TOKEN` (from `.env.sentry-build-plugin`) uploads the JS source
+  map during `bundleRelease`; the Sentry Gradle step fails the build without it.
+  Set `SENTRY_DISABLE_AUTO_UPLOAD=true` only for a local smoke build.
+- The Gradle daemon needs several GB of free disk; a full disk kills it with
+  "Gradle build daemon disappeared unexpectedly", not an out-of-space error.
+- For an emulator smoke test use an **API 36 Google APIs** image. The API 37
+  preview image (`Pixel_10a` AVD) failed to resolve any launcher activity and
+  rendered black on 2026-09-15.
+- Emulators report `not_physical_device`, so push shows as unavailable and the
+  approver banner reports attestation could not complete. Both are expected off
+  hardware; verify push and the approver key on a physical phone before
+  promoting to production.
+
+### Play Console record
+
+- App name: **Breeze RMM** · default language English (United States)
+- App or game: App · Free · package `com.breeze.rmm`
+- Category: Business · tags: IT management, Productivity
+- Contact email: support address · website `https://breezermm.com/`
+- Privacy policy: `https://breezermm.com/legal/privacy-policy/`
+- Account deletion URL (Data safety → account deletion): `https://us.2breeze.app/account/delete`
+- Ads: none · Content rating: IARC questionnaire, Utility/Productivity, no
+  user-generated public content (ticket comments are private to the tenant)
+- Target audience: 18+ only, not designed for children
+- Government app: no · Financial features: none · Health: none
+- Data safety: see below
+
+### Store listing assets (`apps/mobile/store/android/`)
+
+- `hi-res-icon-512.png` — 512×512 app icon
+- `feature-graphic.png` — 1024×500
+- `screenshots/1-home.png … 5-settings.png` — 1080×2160 (2:1) phone screenshots
+  from the 2026-09-15 emulator run, signed in as the reviewer demo account.
+  Retake after any visual change. No 7-inch/10-inch tablet screenshots: the
+  app is phone-only on iOS and Play lists tablets as optional.
+- Short description (≤80): `Your fleet, in one chat. Alerts, approvals, tickets and time for MSPs.`
+- Full description: reuse the App Store description above verbatim, replacing
+  "Face ID or Touch ID" with "fingerprint or face unlock". Play allows 4000
+  characters, same limit as Apple.
+
+### Data safety form
+
+Play's form is per data type with collection/sharing/purpose; map the App
+Store declarations above like this. Everything is transmitted over TLS, none
+of it is shared with third parties other than the processors below, and all of
+it is deletable via account deletion.
+
+| Data type | Collected | Purpose | Notes |
+|---|---|---|---|
+| Personal info → Email address, Name | Yes, required | App functionality, Account management, Analytics | Sentry user context; PostHog identify only when `EXPO_PUBLIC_POSTHOG_KEY` is set |
+| App info and performance → Crash logs, Diagnostics | Yes | Analytics, App functionality | Sentry |
+| App activity → App interactions | Yes | Analytics | PostHog, only when configured in the shipped build |
+| Device or other IDs | Yes | App functionality, Fraud prevention, security | push token, approver device id, Play Integrity / attestation |
+| Photos and videos | Yes, optional | App functionality | ticket attachments, user-initiated only |
+| Audio → Voice or sound recordings | No (processed on-device, not stored) | — | expo-speech-recognition; declare "collected, not stored" if the reviewer asks |
+| Location, Contacts, Financial, Health, Messages, Files | No | — | |
+
+Security practices: data encrypted in transit; users can request deletion
+(in-app "Delete account" → per-region page). No independent security review
+claim.
+
+### Release path
+
+1. Internal testing track first: upload the AAB, add your own Google account as
+   a tester, install from the Play link on a physical phone, confirm push
+   registration and an approval round-trip (that needs the Firebase project
+   wired on the droplets — `FIREBASE_SERVICE_ACCOUNT` — see #4717).
+2. Production release with review notes: reviewer credentials
+   `appstore-review@breezermm.com` (same demo account Apple uses; MFA off),
+   server "United States", and a note that accounts are created by an
+   organization admin so there is no in-app sign-up.
+3. Play review for a new business app typically takes 1–7 days. The
+   `versionCode` used on any track is consumed forever; bump before re-uploading.
+
+## App Store Connect record
+
+Create an iOS app record with:
+
+- Name: **Breeze RMM**
+- Primary language: English (U.S.)
+- Bundle ID: `com.breeze.rmm`
+- SKU: `breeze-rmm-ios`
+- User access: Full Access
+
+The app is **iPhone-only** (`supportsTablet` is `false` in `app.json`). Do not tick iPad in the App Store Connect availability, and do not upload iPad screenshots. Capture iPhone screenshots for every required display-size family after the first release candidate is installed.
+
+## Metadata ready to enter
+
+Field limits are App Store Connect's (subtitle 30, promotional text 170, description 4000, keywords 100). Copy verified against the shipped feature set on 2026-09-09; every capability named below exists in `apps/mobile/src` at that date. Do not add a feature here without a matching screen.
+
+- Name: `Breeze RMM`
+- Subtitle (23/30): `Your fleet, in one chat` (alternate, 29/30: `Manage your IT fleet anywhere`)
+- Primary category: Business
+- Secondary category: Productivity
+- Support URL: `https://breezermm.com/`
+- Marketing URL: `https://breezermm.com/`
+- Privacy policy: `https://breezermm.com/legal/privacy-policy/`
+- Terms: `https://breezermm.com/legal/terms-of-service/`
+- Account deletion: `https://us.2breeze.app/account/delete` (or `https://eu.2breeze.app/account/delete`)
+  - **Do not use `https://breezermm.com/account/delete` — it 404s.** That was the
+    Guideline 5.1.1(v) bug fixed in #2325; the page is served per-region by the
+    API, and in-app the URL is built from the user's selected server via
+    `serverConfig.buildAccountDeletionUrl`.
+
+Promotional text (169/170; editable without a new build):
+
+> Ask Breeze about your fleet, approve privileged actions with Face ID, work tickets with photos, and log time in the field. Sign in with your Breeze organization account.
+
+Description (2472/4000):
+
+> Breeze RMM puts your fleet in your pocket. It's the mobile console for Breeze, the remote monitoring and management platform for MSPs and internal IT teams. Sign in with your Breeze organization account and work the same devices, alerts, tickets and time you manage on the web.
+>
+> ASK BREEZE
+> You land in a chat, not a dashboard. Ask what broke last night, which devices are offline, or whether a service is running, and get answers built from your live fleet data. Ask Breeze to restart a service or run a script and it prepares the action for your approval. Type it or say it.
+>
+> APPROVE SAFELY
+> When automation or the assistant needs to do something privileged, Breeze takes over the screen with an approval card: what the action is, which device it touches, how much impact it carries, and the exact tool arguments. Approve with Face ID or Touch ID, deny with a reason, or report it as suspicious. AI prepares. A person decides anything that can't be undone.
+>
+> SYSTEMS
+> See online, offline and issue counts for every organization at a glance. Drill into a customer, filter devices by status, and open a device for CPU, memory, disk, IP addresses, the logged-in user, last seen, and open alerts and tickets. Reboot, shut down, or wake a machine from wherever you are. Acknowledge alerts with a swipe.
+>
+> TICKETS
+> Work your queue from the field. Filter by open or closed, mine or all. Create a ticket with organization, priority and assignee. Reply to the requester or add an internal note. Internal is the default, so a mis-tap never emails a customer. Attach photos of hardware, screens and cabling straight from the camera, your library, or a file.
+>
+> TIME
+> Start a timer on any ticket and it follows you across the app. Stop it and the entry lands on your weekly timesheet, marked billable or not. Time entries save offline and sync when you're back on a network, so a basement job still gets billed.
+>
+> BUILT FOR THE JOB
+> • Push notifications for approvals, tickets assigned to you, and SLA breaches
+> • Face ID or Touch ID lock, with fleet data hidden from the app switcher
+> • Two-factor sign-in, a list of your signed-in phones, and one-tap revoke
+> • Works with Breeze Cloud in the United States or Europe, or your own Breeze server
+> • The assistant runs through your Breeze server. No model credentials live on the phone.
+>
+> Breeze RMM is for existing Breeze customers. Accounts are created by your organization admin, and there's nothing to buy in the app. Learn more at breezermm.com.
+
+Keywords (98/100, comma-separated, no spaces after commas):
+
+> rmm,msp,it management,remote monitoring,help desk,ticketing,psa,time tracking,it support,alerts,ai
+
+What's New (first release; App Store Connect requires the field on updates only):
+
+> First release. Chat with your fleet, approve privileged actions with Face ID, work tickets with photo attachments, and log time with a timer that follows you across the app.
+
+Things the listing must NOT claim (verified absent on 2026-09-09): iPad support, location-aware time suggestions, resolving or muting alerts from the phone (acknowledge only), acting on findings from the phone (display-only until #5365), any purchase or sign-up flow.
+
+## Privacy declaration
+
+The implementation uses Sentry, PostHog (when configured), push notifications, biometric authentication, and optional voice input. Before submitting, complete the App Store Connect privacy questionnaire with the product and privacy owners. Code comments in `App.tsx` identify the implemented analytics collection; do not declare data collection that is disabled in the production environment.
+
+Likely declarations to validate:
+
+- Contact Info — Email Address: linked to the user; app functionality and analytics.
+- Usage Data — Product Interaction: linked to the user; analytics.
+- Diagnostics — Crash Data and Performance Data: app functionality and analytics.
+- Identifiers — User ID and Device ID: linked to the user; app functionality, security, and analytics.
+
+No IDFA or cross-app tracking is implemented, so App Tracking Transparency is not expected.
+
+## Sentry — telemetry (the DSN)
+
+⚠️ **History: the `breeze-mobile` Sentry project recorded zero events in 90
+days.** Nothing was broken; every shipped build was simply archived without
+`EXPO_PUBLIC_SENTRY_DSN`, and `Sentry.init({ enabled: false })` neither throws
+nor logs. A guard existed (`scripts/preflight.mjs`) and was correct — it was
+just never *run*, because the release path is a human pressing **Product →
+Archive** in Xcode and preflight is a manual `pnpm preflight` step. Nothing in
+the repo invoked it: no `eas.json`, no mobile build workflow, no Fastlane, no
+archive script.
+
+**A release build with no DSN now fails the build.** `app.config.js` calls
+`resolveSentryDsn()` from `src/config/sentryDsn.js`, and that throws when it
+sees a release build with a missing or placeholder DSN. That location is the
+point: `expo-constants` installs an Xcode script build phase
+(`:before_compile`, `always_out_of_date`) that runs `expo config` — i.e.
+evaluates `app.config.js` — on **every** build, ⌘B and Archive alike. `expo
+prebuild` and every Metro bundle evaluate it too. There is no path to an IPA
+that skips it.
+
+What counts as a release build: Xcode `CONFIGURATION` matching `Release`, any
+EAS profile other than `development`, or `NODE_ENV=production`. Plain local dev,
+`expo start`, a Debug build, a bare `expo prebuild`, and CI (`test-mobile` runs
+vitest + `tsc` with no DSN anywhere) are all untouched.
+
+⚠️ **`expo start --no-dev` does require a DSN.** Expo sets `NODE_ENV=production`
+for it and it genuinely produces a `__DEV__ === false` bundle, which is the
+whole point of the gesture — so the guard treats it as a release. Use
+`BREEZE_MOBILE_DEV=1` for a throwaway one.
+
+Two escape hatches, both taking the **literal string `1`** and nothing else (the
+same spelling `scripts/preflight.mjs` uses; a near-miss like `=true` fails safe
+by leaving the guard on). Both print a warning to stderr when they actually
+suppress something:
+
+| Flag | Effect |
+|---|---|
+| `BREEZE_MOBILE_ALLOW_NO_SENTRY=1` | Build a release deliberately without telemetry. Succeeds, warns. |
+| `BREEZE_MOBILE_DEV=1` | **Disables the release check entirely** — a genuine Archive is treated as a dev build, so an IPA with no crash reporting can be produced. Warns whenever it suppresses a real release signal, but nothing stops that IPA being uploaded. **Never leave it in `apps/mobile/.env`**, which the Xcode build phase loads on every build. |
+
+Where the DSN comes from:
+
+| Build path | Source of truth | Notes |
+|---|---|---|
+| Local Xcode Archive (**current release path**) | `apps/mobile/.env` — gitignored, see `.env.example` | Must be in the **file**. Xcode build phases do not inherit your shell, so `export` in `.zshrc` + Archive does **not** work. |
+| EAS Build (not currently used) | the EAS environment of the same name as the profile, referenced by `eas.json` | `eas env:create --environment <profile> --name EXPO_PUBLIC_SENTRY_DSN --value <dsn> --visibility sensitive` |
+
+Every profile other than `development` is treated as a release, so
+`eas build --profile preview` needs the DSN in the **`preview`** environment —
+configuring `production` will not cover it. The failure message names the
+environment matching the profile being built.
+
+`eas.json` is committed and declares `development` / `preview` / `production`
+profiles. It deliberately does **not** carry a DSN value: `env` in `eas.json`
+outranks the EAS-stored environment variable, so a placeholder there would
+shadow the real value on every build. Non-secret public config
+(`EXPO_PUBLIC_API_URL`, `EXPO_PUBLIC_POSTHOG_HOST`) is inline; the DSN is
+referenced by environment name only. Note that EAS is not the release path
+today — `eas.json` exists so the DSN has a committed, named home if it becomes
+one.
+
+The DSN is a write-only client key and ships inside the IPA either way, so it is
+not a secret — but it is a live ingest endpoint, and per the repo's own rule
+real environment values stay out of the public tree. Get it from
+Sentry → **olivetech-ks / breeze-mobile** → Settings → Client Keys (DSN).
+Placeholder-shaped values (`REPLACE_ME`, `changeme`, `example.com`, `TODO`, …)
+are rejected, so a half-configured build fails loudly rather than posting events
+to a host that does not exist.
+
+At runtime the app reads the DSN from `EXPO_PUBLIC_SENTRY_DSN` **or**
+`expoConfig.extra.sentryDsn`, which `app.config.js` writes. The two are produced
+by different build phases (Metro transform vs. the expo-constants phase), so the
+fallback guarantees the value the guard verified is the value that ships.
+
+## Sentry — symbolication (source maps and dSYMs)
+
+A DSN alone only makes events *arrive*. Making them *readable* needs two uploads,
+both wired by the `@sentry/react-native/expo` plugin now that `app.json` passes
+`organization` and `project`:
+
+| Upload | Xcode build phase | Without it |
+|---|---|---|
+| JS source maps | "Bundle React Native code and images" (wrapped by `sentry-xcode.sh`) | every JS frame is a minified bundle offset |
+| Native dSYMs | "Upload Debug Symbols to Sentry" | native crashes have no symbols |
+
+`metro.config.js` uses `getSentryExpoConfig` (not `getDefaultConfig`), which
+adds Sentry's asset-serialization plugin so the bundle and its source map carry
+matching **Debug IDs**. Without them an uploaded map cannot be paired with the
+bundle a crash came from, so frames stay minified even though the upload
+reported success. This is the same class of failure as shipping without a DSN:
+it looks like it worked.
+
+Both need `SENTRY_AUTH_TOKEN`, which is a **genuine secret** (unlike the DSN).
+Put it in `.env.sentry-build-plugin` — gitignored, and the officially-supported
+location because **Xcode build phases do not inherit your shell environment**, so
+exporting it in `.zshrc` and pressing Archive in Xcode.app does not work. Copy
+`.env.sentry-build-plugin.example` to get started; scopes needed are
+`project:releases` and `org:read`.
+
+⚠️ **A missing or invalid token fails the Archive** — `sentry-xcode.sh` emits
+`error: sentry-cli` and returns non-zero. That is the correct default (a silent
+skip means unreadable traces nobody notices until the first crash). To
+deliberately build without symbolication, set `SENTRY_ALLOW_FAILURE=true` (try,
+warn on failure) or `SENTRY_DISABLE_AUTO_UPLOAD=true` (skip entirely).
+
+Note the asymmetry that produced the 90-day telemetry gap: the auth token
+self-enforced, because a missing one fails a build phase. The **DSN** — the
+variable that actually decides whether events exist at all — had no build-phase
+enforcement, only the optional `pnpm preflight`. The check that existed was
+built for the failure mode that was already loud. That is what the
+`app.config.js` guard above fixes.
+
+`ios/sentry.properties` and `sentry.options.json` are generated during prebuild
+and are both gitignored — do not hand-edit them, change `app.json` instead.
+
+## Password autofill — Associated Domains (server-side step outstanding)
+
+The login fields set `textContentType` (`username` / `password`), which is what
+makes iOS offer iCloud Keychain and 1Password at all — `autoComplete` alone is
+Android-only and was the reason no password manager ever appeared.
+
+Getting managers to offer **the right saved entry** instead of a generic list
+additionally needs the Associated Domains entitlement. `app.json` declares:
+
+```
+webcredentials:us.2breeze.app
+webcredentials:eu.2breeze.app
+```
+
+Each of those hosts must serve an `apple-app-site-association` file at
+`https://<host>/.well-known/apple-app-site-association` with content type
+`application/json`, HTTP 200, and no redirects:
+
+```json
+{ "webcredentials": { "apps": ["D8W6N2JYMA.com.breeze.rmm"] } }
+```
+
+**Status: DONE on both regions (2026-07-26).** Served by Caddy, not the API — it
+is a static 57-byte document, so this way it does not depend on an api image
+rebuild. The block lives in `docker/Caddyfile.prod` in this repo and was applied
+to `/opt/breeze/Caddyfile.prod` on `breeze-us` and `breeze-eu`, each backed up to
+`Caddyfile.prod.bak-pre-aasa-*` first. Note that `/opt/breeze` is not a git repo,
+so **a future Caddyfile redeploy from the repo must carry this block or the
+association silently stops working**. Use `docker compose restart caddy`, not
+`reload` — reload reports success without rebuilding `handle` ordering.
+
+Verify with:
+
+```bash
+curl -sS -D- https://us.2breeze.app/.well-known/apple-app-site-association
+```
+
+Four constraints worth recording:
+
+- The domain list is **static at build time**, because Apple binds Associated
+  Domains into the signed entitlement. **The published App Store build therefore
+  cannot cover a self-hosted server** — that is a platform constraint, not
+  something a runtime setting can fix, and self-hosters should not chase it.
+  Those users get generic autofill.
+- A self-hoster **building the app themselves** can cover their own domain.
+  `app.config.js` merges `BREEZE_ASSOCIATED_DOMAINS` into the list from
+  `app.json`:
+
+  ```bash
+  BREEZE_ASSOCIATED_DOMAINS=breeze.example.com npx expo prebuild --platform ios
+  ```
+
+  Several entries may be separated by commas or whitespace, and a pasted URL is
+  accepted (`https://breeze.example.com/login` resolves to the host). The two
+  hosted regions above are always kept, so this can only add to the list and
+  cannot break autofill for hosted users. The self-hosted server still has to
+  serve the AASA file described above, with its own team ID and bundle
+  identifier if the build is signed under a different Apple account.
+
+  Only `webcredentials:` is emitted, and an entry that is not a usable hostname
+  **fails the build** rather than being skipped — wildcards, IP addresses,
+  `localhost`, and a bare host carrying a port or `?mode=developer` are all
+  rejected by name. An internationalised domain is punycoded automatically,
+  whether written bare or as a URL. Failing loudly is deliberate: a silently
+  dropped entry would ship an entitlement missing the domain, and the only
+  symptom would be autofill quietly not working. Edit `app.json` directly for
+  anything beyond a plain password-manager association.
+- `breezermm.com` was deliberately dropped: it is the marketing site behind
+  Cloudflare, nobody signs into the app there, and claiming a domain that serves
+  no AASA file just leaves an unanswered claim.
+- Apple fetches the file through its CDN at install time, so changes are not
+  instant; a build installed before the file went live needs a reinstall.
+
+## Build, screenshots, and submission sequence
+
+1. Regenerate the native project when app configuration changes: `npx expo prebuild --platform ios`. This carries the microphone and speech-recognition usage descriptions in `app.json` into the Xcode `Info.plist`, embeds the Geist fonts, and generates the splash screen and Associated Domains entitlement.
+2. Put `EXPO_PUBLIC_SENTRY_DSN`, `EXPO_PUBLIC_API_URL`, and (when approved) `EXPO_PUBLIC_POSTHOG_KEY` / `EXPO_PUBLIC_POSTHOG_HOST` in **`apps/mobile/.env`** — the file, not your shell, because Xcode build phases do not inherit it. See `.env.example` for what each one does when left unset. Neither `EXPO_PUBLIC_SENTRY_DSN` nor `EXPO_PUBLIC_API_URL` is optional for a release build: the Archive fails without either (see "Sentry — telemetry" above and `src/config/apiUrl.js`). The API URL check also rejects `localhost`, a private-network address, and plaintext `http` to a public host. A genuinely LAN-hosted self-hosted build sets `BREEZE_MOBILE_ALLOW_PRIVATE_API_URL=1`, which accepts a private host (plaintext included) and warns on every build that it did; loopback, placeholders, and plaintext to a *public* host still fail.
+3. Run `npx pnpm@10.33.4 --filter=breeze-mobile preflight`. **This is an optional convenience, not a gate** — nothing in the repo invokes it, and Xcode will never run it for you. It is worth running anyway for the one thing it still catches that the build-time guards do not: a missing `SENTRY_AUTH_TOKEN` (not silent, but it fails ten minutes into an archive instead of instantly here). Its DSN and API-URL checks are now echoes of the `app.config.js` guards, which cannot be skipped — the API-URL one literally calls the same rule function, so the two can never disagree.
+4. Run `npx pnpm@10.33.4 --filter=breeze-mobile typecheck` and `npx pnpm@10.33.4 --filter=breeze-mobile test`.
+5. In Xcode, run the `BreezeRMM` scheme on a current iPhone simulator. Capture the reviewed production UI in the simulator, not the development error or debug overlay.
+6. Save iPhone screenshots at the App Store Connect-required 6.5-inch size (1242 × 2688 or 1284 × 2778); no iPad screenshots (iPhone-only). In Simulator, use **File → Save Screen** for each approved screen.
+7. In Xcode, select a physical device or **Any iOS Device**, use **Product → Archive**, then upload the archive to App Store Connect. Attach the processed build to version 1.0.
+8. Enter review notes and working reviewer credentials or an approved demo path, then submit the version to Apple for review.

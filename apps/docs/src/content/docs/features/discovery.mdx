@@ -1,0 +1,690 @@
+---
+title: Network Discovery
+description: Scan subnets with ARP, ICMP ping, TCP port scans, and SNMP to discover devices, classify asset types, map open services, and build network topology.
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Network Discovery lets you scan subnets across your managed sites to find devices, identify their type and manufacturer, map open services, and build a topology of how hosts connect through routers and switches. Scans are executed by the Breeze agent running on a device within the target network. The agent performs ARP resolution, ICMP ping sweeps, TCP port scans, and SNMP queries, then reports results back to the API via WebSocket. Discovered assets are stored per-organization and automatically linked to enrolled devices when a MAC or IP address match is found.
+
+Discovery profiles define what to scan and how. A profile is scoped to a single site and contains target subnets, scan methods, port ranges, SNMP communities, and a schedule. When a scan is triggered, a discovery job is created and dispatched through a background queue to an online agent at the profile's site. Results are processed asynchronously — assets are created or updated, topology edges are enriched, and the job record is updated with summary statistics.
+
+---
+
+## Key Concepts
+
+### Scan Types
+
+| Method | Description | Privilege Required |
+|--------|-------------|--------------------|
+| `arp` | Sends ARP requests on the local subnet to resolve IP-to-MAC mappings using raw packet capture (pcap) | Root / Administrator |
+| `ping` | ICMP echo request sweep to identify live hosts and measure round-trip time | Root / Administrator |
+| `port_scan` | TCP connect scan against configured port ranges to identify open services | None |
+| `snmp` | Queries SNMP system OIDs (sysDescr, sysObjectID, sysName) to identify device type and manufacturer | None |
+
+### Discovery Profiles
+
+A profile defines the complete configuration for a scan: which subnets to target, which methods to use, port ranges, SNMP credentials, and when scans should run. Profiles are scoped to an organization and site. Multiple profiles can exist per site to cover different network segments or scan strategies.
+
+### Discovered Assets
+
+Each unique IP address found during a scan is stored as a discovered asset within the organization. Assets are classified by type (workstation, server, printer, router, switch, etc.) and tracked along two independent axes: an approval status you set, and a liveness indicator the system sets.
+
+| Approval Status | Meaning |
+|--------|---------|
+| `pending` | Recently discovered, not yet reviewed |
+| `approved` | Reviewed and accepted — shows up in dashboards and reports |
+| `dismissed` | Explicitly excluded from dashboards and reports |
+
+Separately, every asset carries an **online/offline** indicator based on whether it was seen in the most recent scan — this is independent of approval status, so a `pending` or `approved` asset can be online or offline at any time. Linking an asset to an enrolled device (see [Asset-to-Device Linking](#asset-to-device-linking) below) is a separate concept from approval status: a linked asset can be `pending`, `approved`, or `dismissed` just like any other.
+
+### Asset Types
+
+| Type | Classification Criteria |
+|------|------------------------|
+| `printer` | SNMP sysDescr contains "printer", or ports 9100/631 are open |
+| `router` | SNMP indicates router, or gateway IP (.1/.254) with HTTP but no SSH/RDP |
+| `switch` | SNMP sysDescr or sysObjectID contains "switch" |
+| `firewall` | SNMP sysDescr or sysObjectID contains "firewall" |
+| `nas` | SNMP indicates NAS/Synology/QNAP, or ports 5000+5001 open |
+| `access_point` | SNMP indicates wireless or access point |
+| `server` | SSH open with database or service ports (3306, 5432, 1433, 6379, etc.) |
+| `workstation` | RDP (3389), SMB (445), SSH (22), or VNC (5900) open |
+| `camera` | MAC vendor (OUI) matches a known camera manufacturer (Hikvision, Dahua, Axis, Vivotek, Hanwha, Avigilon, Reolink) |
+| `phone` | MAC vendor (OUI) matches a known VoIP phone manufacturer (Polycom, Yealink, Grandstream) |
+| `iot` | MAC vendor (OUI) matches a known single-purpose IoT/smart-home manufacturer (Espressif, Tuya, Shelly, Sonoff, Raspberry Pi) |
+| `unknown` | Insufficient data to classify |
+
+`camera`, `phone`, and `iot` are only ever assigned by the MAC vendor (OUI) lookup -- there's no port or SNMP signature for them. This is the weakest classifier in the precedence order below, so a stronger signal (an agent scan or UniFi controller record) can still override one of these three if it disagrees.
+
+When several detection sources disagree about a device's type, the better-informed source wins: a UniFi controller record outranks an agent network scan, which outranks a MAC/OUI vendor guess — so a lower-confidence source can no longer flip a device's type back and forth between scans (e.g. a UniFi switch flapping to `access_point`). A manual **Asset Type** override always beats all three, and **Reset to auto-detected** restores the best available machine classification, not simply the last one written.
+
+### Network Topology
+
+Discovery builds an interactive map of how your network actually fits together -- a measured backbone of switches and routers with the hosts attached to them -- and lets you hand-map anything discovery can't see. Connections carry their provenance (how Breeze knows about them) so you can tell measured links from ones you drew yourself. See [Network Topology (classic view)](#network-topology-classic-view) below. Where it's enabled, agents assemble a live logical **[Site Map](#site-map)** from passive network evidence instead, with shared configuration templates and on-demand diagnostics.
+
+---
+
+## Scan Types
+
+### ARP Scan
+
+ARP scanning sends broadcast ARP requests on each matching network interface to resolve IP-to-MAC address mappings for all targets in the subnet. This is the most reliable method for discovering devices on the local L2 network segment.
+
+<Aside type="caution">
+  ARP scanning requires root (Linux/macOS) or Administrator (Windows) privileges because it uses raw packet capture via libpcap. When the agent is built without CGO or lacks permissions, ARP scan falls back to reading the OS ARP cache, which only contains entries for hosts the agent has recently communicated with.
+</Aside>
+
+The agent iterates over local network interfaces, matches them against the requested subnets, and sends ARP requests for each target IP. Replies are collected within the configured timeout window.
+
+### ICMP Ping Sweep
+
+The ping sweep sends ICMP Echo Request packets to every target IP in parallel using a configurable worker pool (default: 128 concurrent workers). Each responding host is recorded with its round-trip time.
+
+<Aside type="caution">
+  ICMP ping requires root or elevated privileges to open raw sockets. The agent performs a pre-flight check before spawning workers — if the ICMP socket cannot be opened, the entire ping sweep is skipped gracefully with a warning log.
+</Aside>
+
+When both ping and port scan are enabled, the port scanner targets only the hosts that responded to ping, reducing scan time on large subnets.
+
+### TCP Port Scan
+
+Port scanning uses TCP connect probes to check whether specific ports are open on each target. The scanner identifies well-known services by port number:
+
+| Port | Service | Port | Service |
+|------|---------|------|---------|
+| 22 | SSH | 445 | SMB |
+| 23 | Telnet | 1433 | MSSQL |
+| 25 | SMTP | 3306 | MySQL |
+| 53 | DNS | 3389 | RDP |
+| 80 | HTTP | 5432 | PostgreSQL |
+| 135 | RPC | 5672 | AMQP |
+| 139 | NetBIOS | 5985/5986 | WinRM |
+| 161 | SNMP | 6379 | Redis |
+| 443 | HTTPS | 9100 | Printer |
+
+Port scanning does not require elevated privileges and works on all platforms.
+
+**Default ports** (when no `portRanges` are specified): `22, 80, 443, 445, 3389, 161, 139, 135, 5985, 5986, 9100`
+
+### SNMP Discovery
+
+SNMP discovery queries each target on UDP port 161 (or the port set in the profile's SNMP settings) using the profile's SNMP credentials. It fetches three system OIDs:
+
+| OID | Field | Usage |
+|-----|-------|-------|
+| `1.3.6.1.2.1.1.1.0` | sysDescr | OS and device identification, manufacturer detection |
+| `1.3.6.1.2.1.1.2.0` | sysObjectID | Device model and type classification |
+| `1.3.6.1.2.1.1.5.0` | sysName | Hostname / device name |
+
+SNMPv1, SNMPv2c and SNMPv3 (noAuthNoPriv, authNoPriv and authPriv) are supported. The profile's `snmpCredentials` object carries the version and, for v3, the user name, authentication protocol (MD5, SHA, SHA224, SHA256, SHA384, SHA512) and privacy protocol (DES, AES, AES192, AES256) with their passphrases; passphrases are stored encrypted and masked on read. For v2c the community string goes in `snmpCommunities`:
+
+```json
+{
+  "snmpCommunities": [],
+  "snmpCredentials": {
+    "version": "v3",
+    "username": "ro-monitor",
+    "authProtocol": "sha",
+    "authPassphrase": "…",
+    "privacyProtocol": "aes",
+    "privacyPassphrase": "…",
+    "port": 161,
+    "timeout": 2000,
+    "retries": 1
+  }
+}
+```
+
+The agent tries the structured credential first, then each `snmpCommunities` entry (the legacy `v3:<user>` prefix for a noAuthNoPriv v3 user is still honoured). The built-in `public` community is used **only** when the profile configures no SNMP credential at all — a profile set to v3 is never probed with v2c/`public`. When a target rejects the configured v3 credentials (unknown user, wrong digest, decryption error) the agent logs a warning with the credential summary (user name and protocols, never passphrases) and the count of rejecting targets, so "no SNMP data" can be told apart from "device does not speak SNMP".
+
+SNMP data is used by the asset classifier to determine manufacturer (Cisco, HP, Dell, Juniper, MikroTik, Synology, QNAP, Ubiquiti, Fortinet) and device type.
+
+---
+
+## Discovery Profiles
+
+<Aside type="note">
+  Creating, editing, or deleting a profile; triggering or cancelling a scan; and approving, dismissing, linking, unlinking, or deleting a discovered asset all require an MFA-verified session. If your account has MFA enrolled, you may be prompted to step up before the action completes. (Network Topology edits are not affected.)
+</Aside>
+
+### Creating a Profile
+
+Profiles define the full scan configuration and are scoped to an organization and site.
+
+```bash
+POST /discovery/profiles
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "orgId": "uuid",
+  "siteId": "uuid",
+  "name": "Office LAN Scan",
+  "description": "Weekly scan of main office subnet",
+  "subnets": ["192.168.1.0/24", "192.168.2.0/24"],
+  "excludeIps": ["192.168.1.1"],
+  "methods": ["arp", "ping", "port_scan", "snmp"],
+  "portRanges": ["22,80,443,445,3389"],
+  "snmpCommunities": ["public"],
+  "schedule": {
+    "type": "cron",
+    "cron": "0 2 * * 0"
+  },
+  "deepScan": false,
+  "identifyOS": true,
+  "resolveHostnames": true,
+  "timeout": 3,
+  "concurrency": 128
+}
+```
+
+### Profile Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `orgId` | UUID | Yes* | Organization ID. Auto-resolved for org-scoped tokens |
+| `siteId` | UUID | Yes | Site the profile belongs to |
+| `name` | string | Yes | Human-readable name (max 255 chars) |
+| `description` | string | No | Optional description |
+| `subnets` | string[] | Yes | CIDR subnets or individual IPs to scan |
+| `excludeIps` | string[] | No | IPs to skip during scanning |
+| `methods` | string[] | Yes | Scan methods: `arp`, `ping`, `port_scan`, `snmp` |
+| `portRanges` | any | No | Port ranges for port scan (e.g., `["22,80,443", "1000-2000"]`) |
+| `snmpCommunities` | string[] | No | SNMPv1/v2c community strings (legacy `v3:<user>` prefix = noAuthNoPriv v3 user) |
+| `snmpCredentials` | object | No | Structured SNMP settings: `version` (`v1`/`v2c`/`v3`), `username`, `authProtocol`, `authPassphrase`, `privacyProtocol`, `privacyPassphrase`, `port`, `timeout` (ms), `retries` |
+| `schedule` | object | Yes | Schedule configuration (see below) |
+| `deepScan` | boolean | No | Allow subnets larger than /16 (65,536+ hosts). Default `false` |
+| `identifyOS` | boolean | No | Attempt OS fingerprinting from SNMP and port data. Default `false` |
+| `resolveHostnames` | boolean | No | Perform reverse DNS lookups. Default `false` |
+| `timeout` | integer | No | Per-probe timeout in seconds. Default `2` |
+| `concurrency` | integer | No | Number of concurrent workers. Default `128` |
+
+### Schedule Types
+
+| Type | Required Fields | Description |
+|------|-----------------|-------------|
+| `manual` | None | Only runs when triggered via `POST /discovery/scan` |
+| `cron` | `cron` | Standard cron expression for recurring scans. Accepts an optional `timezone` (IANA identifier, e.g. `America/New_York`; defaults to `UTC`) so the expression evaluates in that zone rather than UTC |
+| `interval` | `intervalMinutes` | Run every N minutes |
+
+In the profile form, the **Schedule** cadence dropdown offers **Manual**, **Hourly**, **Custom interval**, **Daily**, **Weekly**, and **Monthly**. Daily, Weekly, and Monthly (which compile to a `cron` schedule) show a **Timezone** field alongside the time picker; Hourly and Custom interval don't need one since they aren't clock-aligned. A new profile's **Custom interval** cadence defaults to running every 60 minutes until you change it.
+
+<Aside>
+  Subnets larger than a /16 (65,536 hosts) are skipped unless `deepScan` is set to `true`. This prevents accidental full-class-B scans that could take a long time and generate significant network traffic.
+</Aside>
+
+### Updating a Profile
+
+```bash
+PATCH /discovery/profiles/:id
+Content-Type: application/json
+
+{
+  "subnets": ["10.0.0.0/24"],
+  "enabled": false
+}
+```
+
+Only the fields you include are updated. Omitted fields retain their current values.
+
+### Deleting a Profile
+
+```bash
+DELETE /discovery/profiles/:id
+```
+
+Deleting a profile also removes all associated discovery jobs in a single transaction.
+
+---
+
+## Running Scans
+
+### Triggering a Scan
+
+To run a scan immediately, POST to the scan endpoint with the profile ID and an optional agent ID:
+
+```bash
+POST /discovery/scan
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "profileId": "uuid",
+  "agentId": "optional-agent-id"
+}
+```
+
+If `agentId` is omitted, the system automatically selects an online agent from the profile's site. The scan is dispatched through a background queue to the discovery worker, which sends a `network_discovery` command to the agent via WebSocket.
+
+<Aside type="tip">
+  The response returns a discovery job object with status `scheduled`. The scan transitions to `running` once the agent receives the command, and to `completed` when results have been processed.
+</Aside>
+
+### Scan Execution Flow
+
+<Steps>
+1. **API creates a discovery job** with status `scheduled` and enqueues a dispatch-scan task in the background queue.
+
+2. **Discovery worker picks up the task**, loads the profile, finds an online agent at the site, and sends a `network_discovery` command via WebSocket.
+
+3. **Agent receives the command** and runs the configured scan methods (ARP, ping, port scan, SNMP) against the target subnets.
+
+4. **Agent returns results** via WebSocket as a `command_result` message containing the list of discovered hosts.
+
+5. **API enqueues a process-results task** in the background queue. The worker creates or updates discovered assets, auto-links matches to enrolled devices by MAC/IP, enriches the network topology, and marks the job as `completed`.
+</Steps>
+
+### Monitoring Job Status
+
+**List all jobs:**
+
+```
+GET /discovery/jobs?orgId=uuid
+```
+
+**Get job detail with discovered assets:**
+
+```
+GET /discovery/jobs/:id
+```
+
+The detail endpoint returns the job record plus all discovered assets associated with the job.
+
+### Cancelling a Job
+
+Jobs with status `scheduled` or `running` can be cancelled:
+
+```bash
+POST /discovery/jobs/:id/cancel
+```
+
+The job status is set to `cancelled` and the system attempts to remove it from the background queue. If the scan is already in progress on the agent, cancellation takes effect when results arrive — cancelled jobs skip result processing.
+
+### Job Statuses
+
+| Status | Meaning |
+|--------|---------|
+| `scheduled` | Job created, waiting to be dispatched to an agent |
+| `running` | Command sent to agent, scan in progress |
+| `completed` | Results processed, assets upserted |
+| `failed` | No online agent available, profile not found, or dispatch error |
+| `cancelled` | Cancelled by an administrator before completion |
+
+---
+
+## Discovered Assets
+
+### Viewing Assets
+
+List all discovered assets with optional filters:
+
+```
+GET /discovery/assets?orgId=uuid&approvalStatus=pending&assetType=router
+```
+
+**Filter parameters:**
+
+| Parameter | Values |
+|-----------|--------|
+| `orgId` | UUID of the organization |
+| `approvalStatus` | `pending`, `approved`, `dismissed` |
+| `assetType` | `workstation`, `server`, `printer`, `router`, `switch`, `firewall`, `access_point`, `phone`, `iot`, `camera`, `nas`, `unknown` |
+
+**Quick Filters:** The discovered assets tab includes chip-style quick filter buttons at the top of the list. Filter by scan profile or subnet to quickly narrow down results. When filters are active, bulk actions (approve, dismiss) apply only to the currently filtered view -- unfiltered assets are not affected.
+
+Each asset in the response includes monitoring status flags:
+
+| Field | Description |
+|-------|-------------|
+| `snmpMonitoringEnabled` | Whether an active SNMP monitor is attached to this asset |
+| `networkMonitoringEnabled` | Whether an active network monitor (ping, TCP, HTTP, DNS) is attached |
+| `monitoringEnabled` | `true` if either SNMP or network monitoring is active |
+| `linkedDeviceName` | Display name or hostname of the linked enrolled device, if any |
+
+### Adding a Network Asset Manually
+
+Not every network asset can be discovered by a scan — a hosted website, a SaaS endpoint, or a device on a segment the agent can't reach still needs to show up alongside everything else in the unified **Devices** list. Use the **Add network asset** option from the Devices page's add-asset menu to hand-enter one.
+
+A manually-added asset is a real discovered-asset row (`source: manual`) — it gets the same list presentation, monitors, alerts, and topology treatment as a scan-discovered one, it's just born without a first sighting (`status: unknown` until something actually reaches it).
+
+**Identity.** Every asset needs at least one of: IP address, hostname, or URL. A `website` or `service` asset specifically requires a **URL** — those types have no stable IP (a hosted site's A record can change), so the URL is the identity, not a derived attribute.
+
+**Manual vs. hand-added assets.** This is for assets with a *network identity* (IP, hostname, or URL) — printers, routers, websites, SaaS endpoints, anything reachable on the network or the internet. Equipment with no network identity (a UPS, a physical lock, a piece of furniture you just want tracked in inventory) is tracked separately as inventory, not a network asset. The two never overlap: if it has an IP, hostname, or URL, it's a network asset.
+
+**A later scan updates it in place.** If a scan or the UniFi controller later finds the same IP, the existing row is updated — not duplicated — rather than creating a second, conflicting asset. A network scan never overwrites the hostname, manufacturer, or model you typed in on a manually-added row; MAC address and liveness fields (last-seen time, online status) always update from what the scan finds. A UniFi-adopted device that matches by MAC or IP is enriched the normal UniFi way and can update those same fields, since UniFi sync doesn't distinguish a manually-added row. A `website`/`service` asset, having no IP, is never touched by either path.
+
+**Monitoring hand-off.** After creating a `website` or `service` asset, the form offers to add an HTTP check right away, pre-targeted at the URL you entered — see [Network Monitors](#network-monitors) below for what HTTP checks report. You can always add monitoring later from the asset's detail page instead.
+
+### Network Device Detail Page
+
+Clicking a network-discovered device in the unified **Devices** list opens a dedicated detail page (`/devices/network/:id`) instead of a popup. The page has breadcrumbs back to **Devices** and a working back button, so you can navigate in and out without losing your place.
+
+The page has two tabs — **Overview** (identity, IP/MAC, manufacturer/model, SNMP data, ping, open ports) and **Monitoring** (poll configuration, OIDs, and history). The selected tab is reflected in the URL hash (e.g. `#monitoring`), so you can bookmark or share a link directly to a specific tab.
+
+From the **Overview** tab you can override the auto-detected device type using the **Asset Type** dropdown. If a device's type was set manually, a **Reset to auto-detected** link appears so you can revert to the type the scan originally detected.
+
+**Reachability header.** The header always shows a reachability badge, never a bare "Online" — it names both the state and where that state came from: **Responding**, **Not responding**, or **Unverified**, followed by the source (**Network check**, **Probe**, **Scan**, **UniFi**, or **SNMP**) and how long ago, e.g. "Responding · Network check 2m ago." If nothing has ever reported on the device, it shows **"Nothing has reported on this device."** A **Check now** button triggers an on-demand probe.
+
+**Health and Reachability cards.** The **Reachability** card breaks the headline status down by source, with its own detail line per check type. A stat strip below it shows **Reachability**, **Last poll**, and a device-type-specific slot (for example **Lowest supply** for a printer, or **Ports up** for a switch). A **Device health** or **Printer health** card (depending on the detected device type) surfaces the metrics most relevant to that device type, with a **View all N OIDs** link into the full collection and a **Choose a template** prompt if no SNMP template is assigned yet.
+
+**Monitoring tab.** The Monitoring tab shows a poll configuration summary, an OID table, and metric history charts. Each row in the OID table reports its own state: **Collecting**, **Unsupported**, **Stale**, or **Never polled**. A failed poll always says why — for example, an OID the device doesn't support reports the exact code it returned; a table value that needs a newer agent says so explicitly ("update the agent on the bridging device"); a walk that hit its row limit is marked **Partial**. The poll configuration summary itself reports overall collection status as **Polling**, **Failing**, **No template**, **No agent in site**, **Asset moved**, **Never polled**, or **Paused**.
+
+**Template suggestion.** When Breeze recognizes a device's identity (from its SNMP `sysObjectID`), the Overview and Monitoring tabs show a suggested SNMP template with the reason it was suggested (e.g. "Suggested: Xerox Printer — matched by device identity"). Click **Use suggestion** to apply it. If no template is assigned at all, a warning explains that nothing is being polled until one is set.
+
+All asset-level settings — identity, monitoring configuration, and the manual link to an enrolled Breeze device — are consolidated in a single **Settings** modal, opened from the button in the page header.
+
+<Aside type="note">
+  SNMPv1 devices are polled using SNMP version 1 rather than being treated as v2c.
+</Aside>
+
+From the Settings modal's **Link** section you can see the asset's link state and **Unlink** it from its enrolled Breeze device. Unlinking is **durable** regardless of how the link was made: future scans will not silently re-link the asset — auto-linking is suppressed for it until you deliberately re-link. The network device detail page is also where you link (or re-link) an asset to an enrolled device manually.
+
+### Asset-to-Device Linking
+
+Linking records which enrolled Breeze device corresponds to a discovered asset — it also sets the asset's approval status to `approved` as a side effect, and is used for **identity and asset tracking only**. Linking alone does not open remote access; see [Connecting to a discovered device's web UI](#connecting-to-a-discovered-devices-web-ui) below for proxy access.
+
+Linking is **automatic and hidden**: during scan result processing, the worker matches assets to enrolled devices by MAC address or IP address within the same organization, with no action needed from you. The only manual acts are **overriding** a link (pointing the asset at a different enrolled device from its network device detail page) and **unlinking**. A manual unlink is permanent until you re-link — the next scan will not undo it.
+
+The API equivalent:
+
+```bash
+POST /discovery/assets/:id/link
+Content-Type: application/json
+
+{
+  "deviceId": "uuid"
+}
+```
+
+The discovery asset list also supports filtering by linked device (`linkedDeviceId`).
+
+### Connecting to a discovered device's web UI
+
+Opening a LAN device's built-in web interface (router admin page, NAS panel, printer UI, switch management port, etc.) is done from the network device detail page: find the open web port and click **Open Web UI**. The proxied request rides an online agent on the same network — no VPN, firewall rules, or port forwarding required. See [Network Proxy](/features/remote-access/#network-proxy) in the Remote Access docs for the full workflow, allowlist configuration, session lifetime, and security model.
+
+### Approving and Dismissing Assets
+
+Every discovered asset starts out `pending`. Approving it marks it reviewed and keeps it visible in dashboards and reports; dismissing it excludes it from dashboards and reports without deleting the underlying record.
+
+```bash
+PATCH /discovery/assets/:id/approve
+```
+
+```bash
+PATCH /discovery/assets/:id/dismiss
+```
+
+Both record who made the change and when. Selecting multiple rows in the discovered assets list enables bulk **Approve** and **Dismiss** buttons, backed by:
+
+```bash
+POST /discovery/assets/bulk-approve
+Content-Type: application/json
+
+{
+  "assetIds": ["uuid", "uuid"]
+}
+```
+
+```bash
+POST /discovery/assets/bulk-dismiss
+Content-Type: application/json
+
+{
+  "assetIds": ["uuid", "uuid"]
+}
+```
+
+Each bulk request accepts up to 200 asset IDs.
+
+### Deleting an Asset
+
+```bash
+DELETE /discovery/assets/:id
+```
+
+Deleting an asset also removes all associated SNMP devices (and their metrics and alert thresholds) and network monitors in a single transaction.
+
+---
+
+## Network Change Alerts
+
+A discovery profile can alert you when a scan finds a network change since the last scan: a device shows up for the first time, a previously-seen device stops responding, or a known device's MAC address changes.
+
+### Enabling alerts on a profile
+
+Network alerting is off by default. In the profile's create/edit form, open the **Network Alerting** section and turn on **Enable network alerting**, then choose which changes should raise an alert:
+
+| Setting | Fires when |
+|---|---|
+| New devices | A device this profile hasn't seen before shows up in a scan |
+| Disappeared devices | A device this profile previously saw no longer responds |
+| Changed devices | A known device's MAC address changes |
+
+**Retain change log (days)** sets how long detected-change records are kept before they're pruned (1-365, default 90).
+
+<Aside type="note">
+  A newly-discovered device that matches a known guest entry is auto-approved and never triggers a "new device" alert, and a dismissed asset never alerts on any setting.
+</Aside>
+
+### Viewing detected changes
+
+Open **Network Discovery** in the sidebar and switch to the **Changes** tab to see detected changes across your organization. Each row shows the event type, the device's identity (IP/hostname/MAC), and when it was detected. Filter by site, discovery profile, event type, or acknowledgment status.
+
+Click a row to see its detail, where you can link the change to an enrolled device. Use **Acknowledge** -- on a single row, or in bulk after selecting several with the row checkboxes -- to mark changes as reviewed; acknowledged changes stay in the list but drop out of the default unacknowledged view.
+
+---
+
+## Network Topology (classic view)
+
+The **Topology** tab on the Discovery page renders your network as an interactive map: subnets group their hosts, and lines show how infrastructure and endpoints connect. Every connection is labeled with how Breeze learned it, so you can trust what you're looking at.
+
+<Aside type="note">
+  Breeze is rolling out a next-generation **Site Map** (per-site logical maps, shared configuration templates, and on-demand diagnostics) on this same **Topology** tab. Where it's enabled for your organization it replaces the view below automatically; otherwise this classic scan-and-SNMP map is what you'll see. See [Site Map](#site-map) below.
+</Aside>
+
+### How connections are measured
+
+Instead of guessing relationships from IP subnets, Breeze measures the backbone from the network devices themselves during SNMP-enabled scans:
+
+| Connection | How it's measured | Confidence |
+|---|---|---|
+| **Infrastructure links** (switch-to-switch, switch-to-router) | LLDP / CDP neighbor advertisements read from network devices. | High |
+| **Host attachment** (which switch port a host hangs off) | The switch's MAC forwarding (bridge) table. | Medium |
+| **Manual links** | Connections you draw yourself. | Asserted |
+
+Uplink ports carrying many MAC addresses are filtered out of host-attachment so a trunk port doesn't appear to host hundreds of devices.
+
+### Exploring and editing the map
+
+<Steps>
+
+1. **Explore.** Pan and zoom the map, click a node to inspect its type, status, addresses, and the provenance of its connections, and use the full-screen view for large networks.
+
+2. **Switch on Edit.** With the `topology:write` permission you get an **Edit** toggle. In edit mode, dragging a node saves its position so your layout persists across reloads.
+
+3. **Add what discovery can't see.** Drop a manual placeholder node for unmanaged gear -- a patch panel, an unmanaged switch, a wiring closet -- choosing a role (switch, router, access point, firewall, patch panel, or other).
+
+4. **Connect nodes.** Tap one node, then another, to draw a manual link between them. Manual links and nodes are never altered by future scans; remove them with the delete control when they no longer apply.
+
+5. **Tidy up.** Use auto-arrange to lay out unplaced nodes (pinned nodes stay put) and fit-to-content to reset the view.
+
+</Steps>
+
+<Aside type="note">
+  A useful topology depends on the agent being able to reach your network gear over SNMP. Configure an SNMP community (v2c) or SNMPv3 credentials on the discovery profile and enable SNMP scanning, and make sure the scanning agent shares a routable path with the switches and routers you want mapped. Manual mapping works with no prerequisites.
+</Aside>
+
+---
+
+## Site Map
+
+Where it's enabled, the **Topology** tab shows a per-site **Site Map** instead of the classic view above: a logical map of a site built automatically from what your agents passively observe on the network -- interfaces, routes, and neighbor tables -- refreshed on an interval without you having to run a scan. It adds shared configuration templates you can apply across many sites at once, automatic layout, and on-demand diagnostics you can launch straight from the map.
+
+<Aside type="caution">
+  Site Map needs agents running **v0.115.0 or later** to collect the passive network evidence it's built from. Sites with older agents keep showing the classic Topology view (or an emptier map) until their agents are updated.
+</Aside>
+
+### Turning it on
+
+Network Topology (Beta) is off for every partner by default. A partner admin enables it from **Settings → Partner → Modules**: the main toggle turns on topology materialization and the UI together, and four sub-toggles underneath control physical topology, interface health, diagnostics, and AI insights independently. Until it's turned on, a device's Topology tab shows an empty state explaining that Network Topology is off -- with a link straight to Modules settings for a partner admin, or "Ask your MSP to enable it" for an organization user.
+
+<Aside type="note">
+  Network Topology shipped in v0.115.0 but had no way to enable it until this Modules toggle landed in v0.116.0 -- every device's Topology tab showed a raw `materialization_disabled` code in the meantime. If you're on v0.115.0, there is no supported way to turn it on; upgrade to v0.116.0 or later.
+</Aside>
+
+### Exploring a site's map
+
+Pick a site from the site selector at the top of the tab (it's skipped if you only manage one site). The map opens on the **Overview** view; switch to **Logical** for the addressing-and-routing picture, or **Physical** where interface-level detail has been observed. A **List** toggle swaps the diagram for a searchable table of the same nodes -- useful on a large site or for keyboard-only navigation.
+
+Click any node or connection to open its **Inspector**, which shows what it is, its health, how confidently Breeze knows about it (measured evidence vs. an inferred placeholder), and how recently it was last observed. A node that resolves to an enrolled device or discovered asset links straight to its inventory page. Large or partially-scoped sites show a frontier control you can expand to pull in more of the map on demand.
+
+### Automatic layout
+
+The map lays itself out automatically -- **Arrange** nudges new nodes into place, and **Reflow** rebuilds the whole layout from scratch. If you have edit access, drag a node to reposition it, use **Pin** to hold a node in place through future auto-layouts, and **Save layout** to persist your arrangement; **Fit** resets the view to frame everything. If someone else saves a layout change while you're mid-edit, you're prompted to reload rather than silently overwriting their work.
+
+### On-demand diagnostics
+
+Select a node or connection and click **Diagnose** to run an on-demand, ping/traceroute-style check without leaving the map. Choose what to test against -- the device's reported gateway, its configured DNS server, general internet reachability, or a target you've configured explicitly -- pick an agent to run it from, and start the check. Results stream back step by step (each hop's method, outcome, and round-trip detail), and you can cancel a run that's still in progress. Diagnostics require the `topology:diagnostics` capability to be enabled for your organization and an eligible agent at the site.
+
+### Shared configuration templates
+
+Instead of configuring passive collection and diagnostic targets one site at a time, build a **configuration template** once -- at the partner level (applies across all your managed organizations) or the organization level -- and pin sites to a version of it. From the map's **Configuration** panel you can:
+
+- See which template version (partner and/or organization) a site is currently pinned to, and where each effective setting is coming from.
+- **Preview changes** before committing: the preview shows exactly what will change on every selected site, flags any site with a conflicting revision, and expires a few minutes after it's generated so you're never applying a stale preview.
+- **Apply** the previewed change across up to 500 sites at once, then watch each site's apply status resolve individually.
+- Add per-site overrides on top of the pinned template -- for example, an explicit HTTPS or DNS diagnostic target -- without forking the whole template.
+
+<Aside type="note">
+  Recurring (scheduled) template application isn't available yet -- **Apply** runs once, immediately, against the sites you select.
+</Aside>
+
+---
+
+Discovered assets can be attached to network monitors for ongoing health checking. Monitors are managed from **Fleet Management → Network Monitor** (`/monitoring`) and support four check types:
+
+| Monitor Type | Description |
+|--------------|-------------|
+| `icmp_ping` | Periodic ICMP ping to check availability and measure latency |
+| `tcp_port` | TCP connect check against a specific port |
+| `http_check` | HTTP/HTTPS request with status code and response time validation |
+| `dns_check` | DNS resolution check for a target hostname |
+
+Each monitor tracks its current status (`online`, `offline`, `degraded`, `unknown`), last response time, consecutive failure count, and stores a history of check results. Alert rules can be configured per monitor to trigger notifications on failure thresholds.
+
+The asset list endpoint (`GET /discovery/assets`) includes `snmpMonitoringEnabled` and `networkMonitoringEnabled` flags so you can see at a glance which assets have active monitoring.
+
+---
+
+## API Reference
+
+### Discovery Profiles
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/discovery/profiles` | List profiles (`?orgId=`) |
+| POST | `/discovery/profiles` | Create a new profile |
+| GET | `/discovery/profiles/:id` | Get profile by ID |
+| PATCH | `/discovery/profiles/:id` | Update profile fields |
+| DELETE | `/discovery/profiles/:id` | Delete profile and associated jobs |
+
+### Scan Jobs
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/discovery/scan` | Trigger a scan (`profileId`, optional `agentId`) |
+| GET | `/discovery/jobs` | List all jobs (`?orgId=`) |
+| GET | `/discovery/jobs/:id` | Get job detail with discovered assets |
+| POST | `/discovery/jobs/:id/cancel` | Cancel a scheduled or running job |
+
+### Discovered Assets
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/discovery/assets` | List assets (`?orgId=&approvalStatus=&assetType=`) |
+| GET | `/discovery/assets/:id` | Get single asset detail (identity, monitoring status, discovery metadata) |
+| POST | `/discovery/assets/:id/link` | Link asset to enrolled device |
+| PATCH | `/discovery/assets/:id/approve` | Approve asset |
+| PATCH | `/discovery/assets/:id/dismiss` | Dismiss asset |
+| POST | `/discovery/assets/bulk-approve` | Approve up to 200 assets at once (`assetIds`) |
+| POST | `/discovery/assets/bulk-dismiss` | Dismiss up to 200 assets at once (`assetIds`) |
+| DELETE | `/discovery/assets/:id` | Delete asset and associated monitors |
+
+### Network Topology (classic view)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/discovery/topology` | Get topology graph (`?orgId=`) |
+| PATCH | `/discovery/topology/layout` | Save node positions (requires `topology:write`) |
+| POST | `/discovery/topology/manual-node` | Add a manual placeholder node (requires `topology:write`) |
+| DELETE | `/discovery/topology/manual-node/:id` | Remove a manual node (requires `topology:write`) |
+| POST | `/discovery/topology/manual-edge` | Draw a manual connection (requires `topology:write`) |
+| DELETE | `/discovery/topology/manual-edge/:id` | Remove a manual connection (requires `topology:write`) |
+
+<Aside>
+  All discovery endpoints require authentication and one of these scopes: `organization`, `partner`, or `system`. Organization-scoped tokens are automatically restricted to their own organization's data.
+</Aside>
+
+### Site Map
+
+All Site Map endpoints are scoped to a site: `/topology/sites/:siteId/...`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/topology/sites/:siteId/graph` | Get the site's logical/physical/overview graph |
+| GET | `/topology/sites/:siteId/nodes` | Search/list graph nodes |
+| GET | `/topology/sites/:siteId/nodes/:nodeId` | Get a single node |
+| GET | `/topology/sites/:siteId/relationships/:relationshipId` | Get a connection |
+| GET | `/topology/sites/:siteId/relationships/:relationshipId/evidence` | Get the evidence behind a connection |
+| GET | `/topology/sites/:siteId/health` | Get health for a set of nodes/relationships |
+| PATCH | `/topology/sites/:siteId/layouts/:view` | Save node positions for a view (requires site write access) |
+| POST | `/topology/sites/:siteId/manual-nodes` | Add a manual placeholder node |
+| PATCH | `/topology/sites/:siteId/manual-nodes/:nodeId` | Update a manual node |
+| DELETE | `/topology/sites/:siteId/manual-nodes/:nodeId` | Remove a manual node |
+| POST | `/topology/sites/:siteId/manual-relationships` | Draw a manual connection |
+| DELETE | `/topology/sites/:siteId/manual-relationships/:relationshipId` | Remove a manual connection |
+| GET | `/topology/sites/:siteId/settings` | Read the site's resolved configuration |
+| PATCH | `/topology/sites/:siteId/settings` | Override the site's configuration |
+| GET | `/topology/sites/:siteId/targets` | List explicit diagnostic targets |
+| POST | `/topology/sites/:siteId/targets` | Add a diagnostic target |
+| PATCH | `/topology/sites/:siteId/targets/:id` | Update a diagnostic target |
+| DELETE | `/topology/sites/:siteId/targets/:id` | Remove a diagnostic target |
+| GET | `/topology/sites/:siteId/policies` | List monitoring policies |
+| POST | `/topology/sites/:siteId/policies` | Add a monitoring policy |
+| PATCH | `/topology/sites/:siteId/policies/:id` | Update a monitoring policy |
+| DELETE | `/topology/sites/:siteId/policies/:id` | Remove a monitoring policy |
+| GET | `/topology/sites/:siteId/collectors` | List agents/contexts eligible to run a diagnostic |
+| POST | `/topology/sites/:siteId/diagnostic-runs` | Start an on-demand diagnostic run |
+| GET | `/topology/sites/:siteId/diagnostic-runs/:runId` | Get diagnostic run status and step results |
+| POST | `/topology/sites/:siteId/diagnostic-runs/:runId/cancel` | Cancel a diagnostic run |
+| GET | `/topology/sites/:siteId/template-options` | List template versions eligible to pin to this site |
+| GET | `/topology/templates` | List configuration templates (`ownerScope=partner\|organization`) |
+| POST | `/topology/templates` | Create a template |
+| PATCH | `/topology/templates/:templateId` | Update a template |
+| GET | `/topology/templates/:templateId/versions` | List a template's versions |
+| POST | `/topology/templates/:templateId/versions` | Create a new draft version |
+| POST | `/topology/templates/:templateId/versions/:versionId/publish` | Publish a draft version |
+| POST | `/topology/template-applications/preview` | Preview applying template version(s) across up to 500 sites |
+| POST | `/topology/template-applications` | Apply a previewed template change (requires `Idempotency-Key`) |
+| GET | `/topology/template-applications/:operationId` | Get apply status per site |
+
+<Aside>
+  Site Map endpoints require the requesting token's `organization` or `partner` scope to have access to the site, and mutating endpoints require site write/configure access. Diagnostic and configuration-write endpoints additionally require the corresponding Site Map capability to be enabled for the organization.
+</Aside>
+
+---
+
+## Troubleshooting
+
+**ARP and ping scans return no results.**
+ARP scanning requires root/Administrator privileges and the libpcap library. ICMP ping also requires raw socket access. If the agent runs as a non-privileged user, both methods are skipped. Check agent logs for messages like "ARP scan unavailable (built without CGO/pcap)" or "ICMP ping unavailable (requires root/elevated privileges)". Port scanning works without elevated privileges and can be used as an alternative.
+
+**Scan job stays in `scheduled` status.**
+The discovery worker requires Redis and the background queue to dispatch scan commands. Verify Redis is running and accessible. If Redis is unavailable, the job is immediately marked as `failed` with the message "Background job service unavailable." Also confirm at least one agent at the profile's site is online — the worker selects an online agent from the same site to execute the scan.
+
+**Large subnets are skipped.**
+Subnets larger than /16 (65,536+ hosts) are skipped by default to prevent excessive scan times and network traffic. Set `deepScan: true` on the profile to allow scanning of large subnets. Monitor the agent's resource usage when scanning large address ranges.
+
+**Discovered assets are not auto-linking to enrolled devices.**
+Auto-linking matches assets to enrolled devices by MAC address or IP address within the same organization using the `device_network` table. If the enrolled device has a different IP than what discovery sees (e.g., the device is behind NAT or uses a VPN), auto-linking will not find a match. Use `POST /discovery/assets/:id/link` (or the network device detail page) to manually link the asset to the correct device. Also note that if an asset was manually unlinked, auto-linking is suppressed for it by design until you re-link it.

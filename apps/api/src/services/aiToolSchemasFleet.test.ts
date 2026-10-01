@@ -1,0 +1,430 @@
+import { describe, expect, it } from 'vitest';
+import { fleetToolInputSchemas } from './aiToolSchemasFleet';
+
+const TEST_UUID = '00000000-0000-0000-0000-000000000001';
+const TEST_UUID2 = '00000000-0000-0000-0000-000000000002';
+
+function parse(tool: string, input: unknown) {
+  return fleetToolInputSchemas[tool]!.safeParse(input);
+}
+
+// ─── manage_deployments ─────────────────────────────────────────────────
+
+describe('manage_deployments schema', () => {
+  it('accepts valid list', () => {
+    expect(parse('manage_deployments', { action: 'list' }).success).toBe(true);
+  });
+
+  it('requires deploymentId for get/start/pause/resume/cancel', () => {
+    for (const action of ['get', 'device_status', 'start', 'pause', 'resume', 'cancel']) {
+      expect(parse('manage_deployments', { action }).success).toBe(false);
+    }
+  });
+
+  it('accepts pause with deploymentId', () => {
+    expect(parse('manage_deployments', { action: 'pause', deploymentId: TEST_UUID }).success).toBe(true);
+  });
+
+  it('requires all fields for create', () => {
+    expect(parse('manage_deployments', { action: 'create', name: 'Deploy' }).success).toBe(false);
+  });
+
+  it('accepts valid create', () => {
+    expect(parse('manage_deployments', {
+      action: 'create',
+      name: 'Feb Update',
+      type: 'software',
+      payload: { url: 'https://example.com/pkg' },
+      targetType: 'group',
+      targetConfig: { groupId: TEST_UUID },
+      rolloutConfig: { batchSize: 10 },
+    }).success).toBe(true);
+  });
+});
+
+// ─── manage_patches ─────────────────────────────────────────────────────
+
+describe('manage_patches schema', () => {
+  it('accepts valid list', () => {
+    expect(parse('manage_patches', { action: 'list' }).success).toBe(true);
+  });
+
+  it('accepts list with filters', () => {
+    expect(parse('manage_patches', { action: 'list', source: 'microsoft', severity: 'critical' }).success).toBe(true);
+  });
+
+  it('requires patchId for approve/decline/defer/rollback', () => {
+    for (const action of ['approve', 'decline', 'defer', 'rollback']) {
+      expect(parse('manage_patches', { action }).success).toBe(false);
+    }
+  });
+
+  it('accepts approve with patchId', () => {
+    expect(parse('manage_patches', { action: 'approve', patchId: TEST_UUID }).success).toBe(true);
+  });
+
+  it('requires patchIds for bulk_approve', () => {
+    expect(parse('manage_patches', { action: 'bulk_approve' }).success).toBe(false);
+  });
+
+  it('accepts bulk_approve with patchIds', () => {
+    expect(parse('manage_patches', { action: 'bulk_approve', patchIds: [TEST_UUID, TEST_UUID2] }).success).toBe(true);
+  });
+
+  it('requires patchIds and deviceIds for install', () => {
+    expect(parse('manage_patches', { action: 'install', patchIds: [TEST_UUID] }).success).toBe(false);
+    expect(parse('manage_patches', { action: 'install', deviceIds: [TEST_UUID] }).success).toBe(false);
+  });
+
+  it('accepts valid install', () => {
+    expect(parse('manage_patches', {
+      action: 'install',
+      patchIds: [TEST_UUID],
+      deviceIds: [TEST_UUID2],
+    }).success).toBe(true);
+  });
+
+  it('requires deviceIds for scan', () => {
+    expect(parse('manage_patches', { action: 'scan' }).success).toBe(false);
+  });
+
+  it('accepts scan with deviceIds', () => {
+    expect(parse('manage_patches', { action: 'scan', deviceIds: [TEST_UUID] }).success).toBe(true);
+  });
+
+  it('requires deviceIds for rollback', () => {
+    expect(parse('manage_patches', { action: 'rollback', patchId: TEST_UUID }).success).toBe(false);
+  });
+
+  it('accepts rollback with patchId and deviceIds', () => {
+    expect(parse('manage_patches', {
+      action: 'rollback',
+      patchId: TEST_UUID,
+      deviceIds: [TEST_UUID2],
+    }).success).toBe(true);
+  });
+
+  it('validates deferUntil as ISO datetime', () => {
+    expect(parse('manage_patches', { action: 'defer', patchId: TEST_UUID, deferUntil: 'not-a-date' }).success).toBe(false);
+    expect(parse('manage_patches', { action: 'defer', patchId: TEST_UUID, deferUntil: '2026-03-01T00:00:00Z' }).success).toBe(true);
+  });
+
+  // #5585: an AI decline by name (no known UUID) must be expressible.
+  it('accepts patchName in place of patchId for approve/decline/defer', () => {
+    expect(parse('manage_patches', { action: 'decline', patchName: 'KB5001234' }).success).toBe(true);
+    expect(parse('manage_patches', { action: 'approve', patchName: 'KB5001234' }).success).toBe(true);
+    expect(parse('manage_patches', {
+      action: 'defer', patchName: 'KB5001234', deferUntil: '2026-03-01T00:00:00Z',
+    }).success).toBe(true);
+  });
+
+  it('still requires patchId (never patchName) for rollback', () => {
+    expect(parse('manage_patches', {
+      action: 'rollback', patchName: 'KB5001234', deviceIds: [TEST_UUID],
+    }).success).toBe(false);
+  });
+
+  it('accepts ringId to scope approve/decline/defer to one update ring', () => {
+    expect(parse('manage_patches', { action: 'decline', patchId: TEST_UUID, ringId: TEST_UUID2 }).success).toBe(true);
+  });
+
+  it('accepts allRings on decline to clear every ring approval', () => {
+    expect(parse('manage_patches', { action: 'decline', patchId: TEST_UUID, allRings: true }).success).toBe(true);
+  });
+
+  it('rejects allRings combined with ringId', () => {
+    expect(parse('manage_patches', {
+      action: 'decline', patchId: TEST_UUID, allRings: true, ringId: TEST_UUID2,
+    }).success).toBe(false);
+  });
+
+  it('rejects allRings on actions other than decline', () => {
+    expect(parse('manage_patches', { action: 'approve', patchId: TEST_UUID, allRings: true }).success).toBe(false);
+  });
+});
+
+// ─── manage_groups ──────────────────────────────────────────────────────
+
+describe('manage_groups schema', () => {
+  it('accepts valid list', () => {
+    expect(parse('manage_groups', { action: 'list' }).success).toBe(true);
+  });
+
+  it('requires groupId for get/update/delete/membership_log/add_devices/remove_devices', () => {
+    for (const action of ['get', 'membership_log', 'update', 'delete', 'add_devices', 'remove_devices']) {
+      expect(parse('manage_groups', { action }).success).toBe(false);
+    }
+  });
+
+  it('requires name for create', () => {
+    expect(parse('manage_groups', { action: 'create' }).success).toBe(false);
+  });
+
+  it('accepts create with name', () => {
+    expect(parse('manage_groups', { action: 'create', name: 'Accounting' }).success).toBe(true);
+  });
+
+  it('requires deviceIds for add_devices/remove_devices', () => {
+    expect(parse('manage_groups', { action: 'add_devices', groupId: TEST_UUID }).success).toBe(false);
+  });
+
+  it('accepts add_devices with groupId and deviceIds', () => {
+    expect(parse('manage_groups', {
+      action: 'add_devices',
+      groupId: TEST_UUID,
+      deviceIds: [TEST_UUID2],
+    }).success).toBe(true);
+  });
+
+  it('requires filterConditions for preview', () => {
+    expect(parse('manage_groups', { action: 'preview' }).success).toBe(false);
+  });
+
+  it('accepts preview with filterConditions', () => {
+    expect(parse('manage_groups', {
+      action: 'preview',
+      filterConditions: { os: 'windows' },
+    }).success).toBe(true);
+  });
+});
+
+// ─── manage_maintenance_windows ─────────────────────────────────────────
+
+describe('manage_maintenance_windows schema', () => {
+  it('accepts valid list', () => {
+    expect(parse('manage_maintenance_windows', { action: 'list' }).success).toBe(true);
+  });
+
+  it('accepts active_now', () => {
+    expect(parse('manage_maintenance_windows', { action: 'active_now' }).success).toBe(true);
+  });
+
+  it('requires windowId for get/update/delete', () => {
+    for (const action of ['get', 'update', 'delete']) {
+      expect(parse('manage_maintenance_windows', { action }).success).toBe(false);
+    }
+  });
+
+  it('requires name, startTime, endTime, targetType for create', () => {
+    expect(parse('manage_maintenance_windows', { action: 'create', name: 'Test' }).success).toBe(false);
+  });
+
+  it('accepts valid create', () => {
+    expect(parse('manage_maintenance_windows', {
+      action: 'create',
+      name: 'Nightly window',
+      startTime: '2026-03-01T02:00:00Z',
+      endTime: '2026-03-01T06:00:00Z',
+      targetType: 'site',
+      suppressAlerts: true,
+    }).success).toBe(true);
+  });
+
+  it('rejects invalid datetime for startTime/endTime', () => {
+    expect(parse('manage_maintenance_windows', {
+      action: 'create',
+      name: 'Bad dates',
+      startTime: 'next tuesday',
+      endTime: '2026-03-01T06:00:00Z',
+      targetType: 'site',
+    }).success).toBe(false);
+  });
+});
+
+// ─── manage_automations ─────────────────────────────────────────────────
+
+describe('manage_automations schema', () => {
+  it('accepts valid list', () => {
+    expect(parse('manage_automations', { action: 'list' }).success).toBe(true);
+  });
+
+  it('accepts list with triggerType filter', () => {
+    expect(parse('manage_automations', { action: 'list', triggerType: 'schedule' }).success).toBe(true);
+  });
+
+  it('requires automationId for get/history/update/delete/enable/disable/run', () => {
+    for (const action of ['get', 'history', 'update', 'delete', 'enable', 'disable', 'run']) {
+      expect(parse('manage_automations', { action }).success).toBe(false);
+    }
+  });
+
+  it('requires name, trigger, actions for create', () => {
+    expect(parse('manage_automations', { action: 'create', name: 'Auto' }).success).toBe(false);
+  });
+
+  it('accepts valid create', () => {
+    expect(parse('manage_automations', {
+      action: 'create',
+      name: 'Disk cleanup',
+      trigger: { type: 'schedule', cron: '0 2 * * *' },
+      actions: [{ type: 'script', scriptId: TEST_UUID }],
+    }).success).toBe(true);
+  });
+
+  it('rejects create with empty actions array', () => {
+    expect(parse('manage_automations', {
+      action: 'create',
+      name: 'Empty',
+      trigger: { type: 'event' },
+      actions: [],
+    }).success).toBe(false);
+  });
+});
+
+// ─── manage_alert_rules ─────────────────────────────────────────────────
+
+describe('manage_alert_rules schema', () => {
+  it('accepts valid list_rules', () => {
+    expect(parse('manage_alert_rules', { action: 'list_rules' }).success).toBe(true);
+  });
+
+  it('accepts list_templates', () => {
+    expect(parse('manage_alert_rules', { action: 'list_templates' }).success).toBe(true);
+    expect(parse('manage_alert_rules', { action: 'list_templates', category: 'performance', severity: 'high' }).success).toBe(true);
+  });
+
+  it('accepts list_channels and alert_summary', () => {
+    expect(parse('manage_alert_rules', { action: 'list_channels' }).success).toBe(true);
+    expect(parse('manage_alert_rules', { action: 'alert_summary' }).success).toBe(true);
+  });
+
+  it('requires ruleId for get_rule/update_rule/delete_rule/test_rule', () => {
+    for (const action of ['get_rule', 'update_rule', 'delete_rule', 'test_rule']) {
+      expect(parse('manage_alert_rules', { action }).success).toBe(false);
+    }
+  });
+
+  it('requires name, templateId, targetType, targetId for create_rule', () => {
+    expect(parse('manage_alert_rules', { action: 'create_rule', name: 'Test' }).success).toBe(false);
+  });
+
+  it('accepts valid create_rule', () => {
+    expect(parse('manage_alert_rules', {
+      action: 'create_rule',
+      name: 'High CPU alert',
+      templateId: TEST_UUID,
+      targetType: 'group',
+      targetId: TEST_UUID2,
+      severity: 'high',
+    }).success).toBe(true);
+  });
+});
+
+// ─── generate_report ────────────────────────────────────────────────────
+
+describe('generate_report schema', () => {
+  it('accepts valid list', () => {
+    expect(parse('generate_report', { action: 'list' }).success).toBe(true);
+  });
+
+  it('requires reportId for update/delete/history', () => {
+    for (const action of ['update', 'delete', 'history']) {
+      expect(parse('generate_report', { action }).success).toBe(false);
+    }
+  });
+
+  it('requires reportId or reportType for generate', () => {
+    expect(parse('generate_report', { action: 'generate' }).success).toBe(false);
+  });
+
+  it('accepts generate with reportType', () => {
+    expect(parse('generate_report', { action: 'generate', reportType: 'executive_summary' }).success).toBe(true);
+  });
+
+  it('accepts generate with reportId', () => {
+    expect(parse('generate_report', { action: 'generate', reportId: TEST_UUID }).success).toBe(true);
+  });
+
+  it('requires reportType for data', () => {
+    expect(parse('generate_report', { action: 'data' }).success).toBe(false);
+  });
+
+  it('accepts data with reportType', () => {
+    expect(parse('generate_report', { action: 'data', reportType: 'device_inventory' }).success).toBe(true);
+  });
+
+  it('requires name and reportType for create', () => {
+    expect(parse('generate_report', { action: 'create', name: 'Weekly' }).success).toBe(false);
+  });
+
+  it('accepts valid create', () => {
+    expect(parse('generate_report', {
+      action: 'create',
+      name: 'Weekly inventory',
+      reportType: 'device_inventory',
+      schedule: 'weekly',
+      format: 'csv',
+    }).success).toBe(true);
+  });
+
+  it('rejects invalid reportType', () => {
+    expect(parse('generate_report', { action: 'data', reportType: 'invalid_type' }).success).toBe(false);
+  });
+
+  it('rejects invalid format', () => {
+    expect(parse('generate_report', { action: 'create', name: 'Test', reportType: 'compliance', format: 'docx' }).success).toBe(false);
+  });
+});
+
+// ─── manage_patches: setup_auto_approval ────────────────────────────────
+
+describe('manage_patches setup_auto_approval schema', () => {
+  it('accepts valid setup_auto_approval with defaults', () => {
+    expect(parse('manage_patches', { action: 'setup_auto_approval' }).success).toBe(true);
+  });
+
+  it('accepts setup_auto_approval with all options', () => {
+    expect(parse('manage_patches', {
+      action: 'setup_auto_approval',
+      configPolicyId: TEST_UUID,
+      autoApprove: true,
+      autoApproveSeverities: ['critical', 'important'],
+      scheduleFrequency: 'weekly',
+      scheduleTime: '03:00',
+      rebootPolicy: 'if_required',
+    }).success).toBe(true);
+  });
+
+  it('rejects invalid scheduleTime format', () => {
+    expect(parse('manage_patches', { action: 'setup_auto_approval', scheduleTime: 'midnight' }).success).toBe(false);
+  });
+
+  it('rejects out-of-range scheduleTime values', () => {
+    expect(parse('manage_patches', { action: 'setup_auto_approval', scheduleTime: '25:00' }).success).toBe(false);
+    expect(parse('manage_patches', { action: 'setup_auto_approval', scheduleTime: '99:99' }).success).toBe(false);
+    expect(parse('manage_patches', { action: 'setup_auto_approval', scheduleTime: '1:00' }).success).toBe(false);
+  });
+
+  it('accepts valid edge-case scheduleTime values', () => {
+    expect(parse('manage_patches', { action: 'setup_auto_approval', scheduleTime: '00:00' }).success).toBe(true);
+    expect(parse('manage_patches', { action: 'setup_auto_approval', scheduleTime: '23:59' }).success).toBe(true);
+  });
+
+  it('rejects invalid autoApproveSeverities values', () => {
+    expect(parse('manage_patches', { action: 'setup_auto_approval', autoApproveSeverities: ['unknown'] }).success).toBe(false);
+    expect(parse('manage_patches', { action: 'setup_auto_approval', autoApproveSeverities: ['critical', 'catastrophic'] }).success).toBe(false);
+  });
+
+  it('rejects invalid rebootPolicy', () => {
+    expect(parse('manage_patches', { action: 'setup_auto_approval', rebootPolicy: 'reboot_now' }).success).toBe(false);
+  });
+});
+
+// ─── manage_service_monitors ────────────────────────────────────────────
+
+describe('manage_service_monitors schema', () => {
+  it('accepts valid list', () => {
+    expect(parse('manage_service_monitors', { action: 'list' }).success).toBe(true);
+  });
+
+  it('accepts list with configPolicyId filter', () => {
+    expect(parse('manage_service_monitors', { action: 'list', configPolicyId: TEST_UUID }).success).toBe(true);
+  });
+
+  it('rejects invalid actions (add/remove/update are not supported)', () => {
+    expect(parse('manage_service_monitors', { action: 'add' }).success).toBe(false);
+    expect(parse('manage_service_monitors', { action: 'remove' }).success).toBe(false);
+    expect(parse('manage_service_monitors', { action: 'update' }).success).toBe(false);
+    expect(parse('manage_service_monitors', { action: 'restart' }).success).toBe(false);
+  });
+});

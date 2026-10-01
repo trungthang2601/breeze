@@ -1,0 +1,825 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useEventStream } from "../../hooks/useEventStream";
+import { ArrowLeft } from "lucide-react";
+import { showToast } from "../shared/Toast";
+import DeviceDetails from "./DeviceDetails";
+import DeviceSettingsModal from "./DeviceSettingsModal";
+import ChangeSiteModal from "./ChangeSiteModal";
+import RemoveDeviceDialog from "./RemoveDeviceDialog";
+import { ConfirmDialog } from "../shared/ConfirmDialog";
+import ScriptPickerModal, {
+  type Script,
+  type ScriptRunAsSelection,
+} from "./ScriptPickerModal";
+import MaintenanceModeDialog from "./MaintenanceModeDialog";
+import MoveDeviceOrgDialog from "./MoveDeviceOrgDialog";
+import { isInMaintenance } from "../../lib/maintenanceResource";
+import type { Device, DeviceStatus, OSType } from "./DeviceList";
+import type { DeviceActionOptions } from "./DeviceActions";
+import { fetchWithAuth } from "../../stores/auth";
+import { useRecentsStore } from "../../stores/recentsStore";
+import {
+  sendDeviceCommand,
+  executeScript,
+  exitMaintenanceMode,
+  decommissionDevice,
+  clearDeviceSessions,
+  restoreDevice,
+  permanentDeleteDevice,
+  sendWakeCommand,
+  watchWakeOutcome,
+  WakeCommandError,
+  wakeFriendlyErrorMessage,
+} from "../../services/deviceActions";
+import { useAiStore } from "@/stores/aiStore";
+import { navigateTo } from "@/lib/navigation";
+import { deviceScriptsHash } from "@/lib/deviceScriptsLink";
+import { runAction, ActionError } from "@/lib/runAction";
+import { formatDateTime } from "@/lib/dateTimeFormat";
+import Breadcrumbs from "../layout/Breadcrumbs";
+import { useTranslation } from "react-i18next";
+import "../../lib/i18n";
+
+type DeviceDetailPageProps = {
+  deviceId: string;
+};
+
+export default function DeviceDetailPage({ deviceId }: DeviceDetailPageProps) {
+  const { t } = useTranslation("devices");
+  const [device, setDevice] = useState<Device | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [actionInProgress, setActionInProgress] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  // #3987: Remove has to ask what happens to the agent before it runs.
+  // DeviceActions asks in its own dialog and passes the answer down;
+  // DeviceSettingsModal's Danger Zone button has no dialog at all, so the
+  // page owes that caller one. Set = "asked, not yet answered".
+  const [pendingRemove, setPendingRemove] = useState<Device | null>(null);
+  // #5023: same gate, for the one action that is worse than Remove. Every
+  // trigger on this page (kebab, settings Danger Zone) fired Delete
+  // permanently on a single click, straight into a 5-second undo toast, while
+  // the bulk version of the same operation makes the operator type the device
+  // count. Nothing is restorable afterwards, so it gets asked about first.
+  const [pendingPermanentDelete, setPendingPermanentDelete] =
+    useState<Device | null>(null);
+  const [changeSiteOpen, setChangeSiteOpen] = useState(false);
+  const [scriptPickerOpen, setScriptPickerOpen] = useState(false);
+  const [maintenanceDialogOpen, setMaintenanceDialogOpen] = useState(false);
+  const [moveOrgDialogOpen, setMoveOrgDialogOpen] = useState(false);
+
+  // Track every in-flight wake watcher so that navigating away aborts the
+  // long-running poll loop. Without this, watchWakeOutcome keeps polling
+  // /devices/:id for up to 4 minutes after unmount and tries to render a
+  // toast / setDevice on a dead component. (Todd's #789 review.) A Set is
+  // used because a single device-detail page can only have one wake at a
+  // time, but the abstraction matches the multi-target DevicesPage path
+  // and is cheap.
+  const wakeWatchersRef = useRef<Set<AbortController>>(new Set());
+  useEffect(() => {
+    const watchers = wakeWatchersRef.current;
+    return () => {
+      for (const ctrl of watchers) ctrl.abort();
+      watchers.clear();
+    };
+  }, []);
+
+  const fetchDevice = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(undefined);
+
+      const response = await fetchWithAuth(`/devices/${deviceId}`);
+      if (!response.ok) {
+        if (response.status === 404) {
+          // Gone for good — drop it from the sidebar's recent devices.
+          useRecentsStore.getState().forgetDevice(deviceId);
+          throw new Error("Device not found");
+        }
+        throw new Error("Failed to fetch device");
+      }
+
+      const data = await response.json();
+
+      // #6501: a 200 response is not on its own proof this was a device row.
+      // `/devices/:id` shares its path prefix with several STATIC list
+      // routes (e.g. `GET /devices/network`, the network-asset list), and
+      // Hono resolves those ahead of the `/:id` matcher — so a page URL like
+      // `/devices/network` (no further segment; `pages/devices/[id].astro`
+      // captures "network" as id) fetches a `{ data: [...], pagination }`
+      // list envelope instead of a device. Every field the transform below
+      // reads off that envelope is `undefined`, so it silently renders a
+      // "device" made entirely of placeholder defaults ("Unknown" / offline)
+      // — complete with live Wake / Run Script / Connect buttons — for a
+      // device that was never actually fetched. A real device row always
+      // carries its own `id`; treat anything else as not-found.
+      if (typeof data?.id !== "string" || data.id.length === 0) {
+        // Log which shape we actually got: a list envelope (the #6501 route
+        // collision) looks different from a genuinely malformed device row,
+        // and both would otherwise render an identical "Device not found"
+        // with nothing in the console to tell a future regression apart
+        // from an expected reserved-path collision.
+        console.error(
+          `[DeviceDetailPage] GET /devices/${deviceId} returned 200 with no device id`,
+          { looksLikeListEnvelope: Array.isArray(data?.data), keys: data && typeof data === "object" ? Object.keys(data) : typeof data },
+        );
+        useRecentsStore.getState().forgetDevice(deviceId);
+        throw new Error("Device not found");
+      }
+
+      // Get latest metrics from recentMetrics array
+      const latestMetrics = data.recentMetrics?.[0];
+
+      // Transform API response to match Device type
+      const transformedDevice: Device = {
+        id: data.id,
+        hostname: data.hostname ?? data.displayName ?? "Unknown",
+        os: (data.osType ?? data.os ?? "windows") as OSType,
+        osVersion: data.osVersion ?? "",
+        status: (data.status ?? "offline") as DeviceStatus,
+        cpuPercent: latestMetrics?.cpuPercent ?? 0,
+        ramPercent: latestMetrics?.ramPercent ?? 0,
+        lastSeen: data.lastSeenAt ?? data.lastSeen ?? "",
+        orgId: data.orgId ?? "",
+        orgName: data.orgName ?? "Unknown Org",
+        siteId: data.siteId ?? "",
+        siteName: data.siteName ?? "Unknown Site",
+        agentVersion: data.agentVersion ?? "",
+        tags: data.tags ?? [],
+        lastUser: data.lastUser ?? undefined,
+        uptimeSeconds:
+          typeof data.uptimeSeconds === "number"
+            ? data.uptimeSeconds
+            : (latestMetrics?.uptimeSeconds ?? undefined),
+        deviceRole: data.deviceRole ?? undefined,
+        displayName: data.displayName ?? undefined,
+        isHeadless: data.isHeadless ?? undefined,
+        pendingReboot: data.pendingReboot === true,
+        // RMM-QA-176: the manual maintenance lease end. Same dropped-field
+        // hazard as possibleReplacementOfDeviceId below — this transform is an
+        // explicit whitelist, so omitting it would silently make every leased
+        // device look "not in maintenance" to isInMaintenance.
+        maintenanceUntil:
+          typeof data.maintenanceUntil === "string" ? data.maintenanceUntil : null,
+        // Collision enrollment (#2764) — the ONLY input to the review banner.
+        // The detail endpoint spreads the whole row (the column is not in
+        // SENSITIVE_DEVICE_FIELDS), but this transform is an explicit
+        // whitelist, so omitting it here silently kills the banner while every
+        // other test stays green — the #800/#1273/#2138 dropped-field mode.
+        possibleReplacementOfDeviceId:
+          typeof data.possibleReplacementOfDeviceId === "string"
+            ? data.possibleReplacementOfDeviceId
+            : null,
+        desktopAccess: data.desktopAccess ?? undefined,
+        remoteAccessPolicy: data.remoteAccessPolicy ?? undefined,
+        // Link-group membership (#2138/#2308). Carried through so the detail
+        // page can hide the Linked Profiles tab on an unlinked device (#2865)
+        // without a second fetch — the detail endpoint already returns both
+        // columns (neither is in SENSITIVE_DEVICE_FIELDS).
+        linkGroupId: data.linkGroupId ?? null,
+        linkGroupRole: data.linkGroupRole ?? null,
+        // What became of the agent-uninstall a Remove queued (#3987 item 7) —
+        // the ONLY input to UninstallStateBadge, and the same dropped-field
+        // mode as the three fields above: the badge's `undefined` guard means
+        // omitting it here renders nothing at all, silently.
+        //
+        // `?? null` rather than a passthrough is load-bearing. On THIS payload
+        // an absent field means "this Remove queued no uninstall", which the
+        // badge reports as "left installed"; `undefined` means "this payload
+        // does not carry the field" (a device-list row) and says nothing. The
+        // detail endpoint always knows, so it must never hand the badge the
+        // list row's answer. See the component doc on UninstallStateBadge.
+        uninstall: data.uninstall ?? null,
+        // RDS per-session helper mode (Task 12) — gates the session pickers
+        // added in Tasks 13/14. Not in SENSITIVE_DEVICE_FIELDS, so the
+        // detail endpoint's full-row spread already includes it.
+        helperLifecycleMode: data.helperLifecycleMode ?? null,
+        // Scheduled-restart booking (#3207 W5) — the ONLY input to
+        // RebootScheduledBadge. Not in SENSITIVE_DEVICE_FIELDS, so the detail
+        // endpoint's full-row spread already includes these; omitting them
+        // here silently kills the badge the same way #800/#1273/#2138 did.
+        rebootScheduledAt: data.rebootScheduledAt ?? null,
+        rebootDeadline: data.rebootDeadline ?? null,
+        rebootSource: data.rebootSource ?? null,
+        rebootDeferralsUsed:
+          typeof data.rebootDeferralsUsed === "number"
+            ? data.rebootDeferralsUsed
+            : null,
+        rebootMaxDeferrals:
+          typeof data.rebootMaxDeferrals === "number"
+            ? data.rebootMaxDeferrals
+            : null,
+      };
+
+      setDevice(transformedDevice);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : t("deviceDetailPage.failedToFetchDevice"),
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, [deviceId]);
+
+  useEffect(() => {
+    fetchDevice();
+  }, [fetchDevice]);
+
+  // Real-time device updates
+  const handleDeviceEvent = useCallback(
+    (event: { type: string; payload: Record<string, unknown> }) => {
+      const { type, payload } = event;
+      const eventDeviceId = payload.deviceId as string;
+      if (eventDeviceId !== deviceId) return;
+
+      if (type === "device.online" || type === "device.offline") {
+        setDevice((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: ((payload.status as string) ??
+                  (type === "device.online"
+                    ? "online"
+                    : "offline")) as DeviceStatus,
+                lastSeen: new Date().toISOString(),
+                agentVersion:
+                  (payload.agentVersion as string) ?? prev.agentVersion,
+              }
+            : prev,
+        );
+      } else if (type === "device.updated") {
+        const fields = payload.fields as string[] | undefined;
+        if (fields?.includes("agentVersion")) {
+          setDevice((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  agentVersion:
+                    (payload.agentVersion as string) ?? prev.agentVersion,
+                }
+              : prev,
+          );
+        }
+        // #5250 — the heartbeat now also publishes this event when
+        // desktopAccess changes (was previously only agentVersion), so
+        // Overview picks up a helper recovering/dropping live instead of
+        // only on the next full remount/refetch.
+        if (fields?.includes("desktopAccess")) {
+          setDevice((prev) => {
+            if (!prev) return prev;
+            // `?? prev.desktopAccess` would treat an explicit `null` the
+            // same as "not present", silently discarding a legitimate
+            // cleared state — mirror RemoteToolsPage's `!== undefined`
+            // check instead so only a genuinely missing field falls back.
+            const next = payload.desktopAccess as Device["desktopAccess"] | undefined;
+            return next !== undefined ? { ...prev, desktopAccess: next } : prev;
+          });
+        }
+      } else if (type === "device.decommissioned") {
+        fetchDevice();
+      }
+    },
+    [deviceId, fetchDevice],
+  );
+
+  const { subscribe } = useEventStream({ onEvent: handleDeviceEvent });
+
+  useEffect(() => {
+    subscribe([
+      "device.online",
+      "device.offline",
+      "device.updated",
+      "device.decommissioned",
+    ]);
+  }, [subscribe]);
+
+  // Inject AI context when device data is available
+  const setPageContext = useAiStore((s) => s.setPageContext);
+  useEffect(() => {
+    if (device) {
+      setPageContext({
+        type: "device",
+        id: device.id,
+        hostname: device.hostname,
+        // Lets the AI store notice that an open chat belongs to another tenant
+        // and start a session anchored to THIS device's org instead (#5684).
+        orgId: device.orgId || undefined,
+        os: device.os,
+        status: device.status,
+        ip: undefined,
+      });
+    }
+    return () => setPageContext(null);
+  }, [device, setPageContext]);
+
+  // Remember this device for the sidebar's recent-devices rows and Cmd+K.
+  // `recentsUserId` is a dependency on purpose: on a direct page load the
+  // device fetch can resolve before GlobalShortcuts has hydrated the store for
+  // the signed-in user (recordDevice no-ops until then), so re-run once it has.
+  const recordRecentDevice = useRecentsStore((s) => s.recordDevice);
+  const recentsUserId = useRecentsStore((s) => s.userId);
+  const recentName = device ? device.displayName || device.hostname : null;
+  useEffect(() => {
+    if (!device || !recentName || !recentsUserId) return;
+    recordRecentDevice({ id: device.id, name: recentName, orgId: device.orgId });
+  }, [device?.id, device?.orgId, recentName, recentsUserId, recordRecentDevice]);
+
+  const handleBack = () => {
+    void navigateTo("/devices");
+  };
+
+  const handleAction = async (
+    action: string,
+    device: Device,
+    // #3987: RemoveDeviceDialog's agent answer, present only for Remove.
+    opts?: DeviceActionOptions,
+  ) => {
+    if (actionInProgress) return;
+
+    // Gate/execute split, mirroring DevicesPage. A `decommission` that carries
+    // no agent answer has not been through a dialog yet — open one and come
+    // back through here with `opts` set. Keying on the ABSENCE of `opts` (not on
+    // the caller) means any present or future Remove trigger on this page is
+    // gated by default; a caller that already asked is not asked twice.
+    if (action === "decommission" && !opts) {
+      setPendingRemove(device);
+      return;
+    }
+    // #5023, same shape: `confirmed` is set only by this page's own dialog, so
+    // any present or future Delete permanently trigger is gated by default.
+    if (action === "permanent-delete" && !opts?.confirmed) {
+      setPendingPermanentDelete(device);
+      return;
+    }
+
+    try {
+      setActionInProgress(true);
+
+      switch (action) {
+        case "reboot":
+        case "reboot_safe_mode":
+        case "shutdown":
+        case "lock": {
+          const result = await sendDeviceCommand(device.id, action);
+          const label =
+            action === "reboot_safe_mode"
+              ? t("deviceDetailPage.rebootToSafeMode")
+              : action.charAt(0).toUpperCase() + action.slice(1);
+          // #5128 W2 — a 201 means "a row was inserted", not "the machine
+          // acted"; `result.delivery` is the dispatch core's own outcome, so
+          // an offline device gets the honest "runs when it reconnects" copy
+          // instead of a false "command sent".
+          //
+          // 'queued_live' means the device IS online — only the immediate
+          // socket push missed, and the next heartbeat (seconds away) claims
+          // it. Only 'queued_offline' means "wait for it to reconnect".
+          showToast({
+            type: "success",
+            message: result.delivery !== "queued_offline"
+              ? `${label} command sent to ${device.hostname}`
+              : result.deliverBy
+                ? t("devicesPage.toasts.runsWhenOnline", { date: formatDateTime(result.deliverBy) })
+                : t("devicesPage.toasts.runsWhenOnlineNoExpiry"),
+          });
+          break;
+        }
+
+        case "wake": {
+          try {
+            const wake = await sendWakeCommand(device.id);
+            const hostname = device.hostname;
+            showToast({
+              type: "success",
+              message: `Wake packet sent to ${hostname} via ${wake.relay.hostname} (${wake.broadcast}). Watching for it to come online…`,
+            });
+            const wakeController = new AbortController();
+            wakeWatchersRef.current.add(wakeController);
+            void watchWakeOutcome(device.id, { signal: wakeController.signal })
+              .then(async (outcome) => {
+                if (outcome === "online") {
+                  showToast({
+                    type: "success",
+                    message: `${hostname} is now online.`,
+                  });
+                  await fetchDevice();
+                } else if (outcome === "timeout") {
+                  showToast({
+                    type: "error",
+                    message: `${hostname} did not come online within 4 minutes. Check ethernet + BIOS WoL.`,
+                  });
+                }
+                // 'aborted' is silent — user navigated away or page reloaded.
+              })
+              .finally(() => {
+                wakeWatchersRef.current.delete(wakeController);
+              });
+          } catch (err) {
+            if (err instanceof WakeCommandError) {
+              const friendly =
+                wakeFriendlyErrorMessage(err.code) ?? err.message;
+              showToast({
+                type: "error",
+                message: `${device.hostname}: ${friendly}`,
+              });
+            } else {
+              throw err;
+            }
+          }
+          break;
+        }
+
+        case "refresh": {
+          await sendDeviceCommand(device.id, "refresh_inventory");
+          showToast({
+            type: "success",
+            message: `Inventory refresh requested for ${device.hostname}. Fresh data in 1–2 minutes.`,
+          });
+          break;
+        }
+
+        case "maintenance": {
+          // RMM-QA-176 D10: exit is a one-click, un-gated operation; ENTRY
+          // needs a reason, a duration and possibly a step-up factor, so it
+          // opens MaintenanceModeDialog instead of firing a request here.
+          if (!isInMaintenance(device)) {
+            setMaintenanceDialogOpen(true);
+            break;
+          }
+          await exitMaintenanceMode(device.id);
+          showToast({
+            type: "success",
+            message: `${device.hostname} ${t("deviceDetailPage.takenOutOf")} maintenance mode`,
+          });
+          // Refetch rather than assume: exit returns the device to its REAL
+          // liveness state (online/offline by last-seen), never a blind
+          // 'online'.
+          await fetchDevice();
+          break;
+        }
+
+        case "files":
+          void navigateTo(`/remote/files/${device.id}`);
+          return;
+
+        case "remote-tools":
+          void navigateTo(
+            `/remote/tools?deviceId=${device.id}&deviceName=${encodeURIComponent(device.hostname)}&os=${device.os}`,
+          );
+          return;
+
+        case "deploy-software":
+          // Carry the device into the deploy wizard via the hash (#2866).
+          void navigateTo(`/software#deploy=${device.id}`);
+          return;
+
+        case "run-script":
+          setScriptPickerOpen(true);
+          break;
+
+        case "settings":
+          setSettingsOpen(true);
+          break;
+
+        case "change-site":
+          setChangeSiteOpen(true);
+          return;
+
+        case "move-org":
+          // Spec 2026-09-18 device-move-org D5: the move needs a target org,
+          // a target site and possibly a step-up factor, so it opens a dialog
+          // instead of firing a request here.
+          setMoveOrgDialogOpen(true);
+          return;
+
+        case "install-homebrew": {
+          // Opt-in, per-device package-manager bootstrap. The pinned installer
+          // URL + sha256 live server-side (services/homebrewBootstrap.ts) — the
+          // browser never chooses what gets executed on the endpoint.
+          try {
+            await runAction({
+              request: () =>
+                fetchWithAuth(`/devices/${device.id}/homebrew-bootstrap`, {
+                  method: "POST",
+                }),
+              errorFallback: `Failed to queue Homebrew install for ${device.hostname}`,
+              successMessage: `Homebrew install queued for ${device.hostname}. It runs as the signed-in console user.`,
+            });
+          } catch (err) {
+            // 401 → the auth redirect is the feedback; any other ActionError was
+            // already toasted by runAction.
+            if (!(err instanceof ActionError)) throw err;
+          }
+          break;
+        }
+
+        case "clear-sessions": {
+          const result = await clearDeviceSessions(device.id);
+          showToast({
+            type: "success",
+            message: `Cleared ${result.cleaned} session${result.cleaned !== 1 ? t("deviceDetailPage.s") : ""} for ${device.hostname}`,
+          });
+          break;
+        }
+
+        case "decommission": {
+          // Deferred execution with undo — gives the user 5 seconds to cancel
+          let cancelled = false;
+          showToast({
+            type: "undo",
+            message: `Removing "${device.hostname}"...`,
+            duration: 5000,
+            onUndo: () => {
+              cancelled = true;
+              showToast({
+                type: "success",
+                message: t("deviceDetailPage.decommissionCancelled"),
+                duration: 2000,
+              });
+            },
+          });
+          setTimeout(async () => {
+            if (cancelled) return;
+            try {
+              await decommissionDevice(device.id, { uninstallAgent: opts?.uninstallAgent ?? true });
+              showToast({
+                type: "success",
+                message: `${device.hostname} has been removed`,
+              });
+              void navigateTo("/devices");
+            } catch (err) {
+              showToast({
+                type: "error",
+                message:
+                  err instanceof Error
+                    ? err.message
+                    : `Failed to remove ${device.hostname}`,
+              });
+            }
+          }, 5000);
+          return;
+        }
+
+        case "restore":
+          await restoreDevice(device.id);
+          showToast({
+            type: "success",
+            message: `${device.hostname} has been restored`,
+          });
+          await fetchDevice();
+          break;
+
+        case "permanent-delete": {
+          // Deferred execution with undo — gives the user 5 seconds to cancel
+          let pdCancelled = false;
+          showToast({
+            type: "undo",
+            message: `Permanently deleting "${device.hostname}"...`,
+            duration: 5000,
+            onUndo: () => {
+              pdCancelled = true;
+              showToast({
+                type: "success",
+                message: t("deviceDetailPage.permanentDeleteCancelled"),
+                duration: 2000,
+              });
+            },
+          });
+          setTimeout(async () => {
+            if (pdCancelled) return;
+            try {
+              await permanentDeleteDevice(device.id);
+              // No warning branch: the API returns `{ success: true }` and
+              // nothing else since #2787 (see permanentDeleteDevice).
+              showToast({
+                type: "success",
+                message: `${device.hostname} has been permanently deleted`,
+              });
+              void navigateTo("/devices");
+            } catch (err) {
+              showToast({
+                type: "error",
+                message:
+                  err instanceof Error
+                    ? err.message
+                    : `Failed to delete ${device.hostname}`,
+              });
+            }
+          }, 5000);
+          return;
+        }
+
+        default:
+          showToast({ type: "error", message: `Unknown action: ${action}` });
+      }
+    } catch (err) {
+      showToast({
+        type: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : `Failed to ${action} ${device.hostname}`,
+      });
+    } finally {
+      setActionInProgress(false);
+    }
+  };
+
+  const handleScriptSelect = async (
+    script: Script,
+    runAs: ScriptRunAsSelection,
+    parameters?: Record<string, unknown>,
+    targetSessionId?: number,
+  ) => {
+    if (actionInProgress || !device) return;
+
+    try {
+      setActionInProgress(true);
+      const result = await executeScript(script.id, [device.id], parameters, runAs, targetSessionId);
+      const target = result.targets.find(candidate => candidate.requestedDeviceId === device.id);
+      if (target?.admission === "admitted") {
+        showToast({
+          type: "success",
+          message: `Script "${script.name}" queued for ${device.hostname}`,
+        });
+        // #4886 — land on the Scripts tab with the new execution highlighted,
+        // so the operator watches the result instead of staying wherever they
+        // happened to trigger the run from (often Overview). Same page, so a
+        // direct hash write is enough — DeviceDetails' useHashState picks up
+        // the resulting hashchange (the CLAUDE.md tab-state convention).
+        window.location.hash = deviceScriptsHash(target.executionId);
+      } else {
+        showToast({
+          type: "error",
+          message: `${t("deviceDetailPage.failedToQueueScript")}: ${target?.reasonCode ?? target?.admission ?? "not_admitted"}`,
+        });
+      }
+    } catch (err) {
+      showToast({
+        type: "error",
+        message:
+          err instanceof Error
+            ? err.message
+            : t("deviceDetailPage.failedToQueueScript"),
+      });
+    } finally {
+      setActionInProgress(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+          <p className="mt-4 text-sm text-muted-foreground">
+            {t("deviceDetailPage.loadingDevice")}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !device) {
+    return (
+      <div className="space-y-6">
+        <button
+          type="button"
+          onClick={handleBack}
+          className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          {t("deviceDetailPage.backToDevices")}{" "}
+        </button>
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+          <p className="text-sm text-destructive">
+            {error || "Device not found"}
+          </p>
+          <button
+            type="button"
+            onClick={handleBack}
+            className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+          >
+            {t("deviceDetailPage.goBack")}{" "}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <Breadcrumbs
+        items={[
+          // #3839 (Discord ask): one-click jump to the device's Organization
+          // page from the device breadcrumb, instead of using the OrgSwitcher
+          // dropdown + search. Omitted when the device has no orgId (defensive
+          // — the detail fetch always sets one for a real device).
+          ...(device.orgId
+            ? [{ label: device.orgName, href: `/organizations/${device.orgId}` }]
+            : []),
+          { label: t("deviceDetailPage.devices"), href: "/devices" },
+          { label: device.hostname || "Device" },
+        ]}
+      />
+      <DeviceDetails
+        device={device}
+        onBack={handleBack}
+        onAction={handleAction}
+      />
+      <DeviceSettingsModal
+        device={device}
+        isOpen={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onSaved={fetchDevice}
+        onAction={handleAction}
+      />
+      {pendingRemove && (
+        <RemoveDeviceDialog
+          open
+          targets={[{ hostname: pendingRemove.hostname, status: pendingRemove.status }]}
+          onClose={() => setPendingRemove(null)}
+          onConfirm={(choice) => {
+            const target = pendingRemove;
+            setPendingRemove(null);
+            void handleAction("decommission", target, choice);
+          }}
+          confirmTestId="detail-remove-confirm"
+        />
+      )}
+      {/* #5023 — the purge-framed confirm, reusing the SAME
+          deviceActions.confirm.permanentDelete.* copy DevicesPage renders so
+          the two screens read identically. The undo toast still follows on
+          confirm; the dialog is what stops a single stray click from starting
+          the countdown at all. */}
+      {pendingPermanentDelete && (
+        <ConfirmDialog
+          open
+          onClose={() => setPendingPermanentDelete(null)}
+          onConfirm={() => {
+            const target = pendingPermanentDelete;
+            setPendingPermanentDelete(null);
+            void handleAction("permanent-delete", target, { confirmed: true });
+          }}
+          title={t("deviceActions.confirm.permanentDelete.title", {
+            hostname: pendingPermanentDelete.hostname,
+          })}
+          message={t("deviceActions.confirm.permanentDelete.message", {
+            hostname: pendingPermanentDelete.hostname,
+          })}
+          confirmLabel={t("deviceActions.confirm.permanentDelete.confirm")}
+          variant="destructive"
+          confirmTestId="detail-permanent-delete-confirm"
+        />
+      )}
+      <ChangeSiteModal
+        device={device}
+        isOpen={changeSiteOpen}
+        onClose={() => setChangeSiteOpen(false)}
+        onSaved={() => {
+          showToast({
+            type: "success",
+            message: `${device.hostname} moved to new site`,
+          });
+          void fetchDevice();
+        }}
+      />
+      <MaintenanceModeDialog
+        open={maintenanceDialogOpen}
+        devices={[{ id: device.id, hostname: device.hostname }]}
+        onClose={() => setMaintenanceDialogOpen(false)}
+        onCompleted={() => {
+          showToast({
+            type: "success",
+            message: `${device.hostname} ${t("deviceDetailPage.putInto")} maintenance mode`,
+          });
+          void fetchDevice();
+        }}
+      />
+      <MoveDeviceOrgDialog
+        open={moveOrgDialogOpen}
+        device={{ id: device.id, hostname: device.hostname, orgId: device.orgId, orgName: device.orgName }}
+        onClose={() => setMoveOrgDialogOpen(false)}
+        onCompleted={({ targetOrgName }) => {
+          showToast({
+            type: "success",
+            message: t("deviceDetailPage.movedToOrg", { hostname: device.hostname, orgName: targetOrgName }),
+          });
+          // Refetch rather than trust the echoed row: the route disconnects
+          // the agent after commit, so status and org fields settle server-side.
+          void fetchDevice();
+        }}
+      />
+      <ScriptPickerModal
+        isOpen={scriptPickerOpen}
+        onClose={() => setScriptPickerOpen(false)}
+        onSelect={handleScriptSelect}
+        deviceHostname={device.hostname}
+        deviceOs={device.os}
+        deviceId={device.id}
+        helperLifecycleMode={device.helperLifecycleMode ?? null}
+      />
+    </div>
+  );
+}

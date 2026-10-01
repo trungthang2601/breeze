@@ -1,0 +1,1784 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import cytoscape from 'cytoscape';
+import fcose from 'cytoscape-fcose';
+import { LayoutGrid, Pencil, Check, ArrowRight, X, Network, Maximize2, Minimize2, Frame } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { fetchWithAuth } from '../../stores/auth';
+import { usePermissions } from '../../lib/permissions';
+import { runAction, handleActionError } from '@/lib/runAction';
+import { cn } from '@/lib/utils';
+import {
+  groupNodesBySubnet,
+  parseProfileSubnets,
+  UNGROUPED_LABEL
+} from './topologySubnets';
+
+// Register the fcose layout once at module scope (guarded — re-registering on a
+// hot-reload throws). Used for Auto-arrange of never-placed nodes only.
+let fcoseRegistered = false;
+function registerFcose() {
+  if (fcoseRegistered) return;
+  try {
+    cytoscape.use(fcose);
+  } catch {
+    // Already registered (HMR / duplicate import) — non-fatal.
+  }
+  fcoseRegistered = true;
+}
+
+export type TopologyNodeType =
+  | 'router'
+  | 'switch'
+  | 'server'
+  | 'workstation'
+  | 'printer'
+  | 'firewall'
+  | 'access_point'
+  | 'device'
+  | 'unknown';
+export type TopologyNodeStatus = 'online' | 'offline' | 'warning';
+
+export type TopologyNode = {
+  id: string;
+  label: string;
+  type: TopologyNodeType;
+  status: TopologyNodeStatus;
+  ipAddress?: string;
+  siteId?: string;
+  subnet?: string;
+  // 'manual' = hand-mapped placeholder (editable/deletable), 'discovered' = scan
+  // asset. Preserved from the GET payload so a manual node reloaded from the
+  // server stays connect/delete-able (#1728).
+  kind?: 'manual' | 'discovered';
+  manualRole?: ManualRole;
+};
+
+export type TopologyEdgeMethod = 'lldp' | 'cdp' | 'fdb' | 'manual';
+
+export type TopologyLink = {
+  id: string;
+  source: string;
+  target: string;
+  type: 'wired' | 'wireless';
+  method?: TopologyEdgeMethod;
+  confidence?: string | null;
+  interfaceName?: string | null;
+  vlan?: number | null;
+};
+
+export type TopologyLayoutRow = {
+  nodeType: 'discovered_asset' | 'manual_node';
+  nodeId: string;
+  x: number;
+  y: number;
+  pinned: boolean;
+};
+
+type ApiTopologyNode = {
+  id: string;
+  label?: string | null;
+  type?: string | null;
+  status?: string | null;
+  ipAddress?: string | null;
+  siteId?: string | null;
+  kind?: 'manual' | 'discovered' | null;
+};
+
+type ApiTopologyLink = {
+  id?: string | null;
+  source: string;
+  target: string;
+  type?: string | null;
+  method?: TopologyEdgeMethod | null;
+  confidence?: string | null;
+  interfaceName?: string | null;
+  vlan?: number | null;
+};
+
+// The currently-selected canvas element, surfaced in the inspector panel. An
+// edge carries `method`/`confidence`/provenance; a node carries `kind`.
+export type SelectedElement = {
+  id: string;
+  group: 'nodes' | 'edges';
+  method?: TopologyEdgeMethod | null;
+  confidence?: string | null;
+  interfaceName?: string | null;
+  vlan?: number | null;
+  kind?: 'manual' | 'discovered' | null;
+  // Node-only descriptors, surfaced in the inspector so a tap always reveals
+  // something about the device even when the full asset record can't be loaded.
+  label?: string | null;
+  nodeType?: TopologyNodeType | null;
+  status?: TopologyNodeStatus | null;
+  ipAddress?: string | null;
+  subnet?: string | null;
+  manualRole?: ManualRole | null;
+};
+
+// Imperative edit-mode API published once the Cytoscape instance is ready. Used
+// by the connect gesture (edge-handles / two-tap select) and by tests to drive
+// `connectNodes`/`selectElement` directly (the gestures aren't simulable in jsdom).
+export type TopologyEditApi = {
+  connectNodes: (sourceId: string, targetId: string) => Promise<void>;
+  selectElement: (selected: SelectedElement | null) => void;
+};
+
+type NetworkTopologyMapProps = {
+  height?: number;
+  onNodeClick?: (nodeId: string) => void;
+  onEditApiReady?: (api: TopologyEditApi) => void;
+};
+
+const statusDotClass: Record<TopologyNodeStatus, string> = {
+  online: 'bg-green-500',
+  offline: 'bg-red-500',
+  warning: 'bg-yellow-500'
+};
+
+const statusLabelKey: Record<TopologyNodeStatus, string> = {
+  online: 'common:states.online',
+  offline: 'common:states.offline',
+  warning: 'networkTopologyMap.status.warning'
+};
+
+// Edge provenance presentation: matches the canvas line colors so the inspector
+// and the legend speak the same visual language.
+const EDGE_METHOD_META: Record<TopologyEdgeMethod, { labelKey: string; color: string }> = {
+  lldp: { labelKey: 'networkTopologyMap.edgeMethods.lldp', color: '#2563eb' },
+  cdp: { labelKey: 'networkTopologyMap.edgeMethods.cdp', color: '#2563eb' },
+  fdb: { labelKey: 'networkTopologyMap.edgeMethods.fdb', color: '#16a34a' },
+  // Manual renders with the theme ink (bg-foreground) in the inspector, not this
+  // hex; kept as a sane fallback only.
+  manual: { labelKey: 'networkTopologyMap.edgeMethods.manual', color: '#0f172a' }
+};
+
+const typeLabelKey: Record<TopologyNodeType, string> = {
+  router: 'assetTypes.router',
+  switch: 'assetTypes.switch',
+  server: 'assetTypes.server',
+  workstation: 'assetTypes.workstation',
+  printer: 'assetTypes.printer',
+  firewall: 'assetTypes.firewall',
+  access_point: 'assetTypes.accessPoint',
+  device: 'common:labels.device',
+  unknown: 'assetTypes.unknown'
+};
+
+const typeMap: Record<string, TopologyNodeType> = {
+  router: 'router',
+  switch: 'switch',
+  server: 'server',
+  workstation: 'workstation',
+  printer: 'printer',
+  firewall: 'firewall',
+  access_point: 'access_point',
+  device: 'device',
+  unknown: 'unknown'
+};
+
+// Node fill palette. Harmonised around the app's slate-blue primary: each type
+// gets a distinct, evenly-saturated hue so the canvas reads as one family rather
+// than a bag of random colors. Workstation is a readable slate (a near-black
+// blob reads as a hole on the map); printer warms to amber; switch carries the
+// brand blue since switches are the most common infra node.
+const typeColors: Record<TopologyNodeType, string> = {
+  router: '#0d9488', // teal — gateway/edge
+  switch: '#3b56c4', // brand slate-blue
+  server: '#7c3aed', // violet
+  workstation: '#475569', // slate
+  printer: '#d97706', // amber
+  firewall: '#dc2626', // red
+  access_point: '#0891b2', // cyan
+  device: '#64748b', // muted slate
+  unknown: '#94a3b8' // light slate
+};
+
+const statusStroke: Record<TopologyNodeStatus, string> = {
+  online: '#22c55e',
+  offline: '#ef4444',
+  warning: '#f59e0b'
+};
+
+// Stroke-based device glyphs (lucide geometry, 24×24 viewBox) rendered as the
+// white icon centred inside each node tile. Keyed by node type.
+const ICON_PATHS: Record<TopologyNodeType, string> = {
+  router:
+    '<rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6.01 18H6"/><path d="M10.01 18H10"/><path d="M15 10v4"/><path d="M17.84 7.17a4 4 0 0 0-5.66 0"/><path d="M20.66 4.34a8 8 0 0 0-11.31 0"/>',
+  switch:
+    '<rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>',
+  server:
+    '<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01"/><path d="M6 18h.01"/>',
+  workstation:
+    '<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/>',
+  printer:
+    '<path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect width="12" height="8" x="6" y="14"/>',
+  firewall:
+    '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
+  access_point:
+    '<path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.86a10 10 0 0 1 14 0"/><path d="M8.5 16.43a5 5 0 0 1 7 0"/>',
+  device:
+    '<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
+  unknown:
+    '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>'
+};
+
+// A device glyph as a data-URI SVG, stroked in `color` (white on the tile fill).
+function nodeIconUri(type: TopologyNodeType, color = '#ffffff'): string {
+  const body = ICON_PATHS[type] ?? ICON_PATHS.unknown;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" ` +
+    `stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+// A small status pip (filled disc + white ring) badged on the node's lower-right.
+function statusDotUri(status: TopologyNodeStatus): string {
+  const fill = statusStroke[status] ?? statusStroke.online;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12">` +
+    `<circle cx="6" cy="6" r="5" fill="${fill}" stroke="#ffffff" stroke-width="2"/></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+// The device tile reused outside the canvas (inspector / legend): the glyph on a
+// type-coloured square, mirroring how the node renders on the map.
+function NodeBadge({ type, size = 30 }: { type: TopologyNodeType; size?: number }) {
+  return (
+    <span
+      className="flex shrink-0 items-center justify-center rounded-md shadow-xs"
+      style={{ width: size, height: size, backgroundColor: typeColors[type] ?? typeColors.unknown }}
+    >
+      <img src={nodeIconUri(type)} alt="" width={Math.round(size * 0.6)} height={Math.round(size * 0.6)} />
+    </span>
+  );
+}
+
+// Infrastructure nodes anchor a subnet and get visual emphasis (larger / hub shape).
+const INFRA_TYPES = new Set<TopologyNodeType>(['router', 'switch', 'firewall', 'access_point']);
+
+// Manual placeholder-node roles offered by the edit-mode palette (#1728 phase 4).
+// Mirrors the API's `manualNodeRoleSchema` enum.
+const MANUAL_ROLES = ['switch', 'router', 'ap', 'firewall', 'patch_panel', 'other'] as const;
+type ManualRole = (typeof MANUAL_ROLES)[number];
+
+// Persist a locale-independent default label. Manual node labels are API data,
+// so translating this value would make the stored topology depend on whichever
+// language the creator happened to be using.
+const MANUAL_ROLE_LABELS: Record<ManualRole, string> = {
+  switch: 'Switch',
+  router: 'Router',
+  ap: 'Access Point',
+  firewall: 'Firewall',
+  patch_panel: 'Patch Panel',
+  other: 'Other'
+};
+
+const MANUAL_ROLE_LABEL_KEYS: Record<ManualRole, string> = {
+  switch: 'assetTypes.switch',
+  router: 'assetTypes.router',
+  ap: 'assetTypes.accessPoint',
+  firewall: 'assetTypes.firewall',
+  patch_panel: 'assetTypes.patchPanel',
+  other: 'assetTypes.other'
+};
+
+function mapNode(node: ApiTopologyNode): TopologyNode {
+  const normalizedType = (node.type ?? 'unknown').toLowerCase();
+  const normalizedStatus = (node.status ?? 'online').toLowerCase();
+  const manualRole =
+    node.kind === 'manual' && MANUAL_ROLES.includes(normalizedType as ManualRole)
+      ? (normalizedType as ManualRole)
+      : undefined;
+  return {
+    id: node.id,
+    label: node.label ?? node.id,
+    type: typeMap[normalizedType] ?? 'unknown',
+    status:
+      normalizedStatus === 'offline' || normalizedStatus === 'warning' ? normalizedStatus : 'online',
+    ipAddress: node.ipAddress ?? undefined,
+    siteId: node.siteId ?? undefined,
+    kind: node.kind ?? undefined,
+    manualRole
+  };
+}
+
+function mapLink(link: ApiTopologyLink, idx: number): TopologyLink {
+  const linkType = (link.type ?? 'wired').toLowerCase();
+  return {
+    id: link.id ?? `${link.source}->${link.target}-${idx}`,
+    source: link.source,
+    target: link.target,
+    type: linkType === 'wireless' ? 'wireless' : 'wired',
+    method: link.method ?? undefined,
+    confidence: link.confidence,
+    interfaceName: link.interfaceName,
+    vlan: link.vlan
+  };
+}
+
+// Canvas colours that must track the app theme. The Cytoscape stylesheet renders
+// to <canvas>, so it can't consume CSS custom properties the way the DOM chrome
+// does — we resolve the relevant design tokens at build time and rebuild the
+// stylesheet when the theme flips (#1728 critique: dark-mode parity).
+type TopologyTheme = {
+  surface: string; // --card: node border halo + label chip + subnet label chip
+  ink: string; // --foreground: node + subnet labels
+  border: string; // --border: subnet box outline + hover ring
+  muted: string; // --muted-foreground: subnet box fill + label
+  primary: string; // --primary: selection ring + halo
+};
+
+// Light-mode fallbacks (also used for SSR / jsdom where getComputedStyle is empty).
+const DEFAULT_TOPOLOGY_THEME: TopologyTheme = {
+  surface: '#ffffff',
+  ink: '#1e293b',
+  border: '#cbd5e1',
+  muted: '#64748b',
+  primary: '#3b56c4'
+};
+
+function readTopologyTheme(): TopologyTheme {
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return DEFAULT_TOPOLOGY_THEME;
+  }
+  const cs = getComputedStyle(document.documentElement);
+  // Tokens are stored as space-separated HSL channels ("220 20% 99%"); Cytoscape's
+  // colour parser wants the comma form, so normalise it.
+  const token = (name: string, fallback: string): string => {
+    const raw = cs.getPropertyValue(name).trim();
+    const parts = raw.split(/\s+/);
+    return parts.length === 3 ? `hsl(${parts[0]}, ${parts[1]}, ${parts[2]})` : fallback;
+  };
+  return {
+    surface: token('--card', DEFAULT_TOPOLOGY_THEME.surface),
+    ink: token('--foreground', DEFAULT_TOPOLOGY_THEME.ink),
+    border: token('--border', DEFAULT_TOPOLOGY_THEME.border),
+    muted: token('--muted-foreground', DEFAULT_TOPOLOGY_THEME.muted),
+    primary: token('--primary', DEFAULT_TOPOLOGY_THEME.primary)
+  };
+}
+
+/**
+ * Cytoscape stylesheet. Node styling keys off `data(infra)`/`data(status)`;
+ * edges color by measured provenance (`data(method)`):
+ *   lldp/cdp (high)   → solid blue   (#2563eb)
+ *   fdb (medium)      → solid green  (#16a34a)
+ *   manual (asserted) → solid black  (theme ink, adapts to dark mode)
+ * Theme-dependent neutrals (node border, labels, subnet box) come from `theme`
+ * so the canvas tracks light/dark; semantic hues (type fills, provenance edge
+ * colours, status pips, amber connect-source) are fixed and read on both.
+ */
+function buildStylesheet(theme: TopologyTheme): cytoscape.StylesheetStyle[] {
+  const nodeType = (ele: cytoscape.NodeSingular) =>
+    (ele.data('type') as TopologyNodeType) ?? 'unknown';
+  const nodeStatus = (ele: cytoscape.NodeSingular) =>
+    (ele.data('status') as TopologyNodeStatus) ?? 'online';
+
+  return [
+    {
+      // Device tile: type-colour fill, white glyph centred, status pip badged on
+      // the lower-right, hairline white border so it reads as a sticker on the
+      // canvas. Width/height/border animate for hover & selection feedback.
+      selector: 'node',
+      style: {
+        shape: 'round-rectangle',
+        'background-color': (ele: cytoscape.NodeSingular) =>
+          typeColors[nodeType(ele)] ?? typeColors.unknown,
+        'background-image': (ele: cytoscape.NodeSingular) => [
+          nodeIconUri(nodeType(ele)),
+          statusDotUri(nodeStatus(ele))
+        ],
+        'background-width': ['62%', '38%'],
+        'background-height': ['62%', '38%'],
+        'background-position-x': ['50%', '92%'],
+        'background-position-y': ['50%', '92%'],
+        'background-clip': ['none', 'none'],
+        'background-image-containment': 'over',
+        'bounds-expansion': 6,
+        'border-color': theme.surface,
+        'border-width': 2,
+        'border-opacity': 0.95,
+        label: 'data(label)',
+        color: theme.ink,
+        'font-size': 11,
+        'font-weight': 600,
+        'text-valign': 'bottom',
+        'text-margin-y': 6,
+        'text-background-color': theme.surface,
+        'text-background-opacity': 0.82,
+        'text-background-padding': 3,
+        'text-background-shape': 'round-rectangle',
+        'min-zoomed-font-size': 7,
+        width: 34,
+        height: 34,
+        'transition-property': 'width height border-width border-color opacity',
+        'transition-duration': '140ms',
+        'transition-timing-function': 'ease-out'
+      } as unknown as cytoscape.Css.Node
+    },
+    {
+      // Infrastructure (router/switch/firewall/AP): larger, anchors the subnet.
+      selector: 'node[?infra]',
+      style: {
+        width: 50,
+        height: 50,
+        'border-width': 2.5
+      } as cytoscape.Css.Node
+    },
+    {
+      // Subnet compound group: soft tinted card with a top-left label chip.
+      selector: '$node > node',
+      style: {
+        shape: 'round-rectangle',
+        'background-color': theme.muted,
+        'background-opacity': 0.05,
+        'background-image': 'none',
+        'border-width': 1,
+        'border-color': theme.border,
+        'border-opacity': 0.9,
+        label: 'data(label)',
+        'text-valign': 'top',
+        'text-halign': 'center',
+        'text-margin-y': -6,
+        'font-size': 11,
+        'font-weight': 600,
+        color: theme.muted,
+        'text-background-color': theme.surface,
+        'text-background-opacity': 0.9,
+        'text-background-padding': 4,
+        'text-background-shape': 'round-rectangle',
+        padding: 22
+      } as unknown as cytoscape.Css.Node
+    },
+    {
+      selector: 'edge',
+      style: {
+        width: 2.5,
+        'line-color': '#94a3b8',
+        'curve-style': 'bezier',
+        'line-cap': 'round',
+        'transition-property': 'width line-color opacity',
+        'transition-duration': '140ms',
+        'transition-timing-function': 'ease-out'
+      } as unknown as cytoscape.Css.Edge
+    },
+    {
+      selector: 'edge[method = "lldp"], edge[method = "cdp"]',
+      style: { 'line-color': '#2563eb', 'line-style': 'solid' } as cytoscape.Css.Edge
+    },
+    {
+      selector: 'edge[method = "fdb"]',
+      style: { 'line-color': '#16a34a', 'line-style': 'solid' } as cytoscape.Css.Edge
+    },
+    {
+      // Manual (hand-mapped) links: solid black in light, near-white in dark —
+      // uses the theme ink so it stays visible on both canvases (#1728).
+      selector: 'edge[method = "manual"]',
+      style: { 'line-color': theme.ink, 'line-style': 'solid' } as cytoscape.Css.Edge
+    },
+    // ── Interaction states ────────────────────────────────────────────────
+    {
+      // Hover: lift the tile and thicken its ring; cursor handled in JS.
+      selector: 'node.tp-hover',
+      style: {
+        'border-color': theme.border,
+        'border-width': 4,
+        'border-opacity': 1,
+        'z-index': 20
+      } as cytoscape.Css.Node
+    },
+    {
+      // Selection: brand-blue ring + halo, raised above neighbours.
+      selector: 'node.tp-selected',
+      style: {
+        'border-color': theme.primary,
+        'border-width': 4,
+        'border-opacity': 1,
+        'overlay-color': theme.primary,
+        'overlay-opacity': 0.14,
+        'overlay-padding': 7,
+        'z-index': 30
+      } as cytoscape.Css.Node
+    },
+    {
+      // Connect-gesture source (edit mode): dashed amber ring while awaiting the
+      // second tap.
+      selector: 'node.tp-connect-source',
+      style: {
+        'border-color': '#f59e0b',
+        'border-width': 4,
+        'border-opacity': 1,
+        'overlay-color': '#f59e0b',
+        'overlay-opacity': 0.16,
+        'overlay-padding': 7,
+        'z-index': 30
+      } as cytoscape.Css.Node
+    },
+    {
+      selector: 'edge.tp-hover, edge.tp-selected',
+      style: { width: 4.5, 'z-index': 25 } as cytoscape.Css.Edge
+    }
+  ];
+}
+
+// Persisted pan/zoom so a user's view survives reloads (#1728). Keyed by a
+// signature of the node set so a different topology (e.g. another org) doesn't
+// inherit a stale viewport — it falls back to fit-to-screen instead.
+const VIEWPORT_STORAGE_KEY = 'breeze.topology.viewport';
+
+type SavedViewport = { sig: string; zoom: number; pan: { x: number; y: number } };
+
+function topologySignature(nodes: TopologyNode[]): string {
+  const joined = nodes.map((n) => n.id).sort().join('|');
+  let hash = 0;
+  for (let i = 0; i < joined.length; i++) hash = (hash * 31 + joined.charCodeAt(i)) | 0;
+  return `${nodes.length}:${hash}`;
+}
+
+function readSavedViewport(): SavedViewport | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(VIEWPORT_STORAGE_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    if (
+      v &&
+      typeof v.sig === 'string' &&
+      Number.isFinite(v.zoom) &&
+      v.pan &&
+      Number.isFinite(v.pan.x) &&
+      Number.isFinite(v.pan.y)
+    ) {
+      return v as SavedViewport;
+    }
+  } catch {
+    /* malformed / storage disabled — ignore */
+  }
+  return null;
+}
+
+function saveViewport(v: SavedViewport): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(VIEWPORT_STORAGE_KEY, JSON.stringify(v));
+  } catch {
+    /* storage disabled — ignore */
+  }
+}
+
+function clearSavedViewport(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(VIEWPORT_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Ceiling on the zoom that fit-to-content may apply. Without it, a sparse graph
+// in a large canvas (e.g. after Expand) makes fit() zoom way in and the node
+// icons balloon. Capping keeps icons at roughly their designed size; the graph
+// just centres with margin instead of magnifying (#1728).
+const FIT_MAX_ZOOM = 1.1;
+
+function fitToContent(cy: cytoscape.Core): void {
+  if (!cy.elements().nonempty()) return;
+  cy.fit(undefined, 24);
+  if (cy.zoom() > FIT_MAX_ZOOM) {
+    // fit() centres the content; re-zoom around the viewport centre so it stays
+    // centred while we cap the level.
+    cy.zoom({ level: FIT_MAX_ZOOM, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+  }
+}
+
+export default function NetworkTopologyMap({
+  height = 600,
+  onNodeClick,
+  onEditApiReady
+}: NetworkTopologyMapProps) {
+  const { t } = useTranslation('discovery');
+  const [nodes, setNodes] = useState<TopologyNode[]>([]);
+  const [links, setLinks] = useState<TopologyLink[]>([]);
+  const [layout, setLayout] = useState<TopologyLayoutRow[]>([]);
+  const [profileSubnets, setProfileSubnets] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+
+  const localizedNodeLabel = useCallback(
+    (label: string, kind?: 'manual' | 'discovered' | null, role?: ManualRole | null) => {
+      if (kind !== 'manual' || !role || label !== MANUAL_ROLE_LABELS[role]) return label;
+      return t(/* i18n-dynamic */ MANUAL_ROLE_LABEL_KEYS[role]);
+    },
+    [t]
+  );
+
+  // Manual-mapping edit mode (issue #1728 Phase 4) — gated by topology:write.
+  const { can } = usePermissions();
+  const canEdit = can('topology', 'write');
+  const [editMode, setEditMode] = useState(false);
+  // The element selected in the canvas, shown in the inspector (manual edge →
+  // delete; measured edge → read-only provenance; manual node → delete).
+  const [selected, setSelected] = useState<SelectedElement | null>(null);
+  // Canvas pixel height, recomputed to fit the viewport so the map's header and
+  // the legends below it stay visible without scrolling the card (#1728).
+  const [canvasHeight, setCanvasHeight] = useState(height);
+  // Inline two-step delete confirm (#1728 critique): the first click on a delete
+  // button arms it ("Confirm delete?"), the second performs the irreversible
+  // action. Auto-disarms after 3s so a stray first click can't linger.
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Full-screen "Expand" mode (#1728): the card fills the viewport so the map
+  // gets the whole content area; Esc (or the toggle) exits.
+  const [expanded, setExpanded] = useState(false);
+  // The armed connect source (edit mode): set on the first tap, drives the
+  // "tap another node to connect" hint, cleared on the second tap or Esc (#1728).
+  const [connectSource, setConnectSource] = useState<string | null>(null);
+
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const cyRef = useRef<cytoscape.Core | null>(null);
+  // Viewport (pan/zoom) bookkeeping: `userMoved` suppresses auto-fit once the
+  // user takes control; `programmatic` flags our own fit/restore so the events
+  // they emit don't count as user input; the timer debounces persistence.
+  const userMovedViewportRef = useRef(false);
+  const programmaticViewRef = useRef(false);
+  const viewportSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // siteId per node, so a drag can persist the dragged node's own site.
+  const siteByNodeRef = useRef<Map<string, string | undefined>>(new Map());
+  // node ids that already have a saved (placed) position — Auto-arrange must not
+  // disturb these.
+  const placedRef = useRef<Set<string>>(new Set());
+  // Edit-mode two-tap connect state, read from inside the stable cy tap handler.
+  const editModeRef = useRef(false);
+  const connectSourceRef = useRef<string | null>(null);
+  const connectNodesRef = useRef<((s: string, t: string) => Promise<void>) | null>(null);
+
+  const fetchTopology = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(undefined);
+      const response = await fetchWithAuth('/discovery/topology');
+      if (!response.ok) {
+        throw new Error(t('networkTopologyMap.errors.fetch'));
+      }
+      const data = await response.json();
+      const rawNodes = data.nodes ?? data.data?.nodes ?? [];
+      const rawLinks = data.edges ?? data.links ?? data.data?.edges ?? [];
+      const rawSubnets: string[] = Array.isArray(data.subnets) ? data.subnets : [];
+      const rawLayout: TopologyLayoutRow[] = Array.isArray(data.layout) ? data.layout : [];
+
+      const mappedNodes: TopologyNode[] = rawNodes.map(mapNode);
+      const nodeIds = new Set(mappedNodes.map((n: TopologyNode) => n.id));
+
+      // Only ever render edges the backend actually observed (issue #1325). We
+      // deliberately do NOT fabricate adjacency from IP prefixes.
+      const mappedLinks: TopologyLink[] = rawLinks
+        .map(mapLink)
+        .filter((l: TopologyLink) => nodeIds.has(l.source) && nodeIds.has(l.target));
+
+      setNodes(mappedNodes);
+      setLinks(mappedLinks);
+      // Skip malformed layout rows so a bad x/y can't crash the canvas.
+      setLayout(
+        rawLayout.filter(
+          (r) => r && Number.isFinite(r.x) && Number.isFinite(r.y) && typeof r.nodeId === 'string'
+        )
+      );
+      setProfileSubnets(rawSubnets);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('networkTopologyMap.errors.generic'));
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  useEffect(() => {
+    fetchTopology();
+  }, [fetchTopology]);
+
+  const subnetGroups = useMemo(
+    () => groupNodesBySubnet(nodes, parseProfileSubnets(profileSubnets)),
+    [nodes, profileSubnets]
+  );
+
+  // subnet label per node → compound parent grouping.
+  const subnetByNodeId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const group of subnetGroups) {
+      // The "Ungrouped" bucket is not a real subnet — don't box those nodes in a
+      // compound parent (it produced a large overlapping container) and don't
+      // claim a subnet for them in the inspector.
+      if (group.label === UNGROUPED_LABEL) continue;
+      for (const node of group.nodes) map.set(node.id, group.label);
+    }
+    return map;
+  }, [subnetGroups]);
+
+  // Manual nodes require a site to scope the insert (RLS doesn't defend the site
+  // axis). The topology view is org-wide; derive the active site as the single
+  // distinct site among loaded nodes. If assets span multiple sites (or none has
+  // a site yet) we can't pick one unambiguously, so the palette is disabled.
+  const activeSiteId = useMemo(() => {
+    const siteIds = new Set<string>();
+    for (const n of nodes) if (n.siteId) siteIds.add(n.siteId);
+    return siteIds.size === 1 ? [...siteIds][0] : undefined;
+  }, [nodes]);
+
+  // Device-type legend only lists the types actually present on the map.
+  const presentTypes = useMemo(
+    () => (Object.keys(typeColors) as TopologyNodeType[]).filter((t) => nodes.some((n) => n.type === t)),
+    [nodes]
+  );
+
+  // Select a node from outside the canvas (the accessible device list / keyboard
+  // path). Mirrors a canvas tap: opens the inspector and drives the same
+  // selection-highlight effect, so keyboard + screen-reader users can reach every
+  // device without a pointer — the <canvas> itself isn't focusable (#1728 P0).
+  const selectNodeById = useCallback(
+    (node: TopologyNode) => {
+      setSelected({
+        id: node.id,
+        group: 'nodes',
+        kind: node.kind === 'manual' ? 'manual' : 'discovered',
+        label: localizedNodeLabel(node.label, node.kind, node.manualRole),
+        nodeType: node.type,
+        status: node.status,
+        ipAddress: node.ipAddress ?? null,
+        subnet: subnetByNodeId.get(node.id) ?? null,
+        manualRole: node.manualRole ?? null
+      });
+    },
+    [localizedNodeLabel, subnetByNodeId]
+  );
+
+  const addManualNode = useCallback(
+    async (role: ManualRole) => {
+      if (!activeSiteId) return;
+      try {
+        const node = await runAction<{ id: string; label: string; role: string }>({
+          request: () =>
+            fetchWithAuth('/discovery/topology/manual-node', {
+              method: 'POST',
+              body: JSON.stringify({ siteId: activeSiteId, role, label: MANUAL_ROLE_LABELS[role] })
+            }),
+          errorFallback: t('networkTopologyMap.errors.addNode'),
+          successMessage: t('networkTopologyMap.messages.nodeAdded'),
+          onUnauthorized: () => {
+            /* let the auth redirect handle it */
+          }
+        });
+        // Drop the new node onto the canvas (Phase 3 cy ref). It re-renders from
+        // the server on the next topology fetch; this gives immediate feedback.
+        cyRef.current?.add({
+          data: {
+            id: node.id,
+            label: localizedNodeLabel(node.label, 'manual', role),
+            kind: 'manual',
+            role
+          }
+        });
+      } catch (err) {
+        handleActionError(err, t('networkTopologyMap.errors.addNodeSentence'));
+      }
+    },
+    [activeSiteId, localizedNodeLabel, t]
+  );
+
+  // Resolve a node id to a manual-edge endpoint descriptor. Manual placeholders
+  // (kind 'manual') map to `manual_node`; everything else is a `discovered_asset`.
+  const endpointFor = useCallback(
+    (nodeId: string): { type: 'manual_node' | 'discovered_asset'; id: string } | null => {
+      const n = cyRef.current?.getElementById(nodeId);
+      if (!n || n.empty()) return null;
+      return { type: n.data('kind') === 'manual' ? 'manual_node' : 'discovered_asset', id: nodeId };
+    },
+    []
+  );
+
+  // Draw a manual edge between two nodes (#1728 phase 4). Self-connect is refused
+  // client-side; the created edge renders with the Phase 3 dashed-orange style
+  // keyed on `method:'manual'`.
+  const connectNodes = useCallback(
+    async (sourceId: string, targetId: string) => {
+      if (sourceId === targetId) return;
+      if (!activeSiteId) return;
+      const source = endpointFor(sourceId);
+      const target = endpointFor(targetId);
+      if (!source || !target) return;
+      try {
+        const edge = await runAction<{ id: string }>({
+          request: () =>
+            fetchWithAuth('/discovery/topology/manual-edge', {
+              method: 'POST',
+              body: JSON.stringify({ siteId: activeSiteId, source, target })
+            }),
+          errorFallback: t('networkTopologyMap.errors.connectNodes'),
+          successMessage: t('networkTopologyMap.messages.connectionAdded'),
+          onUnauthorized: () => {
+            /* let the auth redirect handle it */
+          }
+        });
+        cyRef.current?.add({
+          data: {
+            id: edge.id,
+            source: sourceId,
+            target: targetId,
+            method: 'manual',
+            confidence: 'asserted'
+          }
+        });
+      } catch (err) {
+        handleActionError(err, t('networkTopologyMap.errors.connectNodesSentence'));
+      }
+    },
+    [activeSiteId, endpointFor, t]
+  );
+
+  // Delete a manual edge (#1728 phase 4). The API only removes `method='manual'`
+  // rows; measured edges are scan-owned and have no delete path here.
+  const deleteManualEdge = useCallback(async (id: string) => {
+    try {
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/discovery/topology/manual-edge/${id}`, { method: 'DELETE' }),
+        errorFallback: t('networkTopologyMap.errors.deleteConnection'),
+        successMessage: t('networkTopologyMap.messages.connectionRemoved'),
+        onUnauthorized: () => {
+          /* let the auth redirect handle it */
+        }
+      });
+      cyRef.current?.getElementById(id)?.remove();
+      setSelected((cur) => (cur?.id === id ? null : cur));
+    } catch (err) {
+      handleActionError(err, t('networkTopologyMap.errors.deleteConnectionSentence'));
+    }
+  }, [t]);
+
+  // Delete a manual placeholder node (#1728 phase 4). The API cascade-cleans its
+  // manual edges + layout row server-side; locally we drop the node and its now
+  // orphaned edges from the canvas.
+  const deleteManualNode = useCallback(async (id: string) => {
+    try {
+      await runAction({
+        request: () =>
+          fetchWithAuth(`/discovery/topology/manual-node/${id}`, { method: 'DELETE' }),
+        errorFallback: t('networkTopologyMap.errors.deleteNode'),
+        successMessage: t('networkTopologyMap.messages.nodeRemoved'),
+        onUnauthorized: () => {
+          /* let the auth redirect handle it */
+        }
+      });
+      const el = cyRef.current?.getElementById(id);
+      el?.connectedEdges().remove();
+      el?.remove();
+      setSelected((cur) => (cur?.id === id ? null : cur));
+    } catch (err) {
+      handleActionError(err, t('networkTopologyMap.errors.deleteNodeSentence'));
+    }
+  }, [t]);
+
+  // Publish the imperative edit API once it (or its dependencies) change, and
+  // keep a ref for the stable cy tap handler's two-tap connect gesture.
+  const onEditApiReadyRef = useRef(onEditApiReady);
+  onEditApiReadyRef.current = onEditApiReady;
+  connectNodesRef.current = connectNodes;
+  editModeRef.current = editMode;
+  useEffect(() => {
+    onEditApiReadyRef.current?.({ connectNodes, selectElement: setSelected });
+  }, [connectNodes]);
+
+  // Reset the pending connect source + selection whenever edit mode is toggled.
+  useEffect(() => {
+    connectSourceRef.current = null;
+    setConnectSource(null);
+    setSelected(null);
+  }, [editMode]);
+
+  // Arm the inline delete confirm; auto-disarm after 3s.
+  const armDelete = useCallback(() => {
+    setConfirmDelete(true);
+    if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current);
+    confirmTimerRef.current = setTimeout(() => setConfirmDelete(false), 3000);
+  }, []);
+
+  // A new selection (or a cleared one) always starts disarmed.
+  useEffect(() => {
+    setConfirmDelete(false);
+    if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current);
+    return () => {
+      if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current);
+    };
+  }, [selected]);
+
+  const persistDrag = useCallback(
+    async (
+      nodeId: string,
+      x: number,
+      y: number,
+      nodeType: 'discovered_asset' | 'manual_node'
+    ) => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const siteId = siteByNodeRef.current.get(nodeId);
+    if (!siteId) return; // can't scope the upsert without a site
+    try {
+      await runAction({
+        request: () =>
+          fetchWithAuth('/discovery/topology/layout', {
+            method: 'PATCH',
+            body: JSON.stringify({
+              siteId,
+              positions: [{ nodeType, nodeId, x, y }]
+            })
+          }),
+        errorFallback: t('networkTopologyMap.errors.savePosition'),
+        successMessage: t('networkTopologyMap.messages.layoutSaved'),
+        onUnauthorized: () => {
+          /* let the auth redirect handle it */
+        }
+      });
+      placedRef.current.add(nodeId);
+    } catch {
+      // runAction already surfaced the error toast; nothing else to do here.
+    }
+    },
+    [t]
+  );
+
+  // (Re)build the Cytoscape graph whenever the data changes.
+  useEffect(() => {
+    if (!mountRef.current) return;
+    registerFcose();
+
+    // Track which nodes have a saved position (consumed by preset; protected by
+    // Auto-arrange).
+    const layoutById = new Map<string, TopologyLayoutRow>();
+    for (const row of layout) layoutById.set(row.nodeId, row);
+    placedRef.current = new Set(layoutById.keys());
+
+    // siteId lookup for drag persistence.
+    const siteMap = new Map<string, string | undefined>();
+    for (const n of nodes) siteMap.set(n.id, n.siteId);
+    siteByNodeRef.current = siteMap;
+
+    // Compound parents for subnet groups; child nodes reference their parent.
+    const parentIds = new Set<string>();
+    const elements: cytoscape.ElementDefinition[] = [];
+    for (const group of subnetGroups) {
+      if (group.nodes.length === 0) continue;
+      if (group.label === UNGROUPED_LABEL) continue; // no compound box for the catch-all bucket
+      const parentId = `group:${group.label}`;
+      parentIds.add(parentId);
+      elements.push({ data: { id: parentId, label: group.label } });
+    }
+    for (const node of nodes) {
+      const subnet = subnetByNodeId.get(node.id);
+      const parent = subnet ? `group:${subnet}` : undefined;
+      const saved = layoutById.get(node.id);
+      const data: Record<string, unknown> = {
+        id: node.id,
+        label: localizedNodeLabel(node.label, node.kind, node.manualRole),
+        type: node.type,
+        status: node.status,
+        ipAddress: node.ipAddress ?? null,
+        subnet: subnet ?? null,
+        infra: INFRA_TYPES.has(node.type) ? 1 : 0,
+        // Preserve provenance so a server-reloaded manual node is still
+        // connect/delete-able (endpointFor + the tap handler key off data.kind).
+        kind: node.kind ?? 'discovered',
+        manualRole: node.manualRole ?? null
+      };
+      if (parent && parentIds.has(parent)) data.parent = parent;
+      const def: cytoscape.ElementDefinition = { data };
+      if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+        def.position = { x: saved.x, y: saved.y };
+      }
+      elements.push(def);
+    }
+    for (const link of links) {
+      elements.push({
+        data: {
+          id: link.id,
+          source: link.source,
+          target: link.target,
+          method: link.method ?? null,
+          confidence: link.confidence ?? null,
+          interfaceName: link.interfaceName ?? null,
+          vlan: link.vlan ?? null
+        }
+      });
+    }
+
+    const cy = cytoscape({
+      container: mountRef.current,
+      elements,
+      style: buildStylesheet(readTopologyTheme()),
+      // preset: consume saved positions; never auto-layout on every render.
+      layout: { name: 'preset' },
+      wheelSensitivity: 0.2,
+      // Pan + scroll-zoom are always on; only node-dragging is edit-only (#1728).
+      // The editMode effect keeps `autoungrabify` in sync on toggle.
+      userPanningEnabled: true,
+      userZoomingEnabled: true,
+      autoungrabify: !editModeRef.current,
+      boxSelectionEnabled: false
+    });
+    cyRef.current = cy;
+
+    // The container may have been laid out (or resized from a hidden tab) after
+    // cytoscape measured it; re-measure and frame the saved positions so nodes
+    // are visible on first paint rather than parked off-screen.
+    const sig = topologySignature(nodes);
+    userMovedViewportRef.current = false;
+    const fitView = () => {
+      if (!cy.elements().nonempty()) return;
+      programmaticViewRef.current = true;
+      fitToContent(cy);
+      programmaticViewRef.current = false;
+    };
+
+    cy.resize();
+    // Restore the saved pan/zoom for THIS topology (matched by signature) so the
+    // view survives reloads; otherwise frame the whole graph (#1728).
+    const saved = readSavedViewport();
+    if (saved && saved.sig === sig) {
+      programmaticViewRef.current = true;
+      cy.zoom(saved.zoom);
+      cy.pan(saved.pan);
+      programmaticViewRef.current = false;
+      userMovedViewportRef.current = true; // honor it; don't auto-refit over it
+    } else {
+      fitView();
+    }
+
+    // A user pan/zoom takes control of the viewport and is persisted (debounced).
+    // The programmatic guard ignores the events our own fit/restore emits.
+    cy.on('zoom pan', () => {
+      if (programmaticViewRef.current) return;
+      userMovedViewportRef.current = true;
+      if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
+      viewportSaveTimerRef.current = setTimeout(() => {
+        const c = cyRef.current;
+        if (c) saveViewport({ sig, zoom: c.zoom(), pan: c.pan() });
+      }, 400);
+    });
+
+    // Keep the graph framed when the container resizes (height recompute, window
+    // width changes, sidebar collapse) — unless the user has taken control of the
+    // viewport, in which case their pan/zoom is preserved. rAF-debounced.
+    let refitRaf = 0;
+    const resizeObserver =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            cancelAnimationFrame(refitRaf);
+            refitRaf = requestAnimationFrame(() => {
+              const c = cyRef.current;
+              if (!c) return;
+              c.resize();
+              if (!userMovedViewportRef.current) fitView();
+            });
+          })
+        : null;
+    if (resizeObserver && mountRef.current) resizeObserver.observe(mountRef.current);
+
+    cy.on('dragfree', 'node', (evt: cytoscape.EventObject) => {
+      const target = evt.target as cytoscape.NodeSingular;
+      const id = target.id();
+      // Synthetic subnet-group compound parents (id 'group:<subnet>') are not
+      // persistable nodes — skip them so the layout PATCH never 400s on a
+      // non-asset/manual id with no site (#1728).
+      if (id.startsWith('group:')) return;
+      const pos = target.position();
+      const nodeType: 'discovered_asset' | 'manual_node' =
+        target.data('kind') === 'manual' ? 'manual_node' : 'discovered_asset';
+      void persistDrag(id, pos.x, pos.y, nodeType);
+    });
+
+    // Build the inspector descriptor for a node tap (label/type/status/ip), so a
+    // tap always surfaces the device's basics even before/without the full asset
+    // record.
+    const nodeSelection = (node: cytoscape.NodeSingular): SelectedElement => ({
+      id: node.id(),
+      group: 'nodes',
+      kind: node.data('kind') === 'manual' ? 'manual' : 'discovered',
+      label: (node.data('label') as string | null) ?? null,
+      nodeType: (node.data('type') as TopologyNodeType | null) ?? null,
+      status: (node.data('status') as TopologyNodeStatus | null) ?? null,
+      ipAddress: (node.data('ipAddress') as string | null) ?? null,
+      subnet: (node.data('subnet') as string | null) ?? null
+    });
+
+    cy.on('tap', 'node', (evt: cytoscape.EventObject) => {
+      const node = evt.target as cytoscape.NodeSingular;
+      const id = node.id();
+      // Subnet-group compound parents are not selectable devices.
+      if (id.startsWith('group:')) {
+        setSelected(null);
+        return;
+      }
+      // In edit mode, taps drive a two-tap connect gesture: first tap selects the
+      // source, second tap on a different node draws the manual edge. The first
+      // tap also opens the inspector so a manual node can be deleted.
+      if (editModeRef.current) {
+        const source = connectSourceRef.current;
+        if (!source) {
+          connectSourceRef.current = id;
+          setConnectSource(id);
+          setSelected(nodeSelection(node));
+          return;
+        }
+        connectSourceRef.current = null;
+        setConnectSource(null);
+        if (source !== id) void connectNodesRef.current?.(source, id);
+        // Clear the source's amber ring once the gesture resolves.
+        setSelected(null);
+        return;
+      }
+      // A tap only *selects* the node (opens the inspector). Opening the full
+      // asset detail is a deliberate second step via the inspector's "View
+      // details" button (#1728) — a single tap must never navigate away.
+      setSelected(nodeSelection(node));
+    });
+
+    // Tapping an edge opens the inspector: a manual edge can be deleted, a
+    // measured edge shows read-only provenance.
+    cy.on('tap', 'edge', (evt: cytoscape.EventObject) => {
+      const edge = evt.target as cytoscape.EdgeSingular;
+      setSelected({
+        id: edge.id(),
+        group: 'edges',
+        method: (edge.data('method') as TopologyEdgeMethod | null) ?? null,
+        confidence: (edge.data('confidence') as string | null) ?? null,
+        interfaceName: (edge.data('interfaceName') as string | null) ?? null,
+        vlan: (edge.data('vlan') as number | null) ?? null
+      });
+    });
+
+    // Tapping empty canvas clears the selection.
+    cy.on('tap', (evt: cytoscape.EventObject) => {
+      if (evt.target === cy) setSelected(null);
+    });
+
+    // Hover affordance: lift the element and switch the cursor to a pointer.
+    // `mouseout` is unreliable — it's missed on fast moves, when the element
+    // slides out from under the cursor on pan/zoom, or when the pointer leaves
+    // the canvas — which leaves a hover ring stuck. So we keep at most one element
+    // hovered, and also clear on container-leave and viewport changes (#1728).
+    const container = cy.container();
+    const clearHover = () => {
+      cy.elements('.tp-hover').removeClass('tp-hover');
+      if (container) container.style.cursor = 'default';
+    };
+    cy.on('mouseover', 'node, edge', (evt: cytoscape.EventObject) => {
+      const ele = evt.target as cytoscape.SingularElementArgument;
+      if (ele.isNode() && ele.id().startsWith('group:')) return;
+      cy.elements('.tp-hover').not(ele).removeClass('tp-hover');
+      ele.addClass('tp-hover');
+      if (container) container.style.cursor = 'pointer';
+    });
+    cy.on('mouseout', 'node, edge', (evt: cytoscape.EventObject) => {
+      (evt.target as cytoscape.SingularElementArgument).removeClass('tp-hover');
+      if (container) container.style.cursor = 'default';
+    });
+    cy.on('pan zoom', clearHover);
+    container?.addEventListener('mouseleave', clearHover);
+
+    return () => {
+      cancelAnimationFrame(refitRaf);
+      resizeObserver?.disconnect();
+      if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
+      container?.removeEventListener('mouseleave', clearHover);
+      cy.destroy();
+      cyRef.current = null;
+    };
+  }, [nodes, links, layout, subnetGroups, subnetByNodeId, persistDrag, localizedNodeLabel]);
+
+  // Selection highlight: ring the selected element only — no dimming of the rest
+  // of the graph. In edit mode a selected node is the pending connect source
+  // (amber) rather than a plain selection.
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    cy.batch(() => {
+      cy.elements().removeClass('tp-selected tp-connect-source');
+      if (!selected) return;
+      const el = cy.getElementById(selected.id);
+      if (el.empty()) return;
+      el.addClass(selected.group === 'nodes' && editMode ? 'tp-connect-source' : 'tp-selected');
+    });
+  }, [selected, editMode, nodes, links]);
+
+  // Edit-only interactivity (#1728): in view mode the map is a static diagram —
+  // no pan, no scroll-zoom, no node dragging. Edit mode unlocks all three. The
+  // same flags are set at cy-creation from editModeRef so a data-driven rebuild
+  // preserves the current mode.
+  // View mode allows pan + scroll-zoom so a technician can read a large map;
+  // only node *dragging* (repositioning) is gated to edit mode (#1728).
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    cy.userPanningEnabled(true);
+    cy.userZoomingEnabled(true);
+    cy.autoungrabify(!editMode);
+  }, [editMode]);
+
+  // Esc cancels a pending connection first; otherwise it exits full-screen expand.
+  useEffect(() => {
+    if (!connectSource && !expanded) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (connectSource) {
+        connectSourceRef.current = null;
+        setConnectSource(null);
+        setSelected(null);
+      } else if (expanded) {
+        setExpanded(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [connectSource, expanded]);
+
+  // Rebuild the canvas stylesheet from the resolved design tokens whenever the
+  // theme flips (the `dark` class toggles on <html>), so the graph tracks
+  // light/dark instead of staying a light island in a dark shell (#1728).
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const apply = () => cyRef.current?.style(buildStylesheet(readTopologyTheme()));
+    const observer = new MutationObserver(apply);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    return () => observer.disconnect();
+  }, []);
+
+  // Fit the canvas height to the viewport so the legends below the map stay
+  // visible without scrolling the card off-screen. The chrome above the canvas
+  // (mountTop) and the intrinsic height of the content below it are both
+  // independent of the canvas height, so this converges in a single pass.
+  // Re-runs when surrounding chrome changes (inspector/palette) or on resize.
+  useLayoutEffect(() => {
+    const recompute = () => {
+      const mount = mountRef.current;
+      const card = cardRef.current;
+      if (!mount || !card) return;
+      const mountRect = mount.getBoundingClientRect();
+      // Measure the below-canvas content (device list + its margin + the card's
+      // bottom padding) DIRECTLY by summing the canvas wrapper's following
+      // siblings. We can't derive it from the card's rendered/scroll height: in
+      // expand mode the card is `fixed inset-0`, so both are pinned to the
+      // viewport and would feed the canvas height back into itself.
+      const wrap = mount.closest('[data-testid="topology-canvas-wrap"]') ?? mount.parentElement;
+      let below = parseFloat(getComputedStyle(card).paddingBottom) || 0;
+      let sib = wrap?.nextElementSibling ?? null;
+      while (sib) {
+        below += sib.getBoundingClientRect().height + (parseFloat(getComputedStyle(sib).marginTop) || 0);
+        sib = sib.nextElementSibling;
+      }
+      const available = window.innerHeight - mountRect.top - below - 16;
+      // The inspector + edit palette float OVER the canvas (absolute), so they
+      // no longer steal flow height and selecting a node never reflows the page.
+      // Normal mode caps the height to a comfortable band; expand mode lets the
+      // map take the whole viewport.
+      const cap = expanded ? 4000 : 760;
+      setCanvasHeight(Math.max(420, Math.min(cap, Math.round(available))));
+    };
+    recompute();
+    window.addEventListener('resize', recompute);
+    return () => window.removeEventListener('resize', recompute);
+    // Intentionally NOT keyed on `selected`/`editMode`: the overlays don't change
+    // the canvas height, so re-measuring on selection would just cause churn.
+  }, [subnetGroups, presentTypes, links.length, nodes.length, loading, expanded]);
+
+
+  // Auto-arrange: lay out ONLY never-placed nodes; pinned/positioned nodes are
+  // locked first so their saved positions are preserved.
+  const autoArrange = useCallback(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    const placed = placedRef.current;
+    const locked = cy.nodes().filter((n: cytoscape.NodeSingular) => placed.has(n.id()));
+    locked.lock();
+    const unplaced = cy.nodes().filter((n: cytoscape.NodeSingular) => !placed.has(n.id()));
+    unplaced
+      .layout({ name: 'fcose', animate: false, randomize: false } as cytoscape.LayoutOptions)
+      .run();
+    locked.unlock();
+  }, []);
+
+  // "Fit": drop any saved/locked viewport and frame the whole graph again. The
+  // escape hatch after the user has panned/zoomed away (#1728).
+  const resetView = useCallback(() => {
+    const cy = cyRef.current;
+    if (!cy) return;
+    userMovedViewportRef.current = false;
+    if (viewportSaveTimerRef.current) clearTimeout(viewportSaveTimerRef.current);
+    clearSavedViewport();
+    programmaticViewRef.current = true;
+    fitToContent(cy);
+    programmaticViewRef.current = false;
+  }, []);
+
+  if (loading && nodes.length === 0) {
+    return (
+      <div className="flex items-center justify-center rounded-lg border bg-card p-10 shadow-xs">
+        <div className="text-center">
+          <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('networkTopologyMap.loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && nodes.length === 0) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        <button
+          type="button"
+          onClick={fetchTopology}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          {t('networkTopologyMap.tryAgain')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      ref={cardRef}
+      className={cn(
+        'rounded-lg border bg-card p-6 shadow-xs',
+        expanded && 'fixed inset-0 z-40 m-0 overflow-auto rounded-none p-4'
+      )}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <h2 className="text-base font-semibold">{t('networkTopologyMap.title')}</h2>
+          {editMode && (
+            <span className="text-xs text-muted-foreground">{t('networkTopologyMap.editHint')}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {nodes.length > 0 && (
+            <button
+              type="button"
+              data-testid="topology-fit-view"
+              onClick={resetView}
+              title={t('networkTopologyMap.actions.fitTitle')}
+              className="inline-flex items-center gap-1.5 rounded-md border bg-card px-2.5 py-1.5 text-sm font-medium text-foreground shadow-xs transition hover:bg-muted active:scale-[0.98]"
+            >
+              <Frame className="h-4 w-4 text-muted-foreground" aria-hidden />
+              {t('networkTopologyMap.actions.fit')}
+            </button>
+          )}
+          <button
+            type="button"
+            data-testid="topology-expand-toggle"
+            aria-pressed={expanded}
+            onClick={() => setExpanded((v) => !v)}
+            title={expanded ? t('networkTopologyMap.actions.exitFullScreenTitle') : t('networkTopologyMap.actions.expandTitle')}
+            className="inline-flex items-center gap-1.5 rounded-md border bg-card px-2.5 py-1.5 text-sm font-medium text-foreground shadow-xs transition hover:bg-muted active:scale-[0.98]"
+          >
+            {expanded ? (
+              <Minimize2 className="h-4 w-4 text-muted-foreground" aria-hidden />
+            ) : (
+              <Maximize2 className="h-4 w-4 text-muted-foreground" aria-hidden />
+            )}
+            {expanded ? t('networkTopologyMap.actions.collapse') : t('networkTopologyMap.actions.expand')}
+          </button>
+          {editMode && (
+            <button
+              type="button"
+              data-testid="topology-auto-arrange"
+              onClick={autoArrange}
+              className="inline-flex items-center gap-1.5 rounded-md border bg-card px-2.5 py-1.5 text-sm font-medium text-foreground shadow-xs transition hover:bg-muted active:scale-[0.98]"
+            >
+              <LayoutGrid className="h-4 w-4 text-muted-foreground" aria-hidden />
+              {t('networkTopologyMap.actions.autoArrange')}
+            </button>
+          )}
+          {canEdit && (
+            <button
+              type="button"
+              data-testid="topology-edit-toggle"
+              aria-pressed={editMode}
+              onClick={() => setEditMode((v) => !v)}
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium shadow-xs transition active:scale-[0.98]',
+                editMode
+                  ? 'bg-foreground text-background hover:opacity-90'
+                  : 'bg-primary text-primary-foreground hover:opacity-90'
+              )}
+            >
+              {editMode ? <Check className="h-4 w-4" aria-hidden /> : <Pencil className="h-4 w-4" aria-hidden />}
+              {editMode ? t('networkTopologyMap.actions.doneEditing') : t('networkTopologyMap.actions.editMap')}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Map + floating overlays. The inspector and edit palette are positioned
+          OVER the canvas (absolute) so selecting a node never reflows the page —
+          the map keeps its size and nothing jumps (#1728 feedback). */}
+      <div className="relative mt-4" data-testid="topology-canvas-wrap">
+      {editMode && connectSource && (
+        <div
+          data-testid="topology-connect-hint"
+          className="animate-in pointer-events-none absolute left-1/2 top-3 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full border border-amber-400/60 bg-card px-3.5 py-1.5 text-xs font-medium text-foreground shadow-md"
+        >
+          <span className="h-2 w-2 shrink-0 rounded-full bg-amber-500 motion-safe:animate-pulse" />
+          {t('networkTopologyMap.connectHint')}
+          <span className="text-muted-foreground">{t('networkTopologyMap.escToCancel')}</span>
+        </div>
+      )}
+      {editMode && canEdit && (
+        <div
+          className="animate-in absolute left-3 top-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap items-center gap-2 rounded-lg border border-primary/40 bg-card px-3 py-2 shadow-md"
+          data-testid="topology-edit-palette"
+        >
+          <span className="text-xs font-semibold text-muted-foreground">{t('networkTopologyMap.addNodeLabel')}</span>
+          <div className="flex flex-wrap gap-1" role="group" aria-label={t('networkTopologyMap.addNodeAria')}>
+            {MANUAL_ROLES.map((r) => (
+              <button
+                key={r}
+                type="button"
+                data-testid={`topology-add-node-${r}`}
+                disabled={!activeSiteId}
+                title={
+                  activeSiteId
+                    ? t('networkTopologyMap.actions.addPlaceholderTitle', { role: t(/* i18n-dynamic */ MANUAL_ROLE_LABEL_KEYS[r]) })
+                    : t('networkTopologyMap.actions.selectSingleSiteTitle')
+                }
+                onClick={() => void addManualNode(r)}
+                className="rounded border px-2 py-1 text-xs font-medium text-foreground transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {t(/* i18n-dynamic */ MANUAL_ROLE_LABEL_KEYS[r])}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {selected && (
+        <div
+          className={cn(
+            'animate-in absolute inset-x-3 bottom-3 z-10 flex flex-wrap items-center gap-3 rounded-lg border bg-card px-3 py-2.5 shadow-lg sm:inset-x-auto sm:left-3 sm:right-3 md:right-auto md:max-w-[480px]',
+            // In edit mode the card must not block the two-tap connect gesture —
+            // taps pass through to the canvas; only its buttons stay clickable.
+            editMode && 'pointer-events-none'
+          )}
+          data-testid="topology-inspector"
+        >
+          {selected.group === 'nodes' && (
+            <>
+              <NodeBadge type={selected.nodeType ?? 'unknown'} size={34} />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span className="truncate text-sm font-semibold text-foreground">
+                    {selected.label || t('common:labels.device')}
+                  </span>
+                  {selected.status && (
+                    <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                      <span className={cn('h-1.5 w-1.5 rounded-full', statusDotClass[selected.status])} />
+                      {t(/* i18n-dynamic */ statusLabelKey[selected.status])}
+                    </span>
+                  )}
+                  {selected.kind === 'manual' && (
+                    <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      {t('networkTopologyMap.manualBadge')}
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+                  <span>{t(/* i18n-dynamic */ typeLabelKey[selected.nodeType ?? 'unknown'])}</span>
+                  {selected.ipAddress && (
+                    <>
+                      <span className="text-muted-foreground/40">·</span>
+                      <span className="font-mono">{selected.ipAddress}</span>
+                    </>
+                  )}
+                  {selected.subnet && (
+                    <>
+                      <span className="text-muted-foreground/40">·</span>
+                      <span>{selected.subnet}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              {selected.kind !== 'manual' && onNodeClick && (
+                <button
+                  type="button"
+                  data-testid="topology-inspector-view-details"
+                  onClick={() => onNodeClick(selected.id)}
+                  className="pointer-events-auto inline-flex items-center gap-1 rounded-md border bg-card px-2.5 py-1.5 text-xs font-medium text-foreground transition hover:bg-muted active:scale-[0.98]"
+                >
+                  {t('networkTopologyMap.actions.viewDetails')}
+                  <ArrowRight className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              )}
+              {selected.kind === 'manual' && editMode && (
+                <button
+                  type="button"
+                  data-testid="topology-delete-node"
+                  aria-label={confirmDelete ? t('networkTopologyMap.actions.confirmDeleteNode') : t('networkTopologyMap.actions.deleteNode')}
+                  onClick={() => (confirmDelete ? void deleteManualNode(selected.id) : armDelete())}
+                  className={cn(
+                    'pointer-events-auto rounded-md px-2.5 py-1.5 text-xs font-medium transition',
+                    confirmDelete
+                      ? 'bg-destructive text-destructive-foreground hover:opacity-90'
+                      : 'border border-destructive/50 text-destructive hover:bg-destructive/10'
+                  )}
+                >
+                  {confirmDelete ? t('networkTopologyMap.actions.confirmDelete') : t('networkTopologyMap.actions.deleteNode')}
+                </button>
+              )}
+            </>
+          )}
+
+          {selected.group === 'edges' && (
+            <>
+              <span
+                className={cn(
+                  'flex u-h-px-34 w-[34px] shrink-0 items-center justify-center rounded-md shadow-xs',
+                  selected.method === 'manual' ? 'bg-foreground text-background' : 'text-white'
+                )}
+                style={
+                  selected.method === 'manual'
+                    ? undefined
+                    : { backgroundColor: EDGE_METHOD_META[selected.method ?? 'manual']?.color ?? '#64748b' }
+                }
+              >
+                <Network className="h-4 w-4" aria-hidden />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-semibold text-foreground">{t('networkTopologyMap.connection')}</span>
+                  <span
+                    className={cn(
+                      'rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
+                      selected.method === 'manual' ? 'bg-foreground text-background' : 'text-white'
+                    )}
+                    style={
+                      selected.method === 'manual'
+                        ? undefined
+                        : { backgroundColor: EDGE_METHOD_META[selected.method ?? 'manual']?.color ?? '#64748b' }
+                    }
+                  >
+                    {t(/* i18n-dynamic */ EDGE_METHOD_META[selected.method ?? 'manual']?.labelKey ?? 'common:states.unknown')}
+                  </span>
+                  {selected.method === 'manual' ? (
+                    <span className="text-xs text-muted-foreground">{t('networkTopologyMap.handMapped')}</span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">{t('networkTopologyMap.measuredAdjacency')}</span>
+                  )}
+                </div>
+                <div
+                  data-testid="topology-edge-provenance"
+                  className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground"
+                >
+                  {selected.confidence && <span className="capitalize">{t('networkTopologyMap.confidence', { confidence: selected.confidence })}</span>}
+                  {selected.interfaceName && (
+                    <>
+                      <span className="text-muted-foreground/40">·</span>
+                      <span className="font-mono">{selected.interfaceName}</span>
+                    </>
+                  )}
+                  {selected.vlan != null && (
+                    <>
+                      <span className="text-muted-foreground/40">·</span>
+                      <span>{t('networkTopologyMap.vlan', { vlan: selected.vlan })}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              {selected.method === 'manual' && editMode && (
+                <button
+                  type="button"
+                  data-testid="topology-delete-edge"
+                  aria-label={confirmDelete ? t('networkTopologyMap.actions.confirmDeleteConnection') : t('networkTopologyMap.actions.deleteConnection')}
+                  onClick={() => (confirmDelete ? void deleteManualEdge(selected.id) : armDelete())}
+                  className={cn(
+                    'pointer-events-auto rounded-md px-2.5 py-1.5 text-xs font-medium transition',
+                    confirmDelete
+                      ? 'bg-destructive text-destructive-foreground hover:opacity-90'
+                      : 'border border-destructive/50 text-destructive hover:bg-destructive/10'
+                  )}
+                >
+                  {confirmDelete ? t('networkTopologyMap.actions.confirmDelete') : t('networkTopologyMap.actions.deleteConnection')}
+                </button>
+              )}
+              {selected.method !== 'manual' && editMode && (
+                <span
+                  data-testid="topology-edge-locked-note"
+                  className="text-xs italic text-muted-foreground"
+                >
+                  {t('networkTopologyMap.measuredNotEditable')}
+                </span>
+              )}
+            </>
+          )}
+
+          <button
+            type="button"
+            aria-label={t('networkTopologyMap.actions.clearSelection')}
+            onClick={() => setSelected(null)}
+            className="pointer-events-auto ml-auto flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground sm:ml-0"
+          >
+            <X className="h-4 w-4" aria-hidden />
+          </button>
+        </div>
+      )}
+
+      {/* Floating legend (#1728): status + link provenance + device-type key,
+          consolidated into one collapsible corner panel so the legends no longer
+          eat vertical space below the map. */}
+      {nodes.length > 0 && (
+        <details
+          open
+          data-testid="topology-legend"
+          className="absolute right-3 top-3 z-10 max-w-[240px] overflow-hidden rounded-lg border bg-card chart-legend-xs shadow-md"
+        >
+          <summary className="flex cursor-pointer select-none items-center gap-1.5 px-2.5 py-1.5 font-semibold text-muted-foreground transition hover:text-foreground">
+            <Network className="h-3.5 w-3.5" aria-hidden />
+            {t('networkTopologyMap.legend.title')}
+          </summary>
+          <div className="space-y-2 border-t px-2.5 py-2">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground">
+              {(['online', 'warning', 'offline'] as TopologyNodeStatus[]).map((s) => (
+                <span key={s} className="flex items-center gap-1.5">
+                  <span className={cn('h-2 w-2 rounded-full ring-2 ring-background', statusDotClass[s])} />
+                  {t(/* i18n-dynamic */ statusLabelKey[s])}
+                </span>
+              ))}
+            </div>
+            {links.length > 0 && (
+              <div
+                data-testid="topology-provenance-legend"
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2 text-muted-foreground"
+              >
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block u-h-px-3 w-5 rounded-full" style={{ backgroundColor: '#2563eb' }} />
+                  {t('networkTopologyMap.legend.lldpCdp')}
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block u-h-px-3 w-5 rounded-full" style={{ backgroundColor: '#16a34a' }} />
+                  {t('networkTopologyMap.edgeMethods.fdb')}
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className="inline-block u-h-px-3 w-5 rounded-full"
+                    style={{ backgroundColor: 'hsl(var(--foreground))' }}
+                  />
+                  {t('networkTopologyMap.edgeMethods.manual')}
+                </span>
+              </div>
+            )}
+            {presentTypes.length > 0 && (
+              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 border-t pt-2 text-muted-foreground">
+                {presentTypes.map((type) => (
+                  <span key={type} className="flex items-center gap-1">
+                    <NodeBadge type={type} size={14} />
+                    {t(/* i18n-dynamic */ typeLabelKey[type] ?? 'common:states.unknown')}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </details>
+      )}
+
+      {error && nodes.length > 0 && (
+        <div className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      {/* Honesty note: we only draw connections we actually observed. Shown only
+          when nothing has been measured yet — once links exist the legend carries
+          the provenance and the note is just noise. */}
+      {links.length === 0 && nodes.length > 0 && (
+        <div
+          data-testid="topology-adjacency-note"
+          className="mt-4 rounded-md border border-info/30 bg-info/6 px-3 py-2 text-xs text-info"
+        >
+          {t('networkTopologyMap.adjacencyNote')}
+        </div>
+      )}
+
+      <div
+        ref={mountRef}
+        data-testid="topology-cytoscape"
+        role="img"
+        aria-label={
+          nodes.length > 0
+            ? t('networkTopologyMap.canvasAriaWithDevices', {
+                count: nodes.length,
+                suffix: nodes.length === 1 ? '' : 's'
+              })
+            : t('networkTopologyMap.canvasAriaEmpty')
+        }
+        className="relative w-full overflow-hidden rounded-md border bg-muted/30 bg-[radial-gradient(hsl(var(--border))_1px,transparent_0)] bg-size-[22px_22px]"
+        // Cytoscape requires a real pixel height on its container. An inline style
+        // is used deliberately: the `u-h-px-*` utility classes are runtime-built
+        // (`u-h-px-${n}`) and get purged from the production CSS, so a class-based
+        // height collapses the canvas to 0 in prod (issue #1728). The value is
+        // viewport-fitted (see the recompute effect) so the legends stay visible.
+        style={{ height: `${canvasHeight}px` }}
+      >
+        {nodes.length === 0 && !loading && (
+          <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 text-center">
+            <span className="flex h-12 w-12 items-center justify-center rounded-xl border bg-card text-muted-foreground/70 shadow-xs">
+              <Network className="h-6 w-6" aria-hidden />
+            </span>
+            <p className="text-sm font-medium text-foreground">{t('networkTopologyMap.empty.title')}</p>
+            <p className="max-w-xs text-xs text-muted-foreground">
+              {t('networkTopologyMap.empty.description')}
+            </p>
+          </div>
+        )}
+      </div>
+      </div>
+
+      {/* Accessible device list (#1728 P0): a keyboard-focusable, screen-reader
+          enumerable route to every node, since the Cytoscape <canvas> exposes no
+          DOM. Selecting a row drives the same inspector + canvas highlight as a
+          tap. Collapsed by default to stay out of the sighted/mouse user's way. */}
+      {nodes.length > 0 && (
+        <details className="mt-4 rounded-md border bg-card" data-testid="topology-device-list">
+          <summary className="cursor-pointer select-none rounded-md px-3 py-2 text-xs font-semibold text-muted-foreground transition hover:text-foreground">
+            {t('networkTopologyMap.allDevices', { count: nodes.length })}
+          </summary>
+          <ul className="max-h-64 overflow-auto border-t p-1.5" role="list">
+            {nodes.map((n) => (
+              <li key={n.id}>
+                <button
+                  type="button"
+                  data-testid={`topology-device-row-${n.id}`}
+                  aria-pressed={selected?.id === n.id}
+                  onClick={() => selectNodeById(n)}
+                  className={cn(
+                    'flex w-full items-center gap-2.5 rounded px-2 py-1.5 text-left text-xs transition hover:bg-muted',
+                    selected?.id === n.id && 'bg-muted'
+                  )}
+                >
+                  <NodeBadge type={n.type} size={20} />
+                  <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+                    {localizedNodeLabel(n.label, n.kind, n.manualRole)}
+                  </span>
+                  <span className="hidden items-center gap-1 text-muted-foreground sm:inline-flex">
+                    <span className={cn('h-1.5 w-1.5 rounded-full', statusDotClass[n.status])} aria-hidden />
+                    {t(/* i18n-dynamic */ statusLabelKey[n.status])}
+                  </span>
+                  <span className="text-muted-foreground">{t(/* i18n-dynamic */ typeLabelKey[n.type])}</span>
+                  {n.ipAddress && (
+                    <span className="hidden font-mono text-muted-foreground md:inline">{n.ipAddress}</span>
+                  )}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+    </div>
+  );
+}

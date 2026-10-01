@@ -1,0 +1,629 @@
+import { z } from 'zod';
+import { coerceS3EndpointUrl, deriveS3RegionFromEndpoint, optionalQueryBoolean } from '@breeze/shared';
+import {
+  backupRetentionSchema as sharedBackupRetentionSchema,
+  backupRetentionUpdateSchema as sharedBackupRetentionUpdateSchema,
+  backupScheduleSchema as sharedBackupScheduleSchema,
+} from '@breeze/shared/validators';
+import { drRestoreConfigSchema } from '../../services/drBareMetalRebuildStep';
+
+const queryBoolean = z.preprocess((value) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return value;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1') return true;
+  if (normalized === 'false' || normalized === '0') return false;
+  return value;
+}, z.boolean());
+
+/**
+ * Validates s3-provider details and reports missing bucket/region.
+ * Region may be omitted when it can be derived from the endpoint
+ * (e.g. s3.us-west-004.backblazeb2.com) — S3-compatible providers like
+ * Backblaze B2 reject requests signed with a mismatched region, so a
+ * blanket default is never safe. Returns the resolved region so callers
+ * can persist it.
+ */
+export function validateS3Details(details: Record<string, unknown>): {
+  error: string | null;
+  region: string | null;
+  endpoint: string | undefined;
+} {
+  const bucket = typeof details.bucket === 'string' ? details.bucket.trim() : '';
+  if (!bucket) {
+    return { error: 'S3 bucket is required', region: null, endpoint: undefined };
+  }
+  const explicitRegion = typeof details.region === 'string' ? details.region.trim() : '';
+  const endpoint = typeof details.endpoint === 'string' ? details.endpoint : undefined;
+
+  // Reject an endpoint the AWS SDK can't parse *before* it's persisted —
+  // otherwise it survives into a stored config and only surfaces later as an
+  // opaque `TypeError: Invalid URL` from deep inside @smithy/core's endpoint
+  // resolver the first time something calls S3 with it (Sentry BREEZE-P).
+  //
+  // The coerced value is RETURNED so callers persist the normalized form.
+  // Storing the raw string instead would leave every consumer responsible for
+  // re-coercing it, and the Go agent (agent/internal/backup/providers/s3.go)
+  // does NOT — it passes providerConfig.endpoint to the AWS Go SDK verbatim.
+  // A scheme-less endpoint would then pass this API's own connectivity test
+  // while every real backup run kept failing on the device: a green test that
+  // lies. Normalize once, here, at the boundary.
+  let normalizedEndpoint: string | undefined;
+  if (endpoint !== undefined) {
+    try {
+      normalizedEndpoint = coerceS3EndpointUrl(endpoint);
+    } catch (error) {
+      return {
+        error: error instanceof Error ? error.message : 'S3 endpoint is not a valid URL',
+        region: null,
+        endpoint: undefined,
+      };
+    }
+  }
+
+  const region = explicitRegion || deriveS3RegionFromEndpoint(endpoint);
+  if (!region) {
+    return {
+      error: 'S3 region is required (set it explicitly or use an endpoint that includes it, e.g. s3.us-west-004.backblazeb2.com)',
+      region: null,
+      endpoint: normalizedEndpoint,
+    };
+  }
+  return { error: null, region, endpoint: normalizedEndpoint };
+}
+
+/**
+ * Canonicalizes S3 credential field names to accessKey/secretKey — the ONLY
+ * spelling the Go agent reads (agent/cmd/breeze-backup/exec_backup.go). This
+ * API's own S3 config validator/connectivity probe (buildS3StorageClient in
+ * services/backupSnapshotStorage.ts) has long accepted the AWS-idiomatic
+ * accessKeyId/secretAccessKey spelling too, so a config saved under only
+ * that spelling validated, persisted, and dispatched — then every upload on
+ * the agent ran with empty credentials, falling through to the SDK's
+ * default credential chain and stalling on IMDS/DNS (#6511).
+ *
+ * Mutates `details` in place (matching the region/endpoint normalization
+ * this file already does at the same call sites) so whichever spelling was
+ * submitted ends up stored under the canonical name. Canonical values win
+ * when both spellings are present. A no-op when neither alt field exists.
+ */
+export function canonicalizeS3CredentialFields(details: Record<string, unknown>): void {
+  const accessKey =
+    (typeof details.accessKey === 'string' && details.accessKey) ||
+    (typeof details.accessKeyId === 'string' ? details.accessKeyId : undefined);
+  const secretKey =
+    (typeof details.secretKey === 'string' && details.secretKey) ||
+    (typeof details.secretAccessKey === 'string' ? details.secretAccessKey : undefined);
+
+  if (accessKey !== undefined) details.accessKey = accessKey;
+  if (secretKey !== undefined) details.secretKey = secretKey;
+  delete details.accessKeyId;
+  delete details.secretAccessKey;
+}
+
+export const configSchema = z.object({
+  name: z.string().min(1),
+  provider: z.enum(['s3', 'local']),
+  enabled: z.boolean().optional(),
+  encryption: z.boolean().optional(),
+  isDefault: z.boolean().optional(),
+  details: z.record(z.string(), z.any()).refine(
+    (val) => JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ).optional()
+}).superRefine((data, ctx) => {
+  if (data.provider !== 's3') return;
+  const { error } = validateS3Details(data.details ?? {});
+  if (error) {
+    ctx.addIssue({ code: 'custom', message: error, path: ['details'] });
+  }
+});
+
+export const configUpdateSchema = z.object({
+  name: z.string().min(1).optional(),
+  enabled: z.boolean().optional(),
+  encryption: z.boolean().optional(),
+  isDefault: z.boolean().optional(),
+  details: z.record(z.string(), z.any()).refine(
+    (val) => JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ).optional()
+});
+
+export const policyTargetsSchema = z.object({
+  deviceIds: z.array(z.string()).optional(),
+  siteIds: z.array(z.string()).optional(),
+  groupIds: z.array(z.string()).optional()
+});
+
+export const policyScheduleSchema = sharedBackupScheduleSchema;
+
+export const policyRetentionSchema = sharedBackupRetentionSchema;
+
+export const policySchema = z.object({
+  name: z.string().min(1),
+  configId: z.string().min(1),
+  enabled: z.boolean().optional(),
+  targets: policyTargetsSchema.optional(),
+  schedule: policyScheduleSchema,
+  retention: policyRetentionSchema.optional()
+});
+
+export const policyUpdateSchema = z.object({
+  name: z.string().min(1).optional(),
+  configId: z.string().min(1).optional(),
+  enabled: z.boolean().optional(),
+  targets: policyTargetsSchema.partial().optional(),
+  schedule: policyScheduleSchema.partial().optional(),
+  retention: sharedBackupRetentionUpdateSchema.optional()
+});
+
+export const jobListSchema = z.object({
+  // The real backup_status enum values, plus the two legacy misspellings
+  // ('queued'/'canceled') this schema has always accepted, kept so an existing
+  // caller does not start 400ing. They are NOT enum members — the list route
+  // maps them to 'pending'/'cancelled' before building the condition, because
+  // passing one through to a pgEnum comparison makes Postgres raise
+  // `invalid input value for enum backup_status` (a 500, not an empty list).
+  status: z.enum([
+    'pending', 'running', 'completed', 'failed', 'cancelled', 'partial',
+    'queued', 'canceled',
+  ]).optional(),
+  device: z.string().optional(),
+  deviceId: z.string().optional(),
+  date: z.string().optional(),
+  from: z.string().optional(),
+  to: z.string().optional()
+});
+
+export const snapshotListSchema = z.object({
+  deviceId: z.string().optional(),
+  configId: z.string().optional(),
+  // Bare-metal recovery W04a: the recovery-creation panel needs "which
+  // snapshots CAN start a bare-metal recovery" without pulling every
+  // snapshot and filtering client-side.
+  bareMetalRestorable: optionalQueryBoolean,
+});
+
+export const snapshotProtectionReasonSchema = z.object({
+  reason: z.string().trim().min(1).max(500),
+});
+
+export const snapshotImmutabilityApplySchema = snapshotProtectionReasonSchema.extend({
+  immutableDays: z.number().int().min(1).max(3650).optional(),
+  extendUntil: z.string().datetime({ offset: true }).optional(),
+  enforcement: z.enum(['application', 'provider']).default('application'),
+}).superRefine((value, ctx) => {
+  if (!value.immutableDays && !value.extendUntil) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['immutableDays'],
+      message: 'immutableDays or extendUntil is required',
+    });
+  }
+});
+
+export const usageHistoryQuerySchema = z.object({
+  days: z.coerce.number().int().min(3).max(90).optional()
+});
+
+export const restoreSchema = z.object({
+  snapshotId: z.string().min(1),
+  deviceId: z.string().min(1).optional(),
+  targetPath: z.string().optional(),
+  selectedPaths: z.array(z.string()).optional(),
+  restoreType: z.enum(['full', 'selective']).default('full'),
+}).superRefine((value, ctx) => {
+  if (value.restoreType === 'selective' && (!value.selectedPaths || value.selectedPaths.length === 0)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'selectedPaths is required for selective restores',
+      path: ['selectedPaths'],
+    });
+  }
+});
+
+export const restoreListSchema = z.object({
+  deviceId: z.string().optional(),
+  snapshotId: z.string().optional(),
+  status: z.enum(['pending', 'running', 'completed', 'failed', 'partial', 'cancelled']).optional(),
+  from: z.string().optional(),
+  to: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
+export const verificationRunSchema = z.object({
+  deviceId: z.string().min(1),
+  backupJobId: z.string().min(1).optional(),
+  snapshotId: z.string().min(1).optional(),
+  verificationType: z.enum(['integrity', 'test_restore']).optional(),
+});
+
+export const verificationListSchema = z.object({
+  deviceId: z.string().optional(),
+  backupJobId: z.string().optional(),
+  verificationType: z.enum(['integrity', 'test_restore']).optional(),
+  status: z.enum(['pending', 'running', 'passed', 'failed', 'partial']).optional(),
+  from: z.string().optional(),
+  to: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional()
+});
+
+export const backupHealthQuerySchema = z.object({
+  refresh: queryBoolean.optional()
+});
+
+export const recoveryReadinessQuerySchema = z.object({
+  refresh: queryBoolean.optional(),
+  deviceId: z.string().optional()
+});
+
+// ── Encryption key schemas ───────────────────────────────────────────────────
+
+export const createEncryptionKeySchema = z.object({
+  name: z.string().min(1).max(200),
+  keyType: z.enum(['aes_256', 'rsa_2048']).default('aes_256'),
+  publicKeyPem: z.string().optional(),
+  encryptedPrivateKey: z.string().trim().min(16).max(65536),
+  keyHash: z.string().min(16).max(128),
+});
+
+export const rotateEncryptionKeySchema = z.object({
+  newKeyHash: z.string().min(16).max(128),
+  newPublicKeyPem: z.string().optional(),
+  newEncryptedPrivateKey: z.string().trim().min(16).max(65536),
+});
+
+// ── Extended policy schemas (GFS, legal hold, bandwidth) ─────────────────────
+
+export const gfsConfigSchema = z.object({
+  daily: z.number().int().min(1).max(365).optional(),
+  weekly: z.number().int().min(1).max(52).optional(),
+  monthly: z.number().int().min(1).max(120).optional(),
+  yearly: z.number().int().min(1).max(10).optional(),
+  weeklyDay: z.number().int().min(0).max(6).optional(),
+});
+
+export const extendedPolicySchema = policySchema.extend({
+  gfsConfig: gfsConfigSchema.optional(),
+  legalHold: z.boolean().optional(),
+  legalHoldReason: z.string().max(500).optional(),
+  bandwidthLimitMbps: z.number().int().min(1).max(10000).optional(),
+  backupWindowStart: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+  backupWindowEnd: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+  priority: z.number().int().min(1).max(100).optional(),
+});
+
+export const extendedPolicyUpdateSchema = policyUpdateSchema.extend({
+  gfsConfig: gfsConfigSchema.optional(),
+  legalHold: z.boolean().optional(),
+  legalHoldReason: z.string().max(500).optional(),
+  bandwidthLimitMbps: z.number().int().min(1).max(10000).optional(),
+  backupWindowStart: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+  backupWindowEnd: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+  priority: z.number().int().min(1).max(100).optional(),
+});
+
+// ── BMR / Recovery Token schemas ────────────────────────────────────
+
+export const bmrCreateTokenSchema = z.object({
+  snapshotId: z.string().guid(),
+  restoreType: z.enum(['full', 'selective', 'bare_metal']),
+  targetConfig: z
+    .record(z.string(), z.any())
+    .refine((val) => JSON.stringify(val).length <= 65536, {
+      message: 'targetConfig too large (max 64KB)',
+    })
+    .optional(),
+  expiresInHours: z.number().int().min(1).max(168).default(24),
+});
+
+export const bmrAuthenticateSchema = z.object({
+  token: z.string().min(1),
+  capabilities: z.array(z.string().min(1).max(64)).max(16).optional(),
+});
+
+export const bmrRecoveryDownloadSchema = z.object({
+  token: z.string().min(1),
+  path: z.string().min(1).max(4096),
+});
+
+// ── Bare-metal recovery schemas (W04a) ──────────────────────────────
+
+export const bmrRecoveryCreateSchema = z.object({
+  snapshotId: z.string().guid(),
+  identity: z.enum(['original', 'new']).default('original'),
+});
+
+// W05a: POST /bmr/recoveries/:id/cancel — body is optional.
+export const bmrRecoveryCancelSchema = z
+  .object({ reason: z.string().trim().min(1).max(500).optional() })
+  .default({});
+
+export const bmrRecoveryListSchema = z.object({
+  deviceId: z.string().guid().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+// Deliberately generous bound (1..32): the code is normalized/validated by
+// normalizeRecoveryCode() regardless of exact input shape (dashes, spaces,
+// case), so this schema only needs to keep the request body itself small.
+export const bmrExchangeSchema = z.object({
+  code: z.string().min(1).max(32),
+  capabilities: z.array(z.string().min(1).max(64)).max(16).optional(),
+});
+
+// W09a (#6464) Task 6: bound the agent-reported `result` payload so an
+// unbounded or malformed report never reaches the handler. 768 KiB matches
+// the agent's own total-body bound (see Part 0 "Bounded reporting") so a
+// maximally-sized agent report is never rejected by the server, while
+// `failedFilesSample` is capped independently at 50 entries — the agent
+// itself only ever samples up to that many, so a larger array indicates a
+// non-conforming or malicious client.
+const bmrProgressResultSchema = z
+  .any()
+  .superRefine((value, ctx) => {
+    if (JSON.stringify(value ?? null).length > 768 * 1024) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'result payload too large (max 768KB serialized)' });
+    }
+  })
+  .refine(
+    (value) => {
+      if (!value || typeof value !== 'object' || !('failedFilesSample' in value)) return true;
+      const sample = (value as Record<string, unknown>).failedFilesSample;
+      return Array.isArray(sample) && sample.length <= 50 && sample.every((entry) => typeof entry === 'string' && entry.length <= 4096);
+    },
+    { message: 'failedFilesSample must be at most 50 string entries of at most 4096 characters each' },
+  );
+
+export const bmrProgressSchema = z.object({
+  token: z.string().min(1),
+  status: z.enum(['media_booted', 'planned', 'restoring', 'validated', 'rebooted', 'failed', 'refused']),
+  target: z.record(z.string(), z.any()).optional(),
+  plan: z.any().optional(),
+  result: bmrProgressResultSchema.optional(),
+  reason: z.string().max(2000).optional(),
+  warnings: z.array(z.string().max(2000)).max(64).optional(),
+});
+
+export const bmrTokenListSchema = z.object({
+  status: z.enum(['active', 'authenticated', 'used', 'expired', 'revoked']).optional(),
+  deviceId: z.string().guid().optional(),
+  snapshotId: z.string().guid().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+export const bmrCompleteSchema = z.object({
+  token: z.string().min(1),
+  result: z.object({
+    status: z.enum(['completed', 'failed', 'partial']),
+    filesRestored: z.number().int().optional(),
+    bytesRestored: z.number().refine(Number.isInteger, 'expected integer').optional(),
+    stateApplied: z.boolean().optional(),
+    driversInjected: z.number().int().optional(),
+    validated: z.boolean().optional(),
+    // D14: a completion report for a large recovery hit the global 1MB
+    // body-size limit ("Request body too large") over an unbounded warnings
+    // array — one 10,047-file bare-metal recovery sent ~9,900 entries. The
+    // agent-side helper is being capped at 51 entries, but the API contract
+    // needs its own hard ceiling independent of any given agent build: 200
+    // entries x 2000 chars is a generous multiple of that intended cap while
+    // keeping the worst case comfortably bounded.
+    warnings: z.array(z.string().max(2000)).max(200).optional(),
+    error: z.string().optional(),
+    // Per-file restore failures in a partially-successful recovery, mirroring
+    // errorCount on the ordinary backup-result path (resultSchemas.ts). Optional
+    // and omitted (not zero) by an agent that doesn't report it.
+    failedFiles: z.number().int().nonnegative().optional(),
+  }),
+});
+
+export const bmrMediaCreateSchema = z.object({
+  tokenId: z.string().guid(),
+  platform: z.enum(['linux', 'darwin', 'windows']),
+  architecture: z.enum(['amd64', 'arm64']),
+});
+
+export const bmrMediaListSchema = z.object({
+  tokenId: z.string().guid().optional(),
+  snapshotId: z.string().guid().optional(),
+  status: z.enum(['pending', 'building', 'ready', 'ready_signed', 'legacy_unsigned', 'failed', 'expired']).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+// Restore-as-VM (W05a): two engines behind one route. `hyperv` is the
+// existing Hyper-V path (fields verbatim); `rebuild` drives the Linux rebuild
+// engine on a helper host and produces a VHDX. The rebuild variant is strict
+// and carries NO `identity` field — the server always creates the recovery
+// with `identity: 'new'` (spec §9: a rehearsal image can never resume the
+// production identity), so a client cannot even ask.
+const bmrVmRestoreHypervSchema = z.object({
+  engine: z.literal('hyperv'),
+  snapshotId: z.string().guid(),
+  targetDeviceId: z.string().guid(),
+  hypervisor: z.literal('hyperv'),
+  vmName: z.string().min(1).max(200),
+  switchName: z.string().min(1).max(200).optional(),
+  vmSpecs: z
+    .object({
+      memoryMb: z.number().int().min(512).optional(),
+      cpuCount: z.number().int().min(1).optional(),
+      diskSizeGb: z.number().int().min(1).optional(),
+    })
+    .optional(),
+});
+
+export const rebuildVhdxOutputPathSchema = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine((p) => p.startsWith('/') && p.endsWith('.vhdx'), 'absolute .vhdx path required');
+
+const bmrVmRestoreRebuildSchema = z
+  .object({
+    engine: z.literal('rebuild'),
+    snapshotId: z.string().guid(),
+    rebuildHostDeviceId: z.string().guid(),
+    outputPath: rebuildVhdxOutputPathSchema,
+    imageSizeGb: z.number().int().min(1).optional(),
+  })
+  .strict();
+
+// zod 4 does not apply a `.default()` on the discriminator when the key is
+// absent (the union matches on the raw value first), so the legacy Hyper-V
+// payload — every existing wizard/tool/integration caller sends no `engine`
+// — is defaulted in a preprocess step instead.
+export const bmrVmRestoreSchema = z.preprocess(
+  (value) =>
+    value && typeof value === 'object' && !Array.isArray(value) && !('engine' in value)
+      ? { ...(value as Record<string, unknown>), engine: 'hyperv' }
+      : value,
+  z.discriminatedUnion('engine', [bmrVmRestoreHypervSchema, bmrVmRestoreRebuildSchema]),
+);
+export type BmrVmRestoreInput = z.infer<typeof bmrVmRestoreSchema>;
+
+export const instantBootSchema = z.object({
+  snapshotId: z.string().guid(),
+  targetDeviceId: z.string().guid(),
+  vmName: z.string().min(1).max(200),
+  vmSpecs: z
+    .object({
+      memoryMb: z.number().int().min(512).optional(),
+      cpuCount: z.number().int().min(1).optional(),
+      diskSizeGb: z.number().int().min(10).optional(),
+    })
+    .optional(),
+});
+
+// ── Hyper-V VM backup schemas ─────────────────────────────────────────
+
+export const hypervBackupSchema = z.object({
+  deviceId: z.string().guid(),
+  vmName: z.string().min(1).max(256),
+  consistencyType: z.enum(['application', 'crash']).default('application'),
+});
+
+export const hypervRestoreSchema = z.object({
+  deviceId: z.string().guid(),
+  snapshotId: z.string().guid(),
+  vmName: z.string().min(1).max(256).optional(),
+  generateNewId: z.boolean().default(true),
+});
+
+export const hypervCheckpointSchema = z.object({
+  action: z.enum(['create', 'delete', 'apply']),
+  checkpointName: z.string().max(256).optional(),
+});
+
+export const hypervVmStateSchema = z.object({
+  state: z.enum(['start', 'stop', 'force_stop', 'pause', 'resume', 'save']),
+});
+
+export const hypervVmListSchema = z.object({
+  deviceId: z.string().guid().optional(),
+  state: z.string().optional(),
+});
+
+// ── SLA config schemas ─────────────────────────────────────────────────────
+
+export const slaConfigCreateSchema = z.object({
+  name: z.string().min(1).max(200),
+  rpoTargetMinutes: z.number().int().min(1),
+  rtoTargetMinutes: z.number().int().min(1),
+  targetDevices: z.array(z.string().guid()).optional(),
+  targetGroups: z.array(z.string().guid()).optional(),
+  alertOnBreach: z.boolean().optional(),
+  isActive: z.boolean().optional(),
+});
+
+export const slaConfigUpdateSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  rpoTargetMinutes: z.number().int().min(1).optional(),
+  rtoTargetMinutes: z.number().int().min(1).optional(),
+  targetDevices: z.array(z.string().guid()).optional(),
+  targetGroups: z.array(z.string().guid()).optional(),
+  alertOnBreach: z.boolean().optional(),
+  isActive: z.boolean().optional(),
+});
+
+export const slaEventsQuerySchema = z.object({
+  configId: z.string().guid().optional(),
+  deviceId: z.string().guid().optional(),
+  eventType: z.string().optional(),
+  from: z.string().optional(),
+  to: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+
+// ── DR plan schemas ────────────────────────────────────────────────────────
+
+export const drPlanCreateSchema = z.object({
+  name: z.string().min(1).max(200),
+  description: z.string().max(2000).optional(),
+  rpoTargetMinutes: z.number().int().min(1).optional(),
+  rtoTargetMinutes: z.number().int().min(1).optional(),
+});
+
+export const drPlanUpdateSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().max(2000).optional(),
+  status: z.enum(['draft', 'active', 'archived']).optional(),
+  rpoTargetMinutes: z.number().int().min(1).optional(),
+  rtoTargetMinutes: z.number().int().min(1).optional(),
+});
+
+export const drGroupCreateSchema = z.object({
+  name: z.string().min(1).max(200),
+  sequence: z.number().int().min(0).optional(),
+  dependsOnGroupId: z.string().guid().optional(),
+  devices: z.array(z.string().guid()).optional(),
+  restoreConfig: drRestoreConfigSchema.optional(),
+  estimatedDurationMinutes: z.number().int().min(0).optional(),
+});
+
+export const drGroupUpdateSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  sequence: z.number().int().min(0).optional(),
+  dependsOnGroupId: z.string().guid().nullable().optional(),
+  devices: z.array(z.string().guid()).optional(),
+  restoreConfig: drRestoreConfigSchema.optional(),
+  estimatedDurationMinutes: z.number().int().min(0).nullable().optional(),
+});
+
+export const drExecutionTriggerSchema = z.object({
+  executionType: z.enum(['rehearsal', 'failover', 'failback']),
+});
+
+export const drExecutionsQuerySchema = z.object({
+  planId: z.string().guid().optional(),
+  status: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+
+// ── Local vault schemas ─────────────────────────────────────────────────────
+
+export const vaultCreateSchema = z.object({
+  deviceId: z.string().guid(),
+  vaultPath: z.string().min(1).max(1024)
+    .refine(val => !val.includes('..'), { message: 'Path traversal not allowed' })
+    .refine(val => !val.includes('\0'), { message: 'Null bytes not allowed in path' }),
+  vaultType: z.enum(['local', 'smb', 'usb']).default('local'),
+  retentionCount: z.number().int().min(1).max(100).default(3),
+});
+
+export const vaultUpdateSchema = z.object({
+  vaultPath: z.string().min(1).max(1024).optional(),
+  vaultType: z.enum(['local', 'smb', 'usb']).optional(),
+  retentionCount: z.number().int().min(1).max(100).optional(),
+  isActive: z.boolean().optional(),
+});
+
+export const vaultListSchema = z.object({
+  deviceId: z.string().guid().optional(),
+});
+
+export const vaultSyncSchema = z.object({
+  snapshotId: z.string().min(1).max(200).optional(),
+});

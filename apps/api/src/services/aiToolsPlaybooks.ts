@@ -1,0 +1,374 @@
+/**
+ * AI Playbook Tools
+ *
+ * Tools for self-healing playbook management and execution.
+ * - list_playbooks (Tier 1): List available playbooks
+ * - execute_playbook (Tier 3): Create playbook execution record
+ * - get_playbook_history (Tier 1): View past playbook executions
+ */
+
+import { db } from '../db';
+import {
+  devices,
+  playbookDefinitions,
+  playbookExecutions,
+  users,
+} from '../db/schema';
+import { eq, and, desc, inArray, sql, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { checkPlaybookRequiredPermissions } from './playbookPermissions';
+import { sanitizeThrownToolError } from './aiToolErrors';
+import { SITE_SCOPE_EMPTY_NOTE, deviceScopeCondition, runFrozenDeviceIds } from './aiToolsSiteScope';
+
+type AiToolTier = 1 | 2 | 3 | 4;
+
+async function verifyDeviceAccess(
+  deviceId: string,
+  auth: AuthContext,
+  requireOnline = false
+): Promise<{ device: typeof devices.$inferSelect } | { error: string }> {
+  if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
+    return { error: 'Device not found or access denied' };
+  }
+  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const orgCond = auth.orgCondition(devices.orgId);
+  if (orgCond) conditions.push(orgCond);
+  const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
+  if (!device) return { error: 'Device not found or access denied' };
+  // Site axis: deny devices outside the caller's site allowlist (no-op when unrestricted).
+  if (auth.canAccessSite && !auth.canAccessSite(device.siteId)) {
+    return { error: 'Device not found or access denied' };
+  }
+  if (requireOnline && device.status !== 'online')
+    return {
+      error: `Device ${device.hostname} is not online (status: ${device.status}). This tool needs a live connection; to run when the device reconnects use the Run Script / deployment tools instead.`,
+    };
+  return { device };
+}
+
+export function registerPlaybookTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+// ============================================
+// list_playbooks - Tier 1 (read-only)
+// ============================================
+
+registerTool({
+  tier: 1,
+  domain: 'scripts',
+  searchHint: 'self-healing playbooks, remediation templates and verification loops',
+  definition: {
+    name: 'list_playbooks',
+    description: 'List available self-healing playbooks. Playbooks are multi-step remediation templates with verification loops.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        category: {
+          type: 'string',
+          enum: ['disk', 'service', 'memory', 'patch', 'security', 'all'],
+          description: 'Filter by playbook category (default: all)',
+        },
+      },
+    },
+  },
+  handler: async (input, auth) => {
+    try {
+      const conditions: SQL[] = [eq(playbookDefinitions.isActive, true)];
+      const category = typeof input.category === 'string' ? input.category : undefined;
+      if (category && category !== 'all') {
+        conditions.push(eq(playbookDefinitions.category, category));
+      }
+
+      const orgCond = auth.orgCondition(playbookDefinitions.orgId);
+      if (orgCond) {
+        conditions.push(sql`(${playbookDefinitions.isBuiltIn} = true OR ${orgCond})`);
+      }
+
+      const playbooks = await db
+        .select({
+          id: playbookDefinitions.id,
+          name: playbookDefinitions.name,
+          description: playbookDefinitions.description,
+          category: playbookDefinitions.category,
+          isBuiltIn: playbookDefinitions.isBuiltIn,
+          requiredPermissions: playbookDefinitions.requiredPermissions,
+          steps: playbookDefinitions.steps,
+        })
+        .from(playbookDefinitions)
+        .where(and(...conditions))
+        .orderBy(playbookDefinitions.category, playbookDefinitions.name);
+
+      return JSON.stringify({ playbooks, count: playbooks.length });
+    } catch (err) {
+      const message = sanitizeThrownToolError('playbooks', err);
+      console.error(`[AI] list_playbooks failed:`, err);
+      return JSON.stringify({ error: `list_playbooks failed: ${message}` });
+    }
+  },
+});
+
+// ============================================
+// execute_playbook - Tier 3 (requires approval)
+// ============================================
+
+registerTool({
+  tier: 3,
+  domain: 'scripts',
+  searchHint: 'self-healing playbook execution record and audit trail for a device',
+  deviceArgs: ['deviceId'],
+  definition: {
+    name: 'execute_playbook',
+    description: 'Create a self-healing playbook execution record for a device. Requires user approval. This creates the audit trail; execute steps manually and update status as you progress.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        playbookId: { type: 'string', description: 'UUID of the playbook to execute' },
+        deviceId: { type: 'string', description: 'UUID of the target device' },
+        variables: {
+          type: 'object',
+          description: 'Template variables for playbook steps (for example serviceName, cleanupPaths, threshold)',
+        },
+        context: {
+          type: 'object',
+          description: 'Additional execution context such as alertId or userInput',
+        },
+      },
+      required: ['playbookId', 'deviceId'],
+    },
+  },
+  handler: async (input, auth) => {
+    try {
+      const playbookId = input.playbookId as string;
+      const deviceId = input.deviceId as string;
+      const variables = (input.variables as Record<string, unknown> | undefined) ?? {};
+      const extraContext = (input.context as Record<string, unknown> | undefined) ?? {};
+
+      const playbookConditions: SQL[] = [
+        eq(playbookDefinitions.id, playbookId),
+        eq(playbookDefinitions.isActive, true),
+      ];
+      const orgCond = auth.orgCondition(playbookDefinitions.orgId);
+      if (orgCond) {
+        playbookConditions.push(sql`(${playbookDefinitions.isBuiltIn} = true OR ${orgCond})`);
+      }
+
+      const [playbook] = await db
+        .select()
+        .from(playbookDefinitions)
+        .where(and(...playbookConditions))
+        .limit(1);
+
+      if (!playbook) {
+        return JSON.stringify({ error: 'Playbook not found or access denied' });
+      }
+
+      const permissionCheck = await checkPlaybookRequiredPermissions(playbook.requiredPermissions, auth);
+      if (!permissionCheck.allowed) {
+        return JSON.stringify({
+          error: permissionCheck.error ?? 'Missing required permissions for this playbook',
+          missingPermissions: permissionCheck.missingPermissions,
+        });
+      }
+
+      const access = await verifyDeviceAccess(deviceId, auth);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+      const { device } = access;
+
+      if (playbook.orgId !== null && playbook.orgId !== device.orgId) {
+        return JSON.stringify({ error: 'Playbook and device must belong to the same organization' });
+      }
+
+      const existingVariables =
+        extraContext.variables && typeof extraContext.variables === 'object'
+          ? (extraContext.variables as Record<string, unknown>)
+          : {};
+
+      // #3826 Wave 4A Task 3: `playbook_executions.triggered_by_user_id`
+      // FK-references users.id (schema/playbooks.ts:118), but an `ai_agent`
+      // principal's `auth.user.id` is the agent's `ai_agents.id`, not a
+      // users row (services/aiAgents/agentAuthContext.ts) — inserting it
+      // verbatim would die on a 23503. Mirrors the shipped
+      // commandQueue.ts:855-889 probe precedent: one indexed PK lookup, and
+      // a non-resolving id degrades the FK column to NULL. The existing
+      // `triggeredBy: 'ai'` varchar tag is untouched either way — it already
+      // flags every AI-originated execution regardless of which principal
+      // triggered it.
+      const [userRow] = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, auth.user.id))
+        .limit(1);
+      const safeTriggeredByUserId = userRow ? auth.user.id : null;
+
+      const [execution] = await db
+        .insert(playbookExecutions)
+        .values({
+          orgId: device.orgId,
+          deviceId: device.id,
+          playbookId: playbook.id,
+          status: 'pending',
+          context: {
+            ...extraContext,
+            variables: {
+              ...existingVariables,
+              ...variables,
+            },
+          },
+          triggeredBy: 'ai',
+          triggeredByUserId: safeTriggeredByUserId,
+        })
+        .returning();
+
+      if (!execution) {
+        return JSON.stringify({ error: 'Failed to create playbook execution record' });
+      }
+
+      // Substitute {{variable}} tokens in step toolInput using known variables
+      const allVariables: Record<string, string> = {
+        deviceId: device.id,
+        ...Object.fromEntries(
+          Object.entries({ ...existingVariables, ...variables })
+            .filter(([, v]) => v !== undefined && v !== null)
+            .map(([k, v]) => [k, String(v)])
+        ),
+      };
+      const resolvedSteps = JSON.parse(
+        JSON.stringify(playbook.steps).replace(
+          /\{\{(\w+)\}\}/g,
+          (match, key) => allVariables[key] ?? match
+        )
+      );
+
+      return JSON.stringify({
+        execution: {
+          id: execution.id,
+          status: execution.status,
+          currentStepIndex: execution.currentStepIndex,
+          createdAt: execution.createdAt,
+        },
+        playbook: {
+          id: playbook.id,
+          name: playbook.name,
+          description: playbook.description,
+          category: playbook.category,
+          steps: resolvedSteps,
+        },
+        device: {
+          id: device.id,
+          hostname: device.hostname,
+          status: device.status,
+        },
+        message: 'Execution created. Execute each step sequentially and update status/step results as work progresses.',
+      });
+    } catch (err) {
+      const message = sanitizeThrownToolError('playbooks', err);
+      console.error(`[AI] execute_playbook failed:`, err);
+      return JSON.stringify({ error: `execute_playbook failed: ${message}` });
+    }
+  },
+});
+
+// ============================================
+// get_playbook_history - Tier 1 (read-only)
+// ============================================
+
+registerTool({
+  tier: 1,
+  domain: 'scripts',
+  searchHint: 'playbook execution history, remediation auditing and trends',
+  deviceArgs: ['deviceId'],
+  definition: {
+    name: 'get_playbook_history',
+    description: 'View past playbook executions for auditing and trend analysis.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        deviceId: { type: 'string', description: 'Filter by device UUID' },
+        playbookId: { type: 'string', description: 'Filter by playbook UUID' },
+        status: {
+          type: 'string',
+          enum: ['pending', 'running', 'waiting', 'completed', 'failed', 'rolled_back', 'cancelled'],
+          description: 'Filter by execution status',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results (default 20, max 100)',
+        },
+      },
+    },
+  },
+  handler: async (input, auth) => {
+    try {
+      // The site axis is not enforced by RLS. History is attributable to the
+      // execution's current device, so restrict the joined device in SQL
+      // before ordering/LIMIT. `undefined` means unrestricted; a defined-empty
+      // ceiling denies every device and therefore every execution.
+      //
+      // The EXACT-DEVICE axis is independent: a device-less analysis run carries
+      // `allowedDeviceIds` with NO `allowedSiteIds`, so the site branch below
+      // silently no-ops for it and the query stayed org-wide — every sibling
+      // device's playbook history. Push the frozen device set as its own
+      // condition (#6086 finding 7). An execution with a NULL device_id is
+      // excluded for such a caller by construction, which is the fail-closed
+      // direction.
+      const allowedSiteIds = auth.allowedSiteIds;
+      const frozenDeviceIds = runFrozenDeviceIds(auth);
+      if (allowedSiteIds?.length === 0 || frozenDeviceIds?.length === 0) {
+        return JSON.stringify({ executions: [], count: 0, scopeNote: SITE_SCOPE_EMPTY_NOTE });
+      }
+
+      const conditions: SQL[] = [];
+      const orgCond = auth.orgCondition(playbookExecutions.orgId);
+      if (orgCond) conditions.push(orgCond);
+
+      if (typeof input.deviceId === 'string') {
+        conditions.push(eq(playbookExecutions.deviceId, input.deviceId));
+      }
+      if (typeof input.playbookId === 'string') {
+        conditions.push(eq(playbookExecutions.playbookId, input.playbookId));
+      }
+      if (typeof input.status === 'string') {
+        conditions.push(eq(playbookExecutions.status, input.status as typeof playbookExecutions.status.enumValues[number]));
+      }
+      if (allowedSiteIds) conditions.push(inArray(devices.siteId, allowedSiteIds));
+      const deviceCond = deviceScopeCondition(auth, playbookExecutions.deviceId);
+      if (deviceCond) conditions.push(deviceCond);
+
+      const limit = Math.min(Math.max(1, Number(input.limit) || 20), 100);
+
+      const executions = await db
+        .select({
+          id: playbookExecutions.id,
+          status: playbookExecutions.status,
+          currentStepIndex: playbookExecutions.currentStepIndex,
+          steps: playbookExecutions.steps,
+          errorMessage: playbookExecutions.errorMessage,
+          rollbackExecuted: playbookExecutions.rollbackExecuted,
+          startedAt: playbookExecutions.startedAt,
+          completedAt: playbookExecutions.completedAt,
+          triggeredBy: playbookExecutions.triggeredBy,
+          createdAt: playbookExecutions.createdAt,
+          playbookName: playbookDefinitions.name,
+          playbookCategory: playbookDefinitions.category,
+          deviceHostname: devices.hostname,
+        })
+        .from(playbookExecutions)
+        .leftJoin(playbookDefinitions, eq(playbookExecutions.playbookId, playbookDefinitions.id))
+        .leftJoin(devices, eq(playbookExecutions.deviceId, devices.id))
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(playbookExecutions.createdAt))
+        .limit(limit);
+
+      return JSON.stringify({ executions, count: executions.length });
+    } catch (err) {
+      const message = sanitizeThrownToolError('playbooks', err);
+      console.error(`[AI] get_playbook_history failed:`, err);
+      return JSON.stringify({ error: `get_playbook_history failed: ${message}` });
+    }
+  },
+});
+
+}

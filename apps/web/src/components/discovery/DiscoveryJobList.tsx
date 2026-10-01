@@ -1,0 +1,589 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { CheckCircle, Clock, AlertTriangle, PlayCircle, X, ArrowRight, CalendarClock, Filter } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
+import { fetchWithAuth } from '../../stores/auth';
+import { widthPercentClass } from '@/lib/utils';
+import { extractApiError } from '@/lib/apiError';
+import { formatDateTime } from '@/lib/dateTimeFormat';
+import { ResponsiveTable, DataCard, CardField, CardActions } from '../shared/ResponsiveTable';
+import { asList } from '@/lib/asList';
+
+export type DiscoveryJobStatus = 'scheduled' | 'running' | 'completed' | 'failed' | 'cancelled' | 'pending';
+
+type ApiJobStatus = 'scheduled' | 'running' | 'completed' | 'failed' | 'cancelled' | 'pending';
+
+type ApiDiscoveryJob = {
+  id: string;
+  profileId?: string;
+  profileName?: string;
+  status: ApiJobStatus;
+  createdAt?: string;
+  scheduledAt?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  results?: Array<{ assetId: string; status: string; assetType: string }>;
+  progress?: number;
+  hostsDiscovered?: number;
+  hostsScanned?: number;
+  hostsTargeted?: number;
+  newAssets?: number | null;
+  errors?: { message?: string; error?: string } | string | null;
+};
+
+export type DiscoveryJob = {
+  id: string;
+  profileId: string | null;
+  profileName: string;
+  status: DiscoveryJobStatus;
+  progress: number;
+  isIndeterminate: boolean;
+  hostsDiscovered: number;
+  hostsTargeted: number;
+  newAssets: number | null;
+  errors: string | null;
+  duration: string | null;
+  scheduledAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+};
+
+const statusConfig: Record<DiscoveryJobStatus, { color: string; icon: typeof Clock }> = {
+  pending: { color: 'bg-purple-500/20 text-purple-700 border-purple-500/40', icon: CalendarClock },
+  scheduled: { color: 'bg-blue-500/20 text-blue-700 border-blue-500/40', icon: Clock },
+  running: { color: 'bg-warning/15 text-warning border-warning/30', icon: PlayCircle },
+  completed: { color: 'bg-success/15 text-success border-success/30', icon: CheckCircle },
+  failed: { color: 'bg-destructive/15 text-destructive border-destructive/30', icon: AlertTriangle },
+  cancelled: { color: 'bg-muted text-muted-foreground border-border', icon: AlertTriangle }
+};
+
+const progressBarColor: Record<DiscoveryJobStatus, string> = {
+  pending: 'bg-purple-300',
+  failed: 'bg-red-500',
+  cancelled: 'bg-gray-400',
+  completed: 'bg-green-500',
+  running: 'bg-yellow-500',
+  scheduled: 'bg-yellow-500'
+};
+
+function formatTimestamp(value?: string, timezone?: string) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return formatDateTime(date, { timeZone: timezone });
+}
+
+function formatDuration(startedAt?: string | null, completedAt?: string | null): string | null {
+  if (!startedAt || !completedAt) return null;
+  const start = new Date(startedAt).getTime();
+  const end = new Date(completedAt).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  const diffMs = end - start;
+  if (diffMs < 0) return null;
+  const totalSeconds = Math.round(diffMs / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+function mapJob(job: ApiDiscoveryJob, t: TFunction): DiscoveryJob {
+  const rawStatus = job.status ?? 'scheduled';
+  const status: DiscoveryJobStatus = rawStatus === 'pending' ? 'pending' : rawStatus;
+  const discovered = job.hostsDiscovered ?? job.results?.length ?? 0;
+  const targeted = job.hostsTargeted ?? job.hostsScanned ?? Math.max(discovered, job.results?.length ?? 0);
+
+  let progress: number;
+  let isIndeterminate = false;
+
+  if (status === 'completed' || status === 'failed') {
+    progress = 100;
+  } else if (status === 'cancelled') {
+    progress = typeof job.progress === 'number'
+      ? job.progress
+      : targeted > 0
+        ? Math.round((discovered / targeted) * 100)
+        : 0;
+  } else if (status === 'running') {
+    if (typeof job.progress === 'number') {
+      progress = Math.min(95, job.progress);
+    } else if (targeted > 0) {
+      progress = Math.min(95, Math.round((discovered / targeted) * 100));
+    } else {
+      progress = 0;
+      isIndeterminate = true;
+    }
+  } else {
+    // scheduled
+    progress = 0;
+  }
+
+  return {
+    id: job.id,
+    profileId: job.profileId ?? null,
+    profileName: job.profileName ?? job.profileId ?? t('discoveryJobList.unknownProfile'),
+    status,
+    progress,
+    isIndeterminate,
+    hostsDiscovered: discovered,
+    hostsTargeted: targeted,
+    newAssets: job.newAssets ?? null,
+    errors: typeof job.errors === 'string'
+      ? job.errors
+      : job.errors?.message ?? job.errors?.error ?? null,
+    duration: formatDuration(job.startedAt, job.completedAt),
+    scheduledAt: job.scheduledAt ?? job.createdAt ?? '',
+    startedAt: job.startedAt ?? undefined,
+    finishedAt: job.completedAt ?? undefined
+  };
+}
+
+type ProfileSubnetMap = Record<string, string[]>;
+
+interface DiscoveryJobListProps {
+  timezone?: string;
+  profileFilter?: string | null;
+  profileSubnets?: ProfileSubnetMap;
+  onClearFilter?: () => void;
+  onViewProfile?: () => void;
+  onViewAssets?: () => void;
+}
+
+const STATUS_FILTERS: DiscoveryJobStatus[] = ['running', 'scheduled', 'completed', 'failed', 'cancelled', 'pending'];
+
+export default function DiscoveryJobList({ timezone, profileFilter, profileSubnets, onClearFilter, onViewProfile, onViewAssets }: DiscoveryJobListProps) {
+  const { t } = useTranslation('discovery');
+  const [jobs, setJobs] = useState<DiscoveryJob[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<DiscoveryJobStatus | null>(null);
+  const [subnetFilter, setSubnetFilter] = useState<string | null>(null);
+
+  const fetchJobs = useCallback(async (showLoading = true) => {
+    try {
+      if (showLoading) {
+        setLoading(true);
+      }
+      setError(undefined);
+      const response = await fetchWithAuth('/discovery/jobs');
+      if (!response.ok) {
+        throw new Error(t('discoveryJobList.errors.fetch'));
+      }
+      const data = await response.json();
+      const items = asList(data, 'jobs');
+      setJobs(items.map((job: ApiDiscoveryJob) => mapJob(job, t)));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('discoveryJobList.errors.generic'));
+    } finally {
+      if (showLoading) {
+        setLoading(false);
+      }
+    }
+  }, [t]);
+
+  const cancelJob = useCallback(async (jobId: string) => {
+    setCancellingId(jobId);
+    setError(undefined);
+    try {
+      const response = await fetchWithAuth(`/discovery/jobs/${jobId}/cancel`, { method: 'POST' });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(extractApiError(data, t('discoveryJobList.errors.cancel')));
+      }
+      await fetchJobs(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('discoveryJobList.errors.cancel'));
+    } finally {
+      setCancellingId(null);
+    }
+  }, [fetchJobs, t]);
+
+  useEffect(() => {
+    fetchJobs();
+  }, [fetchJobs]);
+
+  useEffect(() => {
+    const hasRunning = jobs.some(job => job.status === 'running' || job.status === 'scheduled');
+    if (!hasRunning) return;
+
+    const interval = setInterval(() => {
+      fetchJobs(false);
+    }, 10000);
+
+    return () => clearInterval(interval);
+  }, [fetchJobs, jobs]);
+
+  // Collect unique subnets from profile data for filter chips
+  const availableSubnets = useMemo(() => {
+    if (!profileSubnets) return [];
+    const allSubnets = new Set<string>();
+    // Only include subnets for profiles that have jobs
+    const profileIdsWithJobs = new Set(jobs.map(j => j.profileId).filter(Boolean));
+    for (const [profileId, subnets] of Object.entries(profileSubnets)) {
+      if (profileIdsWithJobs.has(profileId)) {
+        for (const s of subnets) allSubnets.add(s);
+      }
+    }
+    return Array.from(allSubnets).sort();
+  }, [profileSubnets, jobs]);
+
+  // Collect status counts for filter chips
+  const statusCounts = useMemo(() => {
+    const counts: Partial<Record<DiscoveryJobStatus, number>> = {};
+    const base = profileFilter ? jobs.filter(j => j.profileId === profileFilter) : jobs;
+    for (const job of base) {
+      counts[job.status] = (counts[job.status] ?? 0) + 1;
+    }
+    return counts;
+  }, [jobs, profileFilter]);
+
+  const filteredJobs = useMemo(() => {
+    let result = jobs;
+    if (profileFilter) {
+      result = result.filter(job => job.profileId === profileFilter);
+    }
+    if (statusFilter) {
+      result = result.filter(job => job.status === statusFilter);
+    }
+    if (subnetFilter && profileSubnets) {
+      const matchingProfileIds = new Set(
+        Object.entries(profileSubnets)
+          .filter(([, subnets]) => subnets.includes(subnetFilter))
+          .map(([id]) => id)
+      );
+      result = result.filter(job => job.profileId && matchingProfileIds.has(job.profileId));
+    }
+    return result;
+  }, [jobs, profileFilter, statusFilter, subnetFilter, profileSubnets]);
+
+  const filterProfileName = profileFilter
+    ? filteredJobs[0]?.profileName ?? jobs.find(j => j.profileId === profileFilter)?.profileName
+    : null;
+
+  const hasActiveQuickFilters = statusFilter !== null || subnetFilter !== null;
+
+  if (loading && jobs.length === 0) {
+    return (
+      <div className="flex items-center justify-center rounded-lg border bg-card p-10 shadow-xs">
+        <div className="text-center">
+          <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('discoveryJobList.loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && jobs.length === 0) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        <button
+          type="button"
+          onClick={() => fetchJobs()}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          {t('discoveryJobList.tryAgain')}
+        </button>
+      </div>
+    );
+  }
+
+  // Row pieces shared by the desktop table and the mobile cards.
+  const renderProfile = (job: DiscoveryJob) =>
+    onViewProfile ? (
+      <button
+        type="button"
+        onClick={onViewProfile}
+        className="text-primary underline-offset-2 hover:underline"
+      >
+        {job.profileName}
+      </button>
+    ) : (
+      <span>{job.profileName}</span>
+    );
+
+  const renderStatus = (job: DiscoveryJob) => {
+    const status = statusConfig[job.status];
+    const StatusIcon = status.icon;
+    return (
+      <>
+        <span className={`inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs font-medium ${status.color}`}>
+          <StatusIcon className="h-3.5 w-3.5" />
+          {t(/* i18n-dynamic */ `discoveryJobList.status.${job.status}`)}
+        </span>
+        {job.errors && (
+          <span className="mt-1 block text-xs text-destructive">{job.errors}</span>
+        )}
+      </>
+    );
+  };
+
+  const renderProgress = (job: DiscoveryJob) => (
+    <div className="flex items-center gap-3">
+      <div className="h-2 w-24 overflow-hidden rounded-full bg-muted">
+        {job.isIndeterminate ? (
+          <div className="h-full w-full animate-pulse rounded-full bg-yellow-500" />
+        ) : (
+          <div
+            className={`h-full rounded-full ${progressBarColor[job.status]} ${widthPercentClass(job.progress)}`}
+          />
+        )}
+      </div>
+      <span className="w-10 text-right text-xs">
+        {job.isIndeterminate ? '...' : `${job.progress}%`}
+      </span>
+    </div>
+  );
+
+  const renderActions = (job: DiscoveryJob) => (
+    <div className="flex items-center gap-1">
+      {(job.status === 'scheduled' || job.status === 'running') && (
+        <button
+          type="button"
+          onClick={() => cancelJob(job.id)}
+          disabled={cancellingId === job.id}
+          title={t('discoveryJobList.actions.cancelJob')}
+          className="inline-flex items-center justify-center rounded-md p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      )}
+      {job.status === 'completed' && job.hostsDiscovered > 0 && onViewAssets && (
+        <button
+          type="button"
+          onClick={onViewAssets}
+          title={t('discoveryJobList.actions.viewDiscoveredAssets')}
+          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary hover:bg-primary/10"
+        >
+          {t('discoveryJobList.actions.assets')}
+          <ArrowRight className="h-3 w-3" />
+        </button>
+      )}
+    </div>
+  );
+
+  const emptyMessage = profileFilter ? t('discoveryJobList.emptyForProfile') : t('discoveryJobList.empty');
+
+  return (
+    <div className="rounded-lg border bg-card p-6 shadow-xs">
+      <div>
+        <h2 className="text-lg font-semibold">{t('discoveryJobList.title')}</h2>
+        <p className="text-sm text-muted-foreground">{t('discoveryJobList.description')}</p>
+      </div>
+
+      {profileFilter && filterProfileName && (
+        <div className="mt-4 flex items-center gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
+          <span className="text-muted-foreground">{t('discoveryJobList.filteredByProfile')}</span>
+          <span className="font-medium">{filterProfileName}</span>
+          <button
+            type="button"
+            onClick={onClearFilter}
+            className="ml-auto rounded-md px-2 py-0.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            {t('discoveryJobList.actions.clearFilter')}
+          </button>
+        </div>
+      )}
+
+      {/* Quick filters */}
+      <div className="mt-4 flex flex-wrap items-center gap-3">
+        <div className="flex items-center gap-2">
+          <Filter className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('common:labels.status')}</span>
+          <div className="flex flex-wrap gap-1">
+            {STATUS_FILTERS.map(s => {
+              const count = statusCounts[s] ?? 0;
+              if (count === 0) return null;
+              const cfg = statusConfig[s];
+              const isActive = statusFilter === s;
+              return (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => setStatusFilter(isActive ? null : s)}
+                  className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium transition ${
+                    isActive ? cfg.color : 'border-transparent text-muted-foreground hover:bg-muted'
+                  }`}
+                >
+                  {t(/* i18n-dynamic */ `discoveryJobList.status.${s}`)}
+                  <span className="opacity-60">{count}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {availableSubnets.length > 0 && (
+          <>
+            <div className="h-4 w-px bg-border" />
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('discoveryJobList.filters.subnet')}</span>
+              <div className="flex flex-wrap gap-1">
+                {availableSubnets.map(subnet => {
+                  const isActive = subnetFilter === subnet;
+                  return (
+                    <button
+                      key={subnet}
+                      type="button"
+                      onClick={() => setSubnetFilter(isActive ? null : subnet)}
+                      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium transition ${
+                        isActive
+                          ? 'border-primary/40 bg-primary/10 text-primary'
+                          : 'border-transparent text-muted-foreground hover:bg-muted'
+                      }`}
+                    >
+                      {subnet}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </>
+        )}
+
+        {hasActiveQuickFilters && (
+          <>
+            <div className="h-4 w-px bg-border" />
+            <button
+              type="button"
+              onClick={() => { setStatusFilter(null); setSubnetFilter(null); }}
+              className="text-xs text-muted-foreground hover:text-foreground"
+            >
+              {t('discoveryJobList.actions.clearAll')}
+            </button>
+          </>
+        )}
+      </div>
+
+      {error && jobs.length > 0 && (
+        <div className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      <ResponsiveTable
+        className="mt-6"
+        table={
+          <table className="min-w-full divide-y">
+            <thead className="bg-muted/40">
+              <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                <th className="px-4 py-3">{t('discoveryJobList.columns.profile')}</th>
+                <th className="px-4 py-3">{t('common:labels.status')}</th>
+                <th className="px-4 py-3">{t('discoveryJobList.columns.progress')}</th>
+                <th className="px-4 py-3">{t('discoveryJobList.columns.hostsDiscovered')}</th>
+                <th className="px-4 py-3">{t('discoveryJobList.columns.newAssets')}</th>
+                <th className="px-4 py-3">{t('discoveryJobList.columns.duration')}</th>
+                <th className="px-4 py-3">{t('discoveryJobList.columns.scheduled')}</th>
+                <th className="px-4 py-3">{t('discoveryJobList.columns.started')}</th>
+                <th className="px-4 py-3">{t('discoveryJobList.columns.finished')}</th>
+                <th className="px-4 py-3">{t('common:labels.actions')}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {filteredJobs.length === 0 ? (
+                <tr>
+                  <td colSpan={10} className="px-4 py-6 text-center text-sm text-muted-foreground">
+                    {emptyMessage}
+                  </td>
+                </tr>
+              ) : (
+                filteredJobs.map(job => (
+                  <tr key={job.id} className="transition hover:bg-muted/40">
+                    <td className="px-4 py-3 text-sm font-medium">{renderProfile(job)}</td>
+                    <td className="px-4 py-3">{renderStatus(job)}</td>
+                    {job.status === 'pending' ? (
+                      <>
+                        <td className="px-4 py-3 text-sm text-muted-foreground">—</td>
+                        <td className="px-4 py-3 text-sm text-muted-foreground">—</td>
+                        <td className="px-4 py-3 text-sm text-muted-foreground">—</td>
+                        <td className="px-4 py-3 text-sm text-muted-foreground">—</td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{formatTimestamp(job.scheduledAt, timezone)}</td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">—</td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">—</td>
+                        <td className="px-4 py-3" />
+                      </>
+                    ) : (
+                      <>
+                        <td className="px-4 py-3 text-sm">{renderProgress(job)}</td>
+                        <td className="px-4 py-3 text-sm">
+                          {job.hostsDiscovered} / {job.hostsTargeted}
+                        </td>
+                        <td className="px-4 py-3 text-sm">
+                          {job.newAssets != null ? job.newAssets : '—'}
+                        </td>
+                        <td className="px-4 py-3 text-sm text-muted-foreground">
+                          {job.duration ?? '—'}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{formatTimestamp(job.scheduledAt, timezone)}</td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{formatTimestamp(job.startedAt, timezone)}</td>
+                        <td className="px-4 py-3 text-xs text-muted-foreground">{formatTimestamp(job.finishedAt, timezone)}</td>
+                        <td className="px-4 py-3">{renderActions(job)}</td>
+                      </>
+                    )}
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        }
+        cards={
+          filteredJobs.length === 0 ? (
+            <DataCard>
+              <p className="py-2 text-center text-sm text-muted-foreground">{emptyMessage}</p>
+            </DataCard>
+          ) : (
+            filteredJobs.map(job => (
+              <DataCard key={job.id}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 text-sm font-medium">{renderProfile(job)}</div>
+                  <div className="shrink-0 text-right">{renderStatus(job)}</div>
+                </div>
+                <div className="mt-3 space-y-2 border-t pt-3">
+                  {job.status === 'pending' ? (
+                    <CardField label={t('discoveryJobList.columns.scheduled')}>
+                      <span className="text-xs text-muted-foreground">{formatTimestamp(job.scheduledAt, timezone)}</span>
+                    </CardField>
+                  ) : (
+                    <>
+                      <div>
+                        <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('discoveryJobList.columns.progress')}</span>
+                        <div className="mt-1">{renderProgress(job)}</div>
+                      </div>
+                      <CardField label={t('discoveryJobList.columns.hostsDiscovered')}>
+                        {job.hostsDiscovered} / {job.hostsTargeted}
+                      </CardField>
+                      <CardField label={t('discoveryJobList.columns.newAssets')}>
+                        {job.newAssets != null ? job.newAssets : '—'}
+                      </CardField>
+                      <CardField label={t('discoveryJobList.columns.duration')}>
+                        <span className="text-muted-foreground">{job.duration ?? '—'}</span>
+                      </CardField>
+                      <CardField label={t('discoveryJobList.columns.scheduled')}>
+                        <span className="text-xs text-muted-foreground">{formatTimestamp(job.scheduledAt, timezone)}</span>
+                      </CardField>
+                      <CardField label={t('discoveryJobList.columns.started')}>
+                        <span className="text-xs text-muted-foreground">{formatTimestamp(job.startedAt, timezone)}</span>
+                      </CardField>
+                      <CardField label={t('discoveryJobList.columns.finished')}>
+                        <span className="text-xs text-muted-foreground">{formatTimestamp(job.finishedAt, timezone)}</span>
+                      </CardField>
+                    </>
+                  )}
+                </div>
+                {job.status !== 'pending' &&
+                  ((job.status === 'scheduled' || job.status === 'running') ||
+                    (job.status === 'completed' && job.hostsDiscovered > 0 && onViewAssets)) && (
+                    <CardActions>{renderActions(job)}</CardActions>
+                  )}
+              </DataCard>
+            ))
+          )
+        }
+      />
+    </div>
+  );
+}

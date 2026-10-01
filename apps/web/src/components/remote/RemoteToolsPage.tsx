@@ -1,0 +1,1157 @@
+import { useState, useCallback, useEffect, useRef } from 'react';
+import type { DesktopAccessState, RemoteAccessPolicy } from '@breeze/shared';
+import {
+  Activity,
+  Settings2,
+  Database,
+  FileText,
+  Clock,
+  Terminal,
+  FolderOpen,
+  Monitor,
+  Loader2,
+  ShieldOff
+} from 'lucide-react';
+import * as Sentry from '@sentry/astro';
+import { fetchWithAuth } from '@/stores/auth';
+import { extractApiError } from '@/lib/apiError';
+import { runAction } from '@/lib/runAction';
+import { navigateTo } from '@/lib/navigation';
+import { useHashTab } from '@/lib/useHashState';
+import { useEventStream } from '@/hooks/useEventStream';
+
+// Import actual components
+import ProcessManager, { type Process, type ProcessStatus } from './ProcessManager';
+import ServicesManager, { type WindowsService, type ServiceStatus, type StartupType, isAgentService } from './ServicesManager';
+import EventViewer, { type EventFilter, type EventLog, type EventLogEntry, type EventLevel } from './EventViewer';
+import ScheduledTasks, { type ScheduledTask, type TaskDetails, type TaskHistory, type TaskStatus } from './ScheduledTasks';
+import RegistryEditor from './RegistryEditor';
+import RemoteTerminal from './RemoteTerminal';
+import FileManager from './FileManager';
+import ConnectDesktopButton from './ConnectDesktopButton';
+import { showToast } from '@/components/shared/Toast';
+import { getInitialFilePath } from './filePathUtils';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+
+type RemoteToolsPageProps = {
+  deviceId: string;
+  deviceName: string;
+  deviceOs: 'windows' | 'macos' | 'linux' | 'darwin';
+  initialTab?: ToolTab;
+  onClose?: () => void;
+  showClose?: boolean;
+};
+
+type ToolTab = 'processes' | 'services' | 'registry' | 'eventlog' | 'tasks' | 'terminal' | 'files';
+
+const tabs: { id: ToolTab; label: string; icon: typeof Activity; windowsOnly?: boolean }[] = [
+  { id: 'processes', label: 'Processes', icon: Activity },
+  { id: 'services', label: 'Services', icon: Settings2, windowsOnly: true },
+  { id: 'registry', label: 'Registry', icon: Database, windowsOnly: true },
+  { id: 'eventlog', label: 'Event Log', icon: FileText, windowsOnly: true },
+  { id: 'tasks', label: 'Scheduled Tasks', icon: Clock, windowsOnly: true },
+  { id: 'terminal', label: 'Terminal', icon: Terminal },
+  { id: 'files', label: 'File Browser', icon: FolderOpen }
+];
+
+// The full set of tab ids, used to validate a deep-linked hash (#4512) — every
+// id in `tabs` above, regardless of `windowsOnly`, since the hash can be
+// followed before the device's OS (and therefore tab availability) resolves.
+const VALID_TABS: readonly ToolTab[] = tabs.map((tab) => tab.id);
+
+type DeviceOs = 'windows' | 'macos' | 'linux';
+
+type DeviceApiResponse = {
+  hostname: string;
+  displayName?: string | null;
+  osType?: string | null;
+  isHeadless?: boolean;
+  desktopAccess?: DesktopAccessState | null;
+  remoteAccessPolicy?: RemoteAccessPolicy | null;
+  helperLifecycleMode?: 'always-on' | 'on-demand' | null;
+};
+
+type ApiProcess = {
+  pid: number;
+  name: string;
+  user: string;
+  cpuPercent: number;
+  memoryMB?: number;
+  memoryMb?: number;
+  status?: string;
+  commandLine?: string;
+  startTime?: string;
+  threads?: number;
+  parentPid?: number | null;
+  priority?: number;
+};
+
+type ApiService = {
+  name: string;
+  displayName: string;
+  status: string;
+  startType: string;
+  account: string;
+  description?: string;
+  path?: string;
+  dependencies?: string[];
+};
+
+type ApiEventLog = {
+  name: string;
+  displayName: string;
+  recordCount?: number;
+  lastWriteTime?: string;
+};
+
+type ApiEventEntry = {
+  recordId: number;
+  timeCreated: string;
+  level: string;
+  source: string;
+  eventId: number;
+  message: string;
+  category: string;
+  user: string | null;
+  computer: string;
+  rawXml?: string;
+};
+
+type ApiTask = {
+  path: string;
+  name: string;
+  state?: string;
+  lastRunTime?: string | null;
+  lastRunResult?: number | null;
+  nextRunTime?: string | null;
+  author?: string;
+  description?: string;
+  triggers?: Array<{ type: string; enabled: boolean; schedule?: string }>;
+  actions?: Array<{ type: string; path?: string; arguments?: string }>;
+};
+
+type ApiTaskHistory = {
+  id: string;
+  eventId: number;
+  timestamp: string;
+  level: string;
+  message: string;
+  resultCode?: number;
+};
+
+const normalizeDeviceOs = (value?: string | null): DeviceOs => {
+  switch (value) {
+    case 'windows':
+      return 'windows';
+    case 'macos':
+    case 'darwin':
+      return 'macos';
+    case 'linux':
+      return 'linux';
+    default:
+      return 'windows';
+  }
+};
+
+const formatDeviceOs = (value: DeviceOs): string => {
+  if (value === 'macos') return 'macOS';
+  return value.charAt(0).toUpperCase() + value.slice(1);
+};
+
+const normalizeProcessStatus = (value?: string): ProcessStatus => {
+  switch (value) {
+    case 'running':
+    case 'sleeping':
+    case 'stopped':
+    case 'zombie':
+    case 'idle':
+      return value;
+    default:
+      return 'running';
+  }
+};
+
+const mapProcess = (proc: ApiProcess): Process => ({
+  pid: proc.pid,
+  name: proc.name,
+  user: proc.user,
+  cpuPercent: Number(proc.cpuPercent ?? 0),
+  memoryMb: Number(proc.memoryMB ?? proc.memoryMb ?? 0),
+  status: normalizeProcessStatus(proc.status),
+  commandLine: proc.commandLine ?? '',
+  startTime: proc.startTime,
+  threads: proc.threads,
+  parentPid: proc.parentPid ?? undefined,
+  priority: proc.priority
+});
+
+const mapServiceStatus = (status: string): ServiceStatus => {
+  switch (status) {
+    case 'running':
+      return 'Running';
+    case 'stopped':
+      return 'Stopped';
+    case 'paused':
+      return 'Paused';
+    case 'starting':
+      return 'Starting';
+    case 'stopping':
+      return 'Stopping';
+    default:
+      return 'Stopped';
+  }
+};
+
+const mapStartupType = (value: string): StartupType => {
+  switch (value) {
+    case 'auto':
+      return 'Automatic';
+    case 'auto_delayed':
+      return 'Automatic (Delayed)';
+    case 'manual':
+      return 'Manual';
+    case 'disabled':
+      return 'Disabled';
+    default:
+      return 'Manual';
+  }
+};
+
+const mapService = (service: ApiService): WindowsService => ({
+  name: service.name,
+  displayName: service.displayName,
+  status: mapServiceStatus(service.status),
+  startupType: mapStartupType(service.startType),
+  account: service.account,
+  description: service.description,
+  path: service.path,
+  dependencies: service.dependencies
+});
+
+const mapEventLevel = (level?: string): EventLevel => {
+  switch ((level ?? '').toLowerCase()) {
+    case 'information':
+      return 'Information';
+    case 'warning':
+      return 'Warning';
+    case 'error':
+      return 'Error';
+    case 'critical':
+      return 'Critical';
+    case 'verbose':
+      return 'Information';
+    default:
+      return 'Information';
+  }
+};
+
+const mapEventLog = (log: ApiEventLog): EventLog => ({
+  name: log.name,
+  displayName: log.displayName,
+  recordCount: log.recordCount,
+  lastWriteTime: log.lastWriteTime
+});
+
+const mapEventEntry = (entry: ApiEventEntry, logName: string): EventLogEntry => ({
+  recordId: String(entry.recordId),
+  logName,
+  level: mapEventLevel(entry.level),
+  timeCreated: entry.timeCreated,
+  source: entry.source,
+  eventId: entry.eventId,
+  message: entry.message,
+  taskCategory: entry.category,
+  userId: entry.user ?? undefined,
+  computerName: entry.computer,
+  rawXml: entry.rawXml
+});
+
+const normalizeTaskStatus = (state?: string): TaskStatus => {
+  switch (state) {
+    case 'ready':
+    case 'running':
+    case 'disabled':
+    case 'queued':
+      return state;
+    default:
+      return 'unknown';
+  }
+};
+
+const formatTaskTriggerSummary = (trigger: { type: string; schedule?: string }): string => {
+  if (trigger.schedule) {
+    return `${trigger.type} at ${trigger.schedule}`;
+  }
+  return trigger.type;
+};
+
+const mapTaskSummary = (task: ApiTask): ScheduledTask => {
+  const folder = task.path.split('\\').slice(0, -1).join('\\') || '\\';
+  return {
+    name: task.name,
+    path: task.path,
+    folder,
+    status: normalizeTaskStatus(task.state),
+    lastRun: task.lastRunTime ?? undefined,
+    lastResult: task.lastRunResult ?? undefined,
+    nextRun: task.nextRunTime ?? undefined,
+    author: task.author,
+    description: task.description,
+    triggers: (task.triggers ?? []).map(formatTaskTriggerSummary)
+  };
+};
+
+const mapTaskDetails = (task: ApiTask): TaskDetails => {
+  const folder = task.path.split('\\').slice(0, -1).join('\\') || '\\';
+  const triggers = (task.triggers ?? []).map(trigger => {
+    const rawType = trigger.type ?? '';
+    const normalizedType = rawType.toLowerCase();
+    const type: TaskDetails['triggers'][number]['type'] =
+      normalizedType === 'daily' ||
+      normalizedType === 'weekly' ||
+      normalizedType === 'monthly' ||
+      normalizedType === 'boot' ||
+      normalizedType === 'logon' ||
+      normalizedType === 'idle' ||
+      normalizedType === 'event'
+        ? (normalizedType as TaskDetails['triggers'][number]['type'])
+        : 'time';
+    return {
+      type,
+      description: formatTaskTriggerSummary({ type: rawType || 'Schedule', schedule: trigger.schedule }),
+      enabled: trigger.enabled,
+      nextRun: task.nextRunTime ?? undefined
+    };
+  });
+
+  const actions = (task.actions ?? []).map(action => {
+    const rawType = action.type ?? '';
+    const normalizedType = rawType.toLowerCase();
+    const type: TaskDetails['actions'][number]['type'] =
+      normalizedType === 'execute' || normalizedType === 'com_handler' || normalizedType === 'send_email' || normalizedType === 'show_message'
+        ? (normalizedType as TaskDetails['actions'][number]['type'])
+        : 'execute';
+    const args = action.arguments ? ` ${action.arguments}` : '';
+    return {
+      type,
+      path: action.path,
+      arguments: action.arguments,
+      description: action.path ? `Run ${action.path}${args}` : rawType || 'Execute'
+    };
+  });
+
+  return {
+    name: task.name,
+    path: task.path,
+    folder,
+    status: normalizeTaskStatus(task.state),
+    lastRun: task.lastRunTime ?? undefined,
+    lastResult: task.lastRunResult ?? undefined,
+    nextRun: task.nextRunTime ?? undefined,
+    author: task.author,
+    description: task.description,
+    triggers,
+    actions,
+    conditions: {
+      powerCondition: {
+        disallowStartIfOnBatteries: false,
+        stopIfGoingOnBatteries: false
+      },
+      networkCondition: {
+        name: 'Any connection'
+      }
+    },
+    settings: {
+      allowDemandStart: true,
+      stopIfGoingOnBatteries: false,
+      runOnlyIfNetworkAvailable: true,
+      executionTimeLimit: 'PT72H',
+      deleteExpiredTaskAfter: 'Disabled',
+      restartOnFailure: {
+        count: 3,
+        interval: 'PT1M'
+      },
+      multipleInstances: 'ignore_new'
+    }
+  };
+};
+
+const mapTaskHistoryLevel = (level?: string): TaskHistory['level'] => {
+  switch ((level ?? '').toLowerCase()) {
+    case 'error':
+    case 'critical':
+      return 'error';
+    case 'warning':
+      return 'warning';
+    default:
+      return 'info';
+  }
+};
+
+const mapTaskHistoryEntry = (entry: ApiTaskHistory): TaskHistory => ({
+  id: String(entry.id),
+  eventId: Number(entry.eventId ?? 0),
+  timestamp: entry.timestamp ?? '',
+  level: mapTaskHistoryLevel(entry.level),
+  message: entry.message ?? '',
+  ...(entry.resultCode === undefined ? {} : { resultCode: Number(entry.resultCode) })
+});
+
+export default function RemoteToolsPage({
+  deviceId,
+  deviceName,
+  deviceOs,
+  initialTab = 'processes',
+  onClose,
+  showClose = false
+}: RemoteToolsPageProps) {
+  const { t } = useTranslation('remote');
+  // Tab selection is persisted in the URL hash (#4512) rather than plain
+  // component state, so a browser refresh (or a deep link) lands back on the
+  // tab the user was on instead of always resetting to Processes — same
+  // pattern as DeviceDetails.tsx / DnsSecurityPage.tsx (CLAUDE.md "URL State
+  // in Components": hash, not query params). `useHashTab` is SSR-safe: the
+  // first render uses `initialTab` and the hash is adopted post-mount.
+  const [activeTab, setActiveTabState] = useHashTab<ToolTab>(VALID_TABS, initialTab);
+  const [resolvedDeviceName, setResolvedDeviceName] = useState(deviceName);
+  const [resolvedDeviceOs, setResolvedDeviceOs] = useState<DeviceOs>(normalizeDeviceOs(deviceOs));
+  const [isHeadless, setIsHeadless] = useState(false);
+  const [desktopAccess, setDesktopAccess] = useState<DesktopAccessState | null>(null);
+  const [remoteAccessPolicy, setRemoteAccessPolicy] = useState<RemoteAccessPolicy | null>(null);
+  const [helperLifecycleMode, setHelperLifecycleMode] = useState<'always-on' | 'on-demand' | null>(null);
+
+  // Process state
+  const [processes, setProcesses] = useState<Process[]>([]);
+  const [processLoading, setProcessLoading] = useState(false);
+  // Reason the last process-list fetch failed, or null. Kept separate from
+  // `processes` because an empty list and a failed fetch must not render the
+  // same thing (#4935).
+  const [processError, setProcessError] = useState<string | null>(null);
+
+  // Services state
+  const [services, setServices] = useState<WindowsService[]>([]);
+  const [serviceLoading, setServiceLoading] = useState(false);
+  // Reason the last service-list fetch failed, or null — same "don't render
+  // an offline device as an empty list" contract as `processError` (#4935).
+  const [serviceError, setServiceError] = useState<string | null>(null);
+
+  // Agent restart polling state
+  const [agentRestarting, setAgentRestarting] = useState(false);
+  const restartPollRef = useRef<{ interval: ReturnType<typeof setInterval>; timeout: ReturnType<typeof setTimeout> } | null>(null);
+
+  // Event logs state
+  const [eventLogs, setEventLogs] = useState<EventLog[]>([]);
+  const [eventLoading, setEventLoading] = useState(false);
+  const [eventLogError, setEventLogError] = useState<string | null>(null);
+
+  // Scheduled tasks state
+  const [tasks, setTasks] = useState<ScheduledTask[]>([]);
+  const [taskLoading, setTaskLoading] = useState(false);
+  const [taskError, setTaskError] = useState<string | null>(null);
+
+  const isWindows = resolvedDeviceOs === 'windows';
+  const availableTabs = tabs.filter(tab => !tab.windowsOnly || isWindows);
+  const shouldShowClose = showClose || Boolean(onClose);
+  const deviceOsLabel = formatDeviceOs(resolvedDeviceOs);
+
+  // Reflect tab clicks into the URL hash (CLAUDE.md "URL State in
+  // Components") — matches DnsSecurityPage.tsx's switchTab.
+  const switchTab = useCallback((tab: ToolTab) => {
+    window.location.hash = tab;
+    setActiveTabState(tab);
+  }, [setActiveTabState]);
+
+  // A hash can restore a windows-only tab (bookmarked/shared link, or a stale
+  // fragment left over from a different device) for a device that turns out
+  // not to be Windows. `availableTabs` below already hides that tab's button
+  // and none of the tab-content branches render for it, so without this the
+  // page would silently show no active tab and an empty content pane — the
+  // hash gives that state a second, unguarded path that clicking a tab button
+  // never could. Reset to the always-available Processes tab when that
+  // happens, and reflect the correction into the hash too.
+  useEffect(() => {
+    const tabDef = tabs.find(tab => tab.id === activeTab);
+    if (tabDef?.windowsOnly && !isWindows) {
+      switchTab('processes');
+    }
+  }, [activeTab, isWindows, switchTab]);
+
+  const handleClose = useCallback(() => {
+    if (onClose) {
+      onClose();
+      return;
+    }
+    // Navigate deterministically back to the device's detail page (the only
+    // entry point to this page). Using window.history.back() was unreliable:
+    // after the user clicked around, intermediate SPA history entries meant
+    // "back" landed inside Remote Tools instead of leaving it.
+    void navigateTo(`/devices/${deviceId}`);
+  }, [onClose, deviceId]);
+
+  useEffect(() => {
+    setResolvedDeviceOs(normalizeDeviceOs(deviceOs));
+  }, [deviceOs]);
+
+  // #5250 — pulled out of the mount-only effect below so it can also be
+  // invoked from the live-update paths (device.updated event, tab
+  // visibility regain) without duplicating the fetch/parse logic. A ref
+  // tracks mount state across every caller, not just the initial effect.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const fetchDevice = useCallback(async () => {
+    try {
+      const response = await fetchWithAuth(`/devices/${deviceId}`);
+      if (!response.ok) {
+        console.error(`[RemoteToolsPage] Failed to load device info: HTTP ${response.status}`);
+        // #5250 — this fetch is now a load-bearing live-update path (the
+        // desktopAccess event's "value not in payload" fallback, and the
+        // visibility-regain refetch below), not just a one-shot mount call.
+        // A silent failure here reproduces the exact staleness this fix
+        // closes, with nothing in telemetry to show it happened.
+        Sentry.captureMessage('RemoteToolsPage failed to refresh device info', {
+          level: 'warning',
+          extra: { deviceId, status: response.status },
+        });
+        return;
+      }
+      const data: DeviceApiResponse = await response.json();
+      if (!mountedRef.current) return;
+      setResolvedDeviceName(data.displayName || data.hostname || deviceName);
+      setResolvedDeviceOs(normalizeDeviceOs(data.osType));
+      setIsHeadless(data.isHeadless === true);
+      setDesktopAccess(data.desktopAccess ?? null);
+      setRemoteAccessPolicy(data.remoteAccessPolicy ?? null);
+      setHelperLifecycleMode(data.helperLifecycleMode ?? null);
+    } catch (error) {
+      console.error('Failed to load device info:', error);
+      Sentry.captureException(error, { extra: { deviceId } });
+    }
+  }, [deviceId, deviceName]);
+
+  useEffect(() => {
+    fetchDevice();
+  }, [fetchDevice]);
+
+  // #5250 — Remote Tools previously only ever fetched device access state
+  // once on mount, so a helper recovering (or dropping) while this page
+  // stayed open left Connect Desktop stuck on its stale gray/lit state until
+  // the operator navigated away and back. Two live-update paths, same as the
+  // Overview page's device.updated subscription:
+  //  1. The heartbeat now publishes `device.updated` with
+  //     `fields: ['desktopAccess']` when the reported value changes
+  //     (apps/api/src/routes/agents/heartbeat.ts) — apply it directly rather
+  //     than round-tripping through another fetch.
+  //  2. A tab regaining visibility (operator switches back to this browser
+  //     tab/window) refetches once, covering the case where the socket was
+  //     disconnected while backgrounded.
+  const handleDeviceUpdatedEvent = useCallback(
+    (event: { type: string; payload: Record<string, unknown> }) => {
+      if (event.type !== 'device.updated') return;
+      if (event.payload.deviceId !== deviceId) return;
+      const fields = event.payload.fields as string[] | undefined;
+      if (!fields?.includes('desktopAccess')) return;
+      const nextDesktopAccess = event.payload.desktopAccess as DesktopAccessState | null | undefined;
+      if (nextDesktopAccess !== undefined) {
+        setDesktopAccess(nextDesktopAccess);
+      } else {
+        // Payload didn't carry the value (older API build) — fall back to a
+        // full refetch so we still pick up the change.
+        fetchDevice();
+      }
+    },
+    [deviceId, fetchDevice],
+  );
+
+  const { subscribe } = useEventStream({ onEvent: handleDeviceUpdatedEvent });
+
+  useEffect(() => {
+    subscribe(['device.updated']);
+  }, [subscribe]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fetchDevice();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [fetchDevice]);
+
+  // Cleanup restart polling on unmount
+  useEffect(() => {
+    return () => {
+      if (restartPollRef.current) {
+        clearInterval(restartPollRef.current.interval);
+        clearTimeout(restartPollRef.current.timeout);
+      }
+    };
+  }, []);
+
+  // Process API calls
+  const fetchProcesses = useCallback(async () => {
+    setProcessLoading(true);
+    try {
+      const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/processes?limit=500`);
+      if (!res.ok) {
+        // An offline device answers 503 with
+        // `{ error: 'The device is offline.', code: 'device_offline' }`
+        // (apps/api/src/routes/systemTools/fileBrowserHelpers.ts). Discarding
+        // that body and logging in the catch below is what made this tab read
+        // "Processes 0 / No Data" — indistinguishable from a genuinely idle
+        // box (#4935). Keep the server's reason so the pane says why.
+        const body = await res.json().catch(() => null);
+        throw new Error(extractApiError(body, t('remoteToolsPage.errors.fetchProcesses')));
+      }
+      const json = await res.json();
+      const data: ApiProcess[] = Array.isArray(json.data) ? json.data : [];
+      setProcesses(data.map(mapProcess));
+      setProcessError(null);
+    } catch (err) {
+      console.error('Failed to fetch processes:', err);
+      // Drop any rows from an earlier successful fetch: leaving them beside the
+      // error banner would show a stale list as if it were current.
+      setProcesses([]);
+      setProcessError(
+        err instanceof Error ? err.message : t('remoteToolsPage.errors.fetchProcesses')
+      );
+    } finally {
+      setProcessLoading(false);
+    }
+  }, [deviceId]);
+
+  const handleKillProcess = useCallback(async (pid: number) => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/processes/${pid}/kill`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.killProcess'));
+    }
+    await fetchProcesses();
+  }, [deviceId, fetchProcesses]);
+
+  const handleGetProcess = useCallback(async (pid: number): Promise<Process> => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/processes/${pid}`);
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.processDetails'));
+    }
+    const json = await res.json();
+    return mapProcess(json.data as ApiProcess);
+  }, [deviceId]);
+
+  // Services API calls
+  const fetchServices = useCallback(async () => {
+    setServiceLoading(true);
+    try {
+      // Fetch with a high limit; ServicesManager paginates/filters client-side.
+      // 500 is the agent's max accepted page size (same as the Processes tab) and
+      // covers realistic Windows service counts (the agent caps the list at 512).
+      const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/services?limit=500`);
+      if (!res.ok) {
+        // Same reasoning as fetchProcesses above (#4935): an offline device's
+        // 503 body carries `{ error, code: 'device_offline' }` — discarding it
+        // here made the Services tab read "0 of 0 / No Services Available",
+        // indistinguishable from a device that genuinely has none.
+        const body = await res.json().catch(() => null);
+        throw new Error(extractApiError(body, t('remoteToolsPage.errors.fetchServices')));
+      }
+      const json = await res.json();
+      const data: ApiService[] = Array.isArray(json.data) ? json.data : [];
+      setServices(data.map(mapService));
+      setServiceError(null);
+    } catch (err) {
+      console.error('Failed to fetch services:', err);
+      // Drop any rows from an earlier successful fetch — see fetchProcesses.
+      setServices([]);
+      setServiceError(
+        err instanceof Error ? err.message : t('remoteToolsPage.errors.fetchServices')
+      );
+    } finally {
+      setServiceLoading(false);
+    }
+  }, [deviceId]);
+
+  const handleStartService = useCallback(async (name: string) => {
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/services/${encodeURIComponent(name)}/start`, {
+          method: 'POST'
+        }),
+        errorFallback: t('remoteToolsPage.errors.startService'),
+      });
+    } finally {
+      // Re-sync from the server whether the command succeeded or failed, so
+      // a failed command never leaves the row showing a stale pre-action
+      // status with no indication anything went wrong (#5088).
+      await fetchServices();
+    }
+  }, [deviceId, fetchServices, t]);
+
+  const handleStopService = useCallback(async (name: string) => {
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/system-tools/devices/${deviceId}/services/${encodeURIComponent(name)}/stop`, {
+          method: 'POST'
+        }),
+        errorFallback: t('remoteToolsPage.errors.stopService'),
+      });
+    } finally {
+      await fetchServices();
+    }
+  }, [deviceId, fetchServices, t]);
+
+  const handleRestartService = useCallback(async (name: string) => {
+    const isAgent = isAgentService(name);
+
+    try {
+      await runAction({
+        request: () => fetchWithAuth(
+          `/system-tools/devices/${deviceId}/services/${encodeURIComponent(name)}/restart`,
+          { method: 'POST' }
+        ),
+        errorFallback: t('remoteToolsPage.errors.restartService'),
+      });
+    } catch (err) {
+      // Same re-sync-on-failure rule as start/stop above (#5088).
+      await fetchServices();
+      throw err;
+    }
+
+    if (isAgent) {
+      setAgentRestarting(true);
+      const interval = setInterval(async () => {
+        try {
+          const statusRes = await fetchWithAuth(`/devices/${deviceId}`);
+          if (statusRes.ok) {
+            const data = await statusRes.json();
+            if (data.status === 'online') {
+              clearInterval(interval);
+              if (restartPollRef.current) clearTimeout(restartPollRef.current.timeout);
+              restartPollRef.current = null;
+              setAgentRestarting(false);
+              fetchServices();
+            }
+          }
+        } catch (pollError) {
+          console.warn('[RemoteTools] Polling error during agent restart:', pollError);
+        }
+      }, 3000);
+      const timeout = setTimeout(() => {
+        clearInterval(interval);
+        restartPollRef.current = null;
+        setAgentRestarting(false);
+        console.error('[RemoteTools] Agent restart polling timed out after 60s');
+        fetchServices();
+      }, 60000);
+      restartPollRef.current = { interval, timeout };
+    } else {
+      fetchServices();
+    }
+  }, [deviceId, fetchServices, t]);
+
+  // Event logs API calls
+  const fetchEventLogs = useCallback(async () => {
+    setEventLoading(true);
+    try {
+      const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/eventlogs`);
+      if (!res.ok) {
+        // Same offline-vs-empty distinction as fetchProcesses (#4935).
+        const body = await res.json().catch(() => null);
+        throw new Error(extractApiError(body, t('remoteToolsPage.errors.fetchEventLogs')));
+      }
+      const json = await res.json();
+      const data: ApiEventLog[] = Array.isArray(json.data) ? json.data : [];
+      setEventLogs(data.map(mapEventLog));
+      setEventLogError(null);
+    } catch (err) {
+      console.error('Failed to fetch event logs:', err);
+      setEventLogs([]);
+      setEventLogError(
+        err instanceof Error ? err.message : t('remoteToolsPage.errors.fetchEventLogs')
+      );
+    } finally {
+      setEventLoading(false);
+    }
+  }, [deviceId]);
+
+  const handleQueryEvents = useCallback(async (logName: string, filter: EventFilter) => {
+    const params = new URLSearchParams();
+    if (filter.levels?.length) params.set('level', filter.levels[0].toLowerCase());
+    if (filter.sources?.length) params.set('source', filter.sources[0]);
+    if (filter.startDate) params.set('startTime', filter.startDate);
+    if (filter.endDate) params.set('endTime', filter.endDate);
+    if (filter.eventId !== undefined) params.set('eventId', String(filter.eventId));
+
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/eventlogs/${encodeURIComponent(logName)}/events?${params}`);
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.queryEvents'));
+    }
+    const json = await res.json();
+    const data: ApiEventEntry[] = Array.isArray(json.data) ? json.data : [];
+    return data.map(entry => mapEventEntry(entry, logName));
+  }, [deviceId]);
+
+  const handleGetEvent = useCallback(async (logName: string, recordId: string) => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/eventlogs/${encodeURIComponent(logName)}/events/${encodeURIComponent(recordId)}`);
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.eventDetails'));
+    }
+    const json = await res.json();
+    return mapEventEntry(json.data as ApiEventEntry, logName);
+  }, [deviceId]);
+
+  // Scheduled tasks API calls
+  const fetchTasks = useCallback(async () => {
+    setTaskLoading(true);
+    try {
+      const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks`);
+      if (!res.ok) {
+        // Same offline-vs-empty distinction as fetchProcesses (#4935).
+        const body = await res.json().catch(() => null);
+        throw new Error(extractApiError(body, t('remoteToolsPage.errors.fetchTasks')));
+      }
+      const json = await res.json();
+      const data: ApiTask[] = Array.isArray(json.data) ? json.data : [];
+      setTasks(data.map(mapTaskSummary));
+      setTaskError(null);
+    } catch (err) {
+      console.error('Failed to fetch tasks:', err);
+      setTasks([]);
+      setTaskError(
+        err instanceof Error ? err.message : t('remoteToolsPage.errors.fetchTasks')
+      );
+    } finally {
+      setTaskLoading(false);
+    }
+  }, [deviceId]);
+
+  const handleRunTask = useCallback(async (path: string) => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/run`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.runTask'));
+    }
+    await fetchTasks();
+  }, [deviceId, fetchTasks]);
+
+  const handleSelectTask = useCallback(async (path: string): Promise<TaskDetails> => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}`);
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.taskDetails'));
+    }
+    const json = await res.json();
+    return mapTaskDetails(json.data as ApiTask);
+  }, [deviceId]);
+
+  const handleGetTaskHistory = useCallback(async (path: string): Promise<TaskHistory[]> => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/history?limit=100`);
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.taskHistory'));
+    }
+    const json = await res.json();
+    const data: ApiTaskHistory[] = Array.isArray(json.data) ? json.data : [];
+    return data.map(mapTaskHistoryEntry);
+  }, [deviceId]);
+
+  const handleEnableTask = useCallback(async (path: string) => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/enable`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.enableTask'));
+    }
+    await fetchTasks();
+  }, [deviceId, fetchTasks]);
+
+  const handleDisableTask = useCallback(async (path: string) => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/tasks/${encodeURIComponent(path)}/disable`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.disableTask'));
+    }
+    await fetchTasks();
+  }, [deviceId, fetchTasks]);
+
+  const handleGetRegistryKeys = useCallback(async (hive: string, path: string) => {
+    const params = new URLSearchParams({ hive, path });
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/keys?${params}`);
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.registryKeys'));
+    }
+    const json = await res.json();
+    const data = Array.isArray(json.data) ? json.data : [];
+    return data.map((entry: { name: string; path: string; subKeyCount?: number }) => {
+      const normalizedPath = entry.path.startsWith(`${hive}\\`)
+        ? entry.path.slice(hive.length + 1)
+        : entry.path;
+      return {
+        name: entry.name,
+        path: normalizedPath,
+        hasChildren: (entry.subKeyCount ?? 0) > 0
+      };
+    });
+  }, [deviceId]);
+
+  const handleGetRegistryValues = useCallback(async (hive: string, path: string) => {
+    const params = new URLSearchParams({ hive, path });
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/values?${params}`);
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.registryValues'));
+    }
+    const json = await res.json();
+    return Array.isArray(json.data) ? json.data : [];
+  }, [deviceId]);
+
+  const handleSetRegistryValue = useCallback(async (hive: string, path: string, name: string, type: string, data: unknown) => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/value`, {
+      method: 'PUT',
+      body: JSON.stringify({ hive, path, name, type, data })
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.setRegistryValue'));
+    }
+  }, [deviceId]);
+
+  const handleDeleteRegistryValue = useCallback(async (hive: string, path: string, name: string) => {
+    const params = new URLSearchParams({ hive, path, name });
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/value?${params}`, {
+      method: 'DELETE'
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.deleteRegistryValue'));
+    }
+  }, [deviceId]);
+
+  const handleCreateRegistryKey = useCallback(async (hive: string, path: string) => {
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/key`, {
+      method: 'POST',
+      body: JSON.stringify({ hive, path })
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.createRegistryKey'));
+    }
+  }, [deviceId]);
+
+  const handleDeleteRegistryKey = useCallback(async (hive: string, path: string) => {
+    const params = new URLSearchParams({ hive, path });
+    const res = await fetchWithAuth(`/system-tools/devices/${deviceId}/registry/key?${params}`, {
+      method: 'DELETE'
+    });
+    if (!res.ok) {
+      const json = await res.json();
+      throw new Error(json.error || t('remoteToolsPage.errors.deleteRegistryKey'));
+    }
+  }, [deviceId]);
+
+  // Load data on tab change
+  useEffect(() => {
+    switch (activeTab) {
+      case 'processes':
+        fetchProcesses();
+        break;
+      case 'services':
+        if (isWindows) fetchServices();
+        break;
+      case 'eventlog':
+        if (isWindows) fetchEventLogs();
+        break;
+      case 'tasks':
+        if (isWindows) fetchTasks();
+        break;
+    }
+  }, [activeTab, isWindows, fetchProcesses, fetchServices, fetchEventLogs, fetchTasks]);
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* Header */}
+      <div className="flex items-center justify-between border-b bg-card px-6 py-4">
+        <div className="flex items-center gap-3">
+          <Monitor className="h-5 w-5 text-primary" />
+          <div>
+            <h1 className="text-lg font-semibold">{t('remoteToolsPage.title')}</h1>
+            <p className="text-sm text-muted-foreground">
+              {resolvedDeviceName} ({deviceOsLabel})
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <ConnectDesktopButton deviceId={deviceId} isHeadless={isHeadless} desktopAccess={desktopAccess} remoteAccessPolicy={remoteAccessPolicy} helperLifecycleMode={helperLifecycleMode} />
+          {shouldShowClose && (
+            <button
+              onClick={handleClose}
+              className="rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:bg-muted"
+          >
+            {t('common:actions.close')}
+          </button>
+          )}
+        </div>
+      </div>
+
+      {/* Tab Navigation */}
+      <div className="flex gap-1 border-b bg-muted/30 px-4">
+        {availableTabs.map(tab => {
+          const Icon = tab.icon;
+          const isActive = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => switchTab(tab.id)}
+              className={`flex items-center gap-2 border-b-2 px-4 py-3 text-sm font-medium transition-colors ${
+                isActive
+                  ? 'border-primary text-primary'
+                  : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground'
+              }`}
+            >
+              <Icon className="h-4 w-4" />
+              {t(/* i18n-dynamic */ `remoteToolsPage.tabs.${tab.id}`)}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Policy blocked banner */}
+      {remoteAccessPolicy?.remoteTools === false && (
+        <div className="mx-4 mt-4 flex items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-800 dark:bg-amber-950">
+          <ShieldOff className="h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" />
+          <div>
+            <p className="text-sm font-medium text-amber-800 dark:text-amber-300">
+              {t('remoteToolsPage.policyDisabledTitle')}
+            </p>
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              {remoteAccessPolicy.policyName
+                ? t('remoteToolsPage.policyDisabledNamed', { name: remoteAccessPolicy.policyName })
+                : t('remoteToolsPage.policyDisabled')}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Tool Content */}
+      <div className={`flex-1 min-h-0 flex flex-col p-6 ${activeTab === 'files' ? '' : 'overflow-auto'}`}>
+        {activeTab === 'processes' && (
+          <ProcessManager
+            deviceId={deviceId}
+            deviceName={resolvedDeviceName}
+            processes={processes}
+            loading={processLoading}
+            loadError={processError}
+            onRefresh={fetchProcesses}
+            onKillProcess={handleKillProcess}
+            onGetProcess={handleGetProcess}
+          />
+        )}
+        {activeTab === 'services' && agentRestarting && (
+          <div className="mb-4 flex items-center gap-3 rounded-md border border-blue-500/40 bg-blue-500/10 p-4">
+            <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
+            <div>
+              <h3 className="font-medium text-blue-700">{t('remoteToolsPage.agentRestartingTitle')}</h3>
+              <p className="text-sm text-blue-600">
+                {t('remoteToolsPage.agentRestartingDescription')}
+              </p>
+            </div>
+          </div>
+        )}
+        {activeTab === 'services' && isWindows && (
+          <ServicesManager
+            deviceId={deviceId}
+            deviceName={resolvedDeviceName}
+            deviceOs={resolvedDeviceOs}
+            services={services}
+            loading={serviceLoading}
+            loadError={serviceError}
+            onRefresh={fetchServices}
+            onStartService={handleStartService}
+            onStopService={handleStopService}
+            onRestartService={handleRestartService}
+          />
+        )}
+        {activeTab === 'registry' && isWindows && (
+          <RegistryEditor
+            deviceId={deviceId}
+            deviceName={resolvedDeviceName}
+            onGetKeys={handleGetRegistryKeys}
+            onGetValues={handleGetRegistryValues}
+            onSetValue={handleSetRegistryValue}
+            onDeleteValue={handleDeleteRegistryValue}
+            onCreateKey={handleCreateRegistryKey}
+            onDeleteKey={handleDeleteRegistryKey}
+          />
+        )}
+        {activeTab === 'eventlog' && isWindows && (
+          <EventViewer
+            deviceId={deviceId}
+            deviceName={resolvedDeviceName}
+            logs={eventLogs}
+            loading={eventLoading}
+            loadError={eventLogError}
+            onQueryEvents={handleQueryEvents}
+            onGetEvent={handleGetEvent}
+          />
+        )}
+        {activeTab === 'tasks' && isWindows && (
+          <ScheduledTasks
+            deviceId={deviceId}
+            deviceName={resolvedDeviceName}
+            tasks={tasks}
+            loading={taskLoading}
+            loadError={taskError}
+            onRefresh={fetchTasks}
+            onSelectTask={handleSelectTask}
+            onGetHistory={handleGetTaskHistory}
+            onRunTask={handleRunTask}
+            onEnableTask={handleEnableTask}
+            onDisableTask={handleDisableTask}
+          />
+        )}
+        {activeTab === 'terminal' && (
+          <RemoteTerminal
+            deviceId={deviceId}
+            deviceHostname={resolvedDeviceName}
+            // Without this the terminal's only failure report went nowhere: it
+            // calls onError and, before #4152, did nothing else — so a dead
+            // terminal was indistinguishable from an idle one. The in-pane
+            // retry overlay is the primary signal now; the toast is what makes
+            // the failure noticeable if the user is looking elsewhere.
+            onError={(msg) => {
+              console.error('[RemoteToolsPage] Terminal error:', msg);
+              showToast({ type: 'error', message: msg });
+            }}
+          />
+        )}
+        {activeTab === 'files' && (
+          <FileManager
+            deviceId={deviceId}
+            deviceHostname={resolvedDeviceName}
+            initialPath={getInitialFilePath(resolvedDeviceOs)}
+            onError={(msg) => console.error('[RemoteToolsPage] File manager error:', msg)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}

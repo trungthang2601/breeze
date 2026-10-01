@@ -1,0 +1,143 @@
+import { DelayedError, Job, Queue, Worker } from 'bullmq';
+import { getBullMQConnection } from '../services/redis';
+import { createInstrumentedQueue } from '../services/bullmqQueue';
+import { withSystemDbAccessContext } from '../db';
+import { reconcileDrExecution } from '../services/drExecutionService';
+import { isReusableState } from '../services/bullmqUtils';
+import { attachWorkerObservability } from './workerObservability';
+import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
+import {
+  drExecutionQueueJobDataSchema,
+  type DrExecutionQueueJobData,
+  withQueueMeta,
+} from './queueSchemas';
+
+const DR_EXECUTION_QUEUE = 'dr-execution';
+const PRIVILEGED_JOB_OPTIONS = {
+  attempts: 3,
+  backoff: {
+    type: 'exponential' as const,
+    delay: 1_000,
+  },
+};
+
+let drExecutionQueue: Queue<DrExecutionQueueJobData> | null = null;
+let drExecutionWorkerInstance: Worker<DrExecutionQueueJobData> | null = null;
+
+function getDrExecutionReconcileJobId(executionId: string): string {
+  return `dr-execution-${executionId}`;
+}
+
+function getDrExecutionQueue(): Queue<DrExecutionQueueJobData> {
+  if (!drExecutionQueue) {
+    drExecutionQueue = createInstrumentedQueue<DrExecutionQueueJobData>(DR_EXECUTION_QUEUE);
+  }
+  return drExecutionQueue;
+}
+
+export async function processDrExecutionReconcileJob(
+  job: Job<DrExecutionQueueJobData>,
+): Promise<{ executionId: string; status: string }> {
+  const outcome = await withSystemDbAccessContext(async () => {
+    const data = parseQueueJobData(DR_EXECUTION_QUEUE, job, drExecutionQueueJobDataSchema);
+    if (data.type !== 'reconcile-execution') {
+      throw new Error(`Unknown DR execution job type: ${(data as { type: string }).type}`);
+    }
+    assertQueueJobName(DR_EXECUTION_QUEUE, job, 'reconcile-execution');
+    return {
+      data,
+      outcome: await reconcileDrExecution(data.executionId),
+    };
+  });
+
+  if (outcome.outcome.nextDelayMs !== null) {
+    if (!job.token) throw new Error('Active DR reconcile job is missing its worker token');
+    await job.moveToDelayed(Date.now() + outcome.outcome.nextDelayMs, job.token);
+    throw new DelayedError();
+  }
+
+  return {
+    executionId: outcome.data.executionId,
+    status: outcome.outcome.execution?.status ?? 'missing',
+  };
+}
+
+function createDrExecutionWorker(): Worker<DrExecutionQueueJobData> {
+  return new Worker<DrExecutionQueueJobData>(
+    DR_EXECUTION_QUEUE,
+    processDrExecutionReconcileJob,
+    {
+      connection: getBullMQConnection(),
+      concurrency: 4,
+      lockDuration: 120_000,
+      stalledInterval: 60_000,
+      maxStalledCount: 2,
+    }
+  );
+}
+
+export async function enqueueDrExecutionReconcile(executionId: string, delayMs = 0): Promise<string> {
+  const queue = getDrExecutionQueue();
+  const stableJobId = getDrExecutionReconcileJobId(executionId);
+  const existing = await queue.getJob(stableJobId);
+  if (existing) {
+    const state = await existing.getState();
+    if (isReusableState(state)) {
+      if (state === 'delayed' && delayMs === 0) {
+        await existing.changeDelay(0);
+      }
+      return existing.id!;
+    }
+    if (state === 'completed' || state === 'failed') {
+      await existing.remove().catch((error) => {
+        console.error(`[DrExecutionWorker] Failed to remove stale job:`, error);
+      });
+    }
+  }
+  const job = await queue.add(
+    'reconcile-execution',
+    drExecutionQueueJobDataSchema.parse(withQueueMeta({
+      type: 'reconcile-execution',
+      executionId,
+    }, {
+      actorType: 'system',
+      actorId: null,
+      source: 'service:dr:reconcile',
+    })),
+    {
+      jobId: stableJobId,
+      delay: Math.max(0, delayMs),
+      ...PRIVILEGED_JOB_OPTIONS,
+      removeOnComplete: { count: 100 },
+      removeOnFail: { count: 100 },
+    }
+  );
+  return job.id!;
+}
+
+export async function initializeDrExecutionWorker(): Promise<void> {
+  drExecutionWorkerInstance = createDrExecutionWorker();
+  attachWorkerObservability(drExecutionWorkerInstance, 'drExecutionWorker');
+
+  drExecutionWorkerInstance.on('error', (error) => {
+    console.error('[DrExecutionWorker] Worker error:', error);
+  });
+
+  drExecutionWorkerInstance.on('failed', (job, error) => {
+    console.error(`[DrExecutionWorker] Job ${job?.id} failed:`, error);
+  });
+
+  console.log('[DrExecutionWorker] DR execution worker initialized');
+}
+
+export async function shutdownDrExecutionWorker(): Promise<void> {
+  if (drExecutionWorkerInstance) {
+    await drExecutionWorkerInstance.close();
+    drExecutionWorkerInstance = null;
+  }
+
+  if (drExecutionQueue) {
+    await drExecutionQueue.close();
+    drExecutionQueue = null;
+  }
+}

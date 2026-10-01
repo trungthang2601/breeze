@@ -1,0 +1,830 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_grep() {
+  local pattern="$1"
+  local file="$2"
+  local message="$3"
+  if ! grep -Eq -- "$pattern" "$file"; then
+    fail "$message"
+  fi
+}
+
+reject_grep() {
+  local pattern="$1"
+  local file="$2"
+  local message="$3"
+  if grep -Eq -- "$pattern" "$file"; then
+    fail "$message"
+  fi
+}
+
+# Credential-boundary executor images normally prohibit build-time package
+# resolution. The sole exception is the owner-approved repair for
+# CVE-2026-14456: upgrade exactly the two already-installed OpenSSL packages,
+# with no apk add, general upgrade, extra package, alternate flags, or
+# continuation-line bypass.
+AUDITED_APK_UPGRADE='^RUN[[:space:]]+apk[[:space:]]+upgrade[[:space:]]+--no-cache[[:space:]]+libcrypto3[[:space:]]+libssl3([[:space:]]*&&[[:space:]]*\\)?[[:space:]]*$'
+ANY_APK_INVOCATION='(^|[^[:alnum:]_-])apk([^[:alnum:]_-]|$)'
+
+reject_unaudited_apk() {
+  local dockerfile="$1"
+  local offenders status=0
+
+  # A security predicate must never answer "clean" about input it could not
+  # read: an unreadable file makes the pipeline below emit nothing, which is
+  # indistinguishable from a genuinely clean file.
+  [[ -r "$dockerfile" ]] || fail "cannot read $dockerfile"
+
+  # Strip WHOLE-LINE comments only. A '#' mid-line inside a RUN is ordinary
+  # shell text (a sed delimiter, a URL fragment, a quoted literal), so deleting
+  # from the first '#' — as `sed 's/#.*$//'` did — would hide a real `apk add`
+  # that follows it on the same line and silently pass the credential boundary.
+  offenders="$(
+    grep -vE '^[[:space:]]*#' "$dockerfile" |
+      grep -E "$ANY_APK_INVOCATION" |
+      grep -vE "$AUDITED_APK_UPGRADE"
+  )" || status=$?
+  # grep exits 1 for "no matching lines" (the clean case) and >=2 for a real
+  # error (unreadable, bad regex). Only the former may be treated as clean.
+  (( status <= 1 )) || fail "apk scan of $dockerfile failed (grep status $status)"
+
+  if [[ -n "$offenders" ]]; then
+    fail "$dockerfile contains an unaudited apk invocation: $(printf '%s' "$offenders" | head -1 | sed 's/^[[:space:]]*//')"
+  fi
+}
+
+require_audited_openssl_upgrade() {
+  local dockerfile="$1"
+
+  reject_unaudited_apk "$dockerfile"
+  require_grep "$AUDITED_APK_UPGRADE" "$dockerfile" \
+    "$dockerfile must contain exactly: apk upgrade --no-cache libcrypto3 libssl3"
+}
+
+if [[ "${1:-}" == "--check-apk" ]]; then
+  [[ -n "${2:-}" && -f "${2:-}" && -r "${2:-}" ]] || fail "--check-apk needs a readable Dockerfile"
+  reject_unaudited_apk "$2"
+  exit 0
+fi
+
+# Unlike --check-apk (which only exercises the "no unaudited apk invocation"
+# half via reject_unaudited_apk), this exercises the full credential-boundary
+# rule including the "the audited upgrade line is actually present" half
+# (require_grep inside require_audited_openssl_upgrade) — see issue #4271.
+if [[ "${1:-}" == "--require-openssl-upgrade" ]]; then
+  [[ -n "${2:-}" && -f "${2:-}" && -r "${2:-}" ]] || fail "--require-openssl-upgrade needs a readable Dockerfile"
+  require_audited_openssl_upgrade "$2"
+  exit 0
+fi
+
+extract_yaml_job() {
+  local job="$1"
+  local workflow="$2"
+  local output="$3"
+  awk -v header="  ${job}:" '
+    $0 == header { in_job = 1 }
+    in_job && /^  [[:alnum:]_-]+:/ && $0 != header { exit }
+    in_job { print }
+  ' "$workflow" > "$output"
+  [[ -s "$output" ]] || fail "$workflow must define the $job job"
+}
+
+require_order() {
+  local first_pattern="$1"
+  local second_pattern="$2"
+  local file="$3"
+  local message="$4"
+  local first_line second_line
+  first_line="$(grep -nEm1 -- "$first_pattern" "$file" | cut -d: -f1 || true)"
+  second_line="$(grep -nEm1 -- "$second_pattern" "$file" | cut -d: -f1 || true)"
+  if [[ -z "$first_line" || -z "$second_line" || "$first_line" -ge "$second_line" ]]; then
+    fail "$message"
+  fi
+}
+
+GUARD_TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$GUARD_TMP_DIR"' EXIT
+
+if [[ -e docker-compose.override.yml ]]; then
+  fail "docker-compose.override.yml must not exist; Docker Compose auto-loads it and can weaken production defaults"
+fi
+
+# SR-007: workflows that build/publish artifacts must declare a top-level
+# (workflow-global) least-privilege `permissions:` block so build jobs don't
+# inherit the repo/org default GITHUB_TOKEN scopes. Jobs needing more (release
+# publish, GHCR push, OIDC signing) override per-job. A column-0 `permissions:`
+# is the workflow-global one; per-job blocks are indented.
+require_grep '^permissions:' .github/workflows/release.yml \
+  "release workflow must declare a top-level least-privilege permissions: block (SR-007)"
+require_grep '^permissions:' .github/workflows/ci.yml \
+  "CI workflow must declare a top-level least-privilege permissions: block (SR-007)"
+
+require_grep '^  release-integrity-gate:' .github/workflows/release.yml \
+  "release workflow must include release-integrity-gate"
+require_grep 'needs: .*release-integrity-gate' .github/workflows/release.yml \
+  "create-release must depend on release-integrity-gate"
+require_grep 'ENABLE_MACOS_SIGNING must be true for tag releases' .github/workflows/release.yml \
+  "macOS tag releases must fail when signing is disabled"
+require_grep 'Required signed/notarized release asset missing or empty' .github/workflows/release.yml \
+  "release workflow must verify required signed/notarized assets"
+require_grep 'release-artifact-manifest\.json' .github/workflows/release.yml \
+  "release workflow must generate a release artifact manifest"
+require_grep 'release-artifact-manifest\.json\.minisig' .github/workflows/release.yml \
+  "tag releases must publish a detached release artifact manifest signature"
+require_grep 'release-artifact-manifest\.json\.ed25519' .github/workflows/release.yml \
+  "tag releases must publish a Node-verifiable release artifact manifest signature"
+require_grep 'RELEASE_MANIFEST_MINISIGN_PRIVATE_KEY' .github/workflows/release.yml \
+  "tag releases must require a dedicated release manifest signing key"
+require_grep 'RELEASE_MANIFEST_MINISIGN_PUBLIC_KEY' .github/workflows/release.yml \
+  "tag releases must verify the release manifest with the configured public key"
+require_grep 'RELEASE_MANIFEST_ED25519_PRIVATE_KEY' .github/workflows/release.yml \
+  "tag releases must require a dedicated Ed25519 release manifest signing key"
+require_grep 'RELEASE_MANIFEST_ED25519_PUBLIC_KEY' .github/workflows/release.yml \
+  "tag releases must verify the Ed25519 release manifest signature before publishing"
+require_grep 'minisign -S' .github/workflows/release.yml \
+  "release workflow must sign the release artifact manifest"
+require_grep 'minisign -V' .github/workflows/release.yml \
+  "release workflow must verify the release artifact manifest signature before publishing"
+require_grep 'releaseArtifactManifest' apps/api/src/services/installerBuilder.ts \
+  "installer fallback fetches must use API-side release artifact manifest verification"
+require_grep 'RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS' apps/api/src/services/releaseArtifactManifest.ts \
+  "API release artifact verification must pin an Ed25519 public-key trust root"
+require_grep 'verifySignature' apps/api/src/services/releaseArtifactManifest.ts \
+  "API release artifact verification must verify Ed25519 signatures in Node"
+require_grep 'public key is required for GitHub fallback asset verification in production' apps/api/src/services/releaseArtifactManifest.ts \
+  "API release artifact verification must fail closed in production without a public-key trust root"
+require_grep 'RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS must be set in production for both BINARY_SOURCE=github' apps/api/src/config/validate.ts \
+  "production config validation must require a release artifact public key for both BINARY_SOURCE=github and BINARY_SOURCE=local"
+
+require_grep 'VERSION_METADATA_URL=' apps/api/src/routes/agents/download.ts \
+  "generated Linux installer must fetch version metadata"
+require_grep 'verify_sha256.*TMPFILE.*EXPECTED_SHA256' apps/api/src/routes/agents/download.ts \
+  "generated Linux installer must verify downloaded binary checksum"
+require_grep 'Refusing to install without a trusted checksum' apps/api/src/routes/agents/download.ts \
+  "generated Linux installer must fail closed without checksum metadata"
+
+# First-install fallback authority is the signed release identity, not an
+# independently fetched unsigned checksum list. Protected packaged siblings
+# retain their explicit provenance path; all other bytes require this stage.
+require_grep 'stageFirstInstallArtifact\(spec\)' agent/internal/agentapp/watchdog_bootstrap.go \
+  "watchdog bootstrap must stage through signed first-install verification"
+require_order 'stageFirstInstallArtifact\(spec\)' 'runner\(watchdogPath\)' agent/internal/agentapp/watchdog_bootstrap.go \
+  "watchdog bootstrap must verify before invoking the installer"
+require_grep 'ed25519\.Verify\(key, manifestBytes, signature\)' agent/internal/agentapp/first_install_release.go \
+  "first-install manifest must verify its signature against trusted keys"
+require_grep 'release manifest identity tuple does not match requested release' agent/internal/agentapp/first_install_release.go \
+  "first-install manifest must bind the requested release identity"
+require_grep 'TestStageFirstInstallArtifact_RejectsUnsignedOrAlteredBytes' agent/internal/agentapp/first_install_release_security_test.go \
+  "first-install tests must retain unsigned and altered-byte denials"
+require_grep 'TestBootstrapWatchdog_VerifiesAndUsesInjectedRunner' agent/internal/agentapp/first_install_release_security_test.go \
+  "watchdog tests must retain verified-byte installer positive controls"
+
+require_grep '"packageManager": "pnpm@10\.34\.5"' package.json \
+  "package.json must pin pnpm to a reproducible version"
+require_grep "PNPM_VERSION: '10\.34\.5'" .github/workflows/security.yml \
+  "security workflow must pin PNPM_VERSION to 10.34.5"
+# Defense-in-depth: every site that installs pnpm must pin the same version
+# as the packageManager field, so a single uncoordinated bump can't sneak in.
+require_grep "PNPM_VERSION: '10\.34\.5'" .github/workflows/ci.yml \
+  "CI workflow must pin PNPM_VERSION to 10.34.5"
+require_grep "PNPM_VERSION: '10\.34\.5'" .github/workflows/release.yml \
+  "release workflow must pin PNPM_VERSION to 10.34.5"
+for dockerfile in apps/api/Dockerfile apps/web/Dockerfile docker/Dockerfile.api docker/Dockerfile.web; do
+  require_grep 'npm install -g pnpm@10\.34\.5' "$dockerfile" \
+    "$dockerfile must pin pnpm to 10.34.5"
+done
+
+# Swatinem/rust-cache sat on an untagged master HEAD for months while a trailing
+# `# v2` comment made it look pinned to a release (#3748). A bare major-version
+# comment gives Dependabot no tag to resolve against, so it tracks the default
+# branch and each weekly group PR carries the next branch head forward. Four of
+# the six call sites are release.yml jobs that build signed customer binaries,
+# so the restored cache feeds compiled output. Pin every site to the 2.9.2
+# release commit and require the precise `# vX.Y.Z` comment, so a re-drift fails
+# here rather than inside a signed release build.
+RUST_CACHE_PIN='Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2'
+for workflow in .github/workflows/ci.yml .github/workflows/release.yml; do
+  require_grep "uses: ${RUST_CACHE_PIN//./\\.}\$" "$workflow" \
+    "$workflow must pin Swatinem/rust-cache to the v2.9.2 release commit"
+done
+# require_grep only proves one good line exists; this proves no site deviates.
+# Capture the scan's own status rather than letting a trailing `|| true` absorb
+# it: grep exits 1 for "no matches" but 2 for "could not read", and a security
+# predicate must never answer "clean" about input it could not read (the rule
+# reject_unaudited_apk above is written to). Piping straight into the filter
+# would hide that, because pipefail reports the rightmost status and the filter
+# legitimately exits 1 once it removes every compliant line.
+rust_cache_status=0
+rust_cache_lines="$(grep -rn -i -- 'rust-cache@' .github/workflows/)" || rust_cache_status=$?
+((rust_cache_status <= 1)) || fail \
+  "rust-cache scan of .github/workflows/ failed (grep status $rust_cache_status)"
+# The filter is deliberately case-sensitive: the owner is `Swatinem` upstream,
+# so a lowercase re-drift is reported instead of silently accepted.
+rust_cache_offenders="$(printf '%s\n' "$rust_cache_lines" | grep -vF -- "$RUST_CACHE_PIN" || true)"
+[[ -z "$rust_cache_offenders" ]] || fail \
+  "every rust-cache pin must be ${RUST_CACHE_PIN}, found:"$'\n'"$rust_cache_offenders"
+
+# The customer-Graph-read credential boundary ships as a separately built
+# executor. Keep its image, CI/release coverage, and deployment boundary from
+# silently disappearing while the feature remains dark by default.
+EXECUTOR_DOCKERFILE=apps/m365-graph-read-executor/Dockerfile
+[[ -f "$EXECUTOR_DOCKERFILE" ]] || fail "$EXECUTOR_DOCKERFILE must package the isolated Graph-read executor"
+require_grep '^FROM[[:space:]]+node:24-alpine@sha256:[0-9a-f]{64}[[:space:]]+AS[[:space:]]+build' "$EXECUTOR_DOCKERFILE" \
+  "executor build stage must digest-pin Node while retaining the tag"
+require_grep '^FROM[[:space:]]+node:24-alpine@sha256:[0-9a-f]{64}[[:space:]]+AS[[:space:]]+runner' "$EXECUTOR_DOCKERFILE" \
+  "executor runtime stage must digest-pin Node while retaining the tag"
+require_grep '^USER[[:space:]]+node$' "$EXECUTOR_DOCKERFILE" \
+  "executor runtime must run as the non-root node user"
+require_grep '^HEALTHCHECK .*\/healthz' "$EXECUTOR_DOCKERFILE" \
+  "executor image must declare its bounded health endpoint"
+require_grep '^CMD[[:space:]]+\["node",[[:space:]]*"dist/index\.cjs"\]' "$EXECUTOR_DOCKERFILE" \
+  "executor image must start only its compiled bounded runtime"
+require_audited_openssl_upgrade "$EXECUTOR_DOCKERFILE"
+reject_grep '^(COPY|ADD)[[:space:]].*(\.env|\.pem|\.key|secret)' "$EXECUTOR_DOCKERFILE" \
+  "executor image must not copy env, certificate, key, or secret files"
+reject_grep '^COPY[[:space:]]+\.[[:space:]]+\.' "$EXECUTOR_DOCKERFILE" \
+  "executor image must use an explicit deterministic build context allowlist"
+require_grep '(directory: |^ +- )"/apps/m365-graph-read-executor"$' .github/dependabot.yml \
+  "Dependabot must maintain the executor Dockerfile's digest-pinned base image"
+
+ci_success_block="$GUARD_TMP_DIR/ci-success.yml"
+extract_yaml_job ci-success .github/workflows/ci.yml "$ci_success_block"
+require_grep 'needs: .*test-m365-graph-read-executor' "$ci_success_block" \
+  "ci-success must depend on executor tests"
+require_grep 'needs: .*build-m365-graph-read-executor' "$ci_success_block" \
+  "ci-success must depend on the executor build"
+require_grep 'TEST_M365_GRAPH_READ_EXECUTOR_RESULT:.*needs\.test-m365-graph-read-executor\.result' "$ci_success_block" \
+  "ci-success must read the executor test result"
+require_grep 'BUILD_M365_GRAPH_READ_EXECUTOR_RESULT:.*needs\.build-m365-graph-read-executor\.result' "$ci_success_block" \
+  "ci-success must read the executor build result"
+require_grep '\[\[ "\$\{TEST_M365_GRAPH_READ_EXECUTOR_RESULT\}" != "success" \]\]' "$ci_success_block" \
+  "ci-success must fail unless executor tests succeed"
+require_grep '\[\[ "\$\{BUILD_M365_GRAPH_READ_EXECUTOR_RESULT\}" != "success" \]\]' "$ci_success_block" \
+  "ci-success must fail unless the executor build succeeds"
+
+# Same gating for the customer-graph-ACTIONS executor. It holds mutation
+# credentials, so its jobs must be as tamper-evident as the read sibling's.
+# The env var alone is decorative: the `[[ ]]` clause is what actually blocks.
+require_grep 'needs: .*test-m365-graph-actions-executor' "$ci_success_block" \
+  "ci-success must depend on actions-executor tests"
+require_grep 'needs: .*build-m365-graph-actions-executor' "$ci_success_block" \
+  "ci-success must depend on the actions-executor build"
+require_grep 'TEST_M365_GRAPH_ACTIONS_EXECUTOR_RESULT:.*needs\.test-m365-graph-actions-executor\.result' "$ci_success_block" \
+  "ci-success must read the actions-executor test result"
+require_grep 'BUILD_M365_GRAPH_ACTIONS_EXECUTOR_RESULT:.*needs\.build-m365-graph-actions-executor\.result' "$ci_success_block" \
+  "ci-success must read the actions-executor build result"
+require_grep '\[\[ "\$\{TEST_M365_GRAPH_ACTIONS_EXECUTOR_RESULT\}" != "success" \]\]' "$ci_success_block" \
+  "ci-success must fail unless actions-executor tests succeed"
+require_grep '\[\[ "\$\{BUILD_M365_GRAPH_ACTIONS_EXECUTOR_RESULT\}" != "success" \]\]' "$ci_success_block" \
+  "ci-success must fail unless the actions-executor build succeeds"
+
+# Same gating for the COMMUNICATIONS executor. It holds per-user delegated
+# refresh tokens — the most personal credential in the system — so its jobs
+# must be as tamper-evident as both Graph siblings'.
+require_grep 'needs: .*test-m365-communications-executor' "$ci_success_block" \
+  "ci-success must depend on communications-executor tests"
+require_grep 'needs: .*build-m365-communications-executor' "$ci_success_block" \
+  "ci-success must depend on the communications-executor build"
+require_grep 'TEST_M365_COMMUNICATIONS_EXECUTOR_RESULT:.*needs\.test-m365-communications-executor\.result' "$ci_success_block" \
+  "ci-success must read the communications-executor test result"
+require_grep 'BUILD_M365_COMMUNICATIONS_EXECUTOR_RESULT:.*needs\.build-m365-communications-executor\.result' "$ci_success_block" \
+  "ci-success must read the communications-executor build result"
+require_grep '\[\[ "\$\{TEST_M365_COMMUNICATIONS_EXECUTOR_RESULT\}" != "success" \]\]' "$ci_success_block" \
+  "ci-success must fail unless communications-executor tests succeed"
+require_grep '\[\[ "\$\{BUILD_M365_COMMUNICATIONS_EXECUTOR_RESULT\}" != "success" \]\]' "$ci_success_block" \
+  "ci-success must fail unless the communications-executor build succeeds"
+
+security_audit_block="$GUARD_TMP_DIR/security-audit.yml"
+extract_yaml_job security-audit .github/workflows/ci.yml "$security_audit_block"
+require_grep 'run: bash scripts/security/check-m365-graph-read-runtime\.sh' "$security_audit_block" \
+  "blocking CI must run the real Compose signing-secret runtime smoke"
+require_grep 'run: bash scripts/security/check-m365-graph-actions-runtime\.sh' "$security_audit_block" \
+  "blocking CI must run the real Compose actions signing-secret runtime smoke"
+
+executor_release_block="$GUARD_TMP_DIR/executor-release.yml"
+extract_yaml_job build-docker-m365-graph-read-executor .github/workflows/release.yml "$executor_release_block"
+require_grep 'executor-image-digest:.*steps\.push-executor-digest\.outputs\.digest' "$executor_release_block" \
+  "release must expose the exact untagged executor build digest"
+require_grep 'outputs: type=image,name=.*m365-graph-read-executor,push-by-digest=true,name-canonical=true,push=true' "$executor_release_block" \
+  "release must push an unadvertised executor digest before tagging"
+require_grep 'image-ref:.*m365-graph-read-executor@\$\{\{ steps\.push-executor-digest\.outputs\.digest \}\}' "$executor_release_block" \
+  "release Trivy scan must target the exact pushed executor digest"
+require_grep "severity: 'HIGH,CRITICAL'" "$executor_release_block" \
+  "release executor scan must block HIGH and CRITICAL findings"
+require_grep "exit-code: '1'" "$executor_release_block" \
+  "release executor scan must be blocking"
+reject_grep 'docker buildx imagetools create|--tag' "$executor_release_block" \
+  "executor build must not promote any tag before the image inventory is signed"
+require_grep 'release-image-manifest\.mjs record' "$executor_release_block" \
+  "executor build must emit validated signed-manifest metadata"
+reject_grep 'type=raw,value=latest|pattern=\{\{major\}\}|pattern=\{\{major\}\}\.\{\{minor\}\}' "$executor_release_block" \
+  "executor release must not publish latest, major, or minor mutable tags"
+[[ "$(grep -c 'docker/build-push-action@' "$executor_release_block")" == 1 ]] || \
+  fail "executor release must build the image exactly once"
+require_order 'id: push-executor-digest' 'name: Scan exact executor digest' "$executor_release_block" \
+  "executor release must build before scanning"
+require_order 'name: Scan exact executor digest' 'name: Upload executor digest' "$executor_release_block" \
+  "executor signed-manifest metadata must describe a digest that passed scanning"
+require_grep 'dockerfile: apps/m365-graph-read-executor/Dockerfile' .github/workflows/security.yml \
+  "security workflow's trivy-image-scan matrix must build and scan the executor image"
+[[ -x scripts/security/check-m365-graph-read-runtime.sh ]] || \
+  fail "scripts/security/check-m365-graph-read-runtime.sh must be executable"
+require_grep 'dockerfile: apps/m365-graph-actions-executor/Dockerfile' .github/workflows/security.yml \
+  "security workflow's trivy-image-scan matrix must build and scan the actions-executor image"
+[[ -x scripts/security/check-m365-graph-actions-runtime.sh ]] || \
+  fail "scripts/security/check-m365-graph-actions-runtime.sh must be executable"
+
+actions_release_block="$GUARD_TMP_DIR/actions-executor-release.yml"
+extract_yaml_job build-docker-m365-graph-actions-executor .github/workflows/release.yml "$actions_release_block"
+require_grep 'outputs: type=image,name=.*m365-graph-actions-executor,push-by-digest=true,name-canonical=true,push=true' "$actions_release_block" \
+  "release must push an unadvertised actions-executor digest before tagging"
+require_grep 'image-ref:.*m365-graph-actions-executor@\$\{\{ steps\.push-executor-digest\.outputs\.digest \}\}' "$actions_release_block" \
+  "release Trivy scan must target the exact pushed actions-executor digest"
+require_grep "severity: 'HIGH,CRITICAL'" "$actions_release_block" \
+  "release actions-executor scan must block HIGH and CRITICAL findings"
+require_grep "exit-code: '1'" "$actions_release_block" \
+  "release actions-executor scan must be blocking"
+reject_grep 'docker buildx imagetools create|--tag' "$actions_release_block" \
+  "actions-executor build must not promote any tag before signing"
+require_grep 'release-image-manifest\.mjs record' "$actions_release_block" \
+  "actions-executor build must emit validated signed-manifest metadata"
+reject_grep 'type=raw,value=latest|pattern=\{\{major\}\}|pattern=\{\{major\}\}\.\{\{minor\}\}' "$actions_release_block" \
+  "actions-executor release must not publish latest, major, or minor mutable tags"
+[[ "$(grep -c 'docker/build-push-action@' "$actions_release_block")" == 1 ]] || \
+  fail "actions-executor release must build the image exactly once"
+require_order 'id: push-executor-digest' 'name: Scan exact executor digest' "$actions_release_block" \
+  "actions-executor release must build before scanning"
+require_order 'name: Scan exact executor digest' 'name: Upload executor digest' "$actions_release_block" \
+  "actions-executor signed-manifest metadata must describe a digest that passed scanning"
+
+# The ACTIONS executor's Dockerfile gets the same shape block as its read
+# sibling. It holds Microsoft Graph *mutation* credentials — the highest
+# blast radius of the three executors — so it must be at least as
+# constrained as the ones with lower privilege, not less (#4272, dup #4264).
+ACTIONS_EXECUTOR_DOCKERFILE=apps/m365-graph-actions-executor/Dockerfile
+[[ -f "$ACTIONS_EXECUTOR_DOCKERFILE" ]] || fail "$ACTIONS_EXECUTOR_DOCKERFILE must package the isolated Graph-actions executor"
+require_grep '^FROM[[:space:]]+node:24-alpine@sha256:[0-9a-f]{64}[[:space:]]+AS[[:space:]]+build' "$ACTIONS_EXECUTOR_DOCKERFILE" \
+  "actions-executor build stage must digest-pin Node while retaining the tag"
+require_grep '^FROM[[:space:]]+node:24-alpine@sha256:[0-9a-f]{64}[[:space:]]+AS[[:space:]]+runner' "$ACTIONS_EXECUTOR_DOCKERFILE" \
+  "actions-executor runtime stage must digest-pin Node while retaining the tag"
+require_grep '^USER[[:space:]]+node$' "$ACTIONS_EXECUTOR_DOCKERFILE" \
+  "actions-executor runtime must run as the non-root node user"
+require_grep '^HEALTHCHECK .*\/healthz' "$ACTIONS_EXECUTOR_DOCKERFILE" \
+  "actions-executor image must declare its bounded health endpoint"
+require_grep '^CMD[[:space:]]+\["node",[[:space:]]*"dist/index\.cjs"\]' "$ACTIONS_EXECUTOR_DOCKERFILE" \
+  "actions-executor image must start only its compiled bounded runtime"
+require_audited_openssl_upgrade "$ACTIONS_EXECUTOR_DOCKERFILE"
+reject_grep '^(COPY|ADD)[[:space:]].*(\.env|\.pem|\.key|secret)' "$ACTIONS_EXECUTOR_DOCKERFILE" \
+  "actions-executor image must not copy env, certificate, key, or secret files"
+reject_grep '^COPY[[:space:]]+\.[[:space:]]+\.' "$ACTIONS_EXECUTOR_DOCKERFILE" \
+  "actions-executor image must use an explicit deterministic build context allowlist"
+require_grep '(directory: |^ +- )"/apps/m365-graph-actions-executor"$' .github/dependabot.yml \
+  "Dependabot must maintain the actions-executor Dockerfile's digest-pinned base image"
+
+# The COMMUNICATIONS executor's release image gets the same digest-first shape.
+comms_release_block="$GUARD_TMP_DIR/communications-executor-release.yml"
+extract_yaml_job build-docker-m365-communications-executor .github/workflows/release.yml "$comms_release_block"
+require_grep 'outputs: type=image,name=.*m365-communications-executor,push-by-digest=true,name-canonical=true,push=true' "$comms_release_block" \
+  "release must push an unadvertised communications-executor digest before tagging"
+require_grep 'image-ref:.*m365-communications-executor@\$\{\{ steps\.push-executor-digest\.outputs\.digest \}\}' "$comms_release_block" \
+  "release Trivy scan must target the exact pushed communications-executor digest"
+require_grep "severity: 'HIGH,CRITICAL'" "$comms_release_block" \
+  "release communications-executor scan must block HIGH and CRITICAL findings"
+require_grep "exit-code: '1'" "$comms_release_block" \
+  "release communications-executor scan must be blocking"
+reject_grep 'docker buildx imagetools create|--tag' "$comms_release_block" \
+  "communications-executor build must not promote any tag before signing"
+require_grep 'release-image-manifest\.mjs record' "$comms_release_block" \
+  "communications-executor build must emit validated signed-manifest metadata"
+reject_grep 'type=raw,value=latest|pattern=\{\{major\}\}|pattern=\{\{major\}\}\.\{\{minor\}\}' "$comms_release_block" \
+  "communications-executor release must not publish latest, major, or minor mutable tags"
+[[ "$(grep -c 'docker/build-push-action@' "$comms_release_block")" == 1 ]] || \
+  fail "communications-executor release must build the image exactly once"
+require_order 'id: push-executor-digest' 'name: Scan exact executor digest' "$comms_release_block" \
+  "communications-executor release must build before scanning"
+require_order 'name: Scan exact executor digest' 'name: Upload executor digest' "$comms_release_block" \
+  "communications-executor signed-manifest metadata must describe a digest that passed scanning"
+
+promotion_release_block="$GUARD_TMP_DIR/signed-image-promotion.yml"
+extract_yaml_job promote-signed-release-images .github/workflows/release.yml "$promotion_release_block"
+require_grep 'needs: \[create-release\]' "$promotion_release_block" \
+  "image tag promotion must occur only after create-release signs the image inventory"
+require_grep 'release-image-manifest\.mjs verify' "$promotion_release_block" \
+  "image tag promotion must verify the signed image inventory"
+require_grep 'docker buildx imagetools create' "$promotion_release_block" \
+  "image tag promotion must retag exact signed digests without rebuilding"
+reject_grep 'docker/build-push-action@' "$promotion_release_block" \
+  "post-signature image promotion must never rebuild image bytes"
+# Out-of-band promotion (promote-release-images.yml) exists for a release whose
+# create-release job died after signing the inventory. It must hold the same
+# line as the in-release job: verify the signed inventory, retag exact digests,
+# never rebuild, never walk a moving channel backwards, and refuse (loudly) a
+# dispatch from any ref but main. The main check is a footgun guard, not a trust
+# boundary — the signature and the tag-commit bindings are the controls.
+OOB_PROMOTION=.github/workflows/promote-release-images.yml
+require_grep 'release-image-manifest\.mjs verify' "$OOB_PROMOTION" \
+  "out-of-band image promotion must verify the signed image inventory"
+require_grep 'docker buildx imagetools create' "$OOB_PROMOTION" \
+  "out-of-band image promotion must retag exact signed digests without rebuilding"
+reject_grep 'docker/build-push-action@' "$OOB_PROMOTION" \
+  "out-of-band image promotion must never rebuild image bytes"
+reject_grep '^  (push|pull_request|pull_request_target|schedule|workflow_run):' "$OOB_PROMOTION" \
+  "out-of-band image promotion must be dispatch-only"
+require_grep '"\$DISPATCH_REF" != "refs/heads/main"' "$OOB_PROMOTION" \
+  "out-of-band image promotion must refuse a dispatch from any ref but main"
+require_grep '"\$MOVING_CHANNELS" == "true" && "\$NEWEST_STABLE" == "true"' "$OOB_PROMOTION" \
+  "out-of-band image promotion must not move :latest/:X/:X.Y unless the tag is the newest stable release"
+require_grep 'dockerfile: apps/m365-communications-executor/Dockerfile' .github/workflows/security.yml \
+  "security workflow's trivy-image-scan matrix must build and scan the communications-executor image"
+require_grep '(directory: |^ +- )"/apps/m365-communications-executor"$' .github/dependabot.yml \
+  "Dependabot must maintain the communications-executor Dockerfile's digest-pinned base image"
+
+# The communications executor's Dockerfile gets the same shape block as the
+# read and actions executors' (see ACTIONS_EXECUTOR_DOCKERFILE above).
+COMMS_EXECUTOR_DOCKERFILE=apps/m365-communications-executor/Dockerfile
+[[ -f "$COMMS_EXECUTOR_DOCKERFILE" ]] || fail "$COMMS_EXECUTOR_DOCKERFILE must package the isolated communications executor"
+require_grep '^FROM[[:space:]]+node:24-alpine@sha256:[0-9a-f]{64}[[:space:]]+AS[[:space:]]+build' "$COMMS_EXECUTOR_DOCKERFILE" \
+  "communications-executor build stage must digest-pin Node while retaining the tag"
+require_grep '^FROM[[:space:]]+node:24-alpine@sha256:[0-9a-f]{64}[[:space:]]+AS[[:space:]]+runner' "$COMMS_EXECUTOR_DOCKERFILE" \
+  "communications-executor runtime stage must digest-pin Node while retaining the tag"
+require_grep '^USER[[:space:]]+node$' "$COMMS_EXECUTOR_DOCKERFILE" \
+  "communications-executor runtime must run as the non-root node user"
+require_grep '^HEALTHCHECK .*\/healthz' "$COMMS_EXECUTOR_DOCKERFILE" \
+  "communications-executor image must declare its bounded health endpoint"
+require_grep '^CMD[[:space:]]+\["node",[[:space:]]*"dist/index\.cjs"\]' "$COMMS_EXECUTOR_DOCKERFILE" \
+  "communications-executor image must start only its compiled bounded runtime"
+require_audited_openssl_upgrade "$COMMS_EXECUTOR_DOCKERFILE"
+reject_grep '^(COPY|ADD)[[:space:]].*(\.env|\.pem|\.key|secret)' "$COMMS_EXECUTOR_DOCKERFILE" \
+  "communications-executor image must not copy env, certificate, key, or secret files"
+reject_grep '^COPY[[:space:]]+\.[[:space:]]+\.' "$COMMS_EXECUTOR_DOCKERFILE" \
+  "communications-executor image must use an explicit deterministic build context allowlist"
+
+# Deliberately absent until Plan 3 task 18 (dated 2026-07-30): the comms
+# compose assertions (signing-secret mount, onboarding-off default, service
+# rejection), the comms env-template digest-pin grep, and the
+# check-m365-comms-runtime.sh smoke + its executable check. Each of those
+# greps deploy artifacts task 18 creates — adding them now would fail this
+# guard against files that do not exist yet.
+
+for compose in docker-compose.yml deploy/docker-compose.prod.yml; do
+  reject_grep '^  m365-graph-read-executor:' "$compose" \
+    "$compose must not deploy the executor without an identity-capable private environment"
+  require_grep 'M365_CUSTOMER_GRAPH_READ_ONBOARDING_ENABLED:[[:space:]]+\$\{M365_CUSTOMER_GRAPH_READ_ONBOARDING_ENABLED:-false\}' "$compose" \
+    "$compose must keep customer Graph-read onboarding disabled by default"
+  require_grep 'M365_GRAPH_READ_EXECUTOR_SIGNING_PRIVATE_JWK_FILE:[[:space:]]+/run/secrets/m365_graph_read_executor_signing_private_jwk' "$compose" \
+    "$compose must load the API executor-signing private JWK from a Docker secret"
+  require_grep '^  m365_graph_read_executor_signing_private_jwk:' "$compose" \
+    "$compose must define the API executor-signing private-JWK secret"
+  reject_grep '^  m365-graph-actions-executor:' "$compose" \
+    "$compose must not deploy the actions executor without an identity-capable private environment"
+  require_grep 'M365_CUSTOMER_GRAPH_ACTIONS_ONBOARDING_ENABLED:[[:space:]]+\$\{M365_CUSTOMER_GRAPH_ACTIONS_ONBOARDING_ENABLED:-false\}' "$compose" \
+    "$compose must keep customer Graph-actions onboarding disabled by default"
+  require_grep 'M365_GRAPH_ACTIONS_EXECUTOR_SIGNING_PRIVATE_JWK_FILE:[[:space:]]+/run/secrets/m365_graph_actions_executor_signing_private_jwk' "$compose" \
+    "$compose must load the API actions-executor-signing private JWK from a Docker secret"
+  require_grep '^  m365_graph_actions_executor_signing_private_jwk:' "$compose" \
+    "$compose must define the API actions-executor-signing private-JWK secret"
+
+  api_block="$GUARD_TMP_DIR/$(basename "$compose").api.yml"
+  awk '
+    /^  api:/ { in_api = 1 }
+    in_api && /^  [[:alnum:]_-]+:/ && $0 !~ /^  api:/ { exit }
+    in_api { print }
+  ' "$compose" > "$api_block"
+  require_grep '^[[:space:]]+-[[:space:]]+no-new-privileges:true' "$api_block" \
+    "$compose API service must set no-new-privileges"
+  require_grep '^[[:space:]]+-[[:space:]]+ALL' "$api_block" \
+    "$compose API service must drop all Linux capabilities"
+  require_grep '^[[:space:]]+-[[:space:]]+/tmp:size=64m,mode=1777' "$api_block" \
+    "$compose API service must use a bounded tmpfs"
+  reject_grep '^[[:space:]]+(uid|gid|mode):' "$api_block" \
+    "$compose must not claim Docker Compose applies uid/gid/mode to file-backed secrets"
+done
+
+for deployment_template in .env.example deploy/.env.example; do
+  require_grep '--read-only' "$deployment_template" \
+    "$deployment_template must document the executor read-only filesystem requirement"
+  require_grep '--cap-drop=ALL' "$deployment_template" \
+    "$deployment_template must document dropping all executor capabilities"
+  require_grep '--security-opt=no-new-privileges' "$deployment_template" \
+    "$deployment_template must document executor no-new-privileges"
+  require_grep '--tmpfs /tmp:rw,noexec,nosuid,size=64m' "$deployment_template" \
+    "$deployment_template must document the executor tmpfs requirement"
+  require_grep 'm365-graph-read-executor@sha256:<digest>' "$deployment_template" \
+    "$deployment_template must require a digest-addressed executor image"
+  require_grep 'm365-graph-actions-executor@sha256:<digest>' "$deployment_template" \
+    "$deployment_template must require a digest-addressed actions-executor image"
+  require_grep 'numeric owner 1001:1001 and mode 0400' "$deployment_template" \
+    "$deployment_template must document standalone Compose file-secret ownership requirements"
+done
+require_grep '^  security-audit:' .github/workflows/ci.yml \
+  "CI must include a blocking security-audit job"
+require_grep 'SECURITY_AUDIT_RESULT' .github/workflows/ci.yml \
+  "ci-success must depend on the security-audit job"
+reject_grep 'continue-on-error:[[:space:]]*true' .github/workflows/security.yml \
+  "security workflow must not make dependency audits advisory-only"
+
+# The dependency audit runs on osv-scanner (npm retired the audit endpoints that
+# `pnpm audit` calls, so it fails closed at every pnpm version). Both audit sites
+# must keep invoking the real gate, and the scanner binary must stay pinned and
+# checksum-verified before install.
+for audit_workflow in .github/workflows/ci.yml .github/workflows/security.yml; do
+  require_grep 'scripts/security/check-npm-audit\.sh' "$audit_workflow" \
+    "$audit_workflow must run the blocking dependency audit gate"
+  require_grep 'scripts/security/install-osv-scanner\.sh' "$audit_workflow" \
+    "$audit_workflow must install osv-scanner via the checksum-verified installer"
+done
+require_grep 'OSV_SCANNER_VERSION:-[0-9]+\.[0-9]+\.[0-9]+' scripts/security/install-osv-scanner.sh \
+  "osv-scanner install must pin an explicit version"
+require_grep 'sha256sum -c -' scripts/security/install-osv-scanner.sh \
+  "osv-scanner install must verify the downloaded binary checksum"
+reject_grep 'curl .*\|[[:space:]]*(sudo )?(tar|sh|bash)' scripts/security/install-osv-scanner.sh \
+  "osv-scanner install must not pipe remote payloads into a shell or archiver"
+require_grep 'produced no parseable report' scripts/security/check-npm-audit.sh \
+  "dependency audit must fail closed when osv-scanner produces no report"
+reject_grep 'Login response:' .github/workflows/ci.yml \
+  "CI smoke tests must not print full login responses"
+require_grep '::add-mask::\$\{TOKEN\}' .github/workflows/ci.yml \
+  "CI smoke tests must mask login tokens before writing outputs"
+
+require_grep 'permissions:' .github/workflows/secret-scan.yml \
+  "secret scan workflow must declare explicit permissions"
+require_grep 'contents:[[:space:]]*read' .github/workflows/secret-scan.yml \
+  "secret scan workflow must only need contents: read"
+require_grep 'checksums="gitleaks_\$\{version\}_checksums\.txt"' .github/workflows/secret-scan.yml \
+  "Gitleaks install must verify the release checksum file before installing"
+require_grep 'sha256sum -c -' .github/workflows/secret-scan.yml \
+  "Gitleaks install must verify the downloaded tarball checksum"
+reject_grep 'curl .*\|[[:space:]]*sudo tar' .github/workflows/secret-scan.yml \
+  "Gitleaks install must not pipe remote tarballs directly into sudo tar"
+
+require_grep 'cargo-audit:' .github/workflows/security.yml \
+  "security workflow must run cargo audit for Tauri dependencies"
+require_grep 'directory: "/apps/helper/src-tauri"' .github/dependabot.yml \
+  "Dependabot must cover helper Cargo dependencies"
+require_grep 'directory: "/apps/viewer/src-tauri"' .github/dependabot.yml \
+  "Dependabot must cover viewer Cargo dependencies"
+require_grep '(directory: |^ +- )"/apps/api"$' .github/dependabot.yml \
+  "Dependabot must cover API Dockerfiles before digest pinning can be maintained"
+require_grep '(directory: |^ +- )"/apps/web"$' .github/dependabot.yml \
+  "Dependabot must cover Web Dockerfiles before digest pinning can be maintained"
+require_grep '(directory: |^ +- )"/docker"$' .github/dependabot.yml \
+  "Dependabot must cover release/security Dockerfiles before digest pinning can be maintained"
+require_grep 'language: \[javascript-typescript, go\]' .github/workflows/codeql.yml \
+  "CodeQL must analyze both TypeScript and Go"
+
+require_grep "severity: 'HIGH,CRITICAL'" .github/workflows/security.yml \
+  "Trivy must fail on HIGH and CRITICAL vulnerabilities"
+require_grep '^  trivy-image-scan:' .github/workflows/security.yml \
+  "security workflow must scan built Docker images"
+# The scan must target the Dockerfiles release.yml actually publishes
+# (emergency manual builds go through `docker buildx` + a GHCR push from a
+# maintainer machine instead of a workflow). It previously built the
+# docker/Dockerfile.api|web compose
+# variants, which ship to nobody, so the two most widely deployed images in the
+# product were never scanned at all (issues #4273 / #4260). Note this makes the
+# images visible, not merge-blocking: main's ruleset requires only `CI Success`,
+# which does not depend on any security.yml job. Full published-vs-scanned
+# reconciliation lives in
+# apps/api/src/config/dockerfileImageScanCoverage.test.ts; these two keep the
+# regression visible to the shell check as well.
+require_grep 'dockerfile: apps/api/Dockerfile' .github/workflows/security.yml \
+  "security workflow's trivy-image-scan matrix must build and scan the shipped API image"
+require_grep 'dockerfile: apps/web/Dockerfile' .github/workflows/security.yml \
+  "security workflow's trivy-image-scan matrix must build and scan the shipped Web image"
+require_grep "format: 'sarif'" .github/workflows/security.yml \
+  "Trivy filesystem scan must emit SARIF"
+require_grep "format: 'cyclonedx'" .github/workflows/security.yml \
+  "Trivy filesystem scan must emit an SBOM"
+
+require_grep '^\.env\*' .dockerignore \
+  ".dockerignore must exclude root env files from Docker build context"
+require_grep '^\*\*/\.env\*' .dockerignore \
+  ".dockerignore must exclude nested env files from Docker build context"
+require_grep '^\*\.env' .dockerignore \
+  ".dockerignore must exclude non-dot env files from Docker build context"
+require_grep '^\*\*/\*\.env' .dockerignore \
+  ".dockerignore must exclude nested non-dot env files from Docker build context"
+require_grep '^!\*\*/\.env\.\*\.example' .dockerignore \
+  ".dockerignore must explicitly allow nested env example templates"
+require_grep '^BREEZE_API_IMAGE_DIGEST=sha256:' deploy/.env.example \
+  "deploy env example must require digest-pinned API image digests"
+require_grep '^BREEZE_WEB_IMAGE_DIGEST=sha256:' deploy/.env.example \
+  "deploy env example must require digest-pinned Web image digests"
+require_grep '^BREEZE_BINARIES_IMAGE_DIGEST=sha256:' deploy/.env.example \
+  "deploy env example must require digest-pinned binaries image digests"
+require_grep '^BREEZE_PORTAL_IMAGE_DIGEST=sha256:' deploy/.env.example \
+  "deploy env example must require digest-pinned portal image digests"
+require_grep 'release-image-manifest\.mjs.*verify' scripts/prod/deploy.sh \
+  "production deploy must verify configured first-party images against the signed release manifest"
+require_grep 'verify-release-images\.sh' scripts/guided-setup.sh \
+  "guided self-host setup must verify and resolve signed first-party image refs"
+require_grep 'require_sha256_digest BREEZE_PORTAL_IMAGE_DIGEST' scripts/prod/deploy.sh \
+  "production deploy must validate the portal image digest before Compose"
+require_grep '"schemaVersion": 1' .github/workflows/release.yml \
+  "release manifest must retain its backward-compatible schema while adding image bindings"
+require_grep '"images": images' .github/workflows/release.yml \
+  "release manifest must bind the complete first-party image inventory"
+require_grep '^  promote-signed-release-images:' .github/workflows/release.yml \
+  "release workflow must isolate post-signature image tag promotion"
+require_grep 'release-image-manifest\.test\.mjs.*verify-release-images\.test\.mjs.*release-image-consumers\.test\.mjs' package.json \
+  "CI release-lineage suite must retain signed-image producer and consumer regressions"
+for image_ref_var in BREEZE_API_IMAGE_REF BREEZE_WEB_IMAGE_REF BREEZE_PORTAL_IMAGE_REF BREEZE_BINARIES_IMAGE_REF; do
+  require_grep "^${image_ref_var}=.*@sha256:" .env.example \
+    "self-host env example must require signed digest refs for ${image_ref_var}"
+done
+reject_grep '^BREEZE_(API|WEB|PORTAL|BINARIES)_IMAGE_REF=.*:\$\{BREEZE_VERSION\}' .env.example \
+  "self-host env example must not derive first-party image authority from mutable version tags"
+require_grep './guided-setup\.sh --download --no-up' README.md \
+  "documented manual self-host starts must first run signed image resolution"
+require_grep 'verify-release-images\.sh.*m365-graph-read-executor=' docs/deploy/m365-customer-graph-read-executor.md \
+  "Graph-read executor deployments must verify the signed repository/digest tuple"
+require_grep 'verify-release-images\.sh.*m365-graph-actions-executor=' docs/deploy/m365-customer-graph-actions-executor.md \
+  "Graph-actions executor deployments must verify the signed repository/digest tuple"
+for image_ref_var in CADDY_IMAGE_REF CLOUDFLARED_IMAGE_REF REDIS_IMAGE_REF COTURN_IMAGE_REF BILLING_IMAGE_REF; do
+  require_grep "^${image_ref_var}=.*@sha256:" deploy/.env.example \
+    "deploy env example must digest-pin ${image_ref_var}"
+done
+
+for compose in docker-compose.yml deploy/docker-compose.prod.yml; do
+  reject_grep 'image:[[:space:]].*:latest([[:space:]]|$)' "$compose" \
+    "$compose must not use :latest image refs"
+  reject_grep 'image:[[:space:]].*:local([[:space:]]|$)' "$compose" \
+    "$compose must not use mutable local image refs"
+  reject_grep '^[[:space:]]*build:' "$compose" \
+    "$compose must not build images during production deploys"
+  reject_grep 'BREEZE_VERSION:-latest' "$compose" \
+    "$compose must not default BREEZE_VERSION to latest"
+  reject_grep '/var/run/docker\.sock' "$compose" \
+    "$compose must not mount the raw Docker socket"
+  reject_grep 'watchtower' "$compose" \
+    "$compose must not include Watchtower by default"
+  # Defense-in-depth: even without the Watchtower service present, an
+  # auto-update opt-in label on a tracked compose file would re-introduce
+  # the supply-chain risk the broader rule above forbids (#603).
+  reject_grep 'com\.centurylinklabs\.watchtower\.enable[[:space:]]*[:=][[:space:]]*"?(true|1|yes)"?' "$compose" \
+    "$compose must not declare Watchtower auto-update opt-in labels (com.centurylinklabs.watchtower.enable=true) on any service"
+  reject_grep '--requirepass[[:space:]]+\$\{?REDIS_PASSWORD' "$compose" \
+    "$compose must not expose REDIS_PASSWORD in redis-server command args"
+  reject_grep 'REDISCLI_AUTH' "$compose" \
+    "$compose must not expose Redis auth through healthcheck process environment"
+  reject_grep 'redis-cli.*([[:space:]]-a[[:space:]]|[[:space:]]--pass([=[:space:]]|$))' "$compose" \
+    "$compose must not expose Redis auth through redis-cli command args"
+  reject_grep 'redis-cli.*REDIS_PASSWORD' "$compose" \
+    "$compose must not expose REDIS_PASSWORD in Redis healthcheck args"
+  reject_grep 'REDIS_URL:[[:space:]]+redis://:\$\{REDIS_PASSWORD' "$compose" \
+    "$compose must not expose REDIS_PASSWORD in API container env"
+  require_grep '/run/secrets/redis_password' "$compose" \
+    "$compose must feed Redis auth through a mounted secret"
+  require_grep 'AUTH %s' "$compose" \
+    "$compose Redis healthcheck must feed AUTH through stdin instead of args or environment"
+  require_grep 'REDIS_PASSWORD_FILE:[[:space:]]+/run/secrets/redis_password' "$compose" \
+    "$compose must pass Redis auth to the API through REDIS_PASSWORD_FILE"
+  require_grep 'ENROLLMENT_KEY_PEPPER:[[:space:]]+\$\{ENROLLMENT_KEY_PEPPER:\?Set ENROLLMENT_KEY_PEPPER' "$compose" \
+    "$compose must require ENROLLMENT_KEY_PEPPER for production API startup"
+  require_grep 'MFA_RECOVERY_CODE_PEPPER:[[:space:]]+\$\{MFA_RECOVERY_CODE_PEPPER:\?Set MFA_RECOVERY_CODE_PEPPER' "$compose" \
+    "$compose must require MFA_RECOVERY_CODE_PEPPER for production API startup"
+  # Agent mTLS binding mode (Wave 05 Task 9): must be explicitly mapped into
+  # the API service with a defaulted (not required) interpolation, so a
+  # self-host compose with no override in .env behaves exactly as before —
+  # off is the safe mixed-version and self-hosted default.
+  require_grep 'AGENT_MTLS_BINDING_MODE:[[:space:]]+\$\{AGENT_MTLS_BINDING_MODE:-off\}' "$compose" \
+    "$compose must map AGENT_MTLS_BINDING_MODE into the API service, defaulting to off"
+  reject_grep 'AGENT_MTLS_BINDING_MODE:[[:space:]]+\$\{AGENT_MTLS_BINDING_MODE:\?' "$compose" \
+    "$compose must not make AGENT_MTLS_BINDING_MODE a required env var; off must stay the no-config default"
+  reject_grep 'AGENT_MTLS_BINDING_MODE:[[:space:]]*[^[:space:]]*\$\{?(NODE_ENV|IS_HOSTED|CF_MTLS_[A-Z_]*)\b' "$compose" \
+    "$compose must not infer AGENT_MTLS_BINDING_MODE from NODE_ENV, IS_HOSTED, or CF_MTLS_* — the operator must select the mode explicitly"
+done
+reject_grep '/var/run/docker\.sock' docker-compose.monitoring.yml \
+  "monitoring compose must not mount the raw Docker socket"
+reject_grep 'docker_sd_configs' monitoring/promtail.yml \
+  "Promtail must not use Docker socket service discovery"
+require_grep '/var/lib/docker/containers' docker-compose.monitoring.yml \
+  "monitoring compose must mount Docker JSON log files read-only for Promtail"
+require_grep '/var/lib/docker/containers/\*/\*\.log' monitoring/promtail.yml \
+  "Promtail must scrape Docker JSON log files without the Docker socket"
+require_grep 'COMPOSE_FILE="\$\{REPO_ROOT\}/deploy/docker-compose\.prod\.yml"' scripts/prod/deploy.sh \
+  "production deploy script must use the production compose file"
+require_grep 'require_digest_ref BILLING_IMAGE_REF' scripts/prod/deploy.sh \
+  "production deploy script must validate digest-pinned billing image refs"
+
+for override in docker-compose.override.yml.ghcr docker-compose.override.yml.local-build; do
+  reject_grep 'DEV_PUSH_ENABLED' "$override" \
+    "$override must not enable dev push in GHCR/local-build deploy modes"
+  reject_grep '^[[:space:]]+ports:' "$override" \
+    "$override must not publish internal service ports in GHCR/local-build deploy modes"
+  reject_grep 'MCP_BOOTSTRAP_TEST_MODE' "$override" \
+    "$override must not carry MCP test-mode flags in GHCR/local-build deploy modes"
+  reject_grep 'NODE_ENV:[[:space:]]+\$\{NODE_ENV' "$override" \
+    "$override must not allow env-file NODE_ENV to override production runtime mode"
+  reject_grep 'PUBLIC_API_URL:[[:space:]].*localhost' "$override" \
+    "$override must not default service URLs to localhost in deploy modes"
+  require_grep 'ENROLLMENT_KEY_PEPPER:[[:space:]]+\$\{ENROLLMENT_KEY_PEPPER:\?Set ENROLLMENT_KEY_PEPPER' "$override" \
+    "$override must not weaken production ENROLLMENT_KEY_PEPPER requirements"
+  require_grep 'MFA_RECOVERY_CODE_PEPPER:[[:space:]]+\$\{MFA_RECOVERY_CODE_PEPPER:\?Set MFA_RECOVERY_CODE_PEPPER' "$override" \
+    "$override must not weaken production MFA_RECOVERY_CODE_PEPPER requirements"
+done
+reject_grep 'ENABLE_REGISTRATION:[[:space:]]+\$\{ENABLE_REGISTRATION:-true\}' docker-compose.override.yml.ghcr \
+  "GHCR override must not default API registration on"
+# Registration is now gated by a single runtime flag (ENABLE_REGISTRATION),
+# read by the UI from /api/v1/config — the build-time PUBLIC_ENABLE_REGISTRATION
+# was removed (#1308), so there is no separate UI flag to guard.
+
+reject_grep 'REDISCLI_AUTH' scripts/prod/deploy.sh \
+  "production deploy script must not expose Redis auth through process environment"
+require_grep 'AUTH %s' scripts/prod/deploy.sh \
+  "production deploy script must feed Redis AUTH through stdin"
+
+for dockerfile in apps/api/Dockerfile apps/web/Dockerfile docker/Dockerfile.api docker/Dockerfile.web; do
+  require_grep '^FROM[[:space:]]+node:24-alpine@sha256:[0-9a-f]{64}[[:space:]]+AS[[:space:]]+base' "$dockerfile" \
+    "$dockerfile must digest-pin the Node base image while retaining the tag for Dependabot refreshes"
+  reject_grep '^FROM[[:space:]]+node:[^[:space:]@]+([[:space:]]|$)' "$dockerfile" \
+    "$dockerfile must not use tag-only Node base image references"
+done
+for dockerfile in apps/api/Dockerfile apps/web/Dockerfile; do
+  require_grep '^FROM[[:space:]]+node:24-alpine@sha256:[0-9a-f]{64}[[:space:]]+AS[[:space:]]+runner' "$dockerfile" \
+    "$dockerfile must digest-pin the production Node runner image while retaining the tag for Dependabot refreshes"
+done
+for dockerfile in docker/Dockerfile.api docker/Dockerfile.web; do
+  require_grep '/usr/local/lib/node_modules/pnpm' "$dockerfile" \
+    "$dockerfile must remove unused pnpm dependencies from the production runner"
+  require_grep '/usr/local/bin/pnpm' "$dockerfile" \
+    "$dockerfile must remove the unused pnpm binary from the production runner"
+  require_grep '/usr/local/bin/pnpx' "$dockerfile" \
+    "$dockerfile must remove the unused pnpx binary from the production runner"
+done
+
+require_grep '/run/secrets/metrics_scrape_token' monitoring/prometheus.yml \
+  "Prometheus config must read metrics scrape token from a secret file"
+require_grep 'metrics_scrape_token:' docker-compose.monitoring.yml \
+  "monitoring compose must define the metrics scrape token secret"
+require_grep 'environment: METRICS_SCRAPE_TOKEN' docker-compose.monitoring.yml \
+  "monitoring compose must source metrics scrape token from the environment"
+
+# docker-compose.monitoring.yml must compose cleanly on top of BOTH base
+# stacks: the self-host root docker-compose.yml (which runs a local `postgres`
+# service) and deploy/docker-compose.prod.yml (which has no local Postgres —
+# managed database only). A `depends_on` on a service name that exists in only
+# one of the two makes the combined project invalid for the other (#4362).
+# Behavioral proof, requires Docker — advisory when unavailable, matching
+# check-relay-edge-hardening.sh's coturn probe.
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  monitoring_err="$(mktemp)"
+  if ! docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.monitoring.yml config >/dev/null 2>"$monitoring_err"; then
+    cat "$monitoring_err" >&2
+    rm -f "$monitoring_err"
+    fail "docker-compose.monitoring.yml does not compose cleanly with the root docker-compose.yml (dev)"
+  fi
+  if ! docker compose --env-file deploy/compose-config-test.env -f deploy/docker-compose.prod.yml -f docker-compose.monitoring.yml config >/dev/null 2>"$monitoring_err"; then
+    cat "$monitoring_err" >&2
+    rm -f "$monitoring_err"
+    fail "docker-compose.monitoring.yml does not compose cleanly with deploy/docker-compose.prod.yml (#4362)"
+  fi
+  rm -f "$monitoring_err"
+fi
+
+require_grep 'envFlag..ENABLE_REGISTRATION., false' apps/api/src/routes/system.ts \
+  "system config status must default registration to disabled"
+require_grep "envFlag\\('ENABLE_REGISTRATION', false\\)" apps/api/src/routes/auth/schemas.ts \
+  "API registration must default to disabled"
+require_grep "envFlag\\('ENABLE_REGISTRATION', false\\)" apps/api/src/routes/config.ts \
+  "public /config must default the registration UI flag to disabled"
+require_grep 'ENABLE_REGISTRATION=false' .env.example \
+  "root env example must default registration off"
+require_grep 'ENABLE_REGISTRATION=false' deploy/.env.example \
+  "deploy env example must default API registration off"
+
+require_grep '^AGENT_MTLS_BINDING_MODE=off' .env.example \
+  "root env example must document AGENT_MTLS_BINDING_MODE and default it to off"
+
+require_grep 'not\.toContain.*AGENT_BINARY_DIR' apps/api/src/routes/agents/download.test.ts \
+  "agent public 404 tests must assert AGENT_BINARY_DIR is not disclosed"
+require_grep 'not\.toContain.*VIEWER_BINARY_DIR' apps/api/src/routes/viewers/download.test.ts \
+  "viewer public 404 tests must assert VIEWER_BINARY_DIR is not disclosed"
+
+# The ~50 transitive pins in `pnpm.overrides` are hand-maintained and rot
+# silently: a stale pin is indistinguishable from real coverage by inspection,
+# so the tell-tale has been Trivy re-redding months later (#704, #2694, #2699,
+# #2714, #2783). This asserts the pins still bind against the resolutions in
+# pnpm-lock.yaml; it does not replace the advisory scanners (osv-scanner,
+# Trivy), which are the only things that know a version is vulnerable.
+# Run from here rather than as its own CI step so the guard travels with every
+# caller of this script. See issue #2716.
+command -v node >/dev/null 2>&1 || fail "node is required to audit pnpm.overrides floors"
+# Drift check first: it prints the per-class diagnosis, so it should be the
+# failure a maintainer sees rather than the guard's own unit suite (which also
+# audits the live files, and would otherwise trip first on the same drift).
+node scripts/security/check-override-floors.mjs ||
+  fail "pnpm.overrides contains stale or dead pins (detail: node scripts/security/check-override-floors.mjs --report)"
+node --test scripts/security/check-override-floors.test.mjs >/dev/null ||
+  fail "pnpm.overrides floor guard has failing unit tests (run: pnpm test:override-floors)"
+
+echo "Supply-chain hardening checks passed."

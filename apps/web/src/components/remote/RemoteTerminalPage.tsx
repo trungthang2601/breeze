@@ -1,0 +1,156 @@
+import { useState, useEffect } from 'react';
+import { ArrowLeft, Monitor, Loader2, AlertCircle } from 'lucide-react';
+import RemoteTerminal from './RemoteTerminal';
+import { fetchWithAuth } from '@/stores/auth';
+import { navigateTo } from '@/lib/navigation';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+
+type Device = {
+  id: string;
+  hostname: string;
+  osType: string;
+  osVersion: string;
+  status: string;
+  displayName?: string;
+};
+
+type RemoteTerminalPageProps = {
+  deviceId: string;
+};
+
+export default function RemoteTerminalPage({ deviceId }: RemoteTerminalPageProps) {
+  const { t } = useTranslation('remote');
+  const [device, setDevice] = useState<Device | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const fetchDevice = async () => {
+      try {
+        const response = await fetchWithAuth(`/devices/${deviceId}`);
+
+        if (!response.ok) {
+          if (response.status === 404) {
+            throw new Error(t('remoteTerminalPage.errors.deviceNotFound'));
+          }
+          throw new Error(t('remoteTerminalPage.errors.fetchDevice'));
+        }
+
+        const data = await response.json();
+        setDevice(data);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : t('remoteTerminalPage.errors.generic'));
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchDevice();
+  }, [deviceId, t]);
+
+  const handleBack = () => {
+    // Always return to this device's detail page. This page can be opened from
+    // the devices list, the remote launcher, or device detail, so this is an
+    // intentional, fixed destination rather than a true "back": history.back()
+    // was unreliable across those origins (it lands on intermediate SPA history
+    // entries) and dead-ends on a direct visit.
+    void navigateTo(`/devices/${deviceId}`);
+  };
+
+  const handleSessionCreated = (newSessionId: string) => {
+    setSessionId(newSessionId);
+  };
+
+  const handleDisconnect = () => {
+    setSessionId(null);
+  };
+
+  const handleError = (errorMessage: string) => {
+    console.error('Terminal error:', errorMessage);
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center u-min-h-px-400">
+        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center u-min-h-px-400 gap-4">
+        <AlertCircle className="h-12 w-12 text-red-500" />
+        <h2 className="text-lg font-semibold">{t('remoteTerminalPage.errorTitle')}</h2>
+        <p className="text-muted-foreground">{error}</p>
+        <button
+          type="button"
+          onClick={handleBack}
+          className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          {t('common:actions.back')}
+        </button>
+      </div>
+    );
+  }
+
+  if (!device) {
+    return (
+      <div className="flex flex-col items-center justify-center u-min-h-px-400 gap-4">
+        <Monitor className="h-12 w-12 text-muted-foreground" />
+        <h2 className="text-lg font-semibold">{t('remoteTerminalPage.deviceNotFoundTitle')}</h2>
+        <p className="text-muted-foreground">{t('remoteTerminalPage.deviceNotFoundDescription')}</p>
+        <button
+          type="button"
+          onClick={handleBack}
+          className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          {t('common:actions.back')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center gap-4">
+        <button
+          type="button"
+          onClick={handleBack}
+          className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+        >
+          <ArrowLeft className="h-5 w-5" />
+        </button>
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">{t('remoteTerminalPage.title')}</h1>
+          <p className="text-muted-foreground">
+            {device.displayName || device.hostname} - {device.osType} {device.osVersion}
+          </p>
+        </div>
+      </div>
+
+      {device.status !== 'online' && (
+        <div className="flex items-start gap-3 rounded-lg border border-yellow-500/40 bg-yellow-500/10 px-4 py-3">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-yellow-600" />
+          <p className="text-sm text-yellow-800">
+            {t('remoteTerminalPage.offlineWarning', { status: device.status })}
+          </p>
+        </div>
+      )}
+
+      <RemoteTerminal
+        deviceId={deviceId}
+        deviceHostname={device.displayName || device.hostname}
+        sessionId={sessionId || undefined}
+        onSessionCreated={handleSessionCreated}
+        onDisconnect={handleDisconnect}
+        onError={handleError}
+        className="u-min-h-px-600"
+      />
+    </div>
+  );
+}

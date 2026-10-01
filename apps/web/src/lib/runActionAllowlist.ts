@@ -1,0 +1,52 @@
+// Files in the targeted set permitted to call fetchWithAuth with a mutating
+// method WITHOUT runAction, with the reason. Keep this list short and justified.
+export const RUN_ACTION_ALLOWLIST: ReadonlyArray<{ file: string; reason: string }> = [
+  { file: 'apps/web/src/services/deviceActions.ts', reason: 'typed Wake service (WakeCommandError) — the pattern runAction generalizes' },
+  { file: 'apps/web/src/stores/auth.ts', reason: 'transport/auth store, not a UI action handler' },
+];
+
+// KNOWN UNMIGRATED — pre-existing components with mutating fetchWithAuth NOT yet
+// routed through runAction. OUT OF WS-A scope (sweeping migration is a non-goal).
+// These are NOT silent-failure-safe yet; migrate opportunistically and move each
+// into TARGET_GLOBS in no-silent-mutations.test.ts as it's done. Tracked, not hidden.
+export const RUN_ACTION_MIGRATION_BACKLOG: ReadonlyArray<string> = [
+  'apps/web/src/components/devices/AddDeviceModal.tsx',
+  'apps/web/src/components/devices/ChangeSiteModal.tsx',
+  'apps/web/src/components/devices/CreateGroupModal.tsx',
+  'apps/web/src/components/devices/DeviceBootPerformanceTab.tsx',
+  'apps/web/src/components/devices/DeviceGroupsPage.tsx',
+  // DeviceList.tsx removed: its only fetchWithAuth call (POST /filters/preview,
+  // a read) moved to hooks/useAdvancedFilterIds.ts — no mutating calls remain.
+  // DevicePatchStatusTab.tsx migrated to runAction (patch scan/install) — now in TARGET_GLOBS.
+  'apps/web/src/components/devices/DeviceSecurityTab.tsx',
+  'apps/web/src/components/devices/DeviceSettingsModal.tsx',
+  // DeviceWarrantyCard.tsx migrated to runAction (#1723) — now in TARGET_GLOBS.
+  'apps/web/src/components/alerts/AlertCorrelationView.tsx',
+  // AlertRulesPage.tsx removed (#3988): the page it backed has been a 301 to
+  // /configuration-policies since d8a6bc833 (2026-02-22), so the component was
+  // unreachable from any route.
+  'apps/web/src/components/alerts/AlertTemplateEditor.tsx',
+  'apps/web/src/components/alerts/AlertTemplateList.tsx',
+  // AlertsPage.tsx migrated to runAction (#1300) — now in TARGET_GLOBS.
+  // CorrelatedAlertGroups.tsx migrated to runAction — now in TARGET_GLOBS.
+  // Backup feature tab: config create/update/test surface outcomes via the
+  // FeatureTabShell error banner + per-field errors (inline error UI), but the
+  // fetchWithAuth mutations are not yet routed through runAction.
+  'apps/web/src/components/configurationPolicies/featureTabs/BackupTab.tsx',
+  // Version add/edit (incl. the PATCH edit path) surfaces outcomes via the
+  // inline error banner + the row updating in place, but the fetchWithAuth
+  // mutations are not yet routed through runAction.
+  'apps/web/src/components/software/SoftwareVersionManager.tsx',
+  // ComplianceDashboard.tsx: handleFormSubmit (policy create/update — the
+  // handler that arms autoInstall, #5505 W04) IS migrated to runAction.
+  // handleConfirmDelete / handleCheckCompliance / handleRemediate remain on
+  // bare fetchWithAuth — out of that wave's scope. Not yet moved into
+  // TARGET_GLOBS: doing so would flag those three untouched handlers.
+  'apps/web/src/components/software/ComplianceDashboard.tsx',
+  // ReportsList.tsx: handleGenerate (2026-09-16 pre-release sweep — "Generate
+  // now" 200'd with no toast and the row kept reading "Last Generated: Never"
+  // until reload) IS migrated to runAction. handleDelete remains on bare
+  // fetchWithAuth — out of that fix's scope. Not yet moved into TARGET_GLOBS:
+  // doing so would flag that untouched handler.
+  'apps/web/src/components/reports/ReportsList.tsx',
+];

@@ -1,0 +1,273 @@
+import { useState, useEffect, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { ArrowLeft } from 'lucide-react';
+import PolicyForm, { type PolicyFormValues } from './PolicyForm';
+import { fetchWithAuth } from '../../stores/auth';
+import { fetchAllSites } from '@/lib/fetchAllSites';
+import { navigateTo } from '@/lib/navigation';
+import Breadcrumbs from '../layout/Breadcrumbs';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+type Site = { id: string; name: string };
+type Group = { id: string; name: string };
+type Tag = { id: string; name: string };
+type Script = { id: string; name: string };
+
+type PolicyEditPageProps = {
+  policyId?: string;
+  isNew?: boolean;
+};
+
+export default function PolicyEditPage({ policyId, isNew = false }: PolicyEditPageProps) {
+  const { t } = useTranslation('scripts');
+  const [loading, setLoading] = useState(!isNew);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
+  const [defaultValues, setDefaultValues] = useState<Partial<PolicyFormValues>>();
+  const [sites, setSites] = useState<Site[]>([]);
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [scripts, setScripts] = useState<Script[]>([]);
+
+  const fetchPolicy = useCallback(async () => {
+    if (!policyId || isNew) return;
+
+    try {
+      setLoading(true);
+      setError(undefined);
+      const response = await fetchWithAuth(`/policies/${policyId}`);
+      if (!response.ok) {
+        throw new Error(t('policyEditPage.errors.fetch'));
+      }
+      const data = await response.json();
+      const policy = data.policy ?? data;
+
+      // Transform policy to form values
+      setDefaultValues({
+        name: policy.name,
+        description: policy.description,
+        targetType: policy.targetType ?? 'all',
+        targetIds: policy.targetIds ?? [],
+        rules: policy.rules ?? [{ type: 'required_software' }],
+        enforcementLevel: policy.enforcementLevel ?? 'monitor',
+        remediationScriptId: policy.remediationScriptId ?? '',
+        checkIntervalMinutes: policy.checkIntervalMinutes ?? 60
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('policyEditPage.errors.generic'));
+    } finally {
+      setLoading(false);
+    }
+  }, [policyId, isNew, t]);
+
+  const fetchSites = useCallback(async () => {
+    try {
+      setSites(await fetchAllSites<Site>('/orgs/sites'));
+    } catch {
+      // Silently fail
+    }
+  }, []);
+
+  const fetchGroups = useCallback(async () => {
+    try {
+      const response = await fetchWithAuth('/groups');
+      if (response.ok) {
+        const data = await response.json();
+        setGroups(data.data ?? data.groups ?? []);
+      }
+    } catch {
+      // Silently fail
+    }
+  }, []);
+
+  const fetchTags = useCallback(async () => {
+    try {
+      const response = await fetchWithAuth('/tags');
+      if (response.ok) {
+        const data = await response.json();
+        const rawTags = data.data ?? data.tags ?? [];
+        const normalizedTags = Array.isArray(rawTags)
+          ? rawTags
+            .map((item): Tag | null => {
+              if (typeof item === 'string') {
+                return { id: item, name: item };
+              }
+
+              if (!item || typeof item !== 'object') {
+                return null;
+              }
+
+              const record = item as Record<string, unknown>;
+              const idCandidate = record.id ?? record.tag ?? record.name;
+              const nameCandidate = record.name ?? record.tag ?? record.id;
+              if (typeof idCandidate !== 'string' || typeof nameCandidate !== 'string') {
+                return null;
+              }
+
+              const id = idCandidate.trim();
+              const name = nameCandidate.trim();
+              if (id.length === 0 || name.length === 0) {
+                return null;
+              }
+
+              return { id, name };
+            })
+            .filter((item): item is Tag => item !== null)
+          : [];
+        setTags(normalizedTags);
+      }
+    } catch {
+      // Silently fail
+    }
+  }, []);
+
+  const fetchScripts = useCallback(async () => {
+    try {
+      const response = await fetchWithAuth('/scripts');
+      if (response.ok) {
+        const data = await response.json();
+        setScripts(data.data ?? data.scripts ?? []);
+      }
+    } catch {
+      // Silently fail
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchPolicy();
+    fetchSites();
+    fetchGroups();
+    fetchTags();
+    fetchScripts();
+  }, [fetchPolicy, fetchSites, fetchGroups, fetchTags, fetchScripts]);
+
+  const handleSubmit = async (values: PolicyFormValues) => {
+    setSaving(true);
+    setError(undefined);
+
+    try {
+      // Transform form values to API format
+      const payload = {
+        name: values.name,
+        description: values.description,
+        type: 'compliance', // Default policy type
+        targetType: values.targetType,
+        targetIds: values.targetType !== 'all' ? values.targetIds : undefined,
+        rules: values.rules,
+        enforcementLevel: values.enforcementLevel,
+        remediationScriptId: values.enforcementLevel === 'enforce' ? values.remediationScriptId : undefined,
+        checkIntervalMinutes: values.checkIntervalMinutes,
+        enabled: true
+      };
+
+      const url = isNew ? '/policies' : `/policies/${policyId}`;
+      const method = isNew ? 'POST' : 'PATCH';
+
+      const response = await fetchWithAuth(url, {
+        method,
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        // Handle different error formats - string, object with message, or validation errors
+        let errorMessage = t('policyEditPage.errors.save');
+        if (typeof data.error === 'string') {
+          errorMessage = data.error;
+        } else if (data.error?.message) {
+          errorMessage = data.error.message;
+        } else if (data.message) {
+          errorMessage = data.message;
+        } else if (Array.isArray(data.issues)) {
+          // Zod validation errors
+          errorMessage = data.issues.map((i: { message: string }) => i.message).join(', ');
+        }
+        throw new Error(errorMessage);
+      }
+
+      void navigateTo('/policies');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('policyEditPage.errors.generic'));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCancel = () => {
+    void navigateTo('/policies');
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('policyEditPage.loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && !defaultValues && !isNew) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        <button
+          type="button"
+          onClick={fetchPolicy}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          {t('common:actions.retry')}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <Breadcrumbs items={[
+        { label: t('policyEditPage.breadcrumb.policies'), href: '/policies' },
+        { label: isNew ? t('policyEditPage.breadcrumb.new') : (defaultValues?.name || t('policyEditPage.breadcrumb.edit')) }
+      ]} />
+      <div className="flex items-center gap-4">
+        <a
+          href="/policies"
+          className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+        >
+          <ArrowLeft className="h-5 w-5" />
+        </a>
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">
+            {isNew ? t('policyEditPage.title.create') : t('policyEditPage.title.edit')}
+          </h1>
+          <p className="text-muted-foreground">
+            {isNew
+              ? t('policyEditPage.description.create')
+              : t('policyEditPage.description.edit')}
+          </p>
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      <PolicyForm
+        onSubmit={handleSubmit}
+        onCancel={handleCancel}
+        defaultValues={defaultValues}
+        submitLabel={isNew ? t('policyEditPage.actions.create') : t('policyEditPage.actions.saveChanges')}
+        loading={saving}
+        sites={sites}
+        groups={groups}
+        tags={tags}
+        scripts={scripts}
+      />
+    </div>
+  );
+}

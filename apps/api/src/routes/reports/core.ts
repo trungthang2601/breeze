@@ -1,0 +1,851 @@
+import { Hono } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { and, eq, or, sql, desc, inArray, type SQL } from 'drizzle-orm';
+import { db } from '../../db';
+import { reports, reportRuns } from '../../db/schema';
+import {
+  authMiddleware,
+  requirePermission,
+  requireScope,
+  type AuthContext,
+} from '../../middleware/auth';
+import { writeRouteAudit } from '../../services/auditEvents';
+import { PERMISSIONS } from '../../services/permissions';
+import {
+  canManagePartnerWidePolicies,
+  PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+} from '../../services/partnerWideAccess';
+import {
+  getPagination,
+  decodeOwnerKey,
+  ensureOrgAccess,
+  getReportWithOrgCheck,
+  isPortalSelfServiceLocked,
+  isSystemManagedReportDefinition,
+  partnerOwnedReportVisibility,
+  partnerWideListTarget,
+  PORTAL_SELF_SERVICE_REPORT,
+  reportDefinitionMetadataProjection,
+  reportOwnerCondition,
+  reportOwnerOfRow,
+  reportOwnerScopePredicate,
+  resolveReportOwnerAuthority,
+  tenantAuthorizedReportCondition,
+} from './helpers';
+import {
+  decodeSiteScope,
+  intersectSiteScopes,
+  isSiteScopeSubset,
+  persistedSiteScopeValues,
+  reportDefinitionMultiOrgScopeSqlPredicate,
+  reportDefinitionScopeSqlPredicate,
+  resolveRequestPartnerReportAuthority,
+  resolveRequestReportAuthority,
+  resolveRequestReportAuthorityMap,
+  unrestrictedReportDefinitionScopeSqlPredicate,
+  type LiveSiteScopeV1,
+  type PersistedSiteScopeColumns,
+  type ReportAction,
+} from '../../services/siteScope';
+import {
+  listReportsSchema,
+  createReportSchema,
+  PARTNER_SCOPE_REPORT_TYPES,
+  updateReportSchema,
+} from './schemas';
+
+export const coreRoutes = new Hono();
+
+coreRoutes.use('*', authMiddleware);
+
+const REPORT_NOT_FOUND = { error: 'Report not found' } as const;
+/**
+ * P2-3 (#4190). A 409, not a 403: the caller's permissions are fine and the
+ * report is genuinely theirs to read — it is the report's OWNERSHIP that makes
+ * the mutation impossible. A 404 would be worse still, since the definition is
+ * visible on `GET /reports` a line above.
+ */
+const SYSTEM_MANAGED_REPORT = { error: 'system_managed_report' } as const;
+/** `loadLockedDefinition`'s third outcome — see its docstring. */
+const SYSTEM_MANAGED = 'system_managed' as const;
+/**
+ * #4562 W10 — the mutation routes' fourth outcome: the definition is the
+ * customer portal's while `enable_reports` is on. See
+ * `isPortalSelfServiceLocked`. Not folded into `loadLockedDefinition` because
+ * it needs the locked row's org and a second table; callers answer 409.
+ */
+const PORTAL_SELF_SERVICE = 'portal_self_service' as const;
+/**
+ * #3198 W01 — `loadLockedDefinition`'s partner-wide refusal, DEFENSE IN DEPTH.
+ * Unreachable in production today: `tenantAuthorizedReportCondition` already
+ * drops partner-owned rows for every caller who fails
+ * `canManagePartnerWidePolicies` (org tokens, 'selected' partner users), so
+ * those callers get the ordinary 404 from the metadata read. This check only
+ * fires if that predicate regresses — and then it refuses with 403 instead of
+ * letting the mutation reach the partner authority resolver.
+ */
+const PARTNER_WIDE_DENIED = 'partner_wide_denied' as const;
+/** #3198 W01 — PUT's refusal to re-home a partner-owned definition. */
+const OWNERSHIP_IMMUTABLE = 'ownership_immutable' as const;
+
+type DefinitionListScopeResult =
+  | { ok: true; tenantCondition?: SQL<unknown>; definitionScopePredicate: SQL<unknown> }
+  | { ok: false; error: string };
+
+function liveScopeOf(
+  result: Awaited<ReturnType<typeof resolveReportOwnerAuthority>>,
+): LiveSiteScopeV1 | null {
+  if (!result.ok || result.authority.scope.kind === 'legacy_unscoped') {
+    return null;
+  }
+  return result.authority.scope;
+}
+
+async function resolveDefinitionListScope(
+  auth: AuthContext,
+  explicitOrgId: string | undefined,
+  // #3198 W01: /templates passes false. The web merges templates into its
+  // org-report builder, and cloning a partner-owned business definition would
+  // mint a broken org-owned one, so that listing is org-owned only — without
+  // the partner branch no NULL-org row can match `inArray(reports.org_id, …)`
+  // or any org-axis scope branch.
+  options: { includePartnerOwned: boolean },
+): Promise<DefinitionListScopeResult> {
+  const exactOrgId = auth.scope === 'organization'
+    ? auth.orgId
+    : explicitOrgId;
+
+  if (auth.scope === 'organization' && !exactOrgId) {
+    return { ok: false, error: 'Organization context required' };
+  }
+
+  if (exactOrgId) {
+    const result = await resolveRequestReportAuthority(auth, exactOrgId, 'read');
+    const scope = liveScopeOf(result);
+    if (!scope) {
+      return { ok: false, error: 'Access to this organization denied' };
+    }
+    return {
+      ok: true,
+      tenantCondition: eq(reports.orgId, exactOrgId),
+      definitionScopePredicate: reportDefinitionScopeSqlPredicate(reports, scope),
+    };
+  }
+
+  if (auth.scope === 'partner') {
+    const orgIds = auth.accessibleOrgIds ?? [];
+    const authorityMap = await resolveRequestReportAuthorityMap(
+      auth,
+      orgIds,
+      'read',
+    );
+    const scopes: LiveSiteScopeV1[] = [];
+    for (const result of authorityMap.values()) {
+      const scope = liveScopeOf(result);
+      if (scope) scopes.push(scope);
+    }
+    const orgCondition = orgIds.length > 0
+      ? inArray(reports.orgId, orgIds)
+      : sql<unknown>`FALSE`;
+    // #3198 W01: partner-owned rows join the list only for a caller who may
+    // administer partner-wide state, and only on an all-orgs listing — an
+    // explicit orgId (handled above) asks for one org and excludes them.
+    const partnerWide = options.includePartnerOwned
+      ? partnerWideListTarget(auth)
+      : undefined;
+    return {
+      ok: true,
+      tenantCondition: partnerWide
+        ? or(orgCondition, partnerOwnedReportVisibility(auth))!
+        : orgCondition,
+      definitionScopePredicate: reportDefinitionMultiOrgScopeSqlPredicate(
+        reports.orgId,
+        reports,
+        scopes,
+        // Spread, not a trailing `undefined`: an org-axis caller's call is
+        // exactly the pre-W01 three-argument call.
+        ...(partnerWide ? [partnerWide] : []),
+      ),
+    };
+  }
+
+  return {
+    ok: true,
+    definitionScopePredicate:
+      unrestrictedReportDefinitionScopeSqlPredicate(reports),
+  };
+}
+
+function persistedMetadataMatches(
+  left: PersistedSiteScopeColumns,
+  right: PersistedSiteScopeColumns,
+): boolean {
+  return (
+    left.executionScopeVersion === right.executionScopeVersion &&
+    left.executionScopeKind === right.executionScopeKind &&
+    JSON.stringify(left.executionScopeSiteIds) ===
+      JSON.stringify(right.executionScopeSiteIds) &&
+    left.executionScopeUserId === right.executionScopeUserId &&
+    left.executionScopeFingerprint === right.executionScopeFingerprint &&
+    left.executionScopeCapturedAt?.getTime() ===
+      right.executionScopeCapturedAt?.getTime() &&
+    (left.executionScopePrincipalKind ?? null) ===
+      (right.executionScopePrincipalKind ?? null)
+  );
+}
+
+/**
+ * The single gate every definition MUTATION goes through (PUT, DELETE,
+ * reauthorize). Three outcomes:
+ *
+ *  - `null` — not found, not in the caller's tenancy, or the caller's live
+ *    site scope no longer contains the stored one. Callers answer 404.
+ *  - `SYSTEM_MANAGED` (P2-3, #4190) — the definition belongs to the platform
+ *    (the weekly AI narrative). Callers answer 409. Refused HERE, from the
+ *    metadata read the function already performs, so no authority is resolved
+ *    and no `FOR UPDATE` lock is taken for a mutation that cannot proceed.
+ *  - the locked row + scopes, for callers to mutate.
+ */
+async function loadLockedDefinition(
+  tx: Pick<typeof db, 'select'>,
+  reportId: string,
+  auth: AuthContext,
+  action: Exclude<ReportAction, 'read' | 'export'>,
+) {
+  const [metadata] = await tx
+    .select(reportDefinitionMetadataProjection)
+    .from(reports)
+    .where(tenantAuthorizedReportCondition(reportId, auth))
+    .limit(1);
+  if (!metadata) return null;
+  if (isSystemManagedReportDefinition(metadata)) return SYSTEM_MANAGED;
+
+  const owner = reportOwnerOfRow(metadata);
+  if (!owner) return null;
+  // #3198 W01, defense in depth (see PARTNER_WIDE_DENIED): the metadata read
+  // above already excludes partner-owned rows for callers without the
+  // partner-wide capability; re-assert it before any authority is resolved.
+  if (owner.partnerId !== undefined && !canManagePartnerWidePolicies(auth)) {
+    return PARTNER_WIDE_DENIED;
+  }
+
+  const authorityResult = await resolveReportOwnerAuthority(auth, owner, action);
+  if (!authorityResult.ok) return null;
+  const currentScope = liveScopeOf(authorityResult);
+  if (!currentScope) return null;
+
+  const definitionScopePredicate = reportOwnerScopePredicate(
+    reports,
+    owner,
+    currentScope,
+  );
+  const [locked] = await tx
+    .select(reportDefinitionMetadataProjection)
+    .from(reports)
+    .where(
+      and(
+        eq(reports.id, reportId),
+        reportOwnerCondition(owner),
+        definitionScopePredicate,
+      ),
+    )
+    .limit(1)
+    .for('update');
+  if (!locked) return null;
+
+  try {
+    const storedScope = decodeSiteScope(
+      locked as PersistedSiteScopeColumns,
+      decodeOwnerKey(owner),
+    );
+    if (!isSiteScopeSubset(storedScope, currentScope)) return null;
+    return {
+      metadata,
+      locked,
+      owner,
+      storedScope,
+      currentScope,
+      authority: authorityResult.authority,
+      definitionScopePredicate,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// GET /reports - List saved reports
+coreRoutes.get(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_READ.resource, PERMISSIONS.REPORTS_READ.action),
+  zValidator('query', listReportsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+    const scopeResult = await resolveDefinitionListScope(auth, query.orgId, {
+      includePartnerOwned: true,
+    });
+    if (!scopeResult.ok) {
+      return c.json({ error: scopeResult.error }, 403);
+    }
+
+    const definitionScopePredicate = scopeResult.definitionScopePredicate;
+    const conditions: SQL<unknown>[] = [definitionScopePredicate];
+    if (scopeResult.tenantCondition) {
+      conditions.push(scopeResult.tenantCondition);
+    }
+
+    // Additional filters
+    if (query.type) {
+      conditions.push(eq(reports.type, query.type));
+    }
+
+    if (query.schedule) {
+      conditions.push(eq(reports.schedule, query.schedule));
+    }
+
+    const whereCondition = and(...conditions);
+
+    // Get total count
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(reports)
+      .where(whereCondition);
+    const total = Number(countResult[0]?.count ?? 0);
+
+    // Get reports
+    const reportsList = await db
+      .select()
+      .from(reports)
+      .where(whereCondition)
+      .orderBy(desc(reports.updatedAt), desc(reports.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: reportsList,
+      pagination: { page, limit, total }
+    });
+  }
+);
+
+// GET /reports/templates - List the org's saved reports as reusable custom
+// templates. Registered BEFORE /:id so the literal "templates" isn't treated as
+// a report UUID — otherwise it falls through to /:id and Postgres rejects the
+// `where id = 'templates'` cast with `invalid input syntax for type uuid` (500).
+// The web (ReportTemplates.tsx) merges these rows with its curated defaults.
+coreRoutes.get(
+  '/templates',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_READ.resource, PERMISSIONS.REPORTS_READ.action),
+  zValidator('query', listReportsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+    const scopeResult = await resolveDefinitionListScope(auth, query.orgId, {
+      includePartnerOwned: false,
+    });
+    if (!scopeResult.ok) {
+      return c.json({ error: scopeResult.error }, 403);
+    }
+
+    const definitionScopePredicate = scopeResult.definitionScopePredicate;
+    const conditions: SQL<unknown>[] = [definitionScopePredicate];
+    if (scopeResult.tenantCondition) {
+      conditions.push(scopeResult.tenantCondition);
+    }
+    const whereCondition = and(...conditions);
+
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(reports)
+      .where(whereCondition);
+    const total = Number(countResult[0]?.count ?? 0);
+
+    const templates = await db
+      .select()
+      .from(reports)
+      .where(whereCondition)
+      .orderBy(desc(reports.updatedAt), desc(reports.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: templates,
+      pagination: { page, limit, total },
+    });
+  }
+);
+
+// GET /reports/:id - Get report config
+coreRoutes.get(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_READ.resource, PERMISSIONS.REPORTS_READ.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const reportId = c.req.param('id')!;
+
+    // Skip non-UUID sub-paths so they don't hit the `where id = $1` uuid cast.
+    // 'templates' has its own handler above; listed here as defense-in-depth in
+    // case route registration order ever changes.
+    if (['runs', 'data', 'generate', 'templates'].includes(reportId)) {
+      return c.notFound();
+    }
+
+    const report = await getReportWithOrgCheck(reportId, auth);
+    if (!report) {
+      return c.json({ error: 'Report not found' }, 404);
+    }
+
+    const authorityResult = await resolveReportOwnerAuthority(
+      auth,
+      report.owner,
+      'read',
+    );
+    if (!authorityResult.ok || authorityResult.authority.scope.kind === 'legacy_unscoped') {
+      return c.json({ error: 'Report not found' }, 404);
+    }
+    const runScopePredicate = reportOwnerScopePredicate(
+      reportRuns,
+      report.owner,
+      authorityResult.authority.scope,
+    );
+
+    const { owner, ...reportRow } = report;
+    const recentRunsProjection = {
+        id: reportRuns.id,
+        reportId: reportRuns.reportId,
+        status: reportRuns.status,
+        startedAt: reportRuns.startedAt,
+        completedAt: reportRuns.completedAt,
+        outputUrl: reportRuns.outputUrl,
+        errorMessage: reportRuns.errorMessage,
+        rowCount: reportRuns.rowCount,
+        createdAt: reportRuns.createdAt,
+        executionScopeVersion: reportRuns.executionScopeVersion,
+        executionScopeKind: reportRuns.executionScopeKind,
+        executionScopeSiteIds: reportRuns.executionScopeSiteIds,
+        executionScopeUserId: reportRuns.executionScopeUserId,
+        executionScopeFingerprint: reportRuns.executionScopeFingerprint,
+        executionScopeCapturedAt: reportRuns.executionScopeCapturedAt,
+        executionScopePrincipalKind: reportRuns.executionScopePrincipalKind,
+    };
+    // Get recent runs for this report. A partner-owned definition's run
+    // predicate binds the joined `reports.partner_id` (#3198 W01), so only
+    // that branch joins; the org branch is today's query unchanged.
+    const recentRuns = owner.partnerId !== undefined
+      ? await db
+        .select(recentRunsProjection)
+        .from(reportRuns)
+        .innerJoin(reports, eq(reportRuns.reportId, reports.id))
+        .where(and(eq(reportRuns.reportId, reportId), runScopePredicate))
+        .orderBy(desc(reportRuns.createdAt))
+        .limit(5)
+      : await db
+        .select(recentRunsProjection)
+        .from(reportRuns)
+        .where(and(eq(reportRuns.reportId, reportId), runScopePredicate))
+        .orderBy(desc(reportRuns.createdAt))
+        .limit(5);
+
+    return c.json({
+      ...reportRow,
+      recentRuns
+    });
+  }
+);
+
+// POST /reports - Create report definition
+coreRoutes.post(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_WRITE.resource, PERMISSIONS.REPORTS_WRITE.action),
+  zValidator('json', createReportSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const data = c.req.valid('json');
+
+    // #3198 W01 — a partner-owned definition. partner_id is ALWAYS the
+    // caller's own token partner; `data.orgId` and any client-supplied partner
+    // id are never read on this branch.
+    if (data.ownerScope === 'partner') {
+      if (auth.scope !== 'partner' || !auth.partnerId) {
+        return c.json({ error: 'partner_scope_required' }, 403);
+      }
+      if (!canManagePartnerWidePolicies(auth)) {
+        return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      }
+      if (!PARTNER_SCOPE_REPORT_TYPES.has(data.type)) {
+        return c.json({ error: 'unsupported_report_scope', type: data.type }, 400);
+      }
+      const partnerAuthority = await resolveRequestPartnerReportAuthority(
+        auth,
+        auth.partnerId,
+        'write',
+      );
+      if (!partnerAuthority.ok) {
+        return c.json(
+          { error: 'Report scope is not authorized', reason: partnerAuthority.reason },
+          403,
+        );
+      }
+      const [partnerReport] = await db
+        .insert(reports)
+        .values({
+          orgId: null,
+          partnerId: auth.partnerId,
+          name: data.name,
+          type: data.type,
+          config: data.config,
+          schedule: data.schedule,
+          format: data.format,
+          createdBy: auth.user.id,
+          ...persistedSiteScopeValues(partnerAuthority.authority),
+        })
+        .returning();
+
+      writeRouteAudit(c, {
+        orgId: null,
+        action: 'report.create',
+        resourceType: 'report',
+        resourceId: partnerReport?.id,
+        resourceName: partnerReport?.name,
+        details: {
+          type: partnerReport?.type,
+          schedule: partnerReport?.schedule,
+          format: partnerReport?.format,
+          ownerScope: 'partner',
+          partnerId: auth.partnerId,
+        },
+      });
+
+      return c.json(partnerReport, 201);
+    }
+
+    // Determine orgId
+    let orgId = data.orgId;
+
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      orgId = auth.orgId;
+    } else if (auth.scope === 'partner') {
+      if (!orgId) {
+        const singleOrg = auth.accessibleOrgIds?.[0];
+        if (auth.accessibleOrgIds?.length === 1 && singleOrg) {
+          orgId = singleOrg;
+        } else {
+          return c.json({ error: 'orgId is required when partner has multiple organizations' }, 400);
+        }
+      }
+      const hasAccess = await ensureOrgAccess(orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+    } else if (auth.scope === 'system' && !orgId) {
+      return c.json({ error: 'orgId is required' }, 400);
+    }
+
+    const authorityResult = await resolveRequestReportAuthority(
+      auth,
+      orgId!,
+      'write',
+    );
+    if (!authorityResult.ok) {
+      return c.json({ error: 'Report scope is not authorized' }, 403);
+    }
+    const currentScope = liveScopeOf(authorityResult);
+    if (!currentScope) {
+      return c.json({ error: 'Report scope is not authorized' }, 403);
+    }
+
+    const scopeValues = persistedSiteScopeValues(authorityResult.authority);
+    const [report] = await db
+      .insert(reports)
+      .values({
+        orgId: orgId!,
+        name: data.name,
+        type: data.type,
+        config: data.config,
+        schedule: data.schedule,
+        format: data.format,
+        createdBy: auth.user.id,
+        ...scopeValues,
+      })
+      .returning();
+
+    writeRouteAudit(c, {
+      orgId: report?.orgId ?? orgId ?? auth.orgId,
+      action: 'report.create',
+      resourceType: 'report',
+      resourceId: report?.id,
+      resourceName: report?.name,
+      details: { type: report?.type, schedule: report?.schedule, format: report?.format }
+    });
+
+    return c.json(report, 201);
+  }
+);
+
+// PUT /reports/:id - Update report
+coreRoutes.put(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_WRITE.resource, PERMISSIONS.REPORTS_WRITE.action),
+  zValidator('json', updateReportSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const reportId = c.req.param('id')!;
+    // `orgId` is accepted-and-ignored for an org-owned row (the web builder
+    // sends it on every save) and refused on a partner-owned one below; it is
+    // never an update. `ownerScope` never reaches here (schema: z.never()).
+    const { orgId: bodyOrgId, ownerScope: _ownerScope, ...data } = c.req.valid('json');
+
+    if (Object.keys(data).length === 0) {
+      return c.json({ error: 'No updates provided' }, 400);
+    }
+
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+    if (data.name !== undefined) updates.name = data.name;
+    if (data.config !== undefined) updates.config = data.config;
+    if (data.schedule !== undefined) updates.schedule = data.schedule;
+    if (data.format !== undefined) updates.format = data.format;
+
+    const mutation = await db.transaction(async (tx) => {
+      const locked = await loadLockedDefinition(
+        tx,
+        reportId,
+        auth,
+        'write',
+      );
+      if (locked === SYSTEM_MANAGED) return SYSTEM_MANAGED;
+      if (locked === PARTNER_WIDE_DENIED) return PARTNER_WIDE_DENIED;
+      if (!locked) return null;
+      // #3198 W01: ownership is immutable. The report_schedule_recipients /
+      // service_deliverables composite FKs are ON UPDATE NO ACTION, so flipping
+      // the axis would 23503 anyway — refuse it as what it is.
+      if (locked.owner.partnerId !== undefined && bodyOrgId !== undefined) {
+        return OWNERSHIP_IMMUTABLE;
+      }
+      if (await isPortalSelfServiceLocked(tx, locked.locked)) {
+        return PORTAL_SELF_SERVICE;
+      }
+
+      const effectiveScope = intersectSiteScopes(
+        locked.storedScope,
+        locked.currentScope,
+      );
+      if (!effectiveScope) return null;
+
+      const [updated] = await tx
+        .update(reports)
+        .set(updates)
+        .where(
+          and(
+            eq(reports.id, reportId),
+            reportOwnerCondition(locked.owner),
+            locked.definitionScopePredicate,
+          ),
+        )
+        .returning();
+      if (!updated) return null;
+      return { updated, locked: locked.locked };
+    });
+
+    if (mutation === SYSTEM_MANAGED) {
+      return c.json(SYSTEM_MANAGED_REPORT, 409);
+    }
+    if (mutation === PARTNER_WIDE_DENIED) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+    if (mutation === OWNERSHIP_IMMUTABLE) {
+      return c.json({ error: 'report_ownership_immutable' }, 400);
+    }
+    if (mutation === PORTAL_SELF_SERVICE) {
+      return c.json(PORTAL_SELF_SERVICE_REPORT, 409);
+    }
+    if (!mutation) {
+      return c.json(REPORT_NOT_FOUND, 404);
+    }
+    writeRouteAudit(c, {
+      orgId: mutation.locked.orgId,
+      action: 'report.update',
+      resourceType: 'report',
+      resourceId: mutation.updated.id,
+      resourceName: mutation.updated.name,
+      details: mutation.locked.partnerId
+        ? { changedFields: Object.keys(data), partnerId: mutation.locked.partnerId }
+        : { changedFields: Object.keys(data) }
+    });
+
+    return c.json(mutation.updated);
+  }
+);
+
+// POST /reports/:id/reauthorize - Explicitly replace stored scope provenance
+coreRoutes.post(
+  '/:id/reauthorize',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_WRITE.resource, PERMISSIONS.REPORTS_WRITE.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const reportId = c.req.param('id')!;
+
+    const result = await db.transaction(async (tx) => {
+      const locked = await loadLockedDefinition(
+        tx,
+        reportId,
+        auth,
+        'write',
+      );
+      if (locked === SYSTEM_MANAGED) return { kind: 'system_managed' as const };
+      if (locked === PARTNER_WIDE_DENIED) return { kind: 'partner_wide_denied' as const };
+      if (!locked) return { kind: 'not_found' as const };
+
+      if (
+        locked.storedScope.kind === 'legacy_unscoped' &&
+        locked.currentScope.kind !== 'unrestricted'
+      ) {
+        return { kind: 'not_found' as const };
+      }
+
+      if (
+        !persistedMetadataMatches(
+          locked.metadata as PersistedSiteScopeColumns,
+          locked.locked as PersistedSiteScopeColumns,
+        )
+      ) {
+        return { kind: 'changed' as const };
+      }
+
+      const scopeValues = persistedSiteScopeValues(locked.authority);
+      const [updated] = await tx
+        .update(reports)
+        .set({
+          ...scopeValues,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(reports.id, reportId),
+            reportOwnerCondition(locked.owner),
+            locked.definitionScopePredicate,
+          ),
+        )
+        .returning();
+
+      return updated
+        ? { kind: 'updated' as const, updated }
+        : { kind: 'changed' as const };
+    });
+
+    if (result.kind === 'system_managed') {
+      // The reason this route in particular must refuse: the update below
+      // stamps `persistedSiteScopeValues`, whose principal_kind is ALWAYS
+      // 'user'. Letting it through would silently convert a system-managed
+      // definition into a human-owned one — and the scheduled-report worker's
+      // system-principal refusal would stop protecting it.
+      return c.json(SYSTEM_MANAGED_REPORT, 409);
+    }
+    if (result.kind === 'partner_wide_denied') {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+    if (result.kind === 'not_found') {
+      return c.json(REPORT_NOT_FOUND, 404);
+    }
+    if (result.kind === 'changed') {
+      return c.json({ error: 'Report scope changed', code: 'SCOPE_CHANGED' }, 409);
+    }
+
+    writeRouteAudit(c, {
+      orgId: result.updated.orgId,
+      action: 'report.reauthorize',
+      resourceType: 'report',
+      resourceId: result.updated.id,
+      resourceName: result.updated.name,
+      ...(result.updated.partnerId ? { details: { partnerId: result.updated.partnerId } } : {}),
+    });
+    return c.json(result.updated);
+  },
+);
+
+// DELETE /reports/:id - Delete report
+coreRoutes.delete(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_DELETE.resource, PERMISSIONS.REPORTS_DELETE.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const reportId = c.req.param('id')!;
+
+    const deleted = await db.transaction(async (tx) => {
+      const locked = await loadLockedDefinition(
+        tx,
+        reportId,
+        auth,
+        'delete',
+      );
+      if (locked === SYSTEM_MANAGED) return SYSTEM_MANAGED;
+      if (locked === PARTNER_WIDE_DENIED) return PARTNER_WIDE_DENIED;
+      if (!locked) return null;
+
+      if (await isPortalSelfServiceLocked(tx, locked.locked)) {
+        return { kind: PORTAL_SELF_SERVICE };
+      }
+
+      await tx
+        .delete(reportRuns)
+        .where(eq(reportRuns.reportId, reportId));
+
+      const deletedRows = await tx
+        .delete(reports)
+        .where(
+          and(
+            eq(reports.id, reportId),
+            reportOwnerCondition(locked.owner),
+            locked.definitionScopePredicate,
+          ),
+        )
+        .returning();
+      if (deletedRows.length !== 1) {
+        throw new Error('REPORT_DELETE_SCOPE_CHANGED');
+      }
+      return { kind: 'deleted' as const, report: deletedRows[0]! };
+    }).catch((error) => {
+      if (
+        error instanceof Error &&
+        error.message === 'REPORT_DELETE_SCOPE_CHANGED'
+      ) {
+        return null;
+      }
+      throw error;
+    });
+
+    if (deleted === SYSTEM_MANAGED) {
+      return c.json(SYSTEM_MANAGED_REPORT, 409);
+    }
+    if (deleted === PARTNER_WIDE_DENIED) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+    if (deleted?.kind === PORTAL_SELF_SERVICE) {
+      return c.json(PORTAL_SELF_SERVICE_REPORT, 409);
+    }
+    if (!deleted) {
+      return c.json(REPORT_NOT_FOUND, 404);
+    }
+    writeRouteAudit(c, {
+      orgId: deleted.report.orgId,
+      action: 'report.delete',
+      resourceType: 'report',
+      resourceId: deleted.report.id,
+      resourceName: deleted.report.name,
+      ...(deleted.report.partnerId ? { details: { partnerId: deleted.report.partnerId } } : {}),
+    });
+
+    return c.json({ success: true });
+  }
+);

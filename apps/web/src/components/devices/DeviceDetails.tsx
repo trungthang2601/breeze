@@ -1,0 +1,1117 @@
+import TopologyEntry from '../topology/TopologyEntry';
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useHashState } from "@/lib/useHashState";
+import { fetchWithAuth } from "../../stores/auth";
+import { asList } from "@/lib/asList";
+import {
+  Monitor,
+  Cpu,
+  Database,
+  MemoryStick,
+  HardDrive,
+  Clock,
+  AlertTriangle,
+  Terminal,
+  Package,
+  Activity,
+  FileText,
+  ScrollText,
+  Network,
+  CheckCircle,
+  Bug,
+  Info,
+  Server,
+  Shield,
+  User,
+  Layers,
+  Timer,
+  Usb,
+  Upload,
+  Ticket,
+  TrendingUp,
+  HeartPulse,
+  ShieldCheck,
+  Link2,
+  Cloud,
+  History,
+  Bot,
+} from "lucide-react";
+import { formatPercent } from "@/lib/i18n/format";
+import { formatUptime } from "../../lib/utils";
+import type { Device, DeviceStatus } from "./DeviceList";
+import { formatDeviceSummaryOs } from "./osDisplay";
+import RebootScheduledBadge from "./RebootScheduledBadge";
+import UninstallStateBadge from "./UninstallStateBadge";
+import DeviceActions from "./DeviceActions";
+import DeviceInfoTab from "./DeviceInfoTab";
+import DeviceHardwareInventory from "./DeviceHardwareInventory";
+import DeviceSoftwareInventory from "./DeviceSoftwareInventory";
+import DevicePatchStatusTab from "./DevicePatchStatusTab";
+import DeviceVulnerabilitiesTab from "./DeviceVulnerabilitiesTab";
+import DeviceOneDriveTab from "./DeviceOneDriveTab";
+import DeviceSecurityTab from "./DeviceSecurityTab";
+import DeviceAlertHistory from "./DeviceAlertHistory";
+import DeviceActivityFeed from "./DeviceActivityFeed";
+import DeviceAiActivitySignal from "./DeviceAiActivitySignal";
+import DeviceQueuedActions from "./DeviceQueuedActions";
+import DeviceScriptHistory from "./DeviceScriptHistory";
+import DevicePerformanceGraphs from "./DevicePerformanceGraphs";
+import DeviceEventLogViewer from "./DeviceEventLogViewer";
+import DeviceLogsTab from "./DeviceLogsTab";
+import DeviceNetworkConnections from "./DeviceNetworkConnections";
+import DeviceFilesystemTab from "./DeviceFilesystemTab";
+import DeviceManagementTab from "./DeviceManagementTab";
+import DeviceEffectiveConfigTab from "./DeviceEffectiveConfigTab";
+import DeviceIpHistoryTab from "./DeviceIpHistoryTab";
+import DeviceChangeHistoryTab from "./DeviceChangeHistoryTab";
+import DeviceBootPerformanceTab from "./DeviceBootPerformanceTab";
+import DevicePlaybookHistory from "./DevicePlaybookHistory";
+import DevicePeripheralsTab from "./DevicePeripheralsTab";
+import DeviceFileEgressTab from "./DeviceFileEgressTab";
+import DeviceWarrantyCard from "./DeviceWarrantyCard";
+import DeviceBillingCard from "./DeviceBillingCard";
+import DeviceUserIdleStat from "./DeviceUserIdleStat";
+import MacOSPermissionsBanner from "./MacOSPermissionsBanner";
+import PossibleReplacementBanner from "./PossibleReplacementBanner";
+import { navigateTo } from "@/lib/navigation";
+import { decodeScriptExecutionId } from "@/lib/deviceScriptsLink";
+import { OverflowTabs, type OverflowTab } from "../shared/OverflowTabs";
+import DeviceBackupTab from "../backup/DeviceBackupTab";
+import DeviceTicketsTab from "../tickets/DeviceTicketsTab";
+import OperatorTaskActivityFeed from "../aiOperator/OperatorTaskActivityFeed";
+import DeviceAnomaliesPanel from "./DeviceAnomaliesPanel";
+import type { DeviceTabCounts } from "./deviceTabCounts";
+import DeviceReliabilityPanel from "./DeviceReliabilityPanel";
+import DeviceMonitoringTab from "./DeviceMonitoringTab";
+import DeviceComplianceTab from "./DeviceComplianceTab";
+import DeviceLinkedProfilesTab from "./DeviceLinkedProfilesTab";
+import { useTranslation } from "react-i18next";
+import "../../lib/i18n";
+import { Puzzle } from "lucide-react";
+import ExtensionSlotHost, {
+  useExtensionSlotDescriptors,
+} from "../extensions/ExtensionSlotHost";
+
+type CoreTab =
+  | "overview"
+  | "details"
+  | "hardware"
+  | "software"
+  | "patches"
+  | "vulnerabilities"
+  | "security"
+  | "management"
+  | "effective-config"
+  | "onedrive"
+  | "alerts"
+  | "anomalies"
+  | "scripts"
+  | "performance"
+  | "eventlog"
+  | "topology"
+  | "monitoring"
+  | "compliance"
+  | "activities"
+  | "connections"
+  | "filesystem"
+  | "ip-history"
+  | "change-history"
+  | "boot-performance"
+  | "playbooks"
+  | "peripherals"
+  | "egress"
+  | "backup"
+  | "linked-profiles"
+  | "tickets"
+  | "operator-tasks";
+
+/**
+ * Extension-contributed `device.detail.tabs` tab id:
+ * `ext:<extensionName>:<contributionId>` (contributionId is
+ * ExtensionSlotDescriptor.key without the extension-name prefix duplicated —
+ * see `ExtensionSlotDescriptor.key`, which this literally embeds via
+ * `` `ext:${descriptor.key}` ``). Existence is NOT tracked in this closed
+ * union — the registry (via `useExtensionSlotDescriptors`) is the source of
+ * truth. An `ext:...` id with no matching enabled descriptor (extension
+ * disabled/withdrawn after the hash was set) simply renders nothing, same
+ * no-oracle posture as ExtensionPageHost.
+ */
+type ExtTab = `ext:${string}`;
+
+type Tab = CoreTab | ExtTab;
+
+type DeviceDetailsProps = {
+  device: Device;
+  timezone?: string;
+  onBack?: () => void;
+  onAction?: (action: string, device: Device) => void;
+};
+
+const statusColors: Record<DeviceStatus, string> = {
+  online: "bg-success/15 text-success border-success/30",
+  offline: "bg-destructive/15 text-destructive border-destructive/30",
+  maintenance: "bg-warning/15 text-warning border-warning/30",
+  decommissioned: "bg-muted text-muted-foreground border-border",
+  quarantined: "bg-warning/15 text-warning border-warning/30",
+  updating: "bg-info/15 text-info border-info/30",
+  pending: "bg-muted text-muted-foreground border-border",
+  unknown: "bg-muted text-muted-foreground border-border",
+};
+
+const statusLabels: Record<DeviceStatus, string> = {
+  online: "Online",
+  offline: "Offline",
+  maintenance: "Maintenance",
+  decommissioned: "Removed",
+  quarantined: "Quarantined",
+  updating: "Updating",
+  pending: "Pending",
+  // No detail page exists for a manual asset in v1 (#4622 W04 spec), and
+  // `unknown` is only produced for unprobed network rows (#5213), so this
+  // never renders today — kept for the shared DeviceStatus exhaustiveness.
+  unknown: "Unknown",
+};
+
+function formatLastSeen(dateString: string, timezone?: string): string {
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) return dateString;
+
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / (1000 * 60));
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  if (diffMins < 1) return "Just now";
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString(
+    [],
+    timezone ? { timeZone: timezone } : undefined,
+  );
+}
+
+const VALID_TABS: CoreTab[] = [
+  "overview",
+  "details",
+  "hardware",
+  "software",
+  "patches",
+  "vulnerabilities",
+  "security",
+  "management",
+  "effective-config",
+  "onedrive",
+  "alerts",
+  "scripts",
+  "performance",
+  "anomalies",
+  "eventlog",
+  "topology",
+  "monitoring",
+  "compliance",
+  "activities",
+  "connections",
+  "filesystem",
+  "ip-history",
+  "change-history",
+  "boot-performance",
+  "playbooks",
+  "peripherals",
+  "egress",
+  "backup",
+  "linked-profiles",
+  "tickets",
+  "operator-tasks",
+];
+
+// Mirrors the character set an `ExtensionSlotDescriptor.key` can contain:
+// `extensionName` (packages/extension-sdk NAME_RE: `[a-z][a-z0-9-]{1,31}`)
+// plus `:` plus `contributionId` (an `identifier`, or the `slot:element`
+// fallback key — both draw only from `[a-z0-9._:-]`). Hash-safe: none of
+// these characters are touched by `location.hash` normalization, and none
+// collide with the `/` this module's own hash format uses as a separator
+// (see `anomalyIdFromHash`'s sibling `<tab>/<rest>` shape).
+const EXT_TAB_RE = /^ext:[a-z][a-z0-9-]{1,31}:[a-z0-9._:-]+$/;
+
+// Pure hash parsers (leading `#` already stripped by useHashState) so they are
+// SSR-safe — the hash is adopted post-mount by the hook (#2421). Exported for
+// direct unit-testing of the hash round-trip without mounting the (heavy)
+// full component.
+export function tabFromHash(hash: string): Tab | undefined {
+  const seg = hash.split("/")[0] ?? "";
+  if (VALID_TABS.includes(seg as CoreTab)) return seg as CoreTab;
+  if (EXT_TAB_RE.test(seg)) return seg as ExtTab;
+  return undefined;
+}
+
+function anomalyIdFromHash(hash: string): string | undefined {
+  const [tab, anomalyId] = hash.split("/");
+  return tab === "anomalies" && anomalyId ? anomalyId : undefined;
+}
+
+// #4886 — mirrors anomalyIdFromHash: `#scripts/<executionId>` both selects the
+// Scripts tab (via tabFromHash, which only looks at the first segment) and
+// tells DeviceScriptHistory which execution to auto-open/highlight, so a
+// post-run redirect lands the operator watching the right row rather than a
+// generic tab switch. The segment is percent-decoded — deviceScriptsHash()
+// (the only writer) percent-encodes it, so this must reverse that or a
+// highlight for any id needing an escape would silently never match.
+function scriptExecutionIdFromHash(hash: string): string | undefined {
+  const [tab, executionId] = hash.split("/");
+  return tab === "scripts" ? decodeScriptExecutionId(executionId) : undefined;
+}
+
+type LinkedNetworkAsset = { id: string; label: string };
+
+// Back-link to any discovered assets identity-linked to this device (#3261
+// Task 4). Renders nothing while loading or when there are zero matches —
+// most devices were never seen by network discovery, and a permanent empty
+// row would just be noise.
+function NetworkAssetRow({ deviceId }: { deviceId: string }) {
+  const { t } = useTranslation("devices");
+  const [assets, setAssets] = useState<LinkedNetworkAsset[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setAssets(null);
+    fetchWithAuth(`/discovery/assets?linkedDeviceId=${deviceId}`)
+      .then(async (res) => {
+        if (!res.ok) return [];
+        const data = await res.json();
+        const raw: any[] = asList(data, "assets");
+        return raw.map((a) => ({
+          id: a.id,
+          label: a.label || a.hostname || a.ipAddress || a.id,
+        }));
+      })
+      .catch(() => [])
+      .then((mapped) => {
+        if (!cancelled) setAssets(mapped);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceId]);
+
+  if (!assets || assets.length === 0) return null;
+
+  if (assets.length === 1) {
+    const asset = assets[0]!;
+    return (
+      <div className="flex items-center justify-between gap-4 rounded-lg border bg-card px-5 py-3 text-sm">
+        <span className="text-muted-foreground">
+          {t("deviceDetails.networkAsset")}
+        </span>
+        <a
+          href={`/devices/network/${asset.id}`}
+          data-testid="device-network-asset-link"
+          className="font-medium text-primary hover:underline"
+        >
+          {asset.label}
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="rounded-lg border bg-card px-5 py-3 text-sm"
+      data-testid="device-network-asset-list"
+    >
+      <p className="text-muted-foreground">
+        {t("deviceDetails.networkAssets")}
+      </p>
+      <ul className="mt-1 space-y-1">
+        {assets.map((asset) => (
+          <li key={asset.id}>
+            <a
+              href={`/devices/network/${asset.id}`}
+              className="font-medium text-primary hover:underline"
+            >
+              {asset.label}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export default function DeviceDetails({
+  device,
+  timezone,
+  onBack,
+  onAction,
+}: DeviceDetailsProps) {
+  const { t } = useTranslation("devices");
+  // Enabled `device.detail.tabs` contributions, deterministically ordered.
+  // Never throws — a registry failure or zero enabled contributions simply
+  // appends no extension tabs (see useExtensionSlotDescriptors).
+  const extensionTabDescriptors = useExtensionSlotDescriptors("device.detail.tabs", 1);
+  const [hashTab, setActiveTab] = useHashState<Tab>("overview", tabFromHash);
+  const [focusedAnomalyId, setFocusedAnomalyId] = useHashState<
+    string | undefined
+  >(undefined, anomalyIdFromHash);
+  const [highlightedExecutionId, setHighlightedExecutionId] = useHashState<
+    string | undefined
+  >(undefined, scriptExecutionIdFromHash);
+  // Whether the Overview Activity rail is collapsed to its thin vertical bar.
+  // Starts collapsed so the page paints at full width during the async load and
+  // never flashes a rail that then vanishes (the v0.85.0 stretch bug). Once the
+  // feed loads, the data-driven default opens it when there's content; an empty
+  // device simply stays collapsed with zero motion.
+  const [activityCollapsed, setActivityCollapsed] = useState(true);
+  // Set once the user clicks the collapse/expand affordance, so a manual choice
+  // wins over the data-driven default for the rest of this device's view. Reset
+  // per device below (no cross-device persistence).
+  const activityUserToggled = useRef(false);
+
+  const handleActivityHasContent = useCallback((hasContent: boolean) => {
+    if (activityUserToggled.current) return;
+    setActivityCollapsed(!hasContent);
+  }, []);
+
+  const toggleActivityCollapsed = useCallback(() => {
+    activityUserToggled.current = true;
+    setActivityCollapsed((c) => !c);
+  }, []);
+
+  // Re-derive the rail state for each device: forget any manual toggle and drop
+  // back to the collapsed-during-load default until the new device's feed reports.
+  useEffect(() => {
+    activityUserToggled.current = false;
+    setActivityCollapsed(true);
+  }, [device.id]);
+
+  const switchTab = (tab: Tab) => {
+    window.location.hash = tab;
+    setActiveTab(tab);
+    setFocusedAnomalyId(undefined);
+    setHighlightedExecutionId(undefined);
+  };
+
+  // Use provided timezone or browser default
+  const effectiveTimezone =
+    timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  // Linked Profiles only means something for a device that is actually in a
+  // link group — a multi-boot peer, or a member of a vm_host group (#2865).
+  // Everything else would land on a two-paragraph "not part of a linked group"
+  // explainer, so the tab is omitted entirely rather than rendered dead.
+  const isLinked = device.linkGroupId != null;
+
+  // `tabFromHash` validates against the static VALID_TABS list and cannot know
+  // about linkage, so a `#linked-profiles` deep link on an unlinked device
+  // would otherwise select a tab that has no button and no panel — a blank
+  // content area. Resolve it back to Overview here, where linkage is known.
+  const activeTab: Tab =
+    hashTab === "linked-profiles" && !isLinked ? "overview" : hashTab;
+
+  // "Needs attention" counts per signal tab (GET /devices/:id/tab-counts).
+  // Drives the badges and the promotion of by-default-empty tabs (Anomalies,
+  // Tickets, Operator Tasks) into the primary row. Best-effort: a failed
+  // request simply leaves every count undefined and the layout at its default.
+  // Re-fetched on every tab switch so acting inside a tab (resolving alerts,
+  // closing a ticket) is reflected on the next navigation without a reload;
+  // the previous counts are kept meanwhile so the row does not flicker.
+  const [tabCounts, setTabCounts] = useState<DeviceTabCounts | null>(null);
+  useEffect(() => {
+    setTabCounts(null);
+  }, [device.id]);
+  useEffect(() => {
+    let cancelled = false;
+    fetchWithAuth(`/devices/${device.id}/tab-counts`)
+      .then(async (res) => (res.ok ? ((await res.json()) as { data?: DeviceTabCounts }).data ?? null : null))
+      .catch(() => null)
+      .then((data) => {
+        if (!cancelled && data) setTabCounts(data);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [device.id, activeTab]);
+
+  // Curated layout: only `primary` tabs sit in the row; everything else is
+  // grouped inside "More" under these section headers. A `promoteOnCount`
+  // tab joins the row when its count is non-zero, so Anomalies / Tickets /
+  // Operator Tasks stop taking prime real estate while empty but surface the
+  // moment they have something to show.
+  const groups = {
+    monitoring: t("deviceDetails.tabGroups.monitoring"),
+    inventory: t("deviceDetails.tabGroups.inventory"),
+    management: t("deviceDetails.tabGroups.management"),
+    history: t("deviceDetails.tabGroups.history"),
+    extensions: t("deviceDetails.tabGroups.extensions"),
+  };
+  const promoted = (count: number | undefined) => (count ?? 0) > 0;
+
+  const tabs: {
+    id: Tab;
+    label: string;
+    icon: React.ReactNode;
+    separator?: boolean;
+    title?: string;
+    primary?: boolean;
+    group?: string;
+    count?: number;
+  }[] = [
+    // --- Summary ---
+    {
+      id: "overview",
+      primary: true,
+      label: t("deviceDetails.overview"),
+      icon: <Monitor className="h-4 w-4" />,
+    },
+    {
+      id: "details",
+      primary: true,
+      label: t("deviceDetails.details"),
+      icon: <Info className="h-4 w-4" />,
+      title: t("deviceDetails.osNetworkAndSystemDetails"),
+    },
+    ...(isLinked
+      ? [
+          {
+            id: "linked-profiles" as Tab,
+            primary: true,
+            label: t("deviceDetails.linkedProfiles"),
+            icon: <Link2 className="h-4 w-4" />,
+            title: t("deviceDetails.multiBootOsProfilesLinkedTo"),
+          },
+        ]
+      : []),
+    // --- Monitoring ---
+    {
+      id: "performance",
+      primary: true,
+      group: groups.monitoring,
+      label: t("deviceDetails.performance"),
+      icon: <Activity className="h-4 w-4" />,
+      title: t("deviceDetails.cpuRamAndDiskUsageOver"),
+    },
+    {
+      id: "alerts",
+      primary: true,
+      group: groups.monitoring,
+      count: tabCounts?.alerts,
+      label: t("deviceDetails.alerts"),
+      icon: <AlertTriangle className="h-4 w-4" />,
+      title: t("deviceDetails.alertHistoryForThisDevice"),
+    },
+    {
+      id: "anomalies",
+      primary: promoted(tabCounts?.anomalies),
+      group: groups.monitoring,
+      count: tabCounts?.anomalies,
+      label: t("deviceDetails.anomalies"),
+      icon: <TrendingUp className="h-4 w-4" />,
+      title: t("deviceDetails.metricAnomalySignalsForThisDevice"),
+    },
+    {
+      id: "tickets",
+      primary: promoted(tabCounts?.tickets),
+      group: groups.monitoring,
+      count: tabCounts?.tickets,
+      label: t("deviceDetails.tickets"),
+      icon: <Ticket className="h-4 w-4" />,
+      title: t("deviceDetails.ticketsLinkedToThisDevice"),
+    },
+    {
+      id: "operator-tasks",
+      primary: promoted(tabCounts?.operatorTasks),
+      group: groups.monitoring,
+      count: tabCounts?.operatorTasks,
+      label: t("deviceDetails.operatorTasks"),
+      icon: <Bot className="h-4 w-4" />,
+      title: t("deviceDetails.operatorTasksForThisDevice"),
+    },
+    {
+      id: "eventlog",
+      primary: true,
+      group: groups.monitoring,
+      label: t("deviceDetails.eventLog"),
+      icon: <FileText className="h-4 w-4" />,
+      title: t("deviceDetails.windowsMacosSystemEventLogs"),
+    },
+    {
+      id: "topology",
+      label: t("topology:title"),
+      icon: <Network className="h-4 w-4" />,
+      title: t("topology:title"),
+    },
+    {
+      id: "monitoring",
+      group: groups.monitoring,
+      count: tabCounts?.monitoring,
+      label: t("deviceDetails.monitoring"),
+      icon: <HeartPulse className="h-4 w-4" />,
+      title: t("deviceDetails.serviceProcessWatchResultsFromConfiguration"),
+    },
+    {
+      id: "compliance",
+      group: groups.monitoring,
+      count: tabCounts?.compliance,
+      label: t("deviceDetails.compliance"),
+      icon: <ShieldCheck className="h-4 w-4" />,
+      title: t("deviceDetails.perDeviceConfigurationPolicyComplianceResults"),
+    },
+    // --- Inventory ---
+    {
+      id: "hardware",
+      primary: true,
+      group: groups.inventory,
+      label: t("deviceDetails.hardware"),
+      icon: <Cpu className="h-4 w-4" />,
+    },
+    {
+      id: "software",
+      primary: true,
+      group: groups.inventory,
+      label: t("deviceDetails.software"),
+      icon: <Package className="h-4 w-4" />,
+    },
+    {
+      id: "patches",
+      primary: true,
+      group: groups.inventory,
+      label: t("deviceDetails.patches"),
+      icon: <CheckCircle className="h-4 w-4" />,
+      title: t("deviceDetails.osUpdateAndPatchStatus"),
+    },
+    {
+      id: "vulnerabilities",
+      group: groups.inventory,
+      label: t("deviceDetails.vulnerabilities"),
+      icon: <Bug className="h-4 w-4" />,
+      title: t("deviceDetails.cvesDetectedOnThisDevice"),
+    },
+    {
+      id: "peripherals",
+      group: groups.inventory,
+      label: t("deviceDetails.peripherals"),
+      icon: <Usb className="h-4 w-4" />,
+      title: t("deviceDetails.usbBluetoothAndConnectedDevices"),
+    },
+    {
+      id: "egress",
+      label: t("deviceDetails.egress"),
+      icon: <Upload className="h-4 w-4" />,
+      title: t("deviceDetails.fileEgressDlp"),
+    },
+    // --- Management ---
+    {
+      id: "scripts",
+      primary: true,
+      group: groups.management,
+      label: t("deviceDetails.scripts"),
+      icon: <Terminal className="h-4 w-4" />,
+      title: t("deviceDetails.scriptExecutionHistory"),
+    },
+    {
+      id: "management",
+      group: groups.management,
+      label: t("deviceDetails.management"),
+      icon: <Server className="h-4 w-4" />,
+      title: t("deviceDetails.agentSettingsAndDeviceManagement"),
+    },
+    {
+      id: "effective-config",
+      group: groups.management,
+      label: t("deviceDetails.config"),
+      icon: <Layers className="h-4 w-4" />,
+      title: t("deviceDetails.resolvedConfigurationFromAllAssignedPolicies"),
+    },
+    {
+      id: "onedrive",
+      group: groups.management,
+      label: "OneDrive",
+      icon: <Cloud className="h-4 w-4" />,
+      title: "OneDrive",
+    },
+    {
+      id: "security",
+      group: groups.management,
+      label: t("deviceDetails.security"),
+      icon: <Shield className="h-4 w-4" />,
+    },
+    {
+      id: "playbooks",
+      group: groups.management,
+      label: t("deviceDetails.playbooks"),
+      icon: <Activity className="h-4 w-4" />,
+      title: t("deviceDetails.automatedRemediationPlaybookRuns"),
+    },
+    // --- History & Network ---
+    {
+      id: "activities",
+      group: groups.history,
+      label: t("deviceDetails.activities"),
+      icon: <ScrollText className="h-4 w-4" />,
+      title: t("deviceDetails.auditLogForThisDevice"),
+    },
+    {
+      id: "connections",
+      group: groups.history,
+      label: t("deviceDetails.connections"),
+      icon: <Network className="h-4 w-4" />,
+      title: t("deviceDetails.activeNetworkConnections"),
+    },
+    {
+      id: "ip-history",
+      group: groups.history,
+      label: t("deviceDetails.ipHistory"),
+      icon: <Network className="h-4 w-4" />,
+      title: t("deviceDetails.historicalPublicAndPrivateIpAddresses"),
+    },
+    {
+      id: "change-history",
+      group: groups.history,
+      label: t("deviceDetails.changeHistory"),
+      icon: <History className="h-4 w-4" />,
+      title: t("deviceDetails.changeHistoryTitle"),
+    },
+    {
+      id: "filesystem",
+      group: groups.history,
+      label: t("deviceDetails.diskCleanup"),
+      icon: <HardDrive className="h-4 w-4" />,
+      title: t("deviceDetails.diskUsageAnalysisAndCleanup"),
+    },
+    {
+      id: "boot-performance",
+      group: groups.history,
+      label: t("deviceDetails.bootPerf"),
+      icon: <Timer className="h-4 w-4" />,
+      title: t("deviceDetails.startupTimeAndBootProcessAnalysis"),
+    },
+    {
+      id: "backup",
+      group: groups.history,
+      label: t("deviceDetails.backup"),
+      icon: <Database className="h-4 w-4" />,
+      title: t("deviceDetails.backupStatusJobsSnapshotsAndVerification"),
+    },
+    // --- Runtime extensions (device.detail.tabs@1) ---
+    // Appended last, after every core tab; `extensionTabDescriptors` is
+    // already deterministically ordered (order -> extension name ->
+    // contribution id), so this preserves that order here too.
+    ...extensionTabDescriptors.map((descriptor, index) => ({
+      id: `ext:${descriptor.key}` as ExtTab,
+      label: descriptor.label ?? descriptor.extensionName,
+      icon: <Puzzle className="h-4 w-4" />,
+      group: groups.extensions,
+    })),
+  ];
+
+  // Primary tabs keep their declaration order in the row; separators only
+  // make sense between primaries, so re-derive them from group changes.
+  const visibleTabs = tabs.filter((tab) => tab.id !== "topology" || !!device.siteId);
+  const overflowTabs: OverflowTab[] = visibleTabs.map((tab, index) => {
+    const prev = visibleTabs[index - 1];
+    return {
+      id: tab.id,
+      label: tab.label,
+      icon: tab.icon,
+      title: tab.title,
+      count: tab.count,
+      group: tab.group,
+      secondary: !tab.primary,
+      separator: tab.primary ? Boolean(tab.group && prev?.group !== tab.group) : undefined,
+    };
+  });
+
+  return (
+    <div className="space-y-6">
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-start gap-4">
+            <div className="flex h-14 w-14 items-center justify-center rounded-lg bg-muted">
+              <Monitor className="h-7 w-7 text-muted-foreground" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-3 min-w-0">
+                <h1
+                  className="truncate text-xl font-semibold tracking-tight"
+                  title={device.displayName || device.hostname}
+                >
+                  {device.displayName || device.hostname}
+                </h1>
+                <span
+                  className={`inline-flex shrink-0 items-center rounded-full border px-2.5 py-1 text-xs font-medium ${statusColors[device.status]}`}
+                >
+                  {statusLabels[device.status]}
+                </span>
+                {/* "Removed" says the record was offboarded; this says what
+                    happened to the agent on the actual machine (#3987).
+                    Renders nothing for any device that is not removed. */}
+                <UninstallStateBadge
+                  uninstall={device.uninstall}
+                  status={device.status}
+                />
+                {device.pendingReboot && (
+                  <span
+                    data-testid="device-pending-reboot-badge"
+                    title={t("deviceDetails.theOsReportsAPendingReboot")}
+                    className="inline-flex shrink-0 items-center rounded-full border px-2.5 py-1 text-xs font-medium bg-warning/15 text-warning border-warning/30"
+                  >
+                    {t("deviceDetails.rebootPending")}{" "}
+                  </span>
+                )}
+                {/* A restart BOOKED for a specific instant (#3207 W5) — the
+                    complement of the OS-level "reboot pending" flag beside it,
+                    not a replacement for it. Renders nothing when nothing is
+                    scheduled, which is the steady state for most devices. */}
+                <RebootScheduledBadge
+                  rebootScheduledAt={device.rebootScheduledAt}
+                  rebootDeadline={device.rebootDeadline}
+                  rebootSource={device.rebootSource}
+                  rebootDeferralsUsed={device.rebootDeferralsUsed}
+                  rebootMaxDeferrals={device.rebootMaxDeferrals}
+                />
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-muted-foreground">
+                <span>
+                  {formatDeviceSummaryOs(device.os, device.osVersion)}
+                </span>
+                <span>
+                  {t("deviceDetails.agentV")}
+                  {device.agentVersion}
+                </span>
+                <span>{device.siteName}</span>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <DeviceActions device={device} onAction={onAction} />
+          </div>
+        </div>
+      </div>
+
+      <MacOSPermissionsBanner deviceId={device.id} osType={device.os} />
+
+      {/* Collision enrollment review (#2764) — inert unless the row carries a
+          possible-replacement link. */}
+      <PossibleReplacementBanner
+        possibleReplacementOfDeviceId={device.possibleReplacementOfDeviceId}
+      />
+
+      <OverflowTabs
+        tabs={overflowTabs}
+        activeTab={activeTab}
+        onTabChange={(id) => switchTab(id as Tab)}
+      />
+
+      {activeTab === "overview" && (
+        <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
+          <div className="min-w-0 flex-1 space-y-6">
+            {/* Two groups — Health (CPU/RAM/Uptime) and Activity (Last Seen/
+                User/Idle) — divided on ≥sm. Stats are content-sized (flex, not
+                an equal-width grid) with non-wrapping labels and values so e.g.
+                "14d 13h 24m" and "Logged-in User" stay on one line; only the
+                username (arbitrary length) is allowed to truncate. */}
+            <div className="flex flex-col gap-4 rounded-lg border bg-card px-5 py-4 sm:flex-row sm:gap-6">
+              <div className="flex flex-1 gap-x-6">
+                <div className="shrink-0">
+                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
+                    <Cpu className="h-3.5 w-3.5" />
+                    CPU
+                  </div>
+                  <p className="mt-1 text-lg font-semibold tabular-nums">
+                    {formatPercent(device.cpuPercent / 100, {
+                      minimumFractionDigits: 1,
+                      maximumFractionDigits: 1,
+                    })}
+                  </p>
+                </div>
+                <div className="shrink-0">
+                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
+                    <MemoryStick className="h-3.5 w-3.5" />
+                    RAM
+                  </div>
+                  <p className="mt-1 text-lg font-semibold tabular-nums">
+                    {formatPercent(device.ramPercent / 100, {
+                      minimumFractionDigits: 1,
+                      maximumFractionDigits: 1,
+                    })}
+                  </p>
+                </div>
+                <div className="shrink-0">
+                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
+                    <Clock className="h-3.5 w-3.5" />
+                    {t("deviceDetails.uptime")}{" "}
+                  </div>
+                  <p className="mt-1 whitespace-nowrap text-lg font-semibold">
+                    {formatUptime(device.uptimeSeconds)}
+                  </p>
+                </div>
+              </div>
+              <div
+                className="hidden w-px self-stretch bg-border sm:block"
+                aria-hidden="true"
+              />
+              <div className="flex min-w-0 flex-1 gap-x-6">
+                <div className="shrink-0">
+                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
+                    <Clock className="h-3.5 w-3.5" />
+                    {t("deviceDetails.lastSeen")}{" "}
+                  </div>
+                  <p className="mt-1 whitespace-nowrap text-lg font-semibold">
+                    {formatLastSeen(device.lastSeen, effectiveTimezone)}
+                  </p>
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5 whitespace-nowrap text-xs font-medium text-muted-foreground">
+                    <User className="h-3.5 w-3.5" />
+                    {t("deviceDetails.loggedInUser")}{" "}
+                  </div>
+                  <p
+                    className="mt-1 truncate text-lg font-semibold"
+                    title={device.lastUser || undefined}
+                  >
+                    {device.lastUser || "—"}
+                  </p>
+                </div>
+                <div className="shrink-0">
+                  <DeviceUserIdleStat deviceId={device.id} />
+                </div>
+              </div>
+            </div>
+
+            <NetworkAssetRow deviceId={device.id} />
+
+            <DeviceReliabilityPanel deviceId={device.id} />
+
+            <DevicePerformanceGraphs deviceId={device.id} compact />
+
+            <DeviceWarrantyCard deviceId={device.id} compact />
+
+            <DeviceBillingCard deviceId={device.id} />
+
+            {device.status !== "decommissioned" && (
+              <DeviceQueuedActions deviceId={device.id} />
+            )}
+          </div>
+
+          <div
+            className={`w-full shrink-0 overflow-hidden transition-[width] duration-300 ease-in-out ${
+              activityCollapsed ? "lg:w-11 lg:self-stretch" : "lg:w-80"
+            }`}
+          >
+            {/* #5022 W02 — mounted above the activity feed; renders nothing
+                when there is no recorded AI activity in the window. */}
+            <DeviceAiActivitySignal deviceId={device.id} />
+            <DeviceActivityFeed
+              deviceId={device.id}
+              timezone={effectiveTimezone}
+              collapsed={activityCollapsed}
+              onToggleCollapse={toggleActivityCollapsed}
+              onHasContentChange={handleActivityHasContent}
+            />
+          </div>
+        </div>
+      )}
+
+      {activeTab === "details" && <DeviceInfoTab deviceId={device.id} />}
+
+      {activeTab === "linked-profiles" && (
+        <DeviceLinkedProfilesTab deviceId={device.id} />
+      )}
+
+      {activeTab === "hardware" && (
+        <DeviceHardwareInventory deviceId={device.id} />
+      )}
+
+      {activeTab === "software" && (
+        <DeviceSoftwareInventory
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+          osType={device.os}
+        />
+      )}
+
+      {activeTab === "patches" && (
+        <DevicePatchStatusTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+          osType={device.os}
+        />
+      )}
+
+      {activeTab === "vulnerabilities" && (
+        <DeviceVulnerabilitiesTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "filesystem" && (
+        <DeviceFilesystemTab
+          deviceId={device.id}
+          osType={device.os}
+          onOpenFiles={() => {
+            if (onAction) {
+              onAction("files", device);
+              return;
+            }
+            void navigateTo(`/remote/files/${device.id}`);
+          }}
+        />
+      )}
+
+      {activeTab === "security" && (
+        <DeviceSecurityTab
+          deviceId={device.id}
+          orgId={device.orgId}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "egress" && (
+        <DeviceFileEgressTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "peripherals" && (
+        <DevicePeripheralsTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "management" && (
+        <DeviceManagementTab deviceId={device.id} />
+      )}
+
+      {activeTab === "onedrive" && (
+        <DeviceOneDriveTab deviceId={device.id} />
+      )}
+
+      {activeTab === "effective-config" && (
+        <DeviceEffectiveConfigTab deviceId={device.id} />
+      )}
+
+      {activeTab === "alerts" && (
+        <DeviceAlertHistory deviceId={device.id} timezone={effectiveTimezone} />
+      )}
+
+      {activeTab === "anomalies" && (
+        <DeviceAnomaliesPanel
+          deviceId={device.id}
+          focusedAnomalyId={focusedAnomalyId}
+        />
+      )}
+
+      {activeTab === "tickets" && <DeviceTicketsTab deviceId={device.id} />}
+
+      {activeTab === "operator-tasks" && (
+        <OperatorTaskActivityFeed deviceId={device.id} />
+      )}
+
+      {activeTab === "scripts" && (
+        <DeviceScriptHistory
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+          highlightExecutionId={highlightedExecutionId}
+        />
+      )}
+
+      {activeTab === "performance" && (
+        <div className="space-y-6">
+          <DevicePerformanceGraphs deviceId={device.id} />
+          <DeviceAnomaliesPanel deviceId={device.id} compact />
+        </div>
+      )}
+
+      {activeTab === "boot-performance" && (
+        <DeviceBootPerformanceTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "eventlog" && (
+        <DeviceLogsTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+          osType={device.os}
+        />
+      )}
+
+      {activeTab === "topology" && <TopologyEntry siteId={device.siteId} deviceId={device.id} />}
+
+      {activeTab === "monitoring" && (
+        <DeviceMonitoringTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "compliance" && (
+        <DeviceComplianceTab
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "activities" && (
+        <DeviceEventLogViewer
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "connections" && (
+        <DeviceNetworkConnections deviceId={device.id} />
+      )}
+
+      {activeTab === "ip-history" && (
+        <DeviceIpHistoryTab deviceId={device.id} />
+      )}
+
+      {activeTab === "change-history" && (
+        <DeviceChangeHistoryTab deviceId={device.id} />
+      )}
+
+      {activeTab === "playbooks" && (
+        <DevicePlaybookHistory
+          deviceId={device.id}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab === "backup" && (
+        <DeviceBackupTab
+          deviceId={device.id}
+          // 'unknown' (#5213 network rows, #4622 manual assets) never reaches
+          // this agent-only detail page; DeviceBackupTab's status prop predates
+          // that value, so treat it as "not provided" rather than widening a
+          // backup-module type for a status it can never actually see.
+          deviceStatus={device.status === "unknown" ? undefined : device.status}
+          timezone={effectiveTimezone}
+        />
+      )}
+
+      {activeTab.startsWith("ext:") && (
+        // Scoped to exactly the active extension's descriptor — never
+        // mounts every enabled device.detail.tabs contribution at once.
+        // CONTEXT: only the documented DeviceDetailTabContextV1 shape (no
+        // full `device` object, no orgName/siteName, nothing else).
+        <ExtensionSlotHost
+          slot="device.detail.tabs"
+          contractVersion={1}
+          descriptorKey={activeTab.slice("ext:".length)}
+          context={{
+            contractVersion: 1,
+            deviceId: device.id,
+            organizationId: device.orgId,
+            siteId: device.siteId,
+          }}
+        />
+      )}
+    </div>
+  );
+}

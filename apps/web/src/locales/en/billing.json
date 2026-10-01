@@ -1,0 +1,2345 @@
+{
+  "contracts": {
+    "shared": {
+      "status": {
+        "draft": "Draft",
+        "active": "Active",
+        "paused": "Paused",
+        "cancelled": "Cancelled",
+        "expired": "Expired"
+      },
+      "cadence": {
+        "monthly": "Monthly",
+        "quarterly": "Quarterly",
+        "annual": "Annual",
+        "custom": "Every {{count}} months"
+      },
+      "billingTiming": {
+        "advance": "In advance",
+        "arrears": "In arrears"
+      },
+      "lineType": {
+        "flat": "Flat fee",
+        "perDevice": "Per device",
+        "perDeviceRole": "Per device role",
+        "perDeviceGroup": "Per device group",
+        "perSeat": "Per seat",
+        "manual": "Manual quantity"
+      },
+      "dynamicGroup": "dynamic",
+      "deletedGroup": "{{name}} (deleted group)",
+      "coverage": {
+        "uncovered": "{{count}} device(s) on this organization are not billed by any line on this contract: {{breakdown}}",
+        "allCovered": "Every device on this organization is billed by a line on this contract.",
+        "uncoveredLead": "{{count}} device(s) on this organization are not billed by any line on this contract:",
+        "roleBucket": "{{count}} {{role}}"
+      },
+      "allowance": {
+        "includedOf": "{{counted}} of {{included}} included",
+        "includedOnly": "{{included}} included",
+        "overBilled": "{{included}} included · {{overage}} over (billed)",
+        "overFlagged": "{{included}} included · {{overage}} over (flagged)"
+      },
+      "overage": {
+        "flagged": "{{description}} — {{overage}} over {{included}} included, not billed",
+        "billed": "{{description}} — {{overage}} over {{included}} included, billed at the overage rate"
+      },
+      "transition": {
+        "activate": "Activate",
+        "pause": "Pause",
+        "resume": "Resume",
+        "cancel": "Cancel"
+      },
+      "values": {
+        "auto": "auto",
+        "groupDeleted": "group deleted",
+        "siteDeleted": "site deleted",
+        "siteDeletedNamed": "site deleted: {{name}}"
+      },
+      "lineScope": {
+        "site": "Site: {{name}}"
+      }
+    },
+    "contractDetail": {
+      "fields": {
+        "billingTiming": "Billing timing",
+        "cadence": "Cadence",
+        "startDate": "Start date",
+        "endDate": "End date",
+        "nextBilling": "Next billing",
+        "autoIssue": "Auto-issue",
+        "renewal": "Renewal",
+        "estimatedPerPeriod": "Est. / period",
+        "notes": "Notes",
+        "invoiceNote": "Invoice note"
+      },
+      "values": {
+        "noDrafts": "No (drafts)"
+      },
+      "renewal": {
+        "autoRenews": "Auto-renews",
+        "everyMonths": "every {{count}} months",
+        "currentTermEnds": "· current term ends {{date}}",
+        "noticeDays": "· {{count}}-day notice",
+        "doesNotAutoRenew": "Does not auto-renew"
+      },
+      "table": {
+        "unitPrice": "Unit price",
+        "qty": "Qty",
+        "tax": "Tax",
+        "empty": "This contract has no lines."
+      },
+      "billingHistory": {
+        "title": "Billing history",
+        "period": "Period",
+        "generated": "Generated",
+        "invoice": "Invoice",
+        "outcome": "Outcome",
+        "outcomeAllBilled": "All billed",
+        "outcomeUncovered": "{{count}} uncovered",
+        "outcomeFlagged": "{{count}} flagged",
+        "outcomeNoDeviceLines": "No device lines",
+        "outcomeNotRecorded": "Not recorded",
+        "outcomeToggle": "Show period outcome",
+        "outcomeDevicesEvaluated": "Devices evaluated: {{count}}",
+        "outcomeBilledOverage": "Billed overage: {{count}}",
+        "empty": "No invoices have been generated yet.",
+        "viewInvoice": "View invoice"
+      },
+      "summary": {
+        "active": "This contract is active and will generate invoices on its cadence.",
+        "inactive": "Invoices generate while the contract is active."
+      },
+      "actions": {
+        "generateInvoiceNow": "Generate invoice now",
+        "deleteDraft": "Delete draft"
+      },
+      "errors": {
+        "transition": {
+          "activate": "Could not activate the contract.",
+          "pause": "Could not pause the contract.",
+          "resume": "Could not resume the contract.",
+          "cancel": "Could not cancel the contract."
+        },
+        "generateInvoice": "Could not generate an invoice.",
+        "deleteDraft": "Could not delete the draft."
+      },
+      "toast": {
+        "transition": {
+          "activate": "Contract activated",
+          "pause": "Contract paused",
+          "resume": "Contract resumed",
+          "cancel": "Contract cancelled"
+        },
+        "invoiceGenerated": "Invoice generated",
+        "flaggedOverage": "{{count}} line(s) are over their included quantity and were not billed: {{names}}",
+        "uncoveredDevices": "Invoice generated, but {{count}} device(s) are not billed by any line on this contract: {{breakdown}}",
+        "priceBookGaps": "{{count}} catalog line(s) billed at the contract snapshot — no {{currency}} price in the catalog: {{lines}}",
+        "draftDeleted": "Draft deleted"
+      },
+      "cancelConfirm": {
+        "title": "Cancel this contract?",
+        "message": "Cancelling stops all future invoicing on this contract. This can’t be undone — you’d have to create a new contract to resume billing.",
+        "confirm": "Cancel contract"
+      },
+      "deleteConfirm": {
+        "title": "Delete draft contract",
+        "message": "This permanently deletes the draft contract. This cannot be undone.",
+        "confirm": "Delete draft"
+      },
+      "documents": {
+        "title": "Signed agreements",
+        "subtitle": "Accepted with the quote, pinned to the template version the customer saw.",
+        "columns": {
+          "template": "Template",
+          "signer": "Signer",
+          "signedAt": "Signed",
+          "quote": "Quote"
+        },
+        "templateVersion": "{{name}} — v{{number}}",
+        "empty": "No signed agreements yet.",
+        "loadError": "Could not load signed agreements.",
+        "downloadError": "Could not download the PDF.",
+        "download": "Download PDF",
+        "preparing": "Preparing…",
+        "viewQuote": "View quote"
+      }
+    },
+    "contractEditor": {
+      "validation": {
+        "enterMonths": "Enter the number of months",
+        "enterRenewalTermBeforeSaving": "Enter a renewal term (months) before saving.",
+        "enterContractName": "Enter a contract name.",
+        "enterStartDate": "Enter a start date.",
+        "renewalTermRange": "Enter a renewal term between 1 and 120 months.",
+        "advanceNoticeRange": "Enter advance notice between 0 and 365 days."
+      },
+      "errors": {
+        "loadOrganizations": "Failed to load organizations.",
+        "loadSites": "Failed to load sites.",
+        "createContract": "Could not create the contract.",
+        "saveContract": "Could not save the contract.",
+        "addLine": "Could not add the line.",
+        "removeLine": "Could not remove the line.",
+        "activateContract": "Could not activate the contract.",
+        "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or clear the catalog link.",
+        "updateLine": "Could not update the line.",
+        "lineNotFound": "That line no longer exists. Refresh the contract.",
+        "contractNotEditable": "Lines can only be edited on draft or active contracts.",
+        "siteNotInOrg": "That site belongs to a different organization.",
+        "groupNotInOrg": "That device group belongs to a different organization.",
+        "invalidLinePatch": "Those changes aren’t valid for this line type.",
+        "priceNotRepresentable": "That price has too many decimal places for {{currency}}.",
+        "catalogItemNotFound": "That catalog item isn’t available on this contract."
+      },
+      "toast": {
+        "contractCreated": "Contract created",
+        "lineAdded": "Line added",
+        "lineRemoved": "Line removed",
+        "contractActivated": "Contract activated",
+        "lineUpdated": "Line updated"
+      },
+      "schedule": {
+        "title": "Schedule",
+        "selectOrganization": "Select an organization…",
+        "namePlaceholder": "e.g. Managed Services — Acme Co",
+        "billingTiming": "Billing timing",
+        "billingCadence": "Billing cadence",
+        "customCadence": "Custom…",
+        "intervalMonths": "Interval (months)",
+        "startDate": "Start date"
+      },
+      "renewal": {
+        "title": "Renewal",
+        "endDateOptional": "End date (optional)",
+        "autoIssue": "Auto-issue generated invoices (otherwise they land as drafts)",
+        "autoRenewAtEnd": "Auto-renew at end of term",
+        "autoRenewSetEndDate": "Auto-renew at end of term (set an end date first)",
+        "renewalTermMonths": "Renewal term (months)",
+        "advanceNoticeDays": "Advance notice (days)"
+      },
+      "content": {
+        "title": "Content",
+        "notesOptional": "Notes (optional, added to the Notes block on generated invoices)",
+        "termsOptional": "Invoice note (optional, added to the Notes block on generated invoices)",
+        "termsPlaceholder": "e.g. Net 30. Auto-renews unless cancelled 30 days prior."
+      },
+      "lines": {
+        "unitPrice": "Unit price",
+        "qty": "Qty",
+        "tax": "Tax",
+        "empty": "No lines yet. Add a recurring line below.",
+        "edit": "Edit"
+      },
+      "addLine": {
+        "integrationHint": "Add from an integration — it pre-fills a line.",
+        "linkPax8Subscription": "Link Pax8 subscription",
+        "addFromPax8Catalog": "Add from Pax8 catalog",
+        "importFromTdSynnex": "Import from TD SYNNEX",
+        "lineType": "Line type",
+        "allowanceToggle": "Include a fixed quantity, then handle extras",
+        "allowanceHint": "The line bills the included quantity every period, even when fewer devices are counted.",
+        "includedQuantity": "Included quantity",
+        "overageMode": "Extras beyond the included quantity",
+        "overageBill": "Bill extras",
+        "overageFlag": "Flag extras for review",
+        "overageUnitPrice": "Price per extra unit",
+        "allowanceRequired": "Enter an included quantity, and a price when you bill extras.",
+        "deviceRoles": "Device roles (a device is billed when its role is one of these)",
+        "deviceRolesRequired": "Pick at least one role.",
+        "deviceGroup": "Device group (bills its members; dynamic groups are evaluated at billing time)",
+        "selectGroup": "Select a group",
+        "deviceGroupRequired": "Pick a group.",
+        "deviceGroupsLoadFailed": "Couldn't load this organization's device groups.",
+        "descriptionPlaceholder": "e.g. Workstation management",
+        "unitPrice": "Unit price",
+        "quantity": "Quantity",
+        "siteOptional": "Site (optional — scopes the device count)",
+        "allSites": "All sites",
+        "linkCatalogItemOptional": "Link catalog item (optional)",
+        "itemFallback": "Item",
+        "clearCatalogLink": "Clear catalog link",
+        "searchCatalog": "Search catalog…",
+        "taxable": "Taxable",
+        "quantityResolvedAutomatically": "Quantity resolved automatically at billing time.",
+        "lineTotal": "Line total: {{total}}",
+        "addLine": "Add line",
+        "noPriceInCurrency": "No {{currency}} price for this item — add one in the catalog, or clear the catalog link and enter a manual line.",
+        "priceFromCatalog": "Unit price (from the catalog, in {{currency}})",
+        "resolvingPrice": "Looking up the {{currency}} price…",
+        "priceLookupFailed": "Could not look up the {{currency}} price.",
+        "priceNotRepresentable": "The saved {{currency}} price for this item is not valid in {{currency}} — correct it in the catalog, or clear the catalog link and enter a manual line.",
+        "priceSourceOrgOverride": "Organization-specific price for {{org}}"
+      },
+      "editLine": {
+        "save": "Save line",
+        "cancel": "Cancel",
+        "typeLocked": "Line type can’t be changed. Remove the line and add a new one.",
+        "priceFromCatalog": "Price comes from the catalog. Clear the catalog link to set it by hand.",
+        "refreshPrice": "Refresh price from catalog",
+        "restoreCatalogLink": "Restore catalog link",
+        "unlinkNeedsPrice": "Enter a unit price and tax setting to clear the catalog link.",
+        "noChanges": "Nothing to save yet."
+      },
+      "estimate": {
+        "title": "Estimated this period",
+        "saveFirst": "Save the contract, then add lines to see an estimate.",
+        "plusAuto": "+ auto",
+        "includesLiveCounts": "Includes live device / seat counts as of today.",
+        "loadLiveCountsFailed": "Couldn’t load live counts.",
+        "loadLiveCountsFailedWithAuto": "Couldn’t load live counts — per-device/seat lines are not included in this total."
+      },
+      "actions": {
+        "createContract": "Create contract",
+        "activateContract": "Activate contract",
+        "activateHint": "Add at least one line to activate."
+      },
+      "removeLineConfirm": {
+        "title": "Remove line",
+        "message": "This removes \"{{description}}\" from the contract. This can't be undone.",
+        "thisLine": "this line",
+        "confirm": "Remove line"
+      }
+    },
+    "contractWorkspace": {
+      "errors": {
+        "missingContractId": "Missing contract id",
+        "notFound": "Contract not found.",
+        "loadContract": "Failed to load contract",
+        "unavailable": "Contract unavailable."
+      },
+      "backToContracts": "← Contracts",
+      "backToContractsText": "Back to contracts",
+      "newContract": "New contract",
+      "doneEditing": "Done editing"
+    },
+    "list": {
+      "estimateUnavailable": "Estimate unavailable: a device group on this contract could not be evaluated",
+      "estimateExcluded": "Excludes {{count}} contract(s) whose estimate is unavailable"
+    },
+    "contractsList": {
+      "currencyBanner": {
+        "count": "{{count}} contracts bill in a currency that differs from their organization's.",
+        "countPlus": "{{count}}+ contracts bill in a currency that differs from their organization's.",
+        "review": "Review them"
+      },
+      "title": "Contracts",
+      "description": "Recurring agreements that auto-generate draft invoices on a cadence.",
+      "newContract": "New contract",
+      "accessDenied": "You don't have permission to view contracts.",
+      "errors": {
+        "loadOrganizations": "Failed to load organizations.",
+        "loadContracts": "Failed to load contracts"
+      },
+      "filters": {
+        "allStatuses": "All statuses",
+        "searchPlaceholder": "Search name or org",
+        "searchAria": "Search contracts"
+      },
+      "stats": {
+        "estimatedMonthlyRecurring": "Est. monthly recurring",
+        "activeContractCount": "{{count}} active contracts",
+        "activeContractCount_one": "{{count}} active contract",
+        "activeContractCount_other": "{{count}} active contracts"
+      },
+      "actions": {
+        "tryAgain": "Try again",
+        "clearFilters": "Clear filters"
+      },
+      "empty": {
+        "noMatches": "No contracts match these filters.",
+        "title": "No contracts yet",
+        "description": "Contracts bill an organization on a repeating cadence and auto-generate the invoices for you.",
+        "createFirst": "Create your first contract"
+      },
+      "table": {
+        "selectAllAria": "Select all contracts",
+        "startDate": "Start date",
+        "cadence": "Cadence",
+        "nextBill": "Next bill",
+        "estimatedPerPeriod": "Est. / period",
+        "selectContractAria": "Select contract {{name}}"
+      },
+      "bulk": {
+        "deleteDrafts": "Delete drafts",
+        "deleteDrafts_one": "Delete draft",
+        "deleteDrafts_other": "Delete drafts"
+      },
+      "toast": {
+        "bulkLimit": "Select up to {{limit}} at a time.",
+        "bulkFailed": "Bulk {{verb}} failed. Retry.",
+        "bulkPartial": "{{succeeded}} {{verb}}, {{skipped}} skipped{{failedText}}",
+        "failedSuffix": ", {{failed}} failed",
+        "bulkSuccess": "{{succeeded}} {{verb}}"
+      },
+      "cancelConfirm": {
+        "title": "Cancel contracts",
+        "message": "Cancel {{count}} selected contract(s)? Active and paused contracts will be cancelled; this cannot be undone.",
+        "confirm": "Cancel contracts"
+      },
+      "deleteConfirm": {
+        "title": "Delete draft contracts",
+        "message": "Delete {{count}} draft contracts? Only drafts are deleted{{untouched}}; this cannot be undone.",
+        "message_one": "Delete {{count}} draft contract? Only drafts are deleted{{untouched}}; this cannot be undone.",
+        "message_other": "Delete {{count}} draft contracts? Only drafts are deleted{{untouched}}; this cannot be undone.",
+        "untouchedSuffix": " — any active or paused contracts in your selection are left untouched",
+        "confirm": "Delete drafts"
+      }
+    },
+    "contractPax8Drawer": {
+      "title": "Link a Pax8 subscription",
+      "subtitlePicked": "Pick a line on this contract (or create one) to link.",
+      "subtitleChoose": "Choose a synced subscription to add to this contract.",
+      "loadingSubscriptions": "Loading subscriptions…",
+      "empty": "No Pax8 subscriptions are synced for this organization yet. Sync them under Integrations → Pax8.",
+      "subscriptionFallback": "Pax8 subscription",
+      "quantity": "qty {{quantity}}",
+      "priceEach": "{{currency}} {{price}}/ea",
+      "alreadyLinked": "already linked",
+      "relink": "Re-link",
+      "link": "Link",
+      "errors": {
+        "loadSubscriptions": "Could not load Pax8 subscriptions for this organization."
+      }
+    },
+    "tabs": {
+      "contracts": "Contracts",
+      "templates": "Agreement templates",
+      "documents": "Signed agreements",
+      "currencyMismatches": "Currency mismatches"
+    },
+    "currencyMismatches": {
+      "title": "Currency mismatches",
+      "description": "Contracts still stamped in a currency their organization no longer bills in. Open a contract to review it — nothing is changed in bulk from here.",
+      "loading": "Loading…",
+      "loadError": "Could not load the currency mismatch report.",
+      "loadMore": "Load more",
+      "emptyTitle": "No currency mismatches",
+      "emptyBody": "Every contract is stamped in its organization's billing currency.",
+      "eligible": "Ready to restamp",
+      "currencyPair": "{{contractCurrency}} → {{orgCurrency}}",
+      "blockingDrafts": "{{count}} draft invoices",
+      "blockingDrafts_one": "{{count}} draft invoice",
+      "columns": {
+        "contract": "Contract",
+        "organization": "Organization",
+        "status": "Status",
+        "currencies": "Contract → organization",
+        "nextBilling": "Next billing",
+        "eligibility": "Restamp eligibility"
+      },
+      "reason": {
+        "STATUS_NOT_ACTIVE": "Not active — only active contracts can be restamped",
+        "ORPHANED_CONTRACT_SOURCE": "Contract-sourced invoice lines cannot be attributed",
+        "ORPHANED_BILLING_PERIOD": "A billing period has no reachable invoice",
+        "BROKEN_CONTRACT_LINEAGE": "Invoice lineage check failed",
+        "UNBILLED_MONETARY_ROWS": "Draft invoices still hold money billed under this contract"
+      }
+    },
+    "currency": {
+      "actions": {
+        "change": "Change currency"
+      },
+      "dialog": {
+        "title": "Change contract currency",
+        "description": "This contract bills in {{currency}}. Restamping affects future invoices only — invoices already issued and past billing periods are never changed.",
+        "currencyLabel": "New currency",
+        "modeLegend": "What happens to the contract lines",
+        "modeClear": "Remove all contract lines",
+        "modeClearHint": "Lines are deleted and re-added by hand in the new currency. Required when any line is manual.",
+        "modeReprice": "Reprice catalog lines",
+        "modeRepriceHint": "Every catalog line is resolved from the price book of the new currency. Only possible when all lines come from the catalog.",
+        "confirm": "I understand this restamps an active contract and cannot be undone in bulk.",
+        "submit": "Change currency"
+      },
+      "blockers": {
+        "UNBILLED_MONETARY_ROWS": "Issue or delete these draft invoices first — they still carry amounts from this contract:",
+        "ORPHANED_BILLING_PERIOD": "These billing periods have no reachable invoice. Resolve them before restamping:",
+        "ORPHANED_CONTRACT_SOURCE": "These contract-sourced invoice lines cannot be attributed to a contract. Resolve them before restamping:",
+        "BROKEN_CONTRACT_LINEAGE": "The invoice lineage check failed for these invoices. Resolve them before restamping:"
+      },
+      "toast": {
+        "changed": "Contract currency changed to {{currency}}."
+      },
+      "errors": {
+        "change": "Could not change the contract currency."
+      }
+    },
+    "templatesTab": {
+      "title": "Agreement templates",
+      "description": "Your MSA and standard terms. Add one to a quote and the customer signs it with the proposal; the signed copy is filed against the contract that quote creates.",
+      "newTemplate": "New agreement template",
+      "includeArchived": "Show archived",
+      "allOrgs": "All orgs",
+      "ownerOrg": "Organization",
+      "noVersions": "No versions yet",
+      "versionLabel": "v{{number}} · {{status}}",
+      "archive": "Archive",
+      "loadError": "Failed to load agreement templates",
+      "createError": "Failed to create the template",
+      "created": "Template created",
+      "archiveError": "Failed to archive the template",
+      "archiveSuccess": "Template archived",
+      "columns": {
+        "name": "Name",
+        "owner": "Owner",
+        "status": "Status",
+        "latestVersion": "Latest version"
+      },
+      "status": {
+        "active": "Active",
+        "archived": "Archived"
+      },
+      "empty": {
+        "title": "No agreement templates yet",
+        "description": "Add your MSA or standard terms once, then drop it into any quote. Customers sign it when they accept."
+      },
+      "createDialog": {
+        "title": "New agreement template",
+        "name": "Name",
+        "namePlaceholder": "e.g. Master Services Agreement",
+        "description": "Description",
+        "descriptionPlaceholder": "Optional summary of this template",
+        "scope": "Ownership",
+        "allOrganizations": "All organizations",
+        "partnerWide": "Partner-wide template",
+        "thisOrgOnly": "This organization only",
+        "organization": "Organization",
+        "selectOrg": "Select an organization",
+        "orgRequired": "Select an organization for an organization-owned template.",
+        "nameRequired": "Enter a template name.",
+        "cancel": "Cancel",
+        "create": "Create agreement template",
+        "creating": "Creating…"
+      }
+    },
+    "documentsTab": {
+      "title": "Signed agreements",
+      "description": "Signed agreements not yet linked to a contract. Link each one so it shows on the contract it governs.",
+      "empty": {
+        "title": "No unlinked signed agreements",
+        "description": "Signed agreements appear here until they're linked to a contract."
+      },
+      "loadError": "Could not load signed agreements.",
+      "columns": {
+        "template": "Template",
+        "signer": "Signer",
+        "signedAt": "Signed",
+        "quote": "Quote",
+        "organization": "Organization"
+      },
+      "download": "Download PDF",
+      "preparing": "Preparing…",
+      "viewQuote": "View quote",
+      "linkAction": "Link to contract",
+      "linkDialog": {
+        "title": "Link to a contract",
+        "contractLabel": "Contract",
+        "selectContract": "Select a contract",
+        "noContracts": "No contracts found for this organization.",
+        "loadContractsError": "Failed to load contracts. Please try again.",
+        "cancel": "Cancel",
+        "confirm": "Link",
+        "linking": "Linking…"
+      },
+      "linkSuccess": "Signed agreement linked to contract.",
+      "linkError": "Could not link the signed agreement to that contract."
+    },
+    "templateEditor": {
+      "back": "Back",
+      "loadError": "Failed to load the template",
+      "newVersion": "New version",
+      "newVersionConfirm": {
+        "title": "Discard unsaved changes?",
+        "message": "Starting a new version will clear the editor. Your unsaved edits to this draft will be lost.",
+        "confirm": "Start new version"
+      },
+      "uploadPdf": "Upload PDF",
+      "versions": "Versions",
+      "noVersions": "No versions yet",
+      "versionNumber": "v{{number}}",
+      "versionStatus": {
+        "draft": "Draft",
+        "published": "Published"
+      },
+      "sourceType": {
+        "authored": "Authored",
+        "uploaded": "Uploaded PDF"
+      },
+      "publish": "Publish",
+      "publishDirtyHint": "Save your draft before publishing",
+      "body": "Body",
+      "bodyAria": "Agreement template body",
+      "preview": "Preview",
+      "edit": "Edit",
+      "saveDraft": "Save draft",
+      "saving": "Saving…",
+      "emptyBody": "Add some content before saving.",
+      "autoVariables": "Auto variables",
+      "manualVariables": "Manual variables",
+      "noManualVariables": "None detected",
+      "archivedNotice": "This template is archived. New versions cannot be added.",
+      "saveError": "Failed to save the draft version",
+      "saveSuccess": "Draft version saved",
+      "uploadError": "Failed to upload the PDF",
+      "uploadSuccess": "PDF version uploaded",
+      "publishError": "Failed to publish the version",
+      "publishSuccess": "Version published",
+      "warnings": {
+        "markupRemoved": "Saved, but some unsupported formatting was removed: {{tags}}. Agreement bodies support headings, bold, italic, underline, lists and links."
+      }
+    }
+  },
+  "agreements": {
+    "tabs": {
+      "templates": "Agreement templates",
+      "signed": "Signed agreements"
+    },
+    "signedPage": {
+      "title": "Signed agreements",
+      "description": "Every agreement your customers have signed. Link one to a contract so it shows on the contract it governs.",
+      "unlinkedOnly": "Unlinked only",
+      "empty": {
+        "title": "No signed agreements yet",
+        "description": "An agreement is signed when a customer accepts a quote that carries one."
+      },
+      "emptyUnlinked": {
+        "title": "No unlinked signed agreements",
+        "description": "Every signed agreement is already filed against a contract."
+      },
+      "columns": {
+        "contract": "Contract"
+      },
+      "viewContract": "View contract",
+      "notLinked": "Not linked",
+      "rowSubtitle": "Accepted with quote {{quoteNumber}} by {{signer}} on {{date}}",
+      "rowSubtitleNoQuote": "Signed by {{signer}} on {{date}}"
+    },
+    "templateEditor": {
+      "usage": "Used on {{quotes}} quotes · {{signed}} signed agreements",
+      "usageUnavailable": "Usage unavailable",
+      "backToTemplates": "Back to agreement templates",
+      "archiveConfirm": {
+        "title": "Archive this agreement template?",
+        "message": "Used on {{quotes}} quotes · {{signed}} signed agreements. Quotes already pinned to it keep working, but no new agreement sections can be added.",
+        "messageUnknownUsage": "We couldn't check what this template is used by. Quotes already pinned to it keep working, but no new agreement sections can be added.",
+        "confirm": "Archive template"
+      }
+    },
+    "contractPill": {
+      "under": "Under {{template}} v{{n}}"
+    }
+  },
+  "quotes": {
+    "deviceSet": {
+      "roleNoun": {
+        "workstation": "workstations",
+        "server": "servers",
+        "printer": "printers",
+        "router": "routers",
+        "switch": "switches",
+        "firewall": "firewalls",
+        "access_point": "access points",
+        "phone": "phones",
+        "iot": "IoT devices",
+        "camera": "cameras",
+        "nas": "NAS devices"
+      }
+    },
+    "editor": {
+      "deviceSet": {
+        "toggle": "Bill by device set",
+        "typeLabel": "Device set",
+        "types": {
+          "per_device": "Per device",
+          "per_device_role": "Per device role",
+          "per_device_group": "Per device group",
+          "per_seat": "Per seat"
+        },
+        "rolesLabel": "Device roles",
+        "groupLabel": "Device group",
+        "siteLabel": "Site (optional)",
+        "allSites": "All sites",
+        "quantityAuto": "Quantity is counted automatically",
+        "autoSummary": "Auto quantity · {{count}} {{set}} · estimated",
+        "driftChip": "count changed: {{stored}} → {{live}}",
+        "refresh": "Refresh counts",
+        "estimateError": "Couldn’t check the live device count.",
+        "pickerError": "Couldn’t load device groups or sites. Refresh and try again.",
+        "groupDeleted": "Device group “{{name}}” was deleted — pick another",
+        "siteDeleted": "Site “{{name}}” was deleted — pick another",
+        "typeLocked": "A device set cannot be changed after the line is created — remove the line and add it again.",
+        "allowanceGroupLabel": "Quantity allowance",
+        "allowanceToggle": "Include a fixed quantity, then handle extras",
+        "includedLabel": "Included quantity",
+        "overageModeLabel": "Above the allowance",
+        "overageBill": "Bill each extra unit",
+        "overageFlag": "Report for review",
+        "overagePriceLabel": "Overage price",
+        "driftToast": "{{count}} line(s) no longer match the live device count: {{lines}}",
+        "retargetToast": "{{count}} line(s) need a device group or site re-picked for this organization"
+      },
+      "actions": {
+        "addImage": "Add image",
+        "addLine": "Add line",
+        "addSection": "Add section",
+        "adding": "Adding…",
+        "cancel": "Cancel",
+        "collapseSection": "Collapse section",
+        "dragLine": "Drag to reorder line",
+        "dragLineTitle": "Drag to reorder within this table. Keyboard: use the line menu's Move up / Move down.",
+        "dragSection": "Drag to reorder section",
+        "expandSection": "Expand section",
+        "fetch": "Fetch",
+        "fetchAddImage": "Fetch & add image",
+        "fromUrl": "From URL",
+        "hideCostMargin": "Hide cost & margin",
+        "imageFromUrl": "Add image from URL…",
+        "lineActions": "Line actions",
+        "moveLineDown": "Move line down",
+        "moveLineTo": "Move line to",
+        "moveLineToAnotherTable": "Move line to another pricing table",
+        "moveLineUp": "Move line up",
+        "moveSectionDown": "Move section down",
+        "moveSectionUp": "Move section up",
+        "moveTo": "Move to",
+        "remove": "Remove",
+        "removeImage": "Remove image",
+        "removeLine": "Remove line",
+        "removeSection": "Remove section",
+        "replaceImage": "Replace image",
+        "sectionActions": "Section actions",
+        "showCostMargin": "Show cost & margin",
+        "tidyAllDescriptions": "Tidy all descriptions",
+        "uploadAddImage": "Upload & add image",
+        "uploading": "Uploading…"
+      },
+      "addLine": {
+        "addFromCatalog": "Add from catalog",
+        "aiLookupAction": "AI lookup",
+        "catalogItem": "Catalog item",
+        "manualLine": "Manual line",
+        "moreDetails": "More details",
+        "searchDistributor": "Search distributor",
+        "searchPax8": "Search Pax8"
+      },
+      "addSection": {
+        "captionPlaceholder": "Caption (optional)",
+        "headingPlaceholder": "Heading text",
+        "imageHelp": "PNG or JPEG, up to 5 MB.",
+        "imageUrlPlaceholder": "https://example.com/photo.png",
+        "insertHere": "Add section",
+        "richTextPlaceholder": "Proposal text…",
+        "title": "Add section",
+        "uploadFile": "Upload file"
+      },
+      "autoFill": {
+        "filledDescription": "description",
+        "filledEstimatedCost": "estimated cost {{amount}}",
+        "filledName": "name",
+        "filledPriceWithDefaultMarkup": "price {{amount}} (default {{markup}}% markup)",
+        "filledTaxableOff": "taxable: off",
+        "filledTaxableOn": "taxable: on",
+        "help": "Searches the web and fills name, description, tax, and an estimated cost. You set the price.",
+        "helpWithDefaultMarkup": "Searches the web, fills name, description and tax, estimates your cost, and prices the line at your default {{markup}}% markup.",
+        "label": "Auto-filled:",
+        "review": "Review and adjust before adding."
+      },
+      "autosaveHint": "Changes save automatically. An amber outline marks an unsaved edit.",
+      "block": {
+        "imageSectionPdf": "Image section (rendered in the PDF).",
+        "richTextContentAria": "Rich text content",
+        "tableEmpty": "Empty table.",
+        "calloutEmpty": "Empty callout.",
+        "edit": "Edit",
+        "saveEdit": "Save"
+      },
+      "blockTypes": {
+        "heading": "Heading",
+        "image": "Image",
+        "pricingTable": "Pricing table",
+        "richText": "Rich text",
+        "contract": "Agreement / terms",
+        "table": "Table",
+        "callout": "Callout"
+      },
+      "bulk": {
+        "applied_one": "Updated {{count}} line.",
+        "applied_other": "Updated {{count}} lines.",
+        "apply": "Apply",
+        "barAria": "Bulk edit selected lines",
+        "clearSelection": "Clear selection",
+        "invalidMarkup": "Enter a valid markup percent.",
+        "markupHint": "Applies to selected lines that have a cost.",
+        "partialFailure": "{{failed}} of {{total}} lines failed to update.",
+        "selectAllAria": "Select all lines in {{label}}",
+        "selectLineAria": "Select {{name}}",
+        "selectedCount_one": "{{count}} line selected",
+        "selectedCount_other": "{{count}} lines selected",
+        "setCost": "Set cost",
+        "setMarkup": "Set markup %",
+        "skippedNoCost_one": "Skipped {{count}} line with no cost.",
+        "skippedNoCost_other": "Skipped {{count}} lines with no cost.",
+        "taxableOff": "Taxable off",
+        "taxableOn": "Taxable on"
+      },
+      "catalog": {
+        "addSome": "Add some in Product Catalog",
+        "empty": "No catalog items.",
+        "loadError": "Couldn't load the catalog. Reopen the editor to retry — your existing items are safe.",
+        "searchPlaceholder": "Search catalog by name or SKU",
+        "capNote": "Showing the first {{count}} catalog items — search to find the rest."
+      },
+      "categories": {
+        "hardware": "Hardware",
+        "other": "Other",
+        "service": "Service",
+        "software": "Software"
+      },
+      "confirm": {
+        "removeLineMessage": "This removes \"{{name}}\" from the quote. This can't be undone.",
+        "removeLineTitle": "Remove line",
+        "removeSectionMessage": "This removes this section. This can't be undone.",
+        "removeSectionTitle": "Remove section",
+        "removeSectionWithLines_one": "This removes the pricing table and its {{count}} line item. This can't be undone.",
+        "removeSectionWithLines_other": "This removes the pricing table and its {{count}} line items. This can't be undone.",
+        "thisLine": "this line",
+        "removeSectionWithLines": "This removes the pricing table and its lines. This can't be undone."
+      },
+      "customer": {
+        "confirmLabel": "Move quote",
+        "confirmMessage": "Move this quote to {{name}}? This clears the site assignment and bill-to override, and applies the new company's tax rate.",
+        "confirmTitle": "Change customer?",
+        "help": "Moving a draft to another company clears the site assignment and applies that company’s tax rate.",
+        "label": "Customer",
+        "success": "Quote moved to {{name}}."
+      },
+      "deposit": {
+        "due": "Deposit due",
+        "dueUpFront": "Deposit due up front",
+        "eligibleAria": "Deposit eligible",
+        "label": "Deposit",
+        "none": "No deposit",
+        "percent": "Percent",
+        "percentOfDue": "Percent of amount due",
+        "selectedLines": "Selected lines",
+        "selectedLinesHelp": "Check the deposit-eligible one-time lines in each pricing table.",
+        "selectedLinesStagedHint": "Flag at least one one-time line below as deposit-eligible — the mode saves once one is flagged.",
+        "short": "Deposit"
+      },
+      "emptyBlocks": "No content yet. Add a heading, rich text, or a pricing table below.",
+      "errors": {
+        "addCatalogItem": "Could not add the catalog item.",
+        "addContractSection": "Couldn't add the agreement section",
+        "addDistributorItem": "Could not add the distributor item.",
+        "addImageSection": "Could not add the image section.",
+        "addLine": "Could not add the line.",
+        "addPax8Product": "Could not add the Pax8 product.",
+        "addSection": "Could not add the section.",
+        "costZeroOrMore": "Enter a cost of 0 or more.",
+        "depositPercentRange": "Enter a percent between 0.01 and 99.99.",
+        "fetchImageFromUrl": "Could not fetch the image from that URL.",
+        "imageAddedSectionFailed": "Image added, but adding the section failed.",
+        "imageTooLarge": "Image must be 5 MB or smaller.",
+        "importDistributorItem": "Could not import the distributor item.",
+        "importPax8Product": "Could not import the Pax8 product.",
+        "lineAddedCatalogSaveFailed": "Line added, but saving it to the catalog failed.",
+        "lineNeedsNameOrDescription": "A line needs a name or a description.",
+        "loadContractTemplates": "Couldn't load agreement templates",
+        "moveLine": "Could not move the line.",
+        "quantityWholeGreaterThanZero": "Enter a whole-number quantity greater than 0.",
+        "removeLine": "Could not remove the line.",
+        "removeSection": "Could not remove the section.",
+        "reorderBlocks": "Could not reorder blocks.",
+        "reorderLines": "Could not reorder lines.",
+        "reorderSections": "Could not reorder sections.",
+        "saveCoverPage": "Couldn't save the cover page",
+        "saveCustomer": "Could not change the customer.",
+        "saveTerms": "Could not save terms.",
+        "saveTitle": "Could not save the title.",
+        "unitPriceZeroOrMore": "Enter a unit price of 0 or more.",
+        "updateBlock": "Could not update the block.",
+        "updateDeposit": "Could not update the deposit.",
+        "updateLine": "Could not update the line.",
+        "updateSection": "Could not update the section.",
+        "uploadImage": "Could not upload the image.",
+        "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or enter a manual line.",
+        "sectionAddedListStale": "Section added, but the list could not refresh. Reload the page to see it.",
+        "lineAddedListStale": "Line added, but the list could not refresh. Reload the page to see it."
+      },
+      "image": {
+        "alt": "Quote image",
+        "previewUnavailable": "Image preview unavailable."
+      },
+      "internal": {
+        "full": "Internal · not shown to customer",
+        "short": "Internal"
+      },
+      "lastSaved": {
+        "saved": "Saved {{time}}",
+        "saving": "Saving…"
+      },
+      "line": {
+        "addDescription": "description",
+        "billing": "Billing",
+        "billingFrequencyAria": "Billing frequency",
+        "cost": "Cost",
+        "costMissingAria": "Cost not entered — this line is excluded from the profit estimate.",
+        "descriptionAria": "Line description",
+        "descriptionOptional": "Description (optional)",
+        "enterCostFirstMarkup": "Enter a cost first to set markup %",
+        "enterCostFirstMarkupSentence": "Enter a cost first to set markup %.",
+        "imageUrlAria": "Image URL",
+        "markup": "Markup",
+        "markupPercent": "Markup %",
+        "nameAria": "Line name",
+        "namePlaceholder": "Name",
+        "noCost": "No cost",
+        "noCostHelp": "Mark this line as deliberately having no cost (e.g. labor or a service) — excludes it from the missing-cost warning.",
+        "partNumberAbbr": "PN",
+        "partNumberHelp": "The manufacturer's part number for this item.",
+        "partNumberOptional": "Part # (optional)",
+        "profit": "Profit",
+        "quantityAria": "Quantity",
+        "quantityForAria": "Quantity for {{item}}",
+        "saveToCatalog": "Save to catalog",
+        "showLess": "Show less",
+        "showMore": "Show more",
+        "sku": "SKU",
+        "skuHelp": "Your catalog or distributor stock number for this item.",
+        "skuOptional": "SKU (optional)",
+        "tidyWithAi": "Tidy with AI",
+        "unitCost": "Unit cost",
+        "unitPriceForAria": "Unit price for {{item}}"
+      },
+      "liveTotals": {
+        "annualRecurring": "Annual recurring",
+        "dueOnAcceptance": "Due on acceptance",
+        "firstPeriodSubtotal": "First period subtotal",
+        "firstPeriodTotal": "First-period total (incl. recurring)",
+        "monthlyRecurring": "Monthly recurring",
+        "oneTime": "One-time (pre-tax)",
+        "srUpdated": "Totals updated. One-time {{oneTime}}, monthly recurring {{monthly}}, annual recurring {{annual}}, due on acceptance {{due}}.",
+        "srUpdatedWithTax": "Totals updated. One-time {{oneTime}}, monthly recurring {{monthly}}, annual recurring {{annual}}, tax {{tax}}, due on acceptance {{due}}.",
+        "subtotal": "Subtotal",
+        "tax": "Tax",
+        "taxRate": "Tax rate",
+        "taxRateHelp": "Applies to lines marked taxable. Set in the organization’s tax settings.",
+        "title": "Live totals",
+        "total": "Total"
+      },
+      "outline": {
+        "aria": "Quote contents",
+        "shortcutHint": "Alt+Down / Alt+Up jumps to the next or previous section while editing.",
+        "title": "Contents"
+      },
+      "recurrence": {
+        "annual": "Annual",
+        "monthly": "Monthly",
+        "one_time": "One-time"
+      },
+      "status": {
+        "saved": "Saved"
+      },
+      "success": {
+        "imageSectionAdded": "Image section added",
+        "itemAdded": "Item added",
+        "lineAdded": "Line added",
+        "lineMoved": "Line moved",
+        "lineRemoved": "Line removed",
+        "savedToCatalog": "Saved to catalog",
+        "sectionAdded": "Section added",
+        "sectionRemoved": "Section removed",
+        "contractSectionAdded": "Agreement section added"
+      },
+      "symbols": {
+        "check": "✓",
+        "notAvailable": "—",
+        "percent": "%",
+        "plusSeparator": " + "
+      },
+      "table": {
+        "collapsedSummary": "{{count}} lines · {{amount}}",
+        "collapsedSummary_one": "{{count}} line · {{amount}}",
+        "collapsedSummary_other": "{{count}} lines · {{amount}}",
+        "emptyLines": "No lines yet. Add a catalog item or a manual line below.",
+        "fallbackName": "Pricing table {{number}}",
+        "item": "Item",
+        "labelAria": "Pricing table label",
+        "labelPlaceholder": "Table label (optional, e.g. Monthly services)",
+        "notTaxable": "Not taxable",
+        "qty": "Qty",
+        "recurrence": "Billing",
+        "scrollAria": "Pricing table — scrolls sideways on narrow screens for totals and row actions",
+        "showSubtotal": "Show subtotal row",
+        "tax": "Tax",
+        "taxSuffix": "+ {{amount}} tax",
+        "taxTitle": "Per-line tax. The header Tax total is authoritative and may differ by a rounding cent.",
+        "taxable": "Taxable",
+        "total": "Total",
+        "unitPrice": "Unit price",
+        "columnLabelPlaceholder": "Column label",
+        "columnAlignAria": "Column alignment",
+        "alignLeft": "Left",
+        "alignCenter": "Center",
+        "alignRight": "Right",
+        "removeColumn": "Remove column",
+        "addColumn": "Add column",
+        "removeRow": "Remove row",
+        "addRow": "Add row",
+        "cellAria": "Row {{row}}, column {{column}}",
+        "captionPlaceholder": "Caption (optional)",
+        "zebra": "Zebra stripes",
+        "headerStyle": "Header style",
+        "headerStylePlain": "Plain",
+        "headerStyleAccent": "Accent",
+        "reshapedWarning": "This table didn't fit the {{columns}}-column x {{rows}}-row limit, so it was reshaped to fit. Saving replaces the stored table with what you see here."
+      },
+      "terms": {
+        "placeholder": "Payment terms, delivery notes, etc.",
+        "title": "Terms & Conditions (plain text)",
+        "helper": "For reusable legal terms, add an Agreement / terms section — the customer signs it with the proposal."
+      },
+      "tidyAll": {
+        "complete": "Finished reviewing {{count}} description(s).",
+        "noDescriptions": "No line descriptions to tidy in this section."
+      },
+      "undo": {
+        "lineDeleted": "Line deleted",
+        "sectionDeleted": "Section deleted"
+      },
+      "title": {
+        "label": "Quote title",
+        "placeholder": "e.g. Office network refresh"
+      },
+      "units": {
+        "perMonth": "/mo",
+        "perYear": "/yr"
+      },
+      "contract": {
+        "templateLabel": "Agreement template",
+        "templatePlaceholder": "Select a template…",
+        "noTemplates": "No agreement templates yet. <templatesLink>Create one</templatesLink> under Contracts → Agreement templates.",
+        "noPublishedVersion": "This template has no published version yet. Publish it before adding it to a quote.",
+        "pinnedVersion": "Pinned to v{{version}}",
+        "autoVariablesTitle": "Filled automatically from the quote",
+        "autoHint": "These values resolve from the quote when the proposal is sent.",
+        "manualVariablesTitle": "Fill in for this proposal",
+        "labelFieldLabel": "Section label",
+        "labelPlaceholder": "Optional label (e.g. Master Services Agreement)",
+        "variableRequired": "Enter a value",
+        "variableUnresolved": "This variable is still unresolved",
+        "untitledTemplate": "Agreement",
+        "readOnlyHint": "Remove and re-add this section to change the template, version, or variables.",
+        "updateToVersion": "Update to v{{version}}",
+        "saveVariables": "Save variables",
+        "unresolvedWarning": "Unresolved variables (will block sending): {{names}}"
+      },
+      "coverPage": {
+        "title": "Cover page",
+        "enable": "Show a cover page",
+        "summaryOn": "Shown as the first page of the proposal.",
+        "summaryOff": "No cover page — the proposal starts with its content.",
+        "titleLabel": "Cover title",
+        "titlePlaceholder": "e.g. Managed IT Services Proposal",
+        "preparedForLabel": "Prepared for",
+        "preparedForPlaceholder": "Override the customer name",
+        "showPreparedBy": "Show “prepared by” (your company)",
+        "imageLabel": "Cover image",
+        "imageHelp": "PNG or JPEG, up to 5 MB.",
+        "removeImage": "Remove image"
+      },
+      "ghost": {
+        "add": "Add",
+        "nameAria": "New line name",
+        "placeholder": "Type an item name…",
+        "quantityAria": "New line quantity",
+        "unitPriceAria": "New line unit price"
+      },
+      "unassigned": {
+        "explainer": "These lines aren’t in any pricing section, but they still appear on the customer’s quote and count toward its totals. Move each one into a pricing section to control where it appears.",
+        "moveAria": "Move {{line}} into a pricing section",
+        "movePlaceholder": "Move to…",
+        "noTargets": "Add a pricing section, then move these lines into it.",
+        "qtyPrice": "{{qty}} × {{price}}",
+        "title": "Unassigned lines"
+      },
+      "unsavedField": {
+        "lines": "Line items"
+      },
+      "callout": {
+        "variantLabel": "Style",
+        "variantInfo": "Info",
+        "variantAccent": "Accent",
+        "variantWarn": "Warning",
+        "titlePlaceholder": "Title (optional)",
+        "bodyAria": "Callout text"
+      },
+      "warnings": {
+        "markupRemoved": "Saved, but some unsupported formatting was removed: {{tags}}. Rich text supports headings, bold, italic, underline, lists and links."
+      }
+    },
+    "actions": {
+      "cloneDialog": {
+        "companyLabel": "Company",
+        "confirm": "Create clone",
+        "defaultTitle": "Clone of {{name}}",
+        "message": "Creates a new draft with the same content. Pick the company it’s for and give it a title.",
+        "retargetHint": "The new draft will use this company’s billing details and tax rate; the site assignment is cleared.",
+        "title": "Clone quote",
+        "titleLabel": "Title"
+      },
+      "cloneError": "Could not clone the quote.",
+      "cloneQuote": "Clone quote",
+      "cloneSavingTitle": "Wait for changes to finish saving before cloning.",
+      "reviseQuote": "Revise quote",
+      "revising": "Creating revision…",
+      "reviseSuccess": "Revision created.",
+      "reviseError": "Could not create a revision.",
+      "reviseInProgress": "A revision is already in progress — opening it.",
+      "cloneSuccess": "Quote cloned.",
+      "cloning": "Cloning…",
+      "deleteConfirm": {
+        "message": "This permanently deletes the draft quote. This can't be undone.",
+        "title": "Delete draft quote"
+      },
+      "deleteDraft": "Delete draft",
+      "deleteError": "Could not delete the draft.",
+      "deleteSuccess": "Draft deleted",
+      "downloadPdf": "Download PDF",
+      "emptyHint": "Add at least one item before sending.",
+      "moreActions": "More actions",
+      "savingHint": "Saving changes… Send unlocks when everything is saved.",
+      "savingTitle": "Saving your changes — Send unlocks when everything is saved.",
+      "sendConfirm": {
+        "ccLabel": "Cc",
+        "ccToggle": "Cc",
+        "includePdfLabel": "Attach the proposal PDF",
+        "invalidEmail": "Invalid email address: {{addresses}}",
+        "message": "We'll email this proposal to {{orgName}} and mark it Sent — {{amount}} due on acceptance. You'll have 30 seconds to undo after confirming.",
+        "messageLabel": "Add a personal message (optional)",
+        "messagePlaceholder": "Include a short note — it appears in the email above the accept link.",
+        "paymentEnabled": "Online payment is enabled — the customer can pay by card after accepting.",
+        "paymentNoteNoStripe": "When the customer accepts, they won't have an online payment option. Connect Stripe in <integrationsLink>Settings → Integrations</integrationsLink> to offer one.",
+        "paymentWarningDeposit": "This proposal asks for a deposit, but customers can't pay online yet — connect Stripe in <integrationsLink>Settings → Integrations</integrationsLink> so the deposit can be collected on acceptance.",
+        "recipientRequired": "Enter at least one recipient to send.",
+        "signaturePreviewLabel": "Signature (set in Settings → Branding):",
+        "subjectLabel": "Subject",
+        "subjectPlaceholder": "Proposal {{number}} from your company",
+        "subjectPlaceholderNoNumber": "Proposal from your company",
+        "title": "Send this proposal?",
+        "toLabel": "To",
+        "toPlaceholder": "Add recipient…",
+        "tooManyRecipients": "Use at most {{max}} addresses.",
+        "zeroTotalWarning": "This quote totals {{zero}} — check that its items are priced before sending.",
+        "noBillingContactHint": "No billing contact is saved for this organization — enter an email, or add one in the <orgLink>organization settings</orgLink>.",
+        "revisionWarning": "Sending this replaces {{number}} and disables the link the customer already has."
+      },
+      "sendEmailWarning": {
+        "noBillingContact": "Proposal marked Sent, but no email was delivered — {{orgName}} has no billing contact email. Add one in the organization settings, then resend.",
+        "noEmailService": "Proposal marked Sent, but no email was delivered — email is not configured on this server.",
+        "pdfRenderFailed": "Proposal marked Sent, but the PDF could not be generated, so no email was delivered. Check the attached contract files, then resend.",
+        "sendFailed": "Proposal marked Sent, but the email could not be delivered. Check the address, then resend.",
+        "shareLinkHint": "Use \"{{action}}\" on this proposal to copy the link and send it yourself."
+      },
+      "sendError": "Could not send the proposal.",
+      "sendProposal": "Send proposal",
+      "sendScheduled": "Sending to {{orgName}} in 30 seconds — you can still undo.",
+      "sendSuccess": "Proposal sent — we'll mark it Viewed and Accepted as {{orgName}} opens and signs.",
+      "sending": "Sending…",
+      "sendingIn": "Sending in {{seconds}}s…",
+      "undoError": "Could not cancel the send.",
+      "undoSend": "Undo send",
+      "undoSuccess": "Send canceled — the quote is still a draft.",
+      "undoTooLate": "Too late to undo — the proposal was already sent.",
+      "sendNow": "Send now",
+      "savingTimeout": "Still saving your changes — Send was canceled. Try again once everything is saved.",
+      "sendNowCancelError": "Couldn't send immediately — the proposal will still send as scheduled.",
+      "sendNowAlready": "Already on its way — the proposal is being sent now.",
+      "sendCanceledSaveFailed": "A change failed to save, so Send was canceled. Fix the highlighted field and try again.",
+      "sendBlockedUnsaved": "“{{field}}” has a change that hasn’t saved. Fix it there, then Send.",
+      "unsavedHint": "“{{field}}” has an unsaved change — Send unlocks once it saves.",
+      "unsavedTitle": "“{{field}}” has an unsaved change — Send unlocks once it saves.",
+      "resend": "Re-send",
+      "resendError": "Could not re-send the proposal.",
+      "resendSuccess": "Proposal re-sent to {{orgName}} — same link, same document.",
+      "resendNotDelivered": "Re-send recorded, but no email was delivered. Check the address, or copy the share link and send it yourself.",
+      "copyShareLink": "Copy share link",
+      "copyingShareLink": "Copying…",
+      "shareLinkCopied": "Share link copied — this is the same link the customer was emailed.",
+      "shareLinkCopyFailed": "Could not copy automatically. The share link is: {{url}}",
+      "shareLinkError": "Could not get the share link.",
+      "resendConfirm": {
+        "title": "Re-send proposal",
+        "message": "Send {{orgName}} another copy of this proposal. Nothing about the quote changes and the accept link stays the same."
+      },
+      "resendNewLinkOriginalLive": "Proposal re-sent — but with a NEW link. This proposal predates link tracking, so the link the customer already had could not be reused; it still works alongside the new one.",
+      "resendNewLinkOriginalDead": "Proposal re-sent — but with a NEW link. The previous link can no longer be opened, so anyone holding it must use the new one.",
+      "shareLinkNewLinkOriginalLive": "Copied a NEW link. This proposal predates link tracking, so the link the customer already had could not be reused; it still works alongside this one.",
+      "shareLinkNewLinkOriginalDead": "Copied a NEW link. The previous link can no longer be opened, so anyone holding it must use this one.",
+      "currencyMismatch": "This quote is in {{documentCurrency}} but your Stripe account settles in {{accountCurrency}}. Stripe will present {{documentCurrency}} to the customer and convert it on settlement — you bear the FX spread and any conversion fee.",
+      "currencyUnknown": "Your Stripe account's settlement currency hasn't been cached, so it couldn't be checked against this {{documentCurrency}} quote. Refresh your Stripe account details under Settings → Integrations to enable the mismatch check.",
+      "acceptOnBehalf": {
+        "button": "Accept on behalf",
+        "title": "Record the customer's acceptance",
+        "methodLabel": "How did they agree?",
+        "method": {
+          "verbal": "Verbally / by phone",
+          "email": "By email",
+          "signed_document": "Signed document",
+          "purchase_order": "Purchase order",
+          "other": "Other"
+        },
+        "referenceLabel": "Reference",
+        "referenceHelp": "Where a reviewer would find the customer's agreement — a PO number, an email and date, or a ticket.",
+        "signerNameLabel": "Who agreed",
+        "signerEmailLabel": "Their email (optional)",
+        "consequenceInvoice": "An invoice for {{amount}} will be issued and numbered now.",
+        "consequenceContracts": "Recurring lines become draft contracts you activate later.",
+        "consequenceEmail": "The invoice will be emailed to the customer.",
+        "consequenceDraft": "This quote was never sent. The customer's first sight of it will be the invoice.",
+        "submit": "Accept and issue invoice",
+        "success": "Quote accepted. Invoice {{number}} issued.",
+        "error": "Could not record the acceptance.",
+        "successDraftInvoice": "Quote accepted. Invoice created as a draft.",
+        "errorContractVariablesUnresolved": "This quote's contract still needs values for: {{names}}. Close this dialog, fill them in below, then try again.",
+        "errorContractVariablesUnresolvedGeneric": "This quote's contract has unresolved variables. Close this dialog, fill them in below, then try again.",
+        "errorDepositInvalid": "This quote's deposit can't be collected as configured. Close this dialog, fix the deposit settings below, then try again.",
+        "evidenceLabel": "Evidence file (optional)",
+        "evidenceHelp": "PDF, PNG or JPEG, up to 10 MB — e.g. the signed PO or document.",
+        "evidenceTooLarge": "This file is larger than 10 MB. Choose a smaller file.",
+        "evidenceAttached": "Evidence attached.",
+        "evidenceError": "The acceptance was recorded, but the evidence file could not be attached. Attach it from the quote page."
+      },
+      "declineOnBehalf": {
+        "button": "Decline on behalf",
+        "title": "Record the customer's decline",
+        "methodLabel": "How did they decline?",
+        "referenceLabel": "Reference",
+        "referenceHelp": "Where a reviewer would find the customer's decline — an email and date, a call note, or a ticket.",
+        "reasonLabel": "Their reason (optional)",
+        "consequence": "The quote will be marked declined and can no longer be accepted. Revise it to send the customer a new version.",
+        "submit": "Mark declined",
+        "success": "Quote marked declined.",
+        "error": "Could not record the decline."
+      }
+    },
+    "detail": {
+      "addContentInEditor": "Add content in the Editor",
+      "created": "Created",
+      "customer": "Customer",
+      "empty": "This quote has no content yet.",
+      "expires": "Expires {{date}}",
+      "from": "From",
+      "imageUnavailable": "Image unavailable",
+      "issued": "Issued",
+      "lifecycle": {
+        "accepted": "Accepted",
+        "declined": "Declined",
+        "sent": "Sent",
+        "viewed": "Viewed"
+      },
+      "orderBreakdown": {
+        "copied": "Copied",
+        "copyFailed": "Could not copy to the clipboard.",
+        "copyTsv": "Copy for spreadsheet",
+        "costTotal": "Total cost",
+        "exportCsv": "Download CSV",
+        "fulfillment": {
+          "allocation": {
+            "cancelled": "Cancelled",
+            "eta": "Arriving {{date}}",
+            "ordered": "Ordered {{qty}}",
+            "received": "received {{qty}}",
+            "tracking": "Tracking {{number}}"
+          },
+          "cancel": "Cancel line",
+          "cancelError": "Could not cancel this order line.",
+          "cancelSuccess": "Order line cancelled",
+          "dialog": {
+            "cancel": "Cancel",
+            "empty": "Everything selected is already on order.",
+            "error": "Could not record the order.",
+            "eta": "Expected arrival",
+            "notes": "Notes",
+            "orderRef": "Order reference",
+            "qtyAria": "Quantity to order for {{item}}",
+            "submit": "Record order",
+            "success": "Order recorded",
+            "title": "Mark items ordered",
+            "tracking": "Tracking number",
+            "vendor": "Vendor"
+          },
+          "markOrdered": "Mark ordered",
+          "receive": "Mark received",
+          "receiveQtyAria": "Quantity received",
+          "receiveError": "Could not update this order line.",
+          "receiveSuccess": "Marked received",
+          "select": "Select {{item}}",
+          "selectColumn": "Select for ordering",
+          "status": {
+            "ordered": "Ordered",
+            "partiallyReceived": "Partly received",
+            "received": "Received"
+          }
+        },
+        "itemCount_one": "{{count}} item",
+        "itemCount_other": "{{count}} items",
+        "missingCost_one": "{{count}} item has no cost recorded",
+        "missingCost_other": "{{count}} items have no cost recorded",
+        "pax8Badge": {
+          "failed": "Pax8 failed",
+          "ordered": "Ordered via Pax8",
+          "reconcile": "Pax8 needs review",
+          "staged": "Staged in Pax8"
+        },
+        "table": {
+          "extCost": "Ext. cost",
+          "item": "Item",
+          "markup": "Markup",
+          "partNumber": "Part #",
+          "qty": "Qty",
+          "sku": "SKU",
+          "unitCost": "Unit cost",
+          "vendor": "Vendor"
+        },
+        "title": "To be ordered",
+        "unknownVendor": "Other / unknown vendor"
+      },
+      "pax8Order": {
+        "message_one": "This quote staged a Pax8 order ({{count}} item) awaiting provisioning details",
+        "message_other": "This quote staged a Pax8 order ({{count}} items) awaiting provisioning details",
+        "open": "Open Pax8 order"
+      },
+      "pricing": "Pricing",
+      "proposalImageAlt": "Proposal image",
+      "scheduledSendFailed": "The scheduled send failed — this proposal was NOT sent and is still a draft. Review it and try sending again.",
+      "table": {
+        "item": "Item",
+        "noLines": "No lines in this table.",
+        "qty": "Qty",
+        "recurrence": "Billing",
+        "tax": "Tax",
+        "total": "Total",
+        "unitPrice": "Unit price"
+      },
+      "tableScrollAria": "{{label}} — scroll sideways for more columns",
+      "terms": "Terms",
+      "totals": {
+        "annualRecurring": "Annual recurring",
+        "dueOnAcceptance": "Due on acceptance",
+        "firstPeriod": "First-period total (incl. recurring)",
+        "monthlyRecurring": "Monthly recurring",
+        "oneTime": "One-time",
+        "tax": "Tax",
+        "title": "Totals"
+      },
+      "viewInvoice": "View invoice",
+      "sentTo": "Sent to",
+      "declinedBanner": {
+        "title": "Declined {{date}}",
+        "reasonLabel": "Customer's note:",
+        "revise": "Duplicate & revise",
+        "revising": "Duplicating…"
+      },
+      "lineage": {
+        "supersededTitle": "This quote was replaced by",
+        "inProgressTitle": "A revision of this quote is being drafted — sending it will replace this quote and disable the customer’s link:",
+        "revisionOfTitle": "Revision of",
+        "untitled": "a newer version"
+      },
+      "acceptedOnBehalf": "Accepted on behalf of {{signer}} by {{recorder}} on {{date}} · {{method}} · {{reference}}",
+      "deletedUser": "a deleted user",
+      "evidence": {
+        "download": "Download evidence",
+        "downloadTitle": "Download {{filename}}",
+        "attach": "Attach evidence",
+        "replace": "Replace evidence",
+        "attached": "Evidence attached.",
+        "attachError": "Could not attach the evidence file.",
+        "downloadError": "Could not download the evidence file.",
+        "tooLarge": "This file is larger than 10 MB. Choose a smaller file."
+      }
+    },
+    "currency": {
+      "actions": {
+        "change": "Change currency"
+      },
+      "dialog": {
+        "title": "Change quote currency",
+        "description": "This draft quote is priced in {{currency}}.",
+        "currencyLabel": "New currency",
+        "modeLegend": "What happens to the quote's lines",
+        "modeClear": "Remove all lines",
+        "modeClearHint": "Lines are deleted. Required when any line is manual or a bundle.",
+        "modeReprice": "Reprice catalog lines",
+        "modeRepriceHint": "Every catalog line is resolved from the price book of the new currency. Only possible when all lines come from the catalog.",
+        "modeRepriceUnavailable": "Not available — at least one line is manual or a bundle, so the price book cannot reprice it. Remove all lines instead.",
+        "confirm": "I understand this changes the quote's currency.",
+        "submit": "Change currency"
+      },
+      "toast": {
+        "changed": "Quote currency changed to {{currency}}."
+      },
+      "errors": {
+        "change": "Could not change the quote currency."
+      }
+    },
+    "distributorLookup": {
+      "feedPriceCurrencyUnknown": "Feed price currency unknown — enter a {{currency}} price",
+      "feedPriceIn": "Feed price is {{feedCurrency}} — enter a {{currency}} price",
+      "available": "{{count}} avail",
+      "cost": "cost {{currency}} {{amount}}",
+      "endOfLife": "End of life",
+      "importAndAdd": "Import & add",
+      "inStockOnly": "In stock only",
+      "lookupFailed": "Lookup failed.",
+      "mfgPart": "Mfg part {{part}}",
+      "msrp": "MSRP {{amount}}",
+      "nightlyHint": "Type at least {{count}} characters to search the nightly catalog.",
+      "nightlyPlaceholder": "Search by name, SKU, mfg part # or manufacturer",
+      "noResults": "No matching products.",
+      "outOfStock": "Out of stock",
+      "placeholder": "SYNNEX SKU or mfg part #",
+      "searching": "Searching…",
+      "sellPrice": "Sell price",
+      "sku": "SKU {{sku}}",
+      "source": "Source",
+      "sourceEcExpress": "EC Express (exact SKU / part #)",
+      "sourceNightly": "TD SYNNEX catalog (nightly file)",
+      "syncedDaysAgo": "synced {{count}}d ago",
+      "syncedHoursAgo": "synced {{count}}h ago",
+      "syncedJustNow": "synced just now",
+      "syncedMinutesAgo": "synced {{count}}m ago",
+      "syncedUnknown": "sync time unknown",
+      "toBeDiscontinued": "To be discontinued",
+      "warehouses": "Warehouses: {{list}}"
+    },
+    "document": {
+      "deviceSet": {
+        "badge": "Est.",
+        "estimate": "Estimated quantity — billed at the actual number of {{set}} each billing period.",
+        "setDevices": "devices",
+        "setSeats": "seats",
+        "setGroup": "devices in “{{name}}”",
+        "atSite": "{{set}} at {{site}}",
+        "allowanceBill": "Includes {{included}}; additional units billed at {{price}} each.",
+        "allowanceFlag": "Includes {{included}}; additional units are reported for review, not billed automatically."
+      },
+      "additionalItems": "Additional items",
+      "contract": {
+        "download": "Download agreement",
+        "previewTitle": "{{name}} agreement",
+        "unavailable": "Agreement file unavailable",
+        "versionFooter": "{{name}} — v{{version}}"
+      },
+      "draft": "Draft",
+      "empty": "This proposal doesn’t have any content yet.",
+      "imageUnavailable": "Image unavailable",
+      "issued": "Issued",
+      "preparedFor": "Prepared for",
+      "taxId": "Tax ID: {{id}}",
+      "imageZoomAria": "View larger image",
+      "preview": {
+        "description": "This is what your customer sees on their proposal link.",
+        "downloadPdf": "Download PDF",
+        "preparing": "Preparing…"
+      },
+      "pricing": "Pricing",
+      "pricingScrollAria": "Pricing — scroll sideways for more columns",
+      "proposal": "Proposal",
+      "proposalImageAlt": "Proposal image",
+      "recurrence": {
+        "annual": "Annual",
+        "monthly": "Monthly"
+      },
+      "table": {
+        "amount": "Amount",
+        "description": "Description",
+        "qty": "Qty",
+        "tax": "Tax",
+        "unitPrice": "Unit price"
+      },
+      "terms": "Terms",
+      "totals": {
+        "annualRecurring": "Annual recurring",
+        "depositDue": "Deposit due",
+        "depositDueNow": "Deposit due now",
+        "dueOnAcceptance": "Due on acceptance",
+        "firstPeriodSubtotal": "First period subtotal",
+        "firstPeriodTotal": "First-period total",
+        "monthlyRecurring": "Monthly recurring",
+        "recurringNote": "Accepting this proposal bills the one-time charges now. Recurring lines bill on their own schedule.",
+        "remainingBalance": "Remaining balance (due per terms)",
+        "subtotal": "Subtotal",
+        "tax": "Tax"
+      },
+      "unsupportedBlock": "This block type isn't supported by this viewer yet.",
+      "validUntil": "Valid until"
+    },
+    "page": {
+      "accessDenied": "You don't have permission to view quotes.",
+      "bulk": {
+        "deleteDrafts": "Delete drafts",
+        "deletedVerb": "deleted",
+        "failed": "Bulk {{verb}} failed. Retry.",
+        "limit": "Select up to {{limit}} at a time.",
+        "partial": "{{succeeded}} {{verb}}, {{skipped}} skipped{{failedText}}",
+        "send": "Send",
+        "sentVerb": "sent",
+        "success": "{{succeeded}} {{verb}}"
+      },
+      "bulkDelete": {
+        "message_one": "Delete the selected quote? Only DRAFT quotes are deleted; this cannot be undone.",
+        "message_other": "Delete {{count}} selected quotes? Only DRAFT quotes are deleted; this cannot be undone.",
+        "skippedNotDraft": "Not a draft (skipped)",
+        "title": "Delete draft quotes"
+      },
+      "bulkSend": {
+        "message_one": "Email the selected proposal to its customer? This can't be undone.",
+        "message_other": "Email {{count}} selected proposals to their customers? This can't be undone.",
+        "recipients": "Each proposal is emailed to its organization's billing contact and marked Sent.",
+        "title": "Send quotes",
+        "unnumbered": "Draft"
+      },
+      "create": {
+        "description": "Pick the customer this proposal is for. You can add blocks and pricing next.",
+        "error": "Could not create a draft quote.",
+        "genericError": "Could not create the quote.",
+        "noSpecificSite": "No specific site",
+        "selectOrganization": "Select an organization…",
+        "siteClearedOnClone": "Site is cleared when starting from an existing quote.",
+        "siteOptional": "Site (optional)",
+        "startBlank": "Blank quote",
+        "startFrom": "Start from (optional)",
+        "submit": "Create draft",
+        "success": "Draft quote created",
+        "title": "New quote",
+        "titleOptional": "Title (optional)",
+        "titlePlaceholder": "e.g. Office network refresh",
+        "working": "Working…"
+      },
+      "deposit": {
+        "deposit": "Deposit",
+        "paid": "Deposit paid",
+        "unpaid": "Deposit unpaid"
+      },
+      "duplicate": "Duplicate quote",
+      "duplicateAria": "Duplicate quote {{quote}}",
+      "duplicateError": "Could not duplicate the quote.",
+      "empty": {
+        "clearFilters": "Clear filters",
+        "description": "Draft a proposal with headings, rich text, and a pricing table, then send it for acceptance.",
+        "filtered": "No quotes match these filters.",
+        "title": "No quotes yet"
+      },
+      "errors": {
+        "loadOrganizations": "Failed to load organizations.",
+        "loadQuotes": "Failed to load quotes",
+        "loadSites": "Failed to load sites."
+      },
+      "filters": {
+        "allStatuses": "All statuses",
+        "searchAria": "Search quotes",
+        "searchPlaceholder": "Search number or org",
+        "statusAria": "Filter by status"
+      },
+      "newQuote": "New quote",
+      "stats": {
+        "awaiting": "{{count}} awaiting",
+        "drafts": "Drafts",
+        "notYetSent": "not yet sent",
+        "outForSignature": "Out for signature"
+      },
+      "subtitle": "Build proposals with rich blocks and recurring pricing, then send them to customers.",
+      "table": {
+        "created": "Created",
+        "draftQuote": "Draft quote",
+        "firstPeriodSuffix": "first period",
+        "number": "Number",
+        "selectAll": "Select all quotes",
+        "selectQuote": "Select quote {{quote}}",
+        "total": "Total"
+      },
+      "title": "Quotes",
+      "tryAgain": "Try again"
+    },
+    "pax8ProductLookup": {
+      "feedPriceCurrencyUnknown": "Feed price currency unknown — enter a {{currency}} price",
+      "feedPriceIn": "Feed price is {{feedCurrency}} — enter a {{currency}} price",
+      "cost": "cost {{currency}} {{amount}}",
+      "importAndAdd": "Import & add",
+      "option": "Option {{number}}",
+      "placeholder": "Product, vendor, or SKU",
+      "searchFailed": "Search failed.",
+      "searching": "Searching…",
+      "sellPrice": "Sell price",
+      "term": "Term"
+    },
+    "recurrence": {
+      "one_time": "One-time",
+      "monthly": "Monthly",
+      "annual": "Annual"
+    },
+    "status": {
+      "draft": "Draft",
+      "sent": "Sent",
+      "viewed": "Viewed",
+      "accepted": "Accepted",
+      "declined": "Declined",
+      "expired": "Expired",
+      "converted": "Converted",
+      "superseded": "Superseded"
+    },
+    "workspace": {
+      "backLabel": "Quotes",
+      "backToQuotes": "Back to quotes",
+      "draftTitle": "Draft quote",
+      "errors": {
+        "loadFailed": "Failed to load quote",
+        "missingId": "Missing quote id",
+        "notFound": "Quote not found.",
+        "unavailable": "Quote unavailable."
+      },
+      "tabs": {
+        "editor": "Editor",
+        "preview": "Preview",
+        "detail": "Details"
+      },
+      "loading": "Loading quote…",
+      "revisionBanner": "This is a revision of {{number}}. Sending it will replace the original and disable the link the customer already has."
+    }
+  },
+  "billingUi": {
+    "margin": {
+      "cost": "Cost",
+      "missingCost": "Profit estimate is incomplete — {{count}} line missing a cost.",
+      "missingCost_one": "Profit estimate is incomplete — {{count}} line missing a cost.",
+      "missingCost_other": "Profit estimate is incomplete — {{count}} lines missing a cost.",
+      "profitAnnual": "Profit (annual)",
+      "profitMonthly": "Profit (monthly)",
+      "profitOneTime": "Profit (one-time)",
+      "title": "Margin (internal)"
+    },
+    "recurringBillingNote": "Accepting this quote invoices only the one-time charges now. Recurring lines (monthly + annual) bill later on their own schedule. The first-period total combines the one-time charges with the first period of each recurring cadence.",
+    "units": {
+      "perMonth": "/mo",
+      "perYear": "/yr"
+    },
+    "unsaved": "Unsaved",
+    "showCostMargin": "Show cost & margin",
+    "hideCostMargin": "Hide cost & margin",
+    "orgCombobox": {
+      "searchPlaceholder": "Search organizations…",
+      "noResults": "No matching organizations.",
+      "capNote": "Showing the first {{count}} matches — keep typing to narrow."
+    }
+  },
+  "bulk": {
+    "bulkActionBar": {
+      "selected": "{{count}} selected"
+    }
+  },
+  "invoice": {
+    "status": {
+      "draft": "Draft",
+      "sent": "Sent",
+      "issued": "Issued",
+      "partially_paid": "Partially paid",
+      "overdue": "Overdue",
+      "paid": "Paid",
+      "void": "Void"
+    }
+  },
+  "invoiceEditor": {
+    "addLine": {
+      "add": "Add",
+      "addInCatalog": "Add some in Product Catalog",
+      "bundle": "Bundle",
+      "catalogItem": "Catalog item",
+      "clearSelection": "Clear selection",
+      "manualLine": "Manual line",
+      "noCatalogItems": "No catalog items.",
+      "searchCatalog": "Search catalog by name or SKU",
+      "sourceAria": "Add line source",
+      "catalogLoadFailed": "The catalog couldn't be loaded, so no items can be shown.",
+      "retry": "Try again"
+    },
+    "billTo": {
+      "addInSettings": "Add one in Organization settings",
+      "noContact": "No billing contact set.",
+      "title": "Bill to"
+    },
+    "errors": {
+      "addLine": "Could not add line.",
+      "loadCatalog": "Failed to load catalog.",
+      "nameOrDescription": "A line needs a name or a description.",
+      "nonNegativeUnitPrice": "Enter a unit price of 0 or more.",
+      "quantityGreaterThanZero": "Enter a quantity greater than 0.",
+      "removeLine": "Could not remove line.",
+      "saveNotes": "Could not save notes.",
+      "saveTerms": "Could not save terms.",
+      "updateLine": "Could not update line.",
+      "noPriceForCurrency": "No {{currency}} price for this item. Add one in the catalog or enter a manual line."
+    },
+    "fields": {
+      "descriptionOptional": "Description (optional)",
+      "lineDescription": "Line description",
+      "lineName": "Line name",
+      "name": "Name",
+      "quantity": "Quantity",
+      "quantityFor": "Quantity for {{item}}",
+      "quantityNewLine": "New line quantity",
+      "taxable": "Taxable",
+      "unitPrice": "Unit price",
+      "unitPriceFor": "Unit price for {{item}}",
+      "unitPriceNewLine": "New line unit price",
+      "untitledLine": "this line"
+    },
+    "hiddenSuffix": " (hidden)",
+    "notes": {
+      "placeholder": "Internal or customer notes…",
+      "title": "Notes"
+    },
+    "remove": "Remove",
+    "saved": "Saved",
+    "success": {
+      "lineAdded": "Line added",
+      "notesSaved": "Notes saved",
+      "termsSaved": "Terms saved"
+    },
+    "summary": {
+      "noTaxRate": "Lines are marked taxable, but no tax rate is set.",
+      "inheritedTaxRate": "Tax isn't on this draft yet — the inherited rate of {{rate}} applies when you issue it, adding {{tax}} for a total of {{total}}.",
+      "setTaxRate": "Set one in Billing settings",
+      "subtotal": "Subtotal",
+      "tax": "Tax",
+      "title": "Summary",
+      "total": "Total"
+    },
+    "table": {
+      "customerVisible": "Customer-visible",
+      "customerVisibleTitle": "Whether this line appears on the customer's invoice",
+      "empty": "No lines yet. Add catalog items, a bundle, or a manual line below.",
+      "item": "Item",
+      "price": "Price",
+      "qty": "Qty",
+      "tax": "Tax",
+      "total": "Total"
+    },
+    "terms": {
+      "placeholder": "Payment terms, warranty clauses, etc.",
+      "title": "Terms & Conditions"
+    },
+    "unapprovedTime": "{{count}} lines reference unapproved time. Review before issuing.",
+    "unapprovedTime_one": "{{count}} line reference unapproved time. Review before issuing.",
+    "unapprovedTime_other": "{{count}} lines reference unapproved time. Review before issuing.",
+    "autosaveHint": "Changes save automatically. An amber outline marks an unsaved edit.",
+    "lastSaved": {
+      "saved": "Saved {{time}}",
+      "saving": "Saving…"
+    },
+    "undo": {
+      "lineDeleted": "Line deleted",
+      "tooLate": "Too late to undo — that line was already deleted.",
+      "partialFlush": "{{applied}} line deletion(s) were applied; {{failed}} failed and were restored."
+    },
+    "linesScrollAria": "Invoice lines — scroll sideways for more columns",
+    "unsavedField": {
+      "lines": "Line items"
+    }
+  },
+  "invoiceActions": {
+    "composer": {
+      "toLabel": "To",
+      "toPlaceholder": "billing@customer.com",
+      "ccToggle": "Cc",
+      "ccLabel": "Cc",
+      "subjectLabel": "Subject",
+      "subjectPlaceholder": "Invoice {{number}} from your provider",
+      "subjectPlaceholderNoNumber": "Your invoice",
+      "messageLabel": "Message (optional)",
+      "messagePlaceholder": "Add a short note for the customer…",
+      "includePdfLabel": "Attach the invoice PDF",
+      "includeDeviceAppendixLabel": "Include billed devices appendix",
+      "signaturePreviewLabel": "Your signature will be added:",
+      "invalidEmail": "Not a valid email address: {{addresses}}",
+      "tooManyRecipients": "Up to {{max}} addresses.",
+      "recipientRequired": "Add at least one recipient.",
+      "noBillingContactHint": "This company has no billing contact yet — <orgLink>add one</orgLink> or type an address above.",
+      "payLinkNote": "The email includes a secure link your customer can use to view, download, and pay this invoice — no sign-in needed."
+    },
+    "copyInvoiceLink": "Copy invoice link",
+    "copyInvoiceLinkTitle": "Copies the customer's view & pay link — no sign-in needed",
+    "copyingPaymentLink": "Copying…",
+    "deleteConfirm": {
+      "message": "This permanently deletes the draft invoice. This cannot be undone.",
+      "title": "Delete draft invoice"
+    },
+    "deleteDraft": "Delete draft",
+    "deleteError": "Could not delete the draft.",
+    "deleteSuccess": "Draft deleted",
+    "downloadPdf": "Download PDF",
+    "downloadPdfError": "Could not download the invoice PDF.",
+    "issue": "Issue",
+    "issueAndSend": "Issue & Send",
+    "issueBlockedUnsaved": "“{{field}}” has a change that hasn’t saved. Fix it there, then Issue.",
+    "issueCanceledSaveFailed": "A change failed to save, so Issue was canceled. Fix the highlighted field and try again.",
+    "issueCanceledStillSaving": "Still saving your changes — Issue was canceled. Try again once everything is saved.",
+    "issueError": "Could not issue invoice.",
+    "issueNoEmailWarning": "Invoice issued — but no email was sent (no billing contact / email not configured)",
+    "issueSendConfirm": {
+      "customerFallback": "the customer",
+      "message": "This issues the invoice and emails it to {{customer}} for {{amount}}. This can't be undone.",
+      "title": "Issue and send this invoice?"
+    },
+    "issueSendError": "Invoice issued, but sending failed.",
+    "issueSentSuccess": "Invoice issued and sent",
+    "issueSuccess": "Invoice issued",
+    "issuing": "Issuing…",
+    "noVisibleLineHint": "Add at least one customer-visible line to issue.",
+    "paymentLinkCopyFailed": "Couldn’t copy automatically. Payment link: {{url}}",
+    "preparing": "Preparing…",
+    "resend": "Re-send",
+    "resendConfirm": {
+      "title": "Re-send this invoice?",
+      "message": "This emails another copy to {{customer}} for {{amount}}. Nothing about the invoice changes — same number, same dates, same amounts."
+    },
+    "resendSuccess": "Invoice re-sent",
+    "resending": "Sending…",
+    "savingHint": "Saving changes… Issue unlocks when everything is saved.",
+    "savingTitle": "Saving your changes — Issue unlocks when everything is saved.",
+    "sendConfirm": {
+      "title": "Send this invoice?",
+      "message": "This emails the invoice to {{customer}} for {{amount}}."
+    },
+    "unsavedHint": "“{{field}}” has an unsaved change — Issue unlocks once it saves.",
+    "unsavedTitle": "“{{field}}” has an unsaved change — Issue unlocks once it saves."
+  },
+  "invoiceDetail": {
+    "currency": {
+      "actions": {
+        "change": "Change currency"
+      },
+      "dialog": {
+        "title": "Change invoice currency",
+        "description": "This draft invoice is priced in {{currency}}.",
+        "currencyLabel": "New currency",
+        "modeLegend": "What happens to the invoice's lines",
+        "modeClear": "Remove all lines",
+        "modeClearHint": "Lines are deleted. Required when any line is manual or a bundle.",
+        "modeReprice": "Reprice catalog lines",
+        "modeRepriceHint": "Every catalog line is resolved from the price book of the new currency. Only possible when all lines come from the catalog.",
+        "confirm": "I understand this changes the invoice's currency.",
+        "submit": "Change currency"
+      },
+      "toast": {
+        "changed": "Invoice currency changed to {{currency}}."
+      },
+      "errors": {
+        "change": "Could not change the invoice currency."
+      }
+    },
+    "deposit": {
+      "duePrefix": "Deposit of",
+      "dueSuffix": "due — {{paid}} of {{total}} paid.",
+      "paid": "Deposit paid — remaining balance {{balance}}."
+    },
+    "dueDate": {
+      "aria": "Due date",
+      "display": "Due {{date}}",
+      "updateError": "Could not update the due date.",
+      "updateSuccess": "Due date updated"
+    },
+    "from": "From",
+    "lines": {
+      "cost": "Cost",
+      "description": "Description",
+      "hiddenMarker": " (hidden)",
+      "margin": "Margin",
+      "price": "Price",
+      "qty": "Qty",
+      "tax": "Tax",
+      "total": "Total",
+      "allHidden": "All lines are internal-only. Use “Show cost & margin” to view them."
+    },
+    "devices": {
+      "title": "Billed devices",
+      "toggle": "Devices ({{count}})",
+      "notRecorded": "Device detail was not recorded for this invoice.",
+      "hostname": "Hostname",
+      "role": "Role",
+      "countedAs": "Counted as",
+      "included": "Included",
+      "overage": "Overage",
+      "removed": "Device removed",
+      "showing": "Showing {{shown}} of {{total}}",
+      "flaggedHeading": "Flagged, not billed",
+      "empty": "No devices were counted for this line.",
+      "loadError": "Could not load the device list."
+    },
+    "paymentMethods": {
+      "cash": "Cash",
+      "check": "Check",
+      "bank_transfer": "Bank transfer",
+      "card": "Card",
+      "other": "Other"
+    },
+    "payments": {
+      "amount": "Amount",
+      "amountRequired": "Enter a payment amount to record it",
+      "connectStripe": "Connect Stripe to accept online payments.",
+      "currencyMismatch": "This invoice is in {{documentCurrency}} but your Stripe account settles in {{accountCurrency}}. Stripe will present {{documentCurrency}} to the customer and convert it on settlement — you bear the FX spread and any conversion fee.",
+      "date": "Payment date",
+      "draftHint": "Issue this invoice to record payments.",
+      "empty": "No payments recorded.",
+      "linkCopied": "Payment link copied to clipboard",
+      "linkError": "Could not create a payment link.",
+      "loadFailed": "Could not load payments.",
+      "method": "Payment method",
+      "noLinkReturned": "No payment link was returned. Try again.",
+      "online": "Online",
+      "record": "Record payment",
+      "recordConfirm": {
+        "message": "Record a {{amount}} payment ({{method}}) dated {{date}}?",
+        "title": "Record payment"
+      },
+      "recordError": "Could not record the payment.",
+      "recordSuccess": "Payment recorded",
+      "reference": "Reference",
+      "referencePlaceholder": "Reference (optional)",
+      "reverse": "Reverse",
+      "reverseAria": "Reverse payment of {{amount}}",
+      "reverseConfirm": {
+        "label": "Reverse payment",
+        "message": "This reverses the {{amount}} {{method}} payment and removes it from the invoice balance. This can't be undone.",
+        "title": "Reverse this payment?"
+      },
+      "reverseError": "Could not reverse the payment.",
+      "reverseSuccess": "Payment reversed",
+      "reverseInQuickbooksToo": "Reverse this in QuickBooks too",
+      "sendLink": "Send payment link",
+      "setUp": "Set up",
+      "shareLinkPrompt": "Share this payment link with your customer:",
+      "stripeNudge": "Connect Stripe to accept online card payments.",
+      "title": "Payments",
+      "viaStripe": "via Stripe",
+      "quickbooks": "QuickBooks",
+      "viaQuickbooks": "via QuickBooks",
+      "inQuickbooks": "In QuickBooks",
+      "syncingToQuickbooks": "Syncing…",
+      "quickbooksSyncFailed": "QuickBooks sync failed",
+      "currencyUnknown": "Your Stripe account's settlement currency hasn't been cached, so it couldn't be checked against this {{documentCurrency}} invoice. Refresh your Stripe account details under Settings → Integrations to enable the mismatch check."
+    },
+    "requestPayment": {
+      "invoiceSent": "Invoice sent",
+      "noEmailWarning": "No email was sent (no billing contact / email not configured)",
+      "paymentRequestSent": "Payment request sent",
+      "requestPayment": "Request payment",
+      "sendError": "Could not send the invoice.",
+      "sendInvoice": "Send invoice"
+    },
+    "summary": {
+      "balanceDue": "Balance due",
+      "paid": "Paid",
+      "subtotal": "Subtotal",
+      "tax": "Tax",
+      "total": "Total"
+    },
+    "terms": "Terms & Conditions",
+    "void": {
+      "button": "Void invoice",
+      "description": "Voiding releases billed work so it can be re-invoiced. This cannot be undone.",
+      "error": "Could not void the invoice.",
+      "reason": "Reason",
+      "reissue": "Reissue as a new draft",
+      "reissuedSuccess": "Invoice voided and reissued as a draft",
+      "success": "Invoice voided",
+      "title": "Void invoice"
+    },
+    "empty": "This invoice has no lines yet.",
+    "addContentInEditor": "Add lines in the Editor",
+    "linesScrollAria": "Invoice lines — scroll sideways for more columns",
+    "resetLink": {
+      "button": "Reset customer link",
+      "title": "Reset the customer link?",
+      "description": "Anyone with the current link will lose access — including the link in previously sent emails. The next send or copy creates a new link.",
+      "confirm": "Reset link",
+      "success": "Link reset — previous links no longer work",
+      "error": "Could not reset the link"
+    },
+    "accountingSync": {
+      "title": "QuickBooks sync",
+      "status": {
+        "pending": "Not pushed yet",
+        "synced": "Synced",
+        "error": "Sync failed",
+        "synced_with_tax_variance": "Synced with tax difference"
+      },
+      "taxVarianceHint": "QuickBooks calculated a different tax total. Compare both records before closing the period.",
+      "docNumber": "QuickBooks document {{docNumber}}",
+      "lastSynced": "Last synced {{when}}",
+      "syncing": "Syncing…",
+      "push": "Push to QuickBooks",
+      "pushed": "Invoice pushed to QuickBooks.",
+      "pushFailed": "Failed to push the invoice to QuickBooks.",
+      "voidedHint": "This invoice is voided — there is nothing to push to QuickBooks.",
+      "remoteDeletedHint": "This invoice was deleted in QuickBooks. Pushing again would create a duplicate — resolve it in QuickBooks first."
+    }
+  },
+  "invoiceDocument": {
+    "billTo": "Bill to",
+    "documentType": "Invoice",
+    "due": "Due",
+    "empty": "This invoice doesn’t have any line items yet.",
+    "fallbackTitle": "Invoice",
+    "issued": "Issued",
+    "preview": {
+      "description": "This is what your customer sees on their invoice.",
+      "downloadError": "Could not download the invoice PDF.",
+      "downloadPdf": "Download PDF",
+      "preparing": "Preparing…"
+    },
+    "table": {
+      "amount": "Amount",
+      "description": "Description",
+      "qty": "Qty",
+      "tax": "Tax",
+      "unitPrice": "Unit price"
+    },
+    "terms": "Terms & Conditions",
+    "ticketHeader": "Ticket #{{number}}",
+    "ticketWork": "Ticket work",
+    "totals": {
+      "amountDue": "Amount due",
+      "paid": "Paid",
+      "subtotal": "Subtotal",
+      "tax": "Tax",
+      "total": "Total"
+    }
+  },
+  "invoiceWorkspace": {
+    "backLabel": "Invoices",
+    "backToInvoices": "Back to invoices",
+    "draftTitle": "Draft invoice",
+    "errors": {
+      "loadFailed": "Failed to load invoice",
+      "missingId": "Missing invoice id",
+      "notFound": "Invoice not found.",
+      "unavailable": "Invoice unavailable."
+    },
+    "tabs": {
+      "editor": "Editor",
+      "preview": "Preview",
+      "detail": "Detail"
+    }
+  },
+  "invoicesPage": {
+    "accessDenied": "You don't have permission to view invoices.",
+    "bulk": {
+      "deleteDrafts": "Delete drafts",
+      "deletedVerb": "deleted",
+      "failed": "Bulk {{verb}} failed. Retry.",
+      "issue": "Issue",
+      "issuedVerb": "issued",
+      "limit": "Select up to {{limit}} at a time.",
+      "partial": "{{succeeded}} {{verb}}, {{skipped}} skipped{{failedText}}",
+      "success": "{{succeeded}} {{verb}}",
+      "void": "Void",
+      "voidedVerb": "voided",
+      "quickbooks": "Push to QuickBooks",
+      "quickbooksQueued": "{{enqueued}} queued for QuickBooks",
+      "quickbooksQueuedPartial": "{{enqueued}} queued for QuickBooks, {{skipped}} skipped",
+      "quickbooksQueuedFailed": "{{enqueued}} queued for QuickBooks, {{skipped}} skipped, {{failed}} failed to queue",
+      "quickbooksFailed": "Failed to queue the QuickBooks push. Retry."
+    },
+    "bulkDelete": {
+      "message": "Delete {{count}} selected invoice(s)? Only DRAFT invoices will be deleted; this cannot be undone.",
+      "title": "Delete draft invoices"
+    },
+    "bulkVoid": {
+      "description": "Voiding releases billed work so it can be re-invoiced. This cannot be undone.",
+      "reason": "Reason",
+      "submit": "Void invoices",
+      "title": "Void invoices"
+    },
+    "deposit": {
+      "paid": "Deposit paid",
+      "unpaid": "Deposit unpaid"
+    },
+    "dialog": {
+      "allBlockedByCurrency": "All unbilled work in this range is priced in another currency, so nothing could be assembled. Assemble a draft in that currency instead:",
+      "allSites": "All sites",
+      "assemble": "Assemble",
+      "assembleError": "Could not assemble an invoice for that range.",
+      "assembleFromWork": "Assemble from work",
+      "assembleIn": "Assemble in {{code}} ({{count}} items, {{amount}})",
+      "assembleSuccess": "Draft invoice assembled",
+      "blankInvoice": "Blank invoice",
+      "blockedByCurrency": "{{count}} unbilled items priced in {{code}} were left out — assemble a separate draft in {{code}} to bill them.",
+      "createDraft": "Create draft",
+      "createError": "Could not create a draft invoice.",
+      "createGenericError": "Could not create the invoice.",
+      "createSuccess": "Draft invoice created",
+      "currency": "Currency",
+      "currencyOrgDefault": "Organization default",
+      "description": "Assemble unbilled work into a draft, or start a blank invoice.",
+      "from": "From",
+      "selectOrganization": "Select an organization…",
+      "siteOptional": "Site (optional)",
+      "sourceAria": "Invoice source",
+      "title": "New invoice",
+      "to": "To",
+      "working": "Working…"
+    },
+    "empty": {
+      "description": "Assemble unbilled time and parts into a draft, or start a blank invoice.",
+      "filtered": "No invoices match these filters.",
+      "title": "No invoices yet"
+    },
+    "errors": {
+      "loadInvoices": "Failed to load invoices",
+      "loadOrganizations": "Failed to load organizations.",
+      "loadSites": "Failed to load sites."
+    },
+    "filters": {
+      "allStatuses": "All statuses",
+      "issuedFrom": "Issued from",
+      "issuedTo": "Issued to",
+      "searchAria": "Search invoices",
+      "searchPlaceholder": "Search number or org",
+      "statusAria": "Filter by status"
+    },
+    "newInvoice": "New invoice",
+    "stats": {
+      "drafts": "Drafts",
+      "needsFollowUp": "needs follow-up",
+      "notYetIssued": "not yet issued",
+      "open": "{{count}} open",
+      "outstanding": "Outstanding",
+      "overdue": "Overdue"
+    },
+    "subtitle": "Assemble, issue, and track customer invoices.",
+    "table": {
+      "balance": "Balance",
+      "draftInvoice": "Draft invoice",
+      "due": "Due",
+      "issued": "Issued",
+      "number": "Number",
+      "selectAll": "Select all invoices",
+      "selectInvoice": "Select invoice {{invoice}}",
+      "total": "Total"
+    },
+    "title": "Invoices",
+    "tryAgain": "Try again",
+    "exportBillables": "Export billables",
+    "exportBillablesDialogTitle": "Export billables"
+  },
+  "orgBillingSettings": {
+    "address": {
+      "city": "City",
+      "country": "Country",
+      "line1": "Address line 1",
+      "line2": "Address line 2",
+      "postal": "Postal code",
+      "region": "Region / state",
+      "title": "Billing address"
+    },
+    "contact": {
+      "description": "Quotes and invoices are emailed to this address. Without it, sending a proposal marks it Sent but nothing is emailed.",
+      "email": "Contact email",
+      "emailInvalid": "Enter a valid email address",
+      "emailPlaceholder": "billing@customer.example",
+      "name": "Contact name",
+      "title": "Billing contact"
+    },
+    "currency": {
+      "title": "Currency",
+      "description": "New quotes, invoices, contracts, time entries and parts for this organization are stamped with this currency. Nothing that already exists is changed.",
+      "label": "Billing currency",
+      "loading": "Checking what a change to {{currency}} would affect…",
+      "error": "The currency change summary could not be loaded.",
+      "panelTitle": "Change the billing currency to {{currency}}?",
+      "none": "Nothing in this organization is stamped in another currency.",
+      "groupTitle": "Stamped in {{currency}}",
+      "counts": {
+        "draftInvoices": "Draft invoices",
+        "draftQuotes": "Draft quotes",
+        "sentQuotes": "Sent quotes",
+        "viewedQuotes": "Viewed quotes",
+        "draftContracts": "Draft contracts",
+        "activeContracts": "Active contracts",
+        "pausedContracts": "Paused contracts",
+        "timeEntries": "Unbilled time entries",
+        "parts": "Unbilled parts"
+      },
+      "timeDetail": "{{ready}} ready to bill, {{running}} still running, {{nonBillable}} not billable, {{missingRate}} with no rate",
+      "partsDetail": "{{ready}} ready to bill, {{nonBillable}} not billable",
+      "amounts": "Labor {{labor}} · Parts {{parts}}",
+      "warningsTitle": "Configuration that will stop applying",
+      "warningRate": "The organization default hourly rate is set in {{currency}} and will no longer apply to new time entries.",
+      "warningCategories": "{{count}} ticket category rates in another currency will be skipped.",
+      "warningOverrides": "{{count}} organization catalog price overrides in another currency will be skipped.",
+      "recovery": "To bill the {{currency}} items above, assemble a draft in {{currency}}.",
+      "rateLess": "{{count}} unbilled time entries have hours but no hourly rate. Set a rate on them — a currency change does not affect them.",
+      "retention": "Only future documents, time entries and parts change. No amount is ever converted, and existing drafts, contracts and unbilled items keep the currency they were stamped with.",
+      "advisory": "These counts are a preview, not a promise — anything created after this preview is not included.",
+      "stale": "The billing currency changed to {{currency}} while you were reviewing. Check the refreshed summary and confirm again.",
+      "confirm": "Change currency",
+      "changing": "Changing…",
+      "cancel": "Cancel",
+      "changeError": "Failed to change the organization billing currency.",
+      "changeSuccess": "Organization billing currency updated"
+    },
+    "loadError": "Billing settings failed to load.",
+    "loading": "Loading billing settings…",
+    "saveButton": "Save billing settings",
+    "saveError": "Failed to save organization billing settings.",
+    "saveSuccess": "Organization billing settings saved",
+    "tax": {
+      "partnerDefault": "Partner default",
+      "taxExempt": "Tax exempt",
+      "taxId": "Tax ID",
+      "taxRate": "Tax rate (%)",
+      "title": "Tax"
+    }
+  },
+  "partnerBillingSettings": {
+    "company": {
+      "addressLine1": "Address line 1",
+      "addressLine2": "Address line 2",
+      "city": "City",
+      "country": "Country",
+      "defaultTerms": "Default terms & conditions",
+      "defaultTermsPlaceholder": "Payment terms, disclaimers, warranty language, etc.",
+      "description": "Shown as the seller on quotes and invoices.",
+      "name": "Company name",
+      "phone": "Phone",
+      "postal": "Postal code",
+      "region": "State / region",
+      "title": "Company contact",
+      "website": "Website"
+    },
+    "defaults": {
+      "aiStyle": "AI product copy style",
+      "aiStyleHelp": "Shapes how “Auto-fill from web” and “Polish with AI” write product names and descriptions on quotes, invoices, and catalog items. Leave blank for the default format.",
+      "aiStylePlaceholder": "Default: the item name is a short, generic customer-friendly name (\"Wireless Access Point\"); the description starts with the full product name, then bullet-point specs precise enough to verify an order against. Describe your own style here to override it.",
+      "autoTaxHardware": "Auto-tax hardware items",
+      "autoTaxHardwareHelp": "Newly imported hardware defaults to taxable.",
+      "autoEmailInvoice": "Email the invoice automatically when a quote is accepted",
+      "autoEmailInvoiceHelp": "When a customer accepts a proposal, the issued invoice is emailed right away with a secure view & pay link — no sign-in needed.",
+      "notifyOnBehalfAcceptance": "Email the customer when you record an acceptance on their behalf",
+      "notifyOnBehalfAcceptanceHelp": "When someone on your team accepts a quote for a customer, the customer gets a short note saying who recorded it and when, with the invoice number if one was issued. They can reply if it's wrong. Off by default.",
+      "currencyCode": "Currency code",
+      "defaultMarkup": "Default markup (%)",
+      "defaultTaxRate": "Default tax rate (%)",
+      "description": "Currency, tax, numbering, and terms applied to new quotes and invoices across your customers.",
+      "deviceAppendix": "Include billed devices appendix on invoice PDFs",
+      "deviceAppendixHelp": "Adds a page listing every device counted on each invoice line. Off by default; the choice is frozen when an invoice is issued.",
+      "documentPageSize": "Page size",
+      "documentPageSizeA4": "A4",
+      "documentPageSizeLetter": "Letter",
+      "documentTheme": "Document theme",
+      "documentThemeClassic": "Classic",
+      "documentThemeCondensed": "Condensed",
+      "invoiceFooter": "Invoice footer",
+      "invoiceFooterPlaceholder": "Payment instructions, thank-you note, etc.",
+      "invoiceNumberPrefix": "Invoice number prefix",
+      "markupHelp": "Default markup over distributor cost, used to pre-fill the sell price when importing catalog items. The resulting gross margin is shown as you import.",
+      "paymentTermsDays": "Payment terms (days)",
+      "title": "Billing defaults"
+    },
+    "loadError": "Billing settings failed to load.",
+    "loading": "Loading billing settings…",
+    "saveButton": "Save billing settings",
+    "saveError": "Failed to save billing settings.",
+    "saveSuccess": "Billing settings saved"
+  },
+  "shared": {
+    "documentWorkspace": {
+      "backAria": "Back to {{label}}"
+    },
+    "sortableTh": {
+      "ascending": "Ascending",
+      "descending": "Descending",
+      "sortBy": "Sort by {{label}}",
+      "sortByWithDirection": "Sort by {{label}}, {{direction}}"
+    },
+    "statusPill": {
+      "prefix": "Status:"
+    }
+  },
+  "partnerBillingSettingsTabs": {
+    "defaults": "Defaults",
+    "documents": "Documents",
+    "connections": "Connections",
+    "rates": "Rates"
+  },
+  "billingConnectionsTab": {
+    "accounting": {
+      "title": "Accounting",
+      "description": "Stripe and QuickBooks connect under Integrations — manage them there.",
+      "cta": "Manage accounting connections →"
+    },
+    "catalog": {
+      "title": "Catalog & distributors",
+      "description": "Product Catalog and distributor connections (Pax8, TD SYNNEX) live in two places — jump between them here.",
+      "catalogCta": "Open Product Catalog →",
+      "distributorsCta": "Open Distributors →"
+    }
+  },
+  "orgBillingProfile": {
+    "label": "Billing profile",
+    "inherit": "{{name}} (partner default)",
+    "noProfile": "No billing profile",
+    "unavailable": "Assigned profile unavailable",
+    "resolved": "Rates from {{name}}",
+    "allOtherWork": "All other work",
+    "billable": "Billable at {{rate}}/h",
+    "included": "Included",
+    "nonBillable": "Non-billable",
+    "noRate": "Billable — rate not configured",
+    "minimum": "{{outcome}} · {{minutes}} min minimum",
+    "rounding": "Round to {{minutes}} minutes",
+    "archivedWorkType": "Archived work type",
+    "mismatch": "The assigned billing profile is inactive or uses another currency. The matching partner default applies instead.",
+    "currencyWarning": "The assigned billing profile uses {{currency}}. After this change, the matching partner default will apply.",
+    "loadError": "Billing profiles could not be loaded.",
+    "saveError": "The billing profile could not be saved.",
+    "partialSave": "The billing profile was saved, but the other billing settings were not. Retry Save to finish."
+  },
+  "rates": {
+    "title": "Rates",
+    "description": "Set labour rates by billing profile and work type. Changes apply to new time entries.",
+    "create": "Add billing profile",
+    "loadError": "Could not load billing profiles. Try again.",
+    "saveError": "Could not save billing profile.",
+    "saved": "Billing profile saved.",
+    "empty": "Add a billing profile to configure labour rates.",
+    "profile": "Billing profile",
+    "allOtherWork": "All other work",
+    "actions": "Actions",
+    "default": "Default",
+    "clone": "Clone billing profile",
+    "setDefault": "Set as default",
+    "archive": "Archive",
+    "usageUnavailable": "Organization usage is unavailable.",
+    "edit": "Edit billing profile",
+    "name": "Name",
+    "currency": "Currency",
+    "rounding": "Rounding (minutes)",
+    "notes": "Notes",
+    "coverage": "Billing outcome",
+    "hourlyRate": "Hourly rate",
+    "minimum": "Minimum (minutes)",
+    "billable": "Billable",
+    "included": "Included",
+    "nonBillable": "Non-billable",
+    "noRate": "Billable · no rate set",
+    "billableAt": "Billable at {{rate}}/h",
+    "minimumSummary": "{{minutes}} min minimum",
+    "roundingSummary": "Round to {{minutes}} min",
+    "inherits": "Uses All other work",
+    "currencyHelp": "A default profile or a profile with rates cannot change currency. Blank rounding means no rounding."
+  }
+}

@@ -1,0 +1,243 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  applyPollFailure,
+  dedupeThreatDetections,
+  logSyncFailureServerSide,
+  normalizeSeverity,
+  normalizeThreatStatus,
+  resolveDeviceIdForAgent,
+  resolveAgentSyncTargetById,
+  truncateError
+} from './s1Sync';
+import { SentinelOneHttpError } from '../services/sentinelOne/client';
+
+describe('s1Sync helpers', () => {
+  it('deduplicates threat detections by SentinelOne threat ID', () => {
+    const deduped = dedupeThreatDetections([
+      { s1ThreatId: 'threat-a', severity: 'high' },
+      { s1ThreatId: 'threat-a', severity: 'high' },
+      { s1ThreatId: 'threat-b', severity: 'low' },
+    ]);
+
+    expect(deduped).toHaveLength(2);
+    expect(deduped.map((row) => row.s1ThreatId)).toEqual(['threat-a', 'threat-b']);
+  });
+
+  it('maps provider mitigation statuses to normalized threat states', () => {
+    expect(normalizeThreatStatus('resolved')).toBe('resolved');
+    expect(normalizeThreatStatus('quarantine_pending')).toBe('quarantined');
+    expect(normalizeThreatStatus('in_progress')).toBe('in_progress');
+    expect(normalizeThreatStatus('new')).toBe('active');
+  });
+
+  it('truncateError strips Authorization-bearer patterns before persisting to DB', () => {
+    // S1 puts the bearer token in a header; HTTP error messages can echo
+    // headers back. lastSyncError is read by operators in plain text — the
+    // redaction guards against any future error message that includes the
+    // header verbatim.
+    const out = truncateError(new Error('s1 fetch failed: Authorization: Bearer s1_token_secret at /web/api'));
+    expect(out).not.toContain('s1_token_secret');
+    expect(out).toContain('[REDACTED]');
+  });
+
+  it('truncateError reads only the body-free message of a SentinelOneHttpError', () => {
+    // The persisted lastSyncError column is fed by truncateError, which reads
+    // `.message`. SentinelOneHttpError keeps the upstream body OFF `.message`
+    // (it lives on `.responseBody`), so the tenant-visible column must never
+    // receive the raw upstream body. This pins that invariant: drift in either
+    // the error class or truncateError would leak the body into the DB column.
+    const out = truncateError(
+      new SentinelOneHttpError('GET', '/web/api/v2.1/agents', 401, 'SECRET_UPSTREAM_BODY')
+    );
+    expect(out).toBe('SentinelOne API GET /web/api/v2.1/agents failed (401)');
+    expect(out).not.toContain('SECRET_UPSTREAM_BODY');
+  });
+});
+
+describe('logSyncFailureServerSide', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('logs the status and a redacted responseBody for a SentinelOneHttpError', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    logSyncFailureServerSide(
+      { integrationId: 'int-1', orgId: 'org-1' },
+      new SentinelOneHttpError('GET', '/web/api/v2.1/agents', 500, 'Authorization: Bearer s1_secret')
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    // The logger calls console.error(label, JSON.stringify({...})). Join the
+    // raw string args of the call so we assert on the actual logged payload
+    // (the inner JSON is already a string — no double-encoding).
+    const logged = spy.mock.calls[0]!.map((arg) => String(arg)).join(' ');
+    expect(logged).toContain('"status":500');
+    // responseBody is redacted server-side even though the server log is
+    // allowed to carry more detail than the persisted column.
+    expect(logged).not.toContain('s1_secret');
+    expect(logged).toContain('[REDACTED]');
+  });
+
+  it('logs a plain Error via the fallback branch without throwing', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() =>
+      logSyncFailureServerSide({ actionId: 'act-1', orgId: 'org-1' }, new Error('boom'))
+    ).not.toThrow();
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('transitions action polling failures to terminal failure at threshold', () => {
+    const first = applyPollFailure({}, new Error('timeout'), 3);
+    expect(first.failureCount).toBe(1);
+    expect(first.shouldFail).toBe(false);
+
+    const second = applyPollFailure(first.payload, new Error('timeout'), 3);
+    expect(second.failureCount).toBe(2);
+    expect(second.shouldFail).toBe(false);
+
+    const third = applyPollFailure(second.payload, new Error('timeout'), 3);
+    expect(third.failureCount).toBe(3);
+    expect(third.shouldFail).toBe(true);
+    expect(third.error).toContain('timeout');
+  });
+});
+
+describe('normalizeSeverity', () => {
+  it('maps standard severity strings to canonical values', () => {
+    expect(normalizeSeverity('critical')).toBe('critical');
+    expect(normalizeSeverity('high')).toBe('high');
+    expect(normalizeSeverity('medium')).toBe('medium');
+    expect(normalizeSeverity('low')).toBe('low');
+  });
+
+  it('handles case-insensitive and compound strings', () => {
+    expect(normalizeSeverity('Critical')).toBe('critical');
+    expect(normalizeSeverity('HIGH')).toBe('high');
+    expect(normalizeSeverity(' Medium ')).toBe('medium');
+    expect(normalizeSeverity('High Severity')).toBe('high');
+    expect(normalizeSeverity('critical_severity')).toBe('critical');
+  });
+
+  it('returns unknown for non-string, empty, or unrecognized inputs', () => {
+    expect(normalizeSeverity('')).toBe('unknown');
+    expect(normalizeSeverity(null)).toBe('unknown');
+    expect(normalizeSeverity(undefined)).toBe('unknown');
+    expect(normalizeSeverity(42)).toBe('unknown');
+    expect(normalizeSeverity('garbage')).toBe('unknown');
+  });
+});
+
+describe('resolveDeviceIdForAgent', () => {
+  const candidates = {
+    byHostname: new Map([
+      ['desktop-1', 'device-aaa'],
+      ['server-web', 'device-bbb'],
+    ]),
+    byIp: new Map([
+      ['10.0.0.5', 'device-ccc'],
+      ['192.168.1.100', 'device-ddd'],
+    ]),
+  };
+
+  it('matches by hostname (case-insensitive, trimmed)', () => {
+    expect(resolveDeviceIdForAgent({ computerName: 'DESKTOP-1' }, candidates)).toBe('device-aaa');
+    expect(resolveDeviceIdForAgent({ computerName: ' Server-Web ' }, candidates)).toBe('device-bbb');
+  });
+
+  it('matches by IP from network interfaces when hostname does not match', () => {
+    const agent = {
+      computerName: 'unknown-host',
+      networkInterfaces: [
+        { inet: ['10.0.0.5'] },
+      ],
+    };
+    expect(resolveDeviceIdForAgent(agent, candidates)).toBe('device-ccc');
+  });
+
+  it('searches multiple interfaces and IPs', () => {
+    const agent = {
+      computerName: 'no-match',
+      networkInterfaces: [
+        { inet: ['172.16.0.1'] },
+        { inet: ['10.99.99.99', '192.168.1.100'] },
+      ],
+    };
+    expect(resolveDeviceIdForAgent(agent, candidates)).toBe('device-ddd');
+  });
+
+  it('returns null when no match found', () => {
+    const agent = {
+      computerName: 'no-match',
+      networkInterfaces: [{ inet: ['172.16.0.1'] }],
+    };
+    expect(resolveDeviceIdForAgent(agent, candidates)).toBeNull();
+  });
+
+  it('returns null for agent with no computerName and no networkInterfaces', () => {
+    expect(resolveDeviceIdForAgent({}, candidates)).toBeNull();
+  });
+
+  it('handles malformed networkInterfaces gracefully', () => {
+    const agent = {
+      computerName: 'no-match',
+      networkInterfaces: [null, 'not-an-object', { inet: 'not-an-array' }, { noInet: true }],
+    };
+    expect(resolveDeviceIdForAgent(agent, candidates)).toBeNull();
+  });
+
+  it('prioritizes hostname match over IP match', () => {
+    // Agent hostname matches device-aaa, but IP would match device-ccc
+    const agent = {
+      computerName: 'desktop-1',
+      networkInterfaces: [{ inet: ['10.0.0.5'] }],
+    };
+    expect(resolveDeviceIdForAgent(agent, candidates)).toBe('device-aaa');
+  });
+});
+
+describe('C2 site-id based routing helpers', () => {
+  const candidatesByOrg = new Map([
+    ['org-acme', {
+      byHostname: new Map([['desktop-acme', 'device-acme']]),
+      byIp: new Map(),
+    }],
+    ['org-other', {
+      byHostname: new Map(),
+      byIp: new Map(),
+    }],
+  ]);
+
+  it('routes agent to org via siteId when site is mapped', () => {
+    const siteOrgIds = new Map([['site-123', 'org-acme']]);
+    const agent = { id: 'a1', siteId: 'site-123', siteName: 'Acme', computerName: 'desktop-acme' } as Parameters<typeof resolveAgentSyncTargetById>[0];
+    const result = resolveAgentSyncTargetById(agent, siteOrgIds, candidatesByOrg);
+    expect(result).not.toBeNull();
+    expect(result!.orgId).toBe('org-acme');
+    expect(result!.deviceId).toBe('device-acme');
+  });
+
+  it('returns null (skip) when siteId is absent', () => {
+    const siteOrgIds = new Map([['site-123', 'org-acme']]);
+    const agent = { id: 'a2', siteId: null, siteName: 'Acme', computerName: 'desktop-acme' } as Parameters<typeof resolveAgentSyncTargetById>[0];
+    const result = resolveAgentSyncTargetById(agent, siteOrgIds, candidatesByOrg);
+    expect(result).toBeNull();
+  });
+
+  it('returns null (skip) when siteId is not mapped to an org (org_id IS NULL)', () => {
+    const siteOrgIds = new Map<string, string>(); // empty: no org mapped
+    const agent = { id: 'a3', siteId: 'site-123', siteName: 'Acme', computerName: 'desktop-acme' } as Parameters<typeof resolveAgentSyncTargetById>[0];
+    const result = resolveAgentSyncTargetById(agent, siteOrgIds, candidatesByOrg);
+    expect(result).toBeNull();
+  });
+
+  it('does not fall back to a default integration org when unmapped', () => {
+    // Regression guard: there is no "default org" in the partner-wide model.
+    // An unmapped site must produce null, never a fallback org.
+    const siteOrgIds = new Map([['site-999', 'org-acme']]);
+    const agent = { id: 'a4', siteId: 'site-999-different', siteName: 'Unknown', computerName: 'desktop-unknown' } as Parameters<typeof resolveAgentSyncTargetById>[0];
+    const result = resolveAgentSyncTargetById(agent, siteOrgIds, candidatesByOrg);
+    expect(result).toBeNull();
+  });
+});

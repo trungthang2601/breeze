@@ -1,0 +1,466 @@
+import { describe, it, expect } from 'vitest';
+import { getDocsForPath, DOCS_BASE_URL } from './docsMapping';
+
+describe('getDocsForPath', () => {
+  describe('exact matches', () => {
+    it('/devices maps to devices docs', () => {
+      const result = getDocsForPath('/devices');
+      expect(result.label).toBe('Devices');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/devices/`);
+    });
+
+    it('/ai-script-proposals/:id maps to the AI script authoring docs', () => {
+      const result = getDocsForPath('/ai-script-proposals/abc-123');
+      expect(result.label).toBe('AI Script Proposal');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/ai-script-authoring/`);
+    });
+
+    it('/settings/ai-agents maps to AI Agents docs (not the generic AI page)', () => {
+      const result = getDocsForPath('/settings/ai-agents');
+      expect(result.label).toBe('AI Agents');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/ai-agents/`);
+    });
+
+    it('/approvals maps to AI Agents docs', () => {
+      const result = getDocsForPath('/approvals');
+      expect(result.label).toBe('Approvals');
+      expect(result.url).toContain('/features/ai-agents/');
+    });
+
+    it('/ai-agents/runs maps to AI Agents docs', () => {
+      const result = getDocsForPath('/ai-agents/runs');
+      expect(result.label).toBe('AI Agents');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/ai-agents/`);
+    });
+
+    it('/ai-agents/runs/:id maps to AI Agents docs', () => {
+      const result = getDocsForPath('/ai-agents/runs/abc-123');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/ai-agents/`);
+    });
+
+    it('/ai-agents/impact beats the generic /ai-agents entry', () => {
+      const result = getDocsForPath('/ai-agents/impact');
+      expect(result.label).toBe('AI Impact');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/ai-impact/`);
+    });
+
+    it('/admin/llm-provider-catalog beats the generic /admin entry', () => {
+      const result = getDocsForPath('/admin/llm-provider-catalog');
+      expect(result.label).toBe('LLM Provider Catalog');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/bring-your-own-llm-key/`);
+    });
+
+    it('/admin still falls back to partner management', () => {
+      const result = getDocsForPath('/admin');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/reference/partner-management/`);
+    });
+
+    it('/alerts maps to alerts docs', () => {
+      const result = getDocsForPath('/alerts');
+      expect(result.label).toBe('Alerts');
+      expect(result.url).toContain('/features/alerts/');
+    });
+
+    it('/alerts/correlations maps to AI Insights docs', () => {
+      const result = getDocsForPath('/alerts/correlations');
+      expect(result.label).toBe('Alert Correlations');
+      expect(result.url).toContain('/features/ml-insights/');
+    });
+
+    it('/security/user-risk maps to user-risk docs (not generic security)', () => {
+      const result = getDocsForPath('/security/user-risk');
+      expect(result.label).toBe('User Risk');
+      expect(result.url).toContain('/features/user-risk/');
+    });
+
+    it('/security/edr maps to EDR docs (not generic security)', () => {
+      const result = getDocsForPath('/security/edr');
+      expect(result.label).toBe('EDR Operations');
+      expect(result.url).toContain('/features/edr-integrations/');
+    });
+
+    it('/fleet maps to fleet hygiene docs', () => {
+      const result = getDocsForPath('/fleet');
+      expect(result.label).toBe('Fleet Hygiene Findings');
+      expect(result.url).toContain('/features/fleet-hygiene/');
+    });
+
+    it('/scripts maps to scripts docs', () => {
+      const result = getDocsForPath('/scripts');
+      expect(result.label).toBe('Scripts');
+    });
+
+    it('/pam maps to privileged access docs', () => {
+      const result = getDocsForPath('/pam');
+      expect(result.label).toBe('Privileged Access');
+      expect(result.url).toContain('/features/pam/');
+    });
+
+    it('/timesheet maps to ticketing docs', () => {
+      const result = getDocsForPath('/timesheet');
+      expect(result.label).toBe('Timesheet');
+      expect(result.url).toContain('/features/ticketing/');
+    });
+
+    it('/jobs maps to automations docs (v0.113.0 nav rename)', () => {
+      const result = getDocsForPath('/jobs');
+      expect(result.label).toBe('Jobs');
+      expect(result.url).toContain('/features/automations/');
+    });
+
+    it('/monitoring maps to the Monitors hub, not the observability stack', () => {
+      const result = getDocsForPath('/monitoring');
+      expect(result.label).toBe('Monitoring');
+      expect(result.url).toContain('/features/monitors/');
+    });
+
+    it('/monitoring/network maps to network monitors docs', () => {
+      const result = getDocsForPath('/monitoring/network');
+      expect(result.url).toContain('/features/network-monitors/');
+    });
+
+    it('/settings/deliverable-templates maps to service deliverables docs', () => {
+      const result = getDocsForPath('/settings/deliverable-templates');
+      expect(result.url).toContain('/features/contracts/#service-deliverables');
+    });
+
+    it('/contracts maps to recurring contracts docs', () => {
+      const result = getDocsForPath('/contracts');
+      expect(result.label).toBe('Recurring Contracts');
+      expect(result.url).toContain('/features/contracts/');
+    });
+
+    it('/vulnerabilities maps to vulnerability management docs', () => {
+      const result = getDocsForPath('/vulnerabilities');
+      expect(result.label).toBe('Vulnerability Management');
+      expect(result.url).toContain('/features/vulnerability-management/');
+    });
+
+    it('/settings/catalog maps to product catalog docs', () => {
+      const result = getDocsForPath('/settings/catalog');
+      expect(result.label).toBe('Product Catalog');
+      expect(result.url).toContain('/features/product-catalog/');
+    });
+
+    it('/settings/billing maps to online payments docs', () => {
+      const result = getDocsForPath('/settings/billing');
+      expect(result.label).toBe('Online Payments');
+      expect(result.url).toContain('/features/online-payments/');
+    });
+
+    it('/billing/invoices maps to invoices docs, not generic billing', () => {
+      const result = getDocsForPath('/billing/invoices');
+      expect(result.label).toBe('Invoices');
+      expect(result.url).toContain('/features/invoices/');
+    });
+
+    it('/billing/quotes maps to quotes docs, not generic billing', () => {
+      const result = getDocsForPath('/billing/quotes');
+      expect(result.label).toBe('Quotes');
+      expect(result.url).toContain('/features/quotes/');
+    });
+
+    it('/billing/quotes/:id maps to quotes docs', () => {
+      const result = getDocsForPath('/billing/quotes/q-123');
+      expect(result.label).toBe('Quotes');
+      expect(result.url).toContain('/features/quotes/');
+    });
+  });
+
+  describe('prefix matches', () => {
+    it('/devices/abc-123 matches devices docs', () => {
+      const result = getDocsForPath('/devices/abc-123');
+      expect(result.label).toBe('Devices');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/devices/`);
+    });
+
+    it('/settings/users/some-id matches users entry', () => {
+      const result = getDocsForPath('/settings/users/some-id');
+      expect(result.label).toBe('Users & Roles');
+    });
+  });
+
+  describe('specificity — more-specific pattern wins', () => {
+    it('/settings/users matches Users & Roles, not generic Settings', () => {
+      const result = getDocsForPath('/settings/users');
+      expect(result.label).toBe('Users & Roles');
+      expect(result.url).toContain('/reference/users-and-roles/');
+    });
+
+    it('/settings/api-keys matches API Keys, not generic Settings', () => {
+      const result = getDocsForPath('/settings/api-keys');
+      expect(result.label).toBe('API Keys');
+    });
+
+    it('/settings/connected-apps maps to MCP server docs', () => {
+      const result = getDocsForPath('/settings/connected-apps');
+      expect(result.label).toBe('Connected Apps & MCP');
+      expect(result.url).toContain('/features/mcp-server/');
+    });
+
+    it('/alerts/rules matches Alert Rules, not generic Alerts', () => {
+      const result = getDocsForPath('/alerts/rules');
+      expect(result.label).toBe('Alert Rules');
+      expect(result.url).toContain('/features/alert-templates/');
+    });
+  });
+
+  describe('new mappings', () => {
+    it('/settings/webhooks maps to webhooks docs', () => {
+      const result = getDocsForPath('/settings/webhooks');
+      expect(result.label).toBe('Webhooks');
+      expect(result.url).toContain('/features/webhooks/');
+    });
+
+    it('/settings/integrations/huntress maps to EDR docs', () => {
+      const result = getDocsForPath('/settings/integrations/huntress');
+      expect(result.label).toBe('EDR Integrations');
+      expect(result.url).toContain('/features/edr-integrations/');
+    });
+
+    it('/settings/filters maps to filters docs', () => {
+      const result = getDocsForPath('/settings/filters');
+      expect(result.label).toBe('Filters & Search');
+      expect(result.url).toContain('/reference/filters-and-search/');
+    });
+
+    it('/remote/tools maps to system tools docs', () => {
+      const result = getDocsForPath('/remote/tools');
+      expect(result.label).toBe('System Tools');
+      expect(result.url).toContain('/features/system-tools/');
+    });
+
+    it('/remote/quick-support maps to the Quick Support section, not generic remote access', () => {
+      const result = getDocsForPath('/remote/quick-support');
+      expect(result.label).toBe('Quick Support');
+      expect(result.url).toContain('/features/remote-access/#quick-support-ad-hoc-sessions');
+    });
+
+    it('/setup maps to setup wizard docs', () => {
+      const result = getDocsForPath('/setup');
+      expect(result.label).toBe('Setup Wizard');
+      expect(result.url).toContain('/features/setup-wizard/');
+    });
+
+    it('/security/antivirus maps to antivirus exceptions docs', () => {
+      const result = getDocsForPath('/security/antivirus');
+      expect(result.label).toBe('Antivirus Exceptions');
+      expect(result.url).toContain('/deploy/antivirus-exceptions/');
+    });
+
+    it('/devices/groups maps to device groups docs, not the devices page', () => {
+      const result = getDocsForPath('/devices/groups');
+      expect(result.label).toBe('Device Groups');
+      expect(result.url).toContain('/features/device-groups/');
+    });
+
+    it('/devices/groups/some-id still maps to device groups, not the devices page', () => {
+      const result = getDocsForPath('/devices/groups/some-id');
+      expect(result.label).toBe('Device Groups');
+      expect(result.url).toContain('/features/device-groups/');
+    });
+
+    it('/integrations/webhooks maps to webhooks docs', () => {
+      const result = getDocsForPath('/integrations/webhooks');
+      expect(result.label).toBe('Webhooks');
+      expect(result.url).toContain('/features/webhooks/');
+    });
+
+    it('/alerts/channels maps to alerts docs', () => {
+      const result = getDocsForPath('/alerts/channels');
+      expect(result.label).toBe('Notification Channels');
+      expect(result.url).toContain('/features/alerts/');
+    });
+
+    it('/settings/sites maps to organizations docs', () => {
+      const result = getDocsForPath('/settings/sites');
+      expect(result.label).toBe('Sites');
+      expect(result.url).toContain('/reference/organizations-and-sites/');
+    });
+
+    it('/settings/roles maps to users & roles docs', () => {
+      const result = getDocsForPath('/settings/roles');
+      expect(result.label).toBe('Roles');
+      expect(result.url).toContain('/reference/users-and-roles/');
+    });
+  });
+
+  describe('root path', () => {
+    it('/ matches Getting Started', () => {
+      const result = getDocsForPath('/');
+      expect(result.label).toBe('Getting Started');
+      expect(result.url).toContain('/getting-started/quickstart/');
+    });
+  });
+
+  describe('unknown paths', () => {
+    it('returns base docs URL with Documentation label for unknown path', () => {
+      const result = getDocsForPath('/some-unknown-page');
+      expect(result.url).toBe(DOCS_BASE_URL);
+      expect(result.label).toBe('Documentation');
+    });
+
+    it('handles empty string input', () => {
+      // Empty string is normalized to "/" by the function
+      const result = getDocsForPath('');
+      expect(result.label).toBe('Getting Started');
+    });
+  });
+
+  describe('backup & incident routes', () => {
+    it('/backup maps to backup overview docs', () => {
+      const result = getDocsForPath('/backup');
+      expect(result.label).toBe('Backup');
+      expect(result.url).toContain('/backup/overview/');
+    });
+
+    it('/c2c maps to cloud-to-cloud backup docs', () => {
+      const result = getDocsForPath('/c2c');
+      expect(result.label).toBe('Cloud-to-Cloud Backup');
+      expect(result.url).toContain('/backup/cloud-to-cloud/');
+    });
+
+    it('/dr maps to disaster recovery docs', () => {
+      const result = getDocsForPath('/dr');
+      expect(result.label).toBe('Disaster Recovery');
+      expect(result.url).toContain('/backup/disaster-recovery/');
+    });
+
+    it('/incidents maps to incident response docs', () => {
+      const result = getDocsForPath('/incidents');
+      expect(result.label).toBe('Incident Response');
+      expect(result.url).toContain('/features/incident-response/');
+    });
+
+    it('/incidents/abc-123 matches incident response', () => {
+      const result = getDocsForPath('/incidents/abc-123');
+      expect(result.label).toBe('Incident Response');
+    });
+  });
+
+  describe('ticketing mappings', () => {
+    it('/tickets maps to ticketing docs', () => {
+      const result = getDocsForPath('/tickets');
+      expect(result.label).toBe('Ticketing');
+      expect(result.url).toContain('/features/ticketing/');
+    });
+
+    it('/tickets/abc-123 matches ticketing', () => {
+      const result = getDocsForPath('/tickets/abc-123');
+      expect(result.label).toBe('Ticketing');
+      expect(result.url).toContain('/features/ticketing/');
+    });
+
+    it('/settings/ticketing matches Ticketing, not generic Settings', () => {
+      const result = getDocsForPath('/settings/ticketing');
+      expect(result.label).toBe('Ticketing');
+      expect(result.url).toContain('/features/ticketing/');
+    });
+  });
+
+  describe('trailing slash normalization', () => {
+    it('/devices/ is treated the same as /devices', () => {
+      const withSlash = getDocsForPath('/devices/');
+      const withoutSlash = getDocsForPath('/devices');
+      expect(withSlash).toEqual(withoutSlash);
+    });
+  });
+
+  describe('v0.65.16 mappings', () => {
+    it('/admin/third-party-catalog matches patch management, not generic Admin', () => {
+      const result = getDocsForPath('/admin/third-party-catalog');
+      expect(result.label).toBe('Third-Party Catalog');
+      expect(result.url).toContain('/features/patch-management/');
+    });
+
+    it('/admin/account-deletion-requests matches account deletion, not generic Admin', () => {
+      const result = getDocsForPath('/admin/account-deletion-requests');
+      expect(result.label).toBe('Account Deletion Requests');
+      expect(result.url).toContain('/reference/account-deletion/');
+    });
+
+    it('/admin still falls back to Administration', () => {
+      const result = getDocsForPath('/admin');
+      expect(result.label).toBe('Administration');
+    });
+
+    it('/account/delete maps to account deletion docs', () => {
+      const result = getDocsForPath('/account/delete');
+      expect(result.url).toContain('/reference/account-deletion/');
+    });
+
+    it('/account/devices maps to mobile docs (trusted devices)', () => {
+      const result = getDocsForPath('/account/devices');
+      expect(result.label).toBe('Trusted Devices');
+      expect(result.url).toContain('/features/mobile/');
+    });
+
+    it('/account/connected-apps maps to MCP server docs', () => {
+      const result = getDocsForPath('/account/connected-apps');
+      expect(result.url).toContain('/features/mcp-server/');
+    });
+  });
+
+  describe('hash-aware per-tab docs', () => {
+    it('resolves a tab-specific doc when the hash matches a tab', () => {
+      const result = getDocsForPath('/software', '#policies');
+      expect(result.label).toBe('Software Policies');
+      expect(result.url).toBe(`${DOCS_BASE_URL}/features/software-policies/`);
+    });
+
+    it('accepts a hash without a leading # and only uses the first segment', () => {
+      const result = getDocsForPath('/software', 'policies/extra/segment');
+      expect(result.url).toContain('/features/software-policies/');
+    });
+
+    it('falls back to the page-level doc for an unknown hash', () => {
+      const result = getDocsForPath('/software', '#does-not-exist');
+      expect(result.label).toBe('Software');
+      expect(result.url).toContain('/features/software-inventory/');
+    });
+
+    it('falls back to the page-level doc when no hash is given', () => {
+      const result = getDocsForPath('/software');
+      expect(result.url).toContain('/features/software-inventory/');
+    });
+
+    it('ignores a hash on a path whose entry has no tabs map', () => {
+      const result = getDocsForPath('/alerts', '#anything');
+      expect(result.label).toBe('Alerts');
+      expect(result.url).toContain('/features/alerts/');
+    });
+  });
+
+  describe('previously-missing mappings', () => {
+    it('/dns-security now maps to DNS Security docs', () => {
+      const result = getDocsForPath('/dns-security');
+      expect(result.label).toBe('DNS Security');
+      expect(result.url).toContain('/features/dns-security/');
+    });
+  });
+
+  describe('v0.111.0 mappings', () => {
+    it('/organizations/:id maps to the organisation record page section', () => {
+      const result = getDocsForPath('/organizations/9f1c0c8e-0000-4000-8000-000000000000');
+      expect(result.label).toBe('Organization Record');
+      expect(result.url).toContain('/reference/organizations-and-sites/#the-organisation-record-page');
+    });
+
+    it('/settings/organizations still wins over /organizations', () => {
+      const result = getDocsForPath('/settings/organizations');
+      expect(result.label).toBe('Organizations');
+    });
+
+    it('/operator/tasks/:id maps to the AI Operator section', () => {
+      const result = getDocsForPath('/operator/tasks/9f1c0c8e-0000-4000-8000-000000000000');
+      expect(result.label).toBe('AI Operator Tasks');
+      expect(result.url).toContain('/features/ai-agents/#ai-operator-preview');
+    });
+
+    it('/operator maps to the AI Operator section', () => {
+      const result = getDocsForPath('/operator');
+      expect(result.label).toBe('AI Operator');
+      expect(result.url).toContain('/features/ai-agents/#ai-operator-preview');
+    });
+  });
+});

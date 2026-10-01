@@ -1,0 +1,196 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import '../../../lib/i18n';
+import { pax8Search, pax8Pricing, type Pax8Product, type Pax8PriceOption } from '../../../lib/api/distributors';
+import { computeMarginBreakdown, formatMarginSummary, feedCurrencyCode, feedMatchesCurrency } from '../../settings/marginMath';
+
+function toMoney(value: string): number | null {
+  if (!value.trim()) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Number(parsed.toFixed(2)) : null;
+}
+
+interface Props {
+  blockId: string;
+  busy: boolean;
+  /** The QUOTE's currency — the sell price typed here is stamped with it by
+   *  the caller, so a feed number is only prefilled/compared when the Pax8
+   *  term is priced in the same currency (no conversion, ever). */
+  currencyCode: string;
+  onImportAdd: (product: Pax8Product, term: Pax8PriceOption, sellPrice: number) => void;
+}
+
+export default function Pax8ProductLookup({ blockId, busy, currencyCode, onImportAdd }: Props) {
+  const { t } = useTranslation('billing');
+  // Quote-currency gate: a Pax8 term priced in another (or an unknown) currency
+  // never seeds the sell field and never feeds the margin preview — the
+  // operator must type a price in the quote currency. Never a 'USD' fallback.
+  const defaultSellPrice = useCallback((opt: Pax8PriceOption | undefined): string =>
+    opt && feedMatchesCurrency(opt.currencyCode, currencyCode) ? (opt.suggestedRetailPrice ?? opt.partnerBuyRate ?? '') : '',
+  [currencyCode]);
+  const [query, setQuery] = useState('');
+  const [products, setProducts] = useState<Pax8Product[]>([]);
+  const [pricing, setPricing] = useState<Record<string, Pax8PriceOption[]>>({});
+  const [termIndex, setTermIndex] = useState<Record<string, number>>({});
+  const [prices, setPrices] = useState<Record<string, string>>({});
+  const [searching, setSearching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // The gate has to survive a currency change made AFTER the lookup (#3775
+  // review #4). `prices` was seeded only when pricing loaded or a term was
+  // picked, while the note and margin recompute every render — so switching the
+  // quote currency with results on screen left the foreign-currency number in
+  // the field for Import & add to stamp with the NEW currency. Re-derive
+  // against each product's SELECTED term, and only on an actual currency
+  // change, so a hand-typed price survives ordinary re-renders.
+  const prevCurrency = useRef(currencyCode);
+  useEffect(() => {
+    if (prevCurrency.current === currencyCode) return;
+    prevCurrency.current = currencyCode;
+    setPrices(Object.fromEntries(products.map((p) => {
+      const options = pricing[p.pax8ProductId] ?? [];
+      return [p.pax8ProductId, defaultSellPrice(options[termIndex[p.pax8ProductId] ?? 0])];
+    })));
+  }, [currencyCode, products, pricing, termIndex, defaultSellPrice]);
+
+  const loadPricing = async (productId: string) => {
+    if (pricing[productId]) return;
+    try {
+      const res = await pax8Pricing(productId);
+      const body = (await res.json().catch(() => null)) as { data?: Pax8PriceOption[] } | null;
+      const options = body?.data ?? [];
+      setPricing((s) => ({ ...s, [productId]: options }));
+      setTermIndex((s) => ({ ...s, [productId]: 0 }));
+      const first = options[0];
+      if (first) setPrices((s) => ({ ...s, [productId]: defaultSellPrice(first) }));
+    } catch {
+      setPricing((s) => ({ ...s, [productId]: [] }));
+    }
+  };
+
+  const search = async () => {
+    const q = query.trim();
+    if (!q || searching) return;
+    setSearching(true);
+    setError(null);
+    try {
+      const res = await pax8Search(q);
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        setError(body?.error ?? t('quotes.pax8ProductLookup.searchFailed'));
+        setProducts([]);
+        return;
+      }
+      const body = (await res.json().catch(() => null)) as { data?: Pax8Product[] } | null;
+      const results = body?.data ?? [];
+      setProducts(results);
+      await Promise.all(results.map((p) => loadPricing(p.pax8ProductId)));
+    } catch {
+      setError(t('quotes.pax8ProductLookup.searchFailed'));
+      setProducts([]);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={query}
+          placeholder={t('quotes.pax8ProductLookup.placeholder')}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void search(); } }}
+          data-testid={`pax8-product-search-${blockId}`}
+          className="h-9 flex-1 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+        />
+        <button
+          type="button"
+          onClick={() => void search()}
+          disabled={searching || !query.trim()}
+          data-testid={`pax8-product-search-btn-${blockId}`}
+          className="inline-flex h-9 items-center rounded-md border px-3 text-sm font-medium hover:bg-muted disabled:opacity-50"
+        >
+          {searching ? t('quotes.pax8ProductLookup.searching') : t('common:actions.search')}
+        </button>
+      </div>
+
+      {error && <p className="text-xs text-destructive" data-testid={`pax8-product-error-${blockId}`}>{error}</p>}
+
+      {products.map((p) => {
+        const options = pricing[p.pax8ProductId] ?? [];
+        const idx = termIndex[p.pax8ProductId] ?? 0;
+        const term = options[idx];
+        const cost = term?.partnerBuyRate != null ? Number(term.partnerBuyRate) : null;
+        const priceVal = prices[p.pax8ProductId] ?? '';
+        const parsed = toMoney(priceVal);
+        const sameCurrency = term ? feedMatchesCurrency(term.currencyCode, currencyCode) : true;
+        const margin = sameCurrency ? computeMarginBreakdown(cost, parsed) : null;
+        const feedCurrency = feedCurrencyCode(term?.currencyCode);
+        return (
+          <div key={p.pax8ProductId} data-testid={`pax8-product-result-${p.pax8ProductId}`} className="rounded-md border bg-background/40 p-3 text-sm">
+            <div className="font-medium">{p.name}</div>
+            <div className="text-xs text-muted-foreground">
+              {p.vendorName ?? 'Pax8'}{p.vendorSku ? ` · ${p.vendorSku}` : ''}
+            </div>
+            {options.length > 0 && (
+              <div className="mt-2 flex items-center gap-2">
+                <label className="text-xs text-muted-foreground">{t('quotes.pax8ProductLookup.term')}</label>
+                <select
+                  value={idx}
+                  data-testid={`pax8-product-term-${p.pax8ProductId}`}
+                  onChange={(e) => {
+                    const next = Number(e.target.value);
+                    setTermIndex((s) => ({ ...s, [p.pax8ProductId]: next }));
+                    const opt = options[next];
+                    if (opt) setPrices((s) => ({ ...s, [p.pax8ProductId]: defaultSellPrice(opt) }));
+                  }}
+                  className="h-9 rounded-md border bg-background px-2 text-sm"
+                >
+                  {options.map((o, i) => (
+                    <option key={i} value={i}>
+                      {[o.commitmentTerm, o.billingTerm].filter(Boolean).join(' / ') || t('quotes.pax8ProductLookup.option', { number: i + 1 })}
+                      {o.partnerBuyRate ? ` — ${t('quotes.pax8ProductLookup.cost', { currency: feedCurrencyCode(o.currencyCode) ?? '?', amount: o.partnerBuyRate })}` : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <div className="mt-2 flex items-center gap-2">
+              <label className="text-xs text-muted-foreground">{t('quotes.pax8ProductLookup.sellPrice')}</label>
+              <input
+                type="number" min="0" step="0.01"
+                value={priceVal}
+                onChange={(e) => setPrices((s) => ({ ...s, [p.pax8ProductId]: e.target.value }))}
+                data-testid={`pax8-product-price-${p.pax8ProductId}`}
+                className="h-9 w-28 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+              />
+              <button
+                type="button"
+                onClick={() => { if (parsed != null && term) onImportAdd(p, term, parsed); }}
+                disabled={busy || parsed == null || !term}
+                data-testid={`pax8-product-add-${p.pax8ProductId}`}
+                className="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {t('quotes.pax8ProductLookup.importAndAdd')}
+              </button>
+            </div>
+            {term && !sameCurrency && (
+              <p className="mt-1.5 text-xs text-muted-foreground" data-testid={`pax8-product-currency-note-${p.pax8ProductId}`}>
+                {feedCurrency
+                  ? t('quotes.pax8ProductLookup.feedPriceIn', { feedCurrency, currency: currencyCode })
+                  : t('quotes.pax8ProductLookup.feedPriceCurrencyUnknown', { currency: currencyCode })}
+              </p>
+            )}
+            {margin && (
+              <p className={`mt-1.5 text-xs tabular-nums ${margin.profit < 0 ? 'text-destructive' : 'text-muted-foreground'}`} data-testid={`pax8-product-margin-${p.pax8ProductId}`}>
+                {formatMarginSummary(margin, currencyCode)}
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}

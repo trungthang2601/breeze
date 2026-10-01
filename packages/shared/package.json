@@ -1,0 +1,40 @@
+{
+  "name": "@breeze/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./types": "./src/types/index.ts",
+    "./validators": "./src/validators/index.ts",
+    "./constants": "./src/constants/index.ts",
+    "./m365": "./src/m365/index.ts",
+    "./reportPdf": "./src/reportPdf/index.ts",
+    "./canonicalize": "./src/canonicalize/index.ts",
+    "./canonicalize/vectors": "./src/canonicalize/vectors.ts",
+    "./m365/commsDigests": "./src/m365/commsDigests.ts",
+    "./m365/commsPlanVectors": "./src/m365/commsPlanVectors.ts",
+    "./pgErrors": "./src/pgErrors/index.ts",
+    "./testing/topologyFleet": "./src/testing/topologyFleet.ts",
+    "./validators/topology": "./src/validators/topology.ts",
+    "./validators/topologyConfiguration": "./src/validators/topologyConfiguration.ts",
+    "./validators/topologyDiagnostics": "./src/validators/topologyDiagnostics.ts"
+  },
+  "scripts": {
+    "test": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "disposable-email-domains": "^1.0.62",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.8",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.11"
+  }
+}

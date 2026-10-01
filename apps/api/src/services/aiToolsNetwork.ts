@@ -1,0 +1,923 @@
+/**
+ * AI Network Tools
+ *
+ * Tools for network change monitoring, baseline configuration, IP history, and discovery.
+ * - get_network_changes (Tier 1): Query network change events
+ * - acknowledge_network_device (Tier 2): Acknowledge a network change event
+ * - configure_network_baseline (Tier 2): Create/update network baseline configuration
+ * - get_ip_history (Tier 1): Query historical IP assignments
+ * - network_discovery (Tier 3): Initiate a network discovery scan
+ * - get_network_asset_reachability (Tier 1): Sourced, dated reachability for a discovered asset
+ */
+
+import { isIP } from 'node:net';
+import { z } from 'zod';
+import { maskOidShapedModel, nicVendorFromMac } from './assetIdentity';
+import { db } from '../db';
+import {
+  devices,
+  deviceIpHistory,
+  discoveredAssets,
+  networkBaselines,
+  networkChangeEvents,
+  sites,
+  type NetworkBaselineScanSchedule,
+} from '../db/schema';
+import { loadReachability } from './assetReachabilityLoader';
+import { deviceSiteDenied, siteScopeCondition, SITE_SCOPE_EMPTY_NOTE, deviceScopeCondition, filterToDeviceScope } from './aiToolsSiteScope';
+import { eq, and, desc, gte, inArray, lte, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import {
+  normalizeBaselineAlertSettings,
+  normalizeBaselineScanSchedule,
+} from './networkBaseline';
+import {
+  BaselineAuthorityUnsupportedError,
+  buildBaselineAuthorityEnvelope,
+  type BaselineAuthorityEnvelope,
+} from './networkBaselineAuthority';
+import { aiExecuteCommand } from './aiDispatch';
+
+type AiToolTier = 1 | 2 | 3 | 4;
+
+// ============================================
+// Local helpers
+// ============================================
+
+function normalizeIpLiteral(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  const withoutZone = trimmed.includes('%')
+    ? trimmed.slice(0, Math.max(trimmed.indexOf('%'), 0))
+    : trimmed;
+
+  const parsed = isIP(withoutZone);
+  if (parsed === 0) return null;
+  return parsed === 6 ? withoutZone.toLowerCase() : withoutZone;
+}
+
+async function verifyDeviceAccess(
+  deviceId: string,
+  auth: AuthContext,
+  requireOnline = false
+): Promise<{ device: typeof devices.$inferSelect } | { error: string }> {
+  if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
+    return { error: 'Device not found or access denied' };
+  }
+  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const orgCond = auth.orgCondition(devices.orgId);
+  if (orgCond) conditions.push(orgCond);
+  const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
+  if (!device) return { error: 'Device not found or access denied' };
+  // Site axis: deny devices outside the caller's site allowlist (no-op when unrestricted).
+  if (auth.canAccessSite && !auth.canAccessSite(device.siteId)) {
+    return { error: 'Device not found or access denied' };
+  }
+  if (requireOnline && device.status !== 'online')
+    return {
+      error: `Device ${device.hostname} is not online (status: ${device.status}). This tool needs a live connection; to run when the device reconnects use the Run Script / deployment tools instead.`,
+    };
+  return { device };
+}
+
+/**
+ * Site is an application-layer authorization axis; organization RLS does not
+ * enforce it. `allowedSiteIds === undefined` is the explicit unrestricted
+ * sentinel. Any restricted context that cannot prove access fails closed.
+ */
+function siteAccessDenied(auth: AuthContext, siteId: string | null | undefined): boolean {
+  if (auth.allowedSiteIds === undefined) return false;
+  return !auth.canAccessSite || !auth.canAccessSite(siteId);
+}
+
+
+// ============================================
+// Registration
+// ============================================
+
+/**
+ * SEC-2026-09-05-146 — same arming contract as the REST routes: an enabled
+ * recurring schedule created or changed through the AI/MCP tool is bound to the
+ * calling principal's live authority. Returns null when the schedule is
+ * disabled (nothing dispatches, so nothing needs an owner).
+ */
+async function armScheduleAuthority(
+  auth: AuthContext,
+  effect: { orgId: string; siteId: string; subnet: string; scanSchedule: NetworkBaselineScanSchedule },
+): Promise<BaselineAuthorityEnvelope | null> {
+  if (!effect.scanSchedule.enabled) return null;
+  return buildBaselineAuthorityEnvelope(auth, effect);
+}
+
+function jsonError(error: string): string {
+  return JSON.stringify({ error });
+}
+
+function resolveAssetOrgId(auth: AuthContext, requested?: string): { orgId: string } | { error: string } {
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) return { error: 'Organization context required' };
+    if (requested && requested !== auth.orgId) return { error: 'Access to this organization denied' };
+    return { orgId: auth.orgId };
+  }
+  if (auth.scope !== 'partner' && auth.scope !== 'system') return { error: 'Organization context required' };
+  if (requested) {
+    if (!auth.canAccessOrg(requested)
+      || (auth.scope === 'partner' && !(auth.accessibleOrgIds ?? []).includes(requested))) {
+      return { error: 'Access to this organization denied' };
+    }
+    return { orgId: requested };
+  }
+  if (auth.scope === 'partner') {
+    const orgs = auth.accessibleOrgIds ?? [];
+    if (orgs.length === 1) return { orgId: orgs[0]! };
+    return { error: 'orgId is required when partner has multiple organizations' };
+  }
+  return { error: 'orgId is required for system scope' };
+}
+
+// Named scalar columns only: never expose SNMP data, ports, or internal notes.
+// Built lazily to retain compatibility with older tests' partial schema mocks.
+function safeAssetProjection() {
+  return {
+    id: discoveredAssets.id, orgId: discoveredAssets.orgId, siteId: discoveredAssets.siteId,
+    assetType: discoveredAssets.assetType, approvalStatus: discoveredAssets.approvalStatus,
+    hostname: discoveredAssets.hostname, label: discoveredAssets.label,
+    ipAddress: discoveredAssets.ipAddress, macAddress: discoveredAssets.macAddress,
+    manufacturer: discoveredAssets.manufacturer, model: discoveredAssets.model,
+    linkedDeviceId: discoveredAssets.linkedDeviceId, detectedAssetType: discoveredAssets.detectedAssetType,
+    isOnline: discoveredAssets.isOnline, firstSeenAt: discoveredAssets.firstSeenAt, lastSeenAt: discoveredAssets.lastSeenAt,
+  };
+}
+
+export function registerNetworkTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+  registerTool({
+    tier: 1,
+    domain: 'network',
+    searchHint: 'discovered network devices, switches, printers, unmanaged assets on a customer LAN, MAC/IP/vendor',
+    deviceArgs: ['linkedDeviceId'],
+    definition: {
+      name: 'list_network_assets',
+      description: 'List discovered network assets with IP, MAC, model, linked device and last-seen time, filtered by organization, site, type or approval status.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          orgId: { type: 'string', description: 'Organization UUID' },
+          siteId: { type: 'string', description: 'Site UUID' },
+          approvalStatus: { type: 'string', enum: ['pending', 'approved', 'dismissed'], description: 'Approval status: pending, approved, dismissed' },
+          assetType: {
+            type: 'string',
+            enum: ['workstation', 'server', 'printer', 'router', 'switch', 'firewall', 'access_point', 'phone', 'iot', 'camera', 'nas', 'unknown', 'website', 'service'],
+            description: 'Type: workstation, server, printer, router, switch, firewall, access_point, phone, iot, camera, nas, unknown, website, service',
+          },
+          linkedDeviceId: { type: 'string', description: 'Linked managed device UUID' },
+          limit: { type: 'number', description: 'Maximum rows (default 50, maximum 200)' },
+        },
+      },
+    },
+    handler: async (input, auth) => {
+      const parsed = z.object({
+        orgId: z.string().guid().optional(), siteId: z.string().guid().optional(),
+        approvalStatus: z.enum(['pending', 'approved', 'dismissed']).optional(),
+        assetType: z.enum(['workstation', 'server', 'printer', 'router', 'switch', 'firewall', 'access_point', 'phone', 'iot', 'camera', 'nas', 'unknown', 'website', 'service']).optional(),
+        linkedDeviceId: z.string().guid().optional(), limit: z.number().finite().optional(),
+      }).safeParse(input);
+      if (!parsed.success) return jsonError('Invalid network asset filters');
+      const filters = parsed.data;
+      const resolved = resolveAssetOrgId(auth, filters.orgId);
+      if ('error' in resolved) return jsonError(resolved.error);
+      if (auth.allowedSiteIds?.length === 0) {
+        return JSON.stringify({ assets: [], showing: 0, note: SITE_SCOPE_EMPTY_NOTE });
+      }
+      if (filters.siteId && auth.allowedSiteIds && !auth.allowedSiteIds.includes(filters.siteId)) {
+        return jsonError('Access to this site denied');
+      }
+      if (auth.allowedDeviceIds?.length === 0) return JSON.stringify({ assets: [], showing: 0 });
+      const conditions: SQL[] = [eq(discoveredAssets.orgId, resolved.orgId)];
+      const siteCondition = filters.siteId ? eq(discoveredAssets.siteId, filters.siteId) : siteScopeCondition(auth, discoveredAssets.siteId);
+      if (siteCondition) conditions.push(siteCondition);
+      const deviceCondition = deviceScopeCondition(auth, discoveredAssets.linkedDeviceId);
+      if (deviceCondition) conditions.push(deviceCondition);
+      if (filters.approvalStatus) conditions.push(eq(discoveredAssets.approvalStatus, filters.approvalStatus));
+      if (filters.assetType) conditions.push(eq(discoveredAssets.assetType, filters.assetType));
+      if (filters.linkedDeviceId) conditions.push(eq(discoveredAssets.linkedDeviceId, filters.linkedDeviceId));
+      const limit = Math.min(200, Math.max(1, Math.trunc(filters.limit ?? 50)));
+      const rows = await db.select(safeAssetProjection()).from(discoveredAssets)
+        .where(and(...conditions)).orderBy(desc(discoveredAssets.lastSeenAt)).limit(limit);
+      const assets = rows.map((row) => ({ ...row, model: maskOidShapedModel(row.model), nicVendor: nicVendorFromMac(row.macAddress) }));
+      return JSON.stringify({ assets, showing: assets.length });
+    },
+  });
+
+  registerTool({
+    tier: 1,
+    domain: 'network',
+    searchHint: 'one discovered network asset by id: model, IP, MAC, linked device, last seen',
+    deviceArgs: [],
+    definition: {
+      name: 'get_network_asset',
+      description: 'Get a discovered network asset by UUID with its model, IP, MAC, linked device and last-seen time.',
+      input_schema: {
+        type: 'object', properties: { assetId: { type: 'string', description: 'Discovered asset UUID' } }, required: ['assetId'],
+      },
+    },
+    handler: async (input, auth) => {
+      const parsed = z.string().guid().safeParse(input.assetId);
+      if (!parsed.success) return jsonError('Asset not found');
+      if (!['organization', 'partner', 'system'].includes(auth.scope)
+        || (auth.scope === 'organization' && !auth.orgId)
+        || (auth.scope === 'partner' && !(auth.accessibleOrgIds ?? []).length)
+        || auth.allowedSiteIds?.length === 0 || auth.allowedDeviceIds?.length === 0) return jsonError('Asset not found');
+      const conditions: SQL[] = [eq(discoveredAssets.id, parsed.data)];
+      const orgCondition = auth.orgCondition(discoveredAssets.orgId);
+      if (orgCondition) conditions.push(orgCondition);
+      const [row] = await db.select(safeAssetProjection()).from(discoveredAssets).where(and(...conditions)).limit(1);
+      if (!row || (auth.scope !== 'system' && !auth.canAccessOrg(row.orgId))
+        || (auth.scope === 'organization' && row.orgId !== auth.orgId)
+        || (auth.scope === 'partner' && !(auth.accessibleOrgIds ?? []).includes(row.orgId))
+        || deviceSiteDenied(auth, row.siteId, row.linkedDeviceId)) return jsonError('Asset not found');
+      return JSON.stringify({ asset: { ...row, model: maskOidShapedModel(row.model), nicVendor: nicVendorFromMac(row.macAddress) } });
+    },
+  });
+
+  // ============================================
+  // 1. get_network_changes - Tier 1 (read-only)
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'network',
+    searchHint: 'network changes, new, missing, changed or rogue devices',
+    definition: {
+      name: 'get_network_changes',
+      description: 'Query network change events (new devices, disappeared devices, changed devices, and rogue devices).',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          org_id: { type: 'string', description: 'Optional organization UUID filter' },
+          site_id: { type: 'string', description: 'Optional site UUID filter' },
+          baseline_id: { type: 'string', description: 'Optional baseline UUID filter' },
+          event_type: {
+            type: 'string',
+            enum: ['new_device', 'device_disappeared', 'device_changed', 'rogue_device'],
+            description: 'Filter by event type'
+          },
+          acknowledged: { type: 'boolean', description: 'Filter by acknowledgment status' },
+          since: { type: 'string', description: 'Only include changes detected after this ISO timestamp' },
+          limit: { type: 'number', description: 'Max results (default: 50, max: 200)' }
+        }
+      }
+    },
+    handler: async (input, auth) => {
+      const orgId = typeof input.org_id === 'string' ? input.org_id : undefined;
+      if (orgId && !auth.canAccessOrg(orgId)) {
+        return JSON.stringify({ error: 'Access to this organization denied' });
+      }
+
+      const conditions: SQL[] = [];
+      const orgCondition = auth.orgCondition(networkChangeEvents.orgId);
+      if (orgCondition) conditions.push(orgCondition);
+
+      if (auth.allowedSiteIds !== undefined) {
+        if (auth.allowedSiteIds.length === 0) {
+          return JSON.stringify({ events: [], count: 0 });
+        }
+        conditions.push(inArray(networkChangeEvents.siteId, auth.allowedSiteIds));
+      }
+
+      // Exact-device axis (#6096 I4) — UNCONDITIONAL, beside the site block and
+      // never inside it: a device-LESS analysis run carries `allowedDeviceIds`
+      // with no site axis at all. Change events name a device by
+      // `linkedDeviceId`, so a device-bound run would otherwise read every
+      // sibling finding at its own site. `inArray` also drops UNLINKED rows
+      // (rogue devices never matched to a fleet device): SQL `IN` is never true
+      // for NULL, and such a row is not attributable to the run's device.
+      const changeDeviceScope = deviceScopeCondition(auth, networkChangeEvents.linkedDeviceId);
+      if (changeDeviceScope) conditions.push(changeDeviceScope);
+
+      if (orgId) conditions.push(eq(networkChangeEvents.orgId, orgId));
+
+      const siteId = typeof input.site_id === 'string' ? input.site_id : undefined;
+      if (siteId && siteAccessDenied(auth, siteId)) {
+        return JSON.stringify({ error: 'Site not found or access denied' });
+      }
+      if (siteId) conditions.push(eq(networkChangeEvents.siteId, siteId));
+
+      const baselineId = typeof input.baseline_id === 'string' ? input.baseline_id : undefined;
+      if (baselineId) conditions.push(eq(networkChangeEvents.baselineId, baselineId));
+
+      const eventType = typeof input.event_type === 'string'
+        ? input.event_type as typeof networkChangeEvents.eventType.enumValues[number]
+        : undefined;
+      if (eventType) conditions.push(eq(networkChangeEvents.eventType, eventType));
+
+      if (typeof input.acknowledged === 'boolean') {
+        conditions.push(eq(networkChangeEvents.acknowledged, input.acknowledged));
+      }
+
+      const since = typeof input.since === 'string' ? new Date(input.since) : null;
+      if (since && !Number.isNaN(since.getTime())) {
+        conditions.push(gte(networkChangeEvents.detectedAt, since));
+      }
+
+      const limit = Math.min(Math.max(1, Number(input.limit) || 50), 200);
+
+      const events = await db
+        .select()
+        .from(networkChangeEvents)
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(networkChangeEvents.detectedAt))
+        .limit(limit);
+
+      return JSON.stringify({
+        events,
+        count: events.length
+      });
+    }
+  });
+
+  // ============================================
+  // 2. acknowledge_network_device - Tier 2 (mutating)
+  // ============================================
+
+  registerTool({
+    tier: 2,
+    domain: 'network',
+    searchHint: 'network change acknowledgement with optional investigation notes',
+    definition: {
+      name: 'acknowledge_network_device',
+      description: 'Acknowledge a network change event and optionally attach notes.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          event_id: { type: 'string', description: 'Network change event UUID' },
+          notes: { type: 'string', description: 'Optional acknowledgment notes' }
+        },
+        required: ['event_id']
+      }
+    },
+    handler: async (input, auth) => {
+      const eventId = input.event_id as string;
+      const notes = typeof input.notes === 'string' ? input.notes : undefined;
+
+      const conditions: SQL[] = [eq(networkChangeEvents.id, eventId)];
+      const orgCondition = auth.orgCondition(networkChangeEvents.orgId);
+      if (orgCondition) conditions.push(orgCondition);
+      if (auth.allowedSiteIds !== undefined) {
+        if (auth.allowedSiteIds.length === 0) {
+          return JSON.stringify({ error: 'Event not found or access denied' });
+        }
+        conditions.push(inArray(networkChangeEvents.siteId, auth.allowedSiteIds));
+      }
+      // Exact-device axis (#6096 I4): acknowledging is a write on a finding
+      // about a specific device. Same shape as get_network_changes above —
+      // applied whether or not the site axis is set, and excluding unlinked
+      // rows for a device-restricted caller.
+      const ackDeviceScope = deviceScopeCondition(auth, networkChangeEvents.linkedDeviceId);
+      if (ackDeviceScope) conditions.push(ackDeviceScope);
+
+      const [event] = await db
+        .select()
+        .from(networkChangeEvents)
+        .where(and(...conditions))
+        .limit(1);
+
+      if (!event) {
+        return JSON.stringify({ error: 'Event not found or access denied' });
+      }
+
+      // Defense in depth for malformed/stale fixtures and future query edits.
+      if (siteAccessDenied(auth, event.siteId)) {
+        return JSON.stringify({ error: 'Event not found or access denied' });
+      }
+      // Same, on the device axis: an unlinked (NULL) or sibling-linked event is
+      // outside a device-restricted caller's reach.
+      if (auth.allowedDeviceIds
+        && (!event.linkedDeviceId || !auth.allowedDeviceIds.includes(event.linkedDeviceId))) {
+        return JSON.stringify({ error: 'Event not found or access denied' });
+      }
+
+      if (event.acknowledged) {
+        return JSON.stringify({ error: 'Event already acknowledged' });
+      }
+
+      await db
+        .update(networkChangeEvents)
+        .set({
+          acknowledged: true,
+          acknowledgedBy: auth.user.id,
+          acknowledgedAt: new Date(),
+          notes: notes ?? event.notes
+        })
+        .where(eq(networkChangeEvents.id, event.id));
+
+      return JSON.stringify({ success: true, eventId: event.id });
+    }
+  });
+
+  // ============================================
+  // 3. configure_network_baseline - Tier 2 (mutating)
+  // ============================================
+
+  registerTool({
+    tier: 2,
+    domain: 'network',
+    searchHint: 'network baseline configuration, scheduled scan cadence and change alerts',
+    definition: {
+      name: 'configure_network_baseline',
+      description: 'Create or update network baseline configuration for scheduled scan cadence and alert behavior.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          baseline_id: { type: 'string', description: 'Existing baseline UUID to update' },
+          org_id: { type: 'string', description: 'Organization UUID (required for creation)' },
+          site_id: { type: 'string', description: 'Site UUID (required for creation)' },
+          subnet: { type: 'string', description: 'CIDR subnet, e.g. 192.168.1.0/24' },
+          scan_interval_hours: { type: 'number', description: 'Scan interval in hours (default 4)' },
+          alert_on_new_device: { type: 'boolean', description: 'Enable alerts for new devices' },
+          alert_on_disappeared: { type: 'boolean', description: 'Enable alerts for disappeared devices' },
+          alert_on_changed: { type: 'boolean', description: 'Enable alerts for changed devices' },
+          alert_on_rogue_device: { type: 'boolean', description: 'Enable alerts for rogue devices' }
+        }
+      }
+    },
+    handler: async (input, auth) => {
+      const baselineId = typeof input.baseline_id === 'string' ? input.baseline_id : undefined;
+
+      const intervalInput = Number(input.scan_interval_hours);
+      const hasIntervalInput = Number.isFinite(intervalInput) && intervalInput > 0;
+
+      const alertOverrides = {
+        newDevice: typeof input.alert_on_new_device === 'boolean' ? input.alert_on_new_device : undefined,
+        disappeared: typeof input.alert_on_disappeared === 'boolean' ? input.alert_on_disappeared : undefined,
+        changed: typeof input.alert_on_changed === 'boolean' ? input.alert_on_changed : undefined,
+        rogueDevice: typeof input.alert_on_rogue_device === 'boolean' ? input.alert_on_rogue_device : undefined
+      };
+
+      if (baselineId) {
+        if (auth.allowedSiteIds !== undefined && auth.allowedSiteIds.length === 0) {
+          return JSON.stringify({ error: 'Baseline not found or access denied' });
+        }
+        const conditions: SQL[] = [eq(networkBaselines.id, baselineId)];
+        const orgCondition = auth.orgCondition(networkBaselines.orgId);
+        if (orgCondition) conditions.push(orgCondition);
+        if (auth.allowedSiteIds !== undefined) {
+          conditions.push(inArray(networkBaselines.siteId, auth.allowedSiteIds));
+        }
+
+        const [baseline] = await db
+          .select()
+          .from(networkBaselines)
+          .where(and(...conditions))
+          .limit(1);
+
+        if (!baseline) {
+          return JSON.stringify({ error: 'Baseline not found or access denied' });
+        }
+
+        // Defense in depth: never mutate a row outside the current site ceiling.
+        if (siteAccessDenied(auth, baseline.siteId)) {
+          return JSON.stringify({ error: 'Baseline not found or access denied' });
+        }
+
+        const currentSchedule = normalizeBaselineScanSchedule(baseline.scanSchedule);
+        const currentAlertSettings = normalizeBaselineAlertSettings(baseline.alertSettings);
+
+        const schedulePatch: Record<string, unknown> = { ...currentSchedule };
+        if (hasIntervalInput) {
+          schedulePatch.intervalHours = Math.trunc(intervalInput);
+        }
+
+        const nextSchedule = normalizeBaselineScanSchedule(schedulePatch, currentSchedule.intervalHours);
+        const nextAlertSettings = normalizeBaselineAlertSettings({
+          ...currentAlertSettings,
+          ...(alertOverrides.newDevice !== undefined ? { newDevice: alertOverrides.newDevice } : {}),
+          ...(alertOverrides.disappeared !== undefined ? { disappeared: alertOverrides.disappeared } : {}),
+          ...(alertOverrides.changed !== undefined ? { changed: alertOverrides.changed } : {}),
+          ...(alertOverrides.rogueDevice !== undefined ? { rogueDevice: alertOverrides.rogueDevice } : {})
+        });
+
+        // SEC-146: re-arm the authority envelope and bump the generation for the
+        // changed schedule. Also the re-approval path for a legacy row.
+        let envelope: BaselineAuthorityEnvelope | null;
+        try {
+          envelope = await armScheduleAuthority(auth, {
+            orgId: baseline.orgId,
+            siteId: baseline.siteId,
+            subnet: baseline.subnet,
+            scanSchedule: nextSchedule,
+          });
+        } catch (error) {
+          if (error instanceof BaselineAuthorityUnsupportedError) {
+            return JSON.stringify({ error: error.message });
+          }
+          throw error;
+        }
+
+        await db
+          .update(networkBaselines)
+          .set({
+            scanSchedule: nextSchedule,
+            alertSettings: nextAlertSettings,
+            ...(envelope ?? {}),
+            authorityGeneration: (baseline.authorityGeneration ?? 0) + 1,
+            scheduleBlockedReason: null,
+            updatedAt: new Date()
+          })
+          .where(eq(networkBaselines.id, baseline.id));
+
+        return JSON.stringify({ success: true, baselineId: baseline.id, action: 'updated' });
+      }
+
+      const orgId = typeof input.org_id === 'string' ? input.org_id : undefined;
+      const siteId = typeof input.site_id === 'string' ? input.site_id : undefined;
+      const subnet = typeof input.subnet === 'string' ? input.subnet : undefined;
+
+      if (!orgId || !siteId || !subnet) {
+        return JSON.stringify({ error: 'org_id, site_id, and subnet are required when creating a baseline' });
+      }
+
+      if (!auth.canAccessOrg(orgId)) {
+        return JSON.stringify({ error: 'Access to this organization denied' });
+      }
+
+      if (siteAccessDenied(auth, siteId)) {
+        return JSON.stringify({ error: 'Site not found or access denied' });
+      }
+
+      const [site] = await db
+        .select({ id: sites.id })
+        .from(sites)
+        .where(and(eq(sites.id, siteId), eq(sites.orgId, orgId)))
+        .limit(1);
+
+      if (!site) {
+        return JSON.stringify({ error: 'Site not found for this organization' });
+      }
+
+      const nextSchedule = normalizeBaselineScanSchedule({
+        enabled: true,
+        intervalHours: hasIntervalInput ? Math.trunc(intervalInput) : undefined
+      });
+      const nextAlertSettings = normalizeBaselineAlertSettings({
+        ...(alertOverrides.newDevice !== undefined ? { newDevice: alertOverrides.newDevice } : {}),
+        ...(alertOverrides.disappeared !== undefined ? { disappeared: alertOverrides.disappeared } : {}),
+        ...(alertOverrides.changed !== undefined ? { changed: alertOverrides.changed } : {}),
+        ...(alertOverrides.rogueDevice !== undefined ? { rogueDevice: alertOverrides.rogueDevice } : {})
+      });
+
+      // ON CONFLICT DO NOTHING instead of catch-and-map: this handler runs inside
+      // the AI tool's withDbAccessContext transaction, which re-throws a caught
+      // unique violation as a raw PostgresError at commit time (see
+      // createCatalogItem in catalogService.ts). Suppressing the conflict at the
+      // statement level keeps the transaction healthy; zero returned rows means
+      // a baseline already exists for this org/site/subnet.
+      // SEC-146: bind the new recurring schedule to the calling principal.
+      let createEnvelope: BaselineAuthorityEnvelope | null;
+      try {
+        createEnvelope = await armScheduleAuthority(auth, {
+          orgId,
+          siteId,
+          subnet,
+          scanSchedule: nextSchedule,
+        });
+      } catch (error) {
+        if (error instanceof BaselineAuthorityUnsupportedError) {
+          return JSON.stringify({ error: error.message });
+        }
+        throw error;
+      }
+
+      const [created] = await db
+        .insert(networkBaselines)
+        .values({
+          orgId,
+          siteId,
+          subnet,
+          knownDevices: [],
+          scanSchedule: nextSchedule,
+          alertSettings: nextAlertSettings,
+          ...(createEnvelope ?? {}),
+          authorityGeneration: createEnvelope ? 1 : 0,
+          scheduleBlockedReason: null,
+          updatedAt: new Date()
+        })
+        .onConflictDoNothing()
+        .returning({ id: networkBaselines.id });
+
+      if (!created) {
+        return JSON.stringify({ error: 'Baseline already exists for this org/site/subnet' });
+      }
+
+      return JSON.stringify({ success: true, baselineId: created.id, action: 'created' });
+    }
+  });
+
+  // ============================================
+  // 4. get_ip_history - Tier 1 (auto-execute)
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    deviceArgs: ['device_id'],
+    domain: 'network',
+    searchHint: 'historical IP assignments, device address timeline and reverse lookup at a point in time',
+    definition: {
+      name: 'get_ip_history',
+      description: 'Query historical IP assignments. Supports timeline mode (device_id) and reverse lookup mode (ip_address + at_time).',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          device_id: { type: 'string', description: 'Device UUID for timeline mode' },
+          ip_address: { type: 'string', description: 'IP address for reverse lookup mode' },
+          at_time: { type: 'string', description: 'ISO timestamp used with ip_address for reverse lookup mode' },
+          since: { type: 'string', description: 'Optional timeline lower bound (ISO timestamp)' },
+          until: { type: 'string', description: 'Optional timeline upper bound (ISO timestamp)' },
+          interface_name: { type: 'string', description: 'Optional interface name filter' },
+          assignment_type: { type: 'string', enum: ['dhcp', 'static', 'vpn', 'link-local', 'unknown'], description: 'Optional assignment type filter' },
+          active_only: { type: 'boolean', description: 'Only include active assignments (default false)' },
+          limit: { type: 'number', description: 'Max rows to return (default 100, max 500)' },
+        },
+      },
+    },
+    handler: async (input, auth) => {
+      const deviceId = typeof input.device_id === 'string' ? input.device_id : undefined;
+      const rawIpAddress = typeof input.ip_address === 'string' ? input.ip_address : undefined;
+      const ipAddress = rawIpAddress ? normalizeIpLiteral(rawIpAddress) : undefined;
+      const atTime = typeof input.at_time === 'string' ? input.at_time : undefined;
+      const since = typeof input.since === 'string' ? input.since : undefined;
+      const until = typeof input.until === 'string' ? input.until : undefined;
+      const interfaceName = typeof input.interface_name === 'string' ? input.interface_name : undefined;
+      const assignmentType = typeof input.assignment_type === 'string' ? input.assignment_type : undefined;
+      const activeOnly = input.active_only === true;
+      const parsedLimit = Number(input.limit);
+      const limit = Number.isFinite(parsedLimit)
+        ? Math.min(Math.max(Math.trunc(parsedLimit), 1), 500)
+        : 100;
+
+      if (deviceId) {
+        const access = await verifyDeviceAccess(deviceId, auth);
+        if ('error' in access) return JSON.stringify({ error: access.error });
+
+        const conditions: SQL[] = [eq(deviceIpHistory.deviceId, deviceId)];
+
+        if (since) {
+          const sinceDate = new Date(since);
+          if (Number.isNaN(sinceDate.getTime())) {
+            return JSON.stringify({ error: 'Invalid since timestamp' });
+          }
+          conditions.push(gte(deviceIpHistory.lastSeen, sinceDate));
+        }
+
+        if (until) {
+          const untilDate = new Date(until);
+          if (Number.isNaN(untilDate.getTime())) {
+            return JSON.stringify({ error: 'Invalid until timestamp' });
+          }
+          conditions.push(lte(deviceIpHistory.firstSeen, untilDate));
+        }
+
+        if (interfaceName) {
+          conditions.push(eq(deviceIpHistory.interfaceName, interfaceName));
+        }
+
+        if (assignmentType) {
+          conditions.push(eq(deviceIpHistory.assignmentType, assignmentType as typeof deviceIpHistory.assignmentType.enumValues[number]));
+        }
+
+        if (activeOnly) {
+          conditions.push(eq(deviceIpHistory.isActive, true));
+        }
+
+        const history = await db
+          .select()
+          .from(deviceIpHistory)
+          .where(and(...conditions))
+          .orderBy(desc(deviceIpHistory.firstSeen))
+          .limit(limit);
+
+        return JSON.stringify({
+          mode: 'timeline',
+          device_id: deviceId,
+          hostname: access.device.hostname,
+          history,
+          count: history.length,
+        });
+      }
+
+      if (ipAddress) {
+        if (!atTime) {
+          return JSON.stringify({
+            error: 'at_time is required when ip_address is provided',
+          });
+        }
+
+        const targetTime = new Date(atTime);
+        if (Number.isNaN(targetTime.getTime())) {
+          return JSON.stringify({ error: 'Invalid at_time timestamp' });
+        }
+        if (targetTime.getTime() > Date.now()) {
+          return JSON.stringify({ error: 'at_time cannot be in the future' });
+        }
+
+        const conditions: SQL[] = [
+          eq(deviceIpHistory.ipAddress, ipAddress),
+          lte(deviceIpHistory.firstSeen, targetTime),
+          gte(deviceIpHistory.lastSeen, targetTime),
+        ];
+
+        if (auth.allowedSiteIds !== undefined) {
+          if (auth.allowedSiteIds.length === 0) {
+            return JSON.stringify({
+              mode: 'reverse_lookup',
+              ip_address: ipAddress,
+              at_time: atTime,
+              results: [],
+              count: 0,
+            });
+          }
+          conditions.push(inArray(devices.siteId, auth.allowedSiteIds));
+        }
+
+        const orgCondition = auth.orgCondition(deviceIpHistory.orgId);
+        if (orgCondition) {
+          conditions.push(orgCondition);
+        }
+
+        // Exact-device axis (#6086): "which device held this IP" is otherwise
+        // answered org-wide, so a device-bound run learns about siblings. The
+        // axis is independent of the site block above — a device-less analysis
+        // run carries `allowedDeviceIds` with no `allowedSiteIds` at all.
+        const deviceCondition = deviceScopeCondition(auth, deviceIpHistory.deviceId);
+        if (deviceCondition) {
+          conditions.push(deviceCondition);
+        }
+
+        if (interfaceName) {
+          conditions.push(eq(deviceIpHistory.interfaceName, interfaceName));
+        }
+
+        if (assignmentType) {
+          conditions.push(eq(deviceIpHistory.assignmentType, assignmentType as typeof deviceIpHistory.assignmentType.enumValues[number]));
+        }
+
+        const results = await db
+          .select({
+            ipHistory: deviceIpHistory,
+            device: devices,
+          })
+          .from(deviceIpHistory)
+          .innerJoin(devices, eq(deviceIpHistory.deviceId, devices.id))
+          .where(and(...conditions))
+          .orderBy(desc(deviceIpHistory.firstSeen))
+          .limit(limit);
+
+        const visibleResults = filterToDeviceScope(
+          auth,
+          results.filter((row) => !siteAccessDenied(auth, row.device.siteId)),
+          (row) => row.device.id,
+        );
+
+        return JSON.stringify({
+          mode: 'reverse_lookup',
+          ip_address: ipAddress,
+          at_time: atTime,
+          results: visibleResults.map((row) => ({
+            device: {
+              id: row.device.id,
+              hostname: row.device.hostname,
+              osType: row.device.osType,
+            },
+            assignment: {
+              interfaceName: row.ipHistory.interfaceName,
+              assignmentType: row.ipHistory.assignmentType,
+              firstSeen: row.ipHistory.firstSeen,
+              lastSeen: row.ipHistory.lastSeen,
+              isActive: row.ipHistory.isActive,
+            },
+          })),
+          count: visibleResults.length,
+        });
+      }
+
+      if (rawIpAddress && !ipAddress) {
+        return JSON.stringify({ error: 'Invalid ip_address format' });
+      }
+
+      return JSON.stringify({
+        error: 'Either device_id (timeline) or ip_address + at_time (reverse lookup) must be provided',
+      });
+    }
+  });
+
+  // ============================================
+  // 5. get_network_asset_reachability - Tier 1 (read-only)
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'network',
+    searchHint: 'printer, switch, AP, camera or NAS reachability with evidence source and age',
+    definition: {
+      name: 'get_network_asset_reachability',
+      description:
+        'Report network asset reachability with evidence source and age. Always state both when answering; never report bare "online". Unverified means no recent check, not down.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          asset_id: { type: 'string', description: 'Discovered asset UUID' },
+        },
+        required: ['asset_id'],
+      },
+    },
+    handler: async (input, auth) => {
+      const assetId = typeof input.asset_id === 'string' ? input.asset_id : '';
+      if (!assetId) return JSON.stringify({ error: 'asset_id is required' });
+
+      // Org axis via RLS + the explicit predicate; site axis app-layer, fail closed.
+      const conditions: SQL[] = [eq(discoveredAssets.id, assetId)];
+      const orgCondition = auth.orgCondition(discoveredAssets.orgId);
+      if (orgCondition) conditions.push(orgCondition);
+      if (auth.allowedSiteIds !== undefined) {
+        if (auth.allowedSiteIds.length === 0) return JSON.stringify({ error: 'Asset not found or access denied' });
+        conditions.push(inArray(discoveredAssets.siteId, auth.allowedSiteIds));
+      }
+      // Exact-device axis, independent of the site axis (a device-LESS run has
+      // no `allowedSiteIds`). `inArray` is never true for NULL, so an asset not
+      // linked to a Breeze device is invisible to a device-restricted run —
+      // same fail-closed rule as `assertMonitorSiteAccess` (#6086).
+      const assetDeviceCondition = deviceScopeCondition(auth, discoveredAssets.linkedDeviceId);
+      if (assetDeviceCondition) conditions.push(assetDeviceCondition);
+
+      const [asset] = await db
+        .select({
+          id: discoveredAssets.id,
+          label: discoveredAssets.label,
+          hostname: discoveredAssets.hostname,
+          ipAddress: discoveredAssets.ipAddress,
+          assetType: discoveredAssets.assetType,
+          siteId: discoveredAssets.siteId,
+        })
+        .from(discoveredAssets)
+        .where(and(...conditions))
+        .limit(1);
+
+      if (!asset) return JSON.stringify({ error: 'Asset not found or access denied' });
+      if (siteAccessDenied(auth, asset.siteId)) return JSON.stringify({ error: 'Asset not found or access denied' });
+
+      const reachability = (await loadReachability([asset.id])).get(asset.id) ?? null;
+
+      return JSON.stringify({
+        asset: {
+          id: asset.id,
+          name: asset.label ?? asset.hostname ?? asset.ipAddress ?? asset.id,
+          assetType: asset.assetType,
+          ipAddress: asset.ipAddress,
+        },
+        reachability,
+      });
+    },
+  });
+
+  // ============================================
+  // 6. network_discovery - Tier 3 (requires approval)
+  // ============================================
+
+  registerTool({
+    tier: 3,
+    deviceArgs: ['deviceId'],
+    domain: 'network',
+    searchHint: 'network discovery scan from a managed device to find nearby assets',
+    definition: {
+      name: 'network_discovery',
+      description: 'Initiate a network discovery scan from a device to find other devices on the network.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID to scan from' },
+          subnet: { type: 'string', description: 'CIDR subnet to scan (e.g., "192.168.1.0/24")' },
+          scanType: { type: 'string', enum: ['ping', 'arp', 'full'], description: 'Type of scan (default: ping)' }
+        },
+        required: ['deviceId']
+      }
+    },
+    handler: async (input, auth) => {
+      const deviceId = input.deviceId as string;
+
+      const access = await verifyDeviceAccess(deviceId, auth, true);
+      if ('error' in access) return JSON.stringify({ error: access.error });
+
+      const result = await aiExecuteCommand(auth, 'network_discovery', deviceId, 'network_discovery', {
+        subnet: input.subnet,
+        scanType: input.scanType ?? 'ping'
+      }, { userId: auth.user.id, timeoutMs: 120000 });
+
+      return JSON.stringify(result);
+    }
+  });
+}

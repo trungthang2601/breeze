@@ -1,0 +1,161 @@
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { BookOpen, ExternalLink, Loader2, X } from 'lucide-react';
+import { useHelpStore } from '@/stores/helpStore';
+import { isDocsEmbeddableOrigin } from '@/lib/docsEmbed';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+export default function HelpPanel() {
+  const { t } = useTranslation('common');
+  const { isOpen, docsUrl, label, toggle, close } = useHelpStore();
+  const [iframeLoaded, setIframeLoaded] = useState(false);
+  const [iframeError, setIframeError] = useState(false);
+  // Only mount the docs iframe once the panel has actually been opened. The
+  // panel is always rendered (it slides in/out via CSS transform), but a
+  // mounted iframe loads docs.breezermm.com (+ its Cloudflare RUM beacon) on
+  // every page — those external requests trip the app CSP and spam
+  // report-only violations into the console on every navigation. Latching on
+  // first open means zero docs traffic until the user asks for help, and it
+  // stays mounted afterwards so reopening on the same page is instant.
+  const [hasOpened, setHasOpened] = useState(isOpen);
+  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+  const canEmbedDocs = currentOrigin ? isDocsEmbeddableOrigin(currentOrigin) : true;
+  const localizedLabel = label === 'Documentation'
+    ? t('longTail.help.HelpPanel.documentation')
+    : label;
+
+  useEffect(() => {
+    if (isOpen) setHasOpened(true);
+  }, [isOpen]);
+
+  // Keyboard shortcut: Cmd+Shift+H to toggle
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'h') {
+        e.preventDefault();
+        toggle();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [toggle]);
+
+  useEffect(() => {
+    setIframeLoaded(false);
+    setIframeError(false);
+  }, [docsUrl]);
+
+  // Timeout fallback if iframe never loads
+  useEffect(() => {
+    if (!isOpen || !canEmbedDocs || iframeLoaded || iframeError) return;
+    const timer = setTimeout(() => {
+      if (!iframeLoaded) {
+        console.warn('[HelpPanel] Iframe load timed out after 15s:', docsUrl);
+        setIframeError(true);
+      }
+    }, 15000);
+    return () => clearTimeout(timer);
+  }, [isOpen, docsUrl, canEmbedDocs, iframeLoaded, iframeError]);
+
+  const handleOpenInNewTab = () => {
+    window.open(docsUrl, '_blank', 'noopener,noreferrer');
+  };
+
+  return (
+    <>
+      <div
+        data-testid="help-panel"
+        // When collapsed the panel slides off-screen via transform but stays
+        // mounted (transition:persist). `inert` + pointer-events-none make the
+        // off-canvas shell truly non-interactive so it can't intercept clicks
+        // meant for page content on wide layouts, and its (off-viewport) Close
+        // control drops out of the focus/hit-test order (#1419).
+        inert={!isOpen}
+        className={`fixed right-0 top-0 z-40 flex h-full w-[400px] flex-col border-l bg-card shadow-2xl transition-transform duration-300 ${
+          isOpen ? 'translate-x-0' : 'translate-x-full pointer-events-none'
+        }`}
+      >
+        <div className="flex items-center justify-between border-b bg-card px-4 py-3">
+          <div className="flex items-center gap-2">
+            <BookOpen className="h-4 w-4 text-primary" />
+            <span className="text-sm font-semibold text-foreground">{localizedLabel}</span>
+          </div>
+
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={handleOpenInNewTab}
+              className="flex items-center gap-1 rounded px-2 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              title={t('longTail.help.HelpPanel.openInNewTab')}
+            >
+              <ExternalLink className="h-4 w-4" />
+              <span>{t('longTail.help.HelpPanel.openInNewTab')}</span>
+            </button>
+            <button
+              type="button"
+              onClick={close}
+              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              title={t('longTail.help.HelpPanel.closeShortcut')}
+              aria-label={t('longTail.help.HelpPanel.closeShortcut')}
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+
+        <div className="relative flex flex-1">
+          {canEmbedDocs && hasOpened && !iframeLoaded && !iframeError && (
+            <div className="absolute inset-0 flex items-center justify-center bg-card">
+              <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+            </div>
+          )}
+
+          {(!canEmbedDocs || iframeError) && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-card">
+              <p className="max-w-xs text-center text-sm text-muted-foreground">
+                {canEmbedDocs
+                  ? t('longTail.help.HelpPanel.loadError')
+                  : t('longTail.help.HelpPanel.embedBlocked')}
+              </p>
+              {!canEmbedDocs && currentOrigin && (
+                <code className="rounded bg-muted px-2 py-1 text-xs text-muted-foreground">{currentOrigin}</code>
+              )}
+              <button
+                type="button"
+                onClick={handleOpenInNewTab}
+                className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-muted"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                {t('longTail.help.HelpPanel.openInNewTab')}
+              </button>
+            </div>
+          )}
+
+          {canEmbedDocs && hasOpened && (
+            <iframe
+              key={docsUrl}
+              src={docsUrl}
+              title={localizedLabel}
+              onLoad={() => setIframeLoaded(true)}
+              onError={(e) => {
+                console.error('[HelpPanel] Iframe failed to load:', docsUrl, e);
+                setIframeError(true);
+              }}
+              className="h-full w-full flex-1 border-0 bg-background"
+            />
+          )}
+        </div>
+      </div>
+
+      {isOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/30 lg:hidden"
+          onClick={close}
+        />
+      )}
+    </>
+  );
+}

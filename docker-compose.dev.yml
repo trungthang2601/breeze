@@ -1,0 +1,209 @@
+# Development Docker Compose with mounted code for hot-reloading
+# Usage: docker compose -f docker-compose.dev.yml up
+
+services:
+  # PostgreSQL Database
+  postgres:
+    # pgvector/pgvector is the official postgres image + the vector extension
+    # (drop-in superset; same data dir format as postgres:16).
+    image: pgvector/pgvector:pg16
+    container_name: breeze-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: breeze
+      POSTGRES_PASSWORD: breeze
+      POSTGRES_DB: breeze
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    networks:
+      - breeze-dev-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U breeze -d breeze"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # Redis for BullMQ job queue
+  redis:
+    image: redis:7-alpine
+    container_name: breeze-redis-dev
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_dev_data:/data
+    networks:
+      - breeze-dev-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 3s
+
+  # Hono API Service (Development with hot-reload)
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api.dev
+    container_name: breeze-api-dev
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://breeze:breeze@postgres:5432/breeze
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required - set in .env.dev}
+      API_PORT: 3001
+      AGENT_ENROLLMENT_SECRET: ${AGENT_ENROLLMENT_SECRET:?AGENT_ENROLLMENT_SECRET is required - set in .env.dev}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: breeze
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-auto}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-noreply@breeze.local}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-noreply@breeze.local}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      MAILGUN_API_KEY: ${MAILGUN_API_KEY:-}
+      MAILGUN_DOMAIN: ${MAILGUN_DOMAIN:-}
+      MAILGUN_BASE_URL: ${MAILGUN_BASE_URL:-https://api.mailgun.net}
+      MAILGUN_FROM: ${MAILGUN_FROM:-noreply@breeze.local}
+      # #3905 — transport deadlines (optional; in-code defaults apply when unset).
+      SMTP_TIMEOUT_MS: ${SMTP_TIMEOUT_MS:-}
+      MAILGUN_TIMEOUT_MS: ${MAILGUN_TIMEOUT_MS:-}
+      TICKETS_INBOUND_DOMAIN: ${TICKETS_INBOUND_DOMAIN:-}
+      MAILGUN_INBOUND_SIGNING_KEY: ${MAILGUN_INBOUND_SIGNING_KEY:-}
+      LOG_LEVEL: debug
+      ENABLE_API_DOCS: "true"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # Hardware warranty lookups (all optional, OFF unless set). See
+      # https://docs.breezermm.com/deploy/environment/#warranty-lookups
+      DELL_CLIENT_ID: ${DELL_CLIENT_ID:-}
+      DELL_CLIENT_SECRET: ${DELL_CLIENT_SECRET:-}
+      LENOVO_API_KEY: ${LENOVO_API_KEY:-}
+      LENOVO_WARRANTY_ENABLED: ${LENOVO_WARRANTY_ENABLED:-}
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY is required - set in .env}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:?MFA_ENCRYPTION_KEY is required - set in .env}
+      METRICS_SCRAPE_TOKEN: ${METRICS_SCRAPE_TOKEN:-REDACTED_DEV_TOKEN}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:3001}
+      BINARY_SOURCE: ${BINARY_SOURCE:-github}
+      BREEZE_VERSION: ${BREEZE_VERSION:-latest}
+      # Built-in extensions are off by default per deployment; dev is where
+      # Workspace is developed, and this stack's postgres is already pgvector —
+      # hence the default of "true" here. Still interpolated (not hardcoded), so
+      # a developer can switch it off in .env to reproduce the default-off boot
+      # path without editing this file. Matches docker-compose.yml's convention.
+      BREEZE_WORKSPACE_ENABLED: ${BREEZE_WORKSPACE_ENABLED:-true}
+    ports:
+      - "3001:3001"
+    volumes:
+      # Mount source code for hot-reloading
+      - ./apps/api/src:/app/apps/api/src:cached
+      - ./apps/api/migrations:/app/apps/api/migrations:ro
+      - ./packages/shared/src:/app/packages/shared/src:cached
+      - ./ee/workspace/src:/app/ee/workspace/src:cached
+      - ./ee/workspace/migrations:/app/ee/workspace/migrations:ro
+      # The manifest is BAKED into the image, so without this mount a local edit
+      # to its tenancy / orgExportColumns is invisible to the running container
+      # while the migrations beside it are live — the two would silently drift.
+      - ./ee/workspace/manifest.json:/app/ee/workspace/manifest.json:ro
+      # Mount config files
+      - ./apps/api/package.json:/app/apps/api/package.json:ro
+      - ./apps/api/tsconfig.json:/app/apps/api/tsconfig.json:ro
+      - ./apps/api/drizzle.config.ts:/app/apps/api/drizzle.config.ts:ro
+      - ./packages/shared/package.json:/app/packages/shared/package.json:ro
+      - ./packages/shared/tsconfig.json:/app/packages/shared/tsconfig.json:ro
+      # Mount agent, viewer, and helper binaries for download endpoints
+      - ./agent/bin:/app/apps/api/agent/bin:ro
+      - ./viewer/bin:/app/apps/api/viewer/bin:ro
+      - ./helper/bin:/app/apps/api/helper/bin:ro
+      # Exclude node_modules (use container's)
+      - /app/node_modules
+      - /app/apps/api/node_modules
+      - /app/packages/shared/node_modules
+    networks:
+      - breeze-dev-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Astro Web Frontend (Development with hot-reload)
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web.dev
+    container_name: breeze-web-dev
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      HOST: 0.0.0.0
+      PORT: 4321
+      API_URL: http://api:3001
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:3001}
+    ports:
+      - "4321:4321"
+    volumes:
+      # Mount source code for hot-reloading
+      - ./apps/web/src:/app/apps/web/src:cached
+      - ./apps/web/public:/app/apps/web/public:cached
+      - ./packages/shared/src:/app/packages/shared/src:cached
+      # Mount config files
+      - ./apps/web/package.json:/app/apps/web/package.json:ro
+      - ./apps/web/tsconfig.json:/app/apps/web/tsconfig.json:ro
+      - ./apps/web/astro.config.mjs:/app/apps/web/astro.config.mjs:ro
+      - ./packages/shared/package.json:/app/packages/shared/package.json:ro
+      - ./packages/shared/tsconfig.json:/app/packages/shared/tsconfig.json:ro
+      # Exclude node_modules (use container's)
+      - /app/node_modules
+      - /app/apps/web/node_modules
+      - /app/packages/shared/node_modules
+    networks:
+      - breeze-dev-network
+    depends_on:
+      - api
+
+  # MinIO for S3-compatible object storage
+  minio:
+    image: minio/minio:latest
+    container_name: breeze-minio-dev
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_dev_data:/data
+    networks:
+      - breeze-dev-network
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 10s
+
+networks:
+  breeze-dev-network:
+    driver: bridge
+    name: breeze-dev-network
+
+volumes:
+  postgres_dev_data:
+    name: breeze-postgres-dev-data
+  redis_dev_data:
+    name: breeze-redis-dev-data
+  minio_dev_data:
+    name: breeze-minio-dev-data

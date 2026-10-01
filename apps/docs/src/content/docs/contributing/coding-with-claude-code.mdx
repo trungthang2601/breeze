@@ -1,0 +1,173 @@
+---
+title: Contributing Code with Claude Code
+description: How to pick up work, get it approved before you build, and hand it back ready to merge — the plan-driven contributor workflow for Breeze.
+sidebar:
+  order: 1
+  label: Coding with Claude Code
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from '@astrojs/starlight/components';
+
+This guide is for people who want to **write code** for Breeze. It assumes you'll
+work with [Claude Code](https://claude.com/claude-code) (or a compatible agent) —
+the repo ships a `CLAUDE.md` and a set of skills that hand the agent almost all
+the project's conventions automatically. Your job is to point it at the right
+work and to hand back finished, self-reviewed, green PRs.
+
+If you only want to report a bug or pitch an idea, you don't need any of this —
+see the top of [`CONTRIBUTING.md`](https://github.com/LanternOps/breeze/blob/main/CONTRIBUTING.md).
+
+## The one idea to internalize
+
+Work on Breeze is captured as **plan documents**. A plan spells out the goal,
+the architecture, the tech stack, and a checklist of tasks — it's a
+ready-to-implement work order, written for an agent to execute.
+
+That means a plan is two things at once:
+
+- **The work definition** — it's what there is to build.
+- **The approval** — if a plan exists and has been approved, the *what* and the
+  *how* are already agreed. You don't need a separate sign-off to start.
+
+<Aside type="caution" title="Don't write feature code without an approved plan">
+The plan **is** the approval gate. If there's no plan for what you want to do,
+the first deliverable is the plan — not the code. Write it, get a 👍, *then*
+build. This is the whole point of the workflow: we agree on the approach before
+anyone spends effort, so nothing gets built the wrong way.
+</Aside>
+
+## 1. Find something to build
+
+<Aside type="note" title="Work tracking lives on GitHub">
+This guide used to point at a folder of open plan documents in the repo. That
+folder has been reorganized and no longer reflects what's actually up for
+grabs, so don't mine `docs/superpowers/plans/` for work — it's an archive of
+completed, shipped plans kept for history. Work is tracked on GitHub issues,
+and the public roadmap at [breezermm.com/roadmap](https://breezermm.com/roadmap)
+shows shipped, in-progress, planned, and exploratory items straight from the
+public repository.
+</Aside>
+
+Until then, find work on the issue tracker:
+
+<CardGrid>
+  <LinkCard
+    title="Help wanted"
+    description="Open issues tagged for outside contributors."
+    href="https://github.com/LanternOps/breeze/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22help%20wanted%22"
+  />
+  <LinkCard
+    title="Good first issues"
+    description="Smaller, well-scoped starters."
+    href="https://github.com/LanternOps/breeze/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22"
+  />
+</CardGrid>
+
+<Steps>
+
+1. Browse the open issues above, or any open issue that interests you.
+
+2. Pick one that fits your appetite — some are small UI/CRUD jobs, some touch
+   deeper systems.
+
+3. Comment on the issue that you're taking it (so two people don't grab the
+   same one). Then start with a plan, as below.
+
+</Steps>
+
+## 2. …or propose your own
+
+Want to scratch your own itch? Great — but the plan comes first.
+
+<Steps>
+
+1. From the repo root, run Claude Code and use the **`brainstorming`** skill to
+   pin down intent and requirements, then **`writing-plans`** to produce the plan
+   document.
+
+2. Share the finished plan with Todd — attach it to the GitHub issue you're
+   working from (open one if there isn't one yet).
+
+3. Wait for approval on the *plan*. Once it's a 👍, it's an open work order like
+   any other — go build it.
+
+</Steps>
+
+<Aside type="tip">
+Proposing via a plan doc — not a draft PR — keeps the PR queue meaning exactly
+one thing: "ready to merge." Planning and in-progress work never sit in a PR.
+</Aside>
+
+## 3. Build it
+
+<Steps>
+
+1. Run Claude Code **from the repo root** so it loads `CLAUDE.md` and the project
+   skills automatically. Don't re-explain the conventions — they're already in
+   context.
+
+2. Follow the plan's **`REQUIRED SUB-SKILL`** note (usually
+   `subagent-driven-development` or `executing-plans`). Work the `- [ ]` tasks in
+   order and check them off.
+
+3. Write tests as you go — the **`breeze-testing`** and
+   `test-driven-development` skills cover the repo's patterns (Drizzle mocks,
+   Go table tests, the coverage checklist). New features are expected to ship
+   with tests.
+
+</Steps>
+
+<Aside type="caution" title="Some surfaces are Todd's call">
+`CLAUDE.md` flags high-blast-radius areas — tenant isolation / RLS, database
+migrations, auth, billing, and the org-erasure cascade contracts. If a plan
+leads you into one of these, follow the contract in `CLAUDE.md` exactly and flag
+it in the PR rather than improvising. When in doubt, ask before you touch it.
+</Aside>
+
+## 4. Before you hand it over
+
+Two things are **your** responsibility, not Todd's. A PR that skips them isn't
+ready.
+
+<Steps>
+
+1. **Make CI green yourself.** Mirror the gate locally and get it passing before
+   you open anything — `test-api`, `test-web`, and `test-agent` are the required
+   jobs. You fix your own reds; a red PR isn't on anyone's plate yet.
+
+2. **Self-review your own diff.** Run `/code-review` (or the
+   `pr-review-toolkit` agents) against your changes, address what it finds, and
+   *then* request a human review.
+
+</Steps>
+
+<LinkCard
+  title="Local CI gate — exact commands"
+  description="The functional + security preflight that mirrors CI, in CONTRIBUTING.md."
+  href="https://github.com/LanternOps/breeze/blob/main/CONTRIBUTING.md#pull-request-process"
+/>
+
+## 5. Open the PR
+
+A PR means **done, green, self-reviewed, ready to merge** — not a discussion
+venue and not work-in-progress.
+
+<Steps>
+
+1. Branch, and use [Conventional Commits](https://www.conventionalcommits.org/)
+   (`feat:`, `fix:`, `docs:`, …).
+
+2. Keep it to **one concern**. Don't mix a feature, a refactor, and a docs sweep
+   in one PR — small, single-purpose PRs review fast.
+
+3. Reference the plan and the issue you implemented in the PR description
+   (`Closes #NNN` if the PR completes the issue).
+
+4. Open it against `main`.
+
+</Steps>
+
+<Aside type="note">
+Squash-merge is the norm on this repo; merge commits are disabled. Todd handles
+the merge.
+</Aside>

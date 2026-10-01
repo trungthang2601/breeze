@@ -1,0 +1,302 @@
+import { z } from 'zod';
+import {
+  topologyDiagnosticCommandSchema,
+  topologyDiagnosticResultSchema,
+} from '@breeze/shared';
+
+export type CriticalResultFamily =
+  | 'restore'
+  | 'verification'
+  | 'vault'
+  | 'dr'
+  | 'topology_diagnostic';
+
+export type GenericCommandResultEnvelope = {
+  commandId: string;
+  status: 'completed' | 'failed' | 'timeout';
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  durationMs?: number;
+  error?: string;
+  result?: unknown;
+};
+
+export const CRITICAL_RESULT_STDOUT_MAX_BYTES = 1_048_576;
+export const CRITICAL_RESULT_STDERR_MAX_BYTES = 262_144;
+export const CRITICAL_RESULT_STRUCTURED_MAX_BYTES = 524_288;
+
+const RESTORE_COMMAND_TYPES = new Set([
+  'backup_restore',
+  'vm_restore_from_backup',
+  'vm_instant_boot',
+  'bare_metal_rebuild',
+]);
+
+const DR_COMMAND_TYPES = new Set([
+  'vm_restore_from_backup',
+  'vm_instant_boot',
+  'hyperv_restore',
+  'mssql_restore',
+  'bmr_recover',
+]);
+
+const VERIFICATION_COMMAND_TYPES = new Set(['backup_verify', 'backup_test_restore']);
+const TOPOLOGY_DIAGNOSTIC_COMMAND_TYPES = new Set(['network_diagnostic']);
+const VAULT_COMMAND_TYPES = new Set(['vault_sync']);
+
+const warningListSchema = z.union([
+  z.array(z.string().max(4096)).max(100),
+  z.string().max(10_000),
+]);
+
+export const restoreStructuredResultSchema = z.object({
+  snapshotId: z.string().min(1).max(255).optional(),
+  // 'refused' is the bare_metal_rebuild engine's preflight verdict (W05a); the
+  // helper reports it as a successful command and the server maps it.
+  status: z.enum(['completed', 'failed', 'partial', 'degraded', 'refused']).optional(),
+  filesRestored: z.number().int().nonnegative().optional(),
+  // v4 .int() caps at 2^53; cumulative byte totals can exceed it — keep v3
+  // semantics (integer, any magnitude) so a large backup isn't recorded failed.
+  bytesRestored: z.number().nonnegative().refine(Number.isInteger, 'expected integer').optional(),
+  filesFailed: z.number().int().nonnegative().optional(),
+  failedFiles: z.array(z.string().min(1).max(4096)).max(1000).optional(),
+  warnings: warningListSchema.optional(),
+  error: z.string().max(10_000).optional(),
+  stagingDir: z.string().max(4096).optional(),
+  stateApplied: z.boolean().optional(),
+  driversInjected: z.number().int().nonnegative().optional(),
+  validated: z.boolean().optional(),
+  vmName: z.string().max(255).optional(),
+  newVmId: z.string().max(255).optional(),
+  vhdxPath: z.string().max(4096).optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+  bootTimeMs: z.number().int().nonnegative().optional(),
+  backgroundSyncActive: z.boolean().optional(),
+  syncProgress: z.union([z.number(), z.record(z.string(), z.unknown())]).optional(),
+  databaseName: z.string().max(255).optional(),
+  restoredAs: z.string().max(255).optional(),
+  // W05a bare_metal_rebuild: the rebuild engine's Result fields the server keeps.
+  phaseReached: z.string().max(64).optional(),
+  refusal: z.string().max(10_000).optional(),
+  target: z.object({
+    kind: z.string().max(16),
+    path: z.string().max(4096),
+    imageSizeBytes: z.number().int().nonnegative().optional(),
+  }).passthrough().optional(),
+}).passthrough();
+
+export const backupVerificationStructuredResultSchema = z.object({
+  snapshotId: z.string().min(1).max(255).optional(),
+  status: z.enum(['passed', 'failed', 'partial']),
+  filesVerified: z.number().int().nonnegative().optional(),
+  filesFailed: z.number().int().nonnegative().optional(),
+  sizeBytes: z.number().nonnegative().refine(Number.isInteger, 'expected integer').optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+  restoreTimeSeconds: z.number().int().nonnegative().optional(),
+  restorePath: z.string().max(4096).optional(),
+  cleanedUp: z.boolean().optional(),
+  failedFiles: z.array(z.string().min(1).max(4096)).max(1000).optional(),
+  // #6350: files the BACKUP run never uploaded. They are absent from the
+  // manifest, so verification cannot observe them — the agent reads the count
+  // off the manifest and refuses `passed` when it is non-zero.
+  filesIncomplete: z.number().int().nonnegative().optional(),
+  warnings: warningListSchema.optional(),
+  error: z.string().max(10_000).optional(),
+}).passthrough();
+
+export const vaultSyncStructuredResultSchema = z.object({
+  vaultId: z.string().guid().optional(),
+  snapshotId: z.string().min(1).max(255).optional(),
+  vaultPath: z.string().min(1).max(4096).optional(),
+  fileCount: z.number().int().nonnegative().optional(),
+  totalBytes: z.number().nonnegative().refine(Number.isInteger, 'expected integer').optional(),
+  manifestVerified: z.boolean().optional(),
+  auto: z.boolean().optional(),
+  error: z.string().max(10_000).optional(),
+}).passthrough();
+
+export type CriticalCommandValidation =
+  | {
+      family: CriticalResultFamily;
+      structuredResult: Record<string, unknown>;
+      normalizedStdout: string | undefined;
+      serializedResultBytes: number;
+    }
+  | null;
+
+function byteLength(value?: string): number {
+  return typeof value === 'string' ? Buffer.byteLength(value, 'utf8') : 0;
+}
+
+function detectCriticalFamily(commandType: string): CriticalResultFamily | null {
+  if (TOPOLOGY_DIAGNOSTIC_COMMAND_TYPES.has(commandType)) return 'topology_diagnostic';
+  if (VERIFICATION_COMMAND_TYPES.has(commandType)) return 'verification';
+  if (VAULT_COMMAND_TYPES.has(commandType)) return 'vault';
+  if (DR_COMMAND_TYPES.has(commandType)) return 'dr';
+  if (RESTORE_COMMAND_TYPES.has(commandType)) return 'restore';
+  return null;
+}
+
+function ensureCriticalResultSizeLimits(envelope: GenericCommandResultEnvelope): void {
+  if (byteLength(envelope.stdout) > CRITICAL_RESULT_STDOUT_MAX_BYTES) {
+    throw new Error(`stdout exceeds ${CRITICAL_RESULT_STDOUT_MAX_BYTES} bytes`);
+  }
+  if (byteLength(envelope.stderr) > CRITICAL_RESULT_STDERR_MAX_BYTES) {
+    throw new Error(`stderr exceeds ${CRITICAL_RESULT_STDERR_MAX_BYTES} bytes`);
+  }
+  if (envelope.result !== undefined) {
+    let serialized = '';
+    try {
+      serialized = JSON.stringify(envelope.result);
+    } catch {
+      throw new Error('structured result payload is not JSON-serializable');
+    }
+    if (Buffer.byteLength(serialized, 'utf8') > CRITICAL_RESULT_STRUCTURED_MAX_BYTES) {
+      throw new Error(`structured result exceeds ${CRITICAL_RESULT_STRUCTURED_MAX_BYTES} bytes`);
+    }
+  }
+}
+
+// Agents encode the structured result as a JSON string (marshalResult → stdout),
+// and depending on the path it can arrive double-encoded (a JSON string whose
+// value is itself the JSON object). Parse repeatedly until we reach a non-string,
+// so critical-family validation (ensureObjectLike + the family schemas) sees an
+// object — otherwise verify/test-restore/restore results are rejected as "must be
+// a JSON object" and the record never leaves running.
+function deepJsonParse(value: unknown): unknown {
+  let current = value;
+  for (let i = 0; i < 3 && typeof current === 'string'; i++) {
+    try {
+      current = JSON.parse(current);
+    } catch {
+      return undefined;
+    }
+  }
+  return current;
+}
+
+function parseStructuredResult(envelope: GenericCommandResultEnvelope): unknown {
+  if (envelope.result !== undefined) {
+    return deepJsonParse(envelope.result);
+  }
+  if (!envelope.stdout) {
+    return undefined;
+  }
+  return deepJsonParse(envelope.stdout);
+}
+
+function ensureObjectLike(commandType: string, value: unknown): Record<string, unknown> {
+  if (!value) return {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`critical ${commandType} result must be a JSON object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+export function validateCriticalCommandResult(
+  commandType: string,
+  envelope: GenericCommandResultEnvelope,
+  options: { commandPayload?: unknown } = {}
+): CriticalCommandValidation {
+  const family = detectCriticalFamily(commandType);
+  if (!family) return null;
+
+  ensureCriticalResultSizeLimits(envelope);
+
+  const parsed = parseStructuredResult(envelope);
+
+  if (family === 'topology_diagnostic') {
+    if (envelope.status !== 'completed' && parsed === undefined) {
+      return { family, structuredResult: {}, normalizedStdout: envelope.stdout, serializedResultBytes: 0 };
+    }
+    if (parsed === undefined) {
+      throw new Error(`critical ${commandType} result is missing structured diagnostic data`);
+    }
+    const validated = topologyDiagnosticResultSchema.parse(ensureObjectLike(commandType, parsed));
+    // A digest is an integrity seal, never authorization: the ids and digest a
+    // result claims must equal the ones the SERVER pinned into the delivered
+    // command, so a result cannot be re-pointed at another run or attempt.
+    const command = topologyDiagnosticCommandSchema.safeParse(options.commandPayload);
+    if (!command.success) {
+      throw new Error(`critical ${commandType} result has no pinned command authority`);
+    }
+    if (
+      validated.runId !== command.data.runId ||
+      validated.attemptId !== command.data.attemptId ||
+      validated.commandId !== command.data.commandId ||
+      validated.planDigest !== command.data.planDigest
+    ) {
+      throw new Error(`critical ${commandType} result does not match its accepted plan`);
+    }
+    const normalizedStdout = JSON.stringify(validated);
+    return {
+      family,
+      structuredResult: validated as unknown as Record<string, unknown>,
+      normalizedStdout,
+      serializedResultBytes: Buffer.byteLength(normalizedStdout, 'utf8'),
+    };
+  }
+
+  if (family === 'verification') {
+    if (envelope.status !== 'completed' && parsed === undefined) {
+      return { family, structuredResult: {}, normalizedStdout: envelope.stdout, serializedResultBytes: 0 };
+    }
+    if (parsed === undefined) {
+      throw new Error(`critical ${commandType} result is missing structured verification data`);
+    }
+    const validated = backupVerificationStructuredResultSchema.parse(
+      ensureObjectLike(commandType, parsed)
+    );
+    const normalizedStdout = JSON.stringify(validated);
+    return {
+      family,
+      structuredResult: validated as Record<string, unknown>,
+      normalizedStdout,
+      serializedResultBytes: Buffer.byteLength(normalizedStdout, 'utf8'),
+    };
+  }
+
+  if (family === 'vault') {
+    if (envelope.status !== 'completed' && parsed === undefined) {
+      return { family, structuredResult: {}, normalizedStdout: envelope.stdout, serializedResultBytes: 0 };
+    }
+    if (parsed === undefined) {
+      throw new Error(`critical ${commandType} result is missing structured vault sync data`);
+    }
+    const validated = vaultSyncStructuredResultSchema.parse(
+      ensureObjectLike(commandType, parsed)
+    );
+    const normalizedStdout = JSON.stringify(validated);
+    return {
+      family,
+      structuredResult: validated as Record<string, unknown>,
+      normalizedStdout,
+      serializedResultBytes: Buffer.byteLength(normalizedStdout, 'utf8'),
+    };
+  }
+
+  if (envelope.status !== 'completed' && parsed === undefined) {
+    return { family, structuredResult: {}, normalizedStdout: envelope.stdout, serializedResultBytes: 0 };
+  }
+  if (parsed === undefined) {
+    throw new Error(`critical ${commandType} result is missing structured restore data`);
+  }
+  const validated = restoreStructuredResultSchema.parse(
+    ensureObjectLike(commandType, parsed)
+  );
+  const normalizedStdout = JSON.stringify(validated);
+  return {
+    family,
+    structuredResult: validated as Record<string, unknown>,
+    normalizedStdout,
+    serializedResultBytes: Buffer.byteLength(normalizedStdout, 'utf8'),
+  };
+}
+
+export function detectResultValidationFamily(commandType: string): CriticalResultFamily | null {
+  return detectCriticalFamily(commandType);
+}
+
+/** Canonical set of DR command types — import this instead of redefining locally. */
+export { DR_COMMAND_TYPES };

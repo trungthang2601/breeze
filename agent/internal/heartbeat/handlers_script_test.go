@@ -1,0 +1,1058 @@
+package heartbeat
+
+import (
+	"encoding/json"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/executor"
+	"github.com/breeze-rmm/agent/internal/ipc"
+	"github.com/breeze-rmm/agent/internal/remote/tools"
+	"github.com/breeze-rmm/agent/internal/sessionbroker"
+)
+
+// newTestHeartbeat creates a minimal Heartbeat for testing script handlers.
+func newTestHeartbeat(broker *sessionbroker.Broker) *Heartbeat {
+	return &Heartbeat{
+		executor:      executor.New(nil),
+		sessionBroker: broker,
+	}
+}
+
+func createTestSocketPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	clientCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			return
+		}
+		clientCh <- conn
+	}()
+
+	serverConn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	return serverConn, <-clientCh
+}
+
+// --- resolveRunAsSession tests ---
+
+func TestResolveRunAsSessionEmpty(t *testing.T) {
+	broker := sessionbroker.New("/tmp/test-broker.sock", nil)
+	session := resolveRunAsSession(broker, "")
+	if session != nil {
+		t.Fatal("expected nil for empty runAs")
+	}
+}
+
+func TestResolveRunAsSessionSystem(t *testing.T) {
+	broker := sessionbroker.New("/tmp/test-broker.sock", nil)
+	for _, v := range []string{"system", "System", "SYSTEM"} {
+		session := resolveRunAsSession(broker, v)
+		if session != nil {
+			t.Fatalf("expected nil for runAs=%q", v)
+		}
+	}
+}
+
+func TestResolveRunAsSessionElevated(t *testing.T) {
+	broker := sessionbroker.New("/tmp/test-broker.sock", nil)
+	session := resolveRunAsSession(broker, "elevated")
+	if session != nil {
+		t.Fatal("expected nil for elevated")
+	}
+}
+
+func TestResolveRunAsSessionUserNoSessions(t *testing.T) {
+	broker := sessionbroker.New("/tmp/test-broker.sock", nil)
+	session := resolveRunAsSession(broker, "user")
+	if session != nil {
+		t.Fatal("expected nil when no user sessions connected")
+	}
+}
+
+func TestResolveRunAsSessionUserPrefersRunAsUserScope(t *testing.T) {
+	now := time.Now()
+
+	systemSession := &sessionbroker.Session{
+		SessionID:     "system-helper",
+		Username:      "alice",
+		HelperRole:    ipc.HelperRoleSystem,
+		AllowedScopes: []string{"notify", "desktop"},
+		ConnectedAt:   now.Add(-2 * time.Minute),
+		LastSeen:      now.Add(-1 * time.Minute),
+	}
+	userSession := &sessionbroker.Session{
+		SessionID:     "user-helper",
+		Username:      "bob",
+		HelperRole:    ipc.HelperRoleUser,
+		AllowedScopes: []string{"notify", "run_as_user"},
+		ConnectedAt:   now.Add(-3 * time.Minute),
+		LastSeen:      now.Add(-30 * time.Second),
+	}
+
+	broker := newTestBrokerWithSessions(t, systemSession, userSession)
+
+	session := resolveRunAsSession(broker, "user")
+	if session != userSession {
+		t.Fatalf("resolveRunAsSession(user) = %+v, want %+v", session, userSession)
+	}
+}
+
+func TestResolveRunAsSessionSpecificUserNotFound(t *testing.T) {
+	broker := sessionbroker.New("/tmp/test-broker.sock", nil)
+	session := resolveRunAsSession(broker, "nonexistent")
+	if session != nil {
+		t.Fatal("expected nil for nonexistent user")
+	}
+}
+
+// --- handleScript tests ---
+
+func TestHandleScriptEmptyContent(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-empty",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":  "",
+			"language": "bash",
+		},
+	})
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed status, got %s", result.Status)
+	}
+	if result.Error == "" {
+		t.Fatal("expected error message for empty content")
+	}
+}
+
+func TestHandleScriptBashExecution(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-bash",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo 'hello from breeze'",
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s, stderr: %s)", result.Status, result.Error, result.Stderr)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", result.ExitCode)
+	}
+	if result.Stdout == "" {
+		t.Fatal("expected non-empty stdout")
+	}
+}
+
+func TestHandleScriptNonZeroExitCode(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-fail",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "exit 1",
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed status, got %s", result.Status)
+	}
+	if result.ExitCode != 1 {
+		t.Fatalf("expected exit code 1, got %d", result.ExitCode)
+	}
+}
+
+func TestHandleScriptDefaultLanguage(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	// No language specified, should default to bash
+	result := handleScript(h, Command{
+		ID:   "cmd-default-lang",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo 'default lang'",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s)", result.Status, result.Error)
+	}
+}
+
+func TestHandleScriptRunAsSystemFallsThrough(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-system",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo 'system context'",
+			"language":       "bash",
+			"runAs":          "system",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	// runAs=system should execute directly
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s)", result.Status, result.Error)
+	}
+}
+
+func TestHandleScriptRunAsUserNoHelper(t *testing.T) {
+	// When no user helper is connected, runAs=user must fail fast with the
+	// real reason — before the local executor is involved — instead of the
+	// old misleading "downgraded to SYSTEM" fallthrough (#1009 symptom).
+	broker := sessionbroker.New("/tmp/test-broker-no-helper.sock", nil)
+	h := newTestHeartbeat(broker)
+
+	result := handleScript(h, Command{
+		ID:   "cmd-user-noop",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo 'fallback'",
+			"language":       "bash",
+			"runAs":          "user",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed (no helper for runAs=user), got %s", result.Status)
+	}
+	if !strings.Contains(result.Error, "no eligible session found") {
+		t.Fatalf("expected fail-fast error naming the missing session, got: %q", result.Error)
+	}
+	if !strings.Contains(result.Error, "script was not executed") {
+		t.Fatalf("error must state the script did not run, got: %q", result.Error)
+	}
+}
+
+func TestHandleScriptRunAsUserNoBroker(t *testing.T) {
+	// Same fail-fast contract when there is no session broker at all
+	// (non-service mode) — previously this fell through to a late executor
+	// rejection.
+	h := newTestHeartbeat(nil)
+
+	result := handleScript(h, Command{
+		ID:   "cmd-user-nobroker",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo 'x'",
+			"language":       "bash",
+			"runAs":          "user",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed, got %s", result.Status)
+	}
+	if !strings.Contains(result.Error, "script was not executed") {
+		t.Fatalf("expected fail-fast error, got: %q", result.Error)
+	}
+}
+
+func TestHandleScriptWithParameters(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-params",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo $BREEZE_PARAM_GREETING",
+			"language":       "bash",
+			"timeoutSeconds": 10,
+			"parameters":     map[string]any{"greeting": "hello-world"},
+		},
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s)", result.Status, result.Error)
+	}
+	if result.Stdout == "" {
+		t.Fatal("expected parameter value in stdout")
+	}
+}
+
+func TestHandleScriptTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping timeout test in short mode")
+	}
+
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-timeout",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "sleep 300",
+			"language":       "bash",
+			"timeoutSeconds": 1,
+		},
+	})
+
+	if result.Status != "timeout" {
+		t.Fatalf("expected timeout status, got %s", result.Status)
+	}
+}
+
+func TestHandleScriptCancel(t *testing.T) {
+	h := newTestHeartbeat(nil)
+
+	// Cancel with missing executionId
+	result := handleScriptCancel(h, Command{
+		ID:      "cmd-cancel-missing",
+		Type:    tools.CmdScriptCancel,
+		Payload: map[string]any{},
+	})
+	if result.Status != "failed" {
+		t.Fatalf("expected failed for missing executionId, got %s", result.Status)
+	}
+
+	// A nonexistent execution is NO LONGER a failed result (#3525): it is the
+	// structured `not_found` outcome on a success result, because the server
+	// closes cancel_state differently for not_found than for a failed kill and
+	// an error string cannot carry that. Asserted by
+	// TestScriptCancelReportsNotFoundAsASuccessResult in
+	// handlers_script_cancel_test.go.
+}
+
+func TestHandleScriptListRunning(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScriptListRunning(h, Command{
+		ID:   "cmd-list-running",
+		Type: tools.CmdScriptListRunning,
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s", result.Status)
+	}
+}
+
+func TestRunAsHelperSessionsIncludesDistinctSameIdentityHelpers(t *testing.T) {
+	serverConn1, clientConn1 := createTestSocketPair(t)
+	serverIPC1 := ipc.NewConn(serverConn1)
+	clientIPC1 := ipc.NewConn(clientConn1)
+	session1 := sessionbroker.NewSession(serverIPC1, 1000, "1000", "alice", "quartz", "run-as-1", []string{"run_as_user"})
+
+	serverConn2, clientConn2 := createTestSocketPair(t)
+	serverIPC2 := ipc.NewConn(serverConn2)
+	clientIPC2 := ipc.NewConn(clientConn2)
+	session2 := sessionbroker.NewSession(serverIPC2, 1000, "1000", "alice", "quartz", "run-as-2", []string{"run_as_user"})
+
+	h := &Heartbeat{
+		sessionBroker: newTestBrokerWithSessions(t, session1, session2),
+	}
+
+	helpers := h.runAsHelperSessions()
+
+	_ = session1.Close()
+	_ = session2.Close()
+	_ = clientIPC1.Close()
+	_ = clientIPC2.Close()
+
+	if len(helpers) != 2 {
+		t.Fatalf("runAsHelperSessions returned %d sessions, want 2", len(helpers))
+	}
+
+	got := map[string]bool{}
+	for _, session := range helpers {
+		got[session.SessionID] = true
+	}
+	if !got["run-as-1"] || !got["run-as-2"] {
+		t.Fatalf("runAsHelperSessions returned %+v, want both helper sessions", got)
+	}
+}
+
+// --- executeViaUserHelper integration test ---
+
+func TestExecuteViaUserHelperMissingScope(t *testing.T) {
+	// Create session without run_as_user scope
+	serverConn, clientConn := createTestSocketPair(t)
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	serverIPC := ipc.NewConn(serverConn)
+	session := sessionbroker.NewSession(serverIPC, 1000, "1000", "testuser", "quartz", "test-1", []string{"notify"})
+	defer session.Close()
+
+	h := newTestHeartbeat(nil)
+	result := h.executeViaUserHelper(session, Command{
+		ID:      "cmd-noscope",
+		Type:    tools.CmdScript,
+		Payload: map[string]any{"content": "echo hi", "language": "bash"},
+	}, 10)
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed, got %s", result.Status)
+	}
+	if result.Error == "" || result.Error != "user helper does not have run_as_user scope" {
+		t.Fatalf("unexpected error: %q", result.Error)
+	}
+}
+
+func TestExecuteViaUserHelperSuccess(t *testing.T) {
+	serverConn, clientConn := createTestSocketPair(t)
+
+	serverIPC := ipc.NewConn(serverConn)
+	clientIPC := ipc.NewConn(clientConn)
+
+	session := sessionbroker.NewSession(serverIPC, 1000, "1000", "testuser", "quartz", "test-2", []string{"run_as_user"})
+
+	// Simulate user helper receiving and responding to the command
+	go func() {
+		clientIPC.SetReadDeadline(time.Now().Add(5 * time.Second))
+		env, err := clientIPC.Recv()
+		if err != nil {
+			t.Errorf("client recv: %v", err)
+			return
+		}
+
+		// Build a mock result
+		resultPayload, _ := json.Marshal(map[string]any{
+			"exitCode": 0,
+			"stdout":   "password=secret12345",
+			"stderr":   "",
+		})
+		ipcResult := ipc.IPCCommandResult{
+			CommandID: env.ID,
+			Status:    "completed",
+			Result:    resultPayload,
+		}
+		payload, _ := json.Marshal(ipcResult)
+		resp := &ipc.Envelope{
+			ID:      env.ID,
+			Type:    ipc.TypeCommandResult,
+			Payload: payload,
+		}
+		if err := clientIPC.Send(resp); err != nil {
+			t.Errorf("client send: %v", err)
+		}
+	}()
+
+	// Start recv loop to route responses
+	go session.RecvLoop(func(s *sessionbroker.Session, env *ipc.Envelope) {})
+
+	h := newTestHeartbeat(nil)
+	result := h.executeViaUserHelper(session, Command{
+		ID:   "cmd-user-exec",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo hello",
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	}, 10)
+
+	session.Close()
+	clientIPC.Close()
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s)", result.Status, result.Error)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", result.ExitCode)
+	}
+	if result.Stdout != "password=[REDACTED]" {
+		t.Fatalf("expected stdout from helper, got %q", result.Stdout)
+	}
+}
+
+func TestExecuteViaUserHelperFailedScript(t *testing.T) {
+	serverConn, clientConn := createTestSocketPair(t)
+
+	serverIPC := ipc.NewConn(serverConn)
+	clientIPC := ipc.NewConn(clientConn)
+
+	session := sessionbroker.NewSession(serverIPC, 1000, "1000", "testuser", "quartz", "test-3", []string{"run_as_user"})
+
+	// Simulate user helper returning a failed result
+	go func() {
+		clientIPC.SetReadDeadline(time.Now().Add(5 * time.Second))
+		env, err := clientIPC.Recv()
+		if err != nil {
+			return
+		}
+
+		resultPayload, _ := json.Marshal(map[string]any{
+			"exitCode": 127,
+			"stdout":   "",
+			"stderr":   "token=supersecretvalue",
+		})
+		ipcResult := ipc.IPCCommandResult{
+			CommandID: env.ID,
+			Status:    "failed",
+			Result:    resultPayload,
+		}
+		payload, _ := json.Marshal(ipcResult)
+		clientIPC.Send(&ipc.Envelope{
+			ID:      env.ID,
+			Type:    ipc.TypeCommandResult,
+			Payload: payload,
+		})
+	}()
+
+	go session.RecvLoop(func(s *sessionbroker.Session, env *ipc.Envelope) {})
+
+	h := newTestHeartbeat(nil)
+	result := h.executeViaUserHelper(session, Command{
+		ID:   "cmd-user-fail",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":  "nonexistent_command",
+			"language": "bash",
+		},
+	}, 10)
+
+	session.Close()
+	clientIPC.Close()
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed, got %s", result.Status)
+	}
+	if result.ExitCode != 127 {
+		t.Fatalf("expected exit code 127, got %d", result.ExitCode)
+	}
+	if result.Stderr != "token=[REDACTED]" {
+		t.Fatalf("expected stderr, got %q", result.Stderr)
+	}
+}
+
+func TestExecuteViaUserHelperTimeout(t *testing.T) {
+	serverConn, clientConn := createTestSocketPair(t)
+
+	serverIPC := ipc.NewConn(serverConn)
+	clientIPC := ipc.NewConn(clientConn)
+
+	session := sessionbroker.NewSession(serverIPC, 1000, "1000", "testuser", "quartz", "test-4", []string{"run_as_user"})
+
+	// Client receives but never responds
+	go func() {
+		clientIPC.SetReadDeadline(time.Now().Add(5 * time.Second))
+		clientIPC.Recv() // read but don't respond
+	}()
+
+	go session.RecvLoop(func(s *sessionbroker.Session, env *ipc.Envelope) {})
+
+	h := newTestHeartbeat(nil)
+	result := h.executeViaUserHelper(session, Command{
+		ID:   "cmd-user-timeout",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "sleep 30",
+			"language":       "bash",
+			"timeoutSeconds": 1,
+		},
+	}, 1) // 1 second timeout
+
+	session.Close()
+	clientIPC.Close()
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed, got %s", result.Status)
+	}
+}
+
+// --- Explicit session targeting (RDS phase 1) ---
+
+func TestHandleScriptOnDemandRunAsUserWithoutTargetNamesEligibleSessions(t *testing.T) {
+	// On an RDS host at rest there is no console/console-equivalent helper to
+	// fall back to — the untargeted fail-fast must tell the caller to retry
+	// with targetSessionId instead of the generic workstation message.
+	f := &fakeLifecycle{mode: "on-demand"}
+	h := newTestHeartbeat(nil)
+	h.helperLifecycle = f
+
+	res := handleScript(h, Command{
+		ID:      "cmd-1",
+		Payload: map[string]any{"content": "whoami", "language": "powershell", "runAs": "user"},
+	})
+	if res.Status != "failed" {
+		t.Fatalf("expected failure, got %+v", res)
+	}
+	if !strings.Contains(res.Error, "targetSessionId") {
+		t.Errorf("on-demand error must direct the caller to session targeting, got %q", res.Error)
+	}
+}
+
+func TestHandleScriptTargetSessionNotFoundOnDemand(t *testing.T) {
+	broker := sessionbroker.New("/tmp/test-broker-script-target-notfound.sock", nil)
+	f := &fakeLifecycle{mode: "on-demand", acquireErr: sessionbroker.ErrLeaseSessionNotFound}
+	h := newTestHeartbeat(broker)
+	h.helperLifecycle = f
+
+	res := handleScript(h, Command{
+		ID:      "cmd-2",
+		Payload: map[string]any{"content": "whoami", "language": "powershell", "runAs": "user", "targetSessionId": float64(7)},
+	})
+	if res.Status != "failed" || !strings.Contains(res.Error, "no longer exists") {
+		t.Fatalf("expected session-gone failure, got %+v", res)
+	}
+	if len(f.released) != 0 {
+		t.Errorf("nothing to release when acquire failed, got %+v", f.released)
+	}
+}
+
+func TestHandleScriptTargetWaitFailureTyped(t *testing.T) {
+	broker := sessionbroker.New("/tmp/test-broker-script-target-wait.sock", nil)
+	key := sessionbroker.HelperKey{WindowsSessionID: 7, Role: ipc.HelperRoleUser}
+	f := &fakeLifecycle{
+		mode:        "on-demand",
+		waitResults: map[sessionbroker.HelperKey]sessionbroker.HelperWaitResult{key: {Status: sessionbroker.HelperWaitFatalCooldown, RetryAfter: 3 * time.Minute}},
+	}
+	h := newTestHeartbeat(broker)
+	h.helperLifecycle = f
+
+	res := handleScript(h, Command{
+		ID:      "cmd-3",
+		Payload: map[string]any{"content": "whoami", "language": "powershell", "runAs": "user", "targetSessionId": float64(7)},
+	})
+	if res.Status != "failed" || !strings.Contains(res.Error, "crash cooldown") {
+		t.Fatalf("expected typed cooldown failure, got %+v", res)
+	}
+	// lease must be released after the failed wait
+	if len(f.acquired) != 1 || len(f.released) != 1 {
+		t.Errorf("expected acquire+release, got acquired=%v released=%v", f.acquired, f.released)
+	}
+}
+
+func TestHandleScriptTargetSessionZeroRejected(t *testing.T) {
+	// Session 0 parses fine but can never host an interactive helper — reject
+	// it before any lease/wait, mirroring resolveDesktopTargetWinID (Task 6).
+	broker := sessionbroker.New("/tmp/test-broker-script-target-zero.sock", nil)
+	f := &fakeLifecycle{mode: "on-demand"}
+	h := newTestHeartbeat(broker)
+	h.helperLifecycle = f
+
+	res := handleScript(h, Command{
+		ID:      "cmd-5",
+		Payload: map[string]any{"content": "whoami", "language": "powershell", "runAs": "user", "targetSessionId": float64(0)},
+	})
+	if res.Status != "failed" {
+		t.Fatalf("expected failure, got %+v", res)
+	}
+	if res.Error != "invalid targetSessionId 0: session 0 is never an interactive session" {
+		t.Fatalf("unexpected error: %q", res.Error)
+	}
+	if len(f.acquired) != 0 || len(f.released) != 0 {
+		t.Errorf("session 0 must be rejected before any lease attempt, got acquired=%v released=%v", f.acquired, f.released)
+	}
+}
+
+func TestHandleScriptTargetAlwaysOnNonWindowsRejected(t *testing.T) {
+	// Always-on mode (a lifecycle manager is present but not "on-demand" —
+	// e.g. a workstation forced always-on): executeScriptInSession's
+	// always-on branch calls Broker.FindUserSession, which matches on
+	// Session.WinSessionID — on Unix that field is actually the UID/identity
+	// key, not a Windows session number (see FindUserSession's doc comment
+	// in broker.go). A numeric targetSessionId could therefore collide with
+	// a real Unix UID and silently attach to the wrong user's helper. This
+	// test's env is never Windows (CI never runs internal/heartbeat tests
+	// under windows-latest — see .github/workflows/ci.yml), so the platform
+	// guard must fire here and FindUserSession must never be reached.
+	broker := sessionbroker.New("/tmp/test-broker-script-target-alwayson.sock", nil)
+	f := &fakeLifecycle{mode: "always-on"}
+	h := newTestHeartbeat(broker)
+	h.helperLifecycle = f
+
+	res := handleScript(h, Command{
+		ID:      "cmd-6",
+		Payload: map[string]any{"content": "whoami", "language": "powershell", "runAs": "user", "targetSessionId": float64(7)},
+	})
+	if res.Status != "failed" {
+		t.Fatalf("expected failure, got %+v", res)
+	}
+	if !strings.Contains(res.Error, "not supported on this platform") {
+		t.Fatalf("expected platform-not-supported error, got %q", res.Error)
+	}
+	if len(f.acquired) != 0 || len(f.released) != 0 {
+		t.Errorf("always-on non-Windows path must never touch leases, got acquired=%v released=%v", f.acquired, f.released)
+	}
+}
+
+func TestHandleScriptWorkstationBehaviorUnchanged(t *testing.T) {
+	// No lifecycle manager (workstation / non-service, or no broker at all):
+	// the pinned legacy message must stay byte-identical even when a stale
+	// caller sends a targetSessionId — there is nothing to route it to.
+	h := newTestHeartbeat(nil)
+	res := handleScript(h, Command{
+		ID:      "cmd-4",
+		Payload: map[string]any{"content": "whoami", "language": "powershell", "runAs": "user", "targetSessionId": float64(3)},
+	})
+	if res.Status != "failed" {
+		t.Fatalf("expected legacy failure, got %+v", res)
+	}
+	if !strings.Contains(res.Error, "no eligible session found") {
+		t.Fatalf("expected byte-identical legacy message, got %q", res.Error)
+	}
+}
+
+// --- DurationMs tracking ---
+
+func TestHandleScriptDurationMs(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-duration",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo ok",
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.DurationMs <= 0 {
+		t.Fatalf("expected positive DurationMs, got %d", result.DurationMs)
+	}
+}
+
+// --- #2698 custom-field write-back: extraction from RAW stdout, before SanitizeOutput ---
+
+func TestHandleScriptEmitsCustomFieldEnvelopeAndStripsMarker(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-custom-fields",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        `echo '::breeze:custom-fields:: {"a":"1"}'`,
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s, stderr: %s)", result.Status, result.Error, result.Stderr)
+	}
+	if strings.Contains(result.Stdout, "::breeze:custom-fields::") {
+		t.Fatalf("marker line must be stripped from the stdout the server persists, got %q", result.Stdout)
+	}
+
+	resultMap, ok := result.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("missing customFieldWrites envelope: %#v", result.Result)
+	}
+	writes, ok := resultMap["customFieldWrites"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing customFieldWrites envelope: %#v", result.Result)
+	}
+	if writes["schemaVersion"] != 1 {
+		t.Fatalf("schemaVersion = %#v, want 1", writes["schemaVersion"])
+	}
+	fields, ok := writes["fields"].(map[string]any)
+	if !ok || fields["a"] != "1" {
+		t.Fatalf("fields = %#v", writes["fields"])
+	}
+}
+
+func TestHandleScriptNoMarkerLeavesResultNil(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-no-marker",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo 'hello from breeze'",
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s)", result.Status, result.Error)
+	}
+	if result.Result != nil {
+		t.Fatalf("expected nil Result when no marker is present, got %#v", result.Result)
+	}
+}
+
+func TestHandleScriptSecretShapedMarkerValueSurvivesSanitizer(t *testing.T) {
+	// The marker is extracted from RAW stdout, before SanitizeOutput rewrites
+	// token/secret/password-shaped substrings — that ordering is the entire
+	// point of Wave 3 (Channel A, stdout marker, corrupts on a secret-shaped
+	// key; Channel B does not).
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-secret-shaped",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        `echo '::breeze:custom-fields:: {"vault_token_id":"abcdefgh"}'`,
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s, stderr: %s)", result.Status, result.Error, result.Stderr)
+	}
+	resultMap, _ := result.Result.(map[string]any)
+	writes, _ := resultMap["customFieldWrites"].(map[string]any)
+	fields, _ := writes["fields"].(map[string]any)
+	if fields["vault_token_id"] != "abcdefgh" {
+		t.Fatalf("expected the secret-shaped value to survive intact, got fields=%#v", fields)
+	}
+}
+
+// TestExecuteViaUserHelperEmitsCustomFieldEnvelope exercises the MAIN-AGENT
+// side of the runAs:user path: the user-helper process (userhelper/client.go
+// executeScript) is the one that actually extracts markers from raw stdout —
+// see TestExecuteScriptExtractsCustomFieldsBeforeSanitizeOutput in
+// userhelper/client_test.go for that half. This test proves
+// executeViaUserHelper correctly forwards an already-built customFieldWrites
+// envelope from the IPC nested result onto tools.CommandResult, without
+// re-extracting from (by now already-sanitized) stdout — the mock below
+// simulates exactly the JSON shape the real helper now sends.
+func TestExecuteViaUserHelperEmitsCustomFieldEnvelope(t *testing.T) {
+	serverConn, clientConn := createTestSocketPair(t)
+
+	serverIPC := ipc.NewConn(serverConn)
+	clientIPC := ipc.NewConn(clientConn)
+
+	session := sessionbroker.NewSession(serverIPC, 1000, "1000", "testuser", "quartz", "test-custom-fields", []string{"run_as_user"})
+
+	go func() {
+		_ = clientIPC.SetReadDeadline(time.Now().Add(5 * time.Second))
+		env, err := clientIPC.Recv()
+		if err != nil {
+			t.Errorf("client recv: %v", err)
+			return
+		}
+
+		// Marker already stripped from stdout and already extracted into
+		// customFieldWrites — this is what userhelper's executeScript now
+		// sends, having done the extraction itself before its own
+		// SanitizeOutput call.
+		resultPayload, _ := json.Marshal(map[string]any{
+			"exitCode": 0,
+			"stdout":   "scanning\ndone",
+			"stderr":   "",
+			"customFieldWrites": map[string]any{
+				"schemaVersion": 1,
+				"fields":        map[string]any{"a": "1"},
+			},
+		})
+		ipcResult := ipc.IPCCommandResult{
+			CommandID: env.ID,
+			Status:    "completed",
+			Result:    resultPayload,
+		}
+		payload, _ := json.Marshal(ipcResult)
+		resp := &ipc.Envelope{
+			ID:      env.ID,
+			Type:    ipc.TypeCommandResult,
+			Payload: payload,
+		}
+		if err := clientIPC.Send(resp); err != nil {
+			t.Errorf("client send: %v", err)
+		}
+	}()
+
+	go session.RecvLoop(func(s *sessionbroker.Session, env *ipc.Envelope) {})
+
+	h := newTestHeartbeat(nil)
+	result := h.executeViaUserHelper(session, Command{
+		ID:   "cmd-user-custom-fields",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo hi",
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	}, 10)
+
+	_ = session.Close()
+	_ = clientIPC.Close()
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s)", result.Status, result.Error)
+	}
+	if strings.Contains(result.Stdout, "::breeze:custom-fields::") {
+		t.Fatalf("marker line must not reappear in the runAs=user stdout, got %q", result.Stdout)
+	}
+	resultMap, ok := result.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("missing customFieldWrites envelope on runAs=user path: %#v", result.Result)
+	}
+	writes, ok := resultMap["customFieldWrites"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing customFieldWrites envelope on runAs=user path: %#v", result.Result)
+	}
+	fields, ok := writes["fields"].(map[string]any)
+	if !ok || fields["a"] != "1" {
+		t.Fatalf("fields = %#v", writes["fields"])
+	}
+}
+
+// TestExecuteViaUserHelperNoCustomFieldWritesLeavesResultNil confirms the
+// no-marker case: when the helper's IPC payload carries no customFieldWrites
+// key, Result stays nil rather than becoming an empty envelope.
+func TestExecuteViaUserHelperNoCustomFieldWritesLeavesResultNil(t *testing.T) {
+	serverConn, clientConn := createTestSocketPair(t)
+
+	serverIPC := ipc.NewConn(serverConn)
+	clientIPC := ipc.NewConn(clientConn)
+
+	session := sessionbroker.NewSession(serverIPC, 1000, "1000", "testuser", "quartz", "test-no-custom-fields", []string{"run_as_user"})
+
+	go func() {
+		_ = clientIPC.SetReadDeadline(time.Now().Add(5 * time.Second))
+		env, err := clientIPC.Recv()
+		if err != nil {
+			t.Errorf("client recv: %v", err)
+			return
+		}
+
+		resultPayload, _ := json.Marshal(map[string]any{
+			"exitCode": 0,
+			"stdout":   "hello from breeze",
+			"stderr":   "",
+		})
+		ipcResult := ipc.IPCCommandResult{
+			CommandID: env.ID,
+			Status:    "completed",
+			Result:    resultPayload,
+		}
+		payload, _ := json.Marshal(ipcResult)
+		resp := &ipc.Envelope{
+			ID:      env.ID,
+			Type:    ipc.TypeCommandResult,
+			Payload: payload,
+		}
+		if err := clientIPC.Send(resp); err != nil {
+			t.Errorf("client send: %v", err)
+		}
+	}()
+
+	go session.RecvLoop(func(s *sessionbroker.Session, env *ipc.Envelope) {})
+
+	h := newTestHeartbeat(nil)
+	result := h.executeViaUserHelper(session, Command{
+		ID:   "cmd-user-no-custom-fields",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        "echo hi",
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	}, 10)
+
+	_ = session.Close()
+	_ = clientIPC.Close()
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s)", result.Status, result.Error)
+	}
+	if result.Result != nil {
+		t.Fatalf("expected nil Result when the helper sent no customFieldWrites, got %#v", result.Result)
+	}
+}
+
+// TestHandleScriptRedactsSecretEnvValueFromCustomFieldWrites is the
+// regression guard for the security finding in PR #4781's review: a script
+// with delivered secretEnv values echoing one into a customFieldWrites
+// marker must NOT leak it — device custom fields are visible to any org user
+// with device-read access, and ExtractCustomFields deliberately runs before
+// both SanitizeOutput (pattern-based) and BuildSecretRedactor (exact-value),
+// so without the explicit redactCustomFieldValues pass in handleScript this
+// value rides straight through unredacted.
+func TestHandleScriptRedactsSecretEnvValueFromCustomFieldWrites(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-secret-redact",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        `echo "::breeze:custom-fields:: {\"note\":\"$BREEZE_VAR_API_TOKEN\"}"`,
+			"language":       "bash",
+			"timeoutSeconds": 10,
+			"secretEnv": map[string]any{
+				"api_token": "super-secret-delivered-value",
+			},
+		},
+	})
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s (error: %s, stderr: %s)", result.Status, result.Error, result.Stderr)
+	}
+	resultMap, ok := result.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("missing customFieldWrites envelope: %#v", result.Result)
+	}
+	writes, ok := resultMap["customFieldWrites"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing customFieldWrites envelope: %#v", result.Result)
+	}
+	fields, ok := writes["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing fields: %#v", writes)
+	}
+	note, _ := fields["note"].(string)
+	if strings.Contains(note, "super-secret-delivered-value") {
+		t.Fatalf("delivered secretEnv value leaked into customFieldWrites unredacted: %q", note)
+	}
+	if note != executor.SecretRedactionMarker {
+		t.Fatalf("fields[note] = %q, want the redaction marker %q", note, executor.SecretRedactionMarker)
+	}
+}
+
+// TestHandleScriptCustomFieldEnvelopeSurvivesNonZeroExit pins the intended
+// design (matches apps/api/src/services/commandResultHandlers.ts, which
+// deliberately applies a script's custom-field markers "outside the exit-code
+// branch": a script that discovers a fact and then exits non-zero has still
+// discovered it): a customFieldWrites envelope must still reach Result even
+// when the command carries a non-zero exit / failed status. A plain `exit 1`
+// leaves tools.CommandResult.Error empty (confirmed: the executor only
+// populates Error for execution failures, not a script's own exit code) —
+// the specific Error!=""-AND-Result!=nil combination is covered precisely by
+// TestToWSCommandResultResultWinsEvenWithErrorSet in result_mapping_test.go.
+func TestHandleScriptCustomFieldEnvelopeSurvivesNonZeroExit(t *testing.T) {
+	h := newTestHeartbeat(nil)
+	result := handleScript(h, Command{
+		ID:   "cmd-fail-with-marker",
+		Type: tools.CmdScript,
+		Payload: map[string]any{
+			"content":        `echo '::breeze:custom-fields:: {"discovered":"yes"}'; exit 1`,
+			"language":       "bash",
+			"timeoutSeconds": 10,
+		},
+	})
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed status (exit 1), got %s", result.Status)
+	}
+	if result.ExitCode != 1 {
+		t.Fatalf("expected exit code 1, got %d", result.ExitCode)
+	}
+	resultMap, ok := result.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("expected the customFieldWrites envelope to survive a failed exit, got Result=%#v", result.Result)
+	}
+	writes, ok := resultMap["customFieldWrites"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing customFieldWrites envelope: %#v", result.Result)
+	}
+	fields, ok := writes["fields"].(map[string]any)
+	if !ok || fields["discovered"] != "yes" {
+		t.Fatalf("fields = %#v", writes["fields"])
+	}
+
+	// And confirm this survives the WebSocket leg's toWSCommandResult too.
+	wsResult := toWSCommandResult("cmd-fail-with-marker-ws", result)
+	if wsResult.Result == nil {
+		t.Fatal("expected customFieldWrites to survive toWSCommandResult despite a failed status")
+	}
+}

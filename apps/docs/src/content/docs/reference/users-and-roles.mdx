@@ -1,0 +1,834 @@
+---
+title: Users & Roles
+description: Multi-tenant user management with role-based access control, granular resource permissions, MFA, and SSO for partner and organisation scopes.
+sidebar:
+  order: 4
+  label: Users & Roles
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Breeze provides a multi-tenant user management system with role-based access control (RBAC), multi-factor authentication (MFA), single sign-on (SSO), and granular permission assignment. Users are scoped to either a **Partner** (MSP) or an **Organisation**, and every action is governed by an assigned role.
+
+---
+
+## Overview
+
+The user and role system is built around Breeze's multi-tenant hierarchy:
+
+```
+Partner (MSP) --> Organisation (Customer) --> Site --> Device Group --> Device
+```
+
+- **Partner-scoped users** are linked via the `partner_users` table and can be granted access to all, selected, or no organisations.
+- **Organisation-scoped users** are linked via the `organization_users` table and can optionally be restricted to specific sites or device groups.
+- **Roles** are scoped to either `partner` or `organization` level and carry a set of permissions.
+- **Permissions** follow a `resource:action` model (e.g. `devices:read`, `scripts:execute`).
+
+---
+
+## User Management
+
+### User Status
+
+Every user account has one of three statuses:
+
+| Status | Description |
+|---|---|
+| `active` | The user can log in and access the platform. |
+| `invited` | The user has been invited but has not yet completed setup. |
+| `disabled` | The user account is suspended and cannot log in. |
+
+### Inviting Users
+
+Administrators invite users by providing an email address, display name, and role assignment. The invitation flow differs by scope.
+
+<Tabs>
+  <TabItem label="Organisation Scope">
+    When inviting into an organisation, you can optionally restrict the user to specific **sites** and **device groups**:
+
+    ```json
+    {
+      "email": "tech@example.com",
+      "name": "Jane Doe",
+      "roleId": "<role-uuid>",
+      "siteIds": ["<site-uuid>"],
+      "deviceGroupIds": ["<group-uuid>"]
+    }
+    ```
+
+    Omit `siteIds` and `deviceGroupIds` to grant access to all sites and device groups within the organisation.
+
+    <Aside type="note" title="Site-restricted users and org-wide settings">
+      A site-restricted technician can still **assign** an existing policy to their own site — that stays governed by the resource's normal write permission (e.g. `devices:write`). But a defined site restriction (including a restriction to zero sites) blocks **creating or editing** the org-wide governance objects themselves: webhooks, alert notification channels, software policies, peripheral (USB/Bluetooth) policies, configuration policies and their feature links, PAM configuration and signer groups, and backup destinations/profiles. These objects have no per-site ownership model — they always apply organisation- or partner-wide — so a technician who can only see one site is never allowed to create or change one, even if their role otherwise grants the write permission. An unrestricted administrator (no `siteIds` set) is unaffected. Attempting a blocked action returns an error asking to contact an unrestricted administrator.
+    </Aside>
+  </TabItem>
+  <TabItem label="Partner Scope">
+    When inviting into a partner (MSP), you specify the **organisation access level**:
+
+    | `orgAccess` | Meaning |
+    |---|---|
+    | `all` | Access to every organisation under the partner. |
+    | `selected` | Access only to the organisations listed in `orgIds`. |
+    | `none` | No organisation access (partner-level admin only). |
+
+    ```json
+    {
+      "email": "admin@msp.com",
+      "name": "John Smith",
+      "roleId": "<role-uuid>",
+      "orgAccess": "selected",
+      "orgIds": ["<org-uuid-1>", "<org-uuid-2>"]
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+If an email service is configured, the invitee receives an invitation email with a link to accept. You can resend the invitation for users who are still in `invited` status.
+
+<Aside type="tip">
+  Existing users (by email) can be added to additional partners or organisations without creating a duplicate account. However, a user cannot be added to the same scope twice -- doing so returns `409 Conflict`.
+</Aside>
+
+### Updating Users
+
+`PATCH /users/:id` updates a user's **name**, **status**, or `disabledReason`. These fields live on the shared global identity row, which can be linked to memberships in multiple partners or organisations, so no tenant-scoped authorization proof can cover every tenant a change might affect (including revoking sessions). The endpoint is therefore restricted to **system-scoped callers** (`auth.scope === 'system'`) regardless of `users:write` -- a partner or organisation admin cannot call it directly. For example, disabling a user:
+
+```json
+{
+  "status": "disabled"
+}
+```
+
+### Removing Users
+
+Removing a user from a scope (`DELETE /users/:id`) deletes the association record (`partner_users` or `organization_users`) but does **not** delete the underlying user account. This means the user can be re-invited later.
+
+### Self-Service Profile
+
+Authenticated users can view and update their own profile at `GET /users/me` and `PATCH /users/me` without any special permissions. Updatable fields are `name`, `email`, and `preferences`. Avatars are managed separately via `POST /users/me/avatar` (upload) and `DELETE /users/me/avatar` (remove) -- `PATCH /users/me` rejects an `avatarUrl` field with `400` rather than silently dropping it.
+
+---
+
+## Authentication
+
+### Login
+
+Users authenticate with email and password via `POST /auth/login`. The endpoint is rate-limited per IP + email combination using a Redis-backed sliding window. On success, the response includes a JWT access token and a refresh token set as an HTTP-only cookie.
+
+```bash
+curl -X POST https://breeze.example.com/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "..."}'
+```
+
+If the user has MFA enabled, the response includes `mfaRequired: true` and a `tempToken` instead of tokens. See the MFA section below.
+
+<Aside type="caution">
+  Accounts in `invited` or `disabled` status cannot log in. Inactive accounts receive a `403` response.
+</Aside>
+
+### Token Refresh
+
+Access tokens are short-lived. Use `POST /auth/refresh` to rotate the token pair. The refresh token is read from the `breeze_refresh_token` HTTP-only cookie. A CSRF header (`x-breeze-csrf`) is required when the token is supplied via cookie.
+
+Old refresh tokens are revoked on each rotation to prevent replay.
+
+### Logout
+
+`POST /auth/logout` revokes all active tokens for the user and clears the refresh cookie.
+
+### Registration
+
+When enabled (`ENABLE_REGISTRATION=true`), self-service MSP signup is a **two-step, email-verified** flow, not a single call:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /auth/register-partner` | Step 1: validates the request and queues a verification email. Creates no user, partner, or token, and performs no email-existence lookup -- the response body is identical whether or not the address already has an account. |
+| `POST /auth/verify-email` | Step 2: the emailed link's token. Creates the partner, admin role, user, and association inside one database transaction, then issues tokens. |
+| `POST /auth/register` | Legacy path, kept only so old clients don't see a broken response shape. It is a **no-op**: it runs the same rate-limit and password checks but never creates an account. |
+
+Registration is rate-limited to 5 attempts per IP per hour for `/auth/register` and 3 for `/auth/register-partner` (`/auth/verify-email` has its own separate limit). Password strength requirements are enforced on step 1. See [Partner Management: Self-Registration](/reference/partner-management/#self-registration) for the full request/response shapes.
+
+---
+
+## Multi-Factor Authentication (MFA)
+
+MFA is enabled by default (controlled by the `ENABLE_2FA` environment variable). Three methods are supported:
+
+| Method | Description |
+|---|---|
+| **TOTP** | Time-based one-time passwords via authenticator apps (Google Authenticator, Authy, etc.). |
+| **SMS** | One-time codes sent to a verified phone number via Twilio. |
+| **Passkey** | WebAuthn/FIDO2 credentials (platform authenticators such as Touch ID / Windows Hello, or roaming security keys). Phishing-resistant; the private key never leaves the device. |
+
+The `users.mfa_method` field records a single primary method (`totp`, `sms`, or `passkey`) that determines which challenge is offered at login. A user can enrol a passkey alongside an existing TOTP or SMS factor — enrolling the first passkey only promotes it to the primary method when no TOTP/SMS factor is already configured.
+
+<Aside type="note">
+  Organisation administrators can enforce MFA for all users via the organisation `settings.security.requireMfa` flag. When enforced, users cannot disable MFA.
+</Aside>
+
+### TOTP Setup Flow
+
+<Steps>
+1. Call `POST /auth/mfa/setup` (authenticated). The response includes a `secret`, `otpAuthUrl`, QR code data URL, and one-time recovery codes.
+2. Scan the QR code with an authenticator app.
+3. Confirm setup by calling `POST /auth/mfa/verify` with the 6-digit `code` from the app. MFA is now active.
+</Steps>
+
+Alternatively, use `POST /auth/mfa/enable` with `{ "code": "123456" }` after the setup step -- this endpoint is designed for the frontend settings flow and also returns recovery codes.
+
+### SMS MFA Setup Flow
+
+<Steps>
+1. Verify your phone number by calling `POST /auth/phone/verify` with `{ "phoneNumber": "+14155551234" }`.
+2. Confirm the verification code with `POST /auth/phone/confirm`.
+3. Enable SMS MFA with `POST /auth/mfa/sms/enable`. Recovery codes are returned.
+</Steps>
+
+<Aside type="caution">
+  SMS MFA can be disallowed at the organisation level via `settings.security.allowedMfaMethods.sms`. If disabled, users in that organisation cannot enable the SMS method.
+</Aside>
+
+### Passkey (WebAuthn) Setup Flow
+
+Passkeys are registered from the self-service profile screen (`/settings/profile`) and are protected by a current-password step-up — registration cannot proceed without re-entering the account password.
+
+<Steps>
+1. Call `POST /auth/passkeys/register/options` with `{ "currentPassword": "...", "name": "..." }`. The password is re-verified (rate-limited, separate from login) and the response contains the WebAuthn registration challenge.
+2. The browser completes the WebAuthn attestation ceremony (Touch ID / Windows Hello / security key).
+3. Call `POST /auth/passkeys/register/verify` with the resulting credential. The passkey is stored in the `user_passkeys` table and MFA is activated for the account.
+</Steps>
+
+Enrolled passkeys are managed from the same screen: `GET /auth/passkeys` lists them, `PATCH /auth/passkeys/:id` renames one, and `DELETE /auth/passkeys/:id` removes one. Deleting a passkey also requires a current-password step-up and is blocked if it would strip the account's last MFA factor under a force-MFA policy.
+
+WebAuthn is implemented with `@simplewebauthn/server`. Registration and authentication challenges are held in Redis with a 5-minute TTL and consumed atomically (read-and-delete) to prevent reuse. Each credential stores a monotonic signature counter for clone/replay detection.
+
+### MFA During Login
+
+When MFA is enabled, login returns `mfaRequired: true`, the primary `mfaMethod` (`totp`, `sms`, or `passkey`), and a `tempToken` (valid for 5 minutes). When the account also has a usable enrolled passkey, login additionally returns `passkeyAvailable: true`. The flow continues based on the method:
+
+<Steps>
+1. (If SMS) Call `POST /auth/mfa/sms/send` with the `tempToken` to trigger an SMS code.
+2. (TOTP/SMS) Call `POST /auth/mfa/verify` with `{ "code": "123456", "tempToken": "..." }`.
+3. (Passkey) Call `POST /auth/mfa/passkey/options` with the `tempToken` to obtain a WebAuthn authentication challenge, complete the assertion in the browser, then call `POST /auth/mfa/passkey/verify` with `{ "tempToken": "...", "credential": { ... } }`.
+4. On success, full JWT tokens are issued with the `mfa: true` claim.
+</Steps>
+
+If the primary method is `totp` or `sms` but `passkeyAvailable` is `true`, the user can bypass the primary challenge and authenticate with their passkey instead — the dashboard shows a **"Use a passkey instead"** option that runs the passkey flow in step 3. A passkey is itself a strong second factor, so this relaxes no security requirement.
+
+MFA verification is rate-limited separately from login.
+
+<Aside type="note" title="Integrators: a wrong code and an expired session have different status codes">
+  A **rejected proof** — a wrong six-digit code, a wrong recovery code, or a wrong step-up password — returns **`400`** with a stable machine-readable `code`:
+
+  ```json
+  { "error": "Invalid MFA code", "message": "Invalid MFA code", "code": "mfa_code_invalid" }
+  ```
+
+  A **dead credential** — an expired or invalid `tempToken`, or an expired bearer token — returns **`401`**:
+
+  ```json
+  { "error": "Invalid or expired MFA session" }
+  ```
+
+  Branch on the status code, and on `code` when you need the specific reason. `401` from these endpoints means "re-authenticate"; it never means "you mistyped a digit". The codes in use are `mfa_code_invalid` (wrong TOTP/SMS/recovery code), `mfa_proof_invalid` (a rejected `POST /auth/mfa/step-up` factor proof), `invalid_credentials` (a rejected step-up password or enrollment grant), and `enrollment_grant_expired` (the SSO re-authentication grant a passwordless account used to authorise first-factor enrollment has expired, been replayed, or no longer matches the session — it carries `reauthUrl` so a client can offer the one action that resolves it, restarting `POST /sso/reauth/start`). Never branch on the human-readable `error`/`message` text — it is not part of the contract.
+
+  This applies to `/auth/mfa/*` and `/auth/phone/*`, and to the two other endpoints that verify a password supplied in the request body: `POST /auth/change-password` and `POST /auth/account-deletion-request`. Both answer a rejected password with `400` and `code: "invalid_credentials"`. Earlier releases answered `401` for both cases, which is why a client that auto-refreshes on `401` could sign the user out mid-enrollment for a mistyped digit — or, on those two endpoints, mid-flow for a mistyped password.
+</Aside>
+
+### Disabling MFA
+
+Call `POST /auth/mfa/disable` with `currentPassword` and the current 6-digit code (TOTP or SMS depending on active method). This clears the MFA secret, phone number, and recovery codes. Every **other** session and refresh token for the user is revoked; the calling session is replaced in the same response (new access and refresh tokens, or refreshed cookies in the browser flow), so the user is not signed out by their own request. If the organisation enforces MFA, the endpoint returns `403`. A caller that cannot receive the replacement session (a bearer-only client with no device binding) receives `428`.
+
+### Recovery Codes
+
+Recovery codes are generated during MFA setup and stored as hashed values. They are **shown once, at enrolment, and cannot be displayed again** — the dashboard has no "view codes" action, because the server keeps only hashes. A user who did not save them needs new ones.
+
+To replace the codes for an active MFA configuration, call `POST /auth/mfa/recovery-codes` (authenticated). This invalidates every existing code immediately, including printed copies, and returns the replacements once. In the dashboard this is **Regenerate recovery codes** under profile security settings, behind an explicit confirmation.
+
+### Admin MFA Reset (Lost Authenticator)
+
+When a user has lost their authenticator **and** has no recovery codes, an administrator can reset their MFA so they can sign in again: open **Settings → Users**, find the user, and choose **Reset MFA** (also available as `POST /users/:id/mfa/reset`).
+
+The reset:
+
+- Clears the user's MFA factor, phone number, and recovery codes, forcing **fresh MFA enrollment at their next login** (immediately, if the org or their role enforces MFA).
+- **Revokes the user's active sessions and refresh tokens** and tears down their remote sessions, so a device holding old tokens can't ride out the reset.
+- Is recorded in the [audit log](/reference/audit-logs/) as `user.mfa_reset`, including which method was cleared.
+
+Guardrails:
+
+- Requires the `users:write` permission, and the acting admin's **own session must have satisfied MFA** — a stolen access token alone cannot strip another user's second factor.
+- Tenant-scoped: an admin can only reset users within their own organisation or partner.
+- **Self-reset is refused** — changing your own factor goes through the code-verified self-service flow above.
+- Deliberately works even when the organisation enforces MFA or the platform has `ENABLE_2FA=false`: it is the recovery lever for exactly those situations, and an enforced policy simply forces re-enrollment at next login.
+
+---
+
+## Password Management
+
+### Forgot Password
+
+`POST /auth/forgot-password` accepts an email address and sends a password reset link (valid for 1 hour) if the account exists. The response is always `200` regardless of whether the email was found, to prevent account enumeration.
+
+### Reset Password
+
+`POST /auth/reset-password` accepts the reset `token` and a new `password` (minimum 8 characters, strength-checked). On success, all existing sessions and tokens are invalidated.
+
+### Change Password
+
+Authenticated users can change their password via `POST /auth/change-password` by providing `currentPassword` and `newPassword`. All sessions and tokens are invalidated on success.
+
+<Aside type="tip">
+  SSO-provisioned users do not have a password. The change password endpoint returns `400` for these accounts.
+</Aside>
+
+A **wrong `currentPassword`** also returns `400`, with the stable body `{ "error": "Current password is incorrect", "message": "Current password is incorrect", "code": "invalid_credentials" }`. It previously returned `401`; branch on the status and on `code`, never on the message text. `401` from this endpoint now means only that the bearer token is dead.
+
+---
+
+## Single Sign-On (SSO)
+
+Breeze supports SSO at the organisation or partner level via **OpenID Connect (OIDC)**. SAML schema support is defined but not yet implemented. Organisation providers sign in a customer's users; a partner-owned provider signs in the MSP's own technicians — see [Partner-Wide SSO](/reference/sso/#partner-wide-sso-technician-login).
+
+### Provider Configuration
+
+SSO providers are configured per organisation. Built-in presets are available for common identity providers (retrieved via `GET /sso/presets`).
+
+Key provider settings:
+
+| Setting | Description |
+|---|---|
+| `issuer` | OIDC issuer URL. Endpoint discovery is attempted automatically. |
+| `clientId` / `clientSecret` | OAuth 2.0 credentials. The secret is stored encrypted. |
+| `autoProvision` | When `true`, users who authenticate via SSO but do not yet have a Breeze account are created automatically. |
+| `defaultRoleId` | The role assigned to auto-provisioned users. Required when `autoProvision` is enabled. |
+| `allowedDomains` | Comma-separated list of email domains permitted to log in via this provider. |
+| `enforceSSO` | When `true`, password-based login is disabled for the organisation. |
+
+Provider status can be `active`, `inactive`, or `testing`. Only `active` providers are available for user login.
+
+### SSO Login Flow
+
+<Steps>
+1. The browser navigates to `GET /sso/login/:orgId`. Breeze generates a PKCE challenge, state, and nonce, stores them in an `sso_sessions` record, and redirects to the identity provider's authorization URL.
+2. The user authenticates with the identity provider.
+3. The identity provider redirects back to `GET /sso/callback` with an authorization code.
+4. Breeze exchanges the code for tokens, verifies the ID token claims, retrieves user info, and maps attributes.
+5. If the user does not exist and `autoProvision` is enabled, a new user and organisation membership are created.
+6. A short-lived token exchange code is generated and the user is redirected to the application with `#ssoCode=...`.
+7. The frontend calls `POST /sso/exchange` with the code to receive the access and refresh tokens.
+</Steps>
+
+### SSO Check
+
+The frontend can check whether an organisation has SSO enabled by calling the public endpoint `GET /sso/check/:orgId`. This returns the provider name, type, and whether SSO is enforced. The dashboard login page does not have an `orgId` to pass this endpoint until after a user has chosen an organisation, so it instead discovers SSO from the typed email address via `POST /auth/sso-discovery` — see [Login Page Discovery](/reference/sso/#login-page-discovery) in the SSO reference.
+
+---
+
+## Role-Based Access Control
+
+### How Roles Work
+
+Every user-to-scope association includes a `roleId`. The role determines what the user can do. Roles are scoped:
+
+- **Partner roles** -- govern what MSP-level users can do across the partner and its organisations.
+- **Organisation roles** -- govern what organisation-level users can do within their organisation.
+
+Roles can be **system** (built-in, immutable) or **custom** (created by administrators).
+
+Roles also carry a **Force MFA** flag. When the flag is on, any user assigned to that role gets a `428 Precondition Required` response on protected endpoints until they enrol an MFA method. The enrolment screen offers whichever methods the organisation allows -- an authenticator app, SMS, or a passkey. The dashboard intercepts the 428 and walks the user through a forced enrollment screen before letting them reach any other workflow. Partner Admin is seeded with Force MFA on. Switch it on for any role whose privilege level warrants mandatory MFA — admin-equivalent roles, billing operators, and similar.
+
+Enforcement of the Force MFA flag is itself gated by the `MFA_FORCE_FOR_PARTNER_ADMIN` environment variable, which **defaults to `false`** for this release: the Partner Admin role is seeded/reconciled with Force MFA on regardless, but the 428 wall above only fires once an operator sets `MFA_FORCE_FOR_PARTNER_ADMIN=true`. See `.env.example` for details. The default is unchanged in v0.113.0.
+
+**Enrolment grace window (v0.113.0+).** When enforcement is on, a user who lands in a Force MFA role and has *never* held an MFA factor is not walled off immediately. Breeze grants a one-time enrolment window — **14 days** by default, configurable per partner through the `security.mfaEnrollmentGraceDays` security setting up to a maximum of 30 (0 disables the window) — timed by the database clock, not the user's device. During the window the dashboard shows a dismissible banner (*"Your role will require two-factor authentication. Enrol by &lt;date&gt;"* with a **Set up 2FA** button) and the user receives an email when the window opens and a reminder three days before the deadline. The window is **nonrenewable**: signing in again, a role change, toggling the environment variable, or an administrator resetting the user's factors never extends it, though a partner can shorten it. Once the deadline passes the `428` wall above applies exactly as before; sessions and API keys created during the window are not revoked. Users who have held a factor at any point get no window.
+
+**The variable gates the *role* flag only.** MFA required by an organisation's or partner's own security settings (**Require MFA** under Settings → Security) is enforced regardless of what `MFA_FORCE_FOR_PARTNER_ADMIN` is set to — it is not a global switch for turning MFA requirements off. Related: a settings change that *would* lock out users who have already enrolled is now refused outright with `409 mfa_policy_would_lock_out_users` and a count of the users affected, rather than applied and discovered at the next sign-in.
+
+### Permission Model
+
+Permissions are stored as `resource:action` pairs in the `permissions` table. Roles are linked to permissions through the `role_permissions` join table.
+
+**Available resources:**
+
+| Resource | Description |
+|---|---|
+| `backup` | Backup jobs, vaults, and restore operations |
+| `devices` | Manage and view endpoints |
+| `agent_rollback` | Signed rollback of an agent component on a device |
+| `topology` | Network discovery topology view and saved layout |
+| `scripts` | Script library and execution |
+| `variables` | Tenant script variable definitions |
+| `alerts` | Alert rules and acknowledgement |
+| `tickets` | Ticketing |
+| `ticket_mailbox` | Microsoft 365 partner-wide ticket mailbox administration |
+| `catalog` | Billing product catalog |
+| `invoices` | Invoices |
+| `contracts` | Recurring contracts |
+| `quotes` | Quotes / proposals |
+| `time_entries` | Ticket time entries |
+| `users` | User and role management |
+| `organizations` | Organisation CRUD |
+| `sso` | SSO provider configuration and verified domains |
+| `sites` | Site management |
+| `automations` | Automation workflows |
+| `remote` | Remote access sessions |
+| `audit` | Audit log read, export, and retention management |
+| `reports` | Reporting and analytics |
+| `billing` | Subscriptions, invoicing, and payment methods |
+| `vulnerabilities` | Vulnerability risk-acceptance governance |
+| `ai_sessions` | Using AI chat (`use`) and cross-user session audit (`read_all`) |
+| `ai_agents` | AI agent configuration and runs |
+| `approvals` | Deciding pending action-intent approvals |
+
+The authoritative list of assignable permissions is also available at runtime via `GET /permissions/catalog`. The dashboard's role builder consumes this endpoint so the matrix of resources and actions stays in sync with the server whenever new permissions are added.
+
+**Available actions:**
+
+| Action | Description |
+|---|---|
+| `read` | Read-only access |
+| `write` | Create or modify resources |
+| `delete` | Remove resources |
+| `execute` | Run scripts, commands, remote sessions |
+| `cross_site_restore` | Restore a backup to a site other than its origin |
+| `create` | Create a resource (e.g. an agent rollback) |
+| `manage` | Broader management rights (e.g. audit retention policy, contracts, variables) |
+| `acknowledge` | Acknowledge an alert |
+| `invite` | Invite a new user |
+| `access` | Start a remote access session |
+| `export` | Export data (audit logs, reports, invoices) |
+| `send` | Send an invoice or quote to a customer |
+| `accept` | Record a customer's acceptance on their behalf (phone, email, signed PO) and convert the quote to an invoice. Granted automatically to every role that already held `send` when upgrading; revoke it if you want acceptance narrower than sending. |
+| `fulfill` | Mark a quote fulfilled |
+| `admin` | Full administration of a resource (SSO, ticket mailbox) |
+| `accept_risk` | Accept a vulnerability finding's risk |
+| `read_all` | Read another user's data (AI session audit) |
+| `use` | Use a capability without managing it (AI chat, external tools) |
+| `decide` | Approve or deny a pending action-intent approval |
+
+There is no `view` or `update` action -- read access is `read`, and a write/create/update is `write` (or `create` for the one resource, `agent_rollback`, that uses it). Additionally, the wildcard permission `*:*` grants full administrative access.
+
+<Aside type="note">
+  Opening and using the AI assistant (chat sessions, your own session history, the org's AI usage figures) requires `ai_sessions:use`. It is granted by default to **Org Admin**, **Org Technician** and **Partner Technician**; Partner Admin holds it through `*:*`. Viewer and billing roles do not get it, and the assistant button, the **AI Assistant** navigation entry and the `/workspace` page are all hidden for them. The permission only opens the conversation: every tool the assistant calls is checked against the same permission its HTTP route requires, so it cannot do anything the user could not do by hand. Setting the org's AI budget and flagging another user's session still need `organizations:write`. **Upgrading:** built-in roles receive the new key automatically; a custom role that was given `organizations:write` specifically so its users could open the assistant must be granted `ai_sessions:use` under **Settings → Users & Roles**, or its users lose chat.
+</Aside>
+
+<Aside type="note">
+  `ai_agents:read` and `ai_agents:write` are deliberately separate from `organizations:write`. Authoring an agent policy is what will eventually authorize autonomous action on customer machines, so it is not bundled into a permission every organisation admin already holds. See [AI Agents](/features/ai-agents/).
+</Aside>
+
+<Aside type="note">
+  The `users:invite` permission is required to invite new users and is separate from `users:write`. The `users:read` permission is required to list users **and** roles.
+</Aside>
+
+### Built-in Permissions
+
+The following named permission constants (`packages/shared/src/constants/permissions.ts`) are referenced by route middleware:
+
+| Constant | Resource | Action |
+|---|---|---|
+| `BACKUP_READ` | `backup` | `read` |
+| `BACKUP_WRITE` | `backup` | `write` |
+| `BACKUP_CROSS_SITE_RESTORE` | `backup` | `cross_site_restore` |
+| `DEVICES_READ` | `devices` | `read` |
+| `DEVICES_WRITE` | `devices` | `write` |
+| `DEVICES_DELETE` | `devices` | `delete` |
+| `DEVICES_EXECUTE` | `devices` | `execute` |
+| `AGENT_ROLLBACK_CREATE` | `agent_rollback` | `create` |
+| `TOPOLOGY_READ` | `topology` | `read` |
+| `TOPOLOGY_WRITE` | `topology` | `write` |
+| `SCRIPTS_READ` | `scripts` | `read` |
+| `SCRIPTS_WRITE` | `scripts` | `write` |
+| `SCRIPTS_DELETE` | `scripts` | `delete` |
+| `SCRIPTS_EXECUTE` | `scripts` | `execute` |
+| `VARIABLES_READ` | `variables` | `read` |
+| `VARIABLES_MANAGE` | `variables` | `manage` |
+| `ALERTS_READ` | `alerts` | `read` |
+| `ALERTS_WRITE` | `alerts` | `write` |
+| `ALERTS_ACKNOWLEDGE` | `alerts` | `acknowledge` |
+| `TICKETS_READ` | `tickets` | `read` |
+| `TICKETS_WRITE` | `tickets` | `write` |
+| `TICKETS_MANAGE` | `tickets` | `manage` |
+| `TICKET_MAILBOX_READ` | `ticket_mailbox` | `read` |
+| `TICKET_MAILBOX_ADMIN` | `ticket_mailbox` | `admin` |
+| `CATALOG_READ` | `catalog` | `read` |
+| `CATALOG_WRITE` | `catalog` | `write` |
+| `CATALOG_DELETE` | `catalog` | `delete` |
+| `INVOICES_READ` | `invoices` | `read` |
+| `INVOICES_WRITE` | `invoices` | `write` |
+| `INVOICES_SEND` | `invoices` | `send` |
+| `INVOICES_EXPORT` | `invoices` | `export` |
+| `ACCOUNTING_READ` | `accounting` | `read` |
+| `ACCOUNTING_MANAGE` | `accounting` | `manage` |
+| `CONTRACTS_READ` | `contracts` | `read` |
+| `CONTRACTS_WRITE` | `contracts` | `write` |
+| `CONTRACTS_MANAGE` | `contracts` | `manage` |
+| `QUOTES_READ` | `quotes` | `read` |
+| `QUOTES_WRITE` | `quotes` | `write` |
+| `QUOTES_SEND` | `quotes` | `send` |
+| `QUOTES_ACCEPT` | `quotes` | `accept` |
+| `QUOTES_FULFILL` | `quotes` | `fulfill` |
+| `TIME_ENTRIES_READ` | `time_entries` | `read` |
+| `TIME_ENTRIES_WRITE` | `time_entries` | `write` |
+| `USERS_READ` | `users` | `read` |
+| `USERS_WRITE` | `users` | `write` |
+| `USERS_DELETE` | `users` | `delete` |
+| `USERS_INVITE` | `users` | `invite` |
+| `ORGS_READ` | `organizations` | `read` |
+| `ORGS_WRITE` | `organizations` | `write` |
+| `ORGS_DELETE` | `organizations` | `delete` |
+| `SSO_ADMIN` | `sso` | `admin` |
+| `SITES_READ` | `sites` | `read` |
+| `SITES_WRITE` | `sites` | `write` |
+| `SITES_DELETE` | `sites` | `delete` |
+| `AUTOMATIONS_READ` | `automations` | `read` |
+| `AUTOMATIONS_WRITE` | `automations` | `write` |
+| `AUTOMATIONS_DELETE` | `automations` | `delete` |
+| `REMOTE_ACCESS` | `remote` | `access` |
+| `AUDIT_READ` | `audit` | `read` |
+| `AUDIT_EXPORT` | `audit` | `export` |
+| `AUDIT_MANAGE` | `audit` | `manage` |
+| `REPORTS_READ` | `reports` | `read` |
+| `REPORTS_WRITE` | `reports` | `write` |
+| `REPORTS_DELETE` | `reports` | `delete` |
+| `REPORTS_EXPORT` | `reports` | `export` |
+| `BILLING_MANAGE` | `billing` | `manage` |
+| `VULN_RISK_ACCEPT` | `vulnerabilities` | `accept_risk` |
+| `AI_SESSIONS_READ_ALL` | `ai_sessions` | `read_all` |
+| `AI_SESSIONS_USE` | `ai_sessions` | `use` |
+| `AI_AGENTS_READ` | `ai_agents` | `read` |
+| `AI_AGENTS_WRITE` | `ai_agents` | `write` |
+| `APPROVALS_DECIDE` | `approvals` | `decide` |
+| `PAM_APPROVE` | `pam` | `approve` |
+| `PAM_MANAGE_POLICY` | `pam` | `manage_policy` |
+| `WORKSPACE_READ` | `workspace` | `read` |
+| `WORKSPACE_WRITE` | `workspace` | `write` |
+| `WORKSPACE_CREDENTIALS` | `workspace` | `credentials` |
+| `WORKSPACE_EXECUTE` | `workspace` | `execute` |
+| `CONNECTED_APPS_READ` | `connected_apps` | `read` |
+| `CONNECTED_APPS_MANAGE` | `connected_apps` | `manage` |
+| `ADMIN_ALL` | `*` | `*` |
+
+<Aside type="caution" title="Permissions added in v0.112.0 replace implicit access">
+  `pam:approve`, `pam:manage_policy`, `accounting:read`, `accounting:manage`, the four `workspace:*` keys and the two `connected_apps:*` keys were introduced in v0.112.0. The upgrade grants them to the built-in **Org Admin** role only; **Partner Admin** already holds them through `*:*`. Every other built-in role (Partner Technician, Partner Billing, Org Technician, …) and every custom role **loses** the access those areas previously inferred from device or billing permissions until you grant the new keys in **Settings → Roles**. In practice: QuickBooks pages and sync now need `accounting:*`; approving, denying or revoking a privileged-access elevation needs `pam:approve` and authoring PAM rules needs `pam:manage_policy` (see [Privileged Access Management](/features/pam/#who-can-approve-and-manage-pam)); Workspace sources need `workspace:*`; and the partner's connected apps (OAuth / MCP clients) need `connected_apps:*`. The keys appear in the role editor automatically.
+</Aside>
+
+### Role Inheritance
+
+Roles support single-parent inheritance via the `parentRoleId` field. A child role inherits all permissions from its parent chain and can add additional permissions of its own. Circular inheritance is detected and rejected.
+
+Use `GET /roles/:id/effective-permissions` to view the full permission set including inherited permissions. The response distinguishes direct permissions from inherited ones and identifies the source role for each.
+
+### Creating Custom Roles
+
+Custom roles are created with `POST /roles` and must include a name. Permissions and an optional parent role can be specified:
+
+```json
+{
+  "name": "Helpdesk Tier 1",
+  "description": "View devices and acknowledge alerts",
+  "permissions": [
+    { "resource": "devices", "action": "read" },
+    { "resource": "alerts", "action": "read" },
+    { "resource": "alerts", "action": "acknowledge" }
+  ],
+  "parentRoleId": null
+}
+```
+
+Custom roles are automatically scoped to the current user's context (partner or organisation). System roles cannot be modified or deleted.
+
+### Cloning Roles
+
+Use `POST /roles/:id/clone` to duplicate an existing role (including system roles) as a starting point for a custom role. Provide a new `name` in the request body:
+
+```json
+{
+  "name": "Helpdesk Tier 2"
+}
+```
+
+The cloned role copies all permissions from the source and is created as a non-system role owned by your partner or organisation.
+
+### Deleting Roles
+
+Roles can only be deleted when:
+- The role is **not** a system role.
+- **No users** are currently assigned to the role.
+- **No child roles** inherit from the role.
+
+Attempting to delete a role with assigned users or child roles returns `400` with the count of blocking resources.
+
+---
+
+## API Reference
+
+### User Endpoints
+
+All user endpoints are mounted under `/api/v1/users` and require JWT authentication.
+
+| Method | Path | Permission | Description |
+|---|---|---|---|
+| `GET` | `/users/me` | _(authenticated)_ | Get the current user's profile. |
+| `PATCH` | `/users/me` | _(authenticated)_ | Update the current user's name, email, or preferences. |
+| `GET` | `/users` | `users:read` | List all users in the current scope. |
+| `GET` | `/users/:id` | `users:read` | Get a specific user's details. |
+| `POST` | `/users/invite` | `users:invite` | Invite a new user to the current scope. |
+| `POST` | `/users/resend-invite` | `users:invite` | Resend an invitation email. |
+| `PATCH` | `/users/:id` | `users:write` + **system scope** | Update a user's name or status. Rejects tenant-scoped (partner/organisation) callers with `403` regardless of `users:write`. |
+| `DELETE` | `/users/:id` | `users:delete` | Remove a user from the current scope. |
+| `POST` | `/users/:id/role` | `users:write` | Assign a different role to a user. |
+| `POST` | `/users/:id/mfa/reset` | `users:write` + MFA-satisfied session | Clear another user's MFA so they re-enroll at next login (lost-authenticator recovery). Refused for your own account. |
+| `GET` | `/users/roles` | `users:read` | List available roles for the current scope. |
+
+### Role Endpoints
+
+All role endpoints are mounted under `/api/v1/roles` and require JWT authentication.
+
+| Method | Path | Permission | Description |
+|---|---|---|---|
+| `GET` | `/roles` | `users:read` | List all roles (system + custom) for the current scope. Includes user counts. |
+| `POST` | `/roles` | `users:write` | Create a custom role with permissions. |
+| `GET` | `/roles/permissions/available` | `users:read` | Get the list of available resources and actions. |
+| `GET` | `/roles/:id` | `users:read` | Get a role with its direct permissions and user count. |
+| `PATCH` | `/roles/:id` | `users:write` | Update a custom role's name, description, permissions, or parent. |
+| `DELETE` | `/roles/:id` | `users:delete` | Delete a custom role (must have no users or child roles). |
+| `POST` | `/roles/:id/clone` | `users:write` | Clone an existing role as a new custom role. |
+| `GET` | `/roles/:id/users` | `users:read` | List users assigned to a specific role. |
+| `GET` | `/roles/:id/effective-permissions` | `users:read` | Get all permissions including inherited ones. |
+
+### Auth Endpoints
+
+Auth endpoints are mounted under `/api/v1/auth`. Public endpoints do not require a token.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/auth/register` | Public | Legacy no-op signup path; runs the rate-limit/password checks but never creates an account. |
+| `POST` | `/auth/register-partner` | Public | Step 1 of self-service MSP/partner signup: queues a verification email, creates nothing. |
+| `POST` | `/auth/verify-email` | Public | Step 2 of self-service signup: creates the partner/role/user from the emailed token and issues tokens. Also used for email-change confirmation. |
+| `POST` | `/auth/login` | Public | Log in with email and password. |
+| `POST` | `/auth/logout` | Authenticated | Log out and revoke all tokens. |
+| `POST` | `/auth/refresh` | Cookie | Rotate the access/refresh token pair. |
+| `GET` | `/auth/me` | Authenticated | Get current user details (including MFA and phone status). |
+| `POST` | `/auth/forgot-password` | Public | Request a password reset email. |
+| `POST` | `/auth/reset-password` | Public | Reset password with a token. |
+| `POST` | `/auth/change-password` | Authenticated | Change password (requires current password). |
+| `POST` | `/auth/mfa/setup` | Authenticated | Begin TOTP MFA setup; returns QR code and recovery codes. |
+| `POST` | `/auth/mfa/verify` | Public/Auth | Verify an MFA code during login (with `tempToken`) or setup confirmation. |
+| `POST` | `/auth/mfa/enable` | Authenticated | Confirm MFA setup (frontend settings flow). |
+| `POST` | `/auth/mfa/disable` | Authenticated | Disable MFA (requires current password and code; revokes all other sessions, re-issues the caller's). |
+| `POST` | `/auth/mfa/recovery-codes` | Authenticated | Regenerate MFA recovery codes. |
+| `POST` | `/auth/phone/verify` | Authenticated | Send a phone verification SMS. |
+| `POST` | `/auth/phone/confirm` | Authenticated | Confirm phone verification code. |
+| `POST` | `/auth/mfa/sms/enable` | Authenticated | Enable SMS MFA (requires verified phone). |
+| `POST` | `/auth/mfa/sms/send` | Public | Send SMS code during MFA login (requires `tempToken`). |
+| `POST` | `/auth/passkeys/register/options` | Authenticated | Begin passkey registration (requires current password). |
+| `POST` | `/auth/passkeys/register/verify` | Authenticated | Complete passkey registration. |
+| `GET` | `/auth/passkeys` | Authenticated | List the current user's registered passkeys. |
+| `PATCH` | `/auth/passkeys/:id` | Authenticated | Rename a passkey. |
+| `DELETE` | `/auth/passkeys/:id` | Authenticated | Delete a passkey (requires current password). |
+| `POST` | `/auth/mfa/passkey/options` | Public | Get a passkey challenge during MFA login (requires `tempToken`). |
+| `POST` | `/auth/mfa/passkey/verify` | Public | Verify a passkey assertion during MFA login (requires `tempToken`). |
+
+### SSO Endpoints
+
+SSO endpoints are mounted under `/api/v1/sso`.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/sso/presets` | Authenticated | List available SSO provider presets. |
+| `GET` | `/sso/providers` | Authenticated | List SSO providers for an organisation. |
+| `GET` | `/sso/providers/:id` | Authenticated | Get SSO provider details. |
+| `POST` | `/sso/providers` | Authenticated | Create an SSO provider. |
+| `PATCH` | `/sso/providers/:id` | Authenticated | Update an SSO provider. |
+| `DELETE` | `/sso/providers/:id` | Authenticated | Delete an SSO provider and all linked identities. |
+| `POST` | `/sso/providers/:id/status` | Authenticated | Set provider status (`active`, `inactive`, `testing`). |
+| `POST` | `/sso/providers/:id/test` | Authenticated | Test OIDC provider discovery. |
+| `GET` | `/sso/login/:orgId` | Public | Initiate SSO login (redirects to identity provider). |
+| `GET` | `/sso/callback` | Public | OIDC callback handler. |
+| `POST` | `/sso/exchange` | Public | Exchange SSO code for JWT tokens. |
+| `GET` | `/sso/check/:orgId` | Public | Check if an organisation has SSO enabled. |
+
+---
+
+## Database Schema
+
+### Users Table
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key. |
+| `email` | `varchar(255)` | Unique email address. |
+| `name` | `varchar(255)` | Display name. |
+| `password_hash` | `text` | Argon2 password hash (nullable for SSO users). |
+| `mfa_secret` | `text` | Encrypted TOTP secret. |
+| `mfa_enabled` | `boolean` | Whether MFA is active. |
+| `mfa_recovery_codes` | `jsonb` | Hashed recovery codes. |
+| `phone_number` | `text` | E.164 phone number for SMS MFA. |
+| `phone_verified` | `boolean` | Whether the phone number has been verified. |
+| `mfa_method` | `enum` | `totp`, `sms`, or `passkey`. Primary method used at login. |
+| `status` | `enum` | `active`, `invited`, or `disabled`. |
+| `avatar_url` | `text` | Profile image URL. |
+| `last_login_at` | `timestamp` | Last successful login time. |
+| `password_changed_at` | `timestamp` | Last password change time. |
+| `created_at` | `timestamp` | Account creation time. |
+| `updated_at` | `timestamp` | Last modification time. |
+
+### Roles Table
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key. |
+| `partner_id` | `uuid` | Owning partner (nullable). |
+| `org_id` | `uuid` | Owning organisation (nullable). |
+| `parent_role_id` | `uuid` | Parent role for inheritance (nullable). |
+| `scope` | `enum` | `system`, `partner`, or `organization`. |
+| `name` | `varchar(100)` | Role display name. |
+| `description` | `text` | Optional description. |
+| `is_system` | `boolean` | Whether the role is a built-in system role. |
+
+### Permissions Table
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key. |
+| `resource` | `varchar(100)` | Resource name (e.g. `devices`). |
+| `action` | `varchar(50)` | Action name (e.g. `read`). |
+| `description` | `text` | Human-readable description. |
+
+### Role Permissions Table
+
+| Column | Type | Description |
+|---|---|---|
+| `role_id` | `uuid` | FK to `roles`. |
+| `permission_id` | `uuid` | FK to `permissions`. |
+| `constraints` | `jsonb` | Optional constraints (reserved for future use). |
+
+### Partner Users Table
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key. |
+| `partner_id` | `uuid` | FK to `partners`. |
+| `user_id` | `uuid` | FK to `users`. |
+| `role_id` | `uuid` | FK to `roles`. |
+| `org_access` | `enum` | `all`, `selected`, or `none`. |
+| `org_ids` | `uuid[]` | Array of accessible organisation IDs (when `org_access` is `selected`). |
+
+### Organisation Users Table
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key. |
+| `org_id` | `uuid` | FK to `organizations`. |
+| `user_id` | `uuid` | FK to `users`. |
+| `role_id` | `uuid` | FK to `roles`. |
+| `site_ids` | `uuid[]` | Optional site restrictions. |
+| `device_group_ids` | `uuid[]` | Optional device group restrictions. |
+
+### Sessions Table
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key. |
+| `user_id` | `uuid` | FK to `users`. |
+| `token_hash` | `text` | SHA-256 hash of the session token. |
+| `ip_address` | `varchar(45)` | Client IP at session creation. |
+| `user_agent` | `text` | Browser user agent string. |
+| `expires_at` | `timestamp` | Session expiry. |
+
+---
+
+## Audit Logging
+
+All user and role management actions are recorded in the audit log. Key audit events include:
+
+| Action | Trigger |
+|---|---|
+| `user.invite` | A user is invited to a scope. |
+| `user.invite.resend` | An invitation email is resent. |
+| `user.update` | A user's name or status is changed. |
+| `user.remove` | A user is removed from a scope. |
+| `user.role.assign` | A user's role is changed. |
+| `user.profile.update` | A user updates their own profile. |
+| `user.login` | Successful login. |
+| `user.logout` | Successful logout. |
+| `role.create` | A custom role is created. |
+| `role.update` | A custom role is updated. |
+| `role.delete` | A custom role is deleted. |
+| `role.clone` | A role is cloned. |
+| `auth.mfa.setup` | MFA is enabled for an account. |
+| `auth.mfa.disable` | MFA is disabled. |
+| `auth.mfa.recovery_codes.rotate` | Recovery codes are regenerated. |
+| `auth.mfa.passkey.register` | A passkey is registered. |
+| `auth.mfa.passkey.delete` | A passkey is deleted. |
+| `sso.provider.create` | An SSO provider is created. |
+| `sso.provider.update` | An SSO provider is updated. |
+| `sso.provider.delete` | An SSO provider is deleted. |
+
+---
+
+## Troubleshooting
+
+### "Partner or organization context required"
+
+This error means the authenticated user is not associated with any partner or organisation. Ensure the user has been added to a partner (via `partner_users`) or an organisation (via `organization_users`).
+
+### "Full partner organization access required"
+
+Partner-scoped users with `orgAccess: selected` must have access to **all** organisations under the partner to manage users and roles. Users with limited organisation access cannot administer other users.
+
+### "Cannot modify system roles" / "Cannot delete system roles"
+
+System roles (created with `isSystem: true`) are immutable. To customise permissions, clone the system role with `POST /roles/:id/clone` and modify the clone.
+
+### "Cannot delete role with assigned users"
+
+Re-assign all users from the role before deleting it. Use `GET /roles/:id/users` to find users assigned to the role, then `POST /users/:id/role` to move them.
+
+### "Cannot set parent role: would create circular inheritance"
+
+A role's parent cannot be one of its own descendants. Review the inheritance chain with `GET /roles/:id/effective-permissions` and choose a different parent.
+
+### "User already exists in this scope" (409)
+
+The user (by email) is already linked to this partner or organisation. Use `PATCH /users/:id` or `POST /users/:id/role` to modify their existing membership.
+
+### MFA setup expires
+
+The MFA setup data (TOTP secret and recovery codes) is stored in Redis with a 10-minute TTL. If the user does not confirm the setup within 10 minutes, they must restart with `POST /auth/mfa/setup`.
+
+### "Your organization requires MFA"
+
+The organisation has `settings.security.requireMfa` enabled. MFA cannot be disabled by individual users while this policy is active. Contact an organisation administrator to change the policy.
+
+### "Your organization does not allow SMS MFA"
+
+The organisation has restricted allowed MFA methods via `settings.security.allowedMfaMethods.sms`. Use TOTP instead, or ask an administrator to enable SMS MFA.
+
+### SSO login redirects to `/login?error=...`
+
+Common SSO callback errors:
+
+| Error | Cause |
+|---|---|
+| `session_expired` | The SSO session (state) expired. Login sessions are valid for 10 minutes. |
+| `provider_not_found` | The SSO provider was deleted or deactivated during the flow. |
+| `domain_not_allowed` | The user's email domain is not in the provider's `allowedDomains` list. |
+| `user_not_found` | The user does not exist and `autoProvision` is disabled on the provider. |
+| `default_role_required` | Auto-provisioning is enabled but no `defaultRoleId` is configured. |
+| `no_org_access` | The user exists but is not a member of the SSO provider's organisation. |
+
+### Rate Limiting
+
+| Endpoint | Limit |
+|---|---|
+| Login (`/auth/login`) | Per IP + email combination (configurable via `loginLimiter`). |
+| MFA verification | Per user ID (configurable via `mfaLimiter`). |
+| Forgot password | Per IP (configurable via `forgotPasswordLimiter`). |
+| Registration | 5 per IP per hour (3 for partner registration). |
+| Phone verification | Per phone number and per user. |
+| SMS send during login | Per `tempToken` and per phone number globally. |
+
+If you receive a `429 Too Many Requests` response, wait for the `retryAfter` period specified in the response body.

@@ -1,0 +1,347 @@
+import {
+  pgTable,
+  uuid,
+  varchar,
+  text,
+  timestamp,
+  boolean,
+  jsonb,
+  pgEnum,
+  integer,
+  date,
+  uniqueIndex,
+  index
+} from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { organizations } from './orgs';
+import { partners } from './orgs';
+import { devices } from './devices';
+import { users } from './users';
+import { scripts } from './scripts';
+
+export const patchSourceEnum = pgEnum('patch_source', [
+  'microsoft',
+  'apple',
+  'linux',
+  'third_party',
+  'custom'
+]);
+
+export const patchSeverityEnum = pgEnum('patch_severity', [
+  'critical',
+  'important',
+  'moderate',
+  'low',
+  'unknown'
+]);
+
+export const patchApprovalStatusEnum = pgEnum('patch_approval_status', [
+  'pending',
+  'approved',
+  'rejected',
+  'deferred'
+]);
+
+export const devicePatchStatusEnum = pgEnum('device_patch_status', [
+  'pending',
+  'installed',
+  'failed',
+  'skipped',
+  'missing'
+]);
+
+/**
+ * device_patches.status values that mean "the device still needs this patch
+ * installed" — the set that counts toward outstanding / "missing patch" metrics
+ * and that patch automation is allowed to act on.
+ *
+ * IMPORTANT: 'missing' is deliberately NOT in this set. Despite its name,
+ * 'missing' is a TOMBSTONE, not "a patch the device is missing". Agent scan
+ * ingestion (routes/agents/patches.ts) marks ALL of a device's existing rows
+ * 'missing' at the start of every scan, then re-inserts the rows the current
+ * scan actually reports as 'pending' / 'installed'. Rows left at 'missing' are
+ * stale records from a prior scan that the latest scan no longer reports (e.g.
+ * a package upgraded to a new externalId) — they never get cleaned up and grow
+ * unbounded. Counting them as outstanding made a fully-patched Linux box report
+ * ~960 "missing" patches in the compliance view. Only 'pending' is outstanding.
+ */
+export const OUTSTANDING_DEVICE_PATCH_STATUSES = ['pending'] as const;
+
+export const patchJobStatusEnum = pgEnum('patch_job_status', [
+  'scheduled',
+  'running',
+  'completed',
+  'failed',
+  'cancelled'
+]);
+
+export const patchJobResultStatusEnum = pgEnum('patch_job_result_status', [
+  'pending',
+  'running',
+  // #5128 W3: the install_patches command is persisted with a deliver_by and is
+  // waiting for the device's next heartbeat. Non-terminal, like pending/running,
+  // but owned by the DELIVERY clock (the device_commands reaper), not by
+  // reapStalePatchJobResults' execution clock.
+  'queued',
+  'completed',
+  'failed',
+  'skipped'
+]);
+
+export const patchRollbackStatusEnum = pgEnum('patch_rollback_status', [
+  'pending',
+  'running',
+  'completed',
+  'failed',
+  'cancelled'
+]);
+
+export const patchComplianceReportStatusEnum = pgEnum('patch_compliance_report_status', [
+  'pending',
+  'running',
+  'completed',
+  'failed'
+]);
+
+export const patchComplianceReportFormatEnum = pgEnum('patch_compliance_report_format', [
+  'csv',
+  'pdf'
+]);
+
+export const patchPolicyKindEnum = pgEnum('patch_policy_kind', [
+  'ring',
+  'legacy',
+]);
+
+export const patches = pgTable('patches', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  source: patchSourceEnum('source').notNull(),
+  externalId: varchar('external_id', { length: 255 }).notNull(),
+  vendor: varchar('vendor', { length: 255 }),
+  packageId: varchar('package_id', { length: 256 }),
+  version: varchar('version', { length: 64 }),
+  title: varchar('title', { length: 500 }).notNull(),
+  description: text('description'),
+  severity: patchSeverityEnum('severity'),
+  category: varchar('category', { length: 100 }),
+  osTypes: text('os_types').array(),
+  osVersions: text('os_versions').array(),
+  architecture: text('architecture').array(),
+  releaseDate: date('release_date'),
+  kbArticleUrl: text('kb_article_url'),
+  supersedes: text('supersedes').array(),
+  supersededBy: text('superseded_by'),
+  requiresReboot: boolean('requires_reboot').notNull().default(false),
+  downloadUrl: text('download_url'),
+  downloadSizeMb: integer('download_size_mb'),
+  installCommand: text('install_command'),
+  uninstallCommand: text('uninstall_command'),
+  detectScript: text('detect_script'),
+  metadata: jsonb('metadata'),
+  cveIds: text('cve_ids').array(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  sourceExternalIdUnique: uniqueIndex('patches_source_external_id_unique').on(table.source, table.externalId)
+}));
+
+export const patchPolicies = pgTable('patch_policies', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  kind: patchPolicyKindEnum('kind').notNull().default('ring'),
+  name: varchar('name', { length: 255 }).notNull(),
+  description: text('description'),
+  enabled: boolean('enabled').notNull().default(true),
+  targets: jsonb('targets').notNull().default({}),
+  autoApprove: jsonb('auto_approve').notNull().default({}),
+  schedule: jsonb('schedule').notNull().default({}),
+  rebootPolicy: jsonb('reboot_policy').notNull().default({}),
+  rollbackOnFailure: boolean('rollback_on_failure').notNull().default(false),
+  preInstallScript: uuid('pre_install_script_id').references(() => scripts.id),
+  postInstallScript: uuid('post_install_script_id').references(() => scripts.id),
+  notifyOnComplete: boolean('notify_on_complete').notNull().default(false),
+  // Update Ring fields
+  ringOrder: integer('ring_order').notNull().default(0),
+  deferralDays: integer('deferral_days').notNull().default(0),
+  deadlineDays: integer('deadline_days'),
+  gracePeriodHours: integer('grace_period_hours').notNull().default(4),
+  categories: text('categories').array().notNull().default([]),
+  excludeCategories: text('exclude_categories').array().notNull().default([]),
+  categoryRules: jsonb('category_rules').notNull().default([]),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+});
+
+export const patchApprovals = pgTable('patch_approvals', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  patchId: uuid('patch_id').notNull().references(() => patches.id),
+  policyId: uuid('policy_id').references(() => patchPolicies.id),
+  ringId: uuid('ring_id').references(() => patchPolicies.id),
+  status: patchApprovalStatusEnum('status').notNull().default('pending'),
+  approvedBy: uuid('approved_by').references(() => users.id),
+  approvedAt: timestamp('approved_at'),
+  deferUntil: timestamp('defer_until'),
+  notes: text('notes'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  // Partner-scoped: one approval per (partner, patch, ring). NULL ring = partner-wide blanket.
+  partnerPatchRingUnique: uniqueIndex('patch_approvals_partner_patch_ring_unique').on(
+    table.partnerId,
+    table.patchId,
+    sql`COALESCE(${table.ringId}, '00000000-0000-0000-0000-000000000000')`
+  )
+}));
+
+export const devicePatches = pgTable('device_patches', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  patchId: uuid('patch_id').notNull().references(() => patches.id),
+  status: devicePatchStatusEnum('status').notNull().default('pending'),
+  installedAt: timestamp('installed_at'),
+  installedVersion: varchar('installed_version', { length: 100 }),
+  // Agent-observed available upgrade version, scoped to this device and tenant.
+  availableVersion: varchar('available_version', { length: 64 }),
+  lastCheckedAt: timestamp('last_checked_at'),
+  failureCount: integer('failure_count').notNull().default(0),
+  lastError: text('last_error'),
+  rollbackAvailable: boolean('rollback_available').notNull().default(false),
+  // Windows install scope the patch was discovered at: 'machine' | 'user'
+  // (#2727). NULL for providers with no scope concept and for rows written
+  // before the user-context winget pass existed; NULL is treated as
+  // machine-wide. Constrained by device_patches_scope_chk.
+  scope: varchar('scope', { length: 16 }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  devicePatchUnique: uniqueIndex('device_patches_device_patch_unique').on(table.deviceId, table.patchId),
+  userScopeIdx: index('idx_device_patches_user_scope').on(table.deviceId).where(sql`scope = 'user'`),
+  // Backs the `patches.pending` device-filter field (#968).
+  pendingIdx: index('idx_device_patches_pending').on(table.deviceId).where(sql`status = 'pending'`),
+  orgInstalledAtIdx: index('device_patches_org_installed_at_idx')
+    .on(table.orgId, table.installedAt)
+    .where(sql`${table.status} = 'installed'`)
+}));
+
+export const patchJobs = pgTable('patch_jobs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  policyId: uuid('policy_id').references(() => patchPolicies.id),
+  ringId: uuid('ring_id').references(() => patchPolicies.id),
+  configPolicyId: uuid('config_policy_id'),
+  name: varchar('name', { length: 255 }).notNull(),
+  patches: jsonb('patches').notNull().default({}),
+  targets: jsonb('targets').notNull().default({}),
+  status: patchJobStatusEnum('status').notNull().default('scheduled'),
+  scheduledAt: timestamp('scheduled_at'),
+  startedAt: timestamp('started_at'),
+  completedAt: timestamp('completed_at'),
+  devicesTotal: integer('devices_total').notNull().default(0),
+  devicesCompleted: integer('devices_completed').notNull().default(0),
+  devicesFailed: integer('devices_failed').notNull().default(0),
+  devicesPending: integer('devices_pending').notNull().default(0),
+  // #5128 W3: devices whose install_patches command is queued for an offline
+  // device. The job stays non-terminal while this is > 0 (OD-9) — the
+  // completion checker only terminalises when devicesPending AND devicesQueued
+  // are both zero, so unfinished patching is never reported as completed.
+  devicesQueued: integer('devices_queued').notNull().default(0),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+});
+
+export const patchJobResults = pgTable('patch_job_results', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  jobId: uuid('job_id').notNull().references(() => patchJobs.id),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  // NULL = a WHOLE-DEVICE summary row (the device was skipped, never
+  // dispatched, or closed with no approved set), which is about the device's
+  // outcome for the job rather than about any one patch. Nullable since
+  // 2026-10-13-100200: the previous nil-UUID sentinel had no `patches` row and
+  // raised 23503 on every real database.
+  patchId: uuid('patch_id').references(() => patches.id),
+  status: patchJobResultStatusEnum('status').notNull().default('pending'),
+  startedAt: timestamp('started_at'),
+  completedAt: timestamp('completed_at'),
+  exitCode: integer('exit_code'),
+  output: text('output'),
+  errorMessage: text('error_message'),
+  rebootRequired: boolean('reboot_required').notNull().default(false),
+  rebootedAt: timestamp('rebooted_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+}, (table) => ({
+  // Used by patchRebootHandler and the patch-reboot policy machinery.
+  // NOTE: originally backed the `system.rebootRequired` device filter (#968),
+  // which was re-pointed to devices.pending_reboot in 2026-06-11-j.
+  rebootPendingIdx: index('idx_patch_job_results_reboot_pending')
+    .on(table.deviceId)
+    .where(sql`reboot_required = true AND rebooted_at IS NULL`),
+  // AI patch agent W03 (#5749): the failedWork / queued-offline evidence reads
+  // (`status = 'failed'|'queued' AND created_at >= now() - 30d`). Partial on
+  // status rather than a (status, created_at) composite: under forced RLS as
+  // breeze_app only leakproof operators become index conditions, and enum_eq
+  // is not — the predicate is proven statically instead. See the migration.
+  statusCreatedIdx: index('idx_patch_job_results_status_created')
+    .on(table.createdAt)
+    .where(sql`status IN ('failed', 'queued')`)
+}));
+
+export const patchRollbacks = pgTable('patch_rollbacks', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  patchId: uuid('patch_id').notNull().references(() => patches.id),
+  originalJobId: uuid('original_job_id').references(() => patchJobs.id),
+  reason: text('reason'),
+  status: patchRollbackStatusEnum('status').notNull().default('pending'),
+  startedAt: timestamp('started_at'),
+  completedAt: timestamp('completed_at'),
+  output: text('output'),
+  errorMessage: text('error_message'),
+  initiatedBy: uuid('initiated_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+});
+
+export const patchComplianceSnapshots = pgTable('patch_compliance_snapshots', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  ringId: uuid('ring_id').references(() => patchPolicies.id),
+  snapshotDate: date('snapshot_date').notNull(),
+  totalDevices: integer('total_devices').notNull().default(0),
+  compliantDevices: integer('compliant_devices').notNull().default(0),
+  nonCompliantDevices: integer('non_compliant_devices').notNull().default(0),
+  criticalMissing: integer('critical_missing').notNull().default(0),
+  importantMissing: integer('important_missing').notNull().default(0),
+  patchesPendingApproval: integer('patches_pending_approval').notNull().default(0),
+  patchesInstalled24h: integer('patches_installed_24h').notNull().default(0),
+  failedInstalls24h: integer('failed_installs_24h').notNull().default(0),
+  detailsByCategory: jsonb('details_by_category').notNull().default({}),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+});
+
+export const patchComplianceReports = pgTable('patch_compliance_reports', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  requestedBy: uuid('requested_by').references(() => users.id),
+  status: patchComplianceReportStatusEnum('status').notNull().default('pending'),
+  format: patchComplianceReportFormatEnum('format').notNull().default('csv'),
+  source: patchSourceEnum('source'),
+  severity: patchSeverityEnum('severity'),
+  executionScopeVersion: integer('execution_scope_version'),
+  executionScopeKind: varchar('execution_scope_kind', { length: 32 }),
+  executionScopeSiteIds: uuid('execution_scope_site_ids').array(),
+  executionScopeUserId: uuid('execution_scope_user_id'),
+  executionScopeFingerprint: varchar('execution_scope_fingerprint', { length: 64 }),
+  executionScopeCapturedAt: timestamp('execution_scope_captured_at', { withTimezone: true }),
+  executionScopePrincipalKind: text('execution_scope_principal_kind')
+    .$type<'user' | 'system' | 'portal_user'>(),
+  summary: jsonb('summary'),
+  rowCount: integer('row_count'),
+  outputPath: text('output_path'),
+  errorMessage: text('error_message'),
+  startedAt: timestamp('started_at'),
+  completedAt: timestamp('completed_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+});

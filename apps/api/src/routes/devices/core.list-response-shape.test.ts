@@ -1,0 +1,347 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+
+// Regression test for #800 Layer C / #861 / #862 — the amber
+// "Agent silent (watchdog OK)" badge on the devices list relies on the API
+// returning watchdog health fields in the GET /devices response. These fields
+// are selected from the database in core.ts but
+// were being dropped by the response mapper, so the UI never received them
+// and the badge never rendered.
+//
+// This test asserts the response body contains both keys with the values
+// from the DB row — a check the existing permission tests didn't make.
+//
+// Extended for #1273: the "Reboot pending" list badge has the identical
+// failure mode — `pendingReboot` is selected from the DB in core.ts but was
+// omitted by the same response mapper, so the list/grid badge never rendered
+// (the device-detail page worked because it returns the full row).
+//
+// Extended for #2138/#2308: the device-list link-group scalars
+// (`linkGroupId`, `linkGroupRole`) drive the client-side multiboot grouping
+// and vm_host guest nesting. If the mapper drops either, every linked device
+// silently renders ungrouped while all other tests stay green — the exact
+// dropped-field failure mode this file exists to catch.
+
+vi.mock('../../db', () => ({
+  runOutsideDbContext: vi.fn((fn) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  db: {
+    select: vi.fn(),
+    execute: vi.fn(),
+    insert: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn(),
+  },
+}));
+
+vi.mock('../../db/schema', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../db/schema')>();
+  return { ...actual };
+});
+
+vi.mock('../../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      user: { id: 'user-1', email: 'a@b.c', name: 'A' },
+      scope: 'organization',
+      orgId: 'org-1',
+      partnerId: null,
+      accessibleOrgIds: ['org-1'],
+      canAccessOrg: (orgId: string) => orgId === 'org-1',
+      orgCondition: () => undefined,
+      token: { mfa: false },
+    });
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
+    c.set('permissions', {
+      permissions: [{ resource, action }],
+      partnerId: null,
+      orgId: 'org-1',
+      roleId: 'role-1',
+      scope: 'organization',
+    });
+    return next();
+  }),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+}));
+
+vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: vi.fn() }));
+vi.mock('../../services/sentry', () => ({ captureException: vi.fn() }));
+vi.mock('../../services/remoteAccessPolicy', () => ({
+  resolveRemoteAccessForDevice: vi.fn().mockResolvedValue({ policyId: null, settings: {} }),
+}));
+vi.mock('../../services/remoteAccessLauncher', () => ({
+  resolveRemoteAccessLaunch: vi.fn().mockReturnValue({ launchUrl: null, skipReason: 'no_provider_configured' }),
+}));
+vi.mock('../agentWs', () => ({
+  sendCommandToAgent: vi.fn(),
+  isAgentConnected: vi.fn().mockReturnValue(false),
+}));
+vi.mock('../../services/commandQueue', () => ({
+  CommandTypes: { SELF_UNINSTALL: 'self_uninstall' },
+  queueCommandForExecution: vi.fn(),
+}));
+vi.mock('../agents/enrollment', () => ({
+  getGlobalEnrollmentSecret: vi.fn().mockReturnValue(null),
+}));
+
+import { coreRoutes } from './core';
+import { db } from '../../db';
+
+function rigDeviceListRows(
+  rows: unknown[],
+  // Rows the batched LAN-IP lateral returns (#2503). The handler issues two
+  // db.execute calls per request in a fixed order — latest metrics first, then
+  // the LAN-IP lookup — so the LAN rig has to be the SECOND queued result.
+  lanIpRows: Array<{ device_id: string; ip_address: string }> = [],
+) {
+  const offset = vi.fn().mockResolvedValue(rows);
+  const limit = vi.fn().mockReturnValue({ offset });
+  const orderBy = vi.fn().mockReturnValue({ limit });
+  const where = vi.fn().mockReturnValue({ orderBy });
+  // Two chained leftJoins (deviceHardware, then deviceReliability #1720), so
+  // each leftJoin returns a thenable that also exposes the next leftJoin.
+  const chain: Record<string, unknown> = {};
+  const leftJoin = vi.fn().mockReturnValue(chain);
+  chain.leftJoin = leftJoin;
+  chain.where = where;
+  const from = vi.fn().mockReturnValue({ leftJoin });
+  vi.mocked(db.select).mockReturnValue({ from } as never);
+  vi.mocked(db.execute)
+    .mockResolvedValue([] as never)
+    .mockResolvedValueOnce([] as never)      // latest-metrics lateral
+    .mockResolvedValueOnce(lanIpRows as never); // LAN-IP lateral (#2503)
+}
+
+describe('GET /devices — response shape', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = new Hono();
+    app.route('/devices', coreRoutes);
+  });
+
+  it('includes watchdog health fields in each list row', async () => {
+    const silentSince = new Date('2026-05-26T19:24:57.519Z');
+    rigDeviceListRows(
+      [
+      {
+        id: '33333333-3333-4333-8333-333333333333',
+        orgId: 'org-1',
+        siteId: 'site-1',
+        agentId: 'agent-win-02',
+        hostname: 'WIN-FILESERVER-02',
+        displayName: 'File Server',
+        osType: 'windows',
+        deviceRole: 'unknown',
+        deviceRoleSource: 'auto',
+        osVersion: '10.0.20348',
+        osBuild: null,
+        architecture: 'x64',
+        agentVersion: 'v0.67.0',
+        watchdogVersion: 'v0.67.1',
+        status: 'offline',
+        watchdogStatus: 'connected',
+        mainAgentSilentSince: silentSince,
+        pendingReboot: true,
+        lastSeenAt: new Date('2026-05-26T19:19:57.519Z'),
+        lastSeenIp: '198.51.100.24',
+        enrolledAt: new Date('2026-04-26T19:39:57.519Z'),
+        tags: ['e2e'],
+        customFields: {},
+        desktopAccess: null,
+        lastUser: null,
+        uptimeSeconds: null,
+        isHeadless: false,
+        linkGroupId: '44444444-4444-4444-8444-444444444444',
+        linkGroupRole: 'host',
+        createdAt: new Date('2026-05-26T19:39:57.519Z'),
+        updatedAt: new Date('2026-05-26T19:41:26.390Z'),
+        cpuModel: null,
+        cpuCores: null,
+        ramTotalMb: null,
+        diskTotalGb: null,
+        reliabilityScore: 42,
+        reliabilityTrend: 'degrading',
+        helperLifecycleMode: 'on-demand',
+        possibleReplacementOfDeviceId: '55555555-5555-4555-8555-555555555555',
+        purchaseDate: '2025-03-01',
+        purchaseDateSource: 'vendor',
+      },
+      ],
+      [{ device_id: '33333333-3333-4333-8333-333333333333', ip_address: '10.20.30.40' }],
+    );
+
+    const res = await app.request('/devices?limit=50', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer t' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toHaveLength(1);
+    const row = body.data[0];
+
+    // The fields the response mapper was silently dropping.
+    expect(row).toHaveProperty('watchdogStatus', 'connected');
+    expect(row).toHaveProperty('mainAgentSilentSince', silentSince.toISOString());
+    expect(row).toHaveProperty('watchdogVersion', 'v0.67.1');
+    // #1273 regression — pendingReboot must survive the mapper for the list badge.
+    expect(row).toHaveProperty('pendingReboot', true);
+    // #1720 — reliability score + trend surfaced for the list column.
+    expect(row).toHaveProperty('reliabilityScore', 42);
+    expect(row).toHaveProperty('reliabilityTrend', 'degrading');
+    // #2138/#2308 — link-group scalars must survive the mapper: the web list
+    // groups multiboot rows by linkGroupId and nests vm_host guests by
+    // linkGroupRole; dropping either silently un-groups every linked device.
+    expect(row).toHaveProperty('linkGroupId', '44444444-4444-4444-8444-444444444444');
+    expect(row).toHaveProperty('linkGroupRole', 'host');
+    // Task 12 (RDS per-session helpers) — helperLifecycleMode must survive
+    // the mapper: Tasks 13/14 gate the session picker on this field being
+    // 'on-demand' at the list-row level, not just on the detail page.
+    expect(row).toHaveProperty('helperLifecycleMode', 'on-demand');
+    // #2503 — the opt-in WAN/LAN IP columns. wanIp is renamed from the DB's
+    // `lastSeenIp`, and lanIp comes from a SEPARATE batched query rather than
+    // the row select, so both are exactly the kind of field this file exists
+    // to catch being dropped between the query and the response body.
+    expect(row).toHaveProperty('wanIp', '198.51.100.24');
+    expect(row).toHaveProperty('lanIp', '10.20.30.40');
+    // #2764 — collision-enrollment link. The web list renders the "Possible
+    // duplicate" badge from this field alone; drop it in the mapper and every
+    // duplicate row looks ordinary while the device page still shows the
+    // review banner (the detail route returns the whole row), so nothing else
+    // would go red.
+    expect(row).toHaveProperty(
+      'possibleReplacementOfDeviceId',
+      '55555555-5555-4555-8555-555555555555',
+    );
+    // #5701 follow-up — purchaseDate/purchaseDateSource are selected in
+    // core.ts's query but were being dropped by this same response mapper,
+    // so the Device Settings modal showed a blank field after save/reload.
+    expect(row).toHaveProperty('purchaseDate', '2025-03-01');
+    expect(row).toHaveProperty('purchaseDateSource', 'vendor');
+  });
+
+  it('returns null watchdogStatus / mainAgentSilentSince for healthy rows (still present in shape)', async () => {
+    rigDeviceListRows([
+      {
+        id: '11111111-1111-4111-8111-111111111111',
+        orgId: 'org-1',
+        siteId: 'site-1',
+        agentId: 'agent-mac-01',
+        hostname: 'macbook-test-01.local',
+        displayName: null,
+        osType: 'macos',
+        deviceRole: 'workstation',
+        deviceRoleSource: 'auto',
+        osVersion: '14.5.0',
+        osBuild: null,
+        architecture: 'arm64',
+        agentVersion: 'v0.67.0',
+        watchdogVersion: null,
+        status: 'online',
+        watchdogStatus: null,
+        mainAgentSilentSince: null,
+        pendingReboot: false,
+        lastSeenAt: new Date(),
+        lastSeenIp: null,
+        enrolledAt: new Date(),
+        tags: [],
+        customFields: {},
+        desktopAccess: null,
+        lastUser: null,
+        uptimeSeconds: null,
+        isHeadless: false,
+        linkGroupId: null,
+        linkGroupRole: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        cpuModel: null,
+        cpuCores: null,
+        ramTotalMb: null,
+        diskTotalGb: null,
+        reliabilityScore: null,
+        reliabilityTrend: null,
+        helperLifecycleMode: null,
+        purchaseDate: null,
+        purchaseDateSource: null,
+      },
+    ]);
+
+    const res = await app.request('/devices?limit=50', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer t' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const row = body.data[0];
+
+    // #1720 — reliability keys present even with no computed score (null),
+    // so the UI distinguishes "no score yet" (dash) from "field absent".
+    expect(Object.prototype.hasOwnProperty.call(row, 'reliabilityScore')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'reliabilityTrend')).toBe(true);
+    expect(row.reliabilityScore).toBeNull();
+    expect(row.reliabilityTrend).toBeNull();
+
+    // Keys must exist on the shape even when null — UI distinguishes
+    // "field absent" (older API) from "field present, value null"
+    // (healthy device on a new API).
+    expect(Object.prototype.hasOwnProperty.call(row, 'watchdogStatus')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'mainAgentSilentSince')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'watchdogVersion')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'pendingReboot')).toBe(true);
+    expect(row.watchdogStatus).toBeNull();
+    expect(row.mainAgentSilentSince).toBeNull();
+    expect(row.watchdogVersion).toBeNull();
+    expect(row.pendingReboot).toBe(false);
+
+    // #2138/#2308 — link-group keys present (null) even for unlinked devices.
+    expect(Object.prototype.hasOwnProperty.call(row, 'linkGroupId')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'linkGroupRole')).toBe(true);
+    expect(row.linkGroupId).toBeNull();
+    expect(row.linkGroupRole).toBeNull();
+
+    // Task 12 — helperLifecycleMode key present (null) for devices that
+    // haven't reported a mode (non-RDS hosts, or agents predating plan 2).
+    expect(Object.prototype.hasOwnProperty.call(row, 'helperLifecycleMode')).toBe(true);
+    expect(row.helperLifecycleMode).toBeNull();
+
+    // #2503 — WAN/LAN IP keys present (null) for a device that has never made
+    // an authenticated request and has no reported interface yet. Present-but-
+    // null is what lets the column render a dash instead of guessing.
+    expect(Object.prototype.hasOwnProperty.call(row, 'wanIp')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'lanIp')).toBe(true);
+    expect(row.wanIp).toBeNull();
+    expect(row.lanIp).toBeNull();
+
+    // #3207 W5 — scheduled-restart keys present (null) for a device with no
+    // restart booked, which is the steady state for nearly the whole fleet.
+    // Present-but-null is load-bearing here beyond rendering a dash:
+    // rebootMaxDeferrals null means "this agent predates deferral reporting"
+    // and 0 means "this restart cannot be postponed", and the badge renders
+    // those two differently. A key silently dropped by the response mapper
+    // would collapse them into the same "absent" case.
+    expect(Object.prototype.hasOwnProperty.call(row, 'rebootScheduledAt')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'rebootDeadline')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'rebootSource')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'rebootDeferralsUsed')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'rebootMaxDeferrals')).toBe(true);
+    expect(row.rebootScheduledAt).toBeNull();
+    expect(row.rebootDeadline).toBeNull();
+    expect(row.rebootSource).toBeNull();
+    expect(row.rebootDeferralsUsed).toBeNull();
+    expect(row.rebootMaxDeferrals).toBeNull();
+
+    // #5701 follow-up — keys present (null) for devices with no purchase
+    // date recorded yet.
+    expect(Object.prototype.hasOwnProperty.call(row, 'purchaseDate')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'purchaseDateSource')).toBe(true);
+    expect(row.purchaseDate).toBeNull();
+    expect(row.purchaseDateSource).toBeNull();
+  });
+});

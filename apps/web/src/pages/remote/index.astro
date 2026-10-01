@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import RemoteAccessPage from '../../components/remote/RemoteAccessPage';
+---
+
+<DashboardLayout titleKey="titles.remote">
+  <RemoteAccessPage client:load />
+</DashboardLayout>

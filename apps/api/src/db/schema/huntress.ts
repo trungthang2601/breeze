@@ -1,0 +1,123 @@
+import {
+  pgTable,
+  uuid,
+  varchar,
+  text,
+  timestamp,
+  jsonb,
+  boolean,
+  index,
+  uniqueIndex,
+  integer,
+  foreignKey,
+} from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { organizations, partners } from './orgs';
+import { users } from './users';
+import { devices } from './devices';
+
+export const huntressIntegrations = pgTable('huntress_integrations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  legacyOrgId: uuid('org_id').references(() => organizations.id),
+  name: varchar('name', { length: 200 }).notNull(),
+  apiKeyEncrypted: text('api_key_encrypted').notNull(),
+  accountId: varchar('account_id', { length: 120 }),
+  // The Huntress deployment Account Key (embedded in the installer download URL and
+  // passed as /ACCT_KEY). Distinct from the API account_id; encrypted at rest.
+  accountKeyEncrypted: text('account_key_encrypted'),
+  apiBaseUrl: varchar('api_base_url', { length: 300 }).notNull().default('https://api.huntress.io/v1'),
+  webhookSecretEncrypted: text('webhook_secret_encrypted'),
+  isActive: boolean('is_active').notNull().default(true),
+  lastSyncAt: timestamp('last_sync_at'),
+  lastSyncStatus: varchar('last_sync_status', { length: 20 }),
+  lastSyncError: text('last_sync_error'),
+  // Per-run result counts from the last successful sync (#1736), so the UI can
+  // surface "synced N agents / M incidents / K orgs" and distinguish a real
+  // success from a stale "Connected" badge. Null until the first success.
+  lastSyncAgents: integer('last_sync_agents'),
+  lastSyncIncidents: integer('last_sync_incidents'),
+  lastSyncOrgs: integer('last_sync_orgs'),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  partnerActiveIdx: uniqueIndex('huntress_integrations_partner_active_idx')
+    .on(table.partnerId)
+    .where(sql`${table.isActive} = true`),
+  idPartnerIdx: uniqueIndex('huntress_integrations_id_partner_idx').on(table.id, table.partnerId),
+  legacyOrgIdx: index('huntress_integrations_legacy_org_idx').on(table.legacyOrgId),
+}));
+
+export const huntressOrgMappings = pgTable('huntress_org_mappings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  integrationId: uuid('integration_id').notNull(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  huntressOrgId: varchar('huntress_org_id', { length: 128 }).notNull(),
+  huntressOrgName: varchar('huntress_org_name', { length: 255 }),
+  huntressOrgKey: varchar('huntress_org_key', { length: 120 }),
+  huntressAccountId: varchar('huntress_account_id', { length: 120 }),
+  orgId: uuid('org_id').references(() => organizations.id, { onDelete: 'set null' }),
+  agentsCount: integer('agents_count').notNull().default(0),
+  incidentsCount: integer('incidents_count').notNull().default(0),
+  metadata: jsonb('metadata'),
+  lastSeenAt: timestamp('last_seen_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  uniqueOrgIdx: uniqueIndex('huntress_org_mappings_integration_org_idx').on(table.integrationId, table.huntressOrgId),
+  orgIdx: index('huntress_org_mappings_org_idx').on(table.orgId),
+  integrationIdx: index('huntress_org_mappings_integration_idx').on(table.integrationId),
+  partnerIdx: index('huntress_org_mappings_partner_idx').on(table.partnerId),
+  integrationPartnerFk: foreignKey({
+    columns: [table.integrationId, table.partnerId],
+    foreignColumns: [huntressIntegrations.id, huntressIntegrations.partnerId],
+    name: 'huntress_org_mappings_integration_partner_fkey',
+  }).onDelete('cascade'),
+}));
+
+export const huntressAgents = pgTable('huntress_agents', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  integrationId: uuid('integration_id').notNull().references(() => huntressIntegrations.id, { onDelete: 'cascade' }),
+  huntressAgentId: varchar('huntress_agent_id', { length: 128 }).notNull(),
+  deviceId: uuid('device_id').references(() => devices.id),
+  hostname: varchar('hostname', { length: 255 }),
+  platform: varchar('platform', { length: 32 }),
+  status: varchar('status', { length: 20 }),
+  lastSeenAt: timestamp('last_seen_at'),
+  metadata: jsonb('metadata'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  agentIdIdx: uniqueIndex('huntress_agents_agent_id_idx').on(table.integrationId, table.huntressAgentId),
+  orgDeviceIdx: index('huntress_agents_org_device_idx').on(table.orgId, table.deviceId),
+}));
+
+export const huntressIncidents = pgTable('huntress_incidents', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  integrationId: uuid('integration_id').notNull().references(() => huntressIntegrations.id, { onDelete: 'cascade' }),
+  deviceId: uuid('device_id').references(() => devices.id),
+  huntressIncidentId: varchar('huntress_incident_id', { length: 128 }).notNull(),
+  severity: varchar('severity', { length: 20 }),
+  category: varchar('category', { length: 60 }),
+  title: text('title').notNull(),
+  description: text('description'),
+  recommendation: text('recommendation'),
+  status: varchar('status', { length: 30 }).notNull(),
+  reportedAt: timestamp('reported_at'),
+  resolvedAt: timestamp('resolved_at'),
+  details: jsonb('details'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (table) => ({
+  incidentIdIdx: uniqueIndex('huntress_incidents_external_idx').on(table.integrationId, table.huntressIncidentId),
+  orgStatusIdx: index('huntress_incidents_org_status_idx').on(table.orgId, table.status),
+  orgReportedAtIdx: index('huntress_incidents_org_reported_at_idx')
+    .on(table.orgId, table.reportedAt)
+    .where(sql`${table.reportedAt} IS NOT NULL`),
+  orgResolvedAtIdx: index('huntress_incidents_org_resolved_at_idx')
+    .on(table.orgId, table.resolvedAt)
+    .where(sql`${table.resolvedAt} IS NOT NULL`),
+}));

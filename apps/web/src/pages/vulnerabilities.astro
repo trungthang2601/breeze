@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../layouts/DashboardLayout.astro';
+import VulnerabilityLandingPage from '../components/vulnerabilities/VulnerabilityLandingPage';
+---
+
+<DashboardLayout titleKey="titles.vulnerabilities">
+  <VulnerabilityLandingPage client:load />
+</DashboardLayout>

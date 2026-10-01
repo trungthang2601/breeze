@@ -1,0 +1,945 @@
+import { create } from 'zustand';
+import {
+  getTauriInvoke,
+  helperRequest,
+  requireDevBearerToken,
+  type AgentConfig,
+  type HelperFetchResponse,
+} from '../lib/helperFetch';
+import {
+  WORKSPACE_CHAT_TOOLS,
+  executeWorkspaceChatTool,
+  type ClientToolDeclaration,
+} from '../lib/workspaceChatTools';
+import { useWorkspaceStore } from './workspaceStore';
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'tool_use' | 'tool_result';
+  content: string;
+  toolName?: string;
+  toolInput?: Record<string, unknown>;
+  toolOutput?: unknown;
+  toolUseId?: string;
+  isError?: boolean;
+  isStreaming?: boolean;
+  createdAt: Date;
+}
+
+export interface SessionSummary {
+  id: string;
+  title: string | null;
+  status: 'active' | 'closed' | 'expired';
+  helperUser: string | null;
+  turnCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+type ConnectionState =
+  | 'disconnected'
+  | 'connecting'
+  | 'waiting-for-token'
+  | 'connected'
+  | 'error';
+
+export interface DeviceContext {
+  hostname: string;
+  displayName?: string;
+  status: string;
+  lastSeenAt?: string;
+  activeSessions?: Array<{ username: string; activityState?: string; idleMinutes?: number; sessionType: string }>;
+}
+
+/** W03 (#5612): the trimmed AI script proposal block that rides the
+ *  `approval_required` event (server: services/scriptProposals/approvalSummary.ts). */
+export interface PendingApprovalScriptProposal {
+  proposalId: string;
+  goal: string;
+  summary: string;
+  riskTier: string;
+  findings: string[];
+  content: string;
+  strictHits: string[];
+}
+
+export interface PendingApproval {
+  executionId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  description: string;
+  deviceContext?: DeviceContext;
+  /** Present only when the approval is for an AI-authored script proposal. */
+  scriptProposal?: PendingApprovalScriptProposal;
+}
+
+interface ChatState {
+  connectionState: ConnectionState;
+  connectionError: string | null;
+  agentConfig: AgentConfig | null;
+  sessionId: string | null;
+  messages: ChatMessage[];
+  isStreaming: boolean;
+  error: string | null;
+  username: string | null;
+  sessions: SessionSummary[];
+  sessionsLoading: boolean;
+  pendingApproval: PendingApproval | null;
+  isFlagged: boolean;
+
+  initialize: () => Promise<void>;
+  sendMessage: (content: string) => Promise<void>;
+  clearMessages: () => Promise<void>;
+  setUsername: (name: string) => void;
+  loadSessions: () => Promise<void>;
+  loadSession: (id: string) => Promise<void>;
+  approveExecution: (executionId: string, approved: boolean) => Promise<void>;
+  flagSession: (reason?: string) => Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Tauri bridge helpers
+// ---------------------------------------------------------------------------
+
+/** Cached reference to the Tauri event listen function. */
+let _tauriListen: ((
+  event: string,
+  handler: (ev: { payload: unknown }) => void,
+) => Promise<() => void>) | null = null;
+let _tauriListenResolved = false;
+
+async function getTauriListen() {
+  if (_tauriListenResolved) return _tauriListen;
+  try {
+    if (!window.__TAURI_INTERNALS__) {
+      _tauriListenResolved = true;
+      return null;
+    }
+    const mod = await import('@tauri-apps/api/event');
+    _tauriListen = mod.listen as (
+      event: string,
+      handler: (ev: { payload: unknown }) => void,
+    ) => Promise<() => void>;
+    _tauriListenResolved = true;
+    return _tauriListen;
+  } catch {
+    _tauriListenResolved = true;
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// helper_fetch stream event type (matches Rust struct)
+// ---------------------------------------------------------------------------
+
+interface StreamChunkEvent {
+  stream_id: string;
+  chunk: string | null;
+  done: boolean;
+  error: string | null;
+}
+
+/**
+ * Make a streaming HTTP request. In Tauri, uses helper_fetch with stream=true
+ * and listens for Tauri events. In browser dev mode, uses fetch() ReadableStream.
+ *
+ * Calls `onChunk` for every raw text chunk received and `onDone` when the stream
+ * finishes. Returns a cleanup function.
+ */
+async function helperStreamRequest(
+  config: AgentConfig,
+  url: string,
+  options: { method?: string; headers?: Record<string, string>; body?: string },
+  onChunk: (text: string) => void,
+  onDone: (error?: string) => void,
+): Promise<{
+  ok: boolean;
+  status: number;
+  headers: Record<string, string>;
+  cancel: () => void;
+}> {
+  const invoke = await getTauriInvoke();
+  const listen = await getTauriListen();
+
+  if (invoke && listen) {
+    // Tauri path: use Rust backend for mTLS support.
+    //
+    // IMPORTANT: Register the event listener BEFORE invoking helper_fetch.
+    // The Rust backend spawns a background task that emits stream chunks
+    // immediately after the HTTP response arrives. If the response is
+    // buffered by a reverse proxy (e.g. Caddy), all data arrives at once
+    // and events fire before a post-invoke listener would be ready.
+    let streamId: string | null = null;
+    let unlisten: (() => void) | null = null;
+
+    unlisten = await listen('helper-fetch-stream', (ev: { payload: unknown }) => {
+      const data = ev.payload as StreamChunkEvent;
+      if (!streamId || data.stream_id !== streamId) return;
+
+      if (data.done) {
+        if (data.error) {
+          onDone(data.error);
+        } else {
+          onDone();
+        }
+        // Clean up listener
+        if (unlisten) { unlisten(); unlisten = null; }
+      } else if (data.chunk) {
+        onChunk(data.chunk);
+      }
+    }) as unknown as () => void;
+
+    // Now make the request — listener is already active
+    const resp = (await invoke('helper_fetch', {
+      request: {
+        url,
+        method: options.method ?? 'GET',
+        headers: options.headers ?? {},
+        body: options.body,
+        stream: true,
+      },
+    })) as HelperFetchResponse;
+
+    const isOk = resp.status >= 200 && resp.status < 300;
+    streamId = resp.stream_id;
+
+    if (!streamId) {
+      // No streaming -- body was returned inline (error responses, etc.)
+      if (unlisten) { unlisten(); unlisten = null; }
+      if (resp.body) {
+        onChunk(resp.body);
+      }
+      onDone();
+      return { ok: isOk, status: resp.status, headers: resp.headers, cancel: () => {} };
+    }
+
+    return {
+      ok: resp.status >= 200 && resp.status < 300,
+      status: resp.status,
+      headers: resp.headers,
+      cancel: () => {
+        if (unlisten) { unlisten(); unlisten = null; }
+      },
+    };
+  }
+
+  // Dev fallback: use native fetch with ReadableStream
+  const res = await fetch(url, {
+    method: options.method ?? 'GET',
+    headers: {
+      Authorization: `Bearer ${requireDevBearerToken(config)}`,
+      ...(options.headers ?? {}),
+    },
+    body: options.body,
+  });
+
+  const respHeaders: Record<string, string> = {};
+  res.headers.forEach((v, k) => {
+    respHeaders[k] = v;
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    // Pass the error body text through onChunk so the caller can parse it
+    onChunk(body);
+    onDone();
+    return { ok: false, status: res.status, headers: respHeaders, cancel: () => {} };
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    onDone('No response body');
+    return { ok: true, status: res.status, headers: respHeaders, cancel: () => {} };
+  }
+
+  let cancelled = false;
+  const decoder = new TextDecoder();
+
+  // Read in background
+  (async () => {
+    try {
+      while (!cancelled) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        onChunk(decoder.decode(value, { stream: true }));
+      }
+      onDone();
+    } catch (err) {
+      if (!cancelled) {
+        onDone(err instanceof Error ? err.message : 'Stream read error');
+      }
+    }
+  })();
+
+  return {
+    ok: true,
+    status: res.status,
+    headers: respHeaders,
+    cancel: () => {
+      cancelled = true;
+      reader.cancel().catch(() => {});
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SSE line parser (shared between Tauri and browser paths)
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle a `client_tool_request` SSE event: execute the named workspace tool
+ * client-side and POST the result back to `/tool-results`. A known tool's
+ * output is posted under `output` (including a degradable `{ error }` payload
+ * from a failed executor, which the model reads as tool output); an unknown
+ * tool name is posted under `error` so the model sees a hard tool failure.
+ *
+ * For a known tool, the executed result is ALSO appended to the store's
+ * messages as a `tool_result` entry — the server does not echo one for
+ * client-declared tools, and ChatView needs that transcript entry to render
+ * citation chips and result cards.
+ */
+async function handleClientToolRequest(event: {
+  toolUseId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+}): Promise<void> {
+  const { agentConfig, sessionId } = useChatStore.getState();
+  if (!agentConfig || !sessionId) return;
+
+  const known = WORKSPACE_CHAT_TOOLS.some((t) => t.name === event.toolName);
+
+  let body: { toolUseId: string; output?: unknown; error?: string };
+  if (known) {
+    const output = await executeWorkspaceChatTool(event.toolName, event.input ?? {});
+    // The server never emits a `tool_result` SSE event for client-declared
+    // tools (its post-tool-use hook isn't wired into the bridged-MCP path), so
+    // the client — which executed the tool — records its own transcript entry.
+    // ChatView's buildFileResolutionMap (citation chips) and its result-card
+    // render both scan `role === 'tool_result'` messages and duck-type on
+    // `toolOutput.files`/`toolOutput.passages`; the raw executor return is that
+    // exact shape. Appended for KNOWN tools only, regardless of whether the POST
+    // below succeeds — resolution/cards reflect what was actually executed.
+    const resultMsg: ChatMessage = {
+      id: `result-${event.toolUseId}`,
+      role: 'tool_result',
+      content: typeof output === 'string' ? output : JSON.stringify(output, null, 2),
+      toolName: event.toolName,
+      toolOutput: output,
+      toolUseId: event.toolUseId,
+      createdAt: new Date(),
+    };
+    useChatStore.setState((s) => ({ messages: [...s.messages, resultMsg] }));
+    body = { toolUseId: event.toolUseId, output };
+  } else {
+    body = { toolUseId: event.toolUseId, error: `Unknown tool: ${event.toolName}` };
+  }
+
+  try {
+    // helperRequest resolves (does not throw) on a non-2xx response, so a
+    // rejected/failed tool-result POST would otherwise be silently swallowed.
+    const res = await helperRequest(
+      agentConfig,
+      `${agentConfig.api_url}/api/v1/helper/chat/sessions/${sessionId}/tool-results`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    );
+    if (!res.ok) {
+      console.error(
+        '[Helper] tool-results POST failed:',
+        res.status,
+        res.body?.slice(0, 200),
+      );
+    }
+  } catch (err) {
+    console.error('[Helper] Failed to post client tool result:', err);
+  }
+}
+
+export async function processSSELines(
+  lines: string[],
+  currentAssistantId: { value: string | null },
+  set: (fn: (s: ChatState) => Partial<ChatState>) => void,
+  setDirect: (partial: Partial<ChatState>) => void,
+): Promise<void> {
+  const pending: Promise<void>[] = [];
+  for (const line of lines) {
+    if (!line.startsWith('data:')) continue;
+    const jsonStr = line.slice(5).trim();
+    if (!jsonStr) continue;
+
+    try {
+      const event = JSON.parse(jsonStr);
+
+      switch (event.type) {
+        case 'message_start': {
+          const msg: ChatMessage = {
+            id: event.messageId,
+            role: 'assistant',
+            content: '',
+            isStreaming: true,
+            createdAt: new Date(),
+          };
+          set((s) => ({ messages: [...s.messages, msg] }));
+          currentAssistantId.value = event.messageId;
+          break;
+        }
+
+        case 'content_delta': {
+          if (currentAssistantId.value) {
+            const aid = currentAssistantId.value;
+            set((s) => ({
+              messages: s.messages.map((m) =>
+                m.id === aid ? { ...m, content: m.content + event.delta } : m,
+              ),
+            }));
+          }
+          break;
+        }
+
+        case 'tool_use_start': {
+          const toolMsg: ChatMessage = {
+            id: `tool-${event.toolUseId}`,
+            role: 'tool_use',
+            content: '',
+            toolName: event.toolName,
+            toolInput: event.input,
+            toolUseId: event.toolUseId,
+            createdAt: new Date(),
+          };
+          set((s) => ({ messages: [...s.messages, toolMsg] }));
+          break;
+        }
+
+        case 'tool_result': {
+          const resultMsg: ChatMessage = {
+            id: `result-${event.toolUseId}`,
+            role: 'tool_result',
+            content:
+              typeof event.output === 'string'
+                ? event.output
+                : JSON.stringify(event.output, null, 2),
+            toolOutput: event.output,
+            toolUseId: event.toolUseId,
+            isError: event.isError,
+            createdAt: new Date(),
+          };
+          set((s) => ({ messages: [...s.messages, resultMsg] }));
+          break;
+        }
+
+        case 'message_end': {
+          if (currentAssistantId.value) {
+            const aid = currentAssistantId.value;
+            set((s) => ({
+              messages: s.messages.map((m) =>
+                m.id === aid ? { ...m, isStreaming: false } : m,
+              ),
+            }));
+          }
+          break;
+        }
+
+        case 'approval_required': {
+          setDirect({
+            pendingApproval: {
+              executionId: event.executionId,
+              toolName: event.toolName,
+              input: event.input,
+              description: event.description,
+              deviceContext: event.deviceContext,
+              scriptProposal: event.scriptProposal,
+            },
+          });
+          break;
+        }
+
+        case 'error': {
+          setDirect({ error: event.message || 'An error occurred' });
+          break;
+        }
+
+        case 'client_tool_request': {
+          // Fire the executor + POST asynchronously; awaited via `pending`
+          // below so the synchronous UI updates above are never blocked.
+          pending.push(
+            handleClientToolRequest({
+              toolUseId: event.toolUseId,
+              toolName: event.toolName,
+              input: event.input,
+            }),
+          );
+          break;
+        }
+
+        case 'done': {
+          setDirect({ isStreaming: false });
+          break;
+        }
+
+        case 'plan_approval_required':
+        case 'plan_step_start':
+        case 'plan_step_complete':
+        case 'plan_complete':
+        case 'plan_screenshot':
+        case 'approval_mode_changed':
+          // Plan events not yet supported in helper
+          break;
+      }
+    } catch (parseErr) {
+      console.error('[Helper] Failed to parse SSE event:', jsonStr.slice(0, 200), parseErr);
+    }
+  }
+
+  await Promise.all(pending);
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+const USERNAME_KEY = 'breeze-helper-username';
+
+/** Max time to wait on a cold-start capabilities probe before creating a session. */
+const WORKSPACE_PROBE_TIMEOUT_MS = 3000;
+
+/**
+ * Await the workspace capabilities probe, bounded. On timeout or failure the
+ * session simply proceeds without client tools (today's degraded behavior).
+ * Used to close the cold-start race: client-tool declarations are fixed at
+ * session create, so a first message that beats the startup probe would
+ * otherwise permanently degrade the session.
+ */
+async function awaitWorkspaceProbe(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      useWorkspaceStore.getState().probe(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, WORKSPACE_PROBE_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    // Probe is silent by design; proceed without tools.
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Client-tool declarations to send at session create, gated on the estate's
+ * REAL capabilities: file-search needs the estate reachable (`available`);
+ * passage retrieval additionally needs content preview (`contentEnabled`),
+ * else get_file_passages would 404 forever while the prompt still prefers it.
+ */
+function selectWorkspaceChatTools(): ClientToolDeclaration[] {
+  const { available, contentEnabled } = useWorkspaceStore.getState();
+  if (available !== true) return [];
+  return WORKSPACE_CHAT_TOOLS.filter(
+    (t) => t.name !== 'get_file_passages' || contentEnabled === true,
+  );
+}
+
+export const useChatStore = create<ChatState>((set, get) => ({
+  connectionState: 'disconnected',
+  connectionError: null,
+  agentConfig: null,
+  sessionId: null,
+  messages: [],
+  isStreaming: false,
+  error: null,
+  username: null,
+  sessions: [],
+  sessionsLoading: false,
+  pendingApproval: null,
+  isFlagged: false,
+
+  initialize: async () => {
+    // Avoid stacking concurrent inits (e.g. Retry pressed while a token poll is still running).
+    const cs = get().connectionState;
+    if (cs === 'connecting' || cs === 'waiting-for-token') return;
+
+    set({ connectionState: 'connecting', connectionError: null });
+
+    try {
+      let config: AgentConfig;
+
+      const invoke = await getTauriInvoke();
+      if (invoke) {
+        config = (await invoke('read_agent_config')) as AgentConfig;
+      } else {
+        // Dev fallback: read from env or local config
+        const apiUrl = (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_URL;
+        const token = (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_AGENT_TOKEN;
+        const agentId = (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_AGENT_ID;
+
+        if (!apiUrl || !token || !agentId) {
+          throw new Error('Not running in Tauri and VITE_API_URL/VITE_AGENT_TOKEN/VITE_AGENT_ID not set');
+        }
+
+        config = { api_url: apiUrl, token, agent_id: agentId };
+      }
+
+      // Restore username from localStorage, fall back to OS username
+      const stored = localStorage.getItem(USERNAME_KEY);
+      const username = stored || config.os_username || null;
+
+      // In Tauri, the helper auth token is delivered over IPC by the agent and
+      // may not be present at the instant the window opens. Show a transient
+      // "connecting to agent" state while we wait for it. In Phase 1 the file
+      // token is still a fallback, so we proceed after a bounded number of
+      // attempts even if the IPC token hasn't landed; in Phase 2 (no file
+      // fallback) this gate prevents requests that would 401.
+      if (invoke) {
+        const TOKEN_POLL_INTERVAL_MS = 500;
+        const TOKEN_POLL_MAX_ATTEMPTS = 20; // ~10s
+        let ready = false;
+        for (let attempt = 0; attempt < TOKEN_POLL_MAX_ATTEMPTS; attempt++) {
+          try {
+            ready = (await invoke('helper_token_ready')) as boolean;
+          } catch (err) {
+            ready = false;
+            // Log on the last attempt so a broken IPC bridge (command throwing
+            // every iteration) is visible without spamming on every poll tick.
+            if (attempt === TOKEN_POLL_MAX_ATTEMPTS - 1) {
+              console.warn(
+                '[helper] helper_token_ready threw on final attempt — IPC bridge may be broken:',
+                err,
+              );
+            } else {
+              console.debug('[helper] helper_token_ready threw (attempt', attempt, '):', err);
+            }
+          }
+          if (ready) break;
+          // Surface the waiting state on the first miss so the UI updates.
+          if (attempt === 0) {
+            set({ agentConfig: config, connectionState: 'waiting-for-token', username });
+          }
+          await new Promise((resolve) => setTimeout(resolve, TOKEN_POLL_INTERVAL_MS));
+        }
+
+        if (!ready) {
+          // Phase 1: file-token fallback is still valid, so we continue to
+          // 'connected'. Requests may still succeed via the on-disk token.
+          // Phase 2 (no file fallback): replace this branch with a transition
+          // to an 'agent-unreachable' / 'error' state instead of 'connected'.
+          console.warn(
+            '[helper] IPC token not received before timeout; proceeding with file-fallback token (Phase 1).' +
+              ' If requests fail, ensure the Breeze agent is running.',
+          );
+        }
+      }
+
+      set({ agentConfig: config, connectionState: 'connected', username });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[Helper] Initialize failed:', message);
+      set({ connectionState: 'error', connectionError: message });
+    }
+  },
+
+  setUsername: (name: string) => {
+    localStorage.setItem(USERNAME_KEY, name);
+    set({ username: name });
+  },
+
+  loadSessions: async () => {
+    const { agentConfig, username } = get();
+    if (!agentConfig) return;
+
+    set({ sessionsLoading: true });
+
+    try {
+      const params = username ? `?helperUser=${encodeURIComponent(username)}` : '';
+      const res = await helperRequest(
+        agentConfig,
+        `${agentConfig.api_url}/api/v1/helper/chat/sessions${params}`,
+        { method: 'GET' },
+      );
+
+      if (res.ok) {
+        const sessions = JSON.parse(res.body) as SessionSummary[];
+        set({ sessions });
+      } else {
+        console.error('[Helper] Failed to load sessions:', res.status);
+      }
+    } catch (err) {
+      console.error('[Helper] Failed to load sessions:', err);
+    } finally {
+      set({ sessionsLoading: false });
+    }
+  },
+
+  loadSession: async (id: string) => {
+    const { agentConfig } = get();
+    if (!agentConfig) return;
+
+    try {
+      const res = await helperRequest(
+        agentConfig,
+        `${agentConfig.api_url}/api/v1/helper/chat/sessions/${id}/messages`,
+        { method: 'GET' },
+      );
+
+      if (!res.ok) {
+        const data = (() => {
+          try { return JSON.parse(res.body); } catch { return { error: 'Failed to load session' }; }
+        })();
+        throw new Error(data.error || 'Failed to load session');
+      }
+
+      const rawMessages = JSON.parse(res.body) as Array<{
+        id: string;
+        role: 'user' | 'assistant' | 'tool_use' | 'tool_result';
+        content: string | null;
+        toolName: string | null;
+        toolOutput?: unknown;
+        createdAt: string;
+      }>;
+
+      // Persisted tool_result rows carry toolOutput (the executed tool's return),
+      // so ChatView's citation-resolution map and result cards work on reload —
+      // otherwise citations render as raw [file:<id>|<path>] tokens and cards vanish.
+      const messages: ChatMessage[] = rawMessages.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content ?? '',
+        toolName: m.toolName ?? undefined,
+        ...(m.role === 'tool_result' ? { toolOutput: m.toolOutput } : {}),
+        createdAt: new Date(m.createdAt),
+      }));
+
+      set({ sessionId: id, messages, error: null });
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : 'Failed to load session' });
+    }
+  },
+
+  sendMessage: async (content: string) => {
+    const { agentConfig, sessionId, connectionState, username } = get();
+    if (!agentConfig || connectionState !== 'connected') return;
+
+    const trimmed = content.trim();
+    if (!trimmed) return;
+
+    // Notify backend that chat is active
+    getTauriInvoke().then((inv) => { if (inv) inv('update_chat_active', { active: true }).catch(() => {}); }).catch(() => {});
+
+    // Optimistic user message
+    const userMsgId = crypto.randomUUID();
+    const userMsg: ChatMessage = {
+      id: userMsgId,
+      role: 'user',
+      content: trimmed,
+      createdAt: new Date(),
+    };
+
+    set((s) => ({
+      messages: [...s.messages, userMsg],
+      isStreaming: true,
+      error: null,
+    }));
+
+    try {
+      // Create session if needed
+      let currentSessionId = sessionId;
+      if (!currentSessionId) {
+        // Cold-start race: `available` is null until the startup probe finishes.
+        // Declarations are fixed at create, so if a first message beats the
+        // probe we briefly await it — otherwise the session is permanently
+        // degraded (no tools). On timeout/failure we proceed without tools.
+        if (useWorkspaceStore.getState().available === null) {
+          await awaitWorkspaceProbe();
+        }
+        // Declare the workspace chat tools that the estate can actually serve;
+        // core builds the bridged MCP server from them and drives file-search /
+        // cited-RAG through the client executors.
+        const clientTools = selectWorkspaceChatTools();
+        const createRes = await helperRequest(
+          agentConfig,
+          `${agentConfig.api_url}/api/v1/helper/chat/sessions`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ...(username ? { helperUser: username } : {}),
+              ...(clientTools.length > 0 ? { clientTools } : {}),
+            }),
+          },
+        );
+
+        if (!createRes.ok) {
+          const data = (() => {
+            try {
+              return JSON.parse(createRes.body);
+            } catch {
+              return { error: 'Failed to create session' };
+            }
+          })();
+          throw new Error(data.error || 'Failed to create session');
+        }
+
+        const sessionData = JSON.parse(createRes.body);
+        currentSessionId = sessionData.id;
+        set({ sessionId: currentSessionId });
+      }
+
+      // Send message and process SSE stream
+      let buffer = '';
+      const currentAssistantId = { value: null as string | null };
+
+      const streamResult = await helperStreamRequest(
+        agentConfig,
+        `${agentConfig.api_url}/api/v1/helper/chat/sessions/${currentSessionId}/messages`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: trimmed }),
+        },
+        // onChunk
+        (text: string) => {
+          buffer += text;
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          processSSELines(lines, currentAssistantId, set, (partial) => set(() => partial));
+        },
+        // onDone
+        (error?: string) => {
+          // Process any remaining buffer
+          if (buffer.trim()) {
+            const lines = buffer.split('\n');
+            processSSELines(lines, currentAssistantId, set, (partial) => set(() => partial));
+          }
+          if (error) {
+            set(() => ({ error, isStreaming: false }));
+          }
+          // Notify backend that chat is idle (stream finished)
+          getTauriInvoke().then((inv) => { if (inv) inv('update_chat_active', { active: false }).catch(() => {}); }).catch(() => {});
+        },
+      );
+
+      if (!streamResult.ok) {
+        // For Tauri path: error responses are returned inline (not streamed),
+        // so the body is available in `buffer` from the onChunk callback.
+        // For browser path: the error body was also passed through onChunk.
+        const errorText = buffer.trim();
+        const data = (() => {
+          try {
+            return JSON.parse(errorText);
+          } catch {
+            return { error: errorText || 'Failed to send message' };
+          }
+        })();
+
+        if (streamResult.status === 409) {
+          set((s) => ({
+            messages: s.messages.filter((m) => m.id !== userMsgId),
+            error: data.error || 'Another response is still in progress.',
+          }));
+          return;
+        }
+
+        throw new Error(data.error || 'Failed to send message');
+      }
+    } catch (err) {
+      set({
+        error: err instanceof Error ? err.message : String(err),
+        isStreaming: false,
+      });
+      // Notify backend that chat is idle (error path)
+      getTauriInvoke().then((inv) => { if (inv) inv('update_chat_active', { active: false }).catch(() => {}); }).catch(() => {});
+    } finally {
+      const state = get();
+      if (state.isStreaming) {
+        set({ isStreaming: false });
+      }
+    }
+  },
+
+  clearMessages: async () => {
+    const { agentConfig, sessionId } = get();
+
+    if (agentConfig && sessionId) {
+      try {
+        await helperRequest(
+          agentConfig,
+          `${agentConfig.api_url}/api/v1/helper/chat/sessions/${sessionId}`,
+          { method: 'DELETE' },
+        );
+      } catch (err) {
+        console.error('[Helper] Failed to close session:', err);
+      }
+    }
+
+    // Notify backend that chat is idle (session cleared)
+    const invoke = await getTauriInvoke();
+    if (invoke) invoke('update_chat_active', { active: false }).catch(() => {});
+
+    set({
+      sessionId: null,
+      messages: [],
+      isStreaming: false,
+      error: null,
+      pendingApproval: null,
+      isFlagged: false,
+    });
+  },
+
+  approveExecution: async (executionId: string, approved: boolean) => {
+    const { agentConfig, sessionId } = get();
+    if (!agentConfig || !sessionId) return;
+
+    try {
+      const res = await helperRequest(
+        agentConfig,
+        `${agentConfig.api_url}/api/v1/helper/chat/sessions/${sessionId}/approve/${executionId}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ approved }),
+        },
+      );
+
+      if (!res.ok) {
+        const data = (() => {
+          try { return JSON.parse(res.body); } catch { console.error('[Helper] Failed to parse approval response:', res.body.slice(0, 200)); return { error: 'Failed to process approval' }; }
+        })();
+        set({ error: data.error || 'Failed to process approval' });
+      }
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : 'Failed to process approval' });
+    } finally {
+      set({ pendingApproval: null });
+    }
+  },
+
+  flagSession: async (reason?: string) => {
+    const { agentConfig, sessionId } = get();
+    if (!agentConfig || !sessionId) return;
+
+    try {
+      const res = await helperRequest(
+        agentConfig,
+        `${agentConfig.api_url}/api/v1/helper/chat/sessions/${sessionId}/flag`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason }),
+        },
+      );
+
+      if (res.ok) {
+        set({ isFlagged: true });
+      } else {
+        const data = (() => {
+          try { return JSON.parse(res.body); } catch { return { error: 'Failed to flag session' }; }
+        })();
+        set({ error: data.error || 'Failed to flag session' });
+      }
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : 'Failed to flag session' });
+    }
+  },
+}));

@@ -1,0 +1,1501 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/config"
+	"github.com/breeze-rmm/agent/internal/ipc"
+	"github.com/breeze-rmm/agent/internal/secmem"
+	"github.com/breeze-rmm/agent/internal/state"
+	"github.com/breeze-rmm/agent/internal/updater"
+	"github.com/breeze-rmm/agent/internal/watchdog"
+	"github.com/spf13/cobra"
+)
+
+// tokenHolder wraps a SecureString so that callers sharing the holder see
+// updates made by handleIPCMessage (TypeTokenUpdate).
+type tokenHolder struct {
+	mu    sync.Mutex
+	token *secmem.SecureString
+}
+
+func (h *tokenHolder) Get() *secmem.SecureString {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.token
+}
+
+func (h *tokenHolder) Replace(newToken string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.token != nil {
+		h.token.Zero()
+	}
+	h.token = secmem.NewSecureString(newToken)
+}
+
+func (h *tokenHolder) Reveal() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.token == nil {
+		return ""
+	}
+	return h.token.Reveal()
+}
+
+var version = "0.1.0"
+
+const backupProbeThreshold = 10 // keep in sync with agent/internal/heartbeat
+
+// decideWatchdogServerURL picks the failover client's base URL after a failed
+// poll (#2288). Priority: a server_url the agent swapped on disk since we
+// last looked (lastDiskURL is the anchor — NOT the client's own mutable URL,
+// which this function itself may have pointed at the backup transiently);
+// then, past the probe threshold, alternate between the disk URL and the
+// backup every threshold ticks, so with both control planes down whichever
+// returns first wins without flapping (and journal-spamming) on every poll.
+// Transient, in memory only. The watchdog never persists
+// server_url/backup_server_url; the agent owns those. (Token persistence to
+// secrets.yaml elsewhere in this file is a separate, deliberate exception.)
+func decideWatchdogServerURL(current, lastDiskURL string, reloaded *config.Config, consecutiveFailures int) string {
+	if reloaded.ServerURL != "" && reloaded.ServerURL != lastDiskURL && reloaded.ServerURL != current {
+		return reloaded.ServerURL
+	}
+	if consecutiveFailures >= backupProbeThreshold && reloaded.BackupServerURL != "" &&
+		consecutiveFailures%backupProbeThreshold == 0 {
+		if current == reloaded.BackupServerURL && reloaded.ServerURL != "" {
+			return reloaded.ServerURL
+		}
+		return reloaded.BackupServerURL
+	}
+	return current
+}
+
+// noteFailoverHeartbeatFailure re-reads the on-disk config after a failed
+// failover heartbeat and retargets the client per decideWatchdogServerURL.
+// Returns the server_url now on disk so the caller can carry it into the
+// next tick as the disk-swap anchor (unchanged on reload error).
+func noteFailoverHeartbeatFailure(fc *watchdog.FailoverClient, journal *watchdog.Journal, lastDiskURL string, consecutiveFailures int) string {
+	reloaded, err := config.Load("")
+	if err != nil {
+		// The watchdog may be the only reporter left when this fires —
+		// surface why failover retargeting has degraded to "never switch".
+		journal.Log(watchdog.LevelWarn, "failover.config_reload_failed", map[string]any{"error": err.Error()})
+		return lastDiskURL
+	}
+	current := fc.BaseURL()
+	if next := decideWatchdogServerURL(current, lastDiskURL, reloaded, consecutiveFailures); next != current {
+		journal.Log(watchdog.LevelInfo, "failover.server_url_switch", map[string]any{"to": next})
+		fc.SetBaseURL(next)
+	}
+	return reloaded.ServerURL
+}
+
+var rootCmd = &cobra.Command{
+	Use:   "breeze-watchdog",
+	Short: "Breeze RMM Agent Watchdog",
+	Long:  `Breeze Watchdog monitors the agent process and provides failover heartbeats when the agent is down.`,
+}
+
+// run command flags
+var (
+	devMode  bool
+	agentPID int
+)
+
+// health-journal flags
+var journalCount int
+
+var runCmd = &cobra.Command{
+	Use:   "run",
+	Short: "Start the watchdog monitoring loop",
+	Run: func(cmd *cobra.Command, args []string) {
+		if isWindowsService() {
+			if err := runAsWindowsService(); err != nil {
+				fmt.Fprintf(os.Stderr, "Windows service error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+		runWatchdog(nil)
+	},
+}
+
+var statusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Print watchdog version, agent state, and IPC socket status",
+	Run: func(cmd *cobra.Command, args []string) {
+		printStatus()
+	},
+}
+
+var healthJournalCmd = &cobra.Command{
+	Use:   "health-journal",
+	Short: "Read the health journal from disk",
+	Run: func(cmd *cobra.Command, args []string) {
+		readHealthJournal()
+	},
+}
+
+var triggerFailoverCmd = &cobra.Command{
+	Use:   "trigger-failover",
+	Short: "Trigger failover mode (placeholder)",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Println("trigger-failover: not implemented yet")
+	},
+}
+
+var triggerRecoveryCmd = &cobra.Command{
+	Use:   "trigger-recovery",
+	Short: "Trigger recovery mode (placeholder)",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Println("trigger-recovery: not implemented yet")
+	},
+}
+
+func init() {
+	runCmd.Flags().BoolVar(&devMode, "dev", false, "Development mode (shorter intervals)")
+	runCmd.Flags().IntVar(&agentPID, "agent-pid", 0, "Override agent PID (for testing)")
+	healthJournalCmd.Flags().IntVarP(&journalCount, "count", "n", 50, "Number of recent entries to display")
+
+	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(healthJournalCmd)
+	rootCmd.AddCommand(triggerFailoverCmd)
+	rootCmd.AddCommand(triggerRecoveryCmd)
+	rootCmd.AddCommand(serviceCmd())
+}
+
+func main() {
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// Shutdown causes for the watchdog run context. context.Cause reports which
+// one fired so the journal records why the loop ended.
+var (
+	errShutdownSignal = errors.New("watchdog: shutdown requested by signal")
+	errShutdownSCM    = errors.New("watchdog: shutdown requested by service control manager")
+	errRunEnded       = errors.New("watchdog: run loop ended")
+)
+
+// watchdogRunContext returns a context that is cancelled when a process signal
+// arrives or the SCM stop channel closes, plus a stop func that releases the
+// forwarders on a normal return.
+//
+// The forwarders are separate goroutines on purpose. Recovery runs
+// synchronously inside the main select loop and can park for the recovery
+// deadline waiting on an SCM transition, so a stop that was only noticed the
+// next time the loop came around would leave the watchdog service stuck in
+// STOP_PENDING long past the SCM's own stop deadline. Cancelling the context
+// from outside the loop makes those waits abort promptly. Either channel may
+// be nil (a nil channel blocks forever, which is the intent on the platform
+// that does not use it).
+func watchdogRunContext(parent context.Context, sigCh <-chan os.Signal, stopCh <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel(errShutdownSignal)
+		case <-ctx.Done():
+		}
+	}()
+	go func() {
+		select {
+		case <-stopCh:
+			cancel(errShutdownSCM)
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() { cancel(errRunEnded) }
+}
+
+// shutdownTrigger maps a run-context cancellation cause to the journal's
+// trigger label. An unrecognized cause is reported as "unknown" rather than
+// guessed at — the journal is the only forensic record of why the watchdog
+// stopped.
+func shutdownTrigger(cause error) string {
+	switch {
+	case errors.Is(cause, errShutdownSignal):
+		return "signal"
+	case errors.Is(cause, errShutdownSCM):
+		return "scm"
+	default:
+		return "unknown"
+	}
+}
+
+// recoveryJournalFields renders a recovery outcome for the health journal.
+//
+// state_file_pid, old_scm_pid, and new_scm_pid are deliberately three separate
+// keys: the state-file PID is only the stale hint the agent wrote about
+// itself, while the SCM PIDs are what the service manager reported before and
+// after the action. Collapsing them into one "pid" would erase the evidence
+// that recovery never took destructive action on the hint.
+func recoveryJournalFields(result watchdog.RecoveryResult, err error) map[string]any {
+	fields := map[string]any{
+		"intent":         string(result.Intent),
+		"action":         string(result.Action),
+		"disposition":    string(result.Disposition),
+		"phase":          result.Phase,
+		"initial_state":  result.InitialState,
+		"final_state":    result.FinalState,
+		"state_file_pid": result.StateFilePID,
+		"old_scm_pid":    result.OldPID,
+		"new_scm_pid":    result.NewPID,
+		"elapsed_ms":     result.Elapsed.Milliseconds(),
+		"action_taken":   result.ActionTaken,
+	}
+	if err != nil {
+		fields["error"] = err.Error()
+		fields["failure_class"] = string(recoveryFailureClass(err))
+	}
+	return fields
+}
+
+// recoveryFailureClass extracts the typed failure class from a recovery error.
+// A failure that is not a *watchdog.RecoveryError is reported as
+// "unclassified" so it can never journal an empty class that reads like a
+// success.
+func recoveryFailureClass(err error) watchdog.RecoveryFailureClass {
+	var rerr *watchdog.RecoveryError
+	if errors.As(err, &rerr) && rerr.Class != "" {
+		return rerr.Class
+	}
+	return "unclassified"
+}
+
+// shouldVerifyRecovery reports whether an attempt earned a pending heartbeat
+// verification. It fails closed: only an error-free VerifyHeartbeat
+// disposition qualifies, so a zero-value, errored, or unknown-disposition
+// result can never be misread as "the agent is coming back". ActionTaken is
+// deliberately not consulted — it only means a side effect was issued.
+func shouldVerifyRecovery(result watchdog.RecoveryResult, err error) bool {
+	return err == nil && result.Disposition == watchdog.RecoveryDispositionVerifyHeartbeat
+}
+
+// shouldFailoverRecovery reports whether the controller declared the attempt
+// terminal (identity/ownership uncertainty). Terminal is terminal regardless
+// of the error value: retrying is exactly the action that could kill the wrong
+// process.
+func shouldFailoverRecovery(result watchdog.RecoveryResult) bool {
+	return result.Disposition == watchdog.RecoveryDispositionFailover
+}
+
+// recoveryCanceled reports whether an attempt aborted because the run context
+// was cancelled (SCM stop / signal). That is the watchdog shutting down, not a
+// diagnosis about the agent, so the caller must exit rather than feed a
+// recovery or failover event.
+func recoveryCanceled(err error) bool {
+	var rerr *watchdog.RecoveryError
+	return errors.As(err, &rerr) && rerr.Class == watchdog.RecoveryFailureCanceled
+}
+
+// failoverRecoveryIntent maps an operator failover command to the explicit
+// recovery intent it must run with, and whether the escalation window is reset
+// first. Intent is never inferred from the attempt count: "start_agent" landing
+// while the ladder sits at attempt 2 must not force-kill anything. resetFirst
+// is true only for an operator restart, which is a fresh verified graceful
+// restart rather than the next rung of the current ladder.
+func failoverRecoveryIntent(cmdType string) (intent watchdog.RecoveryIntent, resetFirst bool, ok bool) {
+	switch cmdType {
+	case "restart_agent":
+		return watchdog.RecoveryIntentRestart, true, true
+	case "start_agent":
+		return watchdog.RecoveryIntentEnsureStart, false, true
+	default:
+		return "", false, false
+	}
+}
+
+// runWatchdog is the main watchdog loop.
+// stopCh is an optional channel that, when closed, triggers a clean shutdown.
+// On Unix this is nil (signal handling is used instead). On Windows the SCM
+// handler closes it on Stop/Shutdown.
+func runWatchdog(stopCh <-chan struct{}) {
+	cfg, err := config.Load("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	wdCfg := watchdog.Config{
+		ProcessCheckInterval:    cfg.Watchdog.ProcessCheckInterval,
+		IPCProbeInterval:        cfg.Watchdog.IPCProbeInterval,
+		HeartbeatStaleThreshold: cfg.Watchdog.HeartbeatStaleThreshold,
+		MaxRecoveryAttempts:     cfg.Watchdog.MaxRecoveryAttempts,
+		RecoveryCooldown:        cfg.Watchdog.RecoveryCooldown,
+		StandbyTimeout:          cfg.Watchdog.StandbyTimeout,
+		StandbyGrace:            cfg.Watchdog.StandbyGrace,
+		FailoverPollInterval:    cfg.Watchdog.FailoverPollInterval,
+	}
+
+	// Override intervals in dev mode for faster iteration.
+	if devMode {
+		wdCfg.ProcessCheckInterval = 2 * time.Second
+		wdCfg.IPCProbeInterval = 10 * time.Second
+		wdCfg.HeartbeatStaleThreshold = 30 * time.Second
+		fmt.Println("[dev] Using shortened intervals: process=2s, ipc=10s, heartbeat=30s")
+	}
+
+	// Create health journal in the log directory.
+	journal, err := watchdog.NewJournal(
+		config.LogDir(),
+		cfg.Watchdog.HealthJournalMaxSizeMB,
+		cfg.Watchdog.HealthJournalMaxFiles,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create health journal: %v\n", err)
+		os.Exit(1)
+	}
+	defer journal.Close()
+
+	journal.Log(watchdog.LevelInfo, "watchdog.start", map[string]any{
+		"version": version,
+		"dev":     devMode,
+	})
+
+	// Read agent state file for PID.
+	statePath := state.PathInDir(config.ConfigDir())
+	agentState, err := state.Read(statePath)
+	if err != nil {
+		journal.Log(watchdog.LevelWarn, "state.read_failed", map[string]any{
+			"path":  statePath,
+			"error": err.Error(),
+		})
+	}
+
+	pid := agentPID
+	if pid == 0 && agentState != nil {
+		pid = agentState.PID
+	}
+
+	// Create watchdog state machine.
+	wd := watchdog.NewWatchdog(wdCfg)
+
+	// IPC message channel.
+	ipcMessages := make(chan *ipc.Envelope, 64)
+	onMessage := func(env *ipc.Envelope) {
+		select {
+		case ipcMessages <- env:
+		default:
+			journal.Log(watchdog.LevelWarn, "ipc.message_dropped", map[string]any{
+				"type":       env.Type,
+				"queue_size": len(ipcMessages),
+			})
+		}
+	}
+
+	// Create IPC client.
+	socketPath := ipc.DefaultSocketPath()
+	if cfg.IPCSocketPath != "" {
+		socketPath = cfg.IPCSocketPath
+	}
+	ipcClient := watchdog.NewIPCClient(socketPath, onMessage)
+
+	// Create health checker with the IPC client as the prober.
+	processChecker := &watchdog.OSProcessChecker{}
+	healthChecker := watchdog.NewHealthChecker(processChecker, ipcClient, wdCfg.HeartbeatStaleThreshold)
+	// Sizes the state_sync recency window for the in-flight-backup IPC veto
+	// (D3) — see HealthChecker.SetIPCProbeInterval.
+	healthChecker.SetIPCProbeInterval(wdCfg.IPCProbeInterval)
+
+	// Create recovery manager.
+	recovery := watchdog.NewRecoveryManager(wdCfg.MaxRecoveryAttempts, wdCfg.RecoveryCooldown)
+
+	// Persist the 24h restart history alongside the health journal so it
+	// survives watchdog restarts.
+	historyPath := filepath.Join(config.LogDir(), "watchdog-restart-history.json")
+	recovery.SetHistoryPath(historyPath)
+
+	// Verification state for the in-flight restart attempt, if any. nil =
+	// no attempt waiting on verification; non-nil = we restarted at this
+	// time and are watching for the agent's LastHeartbeat to advance past
+	// (startedAt + RestartVerificationGrace).
+	var pendingVerify *struct {
+		startedAt time.Time
+	}
+
+	// Transition flag for journaling process-ticker state-file read failures
+	// without flooding the journal at the 5s cadence.
+	var processReadFailJournaled bool
+
+	// Wrap auth token in a mutable holder so IPC token updates are visible
+	// to every goroutine that reads the token (failover client, updater, etc.).
+	tokenStore := &tokenHolder{}
+	if cfg.WatchdogAuthToken != "" {
+		tokenStore.token = secmem.NewSecureString(cfg.WatchdogAuthToken)
+		cfg.WatchdogAuthToken = "" // Clear from config struct.
+	}
+	cfg.AuthToken = "" // Watchdog must not use the normal agent credential.
+
+	// Try initial IPC connection.
+	if err := ipcClient.Connect(); err != nil {
+		journal.Log(watchdog.LevelWarn, "ipc.connect_failed", map[string]any{
+			"error": err.Error(),
+		})
+		// Check if agent process exists.
+		if pid > 0 && processChecker.IsAlive(pid) {
+			// Agent is running but IPC failed — will retry on tick.
+			fmt.Printf("Agent process %d found but IPC connection failed, will retry\n", pid)
+		} else {
+			wd.HandleEvent(watchdog.EventAgentNotFound)
+			journal.Log(watchdog.LevelWarn, "agent.not_found", map[string]any{
+				"pid": pid,
+			})
+		}
+	} else {
+		wd.HandleEvent(watchdog.EventIPCConnected)
+		journal.Log(watchdog.LevelInfo, "ipc.connected", nil)
+		healthChecker.ResetIPCFails()
+	}
+
+	fmt.Printf("Watchdog v%s started (state=%s, pid=%d)\n", version, wd.State(), pid)
+
+	// Signal handling.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigChan)
+
+	// A signal or an SCM stop cancels runCtx from its own goroutine, which is
+	// what lets an in-flight recovery abort its waits instead of holding the
+	// service in STOP_PENDING for the whole recovery deadline. Every recovery
+	// request below carries runCtx for exactly that reason.
+	runCtx, stopRun := watchdogRunContext(context.Background(), sigChan, stopCh)
+	defer stopRun()
+
+	shutdown := func() {
+		trigger := shutdownTrigger(context.Cause(runCtx))
+		journal.Log(watchdog.LevelInfo, "watchdog.shutdown", map[string]any{"trigger": trigger})
+		fmt.Printf("Watchdog shutting down (%s)\n", trigger)
+		ipcClient.Close()
+	}
+
+	// Create tickers for the three check intervals.
+	processTicker := time.NewTicker(wdCfg.ProcessCheckInterval)
+	defer processTicker.Stop()
+	ipcTicker := time.NewTicker(wdCfg.IPCProbeInterval)
+	defer ipcTicker.Stop()
+	heartbeatTicker := time.NewTicker(wdCfg.HeartbeatStaleThreshold)
+	defer heartbeatTicker.Stop()
+
+	// Failover poll ticker — only used in FAILOVER state.
+	failoverTicker := time.NewTicker(wdCfg.FailoverPollInterval)
+	defer failoverTicker.Stop()
+
+	var failoverClient *watchdog.FailoverClient
+	var failoverFailures int
+	var lastDiskServerURL string
+
+	// --- STANDBY policy (#5252) ---------------------------------------
+	// Details of the shutdown the agent last announced. Only meaningful
+	// while the state is STANDBY; refreshed on every shutdown intent. The
+	// defaults describe an intent that arrived with no reason at all.
+	standbyWindow := watchdog.StandbyWindow("", 0, wdCfg.StandbyGrace, wdCfg.StandbyTimeout)
+	standbyReason := ""
+	standbyRecognized := true
+	// standbyHoldLogInterval bounds how often a still-holding STANDBY writes a
+	// heartbeat to the health journal.
+	const standbyHoldLogInterval = 5 * time.Minute
+	// A hold is deliberately not journaled per tick (the process ticker runs
+	// every few seconds), but a long hold must not look like a dead watchdog
+	// in the diagnostics bundle: an unrecognized reason can legitimately hold
+	// out to the 30-minute ceiling, and the journal is what
+	// collect_diagnostics ships. One heartbeat every few minutes is the
+	// difference between "waiting on purpose" and "process died".
+	var lastStandbyHoldLog time.Time
+
+	// agentLooksHealthy requires live IPC AND a fresh heartbeat — the same
+	// evidence the FAILOVER self-recovery block uses. IsConnected() alone is
+	// only a socket flag and can still describe the connection of an agent
+	// that is on its way out, so on its own it would cancel the very standby
+	// the agent just asked for.
+	agentLooksHealthy := func() bool {
+		if !ipcClient.IsConnected() {
+			return false
+		}
+		hb := healthChecker.LastKnownHeartbeat(agentState)
+		return !hb.IsZero() && time.Since(hb) <= wdCfg.HeartbeatStaleThreshold
+	}
+
+	// applyStandby evaluates the standby policy once and acts on it. It is
+	// the ONLY place STANDBY leaves its state, so the per-tick check and the
+	// unhealthy-signal funnel below cannot drift apart (#5252).
+	// fireStandbyEvent applies a standby decision and refuses to let a
+	// rejected transition pass silently. HandleEvent logs nothing of its own
+	// on a rejected event, and this whole function exists to guarantee STANDBY
+	// never drifts without a trace.
+	fireStandbyEvent := func(event string, fields map[string]any) bool {
+		if _, ok := wd.HandleEvent(event); ok {
+			return true
+		}
+		rejected := make(map[string]any, len(fields)+2)
+		for k, v := range fields {
+			rejected[k] = v
+		}
+		rejected["event"] = event
+		rejected["state"] = wd.State()
+		journal.Log(watchdog.LevelError, "standby.transition_rejected", rejected)
+		return false
+	}
+
+	applyStandby := func() {
+		elapsed := time.Since(wd.LastTransitionTime())
+		decision := watchdog.EvaluateStandby(watchdog.StandbyInput{
+			Elapsed:      elapsed,
+			Window:       standbyWindow,
+			Ceiling:      wdCfg.StandbyTimeout,
+			Recognized:   standbyRecognized,
+			AgentHealthy: agentLooksHealthy(),
+		})
+		fields := map[string]any{
+			"reason":          standbyReason,
+			"elapsed_seconds": int(elapsed.Seconds()),
+			"window_seconds":  int(standbyWindow.Seconds()),
+			"decision":        decision.String(),
+		}
+		switch decision {
+		case watchdog.StandbyHold:
+			if time.Since(lastStandbyHoldLog) >= standbyHoldLogInterval {
+				lastStandbyHoldLog = time.Now()
+				journal.Log(watchdog.LevelInfo, "standby.holding", fields)
+			}
+			return
+		case watchdog.StandbyResume:
+			// The announced shutdown never completed — the agent is still
+			// there and healthy. Restarting it would be gratuitous.
+			journal.Log(watchdog.LevelInfo, "standby.agent_still_healthy", fields)
+			fireStandbyEvent(watchdog.EventAgentRecovered, fields)
+		case watchdog.StandbyRecover:
+			// The window closed with the agent gone. Hand off to the normal
+			// recovery ladder, which owns the restart budget, flap detection
+			// and its own ensure-start before FAILOVER.
+			journal.Log(watchdog.LevelWarn, "standby.window_expired", fields)
+			fireStandbyEvent(watchdog.EventAgentUnhealthy, fields)
+		case watchdog.StandbyFailover:
+			journal.Log(watchdog.LevelWarn, "standby.timeout", fields)
+			// Transition FIRST and only ensure-start on an ACCEPTED
+			// transition: the ensure-start is budget-free, so running it
+			// ahead of a transition that did not happen would repeat it on
+			// every tick. Entering FAILOVER with the agent stopped is what
+			// stranded the host in #5252.
+			if fireStandbyEvent(watchdog.EventStandbyTimeout, fields) {
+				ensureAgentStartedBeforeFailover(runCtx, recovery, journal)
+			}
+		default:
+			// Go has no exhaustiveness check on this switch, so a decision
+			// added later would otherwise fall through as a no-op — i.e. the
+			// watchdog holds in STANDBY forever, which IS the #5252 failure.
+			// Escalate instead: starting an agent that did not need it is
+			// recoverable, leaving a remote host offline is not.
+			journal.Log(watchdog.LevelError, "standby.unknown_decision", fields)
+			fireStandbyEvent(watchdog.EventAgentUnhealthy, fields)
+		}
+	}
+
+	// noteAgentUnhealthy funnels EVERY "the agent looks dead" signal through
+	// one place. In STANDBY such a signal is EXPECTED — the agent announced
+	// it was going away — so the standby policy decides what happens rather
+	// than the raw transition table restarting an agent mid-shutdown.
+	noteAgentUnhealthy := func() {
+		if wd.State() == watchdog.StateStandby {
+			applyStandby()
+			return
+		}
+		wd.HandleEvent(watchdog.EventAgentUnhealthy)
+	}
+
+	for {
+		select {
+		case <-runCtx.Done():
+			shutdown()
+			return
+
+		case <-processTicker.C:
+			// Re-read state file for fresh PID. Journal read failures on
+			// the transition only — this ticker runs every few seconds and
+			// a persistent failure would otherwise flood the journal; the
+			// heartbeat ticker journals its own read failures every time.
+			if s, err := state.Read(statePath); err == nil && s != nil {
+				pid = s.PID
+				agentState = s
+				processReadFailJournaled = false
+			} else if err != nil {
+				if !processReadFailJournaled {
+					processReadFailJournaled = true
+					journal.Log(watchdog.LevelWarn, "state.read_failed", map[string]any{
+						"path": statePath, "error": err.Error(),
+					})
+				}
+				slog.Warn("state.read_failed", "path", statePath, "error", err.Error())
+			}
+
+			if pid > 0 {
+				result := healthChecker.CheckProcess(pid)
+				if result == watchdog.CheckProcessGone {
+					journal.Log(watchdog.LevelWarn, "check.process_gone", map[string]any{"pid": pid})
+					noteAgentUnhealthy()
+				}
+			}
+
+		case <-ipcTicker.C:
+			if ipcClient.IsConnected() {
+				result := healthChecker.CheckIPC()
+				switch result {
+				case watchdog.CheckIPCFailed:
+					journal.Log(watchdog.LevelError, "check.ipc_failed", map[string]any{
+						"consecutive_failures": healthChecker.IPCFailCount(),
+					})
+					noteAgentUnhealthy()
+				case watchdog.CheckIPCDegraded:
+					if healthChecker.LastIPCCheckVetoed() {
+						// D3: this degraded verdict is standing in for what
+						// would otherwise be a CheckIPCFailed escalation —
+						// distinct event name so the journal shows the veto
+						// happened instead of reading as an ordinary degraded
+						// tick.
+						journal.Log(watchdog.LevelWarn, "check.ipc_veto_backup_inflight", map[string]any{
+							"consecutive_failures": healthChecker.IPCFailCount(),
+							"veto_count":           healthChecker.IPCVetoCount(),
+						})
+					} else {
+						journal.Log(watchdog.LevelWarn, "check.ipc_degraded", map[string]any{
+							"consecutive_failures": healthChecker.IPCFailCount(),
+						})
+					}
+				}
+			} else {
+				// Try to reconnect.
+				if err := ipcClient.Connect(); err == nil {
+					wd.HandleEvent(watchdog.EventIPCConnected)
+					healthChecker.ResetIPCFails()
+					journal.Log(watchdog.LevelInfo, "ipc.reconnected", nil)
+				} else {
+					journal.Log(watchdog.LevelWarn, "ipc.reconnect_failed", map[string]any{
+						"error": err.Error(),
+					})
+				}
+			}
+
+		case <-heartbeatTicker.C:
+			// Re-read state file for heartbeat staleness. Journal (not
+			// slog) the failure: this read feeds a restart decision, and
+			// as an SCM service stderr is discarded — the journal is what
+			// collect_diagnostics ships. A persistent read failure here
+			// (ACL regression, EDR quarantine, torn JSON) plays out as
+			// stale → escalated restarts of a healthy agent, and the
+			// shipped evidence must say why.
+			if s, err := state.Read(statePath); err == nil {
+				agentState = s
+			} else {
+				journal.Log(watchdog.LevelWarn, "state.read_failed", map[string]any{
+					"path": statePath, "error": err.Error(),
+				})
+			}
+			// Stale check + bounded IPC-corroboration veto — see
+			// EvaluateStaleHeartbeat for why a stale state file alone
+			// must not trigger a restart, and what the count means.
+			ipcUp := ipcClient.IsConnected()
+			decision, vetoes := healthChecker.EvaluateStaleHeartbeat(agentState, ipcUp)
+			switch decision {
+			case watchdog.StaleRestart:
+				journal.Log(watchdog.LevelWarn, "check.heartbeat_stale", map[string]any{
+					"ipc_connected": ipcUp,
+					"vetoes_before": vetoes,
+				})
+				noteAgentUnhealthy()
+			case watchdog.StaleVetoed:
+				journal.Log(watchdog.LevelWarn, "check.heartbeat_stale_ipc_alive", map[string]any{
+					"consecutive_vetoes": vetoes,
+				})
+			}
+
+		case env := <-ipcMessages:
+			if intent := handleIPCMessage(env, wd, journal, cfg, tokenStore, healthChecker); intent != nil {
+				standbyReason = intent.Reason
+				standbyRecognized = watchdog.RecognizedShutdownReason(intent.Reason)
+				standbyWindow = watchdog.StandbyWindow(
+					intent.Reason, intent.ExpectedDuration, wdCfg.StandbyGrace, wdCfg.StandbyTimeout)
+				lastStandbyHoldLog = time.Now()
+				journal.Log(watchdog.LevelInfo, "standby.window", map[string]any{
+					"reason":     standbyReason,
+					"recognized": standbyRecognized,
+					// Both, so a declared duration that was clamped (or was
+					// corrupt) is visible in the shipped journal rather than
+					// showing up as a plausible-looking window with no trace.
+					"declared_seconds": intent.ExpectedDuration,
+					"window_seconds":   int(standbyWindow.Seconds()),
+				})
+			}
+
+		case <-failoverTicker.C:
+			// Only poll in FAILOVER state.
+			if wd.State() != watchdog.StateFailover || failoverClient == nil {
+				continue
+			}
+			handleFailoverPoll(runCtx, failoverClient, wd, journal, cfg, tokenStore, recovery, cfg.Watchdog.MaxRestartsPer24h, &failoverFailures, &lastDiskServerURL)
+		}
+
+		// State-driven actions after each tick.
+		switch wd.State() {
+		case watchdog.StateRecovering:
+			// If a restart is awaiting verification, don't start another one.
+			if pendingVerify != nil {
+				elapsed := time.Since(pendingVerify.startedAt)
+				// Re-read state so we see the freshest LastHeartbeat. A
+				// transient disk error here would otherwise look like a
+				// hung verification loop with no log evidence — match the
+				// warn pattern used by the heartbeat ticker.
+				if s, err := state.Read(statePath); err == nil && s != nil {
+					agentState = s
+				} else if err != nil {
+					journal.Log(watchdog.LevelWarn, "state.read_failed", map[string]any{
+						"path": statePath, "error": err.Error(),
+					})
+				}
+				// Success = heartbeat advanced past (startedAt + grace).
+				verifyDeadline := pendingVerify.startedAt.Add(cfg.Watchdog.RestartVerificationGrace)
+				if agentState != nil && agentState.LastHeartbeat.After(verifyDeadline) {
+					journal.Log(watchdog.LevelInfo, "recovery.verified", map[string]any{
+						"elapsed_ms":     elapsed.Milliseconds(),
+						"last_heartbeat": agentState.LastHeartbeat.Format(time.RFC3339),
+					})
+					pendingVerify = nil
+					wd.HandleEvent(watchdog.EventAgentRecovered)
+					break
+				}
+				// Timeout = give up on this attempt; let the next tick try again.
+				if elapsed > cfg.Watchdog.RestartVerificationTimeout {
+					journal.Log(watchdog.LevelWarn, "recovery.verify_timeout", map[string]any{
+						"elapsed_ms": elapsed.Milliseconds(),
+					})
+					pendingVerify = nil
+				}
+				break
+			}
+
+			// Flap-detection gate: if we've exceeded the 24h budget, jump to FAILOVER.
+			if recovery.Count24h() >= cfg.Watchdog.MaxRestartsPer24h {
+				journal.Log(watchdog.LevelError, "recovery.flap_detected", map[string]any{
+					"count_24h": recovery.Count24h(),
+				})
+				ensureAgentStartedBeforeFailover(runCtx, recovery, journal)
+				wd.HandleEvent(watchdog.EventRecoveryExhausted)
+				break
+			}
+
+			if !recovery.CanAttempt() {
+				journal.Log(watchdog.LevelError, "recovery.exhausted", map[string]any{
+					"attempts": recovery.Attempts(),
+				})
+				ensureAgentStartedBeforeFailover(runCtx, recovery, journal)
+				wd.HandleEvent(watchdog.EventRecoveryExhausted)
+				break
+			}
+
+			journal.Log(watchdog.LevelInfo, "recovery.attempt", map[string]any{
+				"attempt":   recovery.Attempts() + 1,
+				"count_24h": recovery.Count24h(),
+				"pid":       pid,
+			})
+			result, err := recovery.Attempt(watchdog.RecoveryRequest{
+				StateFilePID: pid,
+				Intent:       watchdog.RecoveryIntentUnhealthy,
+				Context:      runCtx,
+			})
+			fields := recoveryJournalFields(result, err)
+			fields["attempt"] = recovery.Attempts()
+			fields["count_24h"] = recovery.Count24h()
+
+			// A cancelled attempt means we are shutting down, not that the
+			// agent failed to recover: exit without feeding a recovery or
+			// failover event off a diagnosis we never actually made.
+			if recoveryCanceled(err) {
+				journal.Log(watchdog.LevelInfo, "recovery.canceled", fields)
+				shutdown()
+				return
+			}
+
+			switch {
+			case err != nil:
+				journal.Log(watchdog.LevelError, "recovery.failed", fields)
+			case result.ActionTaken:
+				journal.Log(watchdog.LevelInfo, "recovery.attempt_dispatched", fields)
+			default:
+				// No side effect (e.g. the controller only observed an
+				// in-flight service transition).
+				journal.Log(watchdog.LevelInfo, "recovery.observed_transition", fields)
+			}
+
+			if shouldFailoverRecovery(result) {
+				pendingVerify = nil
+				ensureAgentStartedBeforeFailover(runCtx, recovery, journal)
+				wd.HandleEvent(watchdog.EventRecoveryExhausted)
+			} else if shouldVerifyRecovery(result, err) {
+				pendingVerify = &struct{ startedAt time.Time }{startedAt: time.Now()}
+			}
+
+		case watchdog.StateFailover:
+			if pendingVerify != nil {
+				pendingVerify = nil
+			}
+			// Self-recovery: if the agent is demonstrably healthy — live IPC
+			// AND a fresh heartbeat from any source (state file or IPC
+			// state_sync) — leave FAILOVER. Without this the only exits were
+			// a server-delivered command (useless when the server or the
+			// poll channel is down) and an IPC *re*connect edge (never fires
+			// on a continuously-connected pipe), so a healthy box could sit
+			// in FAILOVER forever (#2763). Manual `sc start BreezeAgent` on
+			// a stranded box now heals the watchdog too.
+			if ipcClient.IsConnected() {
+				if hb := healthChecker.LastKnownHeartbeat(agentState); !hb.IsZero() && time.Since(hb) <= wdCfg.HeartbeatStaleThreshold {
+					journal.Log(watchdog.LevelInfo, "failover.agent_healthy_recovered", map[string]any{
+						"last_heartbeat": hb.Format(time.RFC3339),
+					})
+					// recovery.Reset() happens in the MONITORING block on the
+					// next tick — no need to duplicate it here.
+					wd.HandleEvent(watchdog.EventAgentRecovered)
+					break
+				}
+			}
+			if failoverClient == nil && tokenStore.Reveal() != "" {
+				// Re-read the on-disk config at every failover-window start:
+				// the agent may have promote-swapped server_url since this
+				// process booted (or since the last failover window), and a
+				// client built from the stale startup URL would keep working
+				// against the rolled-back control plane if that URL answers —
+				// the failure-only reload path below would then never run.
+				failoverBaseURL := cfg.ServerURL
+				if reloaded, rerr := config.Load(""); rerr == nil && reloaded.ServerURL != "" {
+					failoverBaseURL = reloaded.ServerURL
+				} else if rerr != nil {
+					journal.Log(watchdog.LevelWarn, "failover.config_reload_failed", map[string]any{"error": rerr.Error()})
+				}
+				failoverClient = watchdog.NewFailoverClient(
+					failoverBaseURL, cfg.AgentID, tokenStore.Reveal(), nil,
+				)
+				lastDiskServerURL = failoverBaseURL
+				journal.Log(watchdog.LevelInfo, "failover.start", map[string]any{"server": failoverBaseURL})
+
+				// Send initial failover heartbeat.
+				stats := currentRestartStats(recovery, cfg.Watchdog.MaxRestartsPer24h)
+				resp, err := failoverClient.SendHeartbeat(version, wd.State(), stats)
+				if err != nil {
+					failoverFailures++
+					lastDiskServerURL = noteFailoverHeartbeatFailure(failoverClient, journal, lastDiskServerURL, failoverFailures)
+					journal.Log(watchdog.LevelError, "failover.heartbeat_failed", map[string]any{
+						"error": err.Error(),
+					})
+				} else {
+					failoverFailures = 0
+					handleInitialFailoverHeartbeatResponse(runCtx, failoverClient, resp, wd, journal, cfg, tokenStore, recovery)
+				}
+			}
+
+		case watchdog.StateStandby:
+			applyStandby()
+
+		case watchdog.StateMonitoring:
+			// Reset per-window recovery counter when healthy. Note: restart history
+			// (24h window) is intentionally retained so flap detection stays armed.
+			recovery.Reset()
+			if pendingVerify != nil {
+				pendingVerify = nil
+			}
+			if failoverClient != nil {
+				failoverClient = nil
+			}
+			failoverFailures = 0
+		}
+	}
+}
+
+// handleIPCMessage dispatches IPC envelope messages from the agent. It returns
+// the shutdown intent that actually moved the watchdog into STANDBY, so the
+// caller can size the standby window from the reason and declared duration the
+// agent sent (#5252). It returns nil for every other message type, for an
+// intent that failed to parse, and for an intent that did not cause a
+// transition.
+func handleIPCMessage(env *ipc.Envelope, wd *watchdog.Watchdog, journal *watchdog.Journal, cfg *config.Config, tokens *tokenHolder, health *watchdog.HealthChecker) *ipc.ShutdownIntent {
+	switch env.Type {
+	case ipc.TypeShutdownIntent:
+		var intent ipc.ShutdownIntent
+		if err := json.Unmarshal(env.Payload, &intent); err != nil {
+			journal.Log(watchdog.LevelError, "ipc.bad_shutdown_intent", map[string]any{
+				"error": err.Error(),
+			})
+			return nil
+		}
+		journal.Log(watchdog.LevelInfo, "agent.shutdown_intent", map[string]any{
+			"reason":   intent.Reason,
+			"duration": intent.ExpectedDuration,
+		})
+		// Report the intent ONLY when it actually moved us into STANDBY.
+		// shutdown_intent is a valid edge from MONITORING alone, so an intent
+		// that arrives while RECOVERING or in FAILOVER changes nothing — and
+		// must not resize a standby window that this intent did not open.
+		if _, ok := wd.HandleEvent(watchdog.EventShutdownIntent); ok {
+			return &intent
+		}
+		return nil
+
+	case ipc.TypeTokenUpdate:
+		var update ipc.TokenUpdate
+		if err := json.Unmarshal(env.Payload, &update); err != nil {
+			journal.Log(watchdog.LevelError, "ipc.bad_token_update", map[string]any{
+				"error": err.Error(),
+			})
+			return nil
+		}
+		journal.Log(watchdog.LevelInfo, "token.updated", nil)
+		tokens.Replace(update.Token)
+		// Persist the new role-scoped token in secrets.yaml so that the next
+		// Load() picks it up without exposing it through agent.yaml.
+		if err := config.SetSecretAndPersist("watchdog_auth_token", update.Token); err != nil {
+			journal.Log(watchdog.LevelError, "token.persist_failed", map[string]any{
+				"error": err.Error(),
+			})
+		}
+
+	case ipc.TypeStateSync:
+		var sync ipc.StateSync
+		if err := json.Unmarshal(env.Payload, &sync); err != nil {
+			journal.Log(watchdog.LevelError, "ipc.bad_state_sync", map[string]any{
+				"error": err.Error(),
+			})
+			return nil
+		}
+		journal.Log(watchdog.LevelInfo, "agent.state_sync", map[string]any{
+			"agentVersion":     sync.AgentVersion,
+			"connected":        sync.Connected,
+			"lastHeartbeat":    sync.LastHeartbeat,
+			"activeBackupRuns": sync.ActiveBackupRuns,
+		})
+		// Feed the staleness check AND the D3 in-flight-backup IPC veto: the
+		// agent sends a state_sync only after a successful server heartbeat,
+		// so this is authoritative liveness evidence even when agent.state on
+		// disk is unwritable (AV/EDR sharing violations). Without the
+		// heartbeat half, the file alone drove restart decisions and a
+		// blocked writer read as a dead agent (#2763). Without the backup-run
+		// count half, CheckIPC has no way to know a backup is in flight and
+		// escalates on a transient IPC hiccup mid-run.
+		if health != nil && sync.LastHeartbeat != "" {
+			if hb, perr := time.Parse(time.RFC3339, sync.LastHeartbeat); perr == nil {
+				health.NoteStateSync(hb, sync.ActiveBackupRuns)
+			} else {
+				journal.Log(watchdog.LevelWarn, "ipc.bad_state_sync_heartbeat", map[string]any{
+					"value": sync.LastHeartbeat, "error": perr.Error(),
+				})
+			}
+		}
+
+	case ipc.TypeWatchdogPong:
+		// Pong received — IPC is healthy. Already tracked by health checker.
+		journal.Log(watchdog.LevelInfo, "ipc.pong", nil)
+
+	default:
+		journal.Log(watchdog.LevelWarn, "ipc.unknown_type", map[string]any{
+			"type": env.Type,
+		})
+	}
+	return nil
+}
+
+// ensureAgentStartedBeforeFailover issues a budget-free, best-effort
+// ensure-start right before the watchdog parks in FAILOVER. A failed graceful
+// attempt may have already stopped the agent service when the flap/budget
+// gate aborts the ladder; FAILOVER ignores health events, so entering it with
+// the agent stopped is permanent until a human intervenes (#2763). The
+// outcome is journaled and failure never blocks the transition.
+func ensureAgentStartedBeforeFailover(ctx context.Context, recovery *watchdog.RecoveryManager, journal *watchdog.Journal) {
+	result, err := recovery.BestEffortEnsureStart(ctx)
+	fields := map[string]any{
+		"action_taken": result.ActionTaken,
+		"final_state":  result.FinalState,
+	}
+	if err != nil {
+		fields["error"] = err.Error()
+		journal.Log(watchdog.LevelError, "recovery.ensure_started_before_failover_failed", fields)
+		return
+	}
+	journal.Log(watchdog.LevelInfo, "recovery.ensure_started_before_failover", fields)
+}
+
+// handleFailoverPoll sends a heartbeat and polls for commands during failover.
+// ctx is the watchdog run context — commands that drive recovery inherit it so
+// an SCM stop cancels them on the same boundary as the main loop's own.
+func handleFailoverPoll(
+	ctx context.Context,
+	fc *watchdog.FailoverClient,
+	wd *watchdog.Watchdog,
+	journal *watchdog.Journal,
+	cfg *config.Config,
+	tokens *tokenHolder,
+	recovery *watchdog.RecoveryManager,
+	maxPer24h int,
+	failoverFailures *int,
+	lastDiskServerURL *string,
+) {
+	// Send failover heartbeat.
+	stats := currentRestartStats(recovery, maxPer24h)
+	resp, err := fc.SendHeartbeat(version, wd.State(), stats)
+	if err != nil {
+		*failoverFailures = *failoverFailures + 1
+		*lastDiskServerURL = noteFailoverHeartbeatFailure(fc, journal, *lastDiskServerURL, *failoverFailures)
+		journal.Log(watchdog.LevelError, "failover.heartbeat_failed", map[string]any{
+			"error": err.Error(),
+		})
+		return
+	}
+	*failoverFailures = 0
+	heartbeatCmds := processHeartbeatResponse(resp, wd, journal, fc.BaseURL, cfg, tokens, recovery)
+
+	// Commands targeted at the watchdog are claimed by the heartbeat (the
+	// server marks them 'sent' and returns them inline), so the poll below
+	// won't re-return them. Execute the heartbeat-delivered batch here, then
+	// the poll batch, deduped — otherwise a `restart_agent` etc. is consumed
+	// but never run (#1103).
+	// Poll for any still-pending commands. A poll failure must not drop the
+	// heartbeat-delivered batch, so fall through with an empty poll set.
+	pollCmds, err := fc.PollCommands()
+	if err != nil {
+		journal.Log(watchdog.LevelError, "failover.poll_failed", map[string]any{
+			"error": err.Error(),
+		})
+		pollCmds = nil
+	}
+
+	executeFailoverCommands(heartbeatCmds, pollCmds, func(cmd watchdog.FailoverCommand) {
+		handleFailoverCommand(ctx, fc, cmd, wd, journal, cfg, tokens, recovery)
+	})
+}
+
+// handleInitialFailoverHeartbeatResponse handles the first heartbeat sent when
+// failover starts. Those heartbeat commands are already claimed server-side, so
+// execute them immediately; there is no poll batch yet on this path.
+func handleInitialFailoverHeartbeatResponse(
+	ctx context.Context,
+	fc *watchdog.FailoverClient,
+	resp *watchdog.HeartbeatResponse,
+	wd *watchdog.Watchdog,
+	journal *watchdog.Journal,
+	cfg *config.Config,
+	tokens *tokenHolder,
+	recovery *watchdog.RecoveryManager,
+) {
+	processInitialFailoverHeartbeatResponse(resp, wd, journal, fc.BaseURL, cfg, tokens, recovery, func(cmd watchdog.FailoverCommand) {
+		handleFailoverCommand(ctx, fc, cmd, wd, journal, cfg, tokens, recovery)
+	})
+}
+
+func processInitialFailoverHeartbeatResponse(
+	resp *watchdog.HeartbeatResponse,
+	wd *watchdog.Watchdog,
+	journal *watchdog.Journal,
+	serverURL func() string,
+	cfg *config.Config,
+	tokens *tokenHolder,
+	recovery *watchdog.RecoveryManager,
+	run func(watchdog.FailoverCommand),
+) {
+	heartbeatCmds := processHeartbeatResponse(resp, wd, journal, serverURL, cfg, tokens, recovery)
+	executeFailoverCommands(heartbeatCmds, nil, run)
+}
+
+// executeFailoverCommands runs the heartbeat-delivered command batch first,
+// then the poll-delivered batch, invoking run() once per unique command id.
+// The server claims+marks heartbeat commands 'sent' so the poll normally
+// won't re-return them; the dedup is defensive against any overlap. Order is
+// preserved (heartbeat batch, then poll batch). (#1103)
+func executeFailoverCommands(
+	heartbeatCmds, pollCmds []watchdog.FailoverCommand,
+	run func(watchdog.FailoverCommand),
+) {
+	seen := make(map[string]bool, len(heartbeatCmds))
+	for _, cmd := range heartbeatCmds {
+		run(cmd)
+		seen[cmd.ID] = true
+	}
+	for _, cmd := range pollCmds {
+		if seen[cmd.ID] {
+			continue
+		}
+		run(cmd)
+	}
+}
+
+// processHeartbeatResponse handles upgrade directives from the API and returns
+// any commands delivered inline with the heartbeat response.
+func processHeartbeatResponse(
+	resp *watchdog.HeartbeatResponse,
+	wd *watchdog.Watchdog,
+	journal *watchdog.Journal,
+	serverURL func() string,
+	cfg *config.Config,
+	tokens *tokenHolder,
+	recovery *watchdog.RecoveryManager,
+) []watchdog.FailoverCommand {
+	if resp == nil {
+		return nil
+	}
+	if resp.UpgradeTo != "" {
+		journal.Log(watchdog.LevelInfo, "failover.upgrade_agent", map[string]any{
+			"version": resp.UpgradeTo,
+		})
+		if err := doUpdateAgent(resp.UpgradeTo, serverURL, cfg, tokens, journal); err != nil {
+			journal.Log(watchdog.LevelError, "failover.upgrade_agent_failed", map[string]any{
+				"version": resp.UpgradeTo,
+				"error":   err.Error(),
+			})
+		}
+	}
+	if resp.WatchdogUpgradeTo != "" {
+		journal.Log(watchdog.LevelInfo, "failover.upgrade_watchdog", map[string]any{
+			"version": resp.WatchdogUpgradeTo,
+		})
+		if err := doUpdateWatchdog(resp.WatchdogUpgradeTo, serverURL, cfg, tokens, journal); err != nil {
+			journal.Log(watchdog.LevelError, "failover.upgrade_watchdog_failed", map[string]any{
+				"version": resp.WatchdogUpgradeTo,
+				"error":   err.Error(),
+			})
+		}
+	}
+	return resp.Commands
+}
+
+// failoverUpdateErrMsg renders an update_agent / update_watchdog failure for the
+// command RESULT, which is POSTed to the control plane
+// (FailoverClient.SubmitCommandResult -> body["error"] -> device_commands -> the
+// UI). This is the ONE download-error consumer in the watchdog that leaves the
+// box, and it must never be err.Error(): net/http wraps every transport failure
+// in *url.Error, whose message repeats the URL of the failed hop — i.e. the
+// presigned CDN URL after a redirect, capability query string included.
+//
+// A named function rather than an inline call so the property is testable
+// without standing up a FailoverClient, Watchdog and RecoveryManager.
+func failoverUpdateErrMsg(err error) string {
+	return updater.SafeDownloadErrorMessage(err)
+}
+
+// handleFailoverCommand executes a single command from the API. ctx is the
+// watchdog run context, so a recovery a command dispatches is cancelled by an
+// SCM stop just like one the main loop started.
+func handleFailoverCommand(
+	ctx context.Context,
+	fc *watchdog.FailoverClient,
+	cmd watchdog.FailoverCommand,
+	wd *watchdog.Watchdog,
+	journal *watchdog.Journal,
+	cfg *config.Config,
+	tokens *tokenHolder,
+	recovery *watchdog.RecoveryManager,
+) {
+	journal.Log(watchdog.LevelInfo, "failover.command", map[string]any{
+		"id":   cmd.ID,
+		"type": cmd.Type,
+	})
+
+	var resultStatus string
+	var result any
+	var errMsg string
+
+	switch cmd.Type {
+	case "restart_agent", "start_agent":
+		// Explicit intent per command type — never whichever rung the
+		// escalation ladder happens to be on. An operator restart additionally
+		// resets the window: it is a fresh graceful restart, not attempt N+1.
+		intent, resetFirst, _ := failoverRecoveryIntent(cmd.Type)
+		if resetFirst {
+			recovery.Reset()
+		}
+		wd.HandleEvent(watchdog.EventStartAgent)
+		res, err := recovery.Attempt(watchdog.RecoveryRequest{
+			Intent:  intent,
+			Context: ctx,
+		})
+		fields := recoveryJournalFields(res, err)
+		fields["command_id"] = cmd.ID
+		if err == nil && res.ActionTaken {
+			journal.Log(watchdog.LevelInfo, "failover.recovery_dispatched", fields)
+			resultStatus = "completed"
+			result = map[string]string{"action": cmd.Type}
+		} else {
+			journal.Log(watchdog.LevelError, "failover.recovery_failed", fields)
+			resultStatus = "failed"
+			errMsg = errStr(err)
+			if errMsg == "" {
+				// No error, but no side effect either (e.g. the controller
+				// observed an in-flight transition). Report why rather than
+				// submitting a bare "failed" with an empty message.
+				errMsg = fmt.Sprintf("recovery took no action (action=%s, disposition=%s)", res.Action, res.Disposition)
+			}
+		}
+
+	case "collect_diagnostics":
+		entries, err := journal.ReadFromDisk()
+		if err != nil {
+			resultStatus = "failed"
+			errMsg = err.Error()
+		} else {
+			res := map[string]any{
+				"journal_entries": len(entries),
+				"state":           wd.State(),
+				"history":         wd.StateHistory(),
+			}
+			// Ship full journal entries to the diagnostic-log endpoint. Only
+			// report "completed" if they actually reached the API — otherwise
+			// operators would see a false success for empty diagnostics.
+			shipped, shipErr := fc.ShipLogs(entries)
+			res["shipped_logs"] = shipped
+			if shipErr != nil {
+				journal.Log(watchdog.LevelWarn, "failover.ship_logs_failed", map[string]any{
+					"error":   shipErr.Error(),
+					"shipped": shipped,
+					"total":   len(entries),
+				})
+				res["ship_error"] = shipErr.Error()
+				// partial flag records that some batches landed; the API's
+				// command-result status enum only accepts completed/failed/
+				// timeout, so any ship failure maps to "failed" while the
+				// payload carries the shipped/total detail.
+				res["partial"] = shipped > 0
+				resultStatus = "failed"
+				errMsg = shipErr.Error()
+			} else {
+				resultStatus = "completed"
+			}
+			result = res
+		}
+
+	case "update_agent":
+		targetVersion, _ := cmd.Payload["version"].(string)
+		if targetVersion == "" {
+			resultStatus = "failed"
+			errMsg = "missing version in payload"
+		} else {
+			err := doUpdateAgent(targetVersion, fc.BaseURL, cfg, tokens, journal)
+			if err != nil {
+				resultStatus = "failed"
+				errMsg = failoverUpdateErrMsg(err)
+			} else {
+				resultStatus = "completed"
+				result = map[string]string{"updated_to": targetVersion}
+			}
+		}
+
+	case "update_watchdog":
+		targetVersion, _ := cmd.Payload["version"].(string)
+		if targetVersion == "" {
+			resultStatus = "failed"
+			errMsg = "missing version in payload"
+		} else {
+			err := doUpdateWatchdog(targetVersion, fc.BaseURL, cfg, tokens, journal)
+			if err != nil {
+				resultStatus = "failed"
+				errMsg = failoverUpdateErrMsg(err)
+			} else {
+				resultStatus = "completed"
+				result = map[string]string{"updated_to": targetVersion}
+			}
+		}
+
+	default:
+		resultStatus = "failed"
+		errMsg = fmt.Sprintf("unknown command type: %s", cmd.Type)
+	}
+
+	if err := fc.SubmitCommandResult(cmd.ID, resultStatus, result, errMsg); err != nil {
+		journal.Log(watchdog.LevelError, "failover.submit_result_failed", map[string]any{
+			"command_id": cmd.ID,
+			"error":      err.Error(),
+		})
+	}
+}
+
+// doUpdateAgent creates an updater and downloads the target version for the
+// agent binary. serverURL is a provider (func() string) resolved at download
+// time — during a failover the watchdog's FailoverClient retargets itself to
+// the promoted backup (SetBaseURL), and passing c.BaseURL here means binary
+// downloads follow that promotion instead of pinning the dead primary captured
+// in cfg at startup (#2478).
+func doUpdateAgent(targetVersion string, serverURL func() string, cfg *config.Config, tokens *tokenHolder, journal *watchdog.Journal) error {
+	tok := tokens.Get()
+	if tok == nil {
+		return fmt.Errorf("no auth token available")
+	}
+	binaryPath := agentBinaryPath()
+	u := updater.New(&updater.Config{
+		ServerURL:                   serverURL,
+		BackupServerURL:             cfg.BackupServerURL,
+		AuthToken:                   tok,
+		CurrentVersion:              "", // Not tracking agent version from watchdog.
+		BinaryPath:                  binaryPath,
+		BackupPath:                  binaryPath + ".bak",
+		PinnedManifestPubKeys:       cfg.PinnedManifestPubKeys,
+		RequireManifestSigningKeyID: cfg.RequireManifestSigningKeyID,
+	})
+	if err := u.UpdateTo(targetVersion); err != nil {
+		// A download failure may carry a *netpolicy.PolicyError, or be a
+		// *url.Error — net/http wraps EVERY transport-level failure that way
+		// (TLS handshake, connection refused/reset, timeout, EOF — not just
+		// policy rejections), and its message repeats the full request URL,
+		// capability query string included. SafeDownloadErrorFields picks
+		// the key/value that never leaks it.
+		key, value := updater.SafeDownloadErrorFields(err)
+		journal.Log(watchdog.LevelError, "update.agent_failed", map[string]any{"version": targetVersion, key: value})
+		// The RAW error is returned deliberately: it stays local (the caller
+		// needs the chain for errors.Is) and the single place it could leave the
+		// box — the command-result errMsg in handleFailoverCommand — redacts it
+		// with SafeDownloadErrorMessage. Do not add a second consumer of this
+		// return value without redacting there too.
+		return err
+	}
+	journal.Log(watchdog.LevelInfo, "update.agent_success", map[string]any{
+		"version": targetVersion,
+	})
+	return nil
+}
+
+// doUpdateWatchdog updates the watchdog binary and restarts the service.
+// serverURL is a provider resolved at download time so a self-update follows
+// the FailoverClient's backup-server-URL promotion during a failover rather
+// than pinning the startup primary (#2478).
+func doUpdateWatchdog(targetVersion string, serverURL func() string, cfg *config.Config, tokens *tokenHolder, journal *watchdog.Journal) error {
+	tok := tokens.Get()
+	if tok == nil {
+		return fmt.Errorf("no auth token available")
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to determine executable path: %w", err)
+	}
+	u := updater.New(&updater.Config{
+		ServerURL:                   serverURL,
+		BackupServerURL:             cfg.BackupServerURL,
+		AuthToken:                   tok,
+		CurrentVersion:              version,
+		Component:                   "watchdog",
+		BinaryPath:                  exePath,
+		BackupPath:                  exePath + ".bak",
+		PinnedManifestPubKeys:       cfg.PinnedManifestPubKeys,
+		RequireManifestSigningKeyID: cfg.RequireManifestSigningKeyID,
+	})
+	if err := u.UpdateTo(targetVersion); err != nil {
+		// See doUpdateAgent above for why err.Error() must not be logged
+		// directly.
+		key, value := updater.SafeDownloadErrorFields(err)
+		journal.Log(watchdog.LevelError, "update.watchdog_failed", map[string]any{"version": targetVersion, key: value})
+		// See doUpdateAgent above: raw return, redacted at the off-box boundary.
+		return err
+	}
+	journal.Log(watchdog.LevelInfo, "update.watchdog_success", map[string]any{
+		"version": targetVersion,
+	})
+	// Restart the watchdog service so the new binary takes effect.
+	if err := restartWatchdogService(); err != nil {
+		journal.Log(watchdog.LevelWarn, "update.watchdog_restart_failed", map[string]any{
+			"error": err.Error(),
+		})
+	}
+	return nil
+}
+
+// printStatus prints watchdog version, agent state file info, and IPC socket status.
+func printStatus() {
+	fmt.Printf("Watchdog Version: %s\n", version)
+
+	statePath := state.PathInDir(config.ConfigDir())
+	agentState, err := state.Read(statePath)
+	if err != nil {
+		fmt.Printf("Agent State: error reading (%v)\n", err)
+	} else if agentState == nil {
+		fmt.Println("Agent State: no state file found")
+	} else {
+		fmt.Printf("Agent State: %s (PID=%d, version=%s)\n", agentState.Status, agentState.PID, agentState.Version)
+		if !agentState.LastHeartbeat.IsZero() {
+			fmt.Printf("Last Heartbeat: %s (%s ago)\n",
+				agentState.LastHeartbeat.Format(time.RFC3339),
+				time.Since(agentState.LastHeartbeat).Truncate(time.Second),
+			)
+		}
+		fmt.Printf("State Timestamp: %s\n", agentState.Timestamp.Format(time.RFC3339))
+	}
+
+	socketPath := ipc.DefaultSocketPath()
+	if _, err := os.Stat(socketPath); err == nil {
+		fmt.Printf("IPC Socket: %s (exists)\n", socketPath)
+	} else {
+		fmt.Printf("IPC Socket: %s (not found)\n", socketPath)
+	}
+}
+
+// readHealthJournal reads the journal from disk and prints recent entries.
+func readHealthJournal() {
+	journal, err := watchdog.NewJournal(config.LogDir(), 10, 3)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open journal: %v\n", err)
+		os.Exit(1)
+	}
+	defer journal.Close()
+
+	entries, err := journal.ReadFromDisk()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to read journal: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("No journal entries found.")
+		return
+	}
+
+	// Trim to the requested count.
+	if journalCount > 0 && journalCount < len(entries) {
+		entries = entries[len(entries)-journalCount:]
+	}
+
+	for _, e := range entries {
+		dataStr := ""
+		if e.Data != nil {
+			if b, err := json.Marshal(e.Data); err == nil {
+				dataStr = " " + string(b)
+			}
+		}
+		fmt.Printf("%s [%s] %s%s\n",
+			e.Time.Format(time.RFC3339),
+			e.Level,
+			e.Event,
+			dataStr,
+		)
+	}
+}
+
+// errStr returns the error string or empty string for nil errors.
+func errStr(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// currentRestartStats builds a RestartStats snapshot from the RecoveryManager.
+func currentRestartStats(rm *watchdog.RecoveryManager, maxPer24h int) watchdog.RestartStats {
+	count := rm.Count24h()
+	return watchdog.RestartStats{
+		Count24h:      count,
+		LastRestartAt: rm.LastRestartAt(),
+		FlapDetected:  count >= maxPer24h,
+	}
+}

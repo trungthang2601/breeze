@@ -1,0 +1,39 @@
+# GHCR deploy overrides — platform fixes for arm64 hosts
+services:
+  binaries-init:
+    platform: linux/amd64
+
+  web:
+    platform: linux/amd64
+
+  portal:
+    platform: linux/amd64
+
+  api:
+    environment:
+      ENROLLMENT_KEY_PEPPER: ${ENROLLMENT_KEY_PEPPER:?Set ENROLLMENT_KEY_PEPPER in .env}
+      MFA_RECOVERY_CODE_PEPPER: ${MFA_RECOVERY_CODE_PEPPER:?Set MFA_RECOVERY_CODE_PEPPER in .env}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}
+      AUTH_COOKIE_SAME_SITE: ${AUTH_COOKIE_SAME_SITE:-Lax}
+      PORTAL_COOKIE_SAME_SITE: ${PORTAL_COOKIE_SAME_SITE:-Lax}
+      ENABLE_REGISTRATION: ${ENABLE_REGISTRATION:-false}
+      BINARY_SOURCE: github
+      RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: ${RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS:?Set RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS in .env}
+      TURN_HOST: ${TURN_HOST:-}
+      TURN_PORT: ${TURN_PORT:-3478}
+      TURN_SECRET: ${TURN_SECRET:-}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      BILLING_URL: ${BILLING_URL:-}
+      BREEZE_BILLING_URL: ${BREEZE_BILLING_URL:-}
+      PUBLIC_ACTIVATION_BASE_URL: ${PUBLIC_ACTIVATION_BASE_URL:-}
+      BREEZE_REGION: ${BREEZE_REGION:-us}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+
+  # Disable local coturn — using external DO droplet
+  coturn:
+    image: alpine:3.19
+    entrypoint: ["true"]
+    restart: "no"
+    network_mode: bridge

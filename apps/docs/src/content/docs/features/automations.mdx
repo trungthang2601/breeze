@@ -1,0 +1,548 @@
+---
+title: Automations
+description: Define event-driven, scheduled, and webhook-triggered automations that run actions against target devices and platform services in your fleet.
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Automations let you define rules that execute automatically when something happens across your managed environment. A trigger — a scheduled time, a platform event, an inbound webhook from an external system, or an explicit manual request — causes the automation to run one or more actions against a set of target devices or platform services.
+
+Automations appear in the left nav as **Jobs**. Older `/automations` links redirect.
+
+You manage automations from the **Jobs** page in the Breeze dashboard. From there you can create new automations, enable or disable existing ones, run them on demand, and review their execution history.
+
+An automation normally belongs to a single organization, but a partner-scoped user with access to every organization can instead create one **partner-wide** ("All orgs") -- see [Partner-wide Automations](#partner-wide-automations-all-organizations) below.
+
+<Aside>
+  Building an `event` automation on `alert.triggered` specifically to respond to a condition you also watch with an Alert Rule? Consider a [Monitor](/features/monitors/) instead -- it bundles the condition, severity, and response actions into one object, deployed through Configuration Policies instead of hand-wiring a rule to a separate automation. Automations you already have under **Jobs** aren't affected -- they keep running exactly as before, as plain event-, schedule-, webhook-, or manually-triggered automations; only a monitor's own generated automation shows up read-only (see [What's read-only, and why](/features/monitors/#whats-read-only-and-why)).
+</Aside>
+
+---
+
+## Creating an Automation
+
+<Steps>
+
+1. **Open the Jobs page.** Navigate to **Jobs** in the sidebar. Click **New Automation** in the top-right corner.
+
+2. **Enter a name and description.** Give the automation a descriptive name (e.g., "Daily maintenance check") and an optional description explaining its purpose.
+
+3. **Choose an owner scope (partner users only).** If you have partner-wide access, choose **This organization only** (the default) or **All organizations (partner-wide automation)**. This choice is only available when creating the automation -- it can't be changed afterward.
+
+4. **Choose a trigger type.** Select one of the four trigger cards:
+   - **Schedule** -- runs on a recurring cron schedule. Use the cron expression field or click a quick preset (Every 15 min, Every hour, Daily 9 AM, Weekdays 9 AM, Weekly Sunday). A plain-language description of the schedule appears below the field.
+   - **Event** -- runs when a platform event occurs. Select the event type from the dropdown (Device Online, Device Offline, Alert Triggered, Alert Resolved, Script Completed, Script Failed, Policy Violation).
+   - **Webhook** -- runs when an external system sends an HTTP POST to the automation's generated URL. After saving, the webhook URL appears and can be copied with one click. Optionally set a webhook secret for authentication.
+   - **Manual** -- runs only when you trigger it from the UI or API.
+
+5. **Configure device targeting (optional).** Expand the **Device Targeting** section to filter which devices the automation applies to. Use **Simple** mode to add conditions (Site is, Group is not, OS contains, Tag is) or switch to **Advanced** mode for the full filter builder with live device preview.
+
+6. **Add actions.** Under **Actions**, click **Add Action** and choose the action type:
+   - **Run Script** -- select a script from the library.
+   - **Send Notification** -- select a notification channel.
+   - **Create Alert** -- set a severity level and message.
+   - **Execute Command** -- enter a raw shell command.
+   - **Deploy Software** -- select a software item from the catalog. Devices already on the latest version or on an unsupported OS are skipped automatically.
+
+   Actions execute in order. Add multiple actions by clicking **Add Action** again. Each action is numbered and can be removed individually.
+
+7. **Set the failure policy.** Choose what happens if an action fails:
+   - **Stop Execution** -- abort immediately.
+   - **Continue** -- proceed with remaining actions.
+   - **Notify & Continue** -- send a failure notification to a selected channel and continue.
+
+8. **Save.** Click **Create Automation** to save and enable the automation.
+
+</Steps>
+
+---
+
+## Partner-wide Automations (All organizations)
+
+Instead of recreating the same automation in every customer organization, a partner-scoped user with access to all organizations can create one automation that fires across every org the partner manages -- for example, "on device offline, run a diagnostic script" applied fleet-wide instead of per org.
+
+- Ownership is chosen at creation time (**This organization only** vs **All organizations (partner-wide automation)**) and can't be changed afterward. To move an automation between an org and partner-wide, delete and recreate it.
+- **Event triggers fan out**: an event (e.g. `device.offline`, `alert.triggered`) occurring in any member organization matches the partner's partner-wide automations, in addition to that org's own automations.
+- Any alert, deployment, or notification an automation's actions create always belongs to the **target device's own organization**, not the partner -- so `create_alert`, `deploy_software`, and `send_notification` actions stay correctly scoped even when the triggering automation is partner-wide.
+- Partner-wide automations show an **All orgs** badge in the automations list. Updating, deleting, or manually triggering one requires the same partner-wide management access as creating it.
+
+---
+
+## Managing Automations
+
+The Automations list page displays all automations in a table with columns for name, trigger type, last run time, status, and an enabled toggle. Partner-wide automations show an **All orgs** badge next to their name.
+
+- **Search and filter.** Use the search bar to find automations by name or description. Filter by trigger type (Schedule, Event, Webhook, Manual) or by status (Enabled / Disabled).
+- **Enable or disable.** Toggle the switch in the Enabled column. Disabled automations do not fire on schedule or in response to events.
+- **Run manually.** Click the play button next to any enabled automation to trigger it immediately.
+- **Edit.** Click the pencil icon to open the automation editor and modify triggers, conditions, actions, or failure policies.
+- **Delete.** Open the three-dot menu and select **Delete**. A confirmation dialog appears before the automation is removed.
+- **View run history.** Open the three-dot menu and select **Run History**, or click "View history" under the status column.
+
+---
+
+## Viewing Run History
+
+To see past executions for an automation, click **Run History** from the three-dot menu on the automations list. A modal opens with a chronological list of runs.
+
+Each run entry shows:
+- **Status badge** -- Running (blue), Success (green), Failed (red), or Partial (yellow).
+- **Trigger source** -- Scheduled, Event Triggered, Webhook, Manual, or API Call.
+- **Device counts** -- how many devices passed, failed, or were skipped.
+- **Duration** -- total run time.
+
+Click a run to expand it and view:
+- **Device results** -- per-device status with hostname, duration, captured output, and error messages. While a run is in flight these rows update **live**, each device advancing `pending → running → success/failed` in real time, so you can watch progress across the fleet without refreshing.
+- **Logs** -- click **View Logs** to see a terminal-style log output showing action dispatches and results.
+- **Timestamps** -- exact start and completion times.
+
+Use the status filter dropdown to narrow results to Success, Failed, Partial, or Running.
+
+### Cancelling a run
+
+A **Cancel run** button appears on any run that is still `running`. It requires the `automations:write` permission — without it the button does not appear at all, not just disabled. For a partner-wide automation's run, cancelling also requires permission to manage partner-wide policies; a technician who can see the run but not cancel it sees a tooltip explaining why instead of the button.
+
+Clicking **Cancel run** asks for confirmation, then stops the run:
+
+- Actions not yet dispatched to any device are marked cancelled immediately.
+- `run_script` actions already sent to a device get a best-effort stop request; the confirmation reports how many were confirmed stopped versus only asked to stop, since a device may not acknowledge in time.
+- `execute_command` and `deploy_software` actions cannot be recalled once dispatched -- the shell command or software install runs to completion on the device regardless. These are listed separately as actions the cancel could not reach, so the run is never reported as fully stopped when one of these is still in flight.
+
+The run's status becomes `cancelled` once the stop is processed.
+
+---
+
+## Key Concepts
+
+### Trigger Types
+
+| Type | Fires when |
+|------|------------|
+| `schedule` | A cron expression matches in the specified timezone |
+| `event` | A platform event occurs (e.g., `alert.created`, `device.offline`) |
+| `webhook` | An HTTP POST is received at the automation's generated URL |
+| `manual` | An admin explicitly triggers a run via UI or API |
+
+### Action Types
+
+| Type | What it does |
+|------|--------------|
+| `run_script` | Executes a script from the library on target devices |
+| `send_notification` | Sends a message to a notification channel |
+| `create_alert` | Creates a Breeze alert with configured severity and message |
+| `execute_command` | Runs a shell command on target devices |
+| `deploy_software` | Installs the latest catalog version of a software item on target devices, automatically skipping devices that are already current or on an unsupported OS |
+| `ai_triage` | **System-managed.** Wakes an AI triage agent when an alert fires. Created automatically with the agent — see below. |
+
+<Aside type="caution" title="`ai_triage` is created for you">
+  You cannot author an automation that uses the `ai_triage` action — the API rejects it with `ai_triage_is_system_managed`. Creating an AI triage agent generates its own managed automation to route alerts to it, and disabling the agent disables that wiring.
+
+  Edit the **agent**, not the automation: severity, site, tag, maintenance-window and cooldown filtering all live on the agent's policy. See [AI Agents](/features/ai-agents/).
+</Aside>
+
+### Run Status
+
+| Status | Meaning |
+|--------|---------|
+| `running` | The run is actively executing; not all actions have completed |
+| `success` | All target devices executed their actions successfully |
+| `failed` | All actions failed, or the automation could not start |
+| `partial` | Some device targets succeeded and some failed; at least one of each |
+| `cancelled` | The run was stopped before all actions completed |
+
+<Aside>
+  When filtering runs by status in the API, use `completed` (not `success`).
+</Aside>
+
+### onFailure Policy
+
+| Policy | Behavior |
+|--------|----------|
+| `stop` | Abort the run immediately; remaining actions are not executed |
+| `continue` | Execute all remaining actions regardless of failures |
+| `notify` | Same as `continue`, but also send a failure notification after the run completes |
+
+---
+
+## Configuring Automations via Configuration Policies
+
+For organizations that manage automations as part of broader device policy, automations can also be defined as features on a [Configuration Policy](/features/configuration-policies/). Policy-managed automations inherit the policy's scope -- a single automation definition can apply across all devices in an organization, site, or device group without creating separate automations per target.
+
+<Aside>
+  Most technicians will create automations through the Jobs page described above. Configuration Policies are useful when you need to bundle automation rules alongside other policy features (monitoring, patching, etc.) and deploy them as a unit.
+</Aside>
+
+### Adding an automation feature to a policy
+
+```bash
+POST /configuration-policies/:policyId/features
+Content-Type: application/json
+
+{
+  "featureType": "automation",
+  "inlineSettings": {
+    "automations": [
+      {
+        "name": "Restart nginx on critical alert",
+        "enabled": true,
+        "triggerType": "event",
+        "eventType": "alert.triggered",
+        "actions": [
+          {
+            "type": "execute_command",
+            "command": "systemctl restart nginx",
+            "shell": "bash"
+          },
+          {
+            "type": "send_notification",
+            "notificationChannelId": "uuid",
+            "title": "nginx restarted",
+            "message": "Auto-restarted nginx after alert",
+            "severity": "medium"
+          }
+        ],
+        "onFailure": "notify"
+      }
+    ]
+  }
+}
+```
+
+You can define multiple automations per feature link by adding additional items to the `automations` array.
+
+### Automation configuration fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Human-readable name |
+| `enabled` | boolean | No | Whether the automation fires automatically. Defaults to `true` |
+| `triggerType` | string | Yes | `schedule`, `event`, `webhook`, or `manual` |
+| `cronExpression` | string | If schedule | Cron expression (5-field format) |
+| `timezone` | string | If schedule | IANA timezone name (e.g., `America/Denver`) |
+| `eventType` | string | If event | Platform event type string (e.g., `alert.created`) |
+| `actions` | array | Yes | Ordered list of action objects |
+| `onFailure` | string | No | `stop`, `continue`, or `notify`. Defaults to `stop` |
+| `sortOrder` | integer | No | Ordering when multiple automations share a feature link |
+
+### Viewing policy-managed automations
+
+Automations created through Configuration Policies appear in `GET /automations` alongside legacy standalone automations. Policy-managed automations include a `configPolicyId` field in the response. Their runs include both `configPolicyId` and `configItemName`; the `automationId` field is `null` for policy-managed runs.
+
+<Aside type="tip">
+  Devices in an active maintenance window with automation suppression enabled are automatically excluded from a policy-managed automation's run, for both schedule and event triggers. This does not apply to standalone automations created directly on the Jobs page. See [Automation and Patching Suppression](/features/maintenance-windows/#automation-and-patching-suppression) for the full behavior.
+</Aside>
+
+---
+
+## Trigger Configuration
+
+### Schedule
+
+Runs on a recurring schedule using a standard 5-field cron expression. The timezone is required and must be a valid IANA timezone name (e.g., `America/Denver`, `Europe/London`, `UTC`).
+
+```json
+{
+  "triggerType": "schedule",
+  "cronExpression": "0 2 * * 0",
+  "timezone": "America/Denver"
+}
+```
+
+The example above runs every Sunday at 2:00 AM Mountain Time. Cron fields are: minute, hour, day-of-month, month, day-of-week.
+
+### Event
+
+Fires when a matching platform event is emitted. The `eventType` field is case-sensitive.
+
+```json
+{
+  "triggerType": "event",
+  "eventType": "alert.triggered"
+}
+```
+
+**Common event types:**
+
+| Event type | Fires when |
+|------------|------------|
+| `alert.triggered` | A new alert is triggered |
+| `alert.resolved` | An alert is resolved |
+| `device.offline` | A device stops sending heartbeats |
+| `device.enrolled` | A new device completes enrollment |
+| `patch.failed` | A patch deployment fails on a device |
+| `huntress.incident_created` | A new Huntress incident is reported (see [EDR Integrations](/features/edr-integrations/)) |
+| `huntress.incident_updated` | A Huntress incident changes severity, status, or resolution |
+| `huntress.agent_offline` | A Huntress agent goes offline |
+| `s1.threat_detected` | A new SentinelOne threat is detected |
+| `s1.device_isolated` | A Breeze-initiated SentinelOne isolation completes |
+| `s1.threat_action_completed` | A Breeze-initiated SentinelOne threat action completes |
+
+### Webhook
+
+Exposes a unique HTTP endpoint that external systems can POST to. See [Inbound Webhooks](#inbound-webhooks) for the integration flow.
+
+```json
+{
+  "triggerType": "webhook"
+}
+```
+
+The webhook endpoint uses the automation's ID:
+
+```
+POST /automations/webhooks/:automationId
+```
+
+### Manual
+
+No additional configuration required. The automation only runs when explicitly triggered via `POST /automations/:id/trigger`.
+
+```json
+{
+  "triggerType": "manual"
+}
+```
+
+Manual automations are useful for runbooks, one-off remediation scripts, or any workflow where human confirmation is required before execution.
+
+---
+
+## Action Configuration
+
+Actions run in the order they are defined. Each action has a `type` and type-specific fields.
+
+### run_script
+
+Executes a script from the Breeze script library on each target device.
+
+```json
+{
+  "type": "run_script",
+  "scriptId": "uuid",
+  "parameters": { "param1": "value" },
+  "runAs": "system",
+  "whenOffline": "queue"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `scriptId` | Yes | UUID of the script in the library |
+| `parameters` | No | Key-value pairs passed to the script at runtime |
+| `runAs` | No | Execution context: `system`, `user`, or `elevated`. Defaults to `system` |
+| `whenOffline` | No | What to do when a target device is offline: `queue` (default) delivers the run automatically on the device's next successful heartbeat, up to a 7-day deadline; `skip` fails that device immediately instead of waiting. |
+
+In the automation editor this appears as the **Run as** selector, with a **Script default** option that leaves the choice to the script itself. There is no target-session picker here, unlike a run started from a single device: an automation fans out across many machines, so naming one signed-in session would mean nothing.
+
+### send_notification
+
+Sends a message to a configured notification channel. The channel must be configured in **Settings → Notifications**.
+
+```json
+{
+  "type": "send_notification",
+  "notificationChannelId": "uuid",
+  "title": "Automation fired",
+  "message": "Device triggered the automation",
+  "severity": "high"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `notificationChannelId` | Yes | UUID of the target notification channel |
+| `title` | Yes | Notification title or subject |
+| `message` | Yes | Notification body text |
+| `severity` | No | Severity hint: `low`, `medium`, `high`, or `critical` |
+
+### create_alert
+
+Creates a Breeze alert record directly from the automation, without requiring a monitoring rule to fire first.
+
+```json
+{
+  "type": "create_alert",
+  "alertSeverity": "critical",
+  "alertTitle": "Disk space critical",
+  "alertMessage": "Device has less than 5GB free"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `alertSeverity` | Yes | Alert severity: `info`, `low`, `medium`, `high`, or `critical` |
+| `alertTitle` | Yes | Alert title displayed in the Alerts view |
+| `alertMessage` | Yes | Detailed message body for the alert |
+
+### execute_command
+
+Runs a raw shell command on each target device.
+
+```json
+{
+  "type": "execute_command",
+  "command": "systemctl restart nginx",
+  "shell": "bash",
+  "whenOffline": "queue"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `command` | Yes | The shell command to execute |
+| `shell` | No | Shell to use: `bash`, `powershell`, or `cmd`. Defaults based on device OS |
+| `whenOffline` | No | What to do when a target device is offline: `queue` (default) delivers the command automatically on the device's next successful heartbeat, up to a 7-day deadline; `skip` fails that device immediately instead of waiting. |
+
+### deploy_software
+
+Installs a catalog software item on each target device. Breeze checks whether the device already has the latest version installed and skips it if so. Devices running an OS not supported by the package are also skipped, and the skips are recorded in the run log.
+
+The only field you configure is which catalog item to deploy:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `catalogItemId` | Yes | UUID of the software catalog item to deploy |
+
+Deployment uses the same built-in or uploaded package that the **Software → Deployment** catalog provides. To use this action with Huntress or SentinelOne, the relevant EDR integration must first be configured (see [EDR Integrations](/features/edr-integrations/)).
+
+---
+
+## Viewing Runs via API
+
+Run history is also available through the API for integrations and reporting. Runs are returned newest-first.
+
+**List all runs for an automation:**
+
+```
+GET /automations/:id/runs?status=&page=&limit=
+```
+
+**Get full detail for a single run:**
+
+```
+GET /automations/runs/:runId
+```
+
+### Run fields
+
+| Field | Description |
+|-------|-------------|
+| `status` | `running`, `success`, `failed`, or `partial` |
+| `triggeredBy` | How the run was triggered: `schedule`, `event`, `webhook`, or `manual` |
+| `devicesTargeted` | Total number of devices the run was dispatched to |
+| `devicesSucceeded` | Number of devices where all actions completed successfully |
+| `devicesFailed` | Number of devices where at least one action failed |
+| `startedAt` | ISO 8601 timestamp when the run began |
+| `completedAt` | ISO 8601 timestamp when the run finished, or `null` if still running |
+
+### Run logs
+
+Each run includes a `logs` array. Logs are returned as formatted strings in the format `[level] message` (e.g., `"[info] Command dispatched to device"`). The structured fields (action type, device ID, command ID, etc.) are stored internally but are serialized to this plain-text format in API responses.
+
+---
+
+## Triggering Manually
+
+Any enabled automation can be triggered immediately regardless of its configured trigger type:
+
+```
+POST /automations/:id/trigger
+```
+
+The endpoint returns the `runId` immediately; the run itself is asynchronous. Poll `GET /automations/runs/:runId` to check status.
+
+The automation must be enabled. Triggering a disabled automation returns `400 Bad Request`.
+
+---
+
+## Inbound Webhooks
+
+Automations with a `webhook` trigger expose a unique HTTP endpoint that external systems — ticketing platforms, monitoring tools, CI/CD pipelines — can POST to.
+
+**Endpoint:**
+
+```
+POST /automations/webhooks/:automationId
+```
+
+**Request body:** Any valid JSON. The body is passed to the automation as event context.
+
+**Authentication is HMAC-only by default.** Compute an HMAC-SHA256 over `<timestamp>.<raw-body>` using the automation's secret and send it as `x-breeze-signature: sha256=<hex>` alongside `x-breeze-timestamp: <unix-seconds>`. Optionally include `x-breeze-event-id` (or `x-breeze-nonce`) as an idempotency token to dedupe replays:
+
+```bash
+TS=$(date +%s)
+BODY='{"any":"payload"}'
+SIG="sha256=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "your-secret-here" -binary | xxd -p -c 256)"
+
+curl -X POST https://your-breeze-host/automations/webhooks/:id \
+  -H "Content-Type: application/json" \
+  -H "x-breeze-timestamp: $TS" \
+  -H "x-breeze-signature: $SIG" \
+  -H "x-breeze-event-id: $(uuidgen)" \
+  -d "$BODY"
+```
+
+The signature is verified within a 5-minute window and protected against replay by the event-id nonce. If the signature is missing, malformed, stale, or replayed, the request is rejected with `401 Unauthorized` and no run is created.
+
+#### Legacy shared-secret header (deprecated)
+
+The `x-automation-secret` / `x-webhook-secret` plain-string header path is deprecated and **disabled by default**. To re-enable temporarily during migration, set `AUTOMATION_WEBHOOK_ALLOW_LEGACY_SECRET=true` on the API. This flag will be removed in a future release — migrate senders to HMAC before then. The plain header value is replayable indefinitely by anyone who captures it in an HTTPS access log or pcap, which is why HMAC is now the default.
+
+The `?secret=` query-string parameter has been **removed entirely** — there is no flag to re-enable it. Query strings end up in every proxy, load-balancer, and CDN access log on the request path.
+
+---
+
+## API Reference
+
+### Active endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/automations` | List automations (`?enabled=true/false&orgId=`) |
+| GET | `/automations/:id` | Get automation with recent runs and statistics |
+| GET | `/automations/:id/runs` | List runs (`?status=&page=&limit=`) |
+| GET | `/automations/runs/:runId` | Get run detail with logs |
+| POST | `/automations/:id/trigger` | Manually trigger a run |
+| POST | `/automations/:id/run` | Alias for trigger |
+| POST | `/automations/runs/:runId/cancel` | Cancel a running run (optional body: `graceSeconds`, integer 0-30, defaults to 5). Requires `automations:write`. |
+| POST | `/automations/webhooks/:id` | (Public) Inbound webhook trigger |
+
+### Configuration Policy endpoints
+
+Automation configurations are managed through Configuration Policies:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/configuration-policies/:id/features` | Add automation feature (`featureType: "automation"`) |
+| PATCH | `/configuration-policies/:id/features/:linkId` | Update automation settings |
+| DELETE | `/configuration-policies/:id/features/:linkId` | Remove automation feature |
+
+### Legacy endpoints (backwards compatibility)
+
+These routes remain active for existing integrations but are deprecated. New integrations should use Configuration Policies.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/automations` | Create standalone automation. Set `ownerScope: "partner"` (instead of `orgId`) for a partner-wide ("all orgs") automation -- create-only, requires partner-wide management access |
+| PUT | `/automations/:id` | Replace automation (full update) |
+| PATCH | `/automations/:id` | Partial update |
+| DELETE | `/automations/:id` | Delete automation |
+
+---
+
+## Troubleshooting
+
+**Schedule not firing.**
+Verify the cron expression is valid and the timezone is a recognized IANA timezone name. Confirm the automation is enabled — disabled automations do not fire on schedule. Use `POST /automations/:id/trigger` to confirm the actions work correctly independently of the schedule mechanism.
+
+**Event automation not firing.**
+The `eventType` field is case-sensitive — `alert.triggered` and `Alert.Triggered` are different values. Confirm the automation is enabled and that its policy assignment covers the device generating the event. Use `POST /automations/:id/trigger` to verify the action configuration is valid separately from the event matching.
+
+**Webhook not received.**
+Verify the URL is `/automations/webhooks/:id` where `:id` is the automation's UUID. If a secret is configured, ensure it is passed as the `x-automation-secret` header with the exact value.
+
+**Run status is `partial`.**
+Retrieve the full run detail via `GET /automations/runs/:runId` and examine the `logs` array for entries with `level: "error"`. If `onFailure` was `continue` or `notify`, later actions may have still executed on devices that had earlier failures — review logs per `actionIndex` separately.
+
+**Script/command action failing.**
+The script referenced by `scriptId` must exist in the library and be accessible to the automation's organization. For `run_script` and `execute_command` actions, an offline target device is not an automatic failure: by default (`whenOffline: queue`) the run is queued and delivered on the device's next successful heartbeat, up to a 7-day deadline. Set `whenOffline: skip` on the action if you want an offline device to produce an immediate failure entry in the run logs instead.

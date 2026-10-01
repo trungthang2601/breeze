@@ -1,0 +1,26 @@
+[package]
+name = "breeze-viewer"
+version = "0.10.0"
+edition = "2021"
+
+[lib]
+name = "breeze_viewer_lib"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.11", features = ["devtools"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tokio = { version = "1", features = ["time"] }
+url = "2"
+
+[target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }

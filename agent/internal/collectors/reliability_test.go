@@ -1,0 +1,826 @@
+package collectors
+
+import (
+	"testing"
+	"time"
+)
+
+func TestNewReliabilityCollectorInitialLookback(t *testing.T) {
+	start := time.Now()
+	collector := NewReliabilityCollector()
+	if collector == nil || collector.eventLogCol == nil {
+		t.Fatalf("collector or eventLogCol is nil")
+	}
+
+	minExpected := start.Add(-reliabilityInitialLookback - 5*time.Second)
+	maxExpected := start.Add(-reliabilityInitialLookback + 5*time.Second)
+	actual := collector.eventLogCol.lastCollectTime
+
+	if actual.Before(minExpected) || actual.After(maxExpected) {
+		t.Fatalf("unexpected lastCollectTime: got %s expected within [%s, %s]", actual, minExpected, maxExpected)
+	}
+}
+
+// newMetrics returns an empty ReliabilityMetrics suitable for classifier tests.
+func newMetrics() *ReliabilityMetrics {
+	return &ReliabilityMetrics{
+		CrashEvents:     []CrashEvent{},
+		AppHangs:        []AppHang{},
+		ServiceFailures: []ServiceFailure{},
+		HardwareErrors:  []HardwareError{},
+	}
+}
+
+// totalFactors sums up how many factor entries exist across all four slices.
+func totalFactors(m *ReliabilityMetrics) int {
+	return len(m.CrashEvents) + len(m.AppHangs) + len(m.ServiceFailures) + len(m.HardwareErrors)
+}
+
+func TestNumericEventID(t *testing.T) {
+	tests := []struct {
+		name   string
+		entry  EventLogEntry
+		wantID int
+	}{
+		{
+			name: "Details int takes priority",
+			entry: EventLogEntry{
+				EventID: "99:12345",
+				Details: map[string]any{"eventId": 1001},
+			},
+			wantID: 1001,
+		},
+		{
+			name: "Details float64 (JSON unmarshal)",
+			entry: EventLogEntry{
+				EventID: "99:12345",
+				Details: map[string]any{"eventId": float64(7031)},
+			},
+			wantID: 7031,
+		},
+		{
+			name: "Fallback to EventID prefix",
+			entry: EventLogEntry{
+				EventID: "10010:66601",
+				Details: map[string]any{},
+			},
+			wantID: 10010,
+		},
+		{
+			name: "No colon in EventID",
+			entry: EventLogEntry{
+				EventID: "41",
+				Details: map[string]any{},
+			},
+			wantID: 41,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := numericEventID(tc.entry)
+			if got != tc.wantID {
+				t.Errorf("numericEventID = %d, want %d", got, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestParseServiceName(t *testing.T) {
+	tests := []struct {
+		msg      string
+		fallback string
+		want     string
+	}{
+		{"The Spooler service terminated unexpectedly.", "Service Control Manager", "Spooler"},
+		{"The Windows Update service failed to start.", "Service Control Manager", "Windows Update"},
+		{"No match here", "Service Control Manager", "Service Control Manager"},
+		{"", "Service Control Manager", "Service Control Manager"},
+	}
+	for _, tc := range tests {
+		got := parseServiceName(tc.msg, tc.fallback)
+		if got != tc.want {
+			t.Errorf("parseServiceName(%q) = %q, want %q", tc.msg, got, tc.want)
+		}
+	}
+}
+
+func TestClassifyEventLogEntry(t *testing.T) {
+	ts := "2026-01-15T10:00:00Z"
+
+	tests := []struct {
+		name            string
+		entry           EventLogEntry
+		wantCrashes     int
+		wantServices    int
+		wantHangs       int
+		wantHardware    int
+		wantCrashType   string // optional: check first crash type
+		wantServiceName string // optional: check first service name
+		wantHWType      string // optional: check first hardware type
+	}{
+		// ── Bug #1: DCOM 10010 must NOT become a crash ──────────────────────
+		{
+			name: "DCOM 10010 is dropped (not a crash, service failure, or hardware error)",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Microsoft-Windows-DistributedCOM",
+				EventID:   "10010:66601",
+				Message:   "The server {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} did not register with DCOM within the required timeout.",
+				Details:   map[string]any{"eventId": 10010},
+			},
+			wantCrashes:  0,
+			wantServices: 0,
+			wantHangs:    0,
+			wantHardware: 0,
+		},
+
+		// ── Bug #1 (mirror): real WER 1001 BugCheck IS a crash ─────────────
+		{
+			name: "WER BugCheck EventID 1001 (source=WER) is a bsod crash",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "application",
+				Source:    "Windows Error Reporting",
+				EventID:   "1001:55001",
+				Message:   "Fault bucket type 5, fault bucket , type 5 Event Name: BlueScreen",
+				Details:   map[string]any{"eventId": 1001},
+			},
+			wantCrashes:   1,
+			wantServices:  0,
+			wantHardware:  0,
+			wantCrashType: "bsod",
+		},
+
+		// ── System-log 1001 via Details int, NEUTRAL message → bsod ─────────
+		// Neutral message (no "bugcheck"/"bluescreen") so this exercises the
+		// `nid==1001 && System-log` branch + the Details["eventId"] int path.
+		{
+			name: "System-log 1001 (Details int, neutral message) → bsod",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Microsoft-Windows-WER-SystemErrorReporting",
+				EventID:   "1001:12",
+				Message:   "Fault bucket 1234567890, type 0",
+				Details:   map[string]any{"eventId": 1001, "logName": "System"},
+			},
+			wantCrashes:   1,
+			wantCrashType: "bsod",
+		},
+
+		// ── System-log 1001 via EventID prefix (no Details eventId) → bsod ──
+		{
+			name: "System-log 1001 (EventID prefix fallback, neutral message) → bsod",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Microsoft-Windows-WER-SystemErrorReporting",
+				EventID:   "1001:999",
+				Message:   "Fault bucket report",
+				Details:   map[string]any{"logName": "System"}, // no eventId → prefix parse
+			},
+			wantCrashes:   1,
+			wantCrashType: "bsod",
+		},
+
+		// ── REGRESSION: Application-log WER 1001 APPCRASH is NOT a crash ─────
+		// Ordinary per-app crashes log as "Windows Error Reporting" 1001 in the
+		// Application log. Gating the 1001 crash branch on the System log keeps
+		// these out of the (heavily-weighted) kernel-crash factor.
+		{
+			name: "Application-log WER 1001 APPCRASH is NOT a crash",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "application",
+				Source:    "Windows Error Reporting",
+				EventID:   "1001:42",
+				Message:   "Fault bucket 99, type 4 Event Name: APPCRASH Faulting application name: foo.exe",
+				Details:   map[string]any{"eventId": 1001, "logName": "Application"},
+			},
+			wantCrashes:  0,
+			wantServices: 0,
+			wantHangs:    0,
+			wantHardware: 0,
+		},
+
+		// ── Kernel-Power 41 → bsod ──────────────────────────────────────────
+		{
+			name: "Kernel-Power EventID 41 is a bsod crash",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "critical",
+				Category:  "system",
+				Source:    "Microsoft-Windows-Kernel-Power",
+				EventID:   "41:100",
+				Message:   "The system has rebooted without cleanly shutting down first.",
+				Details:   map[string]any{"eventId": 41},
+			},
+			wantCrashes:   1,
+			wantServices:  0,
+			wantHardware:  0,
+			wantCrashType: "bsod",
+		},
+
+		// ── SCM 7031 → exactly ONE service failure; serviceName parsed ───────
+		{
+			name: "SCM 7031 Spooler → one service failure, name Spooler, no hardware error",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Service Control Manager",
+				EventID:   "7031:200",
+				Message:   "The Spooler service terminated unexpectedly. It has done this 1 time(s).",
+				Details:   map[string]any{"eventId": 7031},
+			},
+			wantCrashes:     0,
+			wantServices:    1,
+			wantHangs:       0,
+			wantHardware:    0,
+			wantServiceName: "Spooler",
+		},
+
+		// ── SCM 7036 (state change) → dropped ───────────────────────────────
+		{
+			name: "SCM 7036 entered running state is dropped",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "info",
+				Category:  "system",
+				Source:    "Service Control Manager",
+				EventID:   "7036:201",
+				Message:   "The Windows Update service entered the running state.",
+				Details:   map[string]any{"eventId": 7036},
+			},
+			wantCrashes:  0,
+			wantServices: 0,
+			wantHangs:    0,
+			wantHardware: 0,
+		},
+
+		// ── SCM 7000 (failed to start) → service failure ────────────────────
+		{
+			name: "SCM 7000 service failed to start",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Service Control Manager",
+				EventID:   "7000:300",
+				Message:   "The MyService service failed to start due to the following error: The service did not respond.",
+				Details:   map[string]any{"eventId": 7000},
+			},
+			wantCrashes:  0,
+			wantServices: 1,
+			wantHardware: 0,
+		},
+
+		// ── WHEA-Logger → hardware error mce, nothing else ──────────────────
+		{
+			name: "WHEA-Logger hardware event → one hardware error type mce",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Microsoft-Windows-WHEA-Logger",
+				EventID:   "18:500",
+				Message:   "A corrected hardware error has occurred. Machine check details: MCE.",
+				Details:   map[string]any{"eventId": 18},
+			},
+			wantCrashes:  0,
+			wantServices: 0,
+			wantHangs:    0,
+			wantHardware: 1,
+			wantHWType:   "mce",
+		},
+
+		// ── Disk error → hardware error type disk ───────────────────────────
+		{
+			name: "Disk source → one hardware error type disk",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "disk",
+				EventID:   "11:600",
+				Message:   "The driver detected a controller error on \\Device\\Harddisk0.",
+				Details:   map[string]any{"eventId": 11},
+			},
+			wantCrashes:  0,
+			wantServices: 0,
+			wantHangs:    0,
+			wantHardware: 1,
+			wantHWType:   "disk",
+		},
+
+		// ── Application hang 1002 → one hang, nothing else ──────────────────
+		{
+			name: "Application hang EventID 1002 → one hang",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "application",
+				Source:    "Application Hang",
+				EventID:   "1002:700",
+				Message:   "The program explorer.exe stopped interacting with Windows.",
+				Details:   map[string]any{"eventId": 1002},
+			},
+			wantCrashes:  0,
+			wantServices: 0,
+			wantHangs:    1,
+			wantHardware: 0,
+		},
+
+		// ── Category "hardware" alone must NOT cause hardware error ──────────
+		{
+			name: "System log event with old Category=hardware but benign DCOM source is dropped",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "hardware", // old stale value; classifier must not trust it
+				Source:    "Microsoft-Windows-DistributedCOM",
+				EventID:   "10010:801",
+				Message:   "Some DCOM timeout message",
+				Details:   map[string]any{"eventId": 10010},
+			},
+			wantCrashes:  0,
+			wantServices: 0,
+			wantHangs:    0,
+			wantHardware: 0,
+		},
+
+		// ── 6008 unexpected shutdown → bsod ─────────────────────────────────
+		{
+			name: "EventID 6008 unexpected previous shutdown → bsod",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "warning",
+				Category:  "system",
+				Source:    "EventLog",
+				EventID:   "6008:900",
+				Message:   "The previous system shutdown at was unexpected.",
+				Details:   map[string]any{"eventId": 6008},
+			},
+			wantCrashes:   1,
+			wantCrashType: "bsod",
+		},
+
+		// ── "bugcheck" in message → bsod ────────────────────────────────────
+		{
+			name: "Message contains bugcheck → bsod",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "critical",
+				Category:  "system",
+				Source:    "SomeOtherSource",
+				EventID:   "999:1",
+				Message:   "A bugcheck was triggered: 0x0000007E",
+				Details:   map[string]any{"eventId": 999},
+			},
+			wantCrashes:   1,
+			wantCrashType: "bsod",
+		},
+
+		// ── kernel panic in message → kernel_panic ───────────────────────────
+		{
+			name: "Message contains kernel panic → kernel_panic",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "critical",
+				Category:  "system",
+				Source:    "SomeSource",
+				EventID:   "888:1",
+				Message:   "Kernel panic - not syncing: VFS: Unable to mount root fs",
+				Details:   map[string]any{"eventId": 888},
+			},
+			wantCrashes:   1,
+			wantCrashType: "kernel_panic",
+		},
+
+		// ── SCM 7034 → service failure, name parsed ─────────────────────────
+		{
+			name: "SCM 7034 terminated unexpectedly → service failure, name parsed",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Service Control Manager",
+				EventID:   "7034:55",
+				Message:   "The Print Spooler service terminated unexpectedly. It has done this 3 time(s).",
+				Details:   map[string]any{"eventId": 7034},
+			},
+			wantServices:    1,
+			wantServiceName: "Print Spooler",
+		},
+
+		// ── SCM 7022 ("hung on start") → service failure, NOT a hang ─────────
+		{
+			name: "SCM 7022 hung on start → service failure, not a hang",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Service Control Manager",
+				EventID:   "7022:56",
+				Message:   "The Foo service hung on starting.",
+				Details:   map[string]any{"eventId": 7022},
+			},
+			wantServices:    1,
+			wantHangs:       0,
+			wantServiceName: "Foo",
+		},
+
+		// ── Non-SCM source w/ service-failure message → service via fallback ─
+		{
+			name: "Non-SCM source with service-failure message → service failure",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "application",
+				Source:    "SomeAppProvider",
+				EventID:   "5000:57",
+				Message:   "The Backup service terminated unexpectedly.",
+				Details:   map[string]any{"eventId": 5000},
+			},
+			wantServices:    1,
+			wantServiceName: "Backup",
+		},
+
+		// ── Priority: SCM service event mentioning "disk" stays a service ────
+		{
+			name: "SCM 7031 whose message mentions disk → service failure, not hardware",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Service Control Manager",
+				EventID:   "7031:58",
+				Message:   "The DiskBackup service terminated unexpectedly.",
+				Details:   map[string]any{"eventId": 7031},
+			},
+			wantServices:    1,
+			wantHardware:    0,
+			wantServiceName: "DiskBackup",
+		},
+
+		// ── Memory hardware type (classifyHardwareType "memory" branch) ─────
+		{
+			name: "Memory error → hardware error type memory",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "Microsoft-Windows-Kernel-General",
+				EventID:   "13:59",
+				Message:   "A memory error was detected by the hardware.",
+				Details:   map[string]any{"eventId": 13},
+			},
+			wantHardware: 1,
+			wantHWType:   "memory",
+		},
+
+		// ── isHardwareSource-only: known driver, generic message → hardware ─
+		{
+			name: "Known driver source (nvlddmkm) generic message → hardware error type unknown",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "application",
+				Source:    "nvlddmkm",
+				EventID:   "153:60",
+				Message:   "Display driver stopped and has recovered.",
+				Details:   map[string]any{"eventId": 153},
+			},
+			wantHardware: 1,
+			wantHWType:   "unknown",
+		},
+
+		// ── Bare-ID matches require a hardware source ────────────────────────
+		// VSS (Volume Shadow Copy — software) reuses event ID 13; before the
+		// source gate this classified as a "memory" hardware error and tanked
+		// the hardware factor on healthy devices.
+		{
+			name: "VSS event 13 (software provider) → not a hardware error",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "VSS",
+				EventID:   "13:135",
+				Message:   "Volume Shadow Copy Service information: The COM Server with CLSID {4e14fba2-2e22-11d1-9964-00c04fbbb345} and name CEventSystem cannot be started.",
+				Details:   map[string]any{"eventId": 13},
+			},
+			wantHardware: 0,
+		},
+		{
+			name: "disk source event 11 with generic message → hardware error type disk",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "error",
+				Category:  "system",
+				Source:    "disk",
+				EventID:   "11:61",
+				Message:   "The driver detected a controller error on \\Device\\Harddisk0\\DR0.",
+				Details:   map[string]any{"eventId": 11},
+			},
+			wantHardware: 1,
+			wantHWType:   "disk",
+		},
+		{
+			name: "ntfs source event 50 with generic message → hardware error",
+			entry: EventLogEntry{
+				Timestamp: ts,
+				Level:     "warning",
+				Category:  "system",
+				Source:    "Microsoft-Windows-Ntfs",
+				EventID:   "50:62",
+				Message:   "{Delayed Write Failed} Windows was unable to save all the data for the file.",
+				Details:   map[string]any{"eventId": 50},
+			},
+			wantHardware: 1,
+			wantHWType:   "memory",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMetrics()
+			classifyEventLogEntry(m, tc.entry)
+
+			// Assert no double-counting: total across all factors must be 0 or 1
+			total := totalFactors(m)
+			if total > 1 {
+				t.Errorf("double-counted: crashes=%d services=%d hangs=%d hardware=%d (total=%d)",
+					len(m.CrashEvents), len(m.ServiceFailures), len(m.AppHangs), len(m.HardwareErrors), total)
+			}
+
+			if len(m.CrashEvents) != tc.wantCrashes {
+				t.Errorf("crashEvents: got %d, want %d", len(m.CrashEvents), tc.wantCrashes)
+			}
+			if len(m.ServiceFailures) != tc.wantServices {
+				t.Errorf("serviceFailures: got %d, want %d", len(m.ServiceFailures), tc.wantServices)
+			}
+			if len(m.AppHangs) != tc.wantHangs {
+				t.Errorf("appHangs: got %d, want %d", len(m.AppHangs), tc.wantHangs)
+			}
+			if len(m.HardwareErrors) != tc.wantHardware {
+				t.Errorf("hardwareErrors: got %d, want %d", len(m.HardwareErrors), tc.wantHardware)
+			}
+
+			if tc.wantCrashType != "" && len(m.CrashEvents) > 0 {
+				if m.CrashEvents[0].Type != tc.wantCrashType {
+					t.Errorf("crashEvents[0].Type = %q, want %q", m.CrashEvents[0].Type, tc.wantCrashType)
+				}
+			}
+			if tc.wantServiceName != "" && len(m.ServiceFailures) > 0 {
+				if m.ServiceFailures[0].ServiceName != tc.wantServiceName {
+					t.Errorf("serviceFailures[0].ServiceName = %q, want %q", m.ServiceFailures[0].ServiceName, tc.wantServiceName)
+				}
+			}
+			if tc.wantHWType != "" && len(m.HardwareErrors) > 0 {
+				if m.HardwareErrors[0].Type != tc.wantHWType {
+					t.Errorf("hardwareErrors[0].Type = %q, want %q", m.HardwareErrors[0].Type, tc.wantHWType)
+				}
+			}
+		})
+	}
+}
+
+// TestClassifyDarwinEventLogEntry covers the macOS junk that drowned scores
+// (#1907 follow-up): IOKit plugin chatter wrongly counted as hardware, and
+// per-app / JetsamEvent DiagnosticReports wrongly counted as system crashes.
+func TestClassifyDarwinEventLogEntry(t *testing.T) {
+	ts := "2026-01-15T10:00:00Z"
+
+	tests := []struct {
+		name          string
+		entry         EventLogEntry
+		wantCrashes   int
+		wantServices  int
+		wantHangs     int
+		wantHardware  int
+		wantCrashType string
+	}{
+		{
+			name:  "com.apple.iokit.cfplugin error is NOT hardware",
+			entry: EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "com.apple.iokit.cfplugin", EventID: "com.apple.iokit.cfplugin:89", Message: "plugin failed to load"},
+		},
+		{
+			name:  "App Store foundation error is NOT hardware",
+			entry: EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "com.apple.appstorefoundation", EventID: "com.apple.appstorefoundation:15257", Message: "request failed"},
+		},
+		{
+			name:          "Per-app crash counts as weak app_crash",
+			entry:         EventLogEntry{Timestamp: ts, Level: "error", Category: "application", Source: "wdavdaemon", EventID: "crash:wdavdaemon-2026.ips", Message: "Application crash: wdavdaemon (EXC_CRASH)"},
+			wantCrashes:   1,
+			wantCrashType: "app_crash",
+		},
+		{
+			name:  "JetsamEvent memory-pressure report is dropped entirely",
+			entry: EventLogEntry{Timestamp: ts, Level: "error", Category: "application", Source: "Unknown", EventID: "crash:JetsamEvent-2026.ips", Message: "Application crash: Unknown ()"},
+		},
+		{
+			name:          "Kernel panic IS a full device crash",
+			entry:         EventLogEntry{Timestamp: ts, Level: "critical", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "Kernel panic: kernel ()"},
+			wantCrashes:   1,
+			wantCrashType: "kernel_panic",
+		},
+		{
+			name:         "Real disk I/O error IS hardware",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "com.apple.iokit.IOStorageFamily", EventID: "x:1", Message: "disk0s2: I/O error"},
+			wantHardware: 1,
+		},
+		{
+			name:         "Thermal event IS hardware",
+			entry:        EventLogEntry{Timestamp: ts, Level: "critical", Category: "hardware", Source: "com.apple.iokit.thermal", EventID: "x:2", Message: "thermal pressure level critical"},
+			wantHardware: 1,
+		},
+		{
+			name:         "launchd service failure IS a service failure",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "application", Source: "com.apple.launchd", EventID: "x:3", Message: "service com.foo exited with code 1"},
+			wantServices: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMetrics()
+			classifyDarwinEventLogEntry(m, tc.entry)
+			if len(m.CrashEvents) != tc.wantCrashes {
+				t.Errorf("crashes: got %d, want %d", len(m.CrashEvents), tc.wantCrashes)
+			}
+			if len(m.ServiceFailures) != tc.wantServices {
+				t.Errorf("services: got %d, want %d", len(m.ServiceFailures), tc.wantServices)
+			}
+			if len(m.AppHangs) != tc.wantHangs {
+				t.Errorf("hangs: got %d, want %d", len(m.AppHangs), tc.wantHangs)
+			}
+			if len(m.HardwareErrors) != tc.wantHardware {
+				t.Errorf("hardware: got %d, want %d", len(m.HardwareErrors), tc.wantHardware)
+			}
+			if tc.wantCrashType != "" {
+				if len(m.CrashEvents) == 0 || m.CrashEvents[0].Type != tc.wantCrashType {
+					t.Errorf("crash type: got %v, want %q", m.CrashEvents, tc.wantCrashType)
+				}
+			}
+			if total := totalFactors(m); total > 1 {
+				t.Errorf("double-counted: total=%d", total)
+			}
+		})
+	}
+}
+
+// TestClassifyLinuxEventLogEntry covers the Linux hardware catch-all: routine
+// kernel chatter hard-tagged Category="hardware" must not count as a fault.
+func TestClassifyLinuxEventLogEntry(t *testing.T) {
+	ts := "2026-01-15T10:00:00Z"
+
+	tests := []struct {
+		name         string
+		entry        EventLogEntry
+		wantCrashes  int
+		wantServices int
+		wantHangs    int
+		wantHardware int
+	}{
+		{
+			name:  "Routine kernel USB notice is NOT hardware",
+			entry: EventLogEntry{Timestamp: ts, Level: "warning", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "usb 1-1: USB disconnect, device number 5"},
+		},
+		{
+			name:         "Disk I/O error IS hardware",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "blk_update_request: I/O error, dev sda"},
+			wantHardware: 1,
+		},
+		{
+			name:         "EDAC memory error IS hardware",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "EDAC MC0: 1 CE memory read error"},
+			wantHardware: 1,
+		},
+		{
+			name:        "OOM kill IS a crash",
+			entry:       EventLogEntry{Timestamp: ts, Level: "critical", Category: "hardware", Source: "kernel", EventID: "kernel:0", Message: "Out of memory: Killed process 1234"},
+			wantCrashes: 1,
+		},
+		{
+			name:         "systemd unit failure IS a service failure",
+			entry:        EventLogEntry{Timestamp: ts, Level: "error", Category: "application", Source: "systemd", EventID: "systemd:1", Message: "nginx.service: Failed with result 'exit-code'"},
+			wantServices: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMetrics()
+			classifyLinuxEventLogEntry(m, tc.entry)
+			if len(m.CrashEvents) != tc.wantCrashes {
+				t.Errorf("crashes: got %d, want %d", len(m.CrashEvents), tc.wantCrashes)
+			}
+			if len(m.ServiceFailures) != tc.wantServices {
+				t.Errorf("services: got %d, want %d", len(m.ServiceFailures), tc.wantServices)
+			}
+			if len(m.AppHangs) != tc.wantHangs {
+				t.Errorf("hangs: got %d, want %d", len(m.AppHangs), tc.wantHangs)
+			}
+			if len(m.HardwareErrors) != tc.wantHardware {
+				t.Errorf("hardware: got %d, want %d", len(m.HardwareErrors), tc.wantHardware)
+			}
+			if total := totalFactors(m); total > 1 {
+				t.Errorf("double-counted: total=%d", total)
+			}
+		})
+	}
+}
+
+func TestCrashReportKind(t *testing.T) {
+	cases := []struct {
+		name     string
+		bugType  string
+		procName string
+		want     string
+	}{
+		// bug_type is authoritative even when the filename/procName say otherwise.
+		{"Kernel-2026-06-27.ips", "210", "Unknown", "Kernel panic"},
+		{"JetsamEvent-2026-06-27.ips", "298", "Unknown", "JetsamEvent"},
+		{"wdavdaemon-2026-06-27.ips", "309", "wdavdaemon", "Application crash"},
+		// Fallbacks when bug_type is absent (legacy reports).
+		{"panic-full-2026.ips", "", "Unknown", "Kernel panic"},
+		{"weird.ips", "", "kernel", "Kernel panic"},
+		{"JetsamEvent-legacy.ips", "", "Unknown", "JetsamEvent"},
+		{"Chrome-2026-06-27.ips", "", "Chrome", "Application crash"},
+	}
+	for _, tc := range cases {
+		if got := crashReportKind(tc.name, tc.bugType, tc.procName); got != tc.want {
+			t.Errorf("crashReportKind(%q,%q,%q) = %q, want %q", tc.name, tc.bugType, tc.procName, got, tc.want)
+		}
+	}
+}
+
+// TestClassifyHardwareTypeMessageSignals pins the message-only hardware
+// signals (#6696). The bare words "memory" and "disk" used to classify any
+// event that mentioned them in passing as a hardware failure; only
+// hardware-phrased matches may do so now. Source "Application Error" and ID 0
+// keep the source/ID gate out of the way so the message is the sole signal.
+func TestClassifyHardwareTypeMessageSignals(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    string
+	}{
+		// False positives from the issue: passing mentions are NOT hardware.
+		{"insufficient memory is not hardware", "Insufficient memory to complete the operation.", "unknown"},
+		{"disk quota is not hardware", "EXT4-fs warning: disk quota exceeded for uid 1000", "unknown"},
+		{"disk cleanup is not hardware", "Disk Cleanup completed successfully.", "unknown"},
+		{"low memory warning is not hardware", "Windows successfully diagnosed a low virtual memory condition.", "unknown"},
+		{"disk space is not hardware", "The disk space on volume C: is low.", "unknown"},
+		{"bare i/o mention is not hardware", "The I/O operation has been aborted because of either a thread exit or an application request.", "unknown"},
+		// Short tokens are word-anchored so they don't fire inside other words.
+		{"smart card is not hardware", "The Smart Card Resource Manager failed to start.", "unknown"},
+		{"smartscreen is not hardware", "SmartScreen blocked an unrecognized app.", "unknown"},
+		{"display dimming is not hardware", "Display dimming policy applied.", "unknown"},
+		{"eccentric is not ecc", "Eccentric configuration value ignored.", "unknown"},
+		{"non-ascii letter glued to token is not a boundary", "Paramètre àecc invalide", "unknown"},
+
+		// Matcher edges: embedded first occurrence must not stop the scan,
+		// phrase at string start/end, plural on a disk phrase.
+		{"embedded then standalone occurrence", "predimm value cached, then DIMM failure reported", "memory"},
+		{"phrase is the whole message", "disk error", "disk"},
+		{"phrase at end of message", "device fault reported on dimm", "memory"},
+		{"disk phrase plural", "2 bad sectors remapped", "disk"},
+
+		// True positives: hardware-phrased memory signals.
+		{"memory error", "A memory error was detected by the hardware.", "memory"},
+		{"memory errors plural", "3 memory errors logged on CPU 0", "memory"},
+		{"ecc", "ECC error detected in bank 2", "memory"},
+		{"corrected error", "Hardware error: corrected error on memory controller", "memory"},
+		{"uncorrectable", "Uncorrectable error in DIMM_A1", "memory"},
+		{"bad ram", "bad RAM pattern detected at 0x7f000000", "memory"},
+		{"dimm", "DIMM B2 reported a fault", "memory"},
+		{"edac", "EDAC MC0: 1 CE memory read error", "memory"},
+		{"edac driver prefix", "sb_edac: 1 UE on DIMM0", "memory"},
+
+		// True positives: hardware-phrased disk signals.
+		{"disk error", "Disk error on \\Device\\Harddisk1", "disk"},
+		{"i/o error", "disk0s2: I/O error", "disk"},
+		{"buffer i/o error", "Buffer I/O error on dev sdb1, logical block 0", "disk"},
+		{"blk_update_request", "blk_update_request: critical medium error, dev sda, sector 1234", "disk"},
+		{"bad sector", "Bad sector found at LBA 88213", "disk"},
+		{"smart failure", "Device: /dev/sda [SAT], SMART Failure: DATA CHANNEL IMPENDING FAILURE", "disk"},
+		{"reset to device", "Reset to device, \\Device\\RaidPort0, was issued.", "disk"},
+		{"hard error", "The device, \\Device\\Harddisk0\\DR0, has a bad block. A hard error occurred.", "disk"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyHardwareType(tc.message, "Application Error", 0); got != tc.want {
+				t.Errorf("classifyHardwareType(%q) = %q, want %q", tc.message, got, tc.want)
+			}
+		})
+	}
+}

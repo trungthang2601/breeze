@@ -1,0 +1,827 @@
+import { ensureDefaultProfile } from './billingProfileService';
+/**
+ * AI Organization/Site Tools (issue #2366)
+ *
+ * Fills the MCP org-lifecycle gap so the new-customer intake workflow
+ * (org → site → quote) is possible without touching the web UI:
+ *  - `list_organizations` — read-only name-substring lookup of the caller's
+ *    accessible orgs, each with its sites. This is how the model resolves the
+ *    orgId/siteId that `manage_quotes.create_draft` and
+ *    `manage_contracts.create_draft` require.
+ *  - `manage_organizations` — write multiplexer: create_org / update_org /
+ *    create_site / add_contact (all approval-gated Tier 3 via TIER3_ACTIONS
+ *    in aiGuardrails; add_contact resolves to the `supervised` scope, not
+ *    `four_eyes` — see TIER3_SUPERVISED_ACTIONS). add_contact delegates to
+ *    `createContact` in services/contacts/crud.ts (#3258) — the same service
+ *    the org-contacts routes use — so validation, role checks, and the
+ *    legacy-jsonb re-projection live there, not here.
+ *
+ * Tenancy is enforced AT THE TOOL LAYER (the route site/org-scope scanner
+ * cannot see this parallel path):
+ *  - Cross-org listing narrows to `auth.accessibleOrgIds` for partner scope
+ *    and pins org scope to `auth.orgId` with the same safe projection the
+ *    GET /orgs/organizations route uses (no settings/ssoConfig/billing leak).
+ *  - `create_org` is a PARTNER-scope operation: an organization-scoped caller
+ *    gets a clean PARTNER_SCOPE_REQUIRED error. The insert mirrors the
+ *    POST /orgs/organizations route + quickbooksCustomerImport service:
+ *    tenant creation must escape the request RLS context
+ *    (runOutsideDbContext → withSystemDbAccessContext) because the new org id
+ *    cannot be in the caller's accessible set yet. Like the QB customer import
+ *    and partnerCreate, a default "Main Office" site is created in the same
+ *    transaction so the new org is immediately quotable (quotes need siteId).
+ *  - `update_org` mirrors the PATCH /orgs/organizations/:id invariants,
+ *    including severing/restoring agent tenant access on status transitions.
+ *  - `create_site` allows org-scoped callers for their OWN org only (same as
+ *    POST /orgs/sites) via the resolveWritableToolOrgId rules.
+ */
+
+import { and, eq, ilike, inArray, isNull, ne, sql, type SQL } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { devices, organizations, partners, sites } from '../db/schema';
+// Concrete module, not the barrel — see the note in routes/orgs.ts.
+import { ORG_SLUG_UNIQUE_INDEX } from '../db/schema/orgs';
+import { PG_UUID_REGEX } from '../utils/uuid';
+import { escapeLike } from '../utils/sql';
+import { isPgUniqueViolation } from '../utils/pgErrors';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool, AiToolTier } from './aiTools';
+import { writeAuditEvent, requestLikeFromSnapshot } from './auditEvents';
+import {
+  restoreOrganizationTenantAccess,
+  revokeOrganizationTenantAccess,
+} from './tenantLifecycle';
+import { abortOrganizationOffboardingAroundStatusChange } from './tenantOffboarding';
+import { createContact, ContactValidationError, listContacts, countContacts, type ContactListFilters } from './contacts/crud';
+import { contactCreateAuditEvent } from './contacts/audit';
+import { CONTACT_ROLES } from './contacts/types';
+import { ensureOrgAccess } from '../routes/systemTools/helpers';
+import { deviceScopeCondition, siteScopeCondition } from './aiToolsSiteScope';
+
+// Mirrors the org PATCH route's status set (schema orgStatusEnum). Kept as a
+// literal array (not orgStatusEnum.enumValues) so schema mocks in tests don't
+// break the zod/tool definitions.
+// Deliberately excludes `offboarding` (#2774): entering the drain state queues
+// an irreversible fleet-wide self_uninstall, which stays a human, MFA-gated
+// action (PATCH /organizations/:id) — never an AI-tool transition.
+const ORG_STATUSES = ['active', 'suspended', 'trial', 'churned'] as const;
+type OrgStatus = (typeof ORG_STATUSES)[number];
+
+// Local copy of the slug helpers from services/accounting/quickbooksCustomerImport.ts
+// (duplicated rather than imported so this file doesn't drag the accounting
+// provider stack into every consumer; keep the two in sync).
+export function slugifyOrgName(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 90)
+    .replace(/-+$/, '');
+  return slug || 'org';
+}
+
+export function generateUniqueOrgSlug(base: string, taken: Set<string>): string {
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base}-${n}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
+// Local copy of the shared hub helper (same rules as resolveWritableToolOrgId
+// in services/aiTools.ts, duplicated like aiToolsBrowser/aiToolsCompliance do
+// so tests don't need to load the whole tool hub).
+function resolveWritableOrgId(
+  auth: AuthContext,
+  inputOrgId?: string
+): { orgId?: string; error?: string } {
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) return { error: 'Organization context required' };
+    if (inputOrgId && inputOrgId !== auth.orgId) {
+      return { error: 'Cannot access another organization' };
+    }
+    return { orgId: auth.orgId };
+  }
+
+  if (inputOrgId) {
+    if (!auth.canAccessOrg(inputOrgId)) {
+      return { error: 'Access denied to this organization' };
+    }
+    return { orgId: inputOrgId };
+  }
+
+  if (auth.orgId) {
+    return { orgId: auth.orgId };
+  }
+
+  if (Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length === 1) {
+    return { orgId: auth.accessibleOrgIds[0] };
+  }
+
+  return { error: 'orgId is required for this operation' };
+}
+
+function jsonError(message: string, code?: string): string {
+  return JSON.stringify(code ? { error: message, code } : { error: message });
+}
+
+/** Best-effort audit write — never blocks the tool result (deleteTenant pattern). */
+function auditOrgToolEvent(
+  auth: AuthContext,
+  entry: {
+    orgId: string | null;
+    action: string;
+    resourceType: string;
+    resourceId?: string;
+    resourceName?: string;
+    details?: Record<string, unknown>;
+  }
+): void {
+  try {
+    writeAuditEvent(requestLikeFromSnapshot({}), {
+      orgId: entry.orgId,
+      actorId: auth.user.id,
+      actorEmail: auth.user.email,
+      action: entry.action,
+      resourceType: entry.resourceType,
+      resourceId: entry.resourceId,
+      resourceName: entry.resourceName,
+      result: 'success',
+      details: { ...entry.details, tool_name: 'manage_organizations' },
+    });
+  } catch (err) {
+    console.error('[manage_organizations] audit write failed', err);
+  }
+}
+
+const SAFE_ORG_PROJECTION = {
+  id: organizations.id,
+  name: organizations.name,
+  slug: organizations.slug,
+  status: organizations.status,
+};
+
+async function handleListOrganizations(
+  input: Record<string, unknown>,
+  auth: AuthContext
+): Promise<string> {
+  const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
+  const search = typeof input.search === 'string' ? input.search.trim() : '';
+  const searchCondition = search
+    ? ilike(organizations.name, `%${escapeLike(search)}%`)
+    : undefined;
+
+  // The hidden per-partner 'quick_support' org stays inside accessibleOrgIds so
+  // RLS lets techs read their own support sessions — it is therefore NOT filtered
+  // by the scope conditions below and must be excluded explicitly. (The slug read
+  // in handleCreateOrg deliberately does NOT exclude it — its slug must stay in
+  // the taken-set.)
+  const conditions: SQL[] = [isNull(organizations.deletedAt), ne(organizations.type, 'quick_support')];
+  if (searchCondition) conditions.push(searchCondition);
+
+  if (auth.scope === 'organization') {
+    // Org-scoped callers see ONLY their own org.
+    if (!auth.orgId) return JSON.stringify({ organizations: [], showing: 0 });
+    conditions.push(eq(organizations.id, auth.orgId));
+  } else if (auth.scope === 'partner') {
+    const orgIds = auth.accessibleOrgIds ?? [];
+    if (orgIds.length === 0) return JSON.stringify({ organizations: [], showing: 0 });
+    conditions.push(inArray(organizations.id, orgIds));
+  }
+  // system scope: no extra org filter (mirrors GET /orgs/organizations).
+
+  // Safe projection for every scope — an unprojected select would leak
+  // settings/ssoConfig/billingContact into the model context.
+  const orgs = await db
+    .select(SAFE_ORG_PROJECTION)
+    .from(organizations)
+    .where(and(...conditions))
+    .orderBy(organizations.name)
+    .limit(limit);
+
+  // Attach each org's sites (id + name — enough to feed manage_quotes'
+  // siteId). Site-restricted callers only see their allowed sites, mirroring
+  // the GET /orgs/sites confinement.
+  const sitesByOrg = new Map<string, Array<{ id: string; name: string }>>();
+  const orgIdsOnPage = orgs.map((o) => o.id);
+  // Site-restricted caller with an empty allowlist sees no sites at all —
+  // skip the query entirely rather than emit an empty IN ().
+  const siteListDenied = auth.allowedSiteIds !== undefined && auth.allowedSiteIds.length === 0;
+  if (orgIdsOnPage.length > 0 && !siteListDenied) {
+    const siteConditions: SQL[] = [inArray(sites.orgId, orgIdsOnPage)];
+    if (auth.allowedSiteIds && auth.allowedSiteIds.length > 0) {
+      siteConditions.push(inArray(sites.id, auth.allowedSiteIds));
+    }
+    const siteRows = await db
+      .select({ id: sites.id, name: sites.name, orgId: sites.orgId })
+      .from(sites)
+      .where(and(...siteConditions))
+      .orderBy(sites.name);
+    for (const row of siteRows) {
+      const list = sitesByOrg.get(row.orgId) ?? [];
+      list.push({ id: row.id, name: row.name });
+      sitesByOrg.set(row.orgId, list);
+    }
+  }
+
+  const data = orgs.map((org) => ({
+    ...org,
+    sites: sitesByOrg.get(org.id) ?? [],
+  }));
+
+  return JSON.stringify({ organizations: data, showing: data.length });
+}
+
+async function handleCreateOrg(
+  input: Record<string, unknown>,
+  auth: AuthContext
+): Promise<string> {
+  // Org creation is a PARTNER-scope operation: an org-scoped token must get a
+  // clean authorization error (never a cross-tenant write).
+  if (auth.scope !== 'partner' || !auth.partnerId) {
+    return jsonError(
+      'Creating organizations requires a partner-scoped session. Organization-scoped callers cannot create organizations.',
+      'PARTNER_SCOPE_REQUIRED'
+    );
+  }
+  const partnerId = auth.partnerId;
+
+  const name = typeof input.name === 'string' ? input.name.trim() : '';
+  if (!name) return jsonError('name is required for create_org');
+
+  // Tenant creation must escape the request RLS context: the new org id cannot
+  // be in the caller's accessible set yet (same rationale + pattern as
+  // POST /orgs/organizations and quickbooksCustomerImport). Partner authority
+  // was checked above. The slug read, org insert, and default-site insert share
+  // one system-context transaction.
+  const createOrgWithDefaultSite = () => runOutsideDbContext(() =>
+    withSystemDbAccessContext(async () => {
+      const [partnerRow] = await db
+        .select({ currencyCode: partners.currencyCode })
+        .from(partners)
+        .where(eq(partners.id, partnerId))
+        .limit(1);
+      if (!partnerRow) throw new Error('Partner not found');
+
+      const existing = await db
+        .select({ slug: organizations.slug })
+        .from(organizations)
+        .where(eq(organizations.partnerId, partnerId));
+      // Lower-cased because organizations_partner_slug_uniq is on
+      // (partner_id, lower(slug)) (#3967): slugifyOrgName always produces a
+      // lowercase candidate, so a legacy mixed-case row like 'Acme' would not
+      // match a case-sensitive Set and the generated 'acme' would take a 23505
+      // at insert instead of being suffixed.
+      const taken = new Set(existing.map((row) => row.slug.toLowerCase()));
+      const slug = generateUniqueOrgSlug(slugifyOrgName(name), taken);
+
+      const [org] = await db
+        .insert(organizations)
+        .values({
+          partnerId,
+          currencyCode: partnerRow.currencyCode,
+          name: name.slice(0, 255),
+          slug,
+          type: 'customer' as const,
+          status: 'active' as const,
+        })
+        .returning({
+          id: organizations.id,
+          name: organizations.name,
+          slug: organizations.slug,
+          status: organizations.status,
+        });
+      if (!org) throw new Error('Organization insert returned no row');
+      await ensureDefaultProfile(partnerId, partnerRow.currencyCode, db);
+
+      // Default site, same invariant as partnerCreate + the QB customer
+      // import — a brand-new org must be immediately usable for quoting
+      // (quotes require a siteId).
+      const [site] = await db
+        .insert(sites)
+        .values({ orgId: org.id, name: 'Main Office', timezone: 'UTC' })
+        .returning({ id: sites.id, name: sites.name });
+      if (!site) throw new Error('Default site insert returned no row');
+
+      return { org, site };
+    })
+  );
+
+  // #3967 — `taken` is read a few statements before the insert, so a concurrent
+  // create (another create_org, a POST /orgs/organizations, an import commit)
+  // can claim the slug in between and organizations_partner_slug_uniq will
+  // reject this one. Report that as a retryable conflict; letting the raw 23505
+  // escape would surface to the operator as an opaque tool failure.
+  let created: Awaited<ReturnType<typeof createOrgWithDefaultSite>>;
+  try {
+    created = await createOrgWithDefaultSite();
+  } catch (error) {
+    if (isPgUniqueViolation(error, ORG_SLUG_UNIQUE_INDEX)) {
+      return jsonError(
+        'That organization slug was claimed by another request while this one was running. Retry create_org.',
+        'ORG_SLUG_CONFLICT'
+      );
+    }
+    throw error;
+  }
+
+  auditOrgToolEvent(auth, {
+    orgId: created.org.id,
+    action: 'organization.create',
+    resourceType: 'organization',
+    resourceId: created.org.id,
+    resourceName: created.org.name,
+    details: { partnerId, defaultSiteId: created.site.id },
+  });
+  auditOrgToolEvent(auth, {
+    orgId: created.org.id,
+    action: 'site.create',
+    resourceType: 'site',
+    resourceId: created.site.id,
+    resourceName: created.site.name,
+  });
+
+  return JSON.stringify({
+    organization: created.org,
+    defaultSite: created.site,
+    note: 'A default "Main Office" site was created with the organization; use create_site to add more locations.',
+  });
+}
+
+async function handleUpdateOrg(
+  input: Record<string, unknown>,
+  auth: AuthContext
+): Promise<string> {
+  // Mirrors PATCH /orgs/organizations/:id — partner/system scope only.
+  if (auth.scope === 'organization') {
+    return jsonError(
+      'Updating organizations requires a partner-scoped session.',
+      'PARTNER_SCOPE_REQUIRED'
+    );
+  }
+  const orgId = typeof input.orgId === 'string' ? input.orgId : '';
+  if (!orgId) return jsonError('orgId is required for update_org');
+  if (auth.scope === 'partner' && !auth.canAccessOrg(orgId)) {
+    return jsonError('Organization not found or access denied');
+  }
+
+  const name = typeof input.name === 'string' ? input.name.trim() : undefined;
+  const status = typeof input.status === 'string' ? input.status : undefined;
+  if (name === '') return jsonError('name cannot be empty');
+  if (status !== undefined && !ORG_STATUSES.includes(status as OrgStatus)) {
+    return jsonError(`status must be one of: ${ORG_STATUSES.join(', ')}`);
+  }
+  if (name === undefined && status === undefined) {
+    return jsonError('No updates provided — pass name and/or status');
+  }
+
+  const updates: Record<string, unknown> = { updatedAt: new Date() };
+  if (name !== undefined) updates.name = name.slice(0, 255);
+  if (status !== undefined) updates.status = status;
+
+  const runUpdate = async () => {
+    const [row] = await db
+      .update(organizations)
+      .set(updates)
+      .where(and(eq(organizations.id, orgId), isNull(organizations.deletedAt)))
+      .returning({
+        id: organizations.id,
+        name: organizations.name,
+        slug: organizations.slug,
+        status: organizations.status,
+      });
+    return row;
+  };
+
+  // Status-transition invariants from the org PATCH route: suspending/churning
+  // severs agent tenant access; re-activating restores it. Any transition off
+  // `offboarding` (#2774) first cancels in-flight drain uninstalls (no-op
+  // otherwise) so an uncollected self_uninstall can't survive a reactivation —
+  // and #3996: that cancel must be locked and committed WITH the status write,
+  // because a tenant that has stopped reading as `offboarding` puts its whole
+  // fleet back on the ordinary command-claim path.
+  const org = status !== undefined
+    ? (await abortOrganizationOffboardingAroundStatusChange(orgId, runUpdate)).statusChange
+    : await runUpdate();
+  if (!org) return jsonError('Organization not found or access denied');
+
+  if (status !== undefined && status !== 'active' && status !== 'trial') {
+    await revokeOrganizationTenantAccess(org.id);
+  } else if (status === 'active' || status === 'trial') {
+    await restoreOrganizationTenantAccess(org.id);
+  }
+
+  auditOrgToolEvent(auth, {
+    orgId: org.id,
+    action: 'organization.update',
+    resourceType: 'organization',
+    resourceId: org.id,
+    resourceName: org.name,
+    details: {
+      changedFields: [
+        ...(name !== undefined ? ['name'] : []),
+        ...(status !== undefined ? ['status'] : []),
+      ],
+    },
+  });
+
+  return JSON.stringify({ organization: org });
+}
+
+async function handleCreateSite(
+  input: Record<string, unknown>,
+  auth: AuthContext
+): Promise<string> {
+  const resolved = resolveWritableOrgId(
+    auth,
+    typeof input.orgId === 'string' ? input.orgId : undefined
+  );
+  if (resolved.error || !resolved.orgId) {
+    return jsonError(resolved.error ?? 'orgId is required for create_site');
+  }
+
+  const name = typeof input.name === 'string' ? input.name.trim() : '';
+  if (!name) return jsonError('name is required for create_site');
+
+  const address =
+    input.address && typeof input.address === 'object' && !Array.isArray(input.address)
+      ? (input.address as Record<string, unknown>)
+      : undefined;
+
+  // Insert under the request context — RLS on `sites` (org axis) is the
+  // defense-in-depth backstop behind the resolveWritableOrgId check above.
+  const [site] = await db
+    .insert(sites)
+    .values({
+      orgId: resolved.orgId,
+      name: name.slice(0, 255),
+      address,
+    })
+    .returning({ id: sites.id, name: sites.name, orgId: sites.orgId });
+  // A 0-row insert means the RLS policy rejected it even though the app-layer
+  // check passed — surface it instead of returning success with no site.
+  if (!site) return jsonError('Failed to create site');
+
+  auditOrgToolEvent(auth, {
+    orgId: site.orgId,
+    action: 'site.create',
+    resourceType: 'site',
+    resourceId: site.id,
+    resourceName: site.name,
+  });
+
+  return JSON.stringify({ site });
+}
+
+async function handleAddContact(
+  input: Record<string, unknown>,
+  auth: AuthContext
+): Promise<string> {
+  // Same tenancy rule as create_site: org-scoped callers may only write their
+  // OWN org; partner-scoped callers may target any org in their accessible set.
+  const resolved = resolveWritableOrgId(
+    auth,
+    typeof input.orgId === 'string' ? input.orgId : undefined
+  );
+  if (resolved.error || !resolved.orgId) {
+    return jsonError(resolved.error ?? 'orgId is required for add_contact');
+  }
+
+  // Site axis. `allowedSiteIds` is app-layer only and RLS on `contacts` is the
+  // ORG axis, so nothing below this line would stop a sub-org-restricted caller
+  // filing a contact under a sibling site. Refused BEFORE createContact, on the
+  // same structured `{error, code}` path a ContactValidationError takes, and
+  // matching the list handler's allowedSiteIds confinement above. An absent
+  // siteId is an org-level contact and stays allowed: the allowlist confines a
+  // caller within an org, it does not narrow their org reach.
+  //
+  // Written on `allowedSiteIds`, NOT `canAccessSite?.(…) === false`: the
+  // optional-call form fails OPEN whenever the closure is absent, and a human
+  // AuthContext is only guaranteed to carry the restriction itself. A caller
+  // that is restricted but has no closure to evaluate it with is denied.
+  const siteId = typeof input.siteId === 'string' ? input.siteId : undefined;
+  if (siteId !== undefined && auth.allowedSiteIds
+    && (!auth.canAccessSite || !auth.canAccessSite(siteId))) {
+    return jsonError(
+      'Access denied to that site. You can only add contacts to sites you have access to.',
+      'site-access-denied'
+    );
+  }
+
+  const roles = Array.isArray(input.roles)
+    ? input.roles.filter((role): role is string => typeof role === 'string')
+    : undefined;
+
+  // Delegates to the shared contact CRUD service (#3258) — the same function
+  // routes/orgContacts.ts calls — under the request's own DB access context,
+  // so validation, role checks, and the legacy-jsonb re-projection all live
+  // there, not here. No direct Drizzle write into `contacts` from this file.
+  // Deliberately no local "name is required" check: `name` is nullable
+  // (contacts.name) and createContact's own `contacts_identifiable_chk`
+  // mirror already requires at least one of name/email/phone/mobile —
+  // duplicating that here would just be a second place to keep in sync.
+  let contact;
+  try {
+    contact = await createContact(
+      db,
+      {
+        orgId: resolved.orgId,
+        siteId,
+        name: typeof input.name === 'string' ? input.name : undefined,
+        email: typeof input.email === 'string' ? input.email : undefined,
+        phone: typeof input.phone === 'string' ? input.phone : undefined,
+        mobile: typeof input.mobile === 'string' ? input.mobile : undefined,
+        title: typeof input.title === 'string' ? input.title : undefined,
+        roles,
+        isPrimary: input.isPrimary === true,
+      },
+      { userId: auth.user.id, destinationSource: 'ai_tool' }
+    );
+  } catch (err) {
+    // A ContactValidationError is the caller's fault (bad role, site not in
+    // org, or no identifying field at all — mirrors contacts_identifiable_chk)
+    // — surface it as a structured tool error the model can act on, the same
+    // shape the /organizations/:id/contacts route uses. Anything else
+    // propagates to the dispatcher's generic catch below.
+    if (err instanceof ContactValidationError) return jsonError(err.message, err.code);
+    throw err;
+  }
+
+  // Built from the same contactCreateAuditEvent the /organizations/:id/contacts
+  // route uses, so the AI-path and route-path CREATE audit payloads cannot
+  // drift out of sync with each other (review finding).
+  auditOrgToolEvent(auth, { orgId: contact.orgId, ...contactCreateAuditEvent(contact) });
+
+  return JSON.stringify({ contact });
+}
+
+const SAFE_SITE_PROJECTION = {
+  id: sites.id,
+  orgId: sites.orgId,
+  name: sites.name,
+  timezone: sites.timezone,
+  createdAt: sites.createdAt,
+};
+
+export function registerOrgTools(aiTools: Map<string, AiTool>): void {
+  aiTools.set('list_sites', {
+    tier: 1 as AiToolTier,
+    domain: 'accounts',
+    searchHint: 'sites, locations, offices of a customer organization with device counts',
+    deviceArgs: [],
+    definition: {
+      name: 'list_sites',
+      description: 'List accessible sites with organization, name, timezone and device count. Filter by organization or site name.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          orgId: { type: 'string', description: 'Organization UUID' },
+          search: { type: 'string', description: 'Site name substring' },
+          limit: { type: 'number', description: 'Maximum rows (default 25, max 100)' },
+          offset: { type: 'number', description: 'Rows to skip (default 0)' },
+        },
+        required: [],
+      },
+    },
+    handler: async (input, auth) => {
+      try {
+        const limit = Math.min(100, Math.max(1, Math.trunc(Number(input.limit) || 25)));
+        const offset = Math.max(0, Math.trunc(Number(input.offset) || 0));
+        const empty = () => JSON.stringify({ sites: [], total: 0, limit, offset });
+        const conditions: (SQL | undefined)[] = [];
+        if (input.orgId !== undefined) {
+          if (typeof input.orgId !== 'string' || !PG_UUID_REGEX.test(input.orgId)) return jsonError('orgId must be a UUID');
+          if (!await ensureOrgAccess(input.orgId, auth)) return jsonError('Access to this organization denied');
+          conditions.push(eq(sites.orgId, input.orgId));
+        } else if (auth.scope === 'organization') {
+          if (!auth.orgId) return empty();
+          conditions.push(eq(sites.orgId, auth.orgId));
+        } else if (auth.scope === 'partner') {
+          const orgIds = auth.accessibleOrgIds ?? [];
+          if (orgIds.length === 0) return empty();
+          conditions.push(inArray(sites.orgId, orgIds));
+        }
+        if (auth.allowedSiteIds?.length === 0) return empty();
+        // Same correlated exclusion as GET /orgs/sites; no open JSONB containers.
+        conditions.push(sql`NOT EXISTS (
+    SELECT 1 FROM ${organizations} qs_org
+    WHERE qs_org.id = ${sites.orgId} AND qs_org.type = 'quick_support'
+  )`, siteScopeCondition(auth, sites.id));
+        const search = typeof input.search === 'string' ? input.search.trim() : '';
+        if (search) conditions.push(ilike(sites.name, `%${escapeLike(search)}%`));
+        const whereCondition = and(...conditions);
+        const [count] = await db.select({ count: sql<number>`count(*)` }).from(sites).where(whereCondition);
+        const rows = await db.select(SAFE_SITE_PROJECTION).from(sites).where(whereCondition)
+          .limit(limit).offset(offset).orderBy(sites.createdAt, sites.id);
+        const deviceCounts = new Map<string, number>();
+        if (rows.length > 0) {
+          const counts = await db.select({ siteId: devices.siteId, count: sql<number>`count(*)` })
+            .from(devices).where(and(
+              inArray(devices.siteId, rows.map((row) => row.id)),
+              eq(devices.isEphemeral, false), ne(devices.status, 'decommissioned'),
+              deviceScopeCondition(auth, devices.id),
+            )).groupBy(devices.siteId);
+          for (const entry of counts) deviceCounts.set(entry.siteId, Number(entry.count));
+        }
+        return JSON.stringify({
+          sites: rows.map((row) => ({ ...row, deviceCount: deviceCounts.get(row.id) ?? 0 })),
+          total: Number(count?.count ?? 0), limit, offset,
+        });
+      } catch (err) {
+        console.error('[list_sites]', err);
+        return jsonError('Operation failed. Check server logs for details.');
+      }
+    },
+  });
+
+  aiTools.set('get_site', {
+    tier: 1 as AiToolTier,
+    domain: 'accounts',
+    searchHint: 'one site by id: name, organization, timezone',
+    deviceArgs: [],
+    definition: {
+      name: 'get_site',
+      description: 'Get an accessible site by UUID, including name, organization, timezone and creation date.',
+      input_schema: {
+        type: 'object',
+        properties: { siteId: { type: 'string', description: 'Site UUID' } },
+        required: ['siteId'],
+      },
+    },
+    handler: async (input, auth) => {
+      try {
+        if (typeof input.siteId !== 'string' || !PG_UUID_REGEX.test(input.siteId)
+          || auth.allowedSiteIds?.length === 0) return jsonError('Site not found');
+        const [site] = await db.select(SAFE_SITE_PROJECTION).from(sites).where(eq(sites.id, input.siteId)).limit(1);
+        if (!site || !await ensureOrgAccess(site.orgId, auth)
+          || (auth.allowedSiteIds && !auth.allowedSiteIds.includes(site.id))) return jsonError('Site not found');
+        return JSON.stringify({ site });
+      } catch (err) {
+        console.error('[get_site]', err);
+        return jsonError('Operation failed. Check server logs for details.');
+      }
+    },
+  });
+
+  aiTools.set('list_org_contacts', {
+    tier: 1 as AiToolTier,
+    domain: 'accounts',
+    searchHint: 'customer contacts, people at an organization, primary contact, email/phone for a site',
+    deviceArgs: [],
+    definition: {
+      name: 'list_org_contacts',
+      description: 'List organization contacts with names, email, phone, roles and primary status. Filter by site or role. Internal notes are omitted.',
+      input_schema: {
+        type: 'object',
+        properties: {
+          orgId: { type: 'string', description: 'Organization UUID' },
+          siteId: { type: 'string', description: 'Site UUID, or none for organization-level contacts' },
+          role: { type: 'string', description: 'Contact role to match (1–64 characters)' },
+          limit: { type: 'number', description: 'Max rows (default 25, max 100)' },
+          offset: { type: 'number', description: 'Rows to skip (default 0)' },
+        },
+        required: ['orgId'],
+      },
+    },
+    handler: async (input, auth) => {
+      const orgId = input.orgId;
+      if (typeof orgId !== 'string' || !PG_UUID_REGEX.test(orgId)) {
+        return jsonError('orgId must be an organization UUID');
+      }
+      if (auth.scope !== 'system' && !auth.canAccessOrg(orgId)) {
+        return jsonError('Access to this organization denied');
+      }
+      const siteId = input.siteId;
+      if (siteId !== undefined && (typeof siteId !== 'string' || (siteId !== 'none' && !PG_UUID_REGEX.test(siteId)))) {
+        return jsonError('siteId must be a site UUID or none');
+      }
+      if (siteId !== undefined && siteId !== 'none' && (
+        (auth.allowedSiteIds && !auth.allowedSiteIds.includes(siteId)) ||
+        (auth.canAccessSite && !auth.canAccessSite(siteId))
+      )) return jsonError('Access to this site denied');
+      const role = input.role;
+      if (role !== undefined && (typeof role !== 'string' || role.length < 1 || role.length > 64)) {
+        return jsonError('role must be 1–64 characters');
+      }
+      const limit = Math.min(Math.max(1, Math.floor(Number(input.limit) || 25)), 100);
+      const offset = Math.max(0, Math.floor(Number(input.offset) || 0));
+      // Stricter than REST: even org-level contacts are hidden for empty site scope.
+      if (auth.allowedSiteIds?.length === 0) {
+        return JSON.stringify({ contacts: [], total: 0, limit, offset });
+      }
+      try {
+        // Match resolveAccessibleOrg: deleted/missing organizations are not readable.
+        const [org] = await db.select({ id: organizations.id }).from(organizations)
+          .where(and(eq(organizations.id, orgId), isNull(organizations.deletedAt))).limit(1);
+        if (!org) return jsonError('Organization not found');
+        const filters: ContactListFilters = {
+          ...(siteId === undefined ? {} : { siteId: siteId === 'none' ? null : siteId }),
+          ...(role === undefined ? {} : { role }),
+          ...(auth.allowedSiteIds ? { allowedSiteIds: auth.allowedSiteIds } : {}),
+        };
+        const [contacts, total] = await Promise.all([
+          listContacts(db, orgId, filters, { limit, offset }),
+          countContacts(db, orgId, filters),
+        ]);
+        // Named projection prevents notes or future private fields entering model context.
+        const safeContacts = contacts.map((contact) => ({
+          id: contact.id, orgId: contact.orgId, siteId: contact.siteId,
+          name: contact.name, email: contact.email, phone: contact.phone,
+          mobile: contact.mobile, title: contact.title, roles: contact.roles,
+          isPrimary: contact.isPrimary, createdAt: contact.createdAt, updatedAt: contact.updatedAt,
+        }));
+        return JSON.stringify({ contacts: safeContacts, total, limit, offset });
+      } catch (err) {
+        console.error('[list_org_contacts]', err);
+        return jsonError('Operation failed. Check server logs for details.');
+      }
+    },
+  });
+
+  aiTools.set('list_organizations', {
+    tier: 1 as AiToolTier,
+    domain: 'core',
+    searchHint: 'organizations, customers, sites, organization IDs and site IDs by name',
+    alwaysLoad: true,
+    deviceArgs: [],
+    definition: {
+      name: 'list_organizations',
+      description:
+        "List/search accessible organizations with id, name, slug, status and site IDs/names. Resolve orgId/siteId for quotes, contracts and invoices. Partner callers see their organizations; organization callers see only their own. Read-only.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          search: { type: 'string', description: 'Case-insensitive name substring filter' },
+          limit: { type: 'number', description: 'Max results (default 25, max 100)' },
+        },
+        required: [],
+      },
+    },
+    handler: async (input, auth) => {
+      try {
+        return await handleListOrganizations(input, auth);
+      } catch (err) {
+        console.error('[list_organizations]', err);
+        return jsonError('Operation failed. Check server logs for details.');
+      }
+    },
+  });
+
+  aiTools.set('manage_organizations', {
+    tier: 2 as AiToolTier,
+    domain: 'accounts',
+    searchHint: 'customer intake: create or update organizations, create sites, add contacts',
+    deviceArgs: [],
+    definition: {
+      name: 'manage_organizations',
+      description:
+        "Manage orgs, sites, contacts. Actions: create_org, update_org, create_site, add_contact. Approval required; status changes need a second approver. Name edits/add_contact allow self-approval. create_org is partner-only; suspend/churn severs agents.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['create_org', 'update_org', 'create_site', 'add_contact'],
+          },
+          orgId: { type: 'string', description: 'Organization UUID (update_org, create_site, add_contact)' },
+          name: { type: 'string', description: 'Org name (create_org/update_org), site name (create_site), or contact name (add_contact — optional; add_contact needs at least one of name/email/phone/mobile)' },
+          status: { type: 'string', enum: [...ORG_STATUSES], description: 'New org status (update_org)' },
+          address: { type: 'object', description: 'Site address object (create_site), e.g. {addressLine1, city, state, postalCode, country}' },
+          email: { type: 'string', description: 'Contact email (add_contact)' },
+          siteId: { type: 'string', description: 'Site UUID to scope the contact to a specific site rather than org-level (add_contact)' },
+          phone: { type: 'string', description: 'Contact phone number (add_contact)' },
+          mobile: { type: 'string', description: 'Contact mobile number (add_contact)' },
+          title: { type: 'string', description: 'Contact job title (add_contact)' },
+          roles: {
+            type: 'array',
+            items: { type: 'string', enum: [...CONTACT_ROLES] },
+            description: 'Contact roles (add_contact)',
+          },
+          isPrimary: {
+            type: 'boolean',
+            description: 'Mark as the primary contact for its org/site scope, demoting any existing primary (add_contact)',
+          },
+        },
+        required: ['action'],
+      },
+    },
+    handler: async (input, auth) => {
+      try {
+        switch (input.action) {
+          case 'create_org':
+            return await handleCreateOrg(input, auth);
+          case 'update_org':
+            return await handleUpdateOrg(input, auth);
+          case 'create_site':
+            return await handleCreateSite(input, auth);
+          case 'add_contact':
+            return await handleAddContact(input, auth);
+          default:
+            return jsonError(`Unknown action: ${String(input.action)}`);
+        }
+      } catch (err) {
+        console.error('[manage_organizations]', input.action, err);
+        return jsonError('Operation failed. Check server logs for details.');
+      }
+    },
+  });
+}

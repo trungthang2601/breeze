@@ -1,0 +1,249 @@
+---
+title: Privileged Access Management Security Model
+description: Trust boundaries, elevation primitives, the dormant-admin pattern, and the audit guarantees behind Breeze just-in-time elevation, for security teams.
+sidebar:
+  label: PAM Security Model
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This document describes the security model behind Breeze **Privileged Access Management (PAM)** -- the just-in-time elevation system that replaces standing local-administrator rights with short-lived, recorded grants. It is written for security teams assessing Breeze for compliance or risk review. For the day-to-day administrative workflow, see [Privileged Access Management](/features/pam/); for the REST surface, see [PAM API](/reference/pam-api/).
+
+PAM is a high-trust feature: it lets a Breeze operator grant local-administrator access on a managed endpoint. The model below explains exactly what is trusted, what is not, where credentials live, and what the system does -- and does not -- defend against.
+
+---
+
+## What PAM is for
+
+Endpoint PAM does one job: keep standard users standard, while making admin approvals fast enough that nobody works around the policy. Without it, the only choices are "make everyone a local admin" or "have the helpdesk remote in every time someone needs to install a printer driver." PAM removes standing privilege and replaces it with elevation that exists only for the moment it is needed and cleans itself up afterward.
+
+PAM governs three elevation flows, all recorded on one ledger:
+
+| Flow | What it elevates |
+|---|---|
+| **UAC intercept** (`uac_intercept`) | A Windows UAC consent prompt observed on a managed endpoint. |
+| **Tech JIT admin** (`tech_jit_admin`) | A technician-requested temporary local-admin grant on a device. |
+| **AI tool action** (`ai_tool_action`) | A privileged action proposed by the Breeze AI agent or Helper that requires a human to sign off before it runs. |
+
+---
+
+## Trust boundaries
+
+PAM spans three trust domains, each with a distinct identity and a distinct set of privileges. No domain can unilaterally grant elevation.
+
+| Domain | Identity | Holds | Cannot |
+|---|---|---|---|
+| **Endpoint agent** (Windows service) | Local `SYSTEM` | The dormant-admin account lifecycle and credential minting | Decide its own approvals; reach across tenants |
+| **Breeze control plane** (API) | Unprivileged DB role under row-level security | The request ledger, rule chain, and decisions | See or transmit any endpoint credential |
+| **Approver** (technician / mobile / Helper) | Authenticated user with MFA | The approve/deny/revoke decision | Relax automation's own verdict (AI/unmatched actions default to pending) |
+
+The single most important property of this split: **the credential that satisfies a UAC prompt is minted on the endpoint, used on the endpoint, and destroyed on the endpoint.** It is never written to the agent's configuration file and never transmitted to the server. The control plane records *that* an elevation was approved; it never holds the secret that exercises it.
+
+<Aside type="caution">
+  Because Breeze has privileged access to every device it manages, PAM is held to the same standard as the rest of the platform: tenant isolation by forced PostgreSQL row-level security, an unprivileged application database role, MFA on every state-changing decision, and append-only audit. See the [Security Architecture](/security/overview/) overview for the platform-wide controls these inherit from.
+</Aside>
+
+---
+
+## Elevation primitives
+
+### The dormant-admin pattern
+
+On a managed Windows device, the agent maintains a single dormant local account named **`~breeze_elev`**. The leading tilde and a `SpecialAccounts\UserList` registry entry hide it from the logon screen and from Settings. At rest, the account is:
+
+- **Disabled** -- it cannot be logged into.
+- **Removed from the local Administrators group** -- it holds no privilege.
+- **Holding a 40-character random password** generated with a cryptographically secure RNG (`crypto/rand`), with guaranteed upper/lower/digit/symbol complexity and a 32-character floor.
+
+The account moves through exactly three states, each driven by the SYSTEM-context agent:
+
+1. **Provisioned (at rest).** The account exists, disabled, with no admin membership and a freshly randomized password. If the agent ever finds the account *in* the Administrators group when no elevation is active -- for example after a crash mid-window -- it strips the membership and re-randomizes the password to recover. This self-heal works "blind": it never needs the previous password.
+
+2. **Promoted (window open).** On an approved elevation the agent generates a *new* random password locally, enables the account, and adds it to the local Administrators group -- for exactly the approved duration. If any step of the promotion fails, the agent immediately demotes (best-effort, 10-second deadline) so a half-promoted account is never left behind.
+
+3. **Demoted (window closed).** When the timer expires, the elevation is revoked, or the work finishes, the agent removes the account from Administrators, re-randomizes its password, and disables it again.
+
+The net effect is admin access that is genuinely just-in-time: it exists only inside an approved window, holds a different password each time, and returns to a powerless state automatically.
+
+### Secure-desktop credential injection (Flavor A)
+
+On Windows, a UAC prompt (`consent.exe`) runs at high integrity on the secure desktop (`WINSTA0\WINLOGON`). Only Windows processes can natively reach that desktop, and `SendInput` from any process not already attached to it is silently dropped.
+
+Breeze satisfies the prompt the same way a person would -- by typing real credentials into the consent UI -- rather than by injecting a SYSTEM-side approval through a kernel hook. This is **Flavor A**:
+
+1. The agent runs as a Windows service under `SYSTEM`, which holds the privileges needed to open the input desktop.
+2. On an approved actuation, the agent mints the `~breeze_elev` credential locally and hands it, in process memory, to the actuator.
+3. The actuator pins its OS thread, opens the active input desktop, attaches the thread to it, waits for `consent.exe`, and types the username, Tab, password, and Enter via Unicode `SendInput`. The credential string lives only in process memory for the duration of the keystrokes and is cleared after use.
+4. The actuator waits for `consent.exe` to close, then reports a stable result code (`ok`, `no_consent_window`, `consent_did_not_close`, and so on) back to the control plane.
+
+This choice keeps the native Windows audit trail intact -- the standard logon event and `consent.exe` process record are preserved -- and avoids shipping a kernel driver, which would carry a far heavier signing and attack-surface burden.
+
+<Aside type="note">
+  The password is never present in the device command, the API request, the audit log, or any agent configuration file. The actuator's detail messages and log lines are explicitly constructed to exclude it.
+</Aside>
+
+### Single-use actuation
+
+A server-side actuation cannot be replayed. The actuator route's proof of approval is the elevation row's status being `approved`. To make that proof one-shot, the same database transaction that queues the agent command performs an atomic compare-and-swap of the row from `approved` to `actuating`, scoped by the device's organization. If the compare-and-swap returns zero rows -- because the row was not approved, or a concurrent request already claimed it -- the actuation is refused with `409`. Every outcome (success, lost race, wrong status) is written to the elevation audit ledger with its cause.
+
+The PAM actuator is additionally **disabled by default in every environment** and is only enabled via an explicit server-side flag once just-in-time credentials and agent-side target re-validation are deployed.
+
+### Enablement
+
+PAM actuation on a given device requires three independent gates to all be open at once:
+
+1. **`PAM_ACTUATOR_ENABLED=true`** on the API server. Off by default; without it the actuator route refuses every request regardless of approval state.
+2. **`pam_enabled`** on the agent. The agent's own config must opt it into the PAM actuation path.
+3. **The org's UAC-interception policy.** `uac_interception_enabled` on the org's PAM config (or the resolved `pam` config-policy feature link, which takes precedence) must allow the agent to capture UAC events for that org in the first place -- with no opinion set anywhere, the global default is off.
+
+All three are independently controlled, so a device with the agent flag set but no config-policy link (and no org fallback) still won't intercept anything, and a server with the actuator disabled won't act even on a fully-configured device.
+
+---
+
+## Separation of duties
+
+The separation-of-duties property the system enforces today is **automation cannot self-grant**:
+
+- An AI agent or Helper session **cannot sign off on the action it proposed** -- AI tool actions and unmatched UAC prompts always default to **pending**, waiting on a human (see [Decisioning chain and fail-safe behavior](#decisioning-chain-and-fail-safe-behavior)). Automation can never quietly relax its own approval, and an evaluator outage degrades to pending rather than to an auto-grant.
+
+<Aside type="caution">
+  **Human requester-vs-approver separation has been enforced since v0.82.0 (#1662).** For the `tech_jit_admin` flow, the requesting technician's user id is recorded on the request as `subjectUserId`, and the respond route rejects an APPROVE where the approver matches that `subjectUserId` with `403` (`Requester cannot approve their own elevation request`). Only APPROVE is blocked this way -- a self-DENY still grants nothing, so it remains allowed.
+
+  `subjectUserId` is `null` only for the `uac_intercept` and `ai_tool_action` flows, where there is no single human requester to compare against: `uac_intercept` originates from an end-user OS prompt, and `ai_tool_action` originates from the AI agent or Helper. For those two flows the self-approval guard has nothing to compare and never fires -- rely on the automation-cannot-self-grant behavior below, approval reasons, and anomaly alerting for those paths instead.
+</Aside>
+
+Every approve, deny, and revoke is gated by:
+
+- **Permission** -- the caller must hold the device execute permission.
+- **Scope** -- organization, partner, or system scope, narrowed to the caller's allowed sites for site-restricted technicians.
+- **MFA** -- the decision endpoints require a multi-factor-satisfied session. A caller without MFA receives `403`.
+
+Decisions are made through a transactional compare-and-swap on the request's `pending` (or active) status, so when two approvers -- or an approver and the expiry reaper -- act on the same request at once, exactly one wins; a request can never be both approved and denied.
+
+---
+
+## Decisioning chain and fail-safe behavior
+
+When the agent reports a UAC observation, the control plane decides it before any human sees it:
+
+1. **Software-policy bridge.** The device's winning software policy is consulted first: an allowlist match auto-approves, a blocklist match denies.
+2. **PAM rules.** When no software policy binds, the org's enabled PAM rules run in priority order; the first match wins with its verdict (`auto_approve`, `auto_deny`, `require_approval`, or `ignore`).
+3. **Org default verdict.** With no policy and no matching rule, the request falls to the org's configured **default verdict for unmatched elevations**. The default -- and the behavior when no configuration row exists -- is **require approval** (held pending for a human); an org may instead opt into **auto-deny**, failing unmatched elevations closed. An auto-deny here is a deliberate, configured decision, not an evaluator error.
+
+This chain **fails safe**. If either evaluator *errors*, the request falls through to `pending` -- never to an auto-approval (regardless of the configured default verdict). Degrading a would-be blocklist denial to a pending row is preferable to dropping the observation, and an evaluator outage can never become a silent grant.
+
+A rule must carry at least one identifying criterion; a rule scoped only by time window (or nothing) is rejected at the API, because it would match every elevation in the org -- catastrophic for an auto-approve verdict.
+
+---
+
+## Signer trust: CN matching vs. thumbprint pinning
+
+Executable rules and signer groups can trust a binary by its Authenticode signer in two tiers of strength:
+
+- **CN matching (weak, legacy).** A rule's `matchSigner` field -- or a bare-string entry in a signer group -- compares the candidate's certificate **Common Name** (e.g. "Microsoft Corporation") case-insensitively. The CN is a self-asserted display string on the certificate, not a cryptographic identity: an attacker who obtains or crafts a code-signing certificate whose CN matches or mimics a trusted vendor's name can get a malicious binary auto-approved by a rule or group keyed on CN alone. This class of attack was tracked as **issue #1776**.
+- **Thumbprint pinning (strong).** A rule's `matchSignerThumbprint` field -- or a thumbprint-bearing entry in a signer group -- pins the certificate's **SHA-256 leaf-cert thumbprint**, a 64-character lowercase hex digest unique to the exact signing certificate. A look-alike certificate with a spoofed CN has a different key pair and therefore a different thumbprint; it cannot satisfy a thumbprint-pinned rule no matter how convincingly its display name is forged. `matchSigner` and `matchSignerThumbprint` AND together when both are set on a rule (maximum strength: exact certificate AND expected name); a signer-group entry may likewise pin a CN, a thumbprint, or both.
+
+The matching engine described above is real and covered by tests, but it has nothing to match against yet on Windows:
+
+<Aside type="caution" title="Not yet active in the agent">
+  The Windows agent does not extract an Authenticode signer at all today -- `decodeConsentRequest` in `agent/internal/etwlua/etwlua_windows.go` defers all WinTrust/CryptoAPI signer extraction, so every UAC event it reports carries a `null` signer CN and `null` thumbprint. A thumbprint-pinned rule fails closed against that `null` (see below), and a CN-only rule simply never matches either -- so **no signer-based rule, weak or strong tier, is enforceable in practice today.** Tracked as **issue #2082** (completes #1776). Once the agent emits a thumbprint, prefer thumbprint pins over CN-only rules for anything carrying an auto-approve verdict.
+</Aside>
+
+**Fail-closed guarantee.** A criterion is only ever satisfied when the candidate's data is present; absent data never satisfies a criterion, even when the rule negates it (see [Decisioning chain and fail-safe behavior](#decisioning-chain-and-fail-safe-behavior)). This applies to the thumbprint criterion without exception: if a binary's signer thumbprint cannot be determined -- because it is unsigned, or because the reporting agent predates thumbprint collection -- a rule or signer-group entry pinned to a thumbprint **never matches**. There is no silent fallback to CN-only matching in that case: a thumbprint-pinned rule that can't see a thumbprint fails closed rather than degrading to the weaker check.
+
+**Constant-time comparison.** The thumbprint match is not a plain string comparison. The engine normalizes both the pinned and candidate thumbprints to lowercase, validates them as 64-character hex, and compares them with Node's `crypto.timingSafeEqual` -- a fixed-time byte comparison that does not short-circuit on the first mismatching byte. This closes the theoretical timing side-channel where an attacker able to submit binaries and measure decision latency might otherwise recover a valid thumbprint one byte at a time.
+
+---
+
+## Offline rule enforcement and staleness
+
+<Aside type="caution" title="Not yet active in the agent">
+  The HMAC-authenticated rule cache described below (`agent/internal/pam`) exists in the agent codebase but is not imported or invoked by anything today. Offline UAC observations are held in a separate on-disk queue (`agent/internal/etwlua/queue.go`) and posted to the API once connectivity returns; the agent does not currently enforce a locally cached ruleset while offline. Treat this section as a description of a built component awaiting wiring, not live behavior.
+</Aside>
+
+Once wired in, the agent would cache the PAM ruleset locally so it can keep enforcing while disconnected from the API. The cache is designed as an **HMAC-SHA256-authenticated JSON envelope**:
+
+- The HMAC is the authoritative trust boundary. Tampering with the file on disk is detected on load, and a mismatch causes the agent to reject the rule body entirely.
+- The HMAC key lives in a separately permissioned `keys/` subdirectory, not alongside the cache file, so a single ACL regression on the data directory cannot expose both the envelope and the key needed to forge a new one. On Windows the cache is additionally locked to a SYSTEM-and-Administrators-only DACL; on Unix it is mode `0600` under a `0750` parent.
+
+Staleness is designed to be bounded by two thresholds keyed on the last successful sync:
+
+| Threshold | Behavior |
+|---|---|
+| **24 hours** (stale) | The agent keeps enforcing the cached rules but raises a staleness alert. |
+| **7 days** (refuse) | The agent refuses to hand back the cached ruleset at all. The policy layer must re-sync or fail closed rather than enforce ancient rules. |
+
+<Aside type="caution">
+  The staleness gate uses wall-clock time. A local-administrator attacker who can roll the system clock back can keep a stale envelope "fresh" indefinitely. The gate is designed to catch the *operational* failure mode -- "agent forgotten or connectivity broken for more than a week, rules need to fail closed" -- not to defend against an active local-admin adversary on the box. A monotonic last-seen-fresh watermark is tracked as a follow-up.
+</Aside>
+
+---
+
+## Audit guarantees
+
+Every elevation produces an immutable chain of events on a dedicated ledger, separate from -- and in addition to -- the platform audit log:
+
+- A `requested` event is written for every observation.
+- Auto-decisions add an `approved` / `denied` event attributed to the deciding software policy or PAM rule.
+- Human decisions add `approved`, `denied`, or `revoked` events attributed to the approver **by user**, with the supplied reason.
+- Actuation, session start/stop, and command execution land as their own event types.
+
+The ledger denormalizes the organization id and ties each audit row to its parent request with a **composite foreign key** `(elevation_request_id, org_id) -> elevation_requests(id, org_id)`. This is a structural guarantee that an audit row's tenant can never drift from its parent request's tenant, even under a logic bug. Because it inherits the platform's forced row-level security, an audit entry is only ever visible within its own tenant.
+
+The **Audit** tab of the Privileged Access console renders this ledger -- filterable by status, flow, and date range, and exportable to CSV for compliance reporting. Each entry names the decider, so there is never ambiguity about who (or what rule) granted access.
+
+---
+
+## Windows Event Log
+
+Console audit is authoritative, but an auditor reviewing the *endpoint* directly -- the usual Cyber Essentials / SOC workflow -- previously saw only that the dormant `~breeze_elev` account logged on (native events 4624/4672/4688), with no link back to the Breeze user who authorized it. Every actuation the agent performs on Windows also writes a structured event to the Application log under a dedicated source, so a SIEM can answer "who approved this elevation" without cross-referencing the console.
+
+- **Source:** `Breeze-PAM` (distinct from the generic `BreezeAgent` source used for enrollment/bootstrap diagnostics, so PAM activity can be filtered on its own).
+- **Event IDs:**
+
+  | ID | Stage | Fires when |
+  |----|-------|------------|
+  | 1004 | Elevation actuated | The agent begins actuating an approved elevation request -- credential minted, before consent.exe injection or the token-launch. |
+  | 1005 | Session ended | The actuation attempt completes, successfully or not. |
+  | 1006 | Account demoted | `~breeze_elev` is removed from Administrators at the end of an actuation. Not written if the demote itself fails -- the log never claims a demote that didn't happen. |
+  | 1007 | Self-heal demote at startup | Reserved for agent startup finding the dormant account still elevated from a prior crash. Not yet wired to a call site. |
+  | 1008 | Actuation refused | The agent fail-closed refuses to actuate an otherwise-approved request (for example, an unresolved prior consent-prompt dismissal, #2610). |
+
+- **Message body:** a fixed field template -- request ID, target path, target SHA-256, subject user, requested-by name, approved-by name and email, approved-at timestamp, window-end timestamp, risk tier, and matched PAM rule name -- so a SIEM rule can parse the same shape regardless of which event ID fired. Unset fields render as `-`.
+- **Never included:** user ids, session tokens, or the elevation credential. Every identity field is a display name or email resolved server-side inside the same tenant-scoped request that queued the actuation (`POST /devices/:id/actuate-elevation`) -- the agent never holds or forwards a Breeze user id.
+- **Windows only.** macOS/Linux elevation does not yet have a separate-account model to log against; unified-log/syslog parity is tracked alongside that work.
+- **Not yet configurable.** The write is unconditional today -- there is no per-org toggle to silence it for orgs without a SIEM. A `writeEndpointEventLog` config-policy toggle is planned as a follow-up.
+
+The same fields are also appended to the agent's own local `audit.jsonl` (a tamper-evident, SHA-256 hash-chained log file the agent keeps on disk, separate from the platform [audit log](/reference/audit-logs/)) under the existing `privileged_operation` event type, so the trail survives even where the Windows Event Log write is unavailable.
+
+---
+
+## What PAM does and does not protect against
+
+**PAM protects against:**
+
+- **Standing local-administrator sprawl.** Endpoints carry no permanently privileged user account; admin exists only inside approved windows.
+- **Credential exposure.** The elevation credential is minted, used, and destroyed on the endpoint and never transits the network or lands in a config file.
+- **Automation self-grant.** AI tool actions and unmatched UAC prompts default to **pending** and wait on a human, so automation can never approve the action it proposed.
+- **Human self-approval (`tech_jit_admin`).** The requesting technician's user id is recorded as `subjectUserId`, and the respond route rejects an approval where the approver matches it (since v0.82.0, #1662). See [Separation of duties](#separation-of-duties).
+- **Replay of an approval.** Single-use actuation makes an approved request non-replayable.
+- **Tenant cross-contamination.** Forced row-level security plus a composite-FK audit tie keep every request, rule, and audit entry inside its own organization.
+- **Silent failure of the decision engine.** Evaluator errors fail safe to pending, never to auto-approve.
+
+**PAM does not protect against:**
+
+- **A compromised approver.** If an authenticated, MFA-satisfied operator approves a malicious request, PAM grants it. Mitigations are operational: approval reasons, requester history surfaced in the UI, per-tenant approval-rate limits, and anomaly alerting on approval-rate spikes. Treat approver accounts as the high-value identities they are.
+- **Self-approval on the `uac_intercept` and `ai_tool_action` flows.** These flows don't record a single human requester (`subjectUserId` is `null`), so the self-approval guard has nothing to compare and never fires there. Automation self-grant is still blocked independently (see above). See [Separation of duties](#separation-of-duties).
+- **Signer-spoofed binaries.** The signer-matching engine (CN and thumbprint) is real, but the Windows agent doesn't extract a signer yet, so no signer-based rule is enforceable today. See [Signer trust: CN matching vs. thumbprint pinning](#signer-trust-cn-matching-vs-thumbprint-pinning) (#2082).
+- **An offline device enforcing stale or tampered rules.** The HMAC-authenticated rule cache with staleness thresholds is built but not yet wired into the agent's offline path. See [Offline rule enforcement and staleness](#offline-rule-enforcement-and-staleness).
+- **An existing local-administrator adversary on the endpoint.** The dormant-admin self-heal assumes an attacker without prior SYSTEM/admin control (the offline staleness gate, once wired in, would make the same assumption -- see the caveat above). A box that is already fully compromised is outside PAM's threat model -- PAM is a privilege-*reduction* control, not endpoint EDR.
+- **Third-party agent-stack interactions.** UAC-touching code interacts with whatever else is installed. There is a documented production-breaking deadlock between the N-able N-Central agent and `consent.exe` on idle or locked machines that hangs UAC prompts for 4-5 minutes. Validate PAM against the agent stack your customers actually run before enabling it broadly. See the [admin guide's operational notes](/features/pam/#operational-notes).
+- **Non-Windows endpoints.** The dormant-admin lifecycle, secure-desktop injection, and UAC interception are Windows-only. On other platforms the elevation primitives are no-ops.
+
+---
+
+## Platform-evolution and liability notes
+
+- **Windows Administrator Protection / 24H2.** PAM's detection relies on the documented `Microsoft-Windows-LUA` ETW telemetry provider, which Microsoft extends (rather than replaces) for the Administrator Protection path. The injection path uses the supported SYSTEM-context route to the secure desktop.
+- **CVE-2026-20824 (Credential UI hardening, Jan 2026).** Microsoft tightened which processes can request `uiAccess` and added input-source validation. The hardening targeted remote-input tools (TeamViewer, AnyDesk, RDP); SYSTEM-context injection on the secure desktop was not named as impacted. Breeze tracks the trajectory and validates the path empirically each Windows release.
+- **E&O / SLA implications.** Because PAM lets the MSP grant administrator access, an erroneous or coerced approval can attribute blame to the MSP. This may warrant disclosure on the MSP's errors-and-omissions coverage and explicit carve-outs in MSP-customer SLAs. Flag PAM enablement in customer onboarding.

@@ -1,0 +1,374 @@
+/**
+ * Producer→consumer contract test for the ticket-events seam.
+ *
+ * Strategy:
+ * 1. Run the real ticketService functions (with mocked DB / deps).
+ * 2. Capture the TicketEvent objects passed to the mocked emitTicketEvent.
+ * 3. Feed each captured event through the real handleTicketEvent (with mocked
+ *    DB / email), asserting the expected side-effects.
+ *
+ * This pins payload field names across the seam: a rename on either side
+ * causes a type or runtime failure here.
+ *
+ * The shared `db` mock uses a call-queue so service calls and worker calls
+ * can be sequenced without per-test mock re-wiring.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// ── hoisted mocks ────────────────────────────────────────────────────────────
+
+const hoisted = vi.hoisted(() => {
+  // A queue of values to return from db.select().from().where().limit() calls.
+  const selectQueue: unknown[][] = [];
+  const insertReturningQueue: unknown[][] = [];
+  const updateReturningQueue: unknown[][] = [];
+  const insertValuesMock = vi.fn();
+  const sendEmailMock = vi.fn().mockResolvedValue(undefined);
+  const getEmailServiceMock = vi.fn();
+  const withSystemDbAccessContextMock = vi.fn((fn: () => unknown) => fn());
+  const emitCaptured: unknown[] = [];
+  // W07 (#3901): the assignee branch no longer inserts into user_notifications
+  // directly — it goes through createNotification (the dedupe anchor) and then
+  // through the ticketPush helpers. Those are collaborators of the CONSUMER,
+  // not part of the producer→consumer payload seam this file exists to pin, so
+  // they are mocked; the seam assertion moves from insertValuesMock to
+  // createNotificationMock, which still sees the event's field names.
+  const createNotificationMock = vi.fn(async () => 'n-1' as string | null);
+  const loadUserCandidateMock = vi.fn(async (id: string) => ({
+    userId: id, partnerId: 'p-1', status: 'active', email: 'tech@msp.example',
+  }));
+  const loadTicketPushPrefsMock = vi.fn(async () => ({ assignedEnabled: true, slaScope: 'owned' as const }));
+  const listAnySlaSubscribersMock = vi.fn(async () => ({ users: [] as unknown[], truncated: false }));
+  const isAuthorisedForTicketMock = vi.fn(async () => true);
+  const admitPushMock = vi.fn(async () => []);
+  const resolvePushJobsMock = vi.fn(async () => []);
+  const dispatchPushToTokensMock = vi.fn(async () => ({ tokensFound: 0, dispatched: 0, errors: 0 }));
+  return {
+    selectQueue,
+    insertReturningQueue,
+    updateReturningQueue,
+    insertValuesMock,
+    sendEmailMock,
+    getEmailServiceMock,
+    withSystemDbAccessContextMock,
+    emitCaptured,
+    createNotificationMock,
+    loadUserCandidateMock,
+    loadTicketPushPrefsMock,
+    listAnySlaSubscribersMock,
+    isAuthorisedForTicketMock,
+    admitPushMock,
+    resolvePushJobsMock,
+    dispatchPushToTokensMock
+  };
+});
+
+// ── module mocks ─────────────────────────────────────────────────────────────
+
+vi.mock('./ticketEvents', () => ({
+  emitTicketEvent: vi.fn(async (event: unknown) => { hoisted.emitCaptured.push(event); })
+}));
+vi.mock('./auditService', () => ({ createAuditLogAsync: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('./ticketNumbers', () => ({ allocateInternalTicketNumber: vi.fn().mockResolvedValue('T-2026-C001') }));
+vi.mock('./ticketConfigService', () => ({
+  getOrgSlaOverride: vi.fn().mockResolvedValue({ responseMinutes: null, resolutionMinutes: null }),
+  getPartnerPrioritySla: vi.fn().mockResolvedValue({ responseMinutes: null, resolutionMinutes: null }),
+  getSystemStatusId: vi.fn().mockResolvedValue(null),
+  getTicketStatusById: vi.fn().mockResolvedValue(null),
+}));
+
+vi.mock('../db', () => {
+  const dbMock: Record<string, unknown> = {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          limit: vi.fn(() => {
+            const next = hoisted.selectQueue.shift();
+            return Promise.resolve(next ?? []);
+          })
+        }))
+      }))
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn((v: unknown) => {
+        hoisted.insertValuesMock(v);
+        return {
+          returning: vi.fn(() => {
+            const next = hoisted.insertReturningQueue.shift();
+            return Promise.resolve(next ?? []);
+          }),
+          onConflictDoNothing: vi.fn(() => ({
+            returning: vi.fn(() => {
+              const next = hoisted.insertReturningQueue.shift();
+              return Promise.resolve(next ?? []);
+            })
+          }))
+        };
+      })
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => {
+            const next = hoisted.updateReturningQueue.shift();
+            return Promise.resolve(next ?? []);
+          })
+        }))
+      }))
+    })),
+    delete: vi.fn(() => ({
+      where: vi.fn(() => ({
+        returning: vi.fn(() => {
+          const next = hoisted.insertReturningQueue.shift();
+          return Promise.resolve(next ?? []);
+        })
+      }))
+    })),
+    // W08 #3902: addTicketComment now writes the comment, the firstResponseAt
+    // stamp and the attachment claim inside ONE transaction, so the producer
+    // half of this contract runs on `tx`, not on `db`. Handing the callback the
+    // same mock keeps every queue above shared between the two handles — this
+    // suite asserts the emitted EVENT, not which handle issued the write.
+    execute: vi.fn(() => Promise.resolve([])),
+  };
+  dbMock.transaction = vi.fn((fn: (tx: unknown) => unknown) => Promise.resolve(fn(dbMock)));
+  return {
+    withSystemDbAccessContext: hoisted.withSystemDbAccessContextMock,
+    runOutsideDbContext: (fn: () => unknown) => fn(),
+    db: dbMock,
+  };
+});
+
+vi.mock('../db/schema', () => ({
+  tickets: { id: 'id', orgId: 'orgId', status: 'status', assignedTo: 'assignedTo', firstResponseAt: 'firstResponseAt' },
+  ticketComments: {},
+  ticketAlertLinks: {},
+  ticketOutbox: {},
+  organizations: { id: 'id', partnerId: 'partnerId' },
+  alerts: { id: 'id', orgId: 'orgId' },
+  users: { id: 'id', email: 'email', partnerId: 'partnerId' },
+  ticketCategories: { id: 'id', partnerId: 'partnerId' },
+  devices: { id: 'id', orgId: 'orgId' },
+  userNotifications: {},
+  ticketStatusEnum: { enumValues: ['new', 'open', 'pending', 'on_hold', 'resolved', 'closed'] },
+  ticketSourceEnum: { enumValues: ['portal', 'email', 'alert', 'manual', 'api', 'ai'] }
+}));
+
+vi.mock('./userNotifications', () => ({ createNotification: hoisted.createNotificationMock }));
+vi.mock('./ticketPush', () => ({
+  loadUserCandidate: hoisted.loadUserCandidateMock,
+  loadTicketPushPrefs: hoisted.loadTicketPushPrefsMock,
+  listAnySlaSubscribers: hoisted.listAnySlaSubscribersMock,
+  isAuthorisedForTicket: hoisted.isAuthorisedForTicketMock,
+  isEligibleTicketRecipient: vi.fn(async () => true),
+  admitPush: hoisted.admitPushMock,
+  resolvePushJobs: hoisted.resolvePushJobsMock,
+  assertSamePartner: (c: { partnerId: string }, eventPartnerId: string | null) =>
+    !!eventPartnerId && c.partnerId === eventPartnerId,
+  ANY_SUBSCRIBER_CAP: 500,
+}));
+vi.mock('./expoPush', () => ({
+  dispatchPushToTokens: hoisted.dispatchPushToTokensMock,
+  buildTicketPush: vi.fn(() => ({ title: 't', body: 'b', data: {} })),
+}));
+
+vi.mock('bullmq', () => ({ Queue: vi.fn(() => ({ add: vi.fn() })), Worker: vi.fn() }));
+vi.mock('../services/redis', () => ({ getBullMQConnection: vi.fn(() => ({})) }));
+vi.mock('../services/email', () => ({ getEmailService: hoisted.getEmailServiceMock }));
+vi.mock('../services/sentry', () => ({ captureException: vi.fn() }));
+vi.mock('./inboundEmail/commentNotificationPortalHref', () => ({
+  resolveCommentNotificationPortalHref: vi.fn(async () => ({
+    href: 'https://example.test/portal/tickets/t-1',
+    hasPortalUser: false,
+  })),
+}));
+vi.mock('./ticketMailbox/resolveOutboundMailbox', () => ({
+  resolveOutboundMailbox: vi.fn(async () => null),
+}));
+
+// ── real implementations ─────────────────────────────────────────────────────
+
+import { createTicket, addTicketComment, changeTicketStatus, updateTicketFields } from './ticketService';
+import { handleTicketEvent } from '../jobs/ticketNotifyWorker';
+import type { TicketEvent } from './ticketEvents';
+
+const actor = { userId: 'u-actor', name: 'Actor User' };
+
+describe('ticket-events producer→consumer contract', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Clear queues
+    hoisted.selectQueue.length = 0;
+    hoisted.insertReturningQueue.length = 0;
+    hoisted.updateReturningQueue.length = 0;
+    hoisted.emitCaptured.length = 0;
+    hoisted.withSystemDbAccessContextMock.mockImplementation((fn: () => unknown) => fn());
+    hoisted.getEmailServiceMock.mockReturnValue({ sendEmail: hoisted.sendEmailMock });
+    hoisted.sendEmailMock.mockResolvedValue(undefined);
+    hoisted.createNotificationMock.mockResolvedValue('n-1');
+    hoisted.loadUserCandidateMock.mockImplementation(async (id: string) => ({
+      userId: id, partnerId: 'p-1', status: 'active', email: 'tech@msp.example',
+    }));
+    hoisted.loadTicketPushPrefsMock.mockResolvedValue({ assignedEnabled: true, slaScope: 'owned' });
+    hoisted.listAnySlaSubscribersMock.mockResolvedValue({ users: [], truncated: false });
+    hoisted.isAuthorisedForTicketMock.mockResolvedValue(true);
+    hoisted.admitPushMock.mockResolvedValue([]);
+    hoisted.resolvePushJobsMock.mockResolvedValue([]);
+  });
+
+  // ── createTicket with assignee → ticket.created ──────────────────────────
+
+  it('createTicket with assignee: emitted event feeds handleTicketEvent → in-app insert + email', async () => {
+    // Service selects, in call order: org lookup, then the #5075 W04 Service
+    // Management mode read on partners, then the assignee lookup (users table).
+    // The mode row must be seeded explicitly — this queue is positional, and an
+    // unseeded read would hand the assignee lookup the wrong row.
+    hoisted.selectQueue.push([{ id: 'o-1', partnerId: 'p-1' }]);
+    hoisted.selectQueue.push([{ serviceManagementMode: 'native' }]);
+    hoisted.selectQueue.push([{ id: 'u-assignee', partnerId: 'p-1' }]);
+    // Service insert: ticket insert returning
+    hoisted.insertReturningQueue.push([{ id: 't-c1', orgId: 'o-1', internalNumber: 'T-2026-C001', status: 'open' }]);
+
+    await createTicket({ orgId: 'o-1', subject: 'Contract test', source: 'manual', assigneeId: 'u-assignee' }, actor);
+
+    // Exactly one event was emitted
+    expect(hoisted.emitCaptured).toHaveLength(1);
+    const event = hoisted.emitCaptured[0] as TicketEvent;
+    expect(event.type).toBe('ticket.created');
+
+    // Worker selects: ticket lookup, then the org-name lookup for the push body.
+    // The assignee row now comes from the mocked loadUserCandidate, not the queue.
+    hoisted.selectQueue.push(
+      [{ id: 't-c1', orgId: 'o-1', internalNumber: 'T-2026-C001', subject: 'Contract test', submitterEmail: null }],
+      [{ name: 'Acme' }]
+    );
+
+    hoisted.createNotificationMock.mockClear();
+
+    await handleTicketEvent(event);
+
+    // The seam assertion: the emitted event's assigneeId/orgId reach the
+    // consumer's notification write, and the dedupe key is anchored on the
+    // event's own eventId (W07 D2).
+    expect(hoisted.createNotificationMock).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'u-assignee',
+      orgId: 'o-1',
+      type: 'ticket',
+      dedupeKey: expect.stringContaining('ticket:t-c1:assigned:u-assignee:')
+    }));
+    expect(hoisted.sendEmailMock).toHaveBeenCalledWith(expect.objectContaining({
+      to: 'tech@msp.example',
+      subject: expect.stringContaining('T-2026-C001')
+    }));
+  });
+
+  // ── addTicketComment (public) → ticket.commented ─────────────────────────
+
+  it('addTicketComment (public): emitted event feeds handleTicketEvent → requester email', async () => {
+    // Service: ticket lookup for addTicketComment
+    hoisted.selectQueue.push([{
+      id: 't-c2', orgId: 'o-1', partnerId: 'p-1', status: 'open', firstResponseAt: null
+    }]);
+    // Service: comment insert returning
+    hoisted.insertReturningQueue.push([{ id: 'comment-1', isPublic: true }]);
+    // Service: update firstResponseAt returning
+    hoisted.updateReturningQueue.push([{ id: 't-c2' }]);
+
+    await addTicketComment('t-c2', { content: 'We are looking into this.', isPublic: true }, actor);
+
+    expect(hoisted.emitCaptured).toHaveLength(1);
+    const event = hoisted.emitCaptured[0] as TicketEvent;
+    expect(event.type).toBe('ticket.commented');
+
+    // Worker: ticket lookup — this ticket has submitterEmail
+    hoisted.selectQueue.push([{
+      id: 't-c2', orgId: 'o-1', internalNumber: 'T-2026-C001', subject: 'Contract test',
+      submitterEmail: 'user@acme.example'
+    }]);
+
+    await handleTicketEvent(event);
+
+    expect(hoisted.sendEmailMock).toHaveBeenCalledWith(expect.objectContaining({
+      to: 'user@acme.example',
+      subject: expect.stringContaining('New reply')
+    }));
+  });
+
+  // ── changeTicketStatus (resolve) → ticket.status_changed ─────────────────
+
+  it('changeTicketStatus to resolved: emitted event feeds handleTicketEvent → requester email with resolution note', async () => {
+    // Service: ticket lookup for changeTicketStatus
+    hoisted.selectQueue.push([{
+      id: 't-c3', orgId: 'o-1', partnerId: 'p-1', status: 'open', resolvedAt: null
+    }]);
+    // Service: update returning
+    hoisted.updateReturningQueue.push([{ id: 't-c3', status: 'resolved' }]);
+    // Service: comment insert returning
+    hoisted.insertReturningQueue.push([{ id: 'feed-1' }]);
+
+    await changeTicketStatus('t-c3', { status: 'resolved' }, { resolutionNote: 'Fixed the printer.' }, actor);
+
+    expect(hoisted.emitCaptured).toHaveLength(1);
+    const event = hoisted.emitCaptured[0] as TicketEvent;
+    expect(event.type).toBe('ticket.status_changed');
+
+    // Verify payload field names via narrowed access — this is the seam assertion.
+    // #3828 wave-6-3 task 2: resolutionNote is deliberately ABSENT from the
+    // payload now (free-text ticket content never rides the event) — the
+    // worker instead reads it off the ticket row fetched by handleTicketEvent.
+    if (event.type === 'ticket.status_changed') {
+      expect(event.payload.to).toBe('resolved');
+      expect(event.payload.from).toBe('open');
+      expect(event.payload).not.toHaveProperty('resolutionNote');
+    }
+
+    // Worker: ticket lookup — resolutionNote now comes from THIS row, not the
+    // event payload.
+    hoisted.selectQueue.push([{
+      id: 't-c3', orgId: 'o-1', internalNumber: 'T-2026-C001', subject: 'Contract test',
+      submitterEmail: 'user@acme.example', resolutionNote: 'Fixed the printer.', status: 'resolved'
+    }]);
+
+    await handleTicketEvent(event);
+
+    expect(hoisted.sendEmailMock).toHaveBeenCalledWith(expect.objectContaining({
+      to: 'user@acme.example',
+      subject: expect.stringContaining('Resolved')
+    }));
+    const emailCall = hoisted.sendEmailMock.mock.calls[0]![0] as { html: string };
+    expect(emailCall.html).toContain('Fixed the printer.');
+  });
+
+  // ── updateTicketFields → ticket.updated ───────────────────────────────────
+
+  it('updateTicketFields: emitted ticket.updated event feeds handleTicketEvent → explicit no-op (no insert, no email)', async () => {
+    // Service selects: ticket lookup
+    hoisted.selectQueue.push([{
+      id: 't-c4', orgId: 'o-1', partnerId: 'p-1', status: 'open',
+      subject: 'Old subject', priority: 'normal', description: null,
+      categoryId: null, dueDate: null, deviceId: null, tags: []
+    }]);
+    // Service update: returning
+    hoisted.updateReturningQueue.push([{ id: 't-c4', subject: 'New subject', priority: 'high' }]);
+    // Service insert: system feed entry returning
+    hoisted.insertReturningQueue.push([{ id: 'feed-2' }]);
+
+    await updateTicketFields('t-c4', { subject: 'New subject', priority: 'high' }, actor);
+
+    expect(hoisted.emitCaptured).toHaveLength(1);
+    const event = hoisted.emitCaptured[0] as TicketEvent;
+    expect(event.type).toBe('ticket.updated');
+
+    // Verify payload field names via narrowed access — this is the seam assertion
+    if (event.type === 'ticket.updated') {
+      expect(event.payload.changed).toEqual(['subject', 'priority']);
+    }
+
+    hoisted.insertValuesMock.mockClear();
+
+    // Worker: ticket.updated is a deliberate no-op — must not throw, insert, or email
+    await expect(handleTicketEvent(event)).resolves.toBeUndefined();
+    expect(hoisted.insertValuesMock).not.toHaveBeenCalled();
+    expect(hoisted.sendEmailMock).not.toHaveBeenCalled();
+  });
+});

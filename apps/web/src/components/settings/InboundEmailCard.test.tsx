@@ -1,0 +1,259 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { navigateTo } from '@/lib/navigation';
+
+const fetchWithAuth = vi.fn();
+vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
+vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
+vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
+vi.mock('../../lib/authScope', () => ({ loginPathWithNext: () => '/login' }));
+// pass-through runAction so the request fn (and thus fetchWithAuth) runs
+vi.mock('../../lib/runAction', () => ({
+  runAction: async (o: { request: () => Promise<Response> }) => {
+    const r = await o.request();
+    return r.json().catch(() => null);
+  },
+  handleActionError: vi.fn(),
+}));
+// CustomerDomainsCard does its own fetches; stub it out — not under test here.
+vi.mock('./CustomerDomainsCard', () => ({ CustomerDomainsCard: () => null }));
+
+import InboundEmailCard from './InboundEmailCard';
+
+function jsonRes(body: unknown, ok = true, status = 200) {
+  return { ok, status, json: async () => body, blob: async () => new Blob() } as unknown as Response;
+}
+
+interface CfgShape {
+  enabled: boolean;
+  address: string;
+  inboundLocalPart: string | null;
+  addressOverride: string | null;
+  defaultTriageOrgId: string | null;
+  autoresponderEnabled: boolean;
+  unknownSenderMode: 'quarantine' | 'triage' | 'drop';
+  dropUnverifiedSenders: boolean;
+  autoresponseSubject: string | null;
+  autoresponseBody: string | null;
+  slug: string;
+  domainConfigured: boolean;
+  connectedMailboxCount?: number;
+  isHosted?: boolean;
+}
+
+const CFG: CfgShape = {
+  enabled: false,
+  address: 'acme@tickets.example.com',
+  inboundLocalPart: null,
+  addressOverride: null,
+  defaultTriageOrgId: null,
+  autoresponderEnabled: true,
+  unknownSenderMode: 'quarantine',
+  dropUnverifiedSenders: false,
+  autoresponseSubject: null,
+  autoresponseBody: null,
+  slug: 'acme',
+  domainConfigured: true,
+};
+
+function routeFetch(cfg: CfgShape = CFG) {
+  fetchWithAuth.mockImplementation((url: string) => {
+    if (url === '/ticket-config') return Promise.resolve(jsonRes({ data: { inbound: cfg } }));
+    if (url === '/orgs/organizations?page=1&limit=100')
+      return Promise.resolve(jsonRes({ data: [{ id: 'o-1', name: 'Acme Org' }] }));
+    if (url === '/orgs/partners/me') return Promise.resolve(jsonRes({ id: 'p-1' }));
+    return Promise.resolve(jsonRes({ data: [] }));
+  });
+}
+
+function lastInboundPatch() {
+  const call = fetchWithAuth.mock.calls.find((c) => c[0] === '/orgs/partners/me')!;
+  return JSON.parse((call[1] as { body: string }).body).settings.ticketing.inbound;
+}
+
+beforeEach(() => {
+  fetchWithAuth.mockReset();
+  vi.mocked(navigateTo).mockClear();
+});
+
+describe('InboundEmailCard', () => {
+  it('separates the autosaving toggles from the explicit-Save address form into distinct sections', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    const toggles = screen.getByTestId('inbound-toggles-section');
+    const addressForm = screen.getByTestId('inbound-address-section');
+    expect(toggles.closest('section')).not.toBe(addressForm.closest('section'));
+
+    // Load-bearing check: the explicit-Save address controls live INSIDE the
+    // address section, not the autosaving toggles section, and the enable
+    // toggle (an autosaving control) is NOT inside the address section.
+    expect(addressForm.querySelector('[data-testid="inbound-localpart-save"]')).not.toBeNull();
+    expect(toggles.querySelector('[data-testid="inbound-enabled-toggle"]')).not.toBeNull();
+    expect(addressForm.querySelector('[data-testid="inbound-enabled-toggle"]')).toBeNull();
+    expect(toggles.querySelector('[data-testid="inbound-localpart-save"]')).toBeNull();
+  });
+
+  it('renders the inbound address and the unknown-sender mode control', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    expect(await screen.findByTestId('inbound-email-card')).toBeTruthy();
+    expect((screen.getByTestId('inbound-localpart') as HTMLInputElement).value).toBe('acme');
+    expect(screen.getByTestId('inbound-unknown-sender-mode')).toBeTruthy();
+    // The review queue no longer lives in settings (moved to the Tickets area).
+    expect(screen.queryByTestId('inbound-review-queue')).toBeNull();
+  });
+
+  it('quarantine is selected by default; triage is disabled until a triage org is set', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    expect((screen.getByTestId('inbound-unknown-quarantine') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('inbound-unknown-triage') as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it('triage becomes selectable once a default triage org is configured', async () => {
+    routeFetch({ ...CFG, defaultTriageOrgId: 'o-1', unknownSenderMode: 'triage' });
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    expect((screen.getByTestId('inbound-unknown-triage') as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByTestId('inbound-unknown-triage') as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('selecting "Drop silently" PATCHes unknownSenderMode=drop in the complete inbound object', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    fireEvent.click(screen.getByTestId('inbound-unknown-drop'));
+    await waitFor(() =>
+      expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
+    );
+    const inbound = lastInboundPatch();
+    expect(inbound.unknownSenderMode).toBe('drop');
+    expect(inbound).not.toHaveProperty('triageUnknownSenders'); // legacy key retired
+    expect(inbound).toHaveProperty('dropUnverifiedSenders');
+  });
+
+  it('toggling "drop unverified senders" PATCHes dropUnverifiedSenders=true', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    fireEvent.click(screen.getByTestId('inbound-drop-unverified-toggle'));
+    await waitFor(() =>
+      expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
+    );
+    expect(lastInboundPatch().dropUnverifiedSenders).toBe(true);
+  });
+
+  it('toggling enable PATCHes /orgs/partners/me with the COMPLETE ticketing.inbound (no address when override is null)', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    fireEvent.click(screen.getByTestId('inbound-enabled-toggle'));
+    await waitFor(() =>
+      expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
+    );
+    const inbound = lastInboundPatch();
+    expect(inbound.enabled).toBe(true);
+    expect(inbound).toHaveProperty('defaultTriageOrgId');
+    expect(inbound).toHaveProperty('autoresponderEnabled');
+    expect(inbound).toHaveProperty('unknownSenderMode');
+    expect(inbound).toHaveProperty('autoresponseSubject');
+    expect(inbound).toHaveProperty('autoresponseBody');
+    expect(inbound).not.toHaveProperty('address'); // derived address is NOT re-sent as an override
+  });
+
+  it('re-sends a self-hosted address override on save so the merge does not destroy it (blocker #1)', async () => {
+    routeFetch({ ...CFG, address: 'support@tickets.acme.com', addressOverride: 'support@tickets.acme.com' });
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    fireEvent.click(screen.getByTestId('inbound-autoresponder-toggle'));
+    await waitFor(() =>
+      expect(fetchWithAuth).toHaveBeenCalledWith('/orgs/partners/me', expect.objectContaining({ method: 'PATCH' })),
+    );
+    expect(lastInboundPatch().address).toBe('support@tickets.acme.com');
+  });
+
+  it('replaces the auto-reply editor with a link to email templates', async () => {
+    routeFetch();
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    expect(screen.queryByTestId('inbound-autoreply-subject')).toBeNull();
+    expect(screen.queryByTestId('inbound-autoreply-body')).toBeNull();
+    expect(screen.queryByTestId('inbound-autoreply-editor')).toBeNull();
+    fireEvent.click(screen.getByTestId('inbound-edit-email-templates'));
+    expect(navigateTo).toHaveBeenCalledWith('/settings/partner#email-templates');
+  });
+
+  it('keeps the email-templates link when the autoresponder is disabled', async () => {
+    routeFetch({ ...CFG, autoresponderEnabled: false });
+    render(<InboundEmailCard />);
+    await screen.findByTestId('inbound-email-card');
+    expect(screen.queryByTestId('inbound-autoreply-body')).toBeNull();
+    expect(screen.getByTestId('inbound-edit-email-templates')).toBeTruthy();
+  });
+
+  it('shows the unconfigured-domain hint when domainConfigured is false', async () => {
+    routeFetch({ ...CFG, address: '', domainConfigured: false });
+    render(<InboundEmailCard />);
+    expect(await screen.findByTestId('inbound-address-unconfigured')).toBeTruthy();
+  });
+
+  // #3599: "Contact your administrator" is a dead end on self-host, where the
+  // reader IS the administrator. Name the variable and link the setup docs.
+  it('names TICKETS_INBOUND_DOMAIN and links the docs when the instance is self-hosted', async () => {
+    routeFetch({ ...CFG, address: '', domainConfigured: false, isHosted: false });
+    render(<InboundEmailCard />);
+    const hint = await screen.findByTestId('inbound-address-unconfigured');
+    expect(hint.textContent).toContain('TICKETS_INBOUND_DOMAIN');
+    expect(hint.textContent).toContain('Microsoft 365');
+    const link = screen.getByTestId('inbound-address-unconfigured-docs') as HTMLAnchorElement;
+    expect(link.getAttribute('href')).toBe(
+      'https://docs.breezermm.com/deploy/environment/#inbound-email-to-ticket-mailgun',
+    );
+    expect(link.getAttribute('rel')).toContain('noopener');
+  });
+
+  // #3598: an operator running ONLY the M365 mailbox path needs no inbound
+  // domain — the amber "isn't configured" error told them their working setup
+  // was broken. Only the native address is missing; say that instead.
+  it.each([undefined, false] as const)(
+    'suppresses the unconfigured error when a mailbox is connected (isHosted=%s)',
+    async (isHosted) => {
+      routeFetch({ ...CFG, address: '', domainConfigured: false, connectedMailboxCount: 1, isHosted });
+      render(<InboundEmailCard />);
+      const hint = await screen.findByTestId('inbound-address-via-mailbox');
+      expect(hint.textContent).toContain('Microsoft 365');
+      expect(screen.queryByTestId('inbound-address-unconfigured')).toBeNull();
+      expect(screen.queryByTestId('inbound-address-unconfigured-docs')).toBeNull();
+    },
+  );
+
+  it('still shows the unconfigured error when no mailbox is connected', async () => {
+    routeFetch({ ...CFG, address: '', domainConfigured: false, connectedMailboxCount: 0 });
+    render(<InboundEmailCard />);
+    expect(await screen.findByTestId('inbound-address-unconfigured')).toBeTruthy();
+    expect(screen.queryByTestId('inbound-address-via-mailbox')).toBeNull();
+  });
+
+  // A connected mailbox must not hide the native address editor — both paths
+  // can run at once, and the local part is still editable.
+  it('keeps the native address editor when the domain IS configured and a mailbox is connected', async () => {
+    routeFetch({ ...CFG, connectedMailboxCount: 1 });
+    render(<InboundEmailCard />);
+    expect(await screen.findByTestId('inbound-localpart')).toBeTruthy();
+    expect(screen.queryByTestId('inbound-address-via-mailbox')).toBeNull();
+    expect(screen.queryByTestId('inbound-address-unconfigured')).toBeNull();
+  });
+
+  it.each([true, undefined])(
+    'keeps the generic "contact your administrator" copy when isHosted is %s',
+    async (isHosted) => {
+      routeFetch({ ...CFG, address: '', domainConfigured: false, isHosted });
+      render(<InboundEmailCard />);
+      const hint = await screen.findByTestId('inbound-address-unconfigured');
+      expect(hint.textContent).not.toContain('TICKETS_INBOUND_DOMAIN');
+      expect(screen.queryByTestId('inbound-address-unconfigured-docs')).toBeNull();
+    },
+  );
+});

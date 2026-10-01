@@ -1,0 +1,19 @@
+---
+import PortalLayout from '../../layouts/PortalLayout.astro';
+import ProfileSettings from '../../components/portal/ProfileSettings';
+---
+
+<PortalLayout title="Profile">
+  <div class="space-y-6">
+    <div class="mb-7">
+      <h1 class="font-display text-[1.75rem] font-semibold leading-tight tracking-tight text-foreground">
+        Profile
+      </h1>
+      <p class="mt-1.5 text-sm text-muted-foreground">
+        Your account details and preferences.
+      </p>
+    </div>
+
+    <ProfileSettings client:load />
+  </div>
+</PortalLayout>

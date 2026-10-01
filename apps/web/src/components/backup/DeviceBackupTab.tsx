@@ -1,0 +1,939 @@
+import { useCallback, useEffect, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  Database,
+  Loader2,
+  Play,
+  RefreshCw,
+  ShieldCheck,
+  XCircle,
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { formatDateTime } from '@/lib/dateTimeFormat';
+import { fetchWithAuth } from '../../stores/auth';
+import { friendlyFetchError } from '../../lib/utils';
+import { useScrollToError } from '../../lib/scrollToError';
+import BackupVerificationTab from './BackupVerificationTab';
+import { formatNumber } from '@/lib/i18n/format';
+import DeviceVaultStatus from './DeviceVaultStatus';
+import AlphaBadge from '../shared/AlphaBadge';
+import { useTranslation } from 'react-i18next';
+import '../../lib/i18n';
+
+// `partial` is terminal but degraded: a restorable snapshot exists while a large
+// share of the data did not make it. Warning severity — never green, never red.
+type BackupJobStatus = 'completed' | 'running' | 'failed' | 'pending' | 'cancelled' | 'partial';
+type VssWriterState = 'stable' | 'failed' | 'waiting' | string;
+
+type VssWriter = {
+  name?: string | null;
+  writerName?: string | null;
+  state?: VssWriterState | null;
+};
+
+type VssMetadata = {
+  writers?: VssWriter[] | null;
+  // Requested volumes that got NO shadow copy and were therefore read live —
+  // in-use files on them may have been skipped or captured torn. A non-empty
+  // value means the run is NOT a clean snapshot even when it reports success.
+  unprotectedVolumes?: string[] | null;
+  warnings?: string[] | null;
+} | VssWriter[];
+
+type BackupJob = {
+  id: string;
+  deviceId: string;
+  type: string;
+  status: BackupJobStatus;
+  startedAt: string;
+  completedAt?: string | null;
+  totalSize?: number | null;
+  errorCount?: number | null;
+  vssMetadata?: VssMetadata | null;
+  // Despite the name this is the run's DIAGNOSTIC channel, not strictly errors:
+  // a successful-but-degraded run writes its warning here (e.g. VSS could not
+  // be created, so paths were read live). Rendered accordingly below — labelled
+  // by the job's own status rather than always as an error.
+  errorLog?: string | null;
+};
+
+type Snapshot = {
+  id: string;
+  deviceId: string;
+  label: string | null;
+  createdAt: string;
+  sizeBytes?: number | null;
+  fileCount?: number | null;
+  location?: string | null;
+  expiresAt?: string | null;
+  legalHold: boolean;
+  legalHoldReason?: string | null;
+  legalHoldSource?: 'policy' | 'manual' | null;
+  isImmutable: boolean;
+  immutableUntil?: string | null;
+  immutabilityEnforcement?: 'application' | 'provider' | null;
+  requestedImmutabilityEnforcement?: 'application' | 'provider' | null;
+  immutabilityFallbackReason?: string | null;
+  retentionBlockedReason?: 'legal_hold' | 'immutable_until' | null;
+};
+
+type BackupStatus = {
+  protected?: boolean;
+  lastJob?: BackupJob | null;
+  lastSuccessAt?: string | null;
+  nextScheduledAt?: string | null;
+  timezone?: string | null;
+};
+
+const jobStatusConfig: Record<BackupJobStatus, { icon: typeof CheckCircle2; className: string; label: string }> = {
+  completed: { icon: CheckCircle2, className: 'text-success bg-success/10', label: 'Completed' },
+  running: { icon: Clock, className: 'text-primary bg-primary/10', label: 'Running' },
+  failed: { icon: XCircle, className: 'text-destructive bg-destructive/10', label: 'Failed' },
+  partial: { icon: AlertTriangle, className: 'text-warning bg-warning/10', label: 'Partial' },
+  pending: { icon: Clock, className: 'text-muted-foreground bg-muted', label: 'Pending' },
+  cancelled: { icon: XCircle, className: 'text-muted-foreground bg-muted', label: 'Cancelled' },
+};
+
+const vssStateConfig: Record<string, { className: string; label: string }> = {
+  stable: { className: 'text-success bg-success/10', label: 'Stable' },
+  failed: { className: 'text-destructive bg-destructive/10', label: 'Failed' },
+  waiting: { className: 'text-warning bg-warning/10', label: 'Waiting' },
+  unknown: { className: 'text-muted-foreground bg-muted', label: 'Unknown' },
+};
+
+function formatBytes(bytes: number | null | undefined): string {
+  if (bytes == null) return '-';
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${formatNumber(bytes / Math.pow(k, i), { maximumFractionDigits: 1 })} ${sizes[i]}`;
+}
+
+function formatTime(iso: string | null | undefined, timezone?: string | null): string {
+  return formatDateTime(iso, {
+    fallback: '-',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    ...(timezone ? { timeZone: timezone, timeZoneName: 'short' as const } : {}),
+  });
+}
+
+function formatDuration(startedAt: string | null | undefined, completedAt: string | null | undefined): string {
+  if (!startedAt || !completedAt) return '-';
+  const ms = new Date(completedAt).getTime() - new Date(startedAt).getTime();
+  if (isNaN(ms) || ms < 0) return '-';
+  const totalSeconds = Math.floor(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainMinutes = minutes % 60;
+  return `${hours}h ${remainMinutes}m`;
+}
+
+function protectionSummary(snapshot: Snapshot): string {
+  if (snapshot.legalHold && snapshot.isImmutable) {
+    return snapshot.immutabilityEnforcement === 'provider'
+      ? 'Legal hold + provider immutability'
+      : 'Legal hold + app immutability';
+  }
+  if (snapshot.legalHold) return 'Legal hold';
+  if (snapshot.isImmutable) {
+    return snapshot.immutabilityEnforcement === 'provider'
+      ? 'Provider immutability'
+      : 'App immutability';
+  }
+  return 'Standard retention';
+}
+
+function getVssWriters(vssMetadata: VssMetadata | null | undefined): VssWriter[] {
+  if (!vssMetadata) return [];
+  if (Array.isArray(vssMetadata)) return vssMetadata;
+  return Array.isArray(vssMetadata.writers) ? vssMetadata.writers : [];
+}
+
+function getVssStringList(
+  vssMetadata: VssMetadata | null | undefined,
+  key: 'unprotectedVolumes' | 'warnings'
+): string[] {
+  if (!vssMetadata || Array.isArray(vssMetadata)) return [];
+  const value = vssMetadata[key];
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+}
+
+function normalizeVssState(state: string | null | undefined): keyof typeof vssStateConfig {
+  const normalized = state?.toLowerCase?.() ?? 'unknown';
+  if (normalized === 'stable' || normalized === 'failed' || normalized === 'waiting') {
+    return normalized;
+  }
+  return 'unknown';
+}
+
+type DeviceBackupTabProps = {
+  deviceId: string;
+  deviceStatus?: 'online' | 'offline' | 'maintenance' | 'decommissioned' | 'quarantined' | 'updating' | 'pending';
+  timezone?: string;
+};
+
+export default function DeviceBackupTab({ deviceId, deviceStatus, timezone }: DeviceBackupTabProps) {
+  const { t } = useTranslation('backup');
+  const [status, setStatus] = useState<BackupStatus | null>(null);
+  const [jobs, setJobs] = useState<BackupJob[]>([]);
+  const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [refreshing, setRefreshing] = useState(false);
+  const [reason, setReason] = useState('');
+  const [immutableDays, setImmutableDays] = useState(30);
+  const [immutabilityMode, setImmutabilityMode] = useState<'application' | 'provider'>('application');
+  const [actionLoading, setActionLoading] = useState(false);
+  const [actionError, setActionError] = useState<string>();
+  const errorBannerRef = useScrollToError<HTMLDivElement>(error || actionError);
+  const [actionMessage, setActionMessage] = useState<string>();
+  const [actionInfo, setActionInfo] = useState<string>();
+  const [runningBackup, setRunningBackup] = useState(false);
+
+  const fetchData = useCallback(async () => {
+    setError(undefined);
+    try {
+      const [statusRes, jobsRes, snapshotsRes] = await Promise.all([
+        fetchWithAuth(`/backup/status/${deviceId}`),
+        fetchWithAuth(`/backup/jobs?deviceId=${deviceId}`),
+        fetchWithAuth(`/backup/snapshots?deviceId=${deviceId}`),
+      ]);
+
+      if (statusRes.ok) {
+        const payload = await statusRes.json();
+        setStatus(payload?.data ?? payload ?? null);
+      }
+
+      if (jobsRes.ok) {
+        const payload = await jobsRes.json();
+        setJobs(Array.isArray(payload?.data) ? payload.data : []);
+      }
+
+      if (snapshotsRes.ok) {
+        const payload = await snapshotsRes.json();
+        setSnapshots(Array.isArray(payload?.data) ? payload.data : []);
+      }
+
+      const firstFail = [statusRes, jobsRes, snapshotsRes].find((r) => !r.ok);
+      if (firstFail) {
+        setError(`Failed to load some data (${firstFail.status})`);
+      }
+    } catch (err) {
+      console.error('[DeviceBackupTab] fetchData:', err);
+      setError(friendlyFetchError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [deviceId]);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await fetchData();
+    setRefreshing(false);
+  }, [fetchData]);
+
+  const handleRunBackupNow = useCallback(async () => {
+    setRunningBackup(true);
+    setActionError(undefined);
+    setActionMessage(undefined);
+    setActionInfo(undefined);
+    try {
+      const response = await fetchWithAuth(`/backup/jobs/run/${deviceId}`, { method: 'POST' });
+
+      if (response.status === 409) {
+        // Informational, not a success — render in the neutral banner.
+        setActionInfo(t('deviceBackupTab.aBackupIsAlreadyRunningForThisDevice'));
+        return;
+      }
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error((errData as { error?: string })?.error || `${response.status} ${response.statusText}`);
+      }
+
+      setActionMessage(t('deviceBackupTab.backupStartedForThisDevice'));
+      await handleRefresh();
+    } catch (err) {
+      console.error('[DeviceBackupTab] handleRunBackupNow:', err);
+      setActionError(err instanceof Error ? err.message : 'Failed to start backup');
+    } finally {
+      setRunningBackup(false);
+    }
+  }, [deviceId, handleRefresh, t]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  useEffect(() => {
+    if (!selectedSnapshotId && snapshots.length > 0) {
+      setSelectedSnapshotId(snapshots[0].id);
+      return;
+    }
+
+    if (selectedSnapshotId && !snapshots.some((snapshot) => snapshot.id === selectedSnapshotId)) {
+      setSelectedSnapshotId(snapshots[0]?.id ?? '');
+    }
+  }, [selectedSnapshotId, snapshots]);
+
+  const handleProtectionAction = useCallback(async (
+    action: 'apply-hold' | 'release-hold' | 'apply-immutability' | 'release-immutability',
+  ) => {
+    if (!selectedSnapshotId) return;
+
+    const trimmedReason = reason.trim();
+    if (!trimmedReason) {
+      setActionError('A reason is required for snapshot protection changes.');
+      return;
+    }
+
+    if (action === 'apply-immutability' && immutableDays < 1) {
+      setActionError('Immutable days must be at least 1.');
+      return;
+    }
+
+    const path = (() => {
+      switch (action) {
+        case 'apply-hold':
+          return `/backup/snapshots/${selectedSnapshotId}/legal-hold`;
+        case 'release-hold':
+          return `/backup/snapshots/${selectedSnapshotId}/legal-hold`;
+        case 'apply-immutability':
+          return `/backup/snapshots/${selectedSnapshotId}/immutability`;
+        case 'release-immutability':
+          return `/backup/snapshots/${selectedSnapshotId}/immutability/release`;
+      }
+    })();
+
+    const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? null;
+    const body = action === 'apply-immutability'
+      ? (
+        selectedSnapshot?.isImmutable && selectedSnapshot.immutableUntil
+          ? {
+              reason: trimmedReason,
+              extendUntil: new Date(new Date(selectedSnapshot.immutableUntil).getTime() + immutableDays * 24 * 60 * 60 * 1000).toISOString(),
+              enforcement: immutabilityMode,
+            }
+          : { reason: trimmedReason, immutableDays, enforcement: immutabilityMode }
+      )
+      : { reason: trimmedReason };
+    const method = action === 'release-hold' ? 'DELETE' : 'POST';
+
+    try {
+      setActionLoading(true);
+      setActionError(undefined);
+      setActionMessage(undefined);
+      setActionInfo(undefined);
+
+      const response = await fetchWithAuth(path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload?.error ?? 'Failed to update snapshot protection');
+      }
+
+      const updated = payload?.data ?? payload;
+      setSnapshots((prev) => prev.map((snapshot) => (
+        snapshot.id === selectedSnapshotId
+          ? { ...snapshot, ...updated }
+          : snapshot
+      )));
+      setActionMessage(
+        action === 'apply-hold'
+          ? 'Legal hold applied to the selected restore point.'
+          : action === 'release-hold'
+            ? 'Legal hold released from the selected restore point.'
+            : action === 'apply-immutability'
+              ? `${immutabilityMode === 'provider' ? 'Provider' : 'Application'} immutability ${selectedSnapshot?.isImmutable ? 'extended' : 'applied'} to the selected restore point.`
+              : 'Application immutability released from the selected restore point.'
+      );
+      setReason('');
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update snapshot protection');
+    } finally {
+      setActionLoading(false);
+    }
+  }, [immutableDays, immutabilityMode, reason, selectedSnapshotId, snapshots]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-16">
+        <div className="text-center">
+          <div className="mx-auto h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('deviceBackupTab.loadingBackupData')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Empty state
+  if (!error && !status?.protected && !status?.lastJob && jobs.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-20 text-center">
+        <Database className="h-12 w-12 text-muted-foreground/40" />
+        <h3 className="mt-4 text-base font-semibold text-foreground">{t('deviceBackupTab.noBackupConfigured')}</h3>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {t('deviceBackupTab.assignABackupPolicyToProtectThisDevice')} </p>
+      </div>
+    );
+  }
+
+  const recentJobs = jobs.slice(0, 20);
+  const lastJob = status?.lastJob ?? recentJobs[0] ?? null;
+  const lastJobStatus = lastJob?.status as BackupJobStatus | undefined;
+  const statusCfg = lastJobStatus ? (jobStatusConfig[lastJobStatus] ?? jobStatusConfig.pending) : null;
+  const latestVssWriters = getVssWriters(status?.lastJob?.vssMetadata);
+  const showVssStatus = status?.lastJob?.vssMetadata != null;
+  const hasVssWarnings = latestVssWriters.some((writer) => normalizeVssState(writer.state) !== 'stable');
+  const unprotectedVolumes = getVssStringList(status?.lastJob?.vssMetadata, 'unprotectedVolumes');
+  const vssWarnings = getVssStringList(status?.lastJob?.vssMetadata, 'warnings');
+  // The run's diagnostic text. On a job that did NOT fail this is a degradation
+  // note, not an error — and it is the only channel a total VSS failure has,
+  // since that outcome produces no vssMetadata at all. This tab used to ignore
+  // errorLog entirely, so such a run displayed as a clean green backup.
+  const lastJobDiagnostic = lastJob?.errorLog?.trim() || null;
+  const lastJobFailed = lastJobStatus === 'failed';
+  const selectedSnapshot = snapshots.find((snapshot) => snapshot.id === selectedSnapshotId) ?? snapshots[0] ?? null;
+  // Prefer the API-reported device zone; fall back to the already-validated
+  // zone passed by the parent (never an invalid IANA id). formatDateTime
+  // tolerates a bad zone regardless, so a Windows OS zone id won't crash the tab.
+  const effectiveZone = status?.timezone ?? timezone;
+  const isOffline = deviceStatus != null && deviceStatus !== 'online';
+  const runBackupDisabledReason = !status?.protected
+    ? t('deviceBackupTab.assignABackupPolicyToProtectThisDevice')
+    : isOffline
+      ? t('deviceBackupTab.deviceIsOfflineBackupsRequireAConnectedAgent')
+      : undefined;
+
+  return (
+    <div className="space-y-6">
+      {(error || actionError) && (
+        <div ref={errorBannerRef} className="space-y-6">
+          {error && (
+            <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+              {error}
+            </div>
+          )}
+          {actionError && (
+            <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+              {actionError}
+            </div>
+          )}
+        </div>
+      )}
+      {actionMessage && (
+        <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 text-sm text-emerald-700">
+          {actionMessage}
+        </div>
+      )}
+      {actionInfo && (
+        <div className="rounded-lg border border-border bg-muted p-3 text-sm text-foreground">
+          {actionInfo}
+        </div>
+      )}
+
+      {/* Status Header */}
+      <div className="rounded-lg border bg-card p-4 shadow-xs">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-4">
+            {statusCfg && lastJobStatus ? (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-muted-foreground">{t('deviceBackupTab.lastBackup')}</span>
+                <span
+                  className={cn(
+                    'inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium',
+                    statusCfg.className
+                  )}
+                >
+                  <statusCfg.icon className="h-3.5 w-3.5" />
+                  {statusCfg.label}
+                </span>
+              </div>
+            ) : status?.protected ? (
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-medium text-primary">
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                  {t('deviceBackupTab.policyAssigned')} </span>
+                <span className="text-xs text-muted-foreground">{t('deviceBackupTab.awaitingFirstBackupRun')}</span>
+              </div>
+            ) : null}
+            {status?.lastSuccessAt && (
+              <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                <CheckCircle2 className="h-3.5 w-3.5 text-success" />
+                <span>{t('deviceBackupTab.lastSuccess')} {formatTime(status.lastSuccessAt, effectiveZone)}</span>
+              </div>
+            )}
+            {status?.nextScheduledAt && (
+              <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Clock className="h-3.5 w-3.5" />
+                <span>{t('deviceBackupTab.next')} {formatTime(status.nextScheduledAt, effectiveZone)}</span>
+              </div>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleRunBackupNow()}
+              disabled={runningBackup || !status?.protected || isOffline}
+              title={runBackupDisabledReason}
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90 disabled:opacity-60"
+            >
+              {runningBackup ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+              {runningBackup ? t('deviceBackupTab.starting') : t('deviceBackupTab.runBackupNow')}
+            </button>
+            <button
+              type="button"
+              onClick={handleRefresh}
+              disabled={refreshing}
+              className="inline-flex items-center gap-2 rounded-md border bg-background px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-60"
+            >
+              {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              {t('deviceBackupTab.refresh')} </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Job History */}
+      <div className="rounded-lg border bg-card p-5 shadow-xs">
+        <h3 className="mb-4 font-semibold">{t('deviceBackupTab.jobHistory')}</h3>
+        {recentJobs.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            {status?.protected
+              ? 'No jobs yet. The first backup will run at the next scheduled time.'
+              : 'No jobs recorded.'}
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b text-left text-xs text-muted-foreground">
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.type')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.status')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.started')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.duration')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.size')}</th>
+                  <th className="pb-2 font-medium">{t('deviceBackupTab.errors')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recentJobs.map((job) => {
+                  const jStatus = job.status as BackupJobStatus;
+                  const cfg = jobStatusConfig[jStatus] ?? jobStatusConfig.pending;
+                  const Icon = cfg.icon;
+                  const errorCount = job.errorCount ?? 0;
+                  return (
+                    <tr key={job.id} className="border-b last:border-0">
+                      <td className="py-2 pr-4 capitalize text-foreground">
+                        {job.type}
+                      </td>
+                      <td className="py-2 pr-4">
+                        <span
+                          className={cn(
+                            'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium',
+                            cfg.className
+                          )}
+                        >
+                          <Icon className="h-3 w-3" />
+                          {cfg.label}
+                        </span>
+                      </td>
+                      <td className="py-2 pr-4 text-muted-foreground">
+                        {formatTime(job.startedAt, effectiveZone)}
+                      </td>
+                      <td className="py-2 pr-4 text-muted-foreground">
+                        {formatDuration(job.startedAt, job.completedAt)}
+                      </td>
+                      <td className="py-2 pr-4 text-muted-foreground">
+                        {formatBytes(job.totalSize)}
+                      </td>
+                      <td className="py-2">
+                        {errorCount > 0 ? (
+                          <span className="inline-flex items-center gap-1 text-destructive">
+                            <AlertTriangle className="h-3.5 w-3.5" />
+                            {errorCount}
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground">0</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Latest-run diagnostic. Rendered whether or not there is VSS metadata:
+          a run whose shadow copy could not be created reports its degradation
+          ONLY here, and that is precisely the run that would otherwise look
+          clean. Styled by the job's real status — a completed-but-degraded run
+          is a warning, not an error (the job list's blanket "error log" framing
+          is what made these easy to dismiss). */}
+      {lastJobDiagnostic && (
+        <div
+          className={cn(
+            'flex items-start gap-2 rounded-lg border p-4 text-sm',
+            lastJobFailed
+              ? 'border-destructive/40 bg-destructive/10 text-destructive'
+              : 'border-warning/40 bg-warning/10 text-warning'
+          )}
+          data-testid="backup-last-job-diagnostic"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className="font-medium">
+              {lastJobFailed
+                ? t('deviceBackupTab.lastBackupFailed')
+                : t('deviceBackupTab.lastBackupCompletedWithWarnings')}
+            </p>
+            <p className="mt-1 break-words opacity-90">{lastJobDiagnostic}</p>
+          </div>
+        </div>
+      )}
+
+      {/* VSS Status */}
+      {showVssStatus && (
+        <div className="rounded-lg border bg-card p-5 shadow-xs">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="font-semibold">{t('deviceBackupTab.vssStatus')} <AlphaBadge /></h3>
+            <span className="text-xs text-muted-foreground">{t('deviceBackupTab.latestBackupJob')}</span>
+          </div>
+
+          {/* Unprotected volumes outrank the writer states: a writer in a
+              non-stable state MAY have degraded the snapshot, but a volume with
+              no shadow copy definitely was read live. Show it first and loudest. */}
+          {unprotectedVolumes.length > 0 && (
+            <div
+              className="mt-4 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              data-testid="backup-vss-unprotected-volumes"
+            >
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                {t('deviceBackupTab.vssUnprotectedVolumes', { volumes: unprotectedVolumes.join(', ') })}
+              </span>
+            </div>
+          )}
+
+          {hasVssWarnings && (
+            <div className="mt-4 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{t('deviceBackupTab.oneOrMoreVssWritersAreNotStable')}</span>
+            </div>
+          )}
+
+          {vssWarnings.length > 0 && (
+            <ul
+              className="mt-4 space-y-1 text-sm text-warning"
+              data-testid="backup-vss-warnings"
+            >
+              {vssWarnings.map((warning, index) => (
+                <li key={`${warning}-${index}`} className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>{warning}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {latestVssWriters.length > 0 ? (
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b text-left text-xs text-muted-foreground">
+                    <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.writer')}</th>
+                    <th className="pb-2 font-medium">{t('deviceBackupTab.state')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {latestVssWriters.map((writer, index) => {
+                    const normalizedState = normalizeVssState(writer.state);
+                    const writerState = vssStateConfig[normalizedState] ?? vssStateConfig.unknown;
+                    const writerName = writer.writerName ?? writer.name ?? `Writer ${index + 1}`;
+                    return (
+                      <tr key={`${writerName}-${index}`} className="border-b last:border-0">
+                        <td className="py-2 pr-4 text-foreground">{writerName}</td>
+                        <td className="py-2">
+                          <span
+                            className={cn(
+                              'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium',
+                              writerState.className
+                            )}
+                          >
+                            {writerState.label}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="mt-4 text-sm text-muted-foreground">{t('deviceBackupTab.noVssWriterDetailsWereReportedForThe')}</p>
+          )}
+        </div>
+      )}
+
+      {/* Vault Status */}
+      <DeviceVaultStatus deviceId={deviceId} />
+
+      {/* Snapshots */}
+      {snapshots.length > 0 && (
+        <div className="rounded-lg border bg-card p-5 shadow-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="font-semibold">{t('deviceBackupTab.restorePoints')}</h3>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {t('deviceBackupTab.manageSnapshotProtectionForThisDeviceWithoutLeaving')} </p>
+            </div>
+            <span className="text-xs text-muted-foreground">
+              {t('deviceBackupTab.restorePointCount', { count: snapshots.length })}
+            </span>
+          </div>
+
+          {selectedSnapshot && (
+            <div className="mt-4 grid gap-4 rounded-lg border bg-muted/15 p-4 lg:grid-cols-[1.15fr_0.85fr]">
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-semibold text-foreground">
+                    {selectedSnapshot.label ?? selectedSnapshot.id}
+                  </span>
+                  {selectedSnapshot.legalHold && (
+                    <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700">
+                      {t('deviceBackupTab.legalHold')} </span>
+                  )}
+                  {selectedSnapshot.isImmutable && (
+                    <span className="rounded-full border border-sky-500/40 bg-sky-500/10 px-2 py-0.5 text-xs font-medium text-sky-700">
+                      {selectedSnapshot.immutabilityEnforcement === 'provider'
+                        ? 'Provider immutability'
+                        : 'Application immutability'}
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-md border bg-background p-3 text-sm">
+                    <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {t('deviceBackupTab.timing')} </div>
+                    <div className="mt-2 space-y-1 text-foreground">
+                      <div>{t('deviceBackupTab.created')} {formatTime(selectedSnapshot.createdAt, effectiveZone)}</div>
+                      <div>{t('deviceBackupTab.expires')} {formatTime(selectedSnapshot.expiresAt, effectiveZone)}</div>
+                      <div>{t('deviceBackupTab.immutableUntil')} {formatTime(selectedSnapshot.immutableUntil, effectiveZone)}</div>
+                    </div>
+                  </div>
+                  <div className="rounded-md border bg-background p-3 text-sm">
+                    <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      {t('deviceBackupTab.snapshotDetails')} </div>
+                    <div className="mt-2 space-y-1 text-foreground">
+                      <div>{t('deviceBackupTab.size2')} {formatBytes(selectedSnapshot.sizeBytes)}</div>
+                      <div>{t('deviceBackupTab.files')} {selectedSnapshot.fileCount ?? '-'}</div>
+                      <div>{t('deviceBackupTab.protection')} {protectionSummary(selectedSnapshot)}</div>
+                    </div>
+                  </div>
+                </div>
+
+                {(selectedSnapshot.legalHoldReason || selectedSnapshot.immutabilityEnforcement || selectedSnapshot.location) && (
+                  <div className="rounded-md border bg-background p-3 text-sm">
+                    {selectedSnapshot.legalHoldReason && (
+                      <div>
+                        <span className="font-medium text-foreground">{t('deviceBackupTab.holdReason')}</span>{' '}
+                        <span className="text-muted-foreground">{selectedSnapshot.legalHoldReason}</span>
+                      </div>
+                    )}
+                    {selectedSnapshot.legalHoldSource && (
+                      <div>
+                        <span className="font-medium text-foreground">{t('deviceBackupTab.holdSource')}</span>{' '}
+                        <span className="text-muted-foreground">
+                          {selectedSnapshot.legalHoldSource === 'policy' ? 'Inherited from backup policy' : 'Applied manually'}
+                        </span>
+                      </div>
+                    )}
+                    {selectedSnapshot.immutabilityEnforcement && (
+                      <div>
+                        <span className="font-medium text-foreground">{t('deviceBackupTab.enforcement')}</span>{' '}
+                        <span className="text-muted-foreground">
+                          {selectedSnapshot.immutabilityEnforcement === 'provider'
+                            ? 'Provider-enforced WORM'
+                            : 'Application-level cleanup protection'}
+                        </span>
+                      </div>
+                    )}
+                    {selectedSnapshot.location && (
+                      <div className="break-all">
+                        <span className="font-medium text-foreground">{t('deviceBackupTab.location')}</span>{' '}
+                        <span className="text-muted-foreground">{selectedSnapshot.location}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {selectedSnapshot.requestedImmutabilityEnforcement === 'provider' &&
+                  selectedSnapshot.immutabilityEnforcement === 'application' && (
+                    <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-800">
+                      {t('deviceBackupTab.providerImmutabilityWasRequestedByPolicyButBreeze')} {selectedSnapshot.immutabilityFallbackReason && (
+                        <div className="mt-1 text-xs text-amber-900/80">
+                          {t('deviceBackupTab.reason')} {selectedSnapshot.immutabilityFallbackReason}
+                        </div>
+                      )}
+                    </div>
+                  )}
+              </div>
+
+              <div className="space-y-3 rounded-md border bg-background p-4">
+                <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                  <ShieldCheck className="h-4 w-4 text-primary" />
+                  {t('deviceBackupTab.protectionControls')} </div>
+                <p className="text-xs text-muted-foreground">
+                  {t('deviceBackupTab.theseActionsApplyOnlyToTheSelectedRestore')} </p>
+                {selectedSnapshot.retentionBlockedReason && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('deviceBackupTab.retentionCleanupIsCurrentlyBlockedBy')} {selectedSnapshot.retentionBlockedReason === 'legal_hold' ? 'legal hold' : 'immutability'} {t('deviceBackupTab.forThisRestorePoint')} </p>
+                )}
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">{t('deviceBackupTab.reason2')}</label>
+                  <input
+                    value={reason}
+                    onChange={(event) => setReason(event.target.value)}
+                    placeholder={t('deviceBackupTab.reasonForApplyingOrReleasingProtection')}
+                    className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">{t('deviceBackupTab.immutableForDays')}</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={3650}
+                    value={immutableDays}
+                    onChange={(event) => setImmutableDays(Number(event.target.value) || 30)}
+                    className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">{t('deviceBackupTab.immutabilityEnforcement')}</label>
+                  <select
+                    value={immutabilityMode}
+                    onChange={(event) => setImmutabilityMode(event.target.value as 'application' | 'provider')}
+                    className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm"
+                  >
+                    <option value="application">{t('deviceBackupTab.applicationLevel')}</option>
+                    <option value="provider">{t('deviceBackupTab.providerEnforced')}</option>
+                  </select>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    disabled={actionLoading || selectedSnapshot.legalHold}
+                    onClick={() => void handleProtectionAction('apply-hold')}
+                    className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm font-medium text-amber-800 disabled:opacity-50"
+                  >
+                    {actionLoading ? 'Working...' : 'Apply legal hold'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={actionLoading || !selectedSnapshot.legalHold}
+                    onClick={() => void handleProtectionAction('release-hold')}
+                    className="rounded-md border px-3 py-2 text-sm font-medium text-foreground disabled:opacity-50"
+                  >
+                    {t('deviceBackupTab.releaseLegalHold')} </button>
+                  <button
+                    type="button"
+                    disabled={actionLoading}
+                    onClick={() => void handleProtectionAction('apply-immutability')}
+                    className="rounded-md border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-sm font-medium text-sky-800 disabled:opacity-50"
+                  >
+                    {selectedSnapshot.isImmutable ? 'Extend immutability' : 'Apply immutability'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={
+                      actionLoading ||
+                      !selectedSnapshot.isImmutable ||
+                      selectedSnapshot.immutabilityEnforcement === 'provider'
+                    }
+                    onClick={() => void handleProtectionAction('release-immutability')}
+                    className="rounded-md border px-3 py-2 text-sm font-medium text-foreground disabled:opacity-50"
+                  >
+                    {t('deviceBackupTab.releaseAppImmutability')} </button>
+                </div>
+                {selectedSnapshot.immutabilityEnforcement === 'provider' && selectedSnapshot.isImmutable && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('deviceBackupTab.providerEnforcedImmutabilityMustBeReleasedAtThe')} </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="overflow-x-auto">
+            <table className="mt-4 w-full text-sm">
+              <thead>
+                <tr className="border-b text-left text-xs text-muted-foreground">
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.label')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.created2')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.expires2')}</th>
+                  <th className="pb-2 pr-4 font-medium">{t('deviceBackupTab.size')}</th>
+                  <th className="pb-2 font-medium">{t('deviceBackupTab.protection2')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {snapshots.map((snap) => (
+                  <tr
+                    key={snap.id}
+                    className={cn(
+                      'cursor-pointer border-b last:border-0',
+                      selectedSnapshotId === snap.id ? 'bg-primary/5' : undefined
+                    )}
+                    onClick={() => setSelectedSnapshotId(snap.id)}
+                  >
+                    <td className="py-2 pr-4 text-foreground">{snap.label ?? snap.id}</td>
+                    <td className="py-2 pr-4 text-muted-foreground">
+                      {formatTime(snap.createdAt, effectiveZone)}
+                    </td>
+                    <td className="py-2 pr-4 text-muted-foreground">{formatTime(snap.expiresAt, effectiveZone)}</td>
+                    <td className="py-2 pr-4 text-muted-foreground">
+                      {formatBytes(snap.sizeBytes)}
+                    </td>
+                    <td className="py-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {snap.legalHold && (
+                          <span className="inline-flex items-center rounded-full bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-700">
+                            {t('deviceBackupTab.hold')} </span>
+                        )}
+                        {snap.isImmutable && (
+                          <span className="inline-flex items-center rounded-full bg-sky-500/10 px-2 py-0.5 text-xs font-medium text-sky-700">
+                            {snap.immutabilityEnforcement === 'provider' ? 'Provider lock' : 'App lock'}
+                          </span>
+                        )}
+                        {!snap.legalHold && !snap.isImmutable && (
+                          <span className="text-muted-foreground">{t('deviceBackupTab.standard')}</span>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Verification & Readiness */}
+      <BackupVerificationTab deviceId={deviceId} deviceStatus={deviceStatus} />
+    </div>
+  );
+}

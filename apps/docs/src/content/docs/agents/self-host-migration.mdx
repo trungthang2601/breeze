@@ -1,0 +1,93 @@
+---
+title: Migrating to the Self-Host Agent Edition
+description: Move devices off hosted-edition agent builds and onto the self-host agent edition for self-hosted Breeze servers.
+sidebar:
+  order: 7
+  label: Self-Host Agent Migration
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+If your self-hosted Breeze dashboard shows a persistent banner saying some of
+your devices are running the **hosted agent edition**, this page explains what
+that means and how to migrate those devices. The banner is shown to
+administrators only and clears on its own once every affected device has been
+migrated.
+
+## What the banner means
+
+Breeze ships the agent in two editions:
+
+- **Self-host edition** — the standard build published on GitHub Releases,
+  which is also what your own server's install links and downloads serve by
+  default (see [Agent Binary Distribution](/deploy/binaries/)). It connects to
+  any Breeze server. This is the edition every device on a self-hosted server
+  should run.
+- **Hosted edition** — built exclusively for the Breeze-hosted cloud and
+  restricted to hosted control-plane servers.
+
+A device is counted in the banner when its agent reports that it is a
+hosted-edition build talking to your self-hosted server. This usually means the
+agent was originally installed from an installer or download link that came
+from the hosted service, rather than from your own server.
+
+<Aside type="caution">
+Hosted-edition agents currently keep working against a self-hosted server —
+they only report the mismatch. Future hosted-edition releases enforce the
+restriction and will refuse to run against a non-hosted server. Migrate
+affected devices before updating them.
+</Aside>
+
+## Migrate a device
+
+On macOS and Linux, migration is an in-place reinstall with the self-host
+edition: the device's enrollment, identity, and history are preserved — the
+agent keeps its existing configuration and does not re-enroll. On Windows, the
+two MSI editions carry different product identities and **refuse to install
+over each other**, so the hosted MSI must be uninstalled first (back up the
+agent's configuration to keep the device's identity — see step 2).
+
+<Steps>
+
+1. Get the self-host agent from **your own server**: use the install command or
+   installer download from **Devices → Add Device** in your dashboard. Anything
+   your server hands out is the self-host edition.
+
+2. Install it on the affected device:
+
+   - **Windows** — the self-host MSI will not upgrade a hosted-edition install
+     in place (the installer blocks with *"A different edition of the Breeze
+     Agent is already installed."*). To migrate while keeping the device's
+     enrollment: first back up `C:\ProgramData\Breeze\agent.yaml` and
+     `C:\ProgramData\Breeze\secrets.yaml` (uninstalling removes them), then
+     uninstall the hosted agent MSI, install the self-host MSI, restore the two
+     files, and restart the **Breeze Agent** service. If you skip the backup,
+     the agent re-enrolls as a new device record instead.
+   - **macOS / Linux** — run the install script over the existing
+     installation, or replace the binary and run
+     `breeze-agent service install`, which reinstalls the binary and, because
+     the device is already enrolled, starts the service again automatically
+     without re-enrolling. (On agent v0.110.0 and earlier, `service install`
+     stopped the service without restarting it — on those versions, follow it
+     with `sudo systemctl restart breeze-agent breeze-watchdog`, or prefer the
+     in-band auto-update instead.) See
+     [Agent Installation](/agents/installation/) for the full commands.
+
+3. Let the device check in. The agent reports its edition on every check-in,
+   so the flag clears automatically the first time the self-host build starts.
+
+</Steps>
+
+<Aside type="note">
+On **macOS and Linux**, do not uninstall the agent, decommission the device, or
+re-enroll with a new enrollment key — none of that is needed. On **Windows**,
+uninstalling the hosted MSI is required, but back up the configuration files
+first as described above; re-enrolling is only appropriate when you
+intentionally want a new device record.
+</Aside>
+
+## Verify
+
+The banner's device count drops as each migrated device checks in, and the
+banner disappears when the count reaches zero. There is nothing to acknowledge
+or dismiss manually.

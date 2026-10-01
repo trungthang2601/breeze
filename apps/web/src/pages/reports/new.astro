@@ -1,0 +1,35 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import ReportBuilder from '../../components/reports/ReportBuilder';
+import Breadcrumbs from '../../components/layout/Breadcrumbs';
+import { navigateTo } from '../../lib/navigation';
+import { tServer } from '../../lib/i18n/server';
+
+const locale = Astro.locals.locale;
+---
+
+<DashboardLayout titleKey="titles.reportsNew">
+  <Breadcrumbs client:load items={[
+    { label: tServer(locale, 'reportsNewPage.breadcrumbReports'), href: '/reports' },
+    { label: tServer(locale, 'reportsNewPage.breadcrumbNew') }
+  ]} />
+  <div class="space-y-6">
+    <div>
+      <h1 class="text-xl font-semibold tracking-tight">{tServer(locale, 'reportsNewPage.heading')}</h1>
+      <p class="text-muted-foreground">
+        {tServer(locale, 'reportsNewPage.description')}
+      </p>
+    </div>
+
+    <ReportBuilder
+      client:only="react"
+      mode="create"
+      onSubmit={() => {
+        void navigateTo('/reports');
+      }}
+      onCancel={() => {
+        void navigateTo('/reports');
+      }}
+    />
+  </div>
+</DashboardLayout>

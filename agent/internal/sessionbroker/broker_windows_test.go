@@ -1,0 +1,625 @@
+//go:build windows
+
+package sessionbroker
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/user"
+	"testing"
+	"time"
+
+	"github.com/Microsoft/go-winio"
+	"github.com/breeze-rmm/agent/internal/ipc"
+)
+
+// TestMain grants the test process explicit access to the broker's named pipe.
+//
+// Production restricts the pipe to SYSTEM + IU (Interactive Users). Every
+// automated context is a NON-interactive logon — a CI runner service, a
+// scheduled task, an SSH session — so the token has no S-1-5-4 and the test
+// cannot dial the pipe it just created, failing with "Access is denied". That
+// is the pipe DACL working correctly, not a bug, but it made every
+// TestNamedPipe* case fail on real Windows.
+//
+// So we swap the descriptor for one granting SYSTEM + this exact user SID. The
+// accept path, handshake, and peer-credential checks are still exercised for
+// real; only the gate that keeps non-interactive callers out is relaxed, and
+// only for this process's own pipe. Set once here, before any test runs, so
+// there is no data race with parallel tests in this package.
+func TestMain(m *testing.M) {
+	current, err := user.Current()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sessionbroker tests: cannot resolve current user SID: %v\n", err)
+		os.Exit(1)
+	}
+	pipeSecurityOverride = fmt.Sprintf("D:P(A;;GA;;;SY)(A;;GA;;;%s)", current.Uid)
+	os.Exit(m.Run())
+}
+
+// TestPipeSecurityOverrideIsTestOnly pins the production descriptor so the
+// override above can never silently become the shipped one. If pipeSecurity
+// stops restricting to Interactive Users, that is a security change and must be
+// a deliberate edit here, not a side effect of a test helper.
+func TestPipeSecurityOverrideIsTestOnly(t *testing.T) {
+	const want = "D:P(A;;GA;;;SY)(A;;GRGW;;;IU)"
+	if pipeSecurity != want {
+		t.Fatalf("production pipe SDDL = %q, want %q", pipeSecurity, want)
+	}
+	if pipeSecurityOverride == "" {
+		t.Fatal("TestMain did not set pipeSecurityOverride; the pipe tests below would be testing the production DACL and failing for environmental reasons")
+	}
+	if pipeSecurityOverride == pipeSecurity {
+		t.Fatal("override equals production SDDL; the tests would fail on any non-interactive logon")
+	}
+}
+
+// requireSystemIdentity skips unless the test process runs as SYSTEM.
+//
+// These handshakes send an AuthRequest with no HelperRole, which the broker
+// defaults to ipc.HelperRoleSystem (broker.go), and roleIdentityRejection
+// requires S-1-5-18 for that role. A CI runner, an SSH session, and an
+// interactive admin are all non-SYSTEM, so the handshake is correctly rejected
+// with "system role requires SYSTEM identity" — the gate working, not a bug.
+//
+// Skipping is the honest outcome: the alternative is a test that is red
+// everywhere forever, or weakening a privilege gate to make a test pass. To
+// exercise these for real, run the package under a SYSTEM context (e.g.
+// PsExec -s).
+func requireSystemIdentity(t *testing.T) {
+	t.Helper()
+	cu, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+	if cu.Uid != systemSID {
+		t.Skipf("needs SYSTEM identity: running as %s (SID %s), but an unset HelperRole defaults to the %q role which requires %s",
+			cu.Username, cu.Uid, ipc.HelperRoleSystem, systemSID)
+	}
+}
+
+// testPipeName returns a unique named pipe path for testing.
+func testPipeName(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf(`\\.\pipe\breeze-test-%d`, os.Getpid())
+}
+
+func TestNamedPipeListenAndAccept(t *testing.T) {
+	pipeName := testPipeName(t)
+	stopChan := make(chan struct{})
+
+	broker := New(pipeName, nil)
+	defer broker.Close()
+
+	// Start broker listener in background
+	listenErr := make(chan error, 1)
+	go func() {
+		listenErr <- broker.Listen(stopChan)
+	}()
+
+	// Give the listener time to start
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify broker started (check for immediate errors)
+	select {
+	case err := <-listenErr:
+		t.Fatalf("broker.Listen failed immediately: %v", err)
+	default:
+	}
+
+	// Connect a client
+	timeout := 2 * time.Second
+	conn, err := winio.DialPipe(pipeName, &timeout)
+	if err != nil {
+		t.Fatalf("DialPipe failed: %v", err)
+	}
+	conn.Close()
+
+	// Shut down
+	close(stopChan)
+}
+
+func TestNamedPipeFullHandshake(t *testing.T) {
+	requireSystemIdentity(t)
+	pipeName := testPipeName(t) + "-handshake"
+	stopChan := make(chan struct{})
+
+	var receivedMessage bool
+	broker := New(pipeName, func(session *Session, env *ipc.Envelope) {
+		receivedMessage = true
+	})
+	defer func() {
+		close(stopChan)
+		time.Sleep(100 * time.Millisecond)
+		broker.Close()
+	}()
+
+	// Start broker
+	go broker.Listen(stopChan)
+	time.Sleep(200 * time.Millisecond)
+
+	// Connect via named pipe
+	timeout := 2 * time.Second
+	rawConn, err := winio.DialPipe(pipeName, &timeout)
+	if err != nil {
+		t.Fatalf("DialPipe: %v", err)
+	}
+	defer rawConn.Close()
+
+	conn := ipc.NewConn(rawConn)
+
+	// Compute our own binary hash (same as broker does)
+	binaryHash := computeTestBinaryHash(t)
+
+	// Get current user info
+	cu, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+
+	// Send auth request with SID (required on Windows)
+	authReq := ipc.AuthRequest{
+		ProtocolVersion: ipc.ProtocolVersion,
+		UID:             0,      // Windows: UID is always 0
+		SID:             cu.Uid, // Go returns SID as Uid on Windows
+		Username:        cu.Username,
+		SessionID:       fmt.Sprintf("test-helper-%d", os.Getpid()),
+		DisplayEnv:      "windows",
+		PID:             os.Getpid(),
+		BinaryHash:      binaryHash,
+	}
+
+	err = conn.SendTyped("auth", ipc.TypeAuthRequest, authReq)
+	if err != nil {
+		t.Fatalf("send auth request: %v", err)
+	}
+
+	// Read auth response
+	env, err := conn.Recv()
+	if err != nil {
+		t.Fatalf("recv auth response: %v", err)
+	}
+
+	if env.Type != ipc.TypeAuthResponse {
+		t.Fatalf("expected auth_response, got %s", env.Type)
+	}
+
+	var authResp ipc.AuthResponse
+	if err := json.Unmarshal(env.Payload, &authResp); err != nil {
+		t.Fatalf("unmarshal auth response: %v", err)
+	}
+
+	if !authResp.Accepted {
+		t.Fatalf("auth rejected: %s", authResp.Reason)
+	}
+
+	if authResp.SessionKey == "" {
+		t.Fatal("expected non-empty session key")
+	}
+
+	t.Logf("Auth accepted: sessionKey=%s..., scopes=%v", authResp.SessionKey[:8], authResp.AllowedScopes)
+
+	// Verify session appears in broker
+	sessions := broker.AllSessions()
+	if len(sessions) == 0 {
+		// Give it a moment — the session registration happens in the broker's goroutine
+		time.Sleep(200 * time.Millisecond)
+		sessions = broker.AllSessions()
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session, got %d", len(sessions))
+	}
+
+	info := sessions[0]
+	if info.Username != cu.Username {
+		t.Errorf("session username = %q, want %q", info.Username, cu.Username)
+	}
+	if info.DisplayEnv != "windows" {
+		t.Errorf("session displayEnv = %q, want %q", info.DisplayEnv, "windows")
+	}
+
+	t.Logf("Session registered: uid=%d, user=%s, sessionId=%s", info.UID, info.Username, info.SessionID)
+
+	// Set session key for HMAC on subsequent messages
+	keyBytes, err := hex.DecodeString(authResp.SessionKey)
+	if err != nil {
+		t.Fatalf("decode session key: %v", err)
+	}
+	conn.SetSessionKey(keyBytes)
+
+	// Send capabilities
+	caps := ipc.Capabilities{
+		CanNotify:     true,
+		CanTray:       true,
+		CanCapture:    false,
+		CanClipboard:  true,
+		DisplayServer: "windows",
+	}
+	if err := conn.SendTyped("caps", ipc.TypeCapabilities, caps); err != nil {
+		t.Fatalf("send capabilities: %v", err)
+	}
+
+	// Give broker time to process capabilities
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify capabilities were received
+	session := broker.SessionForUser(cu.Username)
+	if session == nil {
+		t.Fatal("SessionForUser returned nil")
+	}
+	if session.Capabilities == nil {
+		t.Fatal("capabilities not received")
+	}
+	if !session.Capabilities.CanNotify {
+		t.Error("expected CanNotify=true")
+	}
+	if session.Capabilities.DisplayServer != "windows" {
+		t.Errorf("DisplayServer = %q, want %q", session.Capabilities.DisplayServer, "windows")
+	}
+
+	t.Log("Capabilities received and verified")
+
+	// Send a ping and verify pong
+	if err := conn.SendTyped("ping-1", ipc.TypePing, nil); err != nil {
+		t.Fatalf("send ping: %v", err)
+	}
+
+	pongEnv, err := conn.Recv()
+	if err != nil {
+		t.Fatalf("recv pong: %v", err)
+	}
+	if pongEnv.Type != ipc.TypePong {
+		t.Errorf("expected pong, got %s", pongEnv.Type)
+	}
+
+	t.Log("Ping/pong verified over named pipe with HMAC")
+
+	// Send disconnect
+	_ = conn.SendTyped("disconnect", ipc.TypeDisconnect, nil)
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify session was cleaned up
+	remaining := broker.SessionCount()
+	if remaining != 0 {
+		t.Errorf("expected 0 sessions after disconnect, got %d", remaining)
+	}
+
+	t.Log("Session disconnected and cleaned up")
+	_ = receivedMessage // suppress unused warning
+}
+
+func TestNamedPipeSessionDetector(t *testing.T) {
+	detector := NewSessionDetector()
+
+	sessions, err := detector.ListSessions()
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+
+	if len(sessions) == 0 {
+		t.Skip("no interactive sessions detected (headless CI?)")
+	}
+
+	for _, s := range sessions {
+		t.Logf("Detected session: user=%s, session=%s, state=%s, display=%s",
+			s.Username, s.Session, s.State, s.Display)
+
+		// Session 0 is the non-interactive Services session: it legitimately
+		// has no user. The detector reports it and helperRoleDesired filters it
+		// out downstream, so requiring a username here fails on every host that
+		// has one — which is every Windows host.
+		if s.Session == "0" || s.Type == "services" {
+			continue
+		}
+		if s.Username == "" {
+			t.Error("session has empty username")
+		}
+		if s.Session == "" {
+			t.Error("session has empty session ID")
+		}
+	}
+}
+
+func TestNamedPipeSIDMismatchRejected(t *testing.T) {
+	pipeName := testPipeName(t) + "-sid-reject"
+	stopChan := make(chan struct{})
+
+	broker := New(pipeName, nil)
+	defer func() {
+		close(stopChan)
+		time.Sleep(100 * time.Millisecond)
+		broker.Close()
+	}()
+
+	go broker.Listen(stopChan)
+	time.Sleep(200 * time.Millisecond)
+
+	timeout := 2 * time.Second
+	rawConn, err := winio.DialPipe(pipeName, &timeout)
+	if err != nil {
+		t.Fatalf("DialPipe: %v", err)
+	}
+	defer rawConn.Close()
+
+	conn := ipc.NewConn(rawConn)
+	binaryHash := computeTestBinaryHash(t)
+
+	cu, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+
+	// Send auth request with WRONG SID
+	authReq := ipc.AuthRequest{
+		ProtocolVersion: ipc.ProtocolVersion,
+		UID:             0,
+		SID:             "S-1-5-21-FAKE-SID-12345",
+		Username:        cu.Username,
+		SessionID:       fmt.Sprintf("test-fake-%d", os.Getpid()),
+		DisplayEnv:      "windows",
+		PID:             os.Getpid(),
+		BinaryHash:      binaryHash,
+	}
+
+	if err := conn.SendTyped("auth", ipc.TypeAuthRequest, authReq); err != nil {
+		t.Fatalf("send auth request: %v", err)
+	}
+
+	env, err := conn.Recv()
+	if err != nil {
+		t.Fatalf("recv auth response: %v", err)
+	}
+
+	var authResp ipc.AuthResponse
+	if err := json.Unmarshal(env.Payload, &authResp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if authResp.Accepted {
+		t.Fatal("expected auth to be REJECTED for fake SID, but it was accepted")
+	}
+
+	if authResp.Reason != "SID mismatch" {
+		t.Errorf("expected reason 'SID mismatch', got %q", authResp.Reason)
+	}
+
+	// SID mismatch is a permanent rejection — the helper should not retry.
+	// Verifies that Part A (broker sends Permanent: true for identity rejections)
+	// is wired through to the auth response.
+	if !authResp.Permanent {
+		t.Errorf("expected Permanent=true for SID mismatch rejection, got false")
+	}
+
+	t.Logf("SID mismatch correctly rejected: %s (permanent=%v)", authResp.Reason, authResp.Permanent)
+}
+
+func TestNamedPipeMissingSIDRejected(t *testing.T) {
+	pipeName := testPipeName(t) + "-no-sid"
+	stopChan := make(chan struct{})
+
+	broker := New(pipeName, nil)
+	defer func() {
+		close(stopChan)
+		time.Sleep(100 * time.Millisecond)
+		broker.Close()
+	}()
+
+	go broker.Listen(stopChan)
+	time.Sleep(200 * time.Millisecond)
+
+	timeout := 2 * time.Second
+	rawConn, err := winio.DialPipe(pipeName, &timeout)
+	if err != nil {
+		t.Fatalf("DialPipe: %v", err)
+	}
+	defer rawConn.Close()
+
+	conn := ipc.NewConn(rawConn)
+	binaryHash := computeTestBinaryHash(t)
+
+	cu, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+
+	// Send auth request with NO SID (old-style, should be rejected on Windows)
+	authReq := ipc.AuthRequest{
+		ProtocolVersion: ipc.ProtocolVersion,
+		UID:             0,
+		Username:        cu.Username,
+		SessionID:       fmt.Sprintf("test-nosid-%d", os.Getpid()),
+		DisplayEnv:      "windows",
+		PID:             os.Getpid(),
+		BinaryHash:      binaryHash,
+	}
+
+	if err := conn.SendTyped("auth", ipc.TypeAuthRequest, authReq); err != nil {
+		t.Fatalf("send auth request: %v", err)
+	}
+
+	env, err := conn.Recv()
+	if err != nil {
+		t.Fatalf("recv auth response: %v", err)
+	}
+
+	var authResp ipc.AuthResponse
+	if err := json.Unmarshal(env.Payload, &authResp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if authResp.Accepted {
+		t.Fatal("expected auth to be REJECTED for missing SID, but it was accepted")
+	}
+
+	// Missing SID is a permanent rejection — helper should not retry with the
+	// same missing SID. Verifies Part A integration.
+	if !authResp.Permanent {
+		t.Errorf("expected Permanent=true for missing SID rejection, got false")
+	}
+
+	t.Logf("Missing SID correctly rejected: %s (permanent=%v)", authResp.Reason, authResp.Permanent)
+}
+
+func TestNamedPipeSessionIDCollisionRejected(t *testing.T) {
+	requireSystemIdentity(t)
+	pipeName := testPipeName(t) + "-collision"
+	stopChan := make(chan struct{})
+
+	broker := New(pipeName, nil)
+	defer func() {
+		close(stopChan)
+		time.Sleep(100 * time.Millisecond)
+		broker.Close()
+	}()
+
+	go broker.Listen(stopChan)
+	time.Sleep(200 * time.Millisecond)
+
+	cu, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+	binaryHash := computeTestBinaryHash(t)
+	collisionID := fmt.Sprintf("collision-test-%d", os.Getpid())
+
+	// --- First helper: should succeed ---
+	timeout := 2 * time.Second
+	raw1, err := winio.DialPipe(pipeName, &timeout)
+	if err != nil {
+		t.Fatalf("DialPipe #1: %v", err)
+	}
+	defer raw1.Close()
+
+	conn1 := ipc.NewConn(raw1)
+	err = conn1.SendTyped("auth", ipc.TypeAuthRequest, ipc.AuthRequest{
+		ProtocolVersion: ipc.ProtocolVersion,
+		UID:             0,
+		SID:             cu.Uid,
+		Username:        cu.Username,
+		SessionID:       collisionID,
+		DisplayEnv:      "windows",
+		PID:             os.Getpid(),
+		BinaryHash:      binaryHash,
+	})
+	if err != nil {
+		t.Fatalf("send auth #1: %v", err)
+	}
+
+	env1, err := conn1.Recv()
+	if err != nil {
+		t.Fatalf("recv auth #1: %v", err)
+	}
+	var resp1 ipc.AuthResponse
+	if err := json.Unmarshal(env1.Payload, &resp1); err != nil {
+		t.Fatalf("unmarshal #1: %v", err)
+	}
+	if !resp1.Accepted {
+		t.Fatalf("first connection should be accepted, got rejected: %s", resp1.Reason)
+	}
+	t.Log("First helper accepted")
+
+	// Give broker time to register the session
+	time.Sleep(200 * time.Millisecond)
+
+	// --- Second helper: same SessionID, should be rejected ---
+	raw2, err := winio.DialPipe(pipeName, &timeout)
+	if err != nil {
+		t.Fatalf("DialPipe #2: %v", err)
+	}
+	defer raw2.Close()
+
+	conn2 := ipc.NewConn(raw2)
+	err = conn2.SendTyped("auth", ipc.TypeAuthRequest, ipc.AuthRequest{
+		ProtocolVersion: ipc.ProtocolVersion,
+		UID:             0,
+		SID:             cu.Uid,
+		Username:        cu.Username,
+		SessionID:       collisionID, // same ID!
+		DisplayEnv:      "windows",
+		PID:             os.Getpid(),
+		BinaryHash:      binaryHash,
+	})
+	if err != nil {
+		t.Fatalf("send auth #2: %v", err)
+	}
+
+	env2, err := conn2.Recv()
+	if err != nil {
+		t.Fatalf("recv auth #2: %v", err)
+	}
+	var resp2 ipc.AuthResponse
+	if err := json.Unmarshal(env2.Payload, &resp2); err != nil {
+		t.Fatalf("unmarshal #2: %v", err)
+	}
+	if resp2.Accepted {
+		t.Fatal("second connection with same SessionID should be REJECTED")
+	}
+	if resp2.Reason != "session ID already in use" {
+		t.Errorf("expected reason 'session ID already in use', got %q", resp2.Reason)
+	}
+
+	// Verify the original session is still there
+	if broker.SessionCount() != 1 {
+		t.Errorf("expected 1 session still active, got %d", broker.SessionCount())
+	}
+
+	t.Logf("SessionID collision correctly rejected: %s", resp2.Reason)
+}
+
+// TestAssistRoleRejectsSystemSID verifies the step-10 privilege-escalation gate
+// for the Breeze Assist helper: a process running as Local System (S-1-5-18)
+// that claims the "assist" role must be permanently rejected with the reason
+// "assist role requires non-SYSTEM identity", and no session is registered (the
+// gate returns before NewSession/registration).
+//
+// The gate reads the kernel-verified peer-cred SID, which cannot be forged over
+// a named pipe, so this drives the extracted roleIdentityRejection decision with
+// an injected SID rather than connecting a real SYSTEM peer. It mirrors the
+// existing watchdog/user identity-mismatch behavior covered above.
+func TestAssistRoleRejectsSystemSID(t *testing.T) {
+	cases := []struct {
+		name       string
+		role       ipc.HelperRole
+		sid        string
+		wantReason string
+		wantReject bool
+	}{
+		{"assist as SYSTEM rejected", ipc.HelperRoleAssist, systemSID, "assist role requires non-SYSTEM identity", true},
+		{"assist as non-SYSTEM allowed", ipc.HelperRoleAssist, "S-1-5-21-1-2-3-1001", "", false},
+		{"user as SYSTEM rejected", ipc.HelperRoleUser, systemSID, "user role requires non-SYSTEM identity", true},
+		{"watchdog as non-SYSTEM rejected", ipc.HelperRoleWatchdog, "S-1-5-21-1-2-3-1001", "watchdog role requires SYSTEM identity", true},
+		{"watchdog as SYSTEM allowed", ipc.HelperRoleWatchdog, systemSID, "", false},
+		{"system as non-SYSTEM rejected", ipc.HelperRoleSystem, "S-1-5-21-1-2-3-1001", "system role requires SYSTEM identity", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Claimed and console sessions match the peer session so the SID
+			// gate (not either session binding) is the assertion under test here.
+			reason, rejected := roleIdentityRejection(tc.role, tc.sid, 0, "1", "1", "1", "windows")
+			if rejected != tc.wantReject {
+				t.Fatalf("rejected = %v, want %v (reason %q)", rejected, tc.wantReject, reason)
+			}
+			if reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func computeTestBinaryHash(t *testing.T) string {
+	t.Helper()
+	exePath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	data, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", exePath, err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}

@@ -1,0 +1,80 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { writeEnvStack, readStackEnvValue } from './env';
+
+let dir: string;
+beforeEach(() => { dir = mkdtempSync(path.join(tmpdir(), 'wt-')); });
+afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+describe('writeEnvStack', () => {
+  it('writes all secrets the API config validator requires to boot', () => {
+    const p = writeEnvStack(dir);
+    const env = readFileSync(p, 'utf8');
+    for (const key of [
+      'POSTGRES_PASSWORD', 'ENROLLMENT_KEY_PEPPER', 'MFA_RECOVERY_CODE_PEPPER',
+      'TURN_SECRET', 'IS_HOSTED', 'CADDY_SITE_ADDRESS', 'BREEZE_PORTAL_IMAGE_REF',
+    ]) {
+      expect(env).toContain(`${key}=`);
+    }
+    expect(env).toContain('CADDY_SITE_ADDRESS=:80');
+    expect(env).toContain('IS_HOSTED=false');
+  });
+
+  // #5266 — the seeded system Partner Admin role stores force_mfa=true, so a
+  // stack that lets the API's own default decide bounces the seeded
+  // admin@breeze.local login to /auth/mfa/setup and every Playwright spec dies
+  // in globalSetup. The stack pins the relief valve OFF so the dev stack does
+  // not follow the shipping default (which flips back ON once #5306 lands).
+  it('pins the partner-admin forced-MFA relief valve off for the dev stack', () => {
+    const env = readFileSync(writeEnvStack(dir), 'utf8');
+    expect(env).toContain('MFA_FORCE_FOR_PARTNER_ADMIN=false');
+  });
+
+  // #6447 — every Playwright context in a run is built from the ONE
+  // storageState globalSetup mints, so they all share a single refresh-token
+  // FAMILY, and `apps/web` spends one `POST /auth/refresh` per full-page
+  // navigation. The family budget is 60/60s, which parallel workers exhaust in
+  // seconds; the API then 429s and the app masks itself with "Too many
+  // requests — reconnecting". E2E_MODE is the API's own switch for exactly
+  // this, so the dev stack must pin it on.
+  it('disables the rate limiters that a parallel Playwright run trips', () => {
+    const env = readFileSync(writeEnvStack(dir), 'utf8');
+    expect(env).toContain('E2E_MODE=true');
+  });
+});
+
+// #5266 — `wt-stack test` reads REDIS_PASSWORD this way to hand it to
+// Playwright's globalSetup, which needs it to clear the login rate limiter.
+describe('readStackEnvValue', () => {
+  it('resolves the way compose does: .env.stack overrides .env', () => {
+    writeFileSync(path.join(dir, '.env'), 'REDIS_PASSWORD=from-root\nOTHER=x\n');
+    writeFileSync(path.join(dir, '.env.stack'), 'REDIS_PASSWORD=from-stack\n');
+    expect(readStackEnvValue(dir, 'REDIS_PASSWORD')).toBe('from-stack');
+    expect(readStackEnvValue(dir, 'OTHER')).toBe('x');
+  });
+
+  it('falls back to .env when the key is only there, and strips quotes', () => {
+    writeFileSync(path.join(dir, '.env'), 'REDIS_PASSWORD="quoted pw"\n');
+    writeFileSync(path.join(dir, '.env.stack'), 'UNRELATED=1\n');
+    expect(readStackEnvValue(dir, 'REDIS_PASSWORD')).toBe('quoted pw');
+  });
+
+  it('strips a trailing inline comment from an unquoted value but not from a quoted one', () => {
+    writeFileSync(
+      path.join(dir, '.env'),
+      'REDIS_PASSWORD=plain-pw   # the redis password\nHASHY="pw # not a comment"\nNOSPACE=a#b\n'
+    );
+    expect(readStackEnvValue(dir, 'REDIS_PASSWORD')).toBe('plain-pw');
+    expect(readStackEnvValue(dir, 'HASHY')).toBe('pw # not a comment');
+    // No preceding whitespace — compose treats this as part of the value.
+    expect(readStackEnvValue(dir, 'NOSPACE')).toBe('a#b');
+  });
+
+  it('returns undefined for a missing key, a commented-out key, and a missing file', () => {
+    writeFileSync(path.join(dir, '.env'), '# REDIS_PASSWORD=commented\n');
+    expect(readStackEnvValue(dir, 'REDIS_PASSWORD')).toBeUndefined();
+    expect(readStackEnvValue(dir, 'NOPE')).toBeUndefined();
+  });
+});

@@ -1,0 +1,593 @@
+package desktop
+
+import (
+	"fmt"
+	"image"
+	"log/slog"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/pion/webrtc/v4"
+
+	"github.com/breeze-rmm/agent/internal/remote/clipboard"
+)
+
+const (
+	defaultFrameRate = 30
+	maxFrameRate     = 60
+
+	iceGatherTimeout = 5 * time.Second
+)
+
+// captureMode indicates which capture strategy to use. Returned by the
+// individual loop functions so the top-level captureLoop can switch modes
+// without recursive calls (which would grow the stack on repeated switches).
+type captureMode int
+
+const (
+	captureModeDXGI    captureMode = iota // tight-loop DXGI capture
+	captureModeTicker                     // ticker-paced GDI/macOS/Linux capture
+	captureModeStopped                    // session closed
+)
+
+// Session represents a remote desktop WebRTC session with H264 encoding.
+type Session struct {
+	id            string
+	peerConn      *webrtc.PeerConnection
+	videoTrack    *webrtc.TrackLocalStaticSample
+	dataChannel   *webrtc.DataChannel
+	inputHandler  InputHandler
+	capturer      ScreenCapturer
+	encoder       atomic.Pointer[VideoEncoder]
+	encoderPF     PixelFormat // cached encoder input format for CPU Encode() path
+	clipboardSync *clipboard.ClipboardSync
+	cursorDC      *webrtc.DataChannel
+	controlDC     *webrtc.DataChannel
+	audioTrack    *webrtc.TrackLocalStaticSample
+	audioCapturer AudioCapturer
+	audioEnabled  atomic.Bool
+	done          chan struct{}
+	mu            sync.RWMutex
+	isActive      bool
+	fps           int
+	// stopReason is the short, technician-facing text describing why teardown
+	// happened, set by StopWithReason (#5300). Empty for a plain Stop() call
+	// (operator-initiated stop, lifetime policy, peer disconnect) — callers
+	// fall back to the generic ended-session text in that case, same as the
+	// startup probe path does when describeCaptureFailure has nothing to add.
+	stopReason  string
+	cleanupOnce sync.Once
+	stopOnce    sync.Once
+	startOnce   sync.Once
+	wg          sync.WaitGroup
+
+	// Optimized pipeline components (shared with WS path)
+	differ   *frameDiffer
+	cursor   *cursorOverlay
+	metrics  *StreamMetrics
+	adaptive *AdaptiveBitrate
+
+	// clickFlush is set by handleInputMessage on mouse_down. The capture loop
+	// checks and clears it before encoding, flushing the MFT pipeline so that
+	// stale animation frames are dropped and the click result appears immediately.
+	clickFlush atomic.Bool
+
+	// inputActive is set by handleInputMessage on ANY input event (mouse_move,
+	// key_down, etc.). The capture loop checks and clears it to exit idle mode
+	// immediately when the user is interacting, even without screen changes.
+	inputActive atomic.Bool
+
+	// cursorStreamEnabled gates cursor polling + datachannel sends.
+	// Disabled by default; viewer can toggle via control message.
+	cursorStreamEnabled atomic.Bool
+
+	// localInputBlocked tracks whether THIS session currently holds a local-input
+	// block reference with the InputBlockManager (issue #966). It guards the
+	// refcount so that repeated block_local_input toggles and the session-end
+	// cleanup each adjust the manager's refcount at most once per session.
+	// Disabled by default; viewer engages via the block_local_input control msg.
+	localInputBlocked atomic.Bool
+
+	// capturerSwapped is set by switch_monitor. The capture loop checks and
+	// clears it to re-read s.capturer and reinitialize GPU pipeline state.
+	capturerSwapped atomic.Bool
+	// oldCapturers holds previous capturers after monitor switches so the
+	// capture loop can close them safely after confirming the swap. A slice
+	// prevents leaking capturers if multiple switches arrive before the
+	// capture loop drains the swap.
+	oldCapturers []ScreenCapturer
+
+	// gpuEncodeErrors tracks consecutive GPU encode failures. The GPU path
+	// is only permanently disabled after 3+ consecutive errors to allow the
+	// MFT to warm up after a monitor switch (first frame often fails).
+	gpuEncodeErrors int
+
+	// cpuEncodeErrors tracks consecutive CPU encode failures. After 5+
+	// failures (e.g., VideoToolbox stalling on older Intel Macs), the
+	// encoder is swapped to software (OpenH264) mid-session.
+	cpuEncodeErrors int
+
+	// hwRestore governs retrying the hardware encoder after a software
+	// fallback. On macOS, VideoToolbox can stall on a cold first frame and get
+	// demoted to OpenH264; since the CPU capture path has no Windows-style
+	// hardware-restore trigger, this periodically tries to swap back so a
+	// transient stall doesn't pin a CPU core software-encoding 5K for the whole
+	// session. Driven from the ticker capture loop. See session_encoder_restore.go.
+	hwRestore hardwareRestorePolicy
+
+	// cursorOffsetX/Y store the active monitor's virtual desktop origin so
+	// cursorStreamLoop can convert absolute GetCursorInfo coords to
+	// display-relative coords before sending to the viewer.
+	cursorOffsetX atomic.Int32
+	cursorOffsetY atomic.Int32
+
+	frameIdx uint64
+
+	// sasHandler is set from SessionManager.OnSASRequest during creation.
+	sasHandler func() error
+
+	// displayIndex is the monitor index this session was started on.
+	displayIndex int
+	// captureConfig stores the context needed to recreate capturers on monitor switches.
+	captureConfig CaptureConfig
+	// gpuVendor is the GPU vendor hint ("amd", "nvidia", "") used to pick
+	// the vendor-specific hardware encoder. Carried from SessionManager so
+	// handleDesktopSwitch can recreate a hardware encoder when the session
+	// transitions from a secure desktop (Winlogon) back to Default.
+	gpuVendor string
+
+	// Cached encoded H264 frame used as a fallback resend source when secure
+	// desktop capture yields temporary no-frame periods.
+	lastEncodedMu    sync.RWMutex
+	lastEncodedFrame []byte
+	// Nanoseconds since epoch of the last successful video sample write. NOTE:
+	// this is ALSO bumped by the idle capture-alive heartbeat (which writes no
+	// sample) to keep the no-video watchdog quiet, so it is NOT a reliable
+	// "when did we last emit a frame" signal — use lastSampleNanos for that.
+	lastVideoWriteUnixNano atomic.Int64
+	// lastSampleNanos is the wall-clock nanos of the last actual RTP sample
+	// WriteSample (never bumped by the idle heartbeat). Drives sampleDuration so
+	// the RTP media clock reflects true inter-frame wall time across idle gaps.
+	lastSampleNanos atomic.Int64
+
+	// lastInputUnixNano is the wall-clock nanos of the most recent INPUT event
+	// (mouse/keyboard) from the viewer. It drives the idle-session watchdog
+	// (finding #2). Only genuine operator input resets it — control-channel
+	// traffic (e.g. the viewer's automated ~1s viewer_stats heartbeat) is NOT a
+	// presence signal and must not reset it, otherwise an unattended-but-open
+	// viewer would never idle out and the idle timeout would be defeated.
+	// Updated via recordInputActivity().
+	lastInputUnixNano atomic.Int64
+
+	// leaseState tracks this session's revocation lease: the latest expiry and
+	// hard deadline, plus whether the control plane revoked it. Never nil for a
+	// session created by StartSession (a start without a lease is refused).
+	leaseState *revocationLeaseState
+}
+
+// SessionManager manages remote desktop sessions
+type SessionManager struct {
+	sessions  map[string]*Session
+	mu        sync.RWMutex
+	config    CaptureConfig
+	gpuVendor string // "nvidia", "amd", "intel", or "" for auto-detect
+
+	// startMu serializes StartSession calls so concurrent retries that share
+	// the same commandId/sessionID can't interleave their unlocked setup
+	// phases and leave two live Session objects in the process (only one of
+	// which is in m.sessions). The full body of StartSession runs under this
+	// lock; m.mu is reserved for the map + config, so reads/stops remain
+	// responsive while a start is in progress.
+	startMu sync.Mutex
+
+	// OnSASRequest is called when a viewer requests Ctrl+Alt+Del. In service
+	// mode the helper sets this to route the request via IPC to the SCM service
+	// which can call SendSAS(FALSE). In direct mode it defaults to InvokeSAS().
+	OnSASRequest func() error
+
+	// clock is the watchdog's time source; nil means the real clock. Only
+	// tests set it (see watchdogClock), and only BEFORE starting the watchdog
+	// goroutine — the go statement is what publishes it safely. Reassigning it
+	// while a watchdog is running would be a data race.
+	clock *watchdogClock
+
+	// RequestRevocationLeaseRenew, if set, asks the control plane to renew the
+	// revocation lease for a session. Set by the layer that owns the agent's
+	// command WebSocket (the heartbeat), because this package has no transport
+	// of its own. Fire-and-forget: the answer arrives asynchronously and is
+	// applied via ApplyRevocationLease / RevokeSession.
+	RequestRevocationLeaseRenew func(sessionID string)
+
+	// OnSessionStopped is called when a WebRTC peer connection transitions to
+	// Failed or Closed. Used to notify the API so it can mark the session as
+	// disconnected and allow reconnection.
+	//
+	// reason is the session's LastStopReason() at the time this fires (#5300)
+	// — "" for every stop path except the no-video watchdog, which records the
+	// swallowed capture error via StopWithReason. Safe to read here: by the
+	// time a call site below invokes this, Session.Stop/StopWithReason has
+	// already returned (called synchronously, earlier in the same call chain),
+	// so the reason is fully committed under s.mu before this ever reads it.
+	OnSessionStopped func(sessionID, reason string)
+
+	// OnSessionStarted is the symmetric hook: called when a WebRTC peer
+	// connection reaches Connected, i.e. the viewer is actually watching.
+	// Quick Support uses it to tell the end user "Technician connected."
+	// Invoked on its own goroutine, like OnSessionStopped.
+	OnSessionStarted func(sessionID string)
+
+	// lastDesktopState caches the most recently broadcast desktop state so
+	// late-connecting viewers can receive an initial state when their control
+	// channel opens. Protected by mu.
+	lastDesktopState    string
+	lastDesktopUsername string
+}
+
+// NewSessionManager creates a new session manager.
+// Eagerly loads OpenH264 in the background so the DLL is ready before
+// the first desktop session (avoids download timeout during IPC).
+func NewSessionManager() *SessionManager {
+	go PreloadOpenH264()
+	return &SessionManager{
+		sessions: make(map[string]*Session),
+		config:   DefaultConfig(),
+	}
+}
+
+func (m *SessionManager) SetCaptureConfig(config CaptureConfig) {
+	m.mu.Lock()
+	m.config = config
+	m.mu.Unlock()
+}
+
+func (m *SessionManager) CaptureConfig() CaptureConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.config
+}
+
+// SetGPUVendor sets the GPU vendor hint used when creating the video encoder.
+// Valid values: "nvidia", "amd", "intel", or "" for auto-detect.
+func (m *SessionManager) SetGPUVendor(vendor string) {
+	m.mu.Lock()
+	m.gpuVendor = vendor
+	m.mu.Unlock()
+}
+
+// HasActiveSessions reports whether any desktop session is currently active.
+func (m *SessionManager) HasActiveSessions() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		s.mu.RLock()
+		active := s.isActive
+		s.mu.RUnlock()
+		if active {
+			return true
+		}
+	}
+	return false
+}
+
+// SetAtLoginWindow updates the login-window input mode on all active sessions.
+// Called when the macOS console user changes.
+func (m *SessionManager) SetAtLoginWindow(atLoginWindow bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.sessions {
+		s.inputHandler.SetAtLoginWindow(atLoginWindow)
+	}
+}
+
+// ICEServerConfig represents an ICE server from the API payload.
+type ICEServerConfig struct {
+	// URLs can be a string or []string in the API payload, so we use interface{}
+	// and handle both cases in parseICEServers.
+	URLs       interface{} `json:"urls"`
+	Username   string      `json:"username,omitempty"`
+	Credential string      `json:"credential,omitempty"`
+}
+
+// parseICEServers converts API ICE server configs into pion ICEServer structs.
+func parseICEServers(raw []ICEServerConfig) []webrtc.ICEServer {
+	if len(raw) == 0 {
+		return []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
+	}
+
+	servers := make([]webrtc.ICEServer, 0, len(raw))
+	for _, s := range raw {
+		var urls []string
+		switch v := s.URLs.(type) {
+		case string:
+			urls = []string{v}
+		case []string:
+			urls = append(urls, v...)
+		case []interface{}:
+			for _, u := range v {
+				if str, ok := u.(string); ok {
+					urls = append(urls, str)
+				}
+			}
+		}
+		if len(urls) == 0 {
+			continue
+		}
+		server := webrtc.ICEServer{URLs: urls}
+		if s.Username != "" {
+			server.Username = s.Username
+			server.Credential = s.Credential
+			server.CredentialType = webrtc.ICECredentialTypePassword
+		}
+		servers = append(servers, server)
+	}
+	if len(servers) == 0 {
+		return []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
+	}
+	return servers
+}
+
+// CaptureScreenshot captures a single frame from the active session's capturer.
+// This allows AI tools (take_screenshot, computer_action) to reuse the existing
+// DXGI/ScreenCaptureKit capturer instead of creating a new one, which would
+// conflict with the WebRTC session's capture pipeline (destroying shared global
+// C state on Close()).
+// Returns ErrNoActiveSession if no session is currently streaming.
+func (m *SessionManager) CaptureScreenshot(displayIndex int) (*image.RGBA, int, int, error) {
+	m.mu.RLock()
+	var target, fallback *Session
+	for _, s := range m.sessions {
+		s.mu.RLock()
+		active := s.isActive
+		idx := s.displayIndex
+		s.mu.RUnlock()
+		if !active {
+			continue
+		}
+		if idx == displayIndex {
+			target = s
+			break
+		}
+		if fallback == nil {
+			fallback = s
+		}
+	}
+	if target == nil && fallback != nil {
+		fallback.mu.RLock()
+		actualIdx := fallback.displayIndex
+		fallback.mu.RUnlock()
+		slog.Warn("CaptureScreenshot: no session on requested display, using fallback",
+			"requestedDisplay", displayIndex, "actualDisplay", actualIdx)
+		target = fallback
+	}
+	m.mu.RUnlock()
+
+	if target == nil {
+		return nil, 0, 0, ErrNoActiveSession
+	}
+
+	// Force a desktop repaint so DXGI has a dirty frame, then capture it.
+	// The streaming loop runs at 60fps and consumes DXGI frames before
+	// a one-shot Capture() can grab one, so we force new content.
+	forceDesktopRepaint()
+
+	target.mu.RLock()
+	cap := target.capturer
+	target.mu.RUnlock()
+
+	if cap == nil {
+		return nil, 0, 0, ErrNoActiveSession
+	}
+
+	// Retry a few times — the repaint needs a moment to produce a DXGI frame.
+	var img *image.RGBA
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		img, err = cap.Capture()
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("capture from active session: %w", err)
+		}
+		if img != nil {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if img == nil {
+		return nil, 0, 0, fmt.Errorf("capture from active session: no frame after retries")
+	}
+
+	w, h, err := cap.GetScreenBounds()
+	if err != nil {
+		w = img.Bounds().Dx()
+		h = img.Bounds().Dy()
+	}
+
+	return img, w, h, nil
+}
+
+// StopSession stops and removes a session
+func (m *SessionManager) StopSession(sessionID string) {
+	m.mu.Lock()
+	session, ok := m.sessions[sessionID]
+	if ok {
+		delete(m.sessions, sessionID)
+	}
+	m.mu.Unlock()
+
+	if session != nil {
+		session.Stop()
+	}
+}
+
+// StopAllSessions tears down all active desktop sessions.
+func (m *SessionManager) StopAllSessions() {
+	m.mu.Lock()
+	sessions := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		sessions = append(sessions, s)
+	}
+	m.sessions = make(map[string]*Session)
+	m.mu.Unlock()
+
+	for _, s := range sessions {
+		s.Stop()
+	}
+}
+
+// maxStopReasonBytes bounds the text StopWithReason records. Every source we
+// feed it (gdiCallError's Win32 text, describeCaptureFailure's wrapping) is
+// already short by construction, but the bound is enforced here — not left to
+// callers — so a future caller cannot regress it. Mirrors the ~400-byte bar
+// describeCaptureFailure is held to on the startup path (#5284/#5295).
+const maxStopReasonBytes = 300
+
+// Stop tears down the session with no specific reason recorded. Existing
+// call sites (operator-initiated stop, lifetime-policy expiry, peer
+// disconnect) are unaffected — LastStopReason() reads back empty, and callers
+// fall back to the generic ended-session text.
+func (s *Session) Stop() {
+	s.StopWithReason("")
+}
+
+// StopWithReason tears down the session, recording reason as the short,
+// technician-facing explanation for why it ended.
+//
+// This exists for #5300: the no-video watchdog (session_capture.go) used to
+// call Stop() with nothing, so a mid-session capture failure left the viewer
+// with the same generic "This remote session has ended" text regardless of
+// cause — while the startup probe path (#5284/#5295) already attaches the
+// real Win32 error via describeCaptureFailure. StopWithReason gives teardown
+// the same channel: pass the swallowed capture error (see noVideoStopReason)
+// when one is known, or "" to fall back to the generic text, same as the
+// probe path does when describeCaptureFailure has nothing to add.
+//
+// reason should already be short and free of OS handle values — the same bar
+// gdiCallError's text is held to — but it is truncated defensively regardless.
+//
+// stopOnce means only the first caller's reason is ever recorded — a second,
+// concurrent StopWithReason (e.g. an operator-initiated Stop() racing the
+// no-video watchdog) never runs this body at all. That second reason is not
+// silently dropped: it's logged at Debug below so a real failure reason lost
+// to that race is still visible to anyone reading agent logs, even though it
+// never reaches LastStopReason().
+func (s *Session) StopWithReason(reason string) {
+	if len(reason) > maxStopReasonBytes {
+		reason = reason[:maxStopReasonBytes]
+	}
+	ran := false
+	s.stopOnce.Do(func() {
+		ran = true
+		s.mu.Lock()
+		if !s.isActive {
+			s.mu.Unlock()
+			return
+		}
+		s.isActive = false
+		s.stopReason = reason
+		s.mu.Unlock()
+
+		close(s.done)
+
+		// Close peer connection early to unblock any RTCP reads.
+		if s.peerConn != nil {
+			_ = s.peerConn.Close()
+		}
+
+		// Wait for loops we started to exit before tearing down encoder/capturer.
+		s.wg.Wait()
+
+		s.doCleanup()
+
+		snap := s.metrics.Snapshot()
+		logArgs := []any{
+			"session", s.id,
+			"totalCaptured", snap.FramesCaptured,
+			"totalSent", snap.FramesSent,
+			"totalSkipped", snap.FramesSkipped,
+			"uptime", snap.Uptime.Round(time.Second),
+			"reason", reason,
+		}
+		if reason != "" {
+			// A recorded reason means teardown was triggered by a real
+			// failure (currently: the no-video watchdog), not a routine
+			// stop — log it at a level that stands out from normal teardown.
+			slog.Warn("Desktop WebRTC session stopped", logArgs...)
+		} else {
+			slog.Info("Desktop WebRTC session stopped", logArgs...)
+		}
+
+		// Desktop sessions allocate large buffers (DXGI textures, NV12
+		// staging, RGBA frames). Return memory to the OS promptly rather
+		// than waiting for the next GC cycle.
+		debug.FreeOSMemory()
+	})
+	if !ran && reason != "" {
+		slog.Debug("Desktop session already stopping; discarding late stop reason",
+			"session", s.id,
+			"discardedReason", reason,
+			"recordedReason", s.LastStopReason(),
+		)
+	}
+}
+
+// LastStopReason returns the reason the most recent StopWithReason call
+// recorded, or "" when the session hasn't stopped yet or was stopped via the
+// plain zero-arg Stop(). Safe to call before, during, or after teardown.
+func (s *Session) LastStopReason() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.stopReason
+}
+
+func (s *Session) doCleanup() {
+	s.cleanupOnce.Do(func() {
+		if s.audioCapturer != nil {
+			s.audioCapturer.Stop()
+		}
+		if s.clipboardSync != nil {
+			s.clipboardSync.Stop()
+		}
+		if s.cursorDC != nil {
+			s.cursorDC.Close()
+		}
+		s.clearCachedEncodedFrame()
+		if enc := s.encoder.Load(); enc != nil {
+			enc.Close()
+		}
+		for _, oc := range s.oldCapturers {
+			oc.Close()
+		}
+		s.oldCapturers = nil
+		if s.capturer != nil {
+			s.capturer.Close()
+		}
+		if s.peerConn != nil {
+			s.peerConn.Close()
+		}
+
+		if err := GetWallpaperManager().Restore(); err != nil {
+			slog.Warn("Failed to restore wallpaper", "session", s.id, "error", err.Error())
+		}
+
+		// Auto-release any local-input block this session engaged (issue #966).
+		// CompareAndSwap ensures we only decrement the manager's refcount if this
+		// session was actually holding a block — never leave the local user
+		// locked out after a session ends.
+		if s.localInputBlocked.CompareAndSwap(true, false) {
+			if err := GetInputBlockManager().Release(); err != nil {
+				slog.Warn("Failed to release local-input block", "session", s.id, "error", err.Error())
+			}
+		}
+	})
+}
+
+func (s *Session) getFPS() int {
+	s.mu.RLock()
+	fps := s.fps
+	s.mu.RUnlock()
+	if fps <= 0 {
+		fps = defaultFrameRate
+	}
+	return clampInt(fps, 1, maxFrameRate)
+}

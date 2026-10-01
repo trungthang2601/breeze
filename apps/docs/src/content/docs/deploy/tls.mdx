@@ -1,0 +1,173 @@
+---
+title: TLS & Reverse Proxy
+description: Configure TLS and reverse proxying for Breeze RMM with Caddy or Nginx, including certificates, WebSocket proxying, and security headers.
+sidebar:
+  order: 3
+  label: "TLS & Reverse Proxy"
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+## Caddy (Default)
+
+Breeze ships with Caddy as the default reverse proxy. It automatically provisions TLS certificates from Let's Encrypt.
+
+### Production Caddyfile
+
+Caddy's configuration lives in one canonical file, `docker/Caddyfile.prod`, which every Breeze compose file mounts read-only into the container (`./docker/Caddyfile.prod:/etc/caddy/Caddyfile:ro`) — there is no separate config generated inline, and no other Caddyfile to keep in sync. Edit that file directly if you need to add a route.
+
+Routing is more than a two-way split between `web` and `api`. In match order, the file routes:
+
+| Path | Destination | Notes |
+|---|---|---|
+| `/api/v1/mcp/sse`, `/api/v1/helper/chat/sessions/*/messages`, `/api/v1/ai/sessions/*/stream` | `api:3001` | SSE/streaming — no compression, no buffering |
+| `/api/v1/auth/billing-init` | `billing:3002` | Billing auth init |
+| `/activate/complete`, `/activate/*` (with a `status` query) | `web:4321` | Account-activation pages |
+| `/oauth/consent`, `/oauth/consent/*` | `web:4321` | OAuth consent UI — matched before the API's `/oauth/*` block |
+| `/oauth/*`, the OAuth `.well-known` endpoints | `api:3001` | OAuth provider (authorize, token, registration, discovery) |
+| `/billing/invoices*`, `/billing/quotes*` | `web:4321` | MSP invoicing/quotes UI — matched before the billing sidecar |
+| `/billing`, `/billing/*` | `billing:3002` | Hosted billing UI sidecar |
+| `/portal`, `/portal/*` | `portal:4322` | Customer portal |
+| `/api/*`, `/s/*`, `/health*`, `/ready`, `/metrics/*`, `/i/*` | `api:3001` | General API traffic. Also normalizes the client-certificate assertion headers used by agent mTLS — see [Certificate Pinning & mTLS](/security/mtls/) |
+| everything else | `web:4321` | Dashboard (catch-all) |
+
+The same security headers shown below are set globally on every response.
+
+### How It Works
+
+1. Set `BREEZE_DOMAIN` and `ACME_EMAIL` in your `.env.prod`
+2. Ensure port 80 and 443 are open and DNS points to your server
+3. Caddy requests a certificate from Let's Encrypt on first start
+4. Certificates auto-renew 30 days before expiry
+
+### Internal CA for domains Let's Encrypt cannot reach
+
+If your Breeze domain is an internal name that only resolves on your LAN or VPN, or a host whose ports 80 and 443 are not open to the internet, Let's Encrypt cannot validate it. Left alone, the failed certificate order aborts the TLS handshake and the browser reports `ERR_SSL_PROTOCOL_ERROR` with nothing to click through — which reads like a broken deployment rather than a certificate problem.
+
+Set `CADDY_LOCAL_CERTS` to the literal value `local_certs` and Caddy issues from its own internal certificate authority instead of trying Let's Encrypt:
+
+```bash
+# .env.prod
+CADDY_LOCAL_CERTS=local_certs
+```
+
+Browsers will warn on the self-issued certificate until you trust the internal root on each client machine. Export it with:
+
+```bash
+docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
+```
+
+Leave the variable empty for any internet-reachable deployment. You do not need it for `localhost` or a bare IP address, which Caddy already self-signs.
+
+### WebSocket Proxying
+
+Caddy automatically handles WebSocket upgrade for:
+- Agent connections at `/api/v1/agent-ws/:id/ws`
+- Remote desktop / terminal sessions at `/api/v1/remote/sessions/:id/ws`, `/api/v1/desktop-ws/*`, and `/api/v1/tunnel-ws/*`
+- The one-time-ticket event stream at `/api/v1/events/ws`
+
+It also disables buffering (but does not upgrade the connection) for the SSE endpoints used by MCP and streaming AI chat: `/api/v1/mcp/sse`, `/api/v1/helper/chat/sessions/*/messages`, and `/api/v1/ai/sessions/*/stream`.
+
+No additional configuration needed.
+
+## Nginx (Alternative)
+
+If you prefer nginx, here's an equivalent configuration.
+
+<Aside type="caution" title="The upstream ports below are not published by default">
+  The shipped `docker-compose.yml` publishes host ports for **Caddy only** (`80` and `443`). The `api` (3001), `web` (4321) and `portal` (4322) containers are reachable on the compose network but not from the host, so an nginx (or Nginx Proxy Manager) upstream of `127.0.0.1:4322` returns **502** until you either:
+
+  - **Front Caddy instead** (recommended) — point nginx at `http://127.0.0.1:80` as a single upstream with WebSocket support, and set `CADDY_SITE_ADDRESS=:80` in `.env` so Caddy stays in plain-HTTP mode behind your TLS terminator. Caddy already routes `/api/*`, `/portal/*` and the dashboard, and it is the configuration tested every release. This is the same arrangement as [Cloudflare Tunnel, Option A](/deploy/cloudflare-tunnel/).
+  - **Publish the ports** — add a `docker-compose.override.yml` with `ports:` entries for `api` (`3001:3001`), `web` (`4321:4321`) **and** `portal` (`4322:4322`), then use the per-path config below. If you publish only api and web, everything works except `/portal`, which 502s.
+</Aside>
+
+<Tabs>
+  <TabItem label="nginx + certbot">
+    ```nginx
+    server {
+        listen 80;
+        server_name breeze.yourdomain.com;
+        return 301 https://$host$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name breeze.yourdomain.com;
+
+        ssl_certificate /etc/letsencrypt/live/breeze.yourdomain.com/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/breeze.yourdomain.com/privkey.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+
+        # Security headers
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+        # API routes
+        location /api/ {
+            proxy_pass http://127.0.0.1:3001;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # WebSocket support
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_read_timeout 86400s;
+        }
+
+        location /health {
+            proxy_pass http://127.0.0.1:3001;
+        }
+
+        # Customer portal (Astro SSR on :4322 under the /portal base path). This
+        # mirrors Caddy's `path /portal /portal/*`: an exact match for /portal
+        # plus a prefix match for everything under it (so it can't also grab an
+        # unrelated path like /portalX). The portal emits /portal-prefixed URLs,
+        # so keep the prefix — no trailing slash on proxy_pass. Its API calls
+        # stay on the /api/ block above.
+        location = /portal {
+            proxy_pass http://127.0.0.1:4322;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /portal/ {
+            proxy_pass http://127.0.0.1:4322;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Web dashboard
+        location / {
+            proxy_pass http://127.0.0.1:4321;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside type="caution">
+  When using nginx instead of Caddy, remove the `caddy` service from `docker-compose.yml` and set `TRUST_PROXY_HEADERS=true` in your `.env`.
+</Aside>
+
+## Security Headers
+
+Both configurations include these security headers:
+
+| Header | Value | Purpose |
+|---|---|---|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` | Force HTTPS for 1 year |
+| `X-Content-Type-Options` | `nosniff` | Prevent MIME sniffing |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Control referrer information |

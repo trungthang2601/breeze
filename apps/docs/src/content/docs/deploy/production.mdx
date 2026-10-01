@@ -1,0 +1,314 @@
+---
+title: Production Deployment
+description: Deploy Breeze RMM to production with Docker Compose. Covers Caddy automatic TLS, API, dashboard, customer portal, PostgreSQL, Redis, and monitoring.
+sidebar:
+  order: 1
+  label: Production Deploy
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Breeze ships as pre-built Docker images on GitHub Container Registry. A single `docker compose up -d` brings up a fully working production stack with automatic TLS.
+
+## What Gets Deployed
+
+The core stack (`docker-compose.yml`) includes:
+
+| Service | Image | Purpose |
+|---|---|---|
+| **Binaries Init** | `ghcr.io/lanternops/breeze/binaries` | Copies agent/viewer binaries to a shared volume, then exits |
+| **Caddy** | `caddy:2.8-alpine` | Reverse proxy, auto-TLS, security headers |
+| **API** | `ghcr.io/lanternops/breeze/api` | Hono API server |
+| **Web** | `ghcr.io/lanternops/breeze/web` | Astro SSR dashboard |
+| **Portal** | `ghcr.io/lanternops/breeze/portal` | Astro SSR customer portal, served under `/portal` (see [Customer Portal](/features/portal/)) |
+| **PostgreSQL** | `pgvector/pgvector:pg16` | Primary database |
+| **Redis** | `redis:7-alpine` | Job queue, caching, rate limiting |
+| **Coturn** | `coturn/coturn:4-alpine` | TURN relay server for WebRTC remote desktop (opt-in via `--profile turn`) |
+
+The `pgvector` extension is required **only if you enable the Workspace built-in** (`BREEZE_WORKSPACE_ENABLED=true`), which uses it for content embeddings. Workspace ships inside the API image but is off by default: with the flag unset, no Workspace migrations run and any Postgres 16 image works. The bundled `POSTGRES_IMAGE_REF` default is pgvector-capable regardless, so enabling Workspace later needs no database swap — supply your own Postgres image and you must provide `pgvector` yourself before setting the flag, or the API will fail to start with `extension "vector" is not available`.
+
+<Aside type="caution" title="Do not swap Postgres images over an existing data volume">
+`postgres:16-alpine` is built against **musl**; `pgvector/pgvector:pg16` is built against **glibc**. Starting one image over a data directory initialized by the other produces a **collation version mismatch**: Postgres warns at startup, and every text index (including unique constraints on text columns) is potentially inconsistent until rebuilt — which can return wrong rows rather than failing loudly.
+
+If you are already running on a stock image and want Workspace, either:
+
+- dump and restore into a freshly-initialized volume on the new image, or
+- after the first start on the new image, run `REINDEX DATABASE <dbname>;` followed by `ALTER DATABASE <dbname> REFRESH COLLATION VERSION;`.
+
+If you do not need Workspace, keep the Postgres image you are already running.
+</Aside>
+
+An optional monitoring stack (Prometheus, Grafana, Alertmanager, Loki, Promtail, exporters) is available as a separate overlay — see [Monitoring](#adding-monitoring).
+
+An optional **`m365-graph-read-executor`** sidecar (published as `ghcr.io/lanternops/breeze/m365-graph-read-executor`) isolates the Microsoft 365 customer Graph-read certificate and Key Vault access away from the API. It is only exercised when Customer Graph-read consent is enabled (`M365_CUSTOMER_GRAPH_READ_ONBOARDING_ENABLED=true`); otherwise it sits idle and can be left undeployed. It is not part of the bundled compose files by default — see [Customer Microsoft 365 Graph-read consent](/deploy/environment/#customer-microsoft-365-graph-read-consent-optional) for the full variable contract, including the private base URL and read-only signing-key mount it depends on.
+
+<Aside type="note" title="Customer portal lives at /portal">
+The customer portal is served under the `/portal` path on your main domain (for example `https://breeze.example.com/portal/login`) — no separate hostname or TLS certificate is required. It reaches the API on the same origin, so there is no extra CORS configuration. Set `PUBLIC_PORTAL_URL` (default `https://${BREEZE_DOMAIN}/portal`) so customer-facing links in emails resolve correctly. If you maintain a **custom Compose file**, a `BREEZE_VERSION` bump alone won't add the portal — make sure the `portal` service and the Caddy `/portal` route are present, then `docker compose up -d portal && docker compose restart caddy`.
+</Aside>
+
+## Deploy Steps
+
+<Steps>
+
+1. **Prepare the server**
+
+   You need Docker and Docker Compose on a Linux VPS. See [Prerequisites](/getting-started/prerequisites/).
+
+2. **Clone and configure**
+
+   ```bash
+   git clone https://github.com/LanternOps/breeze.git
+   cd breeze
+   cp .env.example .env
+   ```
+
+   <Aside type="note">
+     `git clone` fails with `destination path 'breeze' already exists and is not
+     an empty directory` if you previously ran the
+     [Quickstart](/getting-started/quickstart/) here, which creates its own
+     `breeze/` directory. Stop and remove the old stack first — renaming the
+     directory is **not** enough, because both installs share the container names
+     and the `COMPOSE_PROJECT_NAME=breeze` Docker volumes:
+
+     ```bash
+     cd breeze && docker compose down     # add -v to also discard the test database
+     cd .. && rm -rf breeze               # or move it somewhere outside your working dir
+     ```
+   </Aside>
+
+3. **Set your domain and secrets**
+
+   Edit `.env` and set these required values:
+
+   ```bash
+   BREEZE_DOMAIN=breeze.yourdomain.com
+   ACME_EMAIL=admin@yourdomain.com
+   ```
+
+   Generate all secrets at once. These commands rewrite the placeholder values
+   `.env.example` ships **in place** — do not append a second copy of a key to
+   the end of the file:
+
+   ```bash
+   for key in JWT_SECRET APP_ENCRYPTION_KEY MFA_ENCRYPTION_KEY \
+     ENROLLMENT_KEY_PEPPER MFA_RECOVERY_CODE_PEPPER \
+     METRICS_SCRAPE_TOKEN SESSION_SECRET AGENT_ENROLLMENT_SECRET; do
+     sed -i "s|^${key}=.*|${key}=$(openssl rand -hex 32)|" .env
+   done
+
+   # Canonical base64 decoding to >= 32 bytes; must not reuse JWT_SECRET.
+   # The API refuses to boot in production without this one.
+   sed -i "s|^PARTNER_API_CURSOR_SIGNING_KEY=.*|PARTNER_API_CURSOR_SIGNING_KEY=$(openssl rand -base64 32)|" .env
+
+   POSTGRES_PASSWORD="$(openssl rand -base64 24 | tr -d '/+=')"
+   REDIS_PASSWORD="$(openssl rand -hex 32)"
+   sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${POSTGRES_PASSWORD}|" .env
+   sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${REDIS_PASSWORD}|" .env
+   sed -i "s|^REDIS_URL=.*|REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379|" .env
+   ```
+
+   On macOS, use `sed -i ''` instead of `sed -i`.
+
+   Confirm no required secret was left at its placeholder:
+
+   ```bash
+   grep -nE 'replace-with|generate-a-random|change-in-production|your-super-secret|changeme' .env \
+     | grep -v '^[0-9]*:GRAFANA_ADMIN_PASSWORD='
+   ```
+
+   That should print nothing. `GRAFANA_ADMIN_PASSWORD` is filtered out because it
+   belongs to the optional monitoring stack and is generated in that section
+   below; `TURN_SECRET` is only needed if you enable the TURN profile in step 4.
+
+   Then set these required deployment-mode flags. Without them the API refuses to boot in production:
+
+   ```bash
+   # Self-hosted by default. Set to "true" only if you're running the hosted SaaS edition.
+   IS_HOSTED=false
+
+   # Trust anchor (raw base64 Ed25519 public key) for the official Breeze GitHub
+   # releases. This is a public key — also embedded in the agent and CI — so it is
+   # safe to commit. Leave the default below unless you build and sign your own binaries.
+   RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS=yzx8ftmcls6uBetFC5SYnZhBo+cbur3IX50TbBthTso=
+   ```
+
+   Then set the initial admin account. The API creates it automatically the
+   first time it starts against an empty database — in production this is
+   **required**: without both variables set, that first-boot seed throws and
+   the API crash-loops instead of starting.
+
+   ```bash
+   BREEZE_BOOTSTRAP_ADMIN_EMAIL=you@yourdomain.com
+   BREEZE_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+   ```
+
+   <Aside type="caution">
+     The password must be at least 16 characters and can't look like a
+     placeholder (`changeme`, `password`, `change-in-production`, etc.) — the
+     API rejects it and refuses to start otherwise. Rotate it after your first
+     login.
+   </Aside>
+
+   If Breeze is behind a reverse proxy, also set `TRUST_PROXY_HEADERS=true` and list the proxy's CIDRs in `TRUSTED_PROXY_CIDRS`. See [Environment Variables](/deploy/environment/) for details.
+
+4. **Configure TURN server**
+
+   The TURN server enables remote desktop connectivity across NATs and firewalls. Set the server's public IP address:
+
+   ```bash
+   # Set to this server's public IP address (required for remote desktop)
+   TURN_HOST=203.0.113.10
+
+   # Optional: TURN realm (defaults to breeze.local)
+   TURN_REALM=breeze.local
+   ```
+
+   Generate the shared secret coturn uses to mint credentials:
+
+   ```bash
+   sed -i "s|^TURN_SECRET=.*|TURN_SECRET=$(openssl rand -hex 32)|" .env
+   ```
+
+   Coturn is behind a Docker Compose profile and does not start by default. To enable it:
+
+   ```bash
+   docker compose --profile turn up -d
+   ```
+
+   Or add `COMPOSE_PROFILES=turn` to your `.env` file for persistent activation.
+
+   <Aside type="note">
+     Skipping remote desktop? Leave `TURN_HOST` and `TURN_SECRET` blank — the rest
+     of the stack starts without them. If you *do* enable the profile, coturn
+     refuses to start on an empty `TURN_SECRET` rather than running as an open
+     relay, since an empty shared secret makes TURN credentials forgeable.
+   </Aside>
+
+
+   <Aside type="tip">
+     If your server is behind **Cloudflare Tunnel** or another HTTP-only proxy, TURN cannot run on the same host because it requires UDP. Deploy TURN on a separate VPS instead — see [TURN Server](/deploy/turn-server/) for a step-by-step guide.
+   </Aside>
+
+5. **Start the stack**
+
+   ```bash
+   docker compose up -d
+   ```
+
+   That's it. On first start, the API container automatically runs database migrations and seeds the initial admin user with the `BREEZE_BOOTSTRAP_ADMIN_EMAIL`/`BREEZE_BOOTSTRAP_ADMIN_PASSWORD` you set in step 3. Caddy obtains a TLS certificate from Let's Encrypt.
+
+6. **Verify the deployment**
+
+   ```bash
+   # Check health
+   curl https://breeze.yourdomain.com/health
+
+   # Check running containers
+   docker compose ps
+
+   # View API logs
+   docker compose logs -f api
+   ```
+
+</Steps>
+
+<Aside type="tip">
+  The API auto-migrates the database on startup by default. To manage migrations manually, set `AUTO_MIGRATE=false` in `.env` and run migrations from the host or a one-off container.
+</Aside>
+
+## Adding Monitoring
+
+The monitoring stack lives in a separate compose overlay file (`docker-compose.monitoring.yml`) and includes Prometheus, Grafana, Alertmanager, Loki, Promtail, and database exporters.
+
+To deploy with monitoring:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+```
+
+Add a Grafana password to `.env`:
+
+```bash
+GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 16 | tr -d '/+=')
+```
+
+Grafana is available at `http://127.0.0.1:3000` (localhost only by default).
+
+## Pinning a Version
+
+`.env.example` ships with an explicit `BREEZE_VERSION` pin, so a fresh deployment is already pinned. Change it deliberately when you upgrade. There is no `latest` fallback: every image reference in `docker-compose.yml` is digest/tag-pinned and required, so clearing `BREEZE_VERSION` (or any of the `*_IMAGE_REF` variables) makes `docker compose` refuse to run at all, with an error like `Set BREEZE_VERSION in .env`, rather than silently pulling a newer image. To pin to a specific release:
+
+```bash
+# In .env
+BREEZE_VERSION=0.67.1
+```
+
+Then pull and restart:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+### Signed, digest-pinned image references (v0.112.0 and later)
+
+Since v0.112.0 every release publishes a **signed image inventory** — `release-artifact-manifest.json` plus its `.ed25519` signature on the GitHub Release — listing the exact `repository@sha256:…` digest of the API, web, portal and binaries images. `.env.example` now ships the four `BREEZE_*_IMAGE_REF` variables as `@sha256:replace-with-signed-release-digest` placeholders rather than `:${BREEZE_VERSION}` tags, so a fresh install pins to verified digests and a GHCR tag or package page is never the authorization source.
+
+- **Guided installer:** `guided-setup.sh` downloads the inventory for the release you pick, verifies its signature against `RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS`, and fills the four image refs itself. Verification is fail-closed: if it cannot download or verify the inventory, no image is pulled. For a release older than 0.112.0 the installer warns that the release predates signed inventories and falls back to tag-tracking refs.
+- **Manual setup:** resolve the digests yourself with the verifier script that ships with the release, then copy the four lines it emits into `.env`:
+
+  ```bash
+  TAG=v0.112.0   # the release you are pinning
+  curl -fsSLO https://github.com/lanternops/breeze/releases/download/$TAG/release-artifact-manifest.json
+  curl -fsSLO https://github.com/lanternops/breeze/releases/download/$TAG/release-artifact-manifest.json.ed25519
+  curl -fsSLO https://raw.githubusercontent.com/lanternops/breeze/$TAG/scripts/release/verify-release-images.sh
+  RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS="$(grep '^RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS=' .env | cut -d= -f2-)" \
+    bash verify-release-images.sh \
+      --manifest release-artifact-manifest.json \
+      --signature release-artifact-manifest.json.ed25519 \
+      --expected-repository lanternops/breeze \
+      --expected-release "$TAG" \
+      --emit-env images.env
+  cat images.env   # BREEZE_API_IMAGE_REF=…@sha256:…, and the web, portal and binaries refs
+  ```
+
+  Repeat this on every upgrade — a digest pin does not follow `BREEZE_VERSION`, so bumping the version alone changes nothing until the four refs are updated too. Keep `BREEZE_VERSION` in step with the pinned release: it still selects the agent release your fleet is offered.
+- **Existing installs** whose `.env` still carries the older `ghcr.io/lanternops/breeze/api:${BREEZE_VERSION}` form keep working; the upgrade guide's `docker compose pull` line is unchanged for them. Switching to digest pins is recommended but not required.
+
+<Aside type="caution" title="Rotating the manifest signing key is a fleet re-enrollment">
+  `RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS` is also the key every enrolled agent pins for its own update manifests, and there is no remote revocation yet — an agent enrolled under the old key keeps trusting it and never learns the new one. Treat a rotation as re-enrolling the fleet; see [Binary Distribution](/deploy/binaries/) and [Key rotation](/deploy/sign-your-own-packages/#key-rotation).
+</Aside>
+
+## Resource Tuning
+
+Override default resource limits via environment variables:
+
+```bash
+# Redis memory limit (default: 256mb)
+REDIS_MAXMEMORY=512mb
+```
+
+### Redis Authentication
+
+Redis password authentication is **required in production**. The API will refuse to start if `REDIS_URL` doesn't carry a password. The secret-generation loop above already produces `REDIS_PASSWORD`; pair it with a `REDIS_URL` that uses it:
+
+```bash
+REDIS_PASSWORD=$(openssl rand -hex 32)
+REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+```
+
+The `docker-compose.yml` passes `REDIS_PASSWORD` to the Redis container automatically. See [Environment Variables](/deploy/environment/) for details.
+
+## Updating
+
+```bash
+cd breeze
+git pull origin main
+docker compose pull
+docker compose up -d
+```
+
+Pre-built images are pulled from GHCR. Database migrations run automatically on startup.
+
+<Aside type="tip">
+  For zero-downtime upgrades, see [Upgrade Guide](/deploy/upgrades/).
+</Aside>

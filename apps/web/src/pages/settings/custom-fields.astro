@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import CustomFieldsPage from '../../components/settings/CustomFieldsPage';
+---
+
+<DashboardLayout titleKey="titles.settingsCustomFields">
+  <CustomFieldsPage client:load />
+</DashboardLayout>

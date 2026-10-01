@@ -1,0 +1,1198 @@
+import { Hono, type Context } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { eq, and, or, isNull, lte, gte, inArray, desc, asc, sql, type SQL } from 'drizzle-orm';
+import { db } from '../db';
+import { maintenanceWindows, maintenanceOccurrences } from '../db/schema/maintenance';
+import { devices } from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import {
+  canManagePartnerWidePolicies,
+  PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+} from '../services/partnerWideAccess';
+import { writeRouteAudit } from '../services/auditEvents';
+import { isDeviceInMaintenance } from '../services/maintenanceService';
+import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import {
+  MAINTENANCE_SITE_SCOPE_MESSAGES,
+  checkMaintenanceTargetsWithinSiteScope,
+  filterWindowsToSiteScope,
+  scopeWindowForRead,
+  type MaintenanceWindowTarget,
+} from '../services/maintenanceSiteScope';
+
+export const maintenanceRoutes = new Hono();
+const requireMaintenanceRead = requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action);
+const requireMaintenanceWrite = requirePermission(PERMISSIONS.DEVICES_WRITE.resource, PERMISSIONS.DEVICES_WRITE.action);
+
+// Helper functions
+async function canAccessOrg(
+  auth: { canAccessOrg: (orgId: string) => boolean },
+  orgId: string
+): Promise<boolean> {
+  return auth.canAccessOrg(orgId);
+}
+
+function resolveOrgId(
+  auth: { scope: string; orgId: string | null; canAccessOrg: (orgId: string) => boolean; accessibleOrgIds: string[] | null },
+  requestedOrgId?: string,
+  requireForNonOrg = false
+) {
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) {
+      return { error: 'Organization context required', status: 403 } as const;
+    }
+
+    if (requestedOrgId && requestedOrgId !== auth.orgId) {
+      return { error: 'Access to this organization denied', status: 403 } as const;
+    }
+
+    return { orgId: auth.orgId } as const;
+  }
+
+  if (requestedOrgId && !auth.canAccessOrg(requestedOrgId)) {
+    return { error: 'Access to this organization denied', status: 403 } as const;
+  }
+
+  if (auth.scope === 'partner' && !requestedOrgId) {
+    const accessibleOrgIds = auth.accessibleOrgIds ?? [];
+    if (!requireForNonOrg && accessibleOrgIds.length === 1) {
+      return { orgId: accessibleOrgIds[0] } as const;
+    }
+    return { error: 'orgId is required when partner has multiple organizations', status: 400 } as const;
+  }
+
+  if (auth.scope === 'system' && !requestedOrgId) {
+    return { error: 'orgId is required for system scope', status: 400 } as const;
+  }
+
+  if (requireForNonOrg && !requestedOrgId) {
+    return { error: 'orgId is required', status: 400 } as const;
+  }
+
+  return { orgId: requestedOrgId ?? auth.orgId ?? null } as const;
+}
+
+// Dual-ownership helpers (#2131). A window is org-owned (orgId set) or
+// partner-wide (orgId NULL, partnerId set).
+
+// Access to a LOADED window row: org-owned keeps the org check; partner-wide
+// rows are visible to system scope and the owning partner's own tokens. Org
+// tokens never see partner-wide windows (RLS is stricter than the app layer).
+function canAccessWindow(
+  auth: AuthContext,
+  window: { orgId: string | null; partnerId: string | null }
+): boolean {
+  if (window.orgId !== null) {
+    return auth.canAccessOrg(window.orgId);
+  }
+  if (auth.scope === 'system') return true;
+  return auth.scope === 'partner' && !!auth.partnerId && window.partnerId === auth.partnerId;
+}
+
+// Site-axis gate (#3654). `canAccessWindow` above is org/partner only, and
+// Postgres RLS does not defend the site axis, so a site-restricted technician
+// could otherwise re-time or delete a window another site's deployment is bound
+// to. Returns a 403 response to return as-is, or null to proceed. Unrestricted
+// callers cost zero queries.
+async function enforceWindowSiteScope(c: Context, target: MaintenanceWindowTarget) {
+  const perms = c.get('permissions') as UserPermissions | undefined;
+  const result = await checkMaintenanceTargetsWithinSiteScope(target, perms);
+  if (result.ok) return null;
+  // Fail closed on a denial that somehow carries no reason: only `ok` may open
+  // the gate, never the absence of an explanation for closing it.
+  return c.json({ error: MAINTENANCE_SITE_SCOPE_MESSAGES[result.reason ?? 'out_of_scope'] }, 403);
+}
+
+function requestPermissions(c: Context): UserPermissions | undefined {
+  return c.get('permissions') as UserPermissions | undefined;
+}
+
+// Window-set condition for an org view: the org's own windows PLUS — for
+// partner-scope callers — their partner-wide windows, which now apply to the
+// org's devices via the enforcement checks.
+function windowOwnershipCondition(auth: AuthContext, orgId: string): SQL {
+  if (auth.scope === 'partner' && auth.partnerId) {
+    return or(
+      eq(maintenanceWindows.orgId, orgId),
+      and(isNull(maintenanceWindows.orgId), eq(maintenanceWindows.partnerId, auth.partnerId))
+    ) as SQL;
+  }
+  return eq(maintenanceWindows.orgId, orgId);
+}
+
+// Validation schemas
+const recurrenceRuleSchema = z.object({
+  interval: z.number().int().positive().optional(),
+  daysOfWeek: z.array(z.number().int().min(0).max(6)).optional(),
+  dayOfMonth: z.number().int().min(1).max(31).optional(),
+  endDate: z.string().datetime().optional(),
+  maxOccurrences: z.number().int().positive().optional()
+}).optional();
+
+const createWindowSchema = z.object({
+  orgId: z.string().guid().optional(),
+  // 'partner' creates a partner-wide ("all orgs") window: orgId NULL,
+  // partnerId = caller's partner (#2131). Create-only.
+  ownerScope: z.enum(['organization', 'partner']).optional(),
+  name: z.string().min(1).max(100),
+  description: z.string().optional(),
+  startTime: z.string().datetime(),
+  endTime: z.string().datetime(),
+  timezone: z.string().default('UTC'),
+  recurrence: z.enum(['once', 'daily', 'weekly', 'monthly', 'custom']),
+  recurrenceRule: recurrenceRuleSchema,
+  targetType: z.enum(['all', 'site', 'group', 'device']),
+  siteIds: z.array(z.string().guid()).optional(),
+  groupIds: z.array(z.string().guid()).optional(),
+  deviceIds: z.array(z.string().guid()).optional(),
+  suppressAlerts: z.boolean().default(true),
+  suppressPatches: z.boolean().default(true),
+  suppressAutomations: z.boolean().default(false)
+  // RETIRED (#3256): `notifyBefore` / `notifyOnStart` / `notifyOnEnd` were
+  // accepted and persisted here but no worker, scheduler, or agent command ever
+  // read them — an admin setting "notify before: 30 minutes" got nothing, with
+  // no indication the setting was inert. They stay off the write surface until a
+  // real maintenance-window notification consumer exists (#3207). This object is
+  // non-strict, so clients still sending the keys get them stripped (200, not
+  // 400) rather than a hard break.
+}).refine((data) => {
+  const start = new Date(data.startTime);
+  const end = new Date(data.endTime);
+  return end > start;
+}, { message: 'End time must be after start time' });
+
+const updateWindowSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  description: z.string().optional(),
+  startTime: z.string().datetime().optional(),
+  endTime: z.string().datetime().optional(),
+  timezone: z.string().optional(),
+  recurrence: z.enum(['once', 'daily', 'weekly', 'monthly', 'custom']).optional(),
+  recurrenceRule: recurrenceRuleSchema,
+  targetType: z.enum(['all', 'site', 'group', 'device']).optional(),
+  siteIds: z.array(z.string().guid()).optional(),
+  groupIds: z.array(z.string().guid()).optional(),
+  deviceIds: z.array(z.string().guid()).optional(),
+  suppressAlerts: z.boolean().optional(),
+  suppressPatches: z.boolean().optional(),
+  suppressAutomations: z.boolean().optional()
+  // RETIRED (#3256) — see createWindowSchema. A PATCH carrying only the retired
+  // notification keys now strips to an empty update and returns the existing
+  // "No updates provided" 400, which is the honest answer: there is nothing
+  // those keys can change.
+});
+
+const listWindowsSchema = z.object({
+  orgId: z.string().guid().optional(),
+  status: z.enum(['scheduled', 'active', 'completed', 'cancelled']).optional(),
+  targetType: z.enum(['all', 'site', 'group', 'device']).optional()
+});
+
+const listOccurrencesSchema = z.object({
+  orgId: z.string().guid().optional(),
+  status: z.enum(['scheduled', 'active', 'completed', 'cancelled']).optional(),
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional()
+});
+
+const updateOccurrenceSchema = z.object({
+  startTime: z.string().datetime().optional(),
+  endTime: z.string().datetime().optional(),
+  notes: z.string().optional()
+});
+
+const activeWindowsSchema = z.object({
+  deviceId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
+  groupId: z.string().guid().optional(),
+  orgId: z.string().guid().optional()
+});
+
+// Helper to generate occurrences based on recurrence rule
+function generateOccurrences(
+  windowId: string,
+  startTime: Date,
+  endTime: Date,
+  recurrence: string,
+  recurrenceRule: Record<string, unknown> | null,
+  count: number = 10
+): Array<{ windowId: string; startTime: Date; endTime: Date; status: 'scheduled' }> {
+  const occurrences: Array<{ windowId: string; startTime: Date; endTime: Date; status: 'scheduled' }> = [];
+  const duration = endTime.getTime() - startTime.getTime();
+  let currentStart = new Date(startTime);
+  const maxOccurrences = (recurrenceRule?.maxOccurrences as number) ?? count;
+  const endDate = recurrenceRule?.endDate ? new Date(recurrenceRule.endDate as string) : null;
+
+  while (occurrences.length < Math.min(count, maxOccurrences)) {
+    if (endDate && currentStart > endDate) {
+      break;
+    }
+
+    occurrences.push({
+      windowId,
+      startTime: new Date(currentStart),
+      endTime: new Date(currentStart.getTime() + duration),
+      status: 'scheduled'
+    });
+
+    if (recurrence === 'once') {
+      break;
+    }
+
+    // Calculate next occurrence
+    const interval = (recurrenceRule?.interval as number) ?? 1;
+
+    switch (recurrence) {
+      case 'daily':
+        currentStart.setDate(currentStart.getDate() + interval);
+        break;
+      case 'weekly': {
+        const daysOfWeek = recurrenceRule?.daysOfWeek as number[] | undefined;
+        if (daysOfWeek && daysOfWeek.length > 0) {
+          // Find next day in the week that matches
+          let found = false;
+          for (let i = 1; i <= 7; i++) {
+            const nextDay = new Date(currentStart);
+            nextDay.setDate(nextDay.getDate() + i);
+            if (daysOfWeek.includes(nextDay.getDay())) {
+              currentStart = nextDay;
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            currentStart.setDate(currentStart.getDate() + 7 * interval);
+          }
+        } else {
+          currentStart.setDate(currentStart.getDate() + 7 * interval);
+        }
+        break;
+      }
+      case 'monthly': {
+        const dayOfMonth = recurrenceRule?.dayOfMonth as number | undefined;
+        currentStart.setMonth(currentStart.getMonth() + interval);
+        if (dayOfMonth) {
+          const lastDay = new Date(currentStart.getFullYear(), currentStart.getMonth() + 1, 0).getDate();
+          currentStart.setDate(Math.min(dayOfMonth, lastDay));
+        }
+        break;
+      }
+      case 'custom':
+        // For custom, default to weekly if no specific rule
+        currentStart.setDate(currentStart.getDate() + 7 * interval);
+        break;
+      default:
+        break;
+    }
+  }
+
+  return occurrences;
+}
+
+// Apply auth middleware to all routes
+maintenanceRoutes.use('*', authMiddleware);
+
+// ============================================
+// Config Policy Integration: Device Maintenance Status
+// ============================================
+
+// GET /device/:deviceId/status - Resolve maintenance status for a device.
+// Checks config policy maintenance settings first (hierarchy-resolved),
+// then falls back to standalone maintenance windows for backward compatibility.
+maintenanceRoutes.get(
+  '/device/:deviceId/status',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const deviceId = c.req.param('deviceId')!;
+
+    // Verify the caller has access to this device's org
+    const [device] = await db.select({ orgId: devices.orgId, siteId: devices.siteId }).from(devices).where(eq(devices.id, deviceId)).limit(1);
+    if (!device) return c.json({ error: 'Device not found' }, 404);
+    if (auth.scope === 'organization' && auth.orgId !== device.orgId) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+    if (auth.scope === 'partner' && !auth.canAccessOrg(device.orgId)) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    // Site-scope gate: `requireMaintenanceRead` populated `permissions` in
+    // context; enforce `allowedSiteIds` so a partner-scope user restricted to
+    // a subset of sites cannot read maintenance status for devices in other
+    // sites within the same org. RLS does not defend the site axis. Mirrors
+    // PR #864/#868 (SP2 launch-readiness sweep).
+    const userPerms = c.get('permissions') as UserPermissions | undefined;
+    if (userPerms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(userPerms, device.siteId))) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    const status = await isDeviceInMaintenance(deviceId);
+
+    return c.json({
+      data: {
+        deviceId,
+        active: status.active,
+        source: status.source,
+        suppressAlerts: status.suppressAlerts,
+        suppressPatching: status.suppressPatching,
+        suppressAutomations: status.suppressAutomations,
+        suppressScripts: status.suppressScripts,
+      },
+    });
+  }
+);
+
+// ============================================
+// Standalone Maintenance Window Routes (Legacy)
+// ============================================
+
+// GET /windows - List maintenance windows for org with filters
+maintenanceRoutes.get(
+  '/windows',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceRead,
+  zValidator('query', listWindowsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const orgResult = resolveOrgId(auth, query.orgId);
+
+    if ('error' in orgResult) {
+      return c.json({ error: orgResult.error }, orgResult.status);
+    }
+
+    if (!orgResult.orgId) {
+      return c.json({ data: [] });
+    }
+
+    const conditions = [windowOwnershipCondition(auth, orgResult.orgId)];
+
+    if (query.status) {
+      conditions.push(eq(maintenanceWindows.status, query.status));
+    }
+
+    if (query.targetType) {
+      conditions.push(eq(maintenanceWindows.targetType, query.targetType));
+    }
+
+    const windows = await db
+      .select()
+      .from(maintenanceWindows)
+      .where(and(...conditions))
+      .orderBy(desc(maintenanceWindows.createdAt));
+
+    // Site axis (#3654): the org filter above discloses every window in the org.
+    return c.json({ data: await filterWindowsToSiteScope(windows, requestPermissions(c)) });
+  }
+);
+
+// DEPRECATED: Maintenance windows are now managed via Configuration Policies.
+// This route remains for legacy compatibility.
+// POST /windows - Create maintenance window
+maintenanceRoutes.post(
+  '/windows',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceWrite,
+  requireMfa(),
+  zValidator('json', createWindowSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const body = c.req.valid('json');
+
+    // Resolve the ownership axis (#2131): partner-wide creation requires the
+    // partner-wide capability; the default path stays org-owned.
+    let owner: { orgId: string | null; partnerId: string | null };
+    if (body.ownerScope === 'partner') {
+      if (!canManagePartnerWidePolicies(auth) || !auth.partnerId) {
+        return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+      }
+      owner = { orgId: null, partnerId: auth.partnerId };
+    } else {
+      const orgResult = resolveOrgId(auth, body.orgId, true);
+      if ('error' in orgResult) {
+        return c.json({ error: orgResult.error }, orgResult.status);
+      }
+      owner = { orgId: orgResult.orgId as string, partnerId: null };
+    }
+
+    const siteScopeDenied = await enforceWindowSiteScope(c, {
+      orgId: owner.orgId,
+      targetType: body.targetType,
+      siteIds: body.siteIds,
+      groupIds: body.groupIds,
+      deviceIds: body.deviceIds,
+    });
+    if (siteScopeDenied) return siteScopeDenied;
+
+    const startTime = new Date(body.startTime);
+    const endTime = new Date(body.endTime);
+
+    // Create the maintenance window
+    const [createdWindow] = await db
+      .insert(maintenanceWindows)
+      .values({
+        orgId: owner.orgId,
+        partnerId: owner.partnerId,
+        name: body.name,
+        description: body.description,
+        startTime,
+        endTime,
+        timezone: body.timezone,
+        recurrence: body.recurrence,
+        recurrenceRule: body.recurrenceRule,
+        targetType: body.targetType,
+        siteIds: body.siteIds,
+        groupIds: body.groupIds,
+        deviceIds: body.deviceIds,
+        suppressAlerts: body.suppressAlerts,
+        suppressPatching: body.suppressPatches,
+        suppressAutomations: body.suppressAutomations,
+        // notifyBefore / notifyOnStart / notifyOnEnd deliberately not written
+        // (#3256) — the columns keep their DB defaults (NULL / false / false),
+        // which is what the old code stored anyway.
+        createdBy: auth.user.id
+      })
+      .returning();
+
+    if (!createdWindow) {
+      return c.json({ error: 'Failed to create maintenance window' }, 500);
+    }
+
+    // Generate initial occurrences
+    const occurrencesToCreate = generateOccurrences(
+      createdWindow.id,
+      startTime,
+      endTime,
+      body.recurrence,
+      body.recurrenceRule ?? null,
+      10
+    );
+
+    if (occurrencesToCreate.length > 0) {
+      await db.insert(maintenanceOccurrences).values(occurrencesToCreate);
+    }
+
+    writeRouteAudit(c, {
+      orgId: createdWindow.orgId,
+      action: 'maintenance_window.create',
+      resourceType: 'maintenance_window',
+      resourceId: createdWindow.id,
+      resourceName: createdWindow.name,
+      details: {
+        targetType: createdWindow.targetType,
+        recurrence: createdWindow.recurrence,
+        occurrenceCount: occurrencesToCreate.length,
+      },
+    });
+
+    return c.json(createdWindow, 201);
+  }
+);
+
+// GET /windows/:id - Get window details with upcoming occurrences
+maintenanceRoutes.get(
+  '/windows/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const windowId = c.req.param('id')!;
+
+    const [window] = await db
+      .select()
+      .from(maintenanceWindows)
+      .where(eq(maintenanceWindows.id, windowId))
+      .limit(1);
+
+    if (!window || !canAccessWindow(auth, window)) {
+      return c.json({ error: 'Maintenance window not found' }, 404);
+    }
+
+    // Site axis (#3654): a window that reaches none of the caller's sites is
+    // not theirs to see, and a visible one is returned with its target arrays
+    // narrowed to what they may see.
+    const scopedWindow = await scopeWindowForRead(window, requestPermissions(c));
+    if (!scopedWindow) {
+      return c.json({ error: 'Maintenance window not found' }, 404);
+    }
+
+    // Get upcoming occurrences
+    const occurrences = await db
+      .select()
+      .from(maintenanceOccurrences)
+      .where(
+        and(
+          eq(maintenanceOccurrences.windowId, windowId),
+          gte(maintenanceOccurrences.startTime, new Date())
+        )
+      )
+      .orderBy(asc(maintenanceOccurrences.startTime))
+      .limit(10);
+
+    return c.json({ ...scopedWindow, upcomingOccurrences: occurrences });
+  }
+);
+
+// DEPRECATED: Maintenance windows are now managed via Configuration Policies.
+// This route remains for legacy compatibility.
+// PATCH /windows/:id - Update window
+maintenanceRoutes.patch(
+  '/windows/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceWrite,
+  requireMfa(),
+  zValidator('json', updateWindowSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const windowId = c.req.param('id')!;
+    const updates = c.req.valid('json');
+
+    if (Object.keys(updates).length === 0) {
+      return c.json({ error: 'No updates provided' }, 400);
+    }
+
+    const [window] = await db
+      .select()
+      .from(maintenanceWindows)
+      .where(eq(maintenanceWindows.id, windowId))
+      .limit(1);
+
+    if (!window || !canAccessWindow(auth, window)) {
+      return c.json({ error: 'Maintenance window not found' }, 404);
+    }
+
+    // Partner-wide windows are administrable only with the partner-wide
+    // capability (#2131).
+    if (window.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    // Site axis (#3654): authority over the window you are about to change is
+    // established by its CURRENT target set — re-timing or deleting it steers
+    // whatever deployments are bound to it.
+    const siteScopeDenied = await enforceWindowSiteScope(c, window);
+    if (siteScopeDenied) return siteScopeDenied;
+
+    // Build update object
+    const updateData: Record<string, unknown> = {
+      updatedAt: new Date()
+    };
+
+    if (updates.name !== undefined) updateData.name = updates.name;
+    if (updates.description !== undefined) updateData.description = updates.description;
+    if (updates.startTime !== undefined) updateData.startTime = new Date(updates.startTime);
+    if (updates.endTime !== undefined) updateData.endTime = new Date(updates.endTime);
+    if (updates.timezone !== undefined) updateData.timezone = updates.timezone;
+    if (updates.recurrence !== undefined) updateData.recurrence = updates.recurrence;
+    if (updates.recurrenceRule !== undefined) updateData.recurrenceRule = updates.recurrenceRule;
+    if (updates.targetType !== undefined) updateData.targetType = updates.targetType;
+    if (updates.siteIds !== undefined) updateData.siteIds = updates.siteIds;
+    if (updates.groupIds !== undefined) updateData.groupIds = updates.groupIds;
+    if (updates.deviceIds !== undefined) updateData.deviceIds = updates.deviceIds;
+    if (updates.suppressAlerts !== undefined) updateData.suppressAlerts = updates.suppressAlerts;
+    if (updates.suppressPatches !== undefined) updateData.suppressPatching = updates.suppressPatches;
+    if (updates.suppressAutomations !== undefined) updateData.suppressAutomations = updates.suppressAutomations;
+    // notifyBefore / notifyOnStart / notifyOnEnd retired from the write surface (#3256).
+
+    // ...and again on the RESULTING target set, so a restricted caller cannot
+    // widen a window they legitimately own onto sites they cannot see.
+    const nextTargetDenied = await enforceWindowSiteScope(c, {
+      orgId: window.orgId,
+      targetType: updates.targetType ?? window.targetType,
+      siteIds: updates.siteIds ?? window.siteIds,
+      groupIds: updates.groupIds ?? window.groupIds,
+      deviceIds: updates.deviceIds ?? window.deviceIds,
+    });
+    if (nextTargetDenied) return nextTargetDenied;
+
+    const [updated] = await db
+      .update(maintenanceWindows)
+      .set(updateData)
+      .where(eq(maintenanceWindows.id, windowId))
+      .returning();
+    if (!updated) {
+      return c.json({ error: 'Failed to update maintenance window' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: window.orgId,
+      action: 'maintenance_window.update',
+      resourceType: 'maintenance_window',
+      resourceId: updated.id,
+      resourceName: updated.name,
+      details: {
+        updatedFields: Object.keys(updates),
+      },
+    });
+
+    return c.json(updated);
+  }
+);
+
+// DEPRECATED: Maintenance windows are now managed via Configuration Policies.
+// This route remains for legacy compatibility.
+// DELETE /windows/:id - Delete window (and future occurrences)
+maintenanceRoutes.delete(
+  '/windows/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const windowId = c.req.param('id')!;
+
+    const [window] = await db
+      .select()
+      .from(maintenanceWindows)
+      .where(eq(maintenanceWindows.id, windowId))
+      .limit(1);
+
+    if (!window || !canAccessWindow(auth, window)) {
+      return c.json({ error: 'Maintenance window not found' }, 404);
+    }
+
+    // Partner-wide windows are administrable only with the partner-wide
+    // capability (#2131).
+    if (window.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    // Site axis (#3654): authority over the window you are about to change is
+    // established by its CURRENT target set — re-timing or deleting it steers
+    // whatever deployments are bound to it.
+    const siteScopeDenied = await enforceWindowSiteScope(c, window);
+    if (siteScopeDenied) return siteScopeDenied;
+
+    // Delete only future occurrences (preserve past ones for audit)
+    await db
+      .delete(maintenanceOccurrences)
+      .where(
+        and(
+          eq(maintenanceOccurrences.windowId, windowId),
+          gte(maintenanceOccurrences.startTime, new Date())
+        )
+      );
+
+    // Delete the window
+    await db.delete(maintenanceWindows).where(eq(maintenanceWindows.id, windowId));
+
+    writeRouteAudit(c, {
+      orgId: window.orgId,
+      action: 'maintenance_window.delete',
+      resourceType: 'maintenance_window',
+      resourceId: window.id,
+      resourceName: window.name,
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+// DEPRECATED: Maintenance windows are now managed via Configuration Policies.
+// This route remains for legacy compatibility.
+// POST /windows/:id/cancel - Cancel window
+maintenanceRoutes.post(
+  '/windows/:id/cancel',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const windowId = c.req.param('id')!;
+
+    const [window] = await db
+      .select()
+      .from(maintenanceWindows)
+      .where(eq(maintenanceWindows.id, windowId))
+      .limit(1);
+
+    if (!window || !canAccessWindow(auth, window)) {
+      return c.json({ error: 'Maintenance window not found' }, 404);
+    }
+
+    // Partner-wide windows are administrable only with the partner-wide
+    // capability (#2131).
+    if (window.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    // Site axis (#3654): authority over the window you are about to change is
+    // established by its CURRENT target set — re-timing or deleting it steers
+    // whatever deployments are bound to it.
+    const siteScopeDenied = await enforceWindowSiteScope(c, window);
+    if (siteScopeDenied) return siteScopeDenied;
+
+    if (window.status === 'cancelled') {
+      return c.json({ error: 'Window is already cancelled' }, 400);
+    }
+
+    // Update window status
+    const [updated] = await db
+      .update(maintenanceWindows)
+      .set({ status: 'cancelled', updatedAt: new Date() })
+      .where(eq(maintenanceWindows.id, windowId))
+      .returning();
+    if (!updated) {
+      return c.json({ error: 'Failed to cancel maintenance window' }, 500);
+    }
+
+    // Cancel all future occurrences
+    await db
+      .update(maintenanceOccurrences)
+      .set({ status: 'cancelled' })
+      .where(
+        and(
+          eq(maintenanceOccurrences.windowId, windowId),
+          gte(maintenanceOccurrences.startTime, new Date())
+        )
+      );
+
+    writeRouteAudit(c, {
+      orgId: window.orgId,
+      action: 'maintenance_window.cancel',
+      resourceType: 'maintenance_window',
+      resourceId: updated.id,
+      resourceName: updated.name,
+      details: {
+        previousStatus: window.status,
+        nextStatus: updated.status,
+      },
+    });
+
+    return c.json(updated);
+  }
+);
+
+// GET /windows/:id/occurrences - List occurrences for a window
+maintenanceRoutes.get(
+  '/windows/:id/occurrences',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const windowId = c.req.param('id')!;
+
+    const [window] = await db
+      .select()
+      .from(maintenanceWindows)
+      .where(eq(maintenanceWindows.id, windowId))
+      .limit(1);
+
+    if (!window || !canAccessWindow(auth, window)) {
+      return c.json({ error: 'Maintenance window not found' }, 404);
+    }
+
+    // Site axis (#3654): a window that reaches none of the caller's sites is
+    // not theirs to see, and neither are its occurrences.
+    if (!(await scopeWindowForRead(window, requestPermissions(c)))) {
+      return c.json({ error: 'Maintenance window not found' }, 404);
+    }
+
+    const occurrences = await db
+      .select()
+      .from(maintenanceOccurrences)
+      .where(eq(maintenanceOccurrences.windowId, windowId))
+      .orderBy(asc(maintenanceOccurrences.startTime));
+
+    return c.json({ data: occurrences });
+  }
+);
+
+// GET /occurrences - List all occurrences across windows (for calendar view)
+maintenanceRoutes.get(
+  '/occurrences',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceRead,
+  zValidator('query', listOccurrencesSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const orgResult = resolveOrgId(auth, query.orgId, true);
+
+    if ('error' in orgResult) {
+      return c.json({ error: orgResult.error }, orgResult.status);
+    }
+
+    // Get all windows for this org first (dual-axis, #2131), then narrow to
+    // the caller's site scope (#3654) — an occurrence discloses its window.
+    const windows = await db
+      .select({
+        id: maintenanceWindows.id,
+        orgId: maintenanceWindows.orgId,
+        targetType: maintenanceWindows.targetType,
+        siteIds: maintenanceWindows.siteIds,
+        groupIds: maintenanceWindows.groupIds,
+        deviceIds: maintenanceWindows.deviceIds,
+      })
+      .from(maintenanceWindows)
+      .where(windowOwnershipCondition(auth, orgResult.orgId as string));
+
+    const visibleWindows = await filterWindowsToSiteScope(windows, requestPermissions(c));
+    const windowIds = visibleWindows.map(w => w.id);
+
+    if (windowIds.length === 0) {
+      return c.json({ data: [] });
+    }
+
+    const conditions = [inArray(maintenanceOccurrences.windowId, windowIds)];
+
+    if (query.status) {
+      conditions.push(eq(maintenanceOccurrences.status, query.status));
+    }
+
+    if (query.from) {
+      conditions.push(gte(maintenanceOccurrences.startTime, new Date(query.from)));
+    }
+
+    if (query.to) {
+      conditions.push(lte(maintenanceOccurrences.endTime, new Date(query.to)));
+    }
+
+    const occurrences = await db
+      .select({
+        occurrence: maintenanceOccurrences,
+        window: {
+          id: maintenanceWindows.id,
+          name: maintenanceWindows.name,
+          targetType: maintenanceWindows.targetType
+        }
+      })
+      .from(maintenanceOccurrences)
+      .innerJoin(maintenanceWindows, eq(maintenanceOccurrences.windowId, maintenanceWindows.id))
+      .where(and(...conditions))
+      .orderBy(asc(maintenanceOccurrences.startTime));
+
+    return c.json({
+      data: occurrences.map(o => ({
+        ...o.occurrence,
+        window: o.window
+      }))
+    });
+  }
+);
+
+// DEPRECATED: Maintenance windows are now managed via Configuration Policies.
+// This route remains for legacy compatibility.
+// PATCH /occurrences/:id - Update occurrence
+maintenanceRoutes.patch(
+  '/occurrences/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceWrite,
+  requireMfa(),
+  zValidator('json', updateOccurrenceSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const occurrenceId = c.req.param('id')!;
+    const updates = c.req.valid('json');
+
+    if (Object.keys(updates).length === 0) {
+      return c.json({ error: 'No updates provided' }, 400);
+    }
+
+    // Get the occurrence and its parent window
+    const [occurrence] = await db
+      .select({
+        occurrence: maintenanceOccurrences,
+        window: maintenanceWindows
+      })
+      .from(maintenanceOccurrences)
+      .innerJoin(maintenanceWindows, eq(maintenanceOccurrences.windowId, maintenanceWindows.id))
+      .where(eq(maintenanceOccurrences.id, occurrenceId))
+      .limit(1);
+
+    if (!occurrence || !canAccessWindow(auth, occurrence.window)) {
+      return c.json({ error: 'Occurrence not found' }, 404);
+    }
+
+    // Partner-wide windows are administrable only with the partner-wide
+    // capability (#2131).
+    if (occurrence.window.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    // Site axis (#3654): an occurrence inherits its parent window's target set;
+    // starting/ending/re-timing one steers the same deployments.
+    const siteScopeDenied = await enforceWindowSiteScope(c, occurrence.window);
+    if (siteScopeDenied) return siteScopeDenied;
+
+    // Build overrides and update data
+    const currentOverrides = (occurrence.occurrence.overrides as Record<string, unknown>) || {};
+    const updateData: Record<string, unknown> = {};
+
+    if (updates.startTime !== undefined) {
+      currentOverrides.startTime = updates.startTime;
+      updateData.startTime = new Date(updates.startTime);
+    }
+
+    if (updates.endTime !== undefined) {
+      currentOverrides.endTime = updates.endTime;
+      updateData.endTime = new Date(updates.endTime);
+    }
+
+    if (updates.notes !== undefined) {
+      updateData.notes = updates.notes;
+    }
+
+    updateData.overrides = currentOverrides;
+
+    const [updated] = await db
+      .update(maintenanceOccurrences)
+      .set(updateData)
+      .where(eq(maintenanceOccurrences.id, occurrenceId))
+      .returning();
+    if (!updated) {
+      return c.json({ error: 'Failed to update maintenance occurrence' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: occurrence.window.orgId,
+      action: 'maintenance_occurrence.update',
+      resourceType: 'maintenance_occurrence',
+      resourceId: updated.id,
+      resourceName: occurrence.window.name,
+      details: {
+        updatedFields: Object.keys(updates),
+      },
+    });
+
+    return c.json(updated);
+  }
+);
+
+// DEPRECATED: Maintenance windows are now managed via Configuration Policies.
+// This route remains for legacy compatibility.
+// POST /occurrences/:id/start - Manually start occurrence early
+maintenanceRoutes.post(
+  '/occurrences/:id/start',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const occurrenceId = c.req.param('id')!;
+
+    const [occurrence] = await db
+      .select({
+        occurrence: maintenanceOccurrences,
+        window: maintenanceWindows
+      })
+      .from(maintenanceOccurrences)
+      .innerJoin(maintenanceWindows, eq(maintenanceOccurrences.windowId, maintenanceWindows.id))
+      .where(eq(maintenanceOccurrences.id, occurrenceId))
+      .limit(1);
+
+    if (!occurrence || !canAccessWindow(auth, occurrence.window)) {
+      return c.json({ error: 'Occurrence not found' }, 404);
+    }
+
+    // Partner-wide windows are administrable only with the partner-wide
+    // capability (#2131).
+    if (occurrence.window.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    // Site axis (#3654): an occurrence inherits its parent window's target set;
+    // starting/ending/re-timing one steers the same deployments.
+    const siteScopeDenied = await enforceWindowSiteScope(c, occurrence.window);
+    if (siteScopeDenied) return siteScopeDenied;
+
+    if (occurrence.occurrence.status !== 'scheduled') {
+      return c.json({ error: 'Occurrence is not in scheduled status' }, 400);
+    }
+
+    const [updated] = await db
+      .update(maintenanceOccurrences)
+      .set({
+        status: 'active',
+        actualStartTime: new Date()
+      })
+      .where(eq(maintenanceOccurrences.id, occurrenceId))
+      .returning();
+    if (!updated) {
+      return c.json({ error: 'Failed to start maintenance occurrence' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: occurrence.window.orgId,
+      action: 'maintenance_occurrence.start',
+      resourceType: 'maintenance_occurrence',
+      resourceId: updated.id,
+      resourceName: occurrence.window.name,
+      details: {
+        previousStatus: occurrence.occurrence.status,
+        nextStatus: updated.status,
+      },
+    });
+
+    return c.json(updated);
+  }
+);
+
+// DEPRECATED: Maintenance windows are now managed via Configuration Policies.
+// This route remains for legacy compatibility.
+// POST /occurrences/:id/end - Manually end occurrence early
+maintenanceRoutes.post(
+  '/occurrences/:id/end',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const occurrenceId = c.req.param('id')!;
+
+    const [occurrence] = await db
+      .select({
+        occurrence: maintenanceOccurrences,
+        window: maintenanceWindows
+      })
+      .from(maintenanceOccurrences)
+      .innerJoin(maintenanceWindows, eq(maintenanceOccurrences.windowId, maintenanceWindows.id))
+      .where(eq(maintenanceOccurrences.id, occurrenceId))
+      .limit(1);
+
+    if (!occurrence || !canAccessWindow(auth, occurrence.window)) {
+      return c.json({ error: 'Occurrence not found' }, 404);
+    }
+
+    // Partner-wide windows are administrable only with the partner-wide
+    // capability (#2131).
+    if (occurrence.window.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    // Site axis (#3654): an occurrence inherits its parent window's target set;
+    // starting/ending/re-timing one steers the same deployments.
+    const siteScopeDenied = await enforceWindowSiteScope(c, occurrence.window);
+    if (siteScopeDenied) return siteScopeDenied;
+
+    if (occurrence.occurrence.status !== 'active') {
+      return c.json({ error: 'Occurrence is not currently active' }, 400);
+    }
+
+    const [updated] = await db
+      .update(maintenanceOccurrences)
+      .set({
+        status: 'completed',
+        actualEndTime: new Date()
+      })
+      .where(eq(maintenanceOccurrences.id, occurrenceId))
+      .returning();
+    if (!updated) {
+      return c.json({ error: 'Failed to end maintenance occurrence' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: occurrence.window.orgId,
+      action: 'maintenance_occurrence.end',
+      resourceType: 'maintenance_occurrence',
+      resourceId: updated.id,
+      resourceName: occurrence.window.name,
+      details: {
+        previousStatus: occurrence.occurrence.status,
+        nextStatus: updated.status,
+      },
+    });
+
+    return c.json(updated);
+  }
+);
+
+// GET /active - Get currently active maintenance windows affecting a device/site/group
+maintenanceRoutes.get(
+  '/active',
+  requireScope('organization', 'partner', 'system'),
+  requireMaintenanceRead,
+  zValidator('query', activeWindowsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const orgResult = resolveOrgId(auth, query.orgId, true);
+
+    if ('error' in orgResult) {
+      return c.json({ error: orgResult.error }, orgResult.status);
+    }
+
+    const now = new Date();
+
+    // Get all windows for this org (dual-axis, #2131), then narrow to the
+    // caller's site scope (#3654).
+    const allWindows = await db
+      .select()
+      .from(maintenanceWindows)
+      .where(windowOwnershipCondition(auth, orgResult.orgId as string));
+
+    const windows = await filterWindowsToSiteScope(allWindows, requestPermissions(c));
+
+    if (windows.length === 0) {
+      return c.json({ data: [] });
+    }
+
+    const windowIds = windows.map(w => w.id);
+
+    // Find active occurrences (currently within the maintenance period)
+    const activeOccurrences = await db
+      .select({
+        occurrence: maintenanceOccurrences,
+        window: maintenanceWindows
+      })
+      .from(maintenanceOccurrences)
+      .innerJoin(maintenanceWindows, eq(maintenanceOccurrences.windowId, maintenanceWindows.id))
+      .where(
+        and(
+          inArray(maintenanceOccurrences.windowId, windowIds),
+          or(
+            eq(maintenanceOccurrences.status, 'active'),
+            and(
+              eq(maintenanceOccurrences.status, 'scheduled'),
+              lte(maintenanceOccurrences.startTime, now),
+              gte(maintenanceOccurrences.endTime, now)
+            )
+          )
+        )
+      );
+
+    // Filter by target
+    const results = activeOccurrences.filter(({ window }) => {
+      // 'all' target type affects everything
+      if (window.targetType === 'all') {
+        return true;
+      }
+
+      // Check if the specified target is affected
+      if (query.deviceId && window.deviceIds?.includes(query.deviceId)) {
+        return true;
+      }
+
+      if (query.siteId && window.siteIds?.includes(query.siteId)) {
+        return true;
+      }
+
+      if (query.groupId && window.groupIds?.includes(query.groupId)) {
+        return true;
+      }
+
+      // If no specific target was requested, return all windows
+      if (!query.deviceId && !query.siteId && !query.groupId) {
+        return true;
+      }
+
+      return false;
+    });
+
+    return c.json({
+      data: results.map(r => ({
+        ...r.occurrence,
+        window: {
+          id: r.window.id,
+          name: r.window.name,
+          targetType: r.window.targetType,
+          suppressAlerts: r.window.suppressAlerts,
+          suppressPatching: r.window.suppressPatching,
+          suppressAutomations: r.window.suppressAutomations
+        }
+      }))
+    });
+  }
+);

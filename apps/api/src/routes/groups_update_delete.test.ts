@@ -1,0 +1,711 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+import { groupRoutes } from './groups';
+
+const GROUP_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const GROUP_ID_2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const ORG_ID = '11111111-1111-1111-1111-111111111111';
+const ORG_ID_2 = '22222222-2222-2222-2222-222222222222';
+const PARTNER_ID = '33333333-3333-3333-3333-333333333333';
+const DEVICE_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const DEVICE_ID_2 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const SITE_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+
+vi.mock('../services', () => ({}));
+
+vi.mock('../services/auditEvents', () => ({
+  writeRouteAudit: vi.fn()
+}));
+
+const { schedulePeripheralPolicyDevice } = vi.hoisted(() => ({
+  schedulePeripheralPolicyDevice: vi.fn().mockResolvedValue('job-id'),
+}));
+vi.mock('../jobs/peripheralJobs', () => ({
+  schedulePeripheralPolicyDevice,
+}));
+
+const { deleteDeviceGroup } = vi.hoisted(() => ({ deleteDeviceGroup: vi.fn() }));
+vi.mock('../services/deviceGroupDelete', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/deviceGroupDelete')>();
+  return { ...actual, deleteDeviceGroup };
+});
+
+vi.mock('../services/filterEngine', () => ({
+  evaluateFilterWithPreview: vi.fn().mockResolvedValue({
+    totalCount: 1,
+    devices: [{
+      id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      hostname: 'host-1',
+      displayName: 'Host One',
+      osType: 'windows',
+      status: 'online',
+      lastSeenAt: new Date('2026-01-01')
+    }],
+    evaluatedAt: new Date('2026-01-01')
+  }),
+  extractFieldsFromFilter: vi.fn().mockReturnValue(['osType']),
+  validateFilter: vi.fn().mockReturnValue({ valid: true, errors: [] })
+}));
+
+vi.mock('../services/groupMembership', () => ({
+  evaluateGroupMembership: vi.fn().mockResolvedValue(undefined),
+  pinDeviceToGroup: vi.fn().mockResolvedValue(undefined),
+  pruneGroupMembershipsOutsideSite: vi.fn().mockResolvedValue({ removed: 0 })
+}));
+
+vi.mock('../db', () => {
+  const mockDb: Record<string, unknown> = {
+    select: vi.fn(),
+    insert: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn()
+  };
+  mockDb.transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockDb));
+  return {
+    db: mockDb,
+    runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+    withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  };
+});
+
+vi.mock('../db/schema', () => ({
+  deviceGroups: {
+    id: 'id',
+    orgId: 'orgId',
+    siteId: 'siteId',
+    name: 'name',
+    type: 'type',
+    rules: 'rules',
+    filterConditions: 'filterConditions',
+    filterFieldsUsed: 'filterFieldsUsed',
+    parentId: 'parentId',
+    createdAt: 'createdAt',
+    updatedAt: 'updatedAt'
+  },
+  deviceGroupMemberships: {
+    deviceId: 'deviceId',
+    groupId: 'groupId',
+    isPinned: 'isPinned',
+    addedAt: 'addedAt',
+    addedBy: 'addedBy'
+  },
+  devices: {
+    id: 'id',
+    orgId: 'orgId',
+    hostname: 'hostname',
+    displayName: 'displayName',
+    status: 'status',
+    osType: 'osType'
+  },
+  sites: {
+    id: 'id',
+    orgId: 'orgId'
+  },
+  groupMembershipLog: {
+    id: 'id',
+    groupId: 'groupId',
+    deviceId: 'deviceId',
+    action: 'action',
+    reason: 'reason',
+    createdAt: 'createdAt'
+  }
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+      scope: 'organization',
+      orgId: '11111111-1111-1111-1111-111111111111',
+      partnerId: null,
+      accessibleOrgIds: ['11111111-1111-1111-1111-111111111111'],
+      canAccessOrg: (orgId: string) => orgId === '11111111-1111-1111-1111-111111111111'
+    });
+    return next();
+  }),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next())
+}));
+
+import { db } from '../db';
+import { authMiddleware } from '../middleware/auth';
+import { validateFilter } from '../services/filterEngine';
+import { evaluateGroupMembership, pruneGroupMembershipsOutsideSite } from '../services/groupMembership';
+import { DeviceGroupDeleteError } from '../services/deviceGroupDelete';
+
+function makeGroup(overrides: Record<string, unknown> = {}) {
+  return {
+    id: GROUP_ID,
+    orgId: ORG_ID,
+    siteId: null,
+    name: 'Test Group',
+    type: 'static',
+    rules: null,
+    filterConditions: null,
+    filterFieldsUsed: [],
+    parentId: null,
+    createdAt: new Date('2026-01-01'),
+    updatedAt: new Date('2026-01-01'),
+    ...overrides
+  };
+}
+
+
+describe('groups routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+        scope: 'organization',
+        orgId: ORG_ID,
+        partnerId: null,
+        accessibleOrgIds: [ORG_ID],
+        canAccessOrg: (orgId: string) => orgId === ORG_ID
+      });
+      return next();
+    });
+    app = new Hono();
+    app.route('/groups', groupRoutes);
+  });
+
+  function restrictToSite() {
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+        scope: 'organization',
+        orgId: ORG_ID,
+        partnerId: null,
+        accessibleOrgIds: [ORG_ID],
+        canAccessOrg: (orgId: string) => orgId === ORG_ID
+      });
+      c.set('permissions', { allowedSiteIds: [SITE_ID] });
+      return next();
+    });
+  }
+
+  // ----------------------------------------------------------------
+  // PATCH /:id - Update group
+  // ----------------------------------------------------------------
+  describe('PATCH /groups/:id', () => {
+    it('rejects mutating an org-wide group for a site-restricted caller', async () => {
+      restrictToSite();
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup({ siteId: null })])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Denied' })
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.update).not.toHaveBeenCalled();
+    });
+    it('should update a group name', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([makeGroup()])
+            })
+          })
+        } as any);
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([makeGroup({ name: 'Updated Name' })])
+          })
+        })
+      } as any);
+      vi.mocked(pruneGroupMembershipsOutsideSite).mockResolvedValueOnce({
+        removed: 1,
+        deviceIds: [DEVICE_ID],
+      });
+      // getDeviceCountForGroup
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([{ count: 2 }])
+        })
+      } as any);
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Updated Name' })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.name).toBe('Updated Name');
+    });
+
+    it('should return 404 for non-existent group', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Updated' })
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('should reject self-referential parentId', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup()])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ parentId: GROUP_ID })
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('its own parent');
+    });
+
+    it('should return 404 when user cannot edit group from different org', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup({ orgId: ORG_ID_2 })])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Hack' })
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('should reject siteId outside the existing group organization', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([makeGroup()])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any);
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ siteId: SITE_ID })
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('Site not found');
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
+    it('prunes old-site memberships and re-evaluates a dynamic group when its site changes', async () => {
+      const filterConditions = { operator: 'AND', conditions: [] };
+      const oldSiteId = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
+      const group = makeGroup({
+        siteId: oldSiteId,
+        type: 'dynamic',
+        filterConditions
+      });
+      const updated = makeGroup({
+        siteId: SITE_ID,
+        type: 'dynamic',
+        filterConditions
+      });
+
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([group])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{ id: SITE_ID }])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ count: 0 }])
+          })
+        } as any);
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([updated])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ siteId: SITE_ID })
+      });
+
+      expect(res.status).toBe(200);
+      expect(db.transaction).toHaveBeenCalledTimes(1);
+      expect(pruneGroupMembershipsOutsideSite).toHaveBeenCalledWith(
+        GROUP_ID,
+        SITE_ID,
+        ORG_ID,
+        expect.anything(),
+        { deferPeripheralReconciliation: true },
+      );
+      expect(schedulePeripheralPolicyDevice).toHaveBeenCalledWith(
+        DEVICE_ID,
+        'dynamic_membership_changed',
+      );
+      expect(evaluateGroupMembership).toHaveBeenCalledWith(GROUP_ID);
+    });
+
+    it('rolls back a site reassignment when membership pruning fails', async () => {
+      const oldSiteId = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
+      const group = makeGroup({ siteId: oldSiteId });
+      const updated = makeGroup({ siteId: SITE_ID });
+      let transactionCommitted = false;
+
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([group])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{ id: SITE_ID }])
+            })
+          })
+        } as any);
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([updated])
+          })
+        })
+      } as any);
+      vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => {
+        const tx = {
+          select: db.select,
+          insert: db.insert,
+          update: db.update,
+          delete: db.delete,
+        };
+        try {
+          const result = await fn(tx);
+          transactionCommitted = true;
+          return result;
+        } catch (error) {
+          transactionCommitted = false;
+          throw error;
+        }
+      });
+      vi.mocked(pruneGroupMembershipsOutsideSite).mockRejectedValueOnce(new Error('prune failed'));
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ siteId: SITE_ID })
+      });
+
+      expect(res.status).toBe(500);
+      expect(db.transaction).toHaveBeenCalledTimes(1);
+      expect(transactionCommitted).toBe(false);
+    });
+  });
+
+  // ----------------------------------------------------------------
+  // DELETE /:id - Delete group
+  // ----------------------------------------------------------------
+  describe('DELETE /groups/:id', () => {
+    it('rejects deleting an org-wide group for a site-restricted caller', async () => {
+      restrictToSite();
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup({ siteId: null })])
+          })
+        })
+      } as any);
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+    it('should delete a group', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup()])
+          })
+        })
+      } as any);
+      deleteDeviceGroup.mockResolvedValueOnce({
+        group: { id: GROUP_ID, name: 'Test Group', orgId: ORG_ID },
+        affectedDeviceIds: [DEVICE_ID, DEVICE_ID_2],
+      });
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.id).toBe(GROUP_ID);
+
+      expect(deleteDeviceGroup).toHaveBeenCalledWith(GROUP_ID, ORG_ID);
+      expect(schedulePeripheralPolicyDevice.mock.calls).toEqual([
+        [DEVICE_ID, 'group_deleted'],
+        [DEVICE_ID_2, 'group_deleted'],
+      ]);
+    });
+
+    it('should return 404 when deleting non-existent group', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('should reject deleting group with child groups', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup()])
+          })
+        })
+      } as any);
+      deleteDeviceGroup.mockRejectedValueOnce(
+        new DeviceGroupDeleteError('HAS_CHILDREN', 'Cannot delete group with child groups')
+      );
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('child groups');
+      expect(deleteDeviceGroup).toHaveBeenCalledWith(GROUP_ID, ORG_ID);
+    });
+
+    it('returns 409 with contractCount only when the caller lacks contracts:read', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup()])
+          })
+        })
+      } as any);
+      deleteDeviceGroup.mockRejectedValueOnce(
+        new DeviceGroupDeleteError('BILLED_BY_CONTRACTS', 'billed', [{ id: 'c1', name: 'Acme', status: 'active' }])
+      );
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        error: 'billed',
+        code: 'GROUP_IN_USE_BY_CONTRACTS',
+        contractCount: 1,
+      });
+    });
+
+    it('includes the contracts when the caller has contracts:read', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: ORG_ID,
+          partnerId: null,
+          accessibleOrgIds: [ORG_ID],
+          canAccessOrg: (orgId: string) => orgId === ORG_ID
+        });
+        c.set('permissions', {
+          permissions: [{ resource: 'contracts', action: 'read' }],
+          scope: 'organization',
+          orgId: ORG_ID,
+          partnerId: null,
+        });
+        return next();
+      });
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup()])
+          })
+        })
+      } as any);
+      const contracts = [{ id: 'c1', name: 'Acme', status: 'active' }];
+      deleteDeviceGroup.mockRejectedValueOnce(
+        new DeviceGroupDeleteError('BILLED_BY_CONTRACTS', 'billed', contracts)
+      );
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        error: 'billed',
+        code: 'GROUP_IN_USE_BY_CONTRACTS',
+        contractCount: 1,
+        contracts,
+      });
+    });
+
+    it('returns quoteCount but omits quotes when the caller lacks quotes:read', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup()])
+          })
+        })
+      } as any);
+      const quotes = [{ id: 'q1', quoteNumber: 'Q-42', status: 'sent' }];
+      deleteDeviceGroup.mockRejectedValueOnce(
+        new DeviceGroupDeleteError('QUOTED_BY_QUOTES', 'quoted', undefined, quotes)
+      );
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        error: 'quoted',
+        code: 'GROUP_IN_USE_BY_QUOTES',
+        quoteCount: 1,
+      });
+    });
+
+    it('includes quotes for a quotes reader and both counts for both refusals', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: ORG_ID,
+          partnerId: null,
+          accessibleOrgIds: [ORG_ID],
+          canAccessOrg: (orgId: string) => orgId === ORG_ID
+        });
+        c.set('permissions', {
+          permissions: [
+            { resource: 'contracts', action: 'read' },
+            { resource: 'quotes', action: 'read' },
+          ],
+          scope: 'organization',
+          orgId: ORG_ID,
+          partnerId: null,
+        });
+        return next();
+      });
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup()])
+          })
+        })
+      } as any);
+      const contracts = [{ id: 'c1', name: 'Acme', status: 'active' }];
+      const quotes = [{ id: 'q1', quoteNumber: 'Q-42', status: 'sent' }];
+      deleteDeviceGroup.mockRejectedValueOnce(
+        new DeviceGroupDeleteError('BILLED_BY_CONTRACTS', 'billed and quoted', contracts, quotes)
+      );
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        error: 'billed and quoted',
+        code: 'GROUP_IN_USE_BY_CONTRACTS',
+        contractCount: 1,
+        quoteCount: 1,
+        contracts,
+        quotes,
+      });
+    });
+
+    it('should reject deleting group from another org (multi-tenant isolation)', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeGroup({ orgId: ORG_ID_2 })])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(404);
+    });
+  });
+
+});

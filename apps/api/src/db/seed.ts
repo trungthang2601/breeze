@@ -1,0 +1,1448 @@
+// Canonicalize NODE_ENV first — seed gates the bootstrap admin on it and runs
+// as a standalone CLI (db:seed) as well as from autoMigrate. See #917 (L-6).
+import '../config/normalizeNodeEnv';
+import { db, withSystemDbAccessContext } from './index';
+import { roles, permissions, rolePermissions, scripts, alertTemplates, partners, organizations, sites, users, partnerUsers } from './schema';
+import { applyNewPartnerDefaultSettings } from '../services/partnerDefaultSettings';
+import { seedSystemTicketStatuses } from '../services/ticketConfigService';
+import { ensureDefaultProfile } from '../services/billingProfileService';
+import { cutScriptVersion } from '../services/scriptVersions';
+import { eq, and, isNull } from 'drizzle-orm';
+import { hashPassword } from '../services/password';
+
+/**
+ * Settings for the seeded dev/e2e "Default Partner". New partners default to
+ * `security.requireMfa = true` (spec
+ * docs/superpowers/specs/2026-09-18-mfa-required-default-new-partners-design.md
+ * D2), but seeded admins sign in without a factor and e2e pins
+ * MFA_FORCE_FOR_PARTNER_ADMIN=false, so the seeded partner opts OUT explicitly.
+ * Pinned by db/seed.test.ts — do not "simplify" this back to the bare helper.
+ */
+export const DEV_SEED_DEFAULT_PARTNER_SETTINGS: Record<string, unknown> =
+  applyNewPartnerDefaultSettings({ security: { requireMfa: false } });
+
+const DEV_BOOTSTRAP_ADMIN_EMAIL = 'admin@breeze.local';
+const DEV_BOOTSTRAP_ADMIN_PASSWORD = 'BreezeAdmin123!';
+const INSECURE_BOOTSTRAP_PASSWORD_PATTERNS = [
+  'changeme',
+  'change-me',
+  'change_me',
+  'password',
+  'your-secret',
+  'generate-a',
+  'change-in-production',
+];
+
+export interface BootstrapAdminConfig {
+  email: string;
+  name: string;
+  password: string;
+  logPassword: boolean;
+}
+
+function requireValidBootstrapEmail(email: string): void {
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new Error('BREEZE_BOOTSTRAP_ADMIN_EMAIL must be a valid email address.');
+  }
+}
+
+function looksLikeInsecureBootstrapPassword(password: string): boolean {
+  const lower = password.toLowerCase().trim();
+  return INSECURE_BOOTSTRAP_PASSWORD_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
+/**
+ * Resolve the initial admin used only when the database has no users.
+ *
+ * Development/test keep a known local convenience account. Production must be
+ * explicitly bootstrapped by the operator so a fresh internet-reachable deploy
+ * never creates a fixed public admin/password pair.
+ */
+export function resolveBootstrapAdminConfig(
+  env: Record<string, string | undefined> = process.env,
+): BootstrapAdminConfig {
+  const isProduction = env.NODE_ENV === 'production';
+  const email = env.BREEZE_BOOTSTRAP_ADMIN_EMAIL?.trim();
+  const password = env.BREEZE_BOOTSTRAP_ADMIN_PASSWORD;
+  const name = env.BREEZE_BOOTSTRAP_ADMIN_NAME?.trim() || (isProduction ? 'Bootstrap Admin' : 'Breeze Admin');
+
+  if (!isProduction) {
+    const resolvedEmail = email || DEV_BOOTSTRAP_ADMIN_EMAIL;
+    requireValidBootstrapEmail(resolvedEmail);
+    return {
+      email: resolvedEmail,
+      name,
+      password: password || DEV_BOOTSTRAP_ADMIN_PASSWORD,
+      logPassword: !password,
+    };
+  }
+
+  if (!email || !password) {
+    throw new Error(
+      'Production bootstrap requires BREEZE_BOOTSTRAP_ADMIN_EMAIL and BREEZE_BOOTSTRAP_ADMIN_PASSWORD when the users table is empty.',
+    );
+  }
+
+  requireValidBootstrapEmail(email);
+
+  if (email.toLowerCase() === DEV_BOOTSTRAP_ADMIN_EMAIL) {
+    throw new Error('BREEZE_BOOTSTRAP_ADMIN_EMAIL must not use the development default admin address in production.');
+  }
+
+  if (password === DEV_BOOTSTRAP_ADMIN_PASSWORD) {
+    throw new Error('BREEZE_BOOTSTRAP_ADMIN_PASSWORD must not use the development default password in production.');
+  }
+
+  if (password.length < 16) {
+    throw new Error('BREEZE_BOOTSTRAP_ADMIN_PASSWORD must be at least 16 characters in production.');
+  }
+
+  if (looksLikeInsecureBootstrapPassword(password)) {
+    throw new Error('BREEZE_BOOTSTRAP_ADMIN_PASSWORD must be a generated one-time secret in production.');
+  }
+
+  return {
+    email,
+    name,
+    password,
+    logPassword: false,
+  };
+}
+
+// Default permissions
+//
+// Exported for the seed↔registry consistency test (seed.test.ts), which
+// asserts every resource:action referenced by SYSTEM_ROLES below exists here.
+// This is intentionally a subset of PERMISSION_GRANTS (the shared registry):
+// the registry may define permissions no system role grants yet (e.g.
+// automations:*) without those needing a seeded row — only permissions a
+// system role actually references must be seeded, or seedRoles silently drops
+// the grant. time_entries:* moved INTO this list with #4251, when the
+// technician roles started granting them.
+export const DEFAULT_PERMISSIONS = [
+  // Backup / recovery
+  { resource: 'backup', action: 'read', description: 'View backup and recovery resources' },
+  { resource: 'backup', action: 'write', description: 'Create and manage backup and recovery resources' },
+  { resource: 'backup', action: 'cross_site_restore', description: 'Restore backup data across sites' },
+
+  // Devices
+  { resource: 'devices', action: 'read', description: 'View devices and their details' },
+  { resource: 'devices', action: 'write', description: 'Create and update devices' },
+  { resource: 'devices', action: 'delete', description: 'Delete/decommission devices' },
+  { resource: 'devices', action: 'execute', description: 'Execute commands on devices' },
+
+  { resource: 'agent_rollback', action: 'create', description: 'Authorize a signed agent rollback' },
+
+  // Built-in Workspace extension. No non-wildcard system role receives these
+  // implicitly: operators must deliberately assign the least privilege a role
+  // needs; Partner Admin retains access through its existing *:* grant.
+  { resource: 'workspace', action: 'read', description: 'View Workspace sources and processing status' },
+  { resource: 'workspace', action: 'write', description: 'Configure Workspace sources and settings' },
+  { resource: 'workspace', action: 'credentials', description: 'Manage Workspace source credentials' },
+  { resource: 'workspace', action: 'execute', description: 'Run Workspace crawling and content processing' },
+
+  // Network topology (discovery topology view + saved layout)
+  { resource: 'topology', action: 'read', description: 'View network topology and saved layout' },
+  { resource: 'topology', action: 'write', description: 'Persist topology node layout (drag-to-save)' },
+
+  // Scripts
+  { resource: 'scripts', action: 'read', description: 'View scripts' },
+  { resource: 'scripts', action: 'write', description: 'Create and edit scripts' },
+  { resource: 'scripts', action: 'delete', description: 'Delete scripts' },
+  { resource: 'scripts', action: 'execute', description: 'Execute scripts on devices' },
+
+  // Tenant variables (#3409)
+  { resource: 'variables', action: 'read', description: 'View tenant variable definitions' },
+  { resource: 'variables', action: 'manage', description: 'Create, edit, and delete tenant variables' },
+
+  // Alerts
+  { resource: 'alerts', action: 'read', description: 'View alerts' },
+  { resource: 'alerts', action: 'write', description: 'Create and edit alert rules' },
+  { resource: 'alerts', action: 'acknowledge', description: 'Acknowledge and resolve alerts' },
+
+  // Tickets
+  { resource: 'tickets', action: 'read', description: 'View tickets, comments, and categories' },
+  { resource: 'tickets', action: 'write', description: 'Create and update tickets, comments, and categories' },
+  { resource: 'tickets', action: 'manage', description: 'Edit or delete any comment and reassign ticket organization' },
+
+  // Time entries (#4251). Seeded because Partner Technician grants them: the
+  // mobile start/stop timer (#3206 W05) calls routes gated on
+  // time_entries:write, and an unseeded grant is dropped silently by seedRoles.
+  { resource: 'time_entries', action: 'read', description: 'View time entries and timesheets' },
+  { resource: 'time_entries', action: 'write', description: 'Log and edit time entries' },
+  { resource: 'time_entries', action: 'manage_billing', description: 'Override and reset time entry billing terms' },
+
+  { resource: 'billing_profiles', action: 'read', description: 'View work types and billing profiles (rate cards)' },
+  { resource: 'billing_profiles', action: 'write', description: 'Create and manage work types and billing profiles' },
+
+  // Microsoft 365 partner-global ticket mailbox administration
+  { resource: 'ticket_mailbox', action: 'read', description: 'View Microsoft 365 ticket mailbox connection status' },
+  { resource: 'ticket_mailbox', action: 'admin', description: 'Connect, verify, retest, and disable Microsoft 365 ticket mailboxes' },
+
+  // Catalog (billing/invoicing program)
+  { resource: 'catalog', action: 'read', description: 'View product catalog items and pricing' },
+  { resource: 'catalog', action: 'write', description: 'Create and update catalog items, pricing, and bundles' },
+  { resource: 'catalog', action: 'delete', description: 'Archive/delete catalog items' },
+
+  // Invoices (billing/invoicing program)
+  { resource: 'invoices', action: 'read', description: 'View invoices and payment history' },
+  { resource: 'invoices', action: 'write', description: 'Create, edit, and delete draft invoices and lines' },
+  { resource: 'invoices', action: 'send', description: 'Issue, send, void invoices and record/remove payments' },
+  { resource: 'invoices', action: 'export', description: 'Export and download invoice PDFs' },
+
+  // Contracts (recurring billing program)
+  { resource: 'contracts', action: 'read', description: 'View contracts, lines, and billing-period history' },
+  { resource: 'contracts', action: 'write', description: 'Create/edit/delete draft contracts and lines' },
+  { resource: 'contracts', action: 'manage', description: 'Activate/pause/resume/cancel contracts and generate invoices' },
+
+  // Organization documents (service deliverables W03)
+  { resource: 'documents', action: 'read', description: 'View the organization document library and download documents' },
+  { resource: 'documents', action: 'write', description: 'Upload, replace, edit, and delete organization documents' },
+
+  // Agreement templates + signed agreements (agreements vocabulary & IA split, W02).
+  { resource: 'agreements', action: 'read', description: 'View agreement templates and signed agreements' },
+  { resource: 'agreements', action: 'write', description: 'Create, edit, publish and archive agreement templates; link signed agreements' },
+
+  // Quotes / Proposals (billing program)
+  { resource: 'quotes', action: 'read', description: 'View quotes and proposals' },
+  { resource: 'quotes', action: 'write', description: 'Create/edit/delete draft quotes and proposal blocks' },
+  { resource: 'quotes', action: 'send', description: 'Send quotes/proposals and record acceptance' },
+  { resource: 'quotes', action: 'accept', description: 'Record a customer acceptance on their behalf and convert the quote to an invoice' },
+
+  // Users
+  { resource: 'users', action: 'read', description: 'View users' },
+  { resource: 'users', action: 'write', description: 'Edit users' },
+  { resource: 'users', action: 'delete', description: 'Remove users' },
+  { resource: 'users', action: 'invite', description: 'Invite new users' },
+
+  // Organizations
+  { resource: 'organizations', action: 'read', description: 'View organizations' },
+  { resource: 'organizations', action: 'write', description: 'Create and edit organizations' },
+  { resource: 'organizations', action: 'delete', description: 'Delete organizations' },
+
+  // Partner-wide OAuth/MCP connected applications. Partner Admin satisfies
+  // these through its wildcard; custom roles must be granted them explicitly.
+  { resource: 'connected_apps', action: 'read', description: 'View partner connected OAuth applications' },
+  { resource: 'connected_apps', action: 'manage', description: 'Disconnect partner connected OAuth applications' },
+
+  // Sites
+  { resource: 'sites', action: 'read', description: 'View sites' },
+  { resource: 'sites', action: 'write', description: 'Create and edit sites' },
+  { resource: 'sites', action: 'delete', description: 'Delete sites' },
+
+  // Remote access
+  { resource: 'remote', action: 'access', description: 'Remote access to devices' },
+
+  // Audit
+  { resource: 'audit', action: 'read', description: 'View audit logs' },
+  { resource: 'audit', action: 'export', description: 'Export audit logs' },
+  { resource: 'audit', action: 'manage', description: 'Manage the audit log retention policy' },
+
+  // Reports
+  { resource: 'reports', action: 'read', description: 'View reports and report data' },
+  { resource: 'reports', action: 'write', description: 'Create, update, and generate reports' },
+  { resource: 'reports', action: 'delete', description: 'Delete reports' },
+  { resource: 'reports', action: 'export', description: 'Export report output' },
+
+  // Billing
+  { resource: 'billing', action: 'manage', description: 'Manage partner billing and billing portal access' },
+
+  // Vulnerability management (BE-16)
+  { resource: 'vulnerabilities', action: 'accept_risk',
+    description: 'Waive (accept risk) and reopen vulnerability findings' },
+
+  // AI session audit (SR5-09)
+  { resource: 'ai_sessions', action: 'read_all',
+    description: "View all users' AI session history (admin audit dashboard)" },
+  { resource: 'ai_sessions', action: 'use',
+    description: 'Open and drive your own AI chat sessions' },
+
+  // AI agents (#3821)
+  { resource: 'ai_agents', action: 'read',
+    description: 'View AI agent policies' },
+  { resource: 'ai_agents', action: 'write',
+    description: 'Create, edit and disable AI agent policies' },
+
+  // Tool sources (BYO MCP/OpenAPI tool catalog, #5215/#5216, spec 2026-09-07 §5):
+  // managing the registrations is an admin task; calling the tools they expose
+  // is gated separately so a technician can use read-only external tools
+  // without being able to register a new egress destination.
+  { resource: 'tool_sources', action: 'read',
+    description: 'View external tool sources' },
+  { resource: 'tool_sources', action: 'write',
+    description: 'Manage external tool sources' },
+  { resource: 'external_tools', action: 'use',
+    description: 'Call Tier 1 (read-only) external tools from AI' },
+  { resource: 'external_tools', action: 'write',
+    description: 'Call Tier 2/3 (mutating) external tools from AI' },
+
+  // Action intents / durable approvals
+  { resource: 'approvals', action: 'decide',
+    description: 'Decide (approve/deny) pending action-intent approvals' },
+
+  // Privileged Access Management (PAM) — dedicated capabilities, distinct from
+  // devices:execute/devices:write (security review wave 7, SR1-13/SR1-14).
+  { resource: 'pam', action: 'approve',
+    description: 'Approve or deny PAM elevation requests' },
+  { resource: 'pam', action: 'manage_policy',
+    description: 'Create, update, and delete PAM rules, signer groups, and org config' },
+
+  // Accounting / QuickBooks integration — dedicated capabilities, distinct
+  // from the partner-authority-only gate the routes previously carried
+  // (SEC-2026-09-05-057).
+  { resource: 'accounting', action: 'read',
+    description: 'Read accounting provider status, customers, mappings, and income accounts' },
+  { resource: 'accounting', action: 'manage',
+    description: 'Connect, disconnect, configure, and synchronize accounting provider integrations' },
+
+  // Admin
+  { resource: '*', action: '*', description: 'Full administrative access' }
+];
+
+// Default system roles
+// Exported for the seed↔registry consistency test (seed.test.ts).
+export interface SystemRoleDefinition {
+  name: string;
+  scope: 'partner' | 'organization';
+  description: string;
+  permissions: string[];
+  /**
+   * Stored on roles.force_mfa at seed time and reconciled false→true on
+   * re-seed (never lowered — see seedRoles()). RMM-QA-164: the
+   * 2026-05-25-f migration promised force_mfa=true for the system Partner
+   * Admin role, but on a fresh database it ran before seed() created the
+   * row, so the definition must carry the flag itself. Only Partner Admin
+   * is forced; every other system role is an MSP opt-in per that
+   * migration's header (D9).
+   */
+  forceMfa: boolean;
+}
+
+export const SYSTEM_ROLES: readonly SystemRoleDefinition[] = [
+  {
+    name: 'Partner Admin',
+    scope: 'partner' as const,
+    description: 'Full access to partner and all organizations',
+    forceMfa: true,
+    permissions: ['*:*']
+  },
+  {
+    name: 'Partner Technician',
+    scope: 'partner' as const,
+    description: 'Access to assigned organizations, can execute scripts',
+    forceMfa: false,
+    permissions: [
+      'backup:read', 'backup:write',
+      'devices:read', 'devices:execute',
+      'scripts:read', 'scripts:execute',
+      'alerts:read', 'alerts:acknowledge',
+      // #4251: a technician works tickets — comments, status, assignment — and
+      // logs time against them from the mobile timer (#3206 W05). tickets:manage
+      // (reassign org, edit any author's comment) stays an admin action.
+      'tickets:read', 'tickets:write',
+      'time_entries:read', 'time_entries:write',
+      // Technicians can see work types; rate-card writes are granted explicitly.
+      'billing_profiles:read',
+      'ticket_mailbox:read',
+      'reports:read', 'reports:write',
+      'sites:read',
+      'topology:read',
+      'organizations:read',
+      // AI chat (#6396): same reasoning as Org Technician.
+      'ai_sessions:use',
+      // Tier 1 (read-only) external tools only (#5216).
+      'external_tools:use',
+      // Org document library (service deliverables W03).
+      'documents:read', 'documents:write'
+    ]
+  },
+  {
+    name: 'Partner Viewer',
+    scope: 'partner' as const,
+    description: 'Read-only access to assigned organizations',
+    forceMfa: false,
+    permissions: [
+      'devices:read',
+      'scripts:read',
+      'alerts:read',
+      'tickets:read',
+      'ticket_mailbox:read',
+      'reports:read',
+      'sites:read',
+      'organizations:read'
+    ]
+  },
+  {
+    name: 'Partner Billing',
+    scope: 'partner' as const,
+    description: 'Full access to product catalog, quotes, invoices, contracts, and agreements',
+    forceMfa: false,
+    permissions: [
+      'catalog:read', 'catalog:write', 'catalog:delete',
+      'quotes:read', 'quotes:write', 'quotes:send', 'quotes:accept',
+      'invoices:read', 'invoices:write', 'invoices:send', 'invoices:export',
+      'contracts:read', 'contracts:write', 'contracts:manage',
+      'agreements:read', 'agreements:write'
+    ]
+  },
+  {
+    name: 'Partner Billing Viewer',
+    scope: 'partner' as const,
+    description: 'Read-only access to product catalog, quotes, invoices, contracts, and agreements',
+    forceMfa: false,
+    permissions: [
+      'catalog:read',
+      'quotes:read',
+      'invoices:read', 'invoices:export',
+      'contracts:read',
+      'agreements:read'
+    ]
+  },
+  {
+    name: 'Org Admin',
+    scope: 'organization' as const,
+    description: 'Full access within organization',
+    forceMfa: false,
+    permissions: [
+      'backup:read', 'backup:write', 'backup:cross_site_restore',
+      'devices:read', 'devices:write', 'devices:delete', 'devices:execute',
+      'scripts:read', 'scripts:write', 'scripts:delete', 'scripts:execute',
+      'alerts:read', 'alerts:write', 'alerts:acknowledge',
+      'tickets:read', 'tickets:write', 'tickets:manage',
+      'reports:read', 'reports:write', 'reports:delete', 'reports:export',
+      'users:read', 'users:write', 'users:delete', 'users:invite',
+      'sites:read', 'sites:write', 'sites:delete',
+      'topology:read', 'topology:write',
+      'remote:access',
+      'audit:read',
+      'audit:manage',
+      'vulnerabilities:accept_risk',
+      'ai_sessions:read_all',
+      // Own-session chat (#6396): dedicated capability, not organizations:write.
+      'ai_sessions:use',
+      // An org admin may tighten their own org's agent policy. Creating a
+      // PARTNER-WIDE baseline additionally requires partner scope with
+      // org_access='all' (canManagePartnerWidePolicies), so this grant cannot
+      // reach across orgs.
+      'ai_agents:read', 'ai_agents:write',
+      // External tool sources (#5216): an org admin registers sources for their
+      // own org. A PARTNER-WIDE source additionally requires partner scope with
+      // org_access='all' (canManagePartnerWidePolicies).
+      'tool_sources:read', 'tool_sources:write',
+      'external_tools:use', 'external_tools:write',
+      'approvals:decide',
+      'agent_rollback:create',
+      // Tenant variables (#3409): managing the definitions is an admin task;
+      // running a script that USES one only needs scripts:execute.
+      'variables:read', 'variables:manage',
+      // PAM (security review wave 7): dedicated, NOT implied by
+      // devices:execute/devices:write above — an Org Technician holds those
+      // for ordinary device work but must not thereby gain PAM authority.
+      'pam:approve', 'pam:manage_policy',
+      // Accounting (SEC-2026-09-05-057): dedicated, NOT implied by partner
+      // authority — a full-partner low-role member must not thereby reach the
+      // shared QuickBooks realm.
+      'accounting:read', 'accounting:manage',
+      // Workspace and partner connected-app permissions were introduced with
+      // no built-in role grant except Partner Admin's wildcard, which would
+      // have silently dropped this access for every existing Org Admin on
+      // upgrade. Org Admin gets every new key by default; the routes for
+      // connected_apps additionally require partner scope, so this literal
+      // grant is inert for an org-scoped token until that boundary is
+      // crossed deliberately.
+      'workspace:read', 'workspace:write', 'workspace:credentials', 'workspace:execute',
+      'connected_apps:read', 'connected_apps:manage',
+      // Org document library (service deliverables W03).
+      'documents:read', 'documents:write'
+    ]
+  },
+  {
+    name: 'Org Technician',
+    scope: 'organization' as const,
+    description: 'Execute scripts and manage devices',
+    forceMfa: false,
+    permissions: [
+      'devices:read', 'devices:write', 'devices:execute',
+      'scripts:read', 'scripts:execute',
+      'alerts:read', 'alerts:acknowledge',
+      'tickets:read',
+      'reports:read', 'reports:write',
+      'sites:read',
+      'topology:read', 'topology:write',
+      'remote:access',
+      // AI chat (#6396): a technician can run scripts and manage devices over
+      // HTTP; the per-tool map bounds chat to exactly the same permissions.
+      'ai_sessions:use',
+      // Read-only: a technician writing a script needs to know which variable
+      // keys exist, but not to create or rotate them.
+      'variables:read',
+      // Tier 1 (read-only) external tools only (#5216); registering a source
+      // and calling mutating external tools stay admin actions.
+      'external_tools:use',
+      // Org document library (service deliverables W03).
+      'documents:read', 'documents:write'
+    ]
+  },
+  {
+    name: 'Org Viewer',
+    scope: 'organization' as const,
+    description: 'Read-only access within organization',
+    forceMfa: false,
+    permissions: [
+      'devices:read',
+      'scripts:read',
+      'alerts:read',
+      'tickets:read',
+      'reports:read',
+      'sites:read',
+      'topology:read'
+    ]
+  },
+  {
+    name: 'Security Approver',
+    scope: 'organization' as const,
+    description: 'Review and waive (accept risk) / reopen vulnerability findings',
+    forceMfa: false,
+    permissions: [
+      'devices:read',
+      'vulnerabilities:accept_risk'
+    ]
+  },
+  {
+    name: 'Partner Security Approver',
+    scope: 'partner' as const,
+    description: 'Review and waive (accept risk) / reopen vulnerability findings across assigned organizations',
+    forceMfa: false,
+    permissions: [
+      'devices:read',
+      'organizations:read',
+      'vulnerabilities:accept_risk'
+    ]
+  }
+];
+
+// System scripts for RMM operations - only action scripts, not info gathering (agent has native collectors)
+const SYSTEM_SCRIPTS = [
+  // === WINDOWS SCRIPTS ===
+  {
+    name: 'IP Configuration',
+    description: 'Displays IP configuration for all network adapters',
+    category: 'Network',
+    osTypes: ['windows'],
+    language: 'cmd' as const,
+    content: `ipconfig /all`,
+    timeoutSeconds: 30,
+    runAs: 'system' as const
+  },
+  {
+    name: 'Flush DNS Cache',
+    description: 'Clears the DNS resolver cache',
+    category: 'Network',
+    osTypes: ['windows'],
+    language: 'cmd' as const,
+    content: `ipconfig /flushdns`,
+    timeoutSeconds: 30,
+    runAs: 'elevated' as const
+  },
+  {
+    name: 'Clear Print Queue',
+    description: 'Stops the print spooler, clears the queue, and restarts it',
+    category: 'Troubleshooting',
+    osTypes: ['windows'],
+    language: 'cmd' as const,
+    content: `net stop spooler
+del /Q /F /S "%systemroot%\\System32\\spool\\PRINTERS\\*.*"
+net start spooler
+echo Print queue cleared successfully`,
+    timeoutSeconds: 60,
+    runAs: 'elevated' as const
+  },
+  {
+    name: 'Clear Windows Temp Files',
+    description: 'Cleans temporary files and caches on Windows',
+    category: 'Maintenance',
+    osTypes: ['windows'],
+    language: 'powershell' as const,
+    content: `# Clear Windows Temp Files
+Write-Host "Clearing temporary files..." -ForegroundColor Cyan
+
+# User temp
+\$userTemp = [System.IO.Path]::GetTempPath()
+Get-ChildItem \$userTemp -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+Write-Host "Cleared user temp folder"
+
+# Windows temp
+Get-ChildItem "C:\\Windows\\Temp" -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+Write-Host "Cleared Windows temp folder"
+
+# Prefetch
+Get-ChildItem "C:\\Windows\\Prefetch" -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+Write-Host "Cleared prefetch folder"
+
+Write-Host ""
+Write-Host "Cleanup complete!" -ForegroundColor Green
+`,
+    timeoutSeconds: 120,
+    runAs: 'elevated' as const
+  },
+  {
+    name: 'Restart Windows Explorer',
+    description: 'Restarts Windows Explorer to resolve shell issues',
+    category: 'Troubleshooting',
+    osTypes: ['windows'],
+    language: 'cmd' as const,
+    content: `taskkill /f /im explorer.exe
+start explorer.exe
+echo Windows Explorer restarted`,
+    timeoutSeconds: 30,
+    runAs: 'system' as const
+  },
+  {
+    name: 'Release and Renew IP',
+    description: 'Releases and renews DHCP IP address',
+    category: 'Network',
+    osTypes: ['windows'],
+    language: 'cmd' as const,
+    content: `ipconfig /release
+ipconfig /renew
+ipconfig`,
+    timeoutSeconds: 60,
+    runAs: 'elevated' as const
+  },
+
+  // === macOS SCRIPTS ===
+  {
+    name: 'Flush DNS Cache (macOS)',
+    description: 'Clears the DNS resolver cache on macOS',
+    category: 'Network',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+sudo dscacheutil -flushcache
+sudo killall -HUP mDNSResponder
+echo "DNS cache flushed successfully"`,
+    timeoutSeconds: 30,
+    runAs: 'elevated' as const
+  },
+  {
+    name: 'Clear System Cache',
+    description: 'Clears system caches to free up disk space on macOS',
+    category: 'Maintenance',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+echo "Clearing system caches..."
+
+# User caches
+rm -rf ~/Library/Caches/* 2>/dev/null
+echo "Cleared user caches"
+
+# Font caches
+sudo atsutil databases -remove 2>/dev/null
+echo "Cleared font caches"
+
+echo "Cache clearing complete!"`,
+    timeoutSeconds: 120,
+    runAs: 'elevated' as const
+  },
+  {
+    name: 'Restart Finder',
+    description: 'Restarts the Finder application to resolve UI issues',
+    category: 'Troubleshooting',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+killall Finder
+echo "Finder restarted successfully"`,
+    timeoutSeconds: 30,
+    runAs: 'user' as const
+  },
+  {
+    name: 'Restart Dock',
+    description: 'Restarts the Dock to resolve UI issues',
+    category: 'Troubleshooting',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+killall Dock
+echo "Dock restarted successfully"`,
+    timeoutSeconds: 30,
+    runAs: 'user' as const
+  },
+  {
+    name: 'Clear Print Queue (macOS)',
+    description: 'Clears all pending print jobs on macOS',
+    category: 'Troubleshooting',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+cancel -a -
+echo "Print queue cleared successfully"`,
+    timeoutSeconds: 30,
+    runAs: 'elevated' as const
+  },
+  {
+    name: 'Network Configuration (macOS)',
+    description: 'Displays network interface configuration',
+    category: 'Network',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+echo "=== Network Interfaces ==="
+ifconfig | grep -E "^[a-z]|inet "
+echo ""
+echo "=== Default Gateway ==="
+netstat -rn | grep default`,
+    timeoutSeconds: 30,
+    runAs: 'system' as const
+  },
+  {
+    name: 'Renew DHCP Lease',
+    description: 'Renews the DHCP lease on the primary interface',
+    category: 'Network',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+sudo ipconfig set en0 DHCP
+echo "DHCP lease renewed on en0"`,
+    timeoutSeconds: 30,
+    runAs: 'elevated' as const
+  },
+
+  // === WINDOWS IDENTITY TEST SCRIPTS ===
+  {
+    name: 'Who Am I? (System Context)',
+    description: 'Shows the current execution identity when running as SYSTEM. Useful for verifying script execution context.',
+    category: 'Troubleshooting',
+    osTypes: ['windows'],
+    language: 'powershell' as const,
+    content: `Write-Host "=== Script Execution Identity ===" -ForegroundColor Cyan
+Write-Host "Username:      $(whoami)"
+Write-Host "Domain\\User:   $env:USERDOMAIN\\$env:USERNAME"
+Write-Host "Computer:      $env:COMPUTERNAME"
+Write-Host "Is Admin:      $([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
+Write-Host "Session ID:    $([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
+Write-Host "Temp Path:     $([System.IO.Path]::GetTempPath())"
+Write-Host ""
+Write-Host "If running as SYSTEM, username will be 'NT AUTHORITY\\SYSTEM'" -ForegroundColor Yellow
+Write-Host "Session ID 0 = service context, >0 = user session" -ForegroundColor Yellow`,
+    timeoutSeconds: 30,
+    runAs: 'system' as const
+  },
+  {
+    name: 'Who Am I? (User Context)',
+    description: 'Shows the current execution identity when running as the logged-in user. Useful for verifying script execution context.',
+    category: 'Troubleshooting',
+    osTypes: ['windows'],
+    language: 'powershell' as const,
+    content: `Write-Host "=== Script Execution Identity ===" -ForegroundColor Cyan
+Write-Host "Username:      $(whoami)"
+Write-Host "Domain\\User:   $env:USERDOMAIN\\$env:USERNAME"
+Write-Host "Computer:      $env:COMPUTERNAME"
+Write-Host "Is Admin:      $([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
+Write-Host "Session ID:    $([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
+Write-Host "User Profile:  $env:USERPROFILE"
+Write-Host "Temp Path:     $([System.IO.Path]::GetTempPath())"
+Write-Host ""
+Write-Host "If running as logged-in user, username will be 'DOMAIN\\username'" -ForegroundColor Yellow
+Write-Host "Session ID should be >0 (interactive user session)" -ForegroundColor Yellow`,
+    timeoutSeconds: 30,
+    runAs: 'user' as const
+  },
+
+  // === macOS IDENTITY TEST SCRIPTS ===
+  {
+    name: 'Who Am I? (System Context) (macOS)',
+    description: 'Shows the current execution identity when running as root/system. Useful for verifying script execution context.',
+    category: 'Troubleshooting',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+echo "=== Script Execution Identity ==="
+echo "Username:      $(whoami)"
+echo "User ID:       $(id -u)"
+echo "Group ID:      $(id -g)"
+echo "Groups:        $(id -Gn)"
+echo "Hostname:      $(hostname)"
+echo "Home Dir:      $HOME"
+echo "Temp Dir:      $TMPDIR"
+echo "Shell:         $SHELL"
+echo ""
+echo "If running as SYSTEM, username will be 'root' (UID 0)"
+echo "If running as user, username will be the logged-in user"`,
+    timeoutSeconds: 30,
+    runAs: 'system' as const
+  },
+  {
+    name: 'Who Am I? (User Context) (macOS)',
+    description: 'Shows the current execution identity when running as the logged-in user. Useful for verifying script execution context.',
+    category: 'Troubleshooting',
+    osTypes: ['macos'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+echo "=== Script Execution Identity ==="
+echo "Username:      $(whoami)"
+echo "User ID:       $(id -u)"
+echo "Group ID:      $(id -g)"
+echo "Groups:        $(id -Gn)"
+echo "Hostname:      $(hostname)"
+echo "Home Dir:      $HOME"
+echo "Temp Dir:      $TMPDIR"
+echo "Shell:         $SHELL"
+CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || echo "unknown")
+echo "Console User:  $CONSOLE_USER"
+echo ""
+echo "If running as logged-in user, username should match Console User"
+echo "If running as root, UID will be 0 and username will be 'root'"`,
+    timeoutSeconds: 30,
+    runAs: 'user' as const
+  },
+
+  // === LINUX IDENTITY TEST SCRIPTS ===
+  {
+    name: 'Who Am I? (System Context) (Linux)',
+    description: 'Shows the current execution identity when running as root/system. Useful for verifying script execution context.',
+    category: 'Troubleshooting',
+    osTypes: ['linux'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+echo "=== Script Execution Identity ==="
+echo "Username:      $(whoami)"
+echo "User ID:       $(id -u)"
+echo "Group ID:      $(id -g)"
+echo "Groups:        $(id -Gn)"
+echo "Hostname:      $(hostname)"
+echo "Home Dir:      $HOME"
+echo "Temp Dir:      ${'${'}TMPDIR:-/tmp}"
+echo "Shell:         $SHELL"
+echo ""
+echo "If running as SYSTEM, username will be 'root' (UID 0)"
+echo "If running as user, username will be the logged-in user"`,
+    timeoutSeconds: 30,
+    runAs: 'system' as const
+  },
+  {
+    name: 'Who Am I? (User Context) (Linux)',
+    description: 'Shows the current execution identity when running as the logged-in user. Useful for verifying script execution context.',
+    category: 'Troubleshooting',
+    osTypes: ['linux'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+echo "=== Script Execution Identity ==="
+echo "Username:      $(whoami)"
+echo "User ID:       $(id -u)"
+echo "Group ID:      $(id -g)"
+echo "Groups:        $(id -Gn)"
+echo "Hostname:      $(hostname)"
+echo "Home Dir:      $HOME"
+echo "Temp Dir:      ${'${'}TMPDIR:-/tmp}"
+echo "Shell:         $SHELL"
+CONSOLE_USER=$(who 2>/dev/null | head -1 | awk '{print $1}')
+echo "Console User:  ${'${'}CONSOLE_USER:-unknown}"
+echo ""
+echo "If running as logged-in user, username should match Console User"
+echo "If running as root, UID will be 0 and username will be 'root'"`,
+    timeoutSeconds: 30,
+    runAs: 'user' as const
+  },
+
+  // === LINUX SCRIPTS ===
+  {
+    name: 'Flush DNS Cache (Linux)',
+    description: 'Clears the DNS resolver cache on Linux',
+    category: 'Network',
+    osTypes: ['linux'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+if command -v systemd-resolve &> /dev/null; then
+    sudo systemd-resolve --flush-caches
+    echo "DNS cache flushed (systemd-resolved)"
+elif command -v resolvectl &> /dev/null; then
+    sudo resolvectl flush-caches
+    echo "DNS cache flushed (resolvectl)"
+else
+    sudo systemctl restart nscd 2>/dev/null || echo "No DNS cache service found"
+fi`,
+    timeoutSeconds: 30,
+    runAs: 'elevated' as const
+  },
+  {
+    name: 'Network Configuration (Linux)',
+    description: 'Displays network interface configuration',
+    category: 'Network',
+    osTypes: ['linux'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+echo "=== Network Interfaces ==="
+ip addr show
+echo ""
+echo "=== Default Gateway ==="
+ip route | grep default`,
+    timeoutSeconds: 30,
+    runAs: 'system' as const
+  },
+  {
+    name: 'Clear Print Queue (Linux)',
+    description: 'Clears all pending print jobs on Linux',
+    category: 'Troubleshooting',
+    osTypes: ['linux'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+cancel -a -
+echo "Print queue cleared successfully"`,
+    timeoutSeconds: 30,
+    runAs: 'elevated' as const
+  },
+  {
+    name: 'Clear Package Cache',
+    description: 'Clears package manager cache to free disk space',
+    category: 'Maintenance',
+    osTypes: ['linux'],
+    language: 'bash' as const,
+    content: `#!/bin/bash
+if command -v apt &> /dev/null; then
+    sudo apt clean
+    echo "APT cache cleared"
+elif command -v dnf &> /dev/null; then
+    sudo dnf clean all
+    echo "DNF cache cleared"
+elif command -v yum &> /dev/null; then
+    sudo yum clean all
+    echo "YUM cache cleared"
+else
+    echo "Unknown package manager"
+fi`,
+    timeoutSeconds: 60,
+    runAs: 'elevated' as const
+  }
+];
+
+export async function seedScripts() {
+  return withSystemDbAccessContext(async () => {
+  console.log('Seeding system scripts...');
+
+  for (const scriptDef of SYSTEM_SCRIPTS) {
+    // Check if script already exists by name and isSystem
+    const [existing] = await db
+      .select()
+      .from(scripts)
+      .where(
+        and(
+          eq(scripts.name, scriptDef.name),
+          eq(scripts.isSystem, true)
+        )
+      )
+      .limit(1);
+
+    if (existing) {
+      console.log('  Script exists:', scriptDef.name);
+      continue;
+    }
+
+    // The row and its v1 version are one unit of work (#5622). Seeding the
+    // `scripts` row alone left a HEADLESS script: `headScriptVersion()` returns
+    // null for it forever, and `script_versions` is append-only so it could not
+    // be repaired afterwards. Same shape as services/systemScriptLibrary.ts —
+    // insert at version 0, let cutScriptVersion move it to 1 and snapshot it;
+    // 0 is never observable outside this transaction.
+    await db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(scripts)
+        .values({
+          name: scriptDef.name,
+          description: scriptDef.description,
+          category: scriptDef.category,
+          osTypes: scriptDef.osTypes,
+          language: scriptDef.language,
+          content: scriptDef.content,
+          timeoutSeconds: scriptDef.timeoutSeconds,
+          runAs: scriptDef.runAs,
+          isSystem: true,
+          orgId: null, // System scripts have no org
+          version: 0,
+          // Matches what the 2026-10-16-100000 backfill stamps on an is_system
+          // row in production (`CASE WHEN s.is_system THEN 'system' ...`), so a
+          // dev stack and a migrated prod DB agree on these same scripts.
+          origin: 'system',
+        })
+        .returning({ id: scripts.id });
+
+      if (!created) {
+        throw new Error(`system script "${scriptDef.name}" insert returned no row`);
+      }
+
+      // No user on the seed path, so createdBy is honestly null.
+      await cutScriptVersion(tx, {
+        scriptId: created.id,
+        provenance: { origin: 'system', changelog: 'Seeded system script', createdBy: null },
+      });
+    });
+    console.log('  Created script:', scriptDef.name);
+  }
+
+  console.log('Scripts seeded.');
+  });
+}
+
+export async function seedPermissions() {
+  return withSystemDbAccessContext(async () => {
+  console.log('Seeding permissions...');
+
+  for (const perm of DEFAULT_PERMISSIONS) {
+    // Match on the full (resource, action) pair. The previous existence check
+    // filtered on resource alone with .limit(1), so for a resource with several
+    // actions (e.g. devices read/write/delete/execute) the single returned row
+    // frequently had the wrong action — the .find(action) missed and re-inserted
+    // a duplicate on every re-seed. permissions has no unique constraint to catch
+    // that, and the duplicate ids then let seedRoles slip extra role_permissions
+    // grants past the (role_id, permission_id) PK. Make the dedup exact.
+    const existing = await db
+      .select()
+      .from(permissions)
+      .where(and(eq(permissions.resource, perm.resource), eq(permissions.action, perm.action)))
+      .limit(1);
+
+    if (existing.length === 0) {
+      await db.insert(permissions).values(perm);
+      console.log('  Created permission:', perm.resource + ':' + perm.action);
+    }
+  }
+
+  console.log('Permissions seeded.');
+  });
+}
+
+export async function seedRoles() {
+  return withSystemDbAccessContext(async () => {
+  console.log('Seeding system roles...');
+
+  // Get all permissions for lookup
+  const allPerms = await db.select().from(permissions);
+  const permMap = new Map(allPerms.map(p => [p.resource + ':' + p.action, p.id]));
+
+  for (const roleDef of SYSTEM_ROLES) {
+    // RMM-QA-164: match ONLY the global system template of THIS definition
+    // (name + scope, is_system, no tenant axis). A name-only lookup could
+    // match a tenant copy (partner_id set, created by createPartner()), a
+    // custom is_system=false role that happens to share the name, or a
+    // global system row of the other scope — it would then skip creating
+    // the template and, with the reconcile and grants below, flip and
+    // over-privilege a row the seed never owned. Scope is pinned because the
+    // ownership boundary the reconcile migration enforces is
+    // scope='partner' AND is_system; the seed must not be looser. Tenant
+    // copies are reconciled by the 2026-10-11-170000 migration, not here.
+    const [existing] = await db
+      .select()
+      .from(roles)
+      .where(
+        and(
+          eq(roles.name, roleDef.name),
+          eq(roles.scope, roleDef.scope),
+          eq(roles.isSystem, true),
+          isNull(roles.partnerId),
+          isNull(roles.orgId),
+        ),
+      )
+      .limit(1);
+
+    let roleId: string;
+
+    if (existing) {
+      roleId = existing.id;
+      if (roleDef.forceMfa && !existing.forceMfa) {
+        // One-directional: the definition may RAISE a stored flag, never
+        // lower one. Org Admin et al. are per-deployment opt-ins (see the
+        // 2026-05-25-f header), so "make it equal the definition" would
+        // silently revert an operator's choice on every db:seed. The UPDATE
+        // fires breeze_roles_permissions_epoch for the template's members
+        // (the bootstrap admin) — intended.
+        await db.update(roles).set({ forceMfa: true }).where(eq(roles.id, existing.id));
+        console.log('  Role reconciled (force_mfa):', roleDef.name);
+      } else {
+        console.log('  Role exists:', roleDef.name);
+      }
+    } else {
+      const [newRole] = await db
+        .insert(roles)
+        .values({
+          name: roleDef.name,
+          scope: roleDef.scope,
+          description: roleDef.description,
+          isSystem: true,
+          forceMfa: roleDef.forceMfa,
+        })
+        .returning();
+
+      if (!newRole) {
+        console.error('  Failed to create role:', roleDef.name);
+        continue;
+      }
+      roleId = newRole.id;
+      console.log('  Created role:', roleDef.name);
+    }
+
+    // Assign permissions to role
+    for (const permKey of roleDef.permissions) {
+      const permId = permMap.get(permKey);
+      if (!permId) {
+        console.warn(`  Role "${roleDef.name}" references unknown permission "${permKey}" — skipping`);
+        continue;
+      }
+      // Permission may already be assigned (re-seed, or a duplicate key in
+      // roleDef.permissions). This PR added the (role_id, permission_id)
+      // composite PK and switched to onConflictDoNothing so the DB no-ops on a
+      // re-seed. A hand-rolled catch is the wrong tool here: it would have
+      // checked `err.code === '23505'`, but under Drizzle's DrizzleQueryError
+      // wrapper `err.code` is undefined (the pg `23505` lives on `err.cause`),
+      // so the catch would have re-thrown the conflict and broken re-seeding.
+      // onConflictDoNothing absorbs only the PK conflict — any genuine error
+      // (RLS, FK, connection loss) still surfaces.
+      await db
+        .insert(rolePermissions)
+        .values({ roleId, permissionId: permId })
+        .onConflictDoNothing();
+    }
+  }
+
+  console.log('Roles seeded.');
+  });
+}
+
+// Built-in alert templates for event log conditions
+const EVENT_LOG_ALERT_TEMPLATES = [
+  {
+    name: 'DNS Threat Blocked',
+    description: 'Device attempted to reach a blocked malicious / threat-categorized domain',
+    conditions: {
+      type: 'dns_threat',
+      eventType: 'dns.threat.blocked',
+      // When `categories` is empty, any category triggers (default-permissive).
+      // Operators can narrow via the rule's override_settings.conditions.categories array.
+      categories: [] as string[]
+    },
+    severity: 'high' as const,
+    titleTemplate: 'DNS threat blocked: {{domain}} ({{category}})',
+    messageTemplate: 'Device {{hostname}} attempted to reach {{domain}} ({{category}}, {{threat_type}}). Query blocked at the resolver.',
+    // 60-minute window so a device hammering one malicious domain doesn't
+    // page-storm. Multiple distinct domains/categories within the window
+    // are de-duplicated by the alert engine's per-(template, target, key)
+    // cooldown logic; first matched event wins.
+    cooldownMinutes: 60
+  },
+  {
+    name: 'Auth Failure Burst',
+    description: '5+ authentication failures within 10 minutes',
+    conditions: {
+      type: 'event_log',
+      category: 'security',
+      level: 'error',
+      messagePattern: 'authentication',
+      countThreshold: 5,
+      windowMinutes: 10
+    },
+    severity: 'high' as const,
+    titleTemplate: 'Authentication Failure Burst on {{hostname}}',
+    messageTemplate: '{{count}} authentication failures detected on {{hostname}} within 10 minutes',
+    cooldownMinutes: 30
+  },
+  {
+    name: 'Application Crash',
+    description: 'Application crash detected via crash report',
+    conditions: {
+      type: 'event_log',
+      category: 'application',
+      level: 'error',
+      countThreshold: 1,
+      windowMinutes: 5
+    },
+    severity: 'medium' as const,
+    titleTemplate: 'Application Crash on {{hostname}}',
+    messageTemplate: 'Application crash detected on {{hostname}}: {{message}}',
+    cooldownMinutes: 15
+  },
+  {
+    name: 'Kernel Panic',
+    description: 'Kernel panic or critical system failure detected',
+    conditions: {
+      type: 'event_log',
+      category: 'hardware',
+      level: 'critical',
+      messagePattern: 'kernel panic',
+      countThreshold: 1,
+      windowMinutes: 60
+    },
+    severity: 'critical' as const,
+    titleTemplate: 'Kernel Panic on {{hostname}}',
+    messageTemplate: 'Critical kernel panic detected on {{hostname}}',
+    cooldownMinutes: 60
+  },
+  {
+    name: 'Disk Error Cluster',
+    description: '3+ disk/hardware errors within 30 minutes',
+    conditions: {
+      type: 'event_log',
+      category: 'hardware',
+      level: 'error',
+      countThreshold: 3,
+      windowMinutes: 30
+    },
+    severity: 'high' as const,
+    titleTemplate: 'Disk Errors on {{hostname}}',
+    messageTemplate: '{{count}} hardware/disk errors detected on {{hostname}} within 30 minutes',
+    cooldownMinutes: 60
+  },
+  {
+    name: 'Unexpected Shutdown',
+    description: 'Unexpected system shutdown or power loss detected',
+    conditions: {
+      type: 'event_log',
+      category: 'system',
+      level: 'warning',
+      messagePattern: 'shutdown',
+      countThreshold: 1,
+      windowMinutes: 60
+    },
+    severity: 'medium' as const,
+    titleTemplate: 'Unexpected Shutdown on {{hostname}}',
+    messageTemplate: 'Unexpected system shutdown detected on {{hostname}}',
+    cooldownMinutes: 60
+  }
+];
+
+export async function seedEventLogAlertTemplates() {
+  return withSystemDbAccessContext(async () => {
+  console.log('Seeding event log alert templates...');
+
+  for (const tmpl of EVENT_LOG_ALERT_TEMPLATES) {
+    const [existing] = await db
+      .select()
+      .from(alertTemplates)
+      .where(
+        and(
+          eq(alertTemplates.name, tmpl.name),
+          eq(alertTemplates.isBuiltIn, true)
+        )
+      )
+      .limit(1);
+
+    if (existing) {
+      console.log('  Template exists:', tmpl.name);
+      continue;
+    }
+
+    await db.insert(alertTemplates).values({
+      name: tmpl.name,
+      description: tmpl.description,
+      conditions: tmpl.conditions,
+      severity: tmpl.severity,
+      titleTemplate: tmpl.titleTemplate,
+      messageTemplate: tmpl.messageTemplate,
+      cooldownMinutes: tmpl.cooldownMinutes,
+      isBuiltIn: true,
+      orgId: null
+    });
+    console.log('  Created template:', tmpl.name);
+  }
+
+  console.log('Event log alert templates seeded.');
+  });
+}
+
+export async function seedDefaultAdmin() {
+  // Wrap the whole function body in a single system-scope context so the
+  // baseline tenant-creation flow (partner → org → site → user →
+  // partner_user) passes RLS on the partner-scoped and org-scoped tables
+  // without each insert needing its own elevation.
+  return withSystemDbAccessContext(async () => {
+  console.log('Seeding bootstrap admin user...');
+
+  const admin = resolveBootstrapAdminConfig();
+
+  // Check if admin user already exists
+  const [existingUser] = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, admin.email))
+    .limit(1);
+
+  if (existingUser) {
+    console.log('  Admin user already exists, skipping.');
+    return;
+  }
+
+  // Create default partner
+  let partnerId: string;
+  const [existingPartner] = await db
+    .select()
+    .from(partners)
+    .where(eq(partners.slug, 'default-partner'))
+    .limit(1);
+
+  if (existingPartner) {
+    partnerId = existingPartner.id;
+    console.log('  Default partner already exists.');
+  } else {
+    partnerId = await db.transaction(async (tx) => {
+      const [newPartner] = await tx
+        .insert(partners)
+        .values({
+          name: 'Default Partner',
+          slug: 'default-partner',
+          type: 'msp',
+          plan: 'enterprise',
+          // #4520: keep the seeded dev partner on the same inbound opt-out
+          // default real partners get, so local behaviour matches production.
+          // Spec 2026-09-18 D2: but NOT the requireMfa default — see the
+          // constant's doc comment.
+          settings: DEV_SEED_DEFAULT_PARTNER_SETTINGS
+        })
+        .returning();
+      await ensureDefaultProfile(newPartner!.id, newPartner!.currencyCode, tx);
+      await seedSystemTicketStatuses(tx, newPartner!.id);
+      return newPartner!.id;
+    });
+    console.log('  Created default partner.');
+  }
+
+  // Create default organization
+  let orgId: string;
+  const [existingOrg] = await db
+    .select()
+    .from(organizations)
+    .where(
+      and(
+        eq(organizations.slug, 'default-organization'),
+        eq(organizations.partnerId, partnerId)
+      )
+    )
+    .limit(1);
+
+  if (existingOrg) {
+    orgId = existingOrg.id;
+    console.log('  Default organization already exists.');
+  } else {
+    const [partnerRow] = await db
+      .select({ currencyCode: partners.currencyCode })
+      .from(partners)
+      .where(eq(partners.id, partnerId))
+      .limit(1);
+    if (!partnerRow) throw new Error('Default partner not found');
+
+    const [newOrg] = await db
+      .insert(organizations)
+      .values({
+        partnerId,
+        currencyCode: partnerRow.currencyCode,
+        name: 'Default Organization',
+        slug: 'default-organization',
+        type: 'customer',
+        status: 'active'
+      })
+      .returning();
+    await ensureDefaultProfile(partnerId, partnerRow.currencyCode, db);
+    orgId = newOrg!.id;
+    console.log('  Created default organization.');
+  }
+
+  // Create default site
+  const [existingSite] = await db
+    .select()
+    .from(sites)
+    .where(
+      and(
+        eq(sites.name, 'Default Site'),
+        eq(sites.orgId, orgId)
+      )
+    )
+    .limit(1);
+
+  if (existingSite) {
+    console.log('  Default site already exists.');
+  } else {
+    await db.insert(sites).values({
+      orgId,
+      name: 'Default Site',
+      timezone: 'UTC'
+    });
+    console.log('  Created default site.');
+  }
+
+  // Find the Partner Admin role
+  const [partnerAdminRole] = await db
+    .select()
+    .from(roles)
+    .where(
+      and(
+        eq(roles.name, 'Partner Admin'),
+        eq(roles.isSystem, true)
+      )
+    )
+    .limit(1);
+
+  if (!partnerAdminRole) {
+    console.error('  Partner Admin role not found. Run seedRoles first.');
+    return;
+  }
+
+  // Hash the password
+  const passwordHash = await hashPassword(admin.password);
+
+  // Create the admin user (setupCompletedAt left null so the setup wizard
+  // triggers on first login). Partner-scope admin → partnerId set, orgId
+  // left NULL per the "MSP staff are not users of any single org" rule.
+  const [adminUser] = await db
+    .insert(users)
+    .values({
+      partnerId,
+      email: admin.email,
+      name: admin.name,
+      passwordHash,
+      status: 'active',
+      // Dev/E2E seed only: pre-verify the bootstrap admin's email so dev/E2E
+      // flows that require a verified recipient (e.g. sending-domain test
+      // sends) aren't blocked on a manual verification step for a seeded
+      // account. Production signup paths are untouched.
+      emailVerifiedAt: new Date(),
+      preferences: { bootstrapSetupRequired: true },
+    })
+    .returning();
+
+  // Link the admin user to the partner with Partner Admin role
+  await db.insert(partnerUsers).values({
+    partnerId,
+    userId: adminUser!.id,
+    roleId: partnerAdminRole.id,
+    orgAccess: 'all'
+  });
+
+  console.log('');
+  console.log('Bootstrap admin created:');
+  console.log(`  Email: ${admin.email}`);
+  if (admin.logPassword) {
+    console.log(`  Password: ${DEV_BOOTSTRAP_ADMIN_PASSWORD}`);
+    console.log('  Development convenience credential only. Change it before exposing this instance.');
+  } else {
+    console.log('  Password: set from BREEZE_BOOTSTRAP_ADMIN_PASSWORD (not logged).');
+  }
+  });
+}
+
+export async function seed() {
+  await seedPermissions();
+  await seedRoles();
+  await seedScripts();
+  await seedEventLogAlertTemplates();
+  await seedDefaultAdmin();
+  console.log('Database seeding complete.');
+}
+
+// Run if executed directly
+const isMainModule = import.meta.url === `file://${process.argv[1]}`;
+if (isMainModule) {
+  seed()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error('Seed failed:', err);
+      process.exit(1);
+    });
+}

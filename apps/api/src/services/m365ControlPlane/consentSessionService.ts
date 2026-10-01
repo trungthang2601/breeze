@@ -1,0 +1,295 @@
+import { createHash, randomBytes } from 'node:crypto';
+import { and, eq, gt, sql } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import {
+  m365ConsentSessions,
+  type M365ConsentPhase,
+  type M365ConsentPurpose,
+  type M365ConsentSessionRow,
+  type NewM365ConsentSessionRow,
+} from '../../db/schema';
+
+export type { M365ConsentPurpose };
+
+const CONSENT_SESSION_TTL_MS = 10 * 60_000;
+const RANDOM_VALUE_BYTES = 32;
+
+export type M365ConsentSession = M365ConsentSessionRow;
+
+/**
+ * Consent sessions exist only for the certificate-based customer Graph
+ * profiles that run the two-phase admin-consent + identity-verification flow.
+ * This is narrower than M365ConnectionProfile on purpose and matches the
+ * m365_consent_sessions.profile column type / CHECK constraint.
+ */
+export type M365ConsentSessionProfile = 'customer-graph-read' | 'customer-graph-actions';
+
+export interface ConsentSessionOwnerInput {
+  connectionId: string;
+  orgId: string;
+  consentAttemptId: string;
+  userId: string;
+  profile: M365ConsentSessionProfile;
+  /**
+   * Which flow this session belongs to. Omitted means `initial`: the
+   * pending-consent → verifying path. `upgrade` marks a manifest bump on a
+   * connection that stays executable throughout (spec §2.2).
+   */
+  purpose?: M365ConsentPurpose;
+}
+
+export interface ConsentSessionAttemptInput {
+  connectionId: string;
+  orgId: string;
+  consentAttemptId: string;
+  profile: M365ConsentSessionProfile;
+}
+
+export interface ConsumeConsentSessionInput extends ConsentSessionAttemptInput {
+  rawState: string;
+  phase: M365ConsentPhase;
+}
+
+export interface CreatedConsentSession {
+  rawState: string;
+  session: M365ConsentSession;
+}
+
+export interface PreparedIdentityVerificationSession {
+  rawState: string;
+  tenantHintHash: string;
+  nonce: string;
+  codeVerifier: string;
+  codeChallenge: string;
+  expiresAt: Date;
+}
+
+function generateRandomValue(): string {
+  return randomBytes(RANDOM_VALUE_BYTES).toString('base64url');
+}
+
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+export function hashTenantHint(tenantId: string): string {
+  return sha256Hex(tenantId.trim().toLowerCase());
+}
+
+async function insertConsentSessionInTransaction(
+  input: ConsentSessionOwnerInput & Pick<
+    NewM365ConsentSessionRow,
+    'phase' | 'tenantHintHash' | 'nonce' | 'codeVerifier'
+  >,
+): Promise<CreatedConsentSession> {
+  const expiresAt = new Date(Date.now() + CONSENT_SESSION_TTL_MS);
+
+  while (true) {
+    const rawState = generateRandomValue();
+    const rows = await db.insert(m365ConsentSessions).values({
+      ...input,
+      stateHash: sha256Hex(rawState),
+      profile: input.profile,
+      purpose: input.purpose ?? 'initial',
+      expiresAt,
+    }).onConflictDoNothing({
+      target: m365ConsentSessions.stateHash,
+    }).returning();
+    const session = rows[0];
+    if (session) return { rawState, session };
+  }
+}
+
+/**
+ * Inserts an admin-consent session using the caller's active system
+ * transaction. This helper deliberately does not open its own DB context so a
+ * connection attempt and its session can be rotated atomically.
+ */
+export function createAdminConsentSessionInTransaction(
+  input: ConsentSessionOwnerInput,
+): Promise<CreatedConsentSession> {
+  return insertConsentSessionInTransaction({
+    ...input,
+    phase: 'admin_consent',
+    tenantHintHash: null,
+    nonce: null,
+    codeVerifier: null,
+  });
+}
+
+export async function createAdminConsentSession(
+  input: ConsentSessionOwnerInput,
+): Promise<CreatedConsentSession> {
+  return runOutsideDbContext(() =>
+    withSystemDbAccessContext(() => createAdminConsentSessionInTransaction(input)),
+  );
+}
+
+/** See createAdminConsentSessionInTransaction for the transaction contract. */
+export function createIdentityVerificationSessionInTransaction(
+  input: ConsentSessionOwnerInput & { tenantHint: string },
+): Promise<CreatedConsentSession & { codeChallenge: string }> {
+  return insertPreparedIdentityVerificationSessionInTransaction(
+    {
+      connectionId: input.connectionId,
+      orgId: input.orgId,
+      consentAttemptId: input.consentAttemptId,
+      userId: input.userId,
+      profile: input.profile,
+    },
+    prepareIdentityVerificationSession({ tenantHint: input.tenantHint }),
+  );
+}
+
+export function prepareIdentityVerificationSession(input: {
+  tenantHint: string;
+}): PreparedIdentityVerificationSession {
+  const codeVerifier = generateRandomValue();
+  const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+  return {
+    rawState: generateRandomValue(),
+    tenantHintHash: hashTenantHint(input.tenantHint),
+    nonce: generateRandomValue(),
+    codeVerifier,
+    codeChallenge,
+    expiresAt: new Date(Date.now() + CONSENT_SESSION_TTL_MS),
+  };
+}
+
+export async function insertPreparedIdentityVerificationSessionInTransaction(
+  input: ConsentSessionOwnerInput,
+  prepared: PreparedIdentityVerificationSession,
+): Promise<CreatedConsentSession & { codeChallenge: string }> {
+  const rows = await db.insert(m365ConsentSessions).values({
+    ...input,
+    stateHash: sha256Hex(prepared.rawState),
+    profile: input.profile,
+    purpose: input.purpose ?? 'initial',
+    phase: 'identity_verification',
+    tenantHintHash: prepared.tenantHintHash,
+    nonce: prepared.nonce,
+    codeVerifier: prepared.codeVerifier,
+    expiresAt: prepared.expiresAt,
+  }).onConflictDoNothing({
+    target: m365ConsentSessions.stateHash,
+  }).returning();
+  const session = rows[0];
+  if (!session) throw new Error('m365_consent_state_collision');
+  return { rawState: prepared.rawState, session, codeChallenge: prepared.codeChallenge };
+}
+
+export async function createIdentityVerificationSession(
+  input: ConsentSessionOwnerInput & { tenantHint: string },
+): Promise<CreatedConsentSession & { codeChallenge: string }> {
+  return runOutsideDbContext(() =>
+    withSystemDbAccessContext(() => createIdentityVerificationSessionInTransaction(input)),
+  );
+}
+
+export async function consumeConsentSession(
+  input: ConsumeConsentSessionInput,
+): Promise<M365ConsentSession | null> {
+  return runOutsideDbContext(() => withSystemDbAccessContext(
+    () => consumeConsentSessionInTransaction(input),
+  ));
+}
+
+export async function consumeConsentSessionInTransaction(
+  input: ConsumeConsentSessionInput,
+): Promise<M365ConsentSession | null> {
+  const rows = await db.delete(m365ConsentSessions).where(and(
+    eq(m365ConsentSessions.stateHash, sha256Hex(input.rawState)),
+    eq(m365ConsentSessions.phase, input.phase),
+    gt(m365ConsentSessions.expiresAt, sql`now()`),
+    eq(m365ConsentSessions.connectionId, input.connectionId),
+    eq(m365ConsentSessions.orgId, input.orgId),
+    eq(m365ConsentSessions.profile, input.profile),
+    eq(m365ConsentSessions.consentAttemptId, input.consentAttemptId),
+  )).returning();
+  return rows[0] ?? null;
+}
+
+/**
+ * Deletes sessions using the caller's active system transaction. Callers that
+ * are not already in such a transaction must use deleteConsentSessionsForAttempt.
+ */
+export async function deleteConsentSessionsForAttemptInTransaction(
+  input: ConsentSessionAttemptInput,
+): Promise<void> {
+  await db.delete(m365ConsentSessions).where(and(
+    eq(m365ConsentSessions.connectionId, input.connectionId),
+    eq(m365ConsentSessions.orgId, input.orgId),
+    eq(m365ConsentSessions.profile, input.profile),
+    eq(m365ConsentSessions.consentAttemptId, input.consentAttemptId),
+  ));
+}
+
+export async function deleteConsentSessionsForAttempt(
+  input: ConsentSessionAttemptInput,
+): Promise<void> {
+  return runOutsideDbContext(() =>
+    withSystemDbAccessContext(() => deleteConsentSessionsForAttemptInTransaction(input)),
+  );
+}
+
+export interface ConsentSessionPurposeLookup {
+  rawState: string;
+  phase: M365ConsentPhase;
+  connectionId: string;
+  consentAttemptId: string;
+  profile: M365ConsentSessionProfile;
+}
+
+/**
+ * Reads which flow a live consent session belongs to WITHOUT consuming it.
+ *
+ * The callback must know this before it can decide which connection statuses
+ * are legal for the callback it is servicing — an upgrade session expects an
+ * `active`/`degraded` connection, a first-time session expects
+ * `pending-consent`/`verifying`. The authoritative consume happens afterwards
+ * and re-checks state hash, phase, expiry, connection, org, profile and
+ * attempt, so this lookup routes and never authorizes. Deliberately not scoped
+ * by org: the org id is not known until the attempt is loaded, and state_hash
+ * is unique.
+ */
+export async function readConsentSessionPurpose(
+  input: ConsentSessionPurposeLookup,
+): Promise<M365ConsentPurpose | null> {
+  return runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    const rows = await db.select({ purpose: m365ConsentSessions.purpose })
+      .from(m365ConsentSessions)
+      .where(and(
+        eq(m365ConsentSessions.stateHash, sha256Hex(input.rawState)),
+        eq(m365ConsentSessions.phase, input.phase),
+        gt(m365ConsentSessions.expiresAt, sql`now()`),
+        eq(m365ConsentSessions.connectionId, input.connectionId),
+        eq(m365ConsentSessions.profile, input.profile),
+        eq(m365ConsentSessions.consentAttemptId, input.consentAttemptId),
+      ))
+      .limit(1);
+    return rows[0]?.purpose ?? null;
+  }));
+}
+
+/**
+ * Deletes every consent session of a connection, whatever attempt it belongs
+ * to. Needed before any write that rotates `consent_attempt_id`: the composite
+ * FK `m365_consent_sessions_connection_identity_fkey` has ON DELETE CASCADE
+ * but NO ON UPDATE CASCADE, so rotating the parent while a session lives
+ * raises 23503 rather than cascading. Before upgrade consent existed, an
+ * executable connection never carried a live session and no caller needed
+ * this — see connectionService.retestConnection.
+ */
+export async function deleteConsentSessionsForConnection(input: {
+  connectionId: string;
+  orgId: string;
+  profile: M365ConsentSessionProfile;
+}): Promise<void> {
+  return runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    await db.delete(m365ConsentSessions).where(and(
+      eq(m365ConsentSessions.connectionId, input.connectionId),
+      eq(m365ConsentSessions.orgId, input.orgId),
+      eq(m365ConsentSessions.profile, input.profile),
+    ));
+  }));
+}

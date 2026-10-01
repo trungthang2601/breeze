@@ -1,0 +1,160 @@
+import type Anthropic from '@anthropic-ai/sdk';
+import { z } from 'zod';
+import { getAnthropicClientForPartner, resolveWireModel } from './llm/llmConfigResolver';
+import { maxOutputTokensForAiBudget } from './aiBudgetReservations';
+
+export interface DraftInput {
+  messages: Array<{ role: string; content: string | null }>;
+  contextSnapshot: unknown;
+  elapsedMinutes: number;
+  model: string;
+  partnerId: string | null;
+  /**
+   * Tenant axis for the LLM egress audit when this function has to resolve its
+   * own client (#3922). Callers that pass `client` have already attributed the
+   * call themselves.
+   */
+  orgId?: string | null;
+  client?: Anthropic;
+  /** Finite amount reserved for the complete two-attempt operation. */
+  budgetCents?: number;
+  calculateCostCents?: (inputTokens: number, outputTokens: number) => number;
+}
+export interface DraftResult {
+  subject: string;
+  problemSummary: string;
+  resolutionSummary: string;
+  wasFixed: boolean;
+  suggestedTimeMinutes: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+export class ThinTranscriptError extends Error {
+  constructor() { super('Not enough conversation to draft a ticket'); this.name = 'ThinTranscriptError'; }
+}
+export class TicketDraftFailedError extends Error {
+  constructor(
+    message: string,
+    public readonly inputTokens: number,
+    public readonly outputTokens: number,
+    public readonly providerOutcomeUnknown: boolean,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'TicketDraftFailedError';
+  }
+}
+
+const llmSchema = z.object({
+  subject: z.string().min(1).max(120),
+  problemSummary: z.string().min(1),
+  resolutionSummary: z.string(),
+  wasFixed: z.boolean(),
+  suggestedTimeMinutes: z.number().int().min(0),
+});
+
+const SYSTEM_PROMPT = [
+  'You turn an IT support chat transcript into a support ticket for a non-technical reader (a customer or office manager).',
+  'Write plain English. No jargon, no command output, no internal tool names.',
+  'Return ONLY a JSON object with keys: subject (<=120 chars), problemSummary, resolutionSummary, wasFixed (boolean), suggestedTimeMinutes (integer).',
+  'The resolution text is shown to the customer. Leave resolutionSummary as an empty string if the issue was not resolved.',
+  'Set wasFixed true ONLY if the transcript shows the issue was actually verified fixed — not merely attempted.',
+  'suggestedTimeMinutes is hands-on work time; seed it from the elapsed ceiling provided but reduce it for idle gaps or non-work chatter. Never exceed the elapsed ceiling.',
+].join(' ');
+
+function lastTextBlock(content: unknown): string | null {
+  if (!Array.isArray(content)) return null;
+  for (let i = content.length - 1; i >= 0; i--) {
+    const b = content[i] as { type?: string; text?: string };
+    if (b?.type === 'text' && typeof b.text === 'string') return b.text;
+  }
+  return null;
+}
+
+function buildUserContent(input: DraftInput): string {
+  const lines = input.messages
+    .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content && m.content.trim().length > 0)
+    .map((m) => `${m.role === 'user' ? 'Technician/User' : 'Assistant'}: ${m.content!.trim()}`);
+  const ctx = input.contextSnapshot ? `Context: ${JSON.stringify(input.contextSnapshot)}\n` : '';
+  return `${ctx}Elapsed ceiling (minutes): ${input.elapsedMinutes}\n\nTranscript:\n${lines.join('\n')}`;
+}
+
+export async function draftTicketFromTranscript(input: DraftInput): Promise<DraftResult> {
+  const hasAssistant = input.messages.some((m) => m.role === 'assistant' && m.content && m.content.trim().length > 0);
+  if (!hasAssistant) throw new ThinTranscriptError();
+
+  // `input.model` is the WIRE model when the caller supplies its own client
+  // (the caller already translated it via `resolveWireModel`). On the fallback
+  // path we resolve the client here, so we must translate it here too — sending
+  // a platform-logical id to a catalog endpoint 404s at the provider.
+  let client = input.client;
+  let wireModel = input.model;
+  if (!client) {
+    const llm = await getAnthropicClientForPartner(input.partnerId, {
+      surface: 'one_shot_ticket_draft',
+      orgId: input.orgId ?? null,
+    });
+    client = llm.client;
+    wireModel = resolveWireModel(llm.resolved, input.model).model;
+  }
+  const userContent = buildUserContent(input);
+  const maxTokens = input.budgetCents === undefined
+    ? 1024
+    : maxOutputTokensForAiBudget({
+      prompt: `${SYSTEM_PROMPT}\n${userContent}`,
+      requestedMaxOutputTokens: 1024,
+      // Either attempt may consume its full output ceiling.
+      budgetCents: input.budgetCents / 2,
+      calculateCostCents: input.calculateCostCents
+        ?? (() => { throw new Error('Budgeted ticket draft requires pricing'); }),
+    });
+  if (maxTokens === null) {
+    throw new TicketDraftFailedError('Ticket draft prompt exceeds the reserved budget', 0, 0, false);
+  }
+  let lastErr: unknown;
+  let inTok = 0;
+  let outTok = 0;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let resp;
+    try {
+      resp = await client.messages.create({
+        model: wireModel,
+        max_tokens: maxTokens,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: userContent }],
+      });
+    } catch (error) {
+      throw new TicketDraftFailedError(
+        'Ticket draft provider outcome is unknown',
+        inTok,
+        outTok,
+        true,
+        { cause: error },
+      );
+    }
+    inTok += resp.usage?.input_tokens ?? 0;
+    outTok += resp.usage?.output_tokens ?? 0;
+    const text = lastTextBlock(resp.content);
+    if (text) {
+      try {
+        const parsed = llmSchema.parse(JSON.parse(text));
+        return {
+          subject: parsed.subject,
+          problemSummary: parsed.problemSummary,
+          resolutionSummary: parsed.wasFixed ? parsed.resolutionSummary : '',
+          wasFixed: parsed.wasFixed,
+          suggestedTimeMinutes: Math.min(parsed.suggestedTimeMinutes, Math.max(0, Math.round(input.elapsedMinutes))),
+          inputTokens: inTok,
+          outputTokens: outTok,
+        };
+      } catch (err) { lastErr = err; }
+    }
+  }
+  throw new TicketDraftFailedError(
+    `Failed to draft ticket from transcript: ${String(lastErr)}`,
+    inTok,
+    outTok,
+    false,
+  );
+}

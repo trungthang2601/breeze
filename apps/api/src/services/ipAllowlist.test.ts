@@ -1,0 +1,384 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  evaluateIpAllowlist,
+  enforceIpAllowlist,
+  readPartnerAllowlist,
+  clearPartnerAllowlistCache,
+  ipAllowlistMode,
+  isBlocked,
+} from './ipAllowlist';
+
+const serviceMocks = vi.hoisted(() => ({
+  getTrustedClientIpOrUndefined: vi.fn(),
+  writeAuditEvent: vi.fn(),
+}));
+
+const configMocks = vi.hoisted(() => ({
+  getConfig: vi.fn(),
+  isConfigInitialized: vi.fn(() => false),
+}));
+
+// Spread the real module rather than replacing it: this mock is file-wide, and
+// the first other module in this graph to import config/validate would
+// otherwise silently receive `undefined` for every export not listed here.
+vi.mock('../config/validate', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config/validate')>()),
+  getConfig: configMocks.getConfig,
+  isConfigInitialized: configMocks.isConfigInitialized,
+}));
+
+vi.mock('../db', () => {
+  const limit = vi.fn();
+  return {
+    db: {
+      select: () => ({ from: () => ({ where: () => ({ limit }) }) }),
+      __limit: limit,
+    },
+    runOutsideDbContext: vi.fn(<T,>(fn: () => T): T => fn()),
+    withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  };
+});
+
+vi.mock('./clientIp', () => ({
+  getTrustedClientIpOrUndefined: serviceMocks.getTrustedClientIpOrUndefined,
+}));
+
+vi.mock('./auditEvents', () => ({
+  writeAuditEvent: serviceMocks.writeAuditEvent,
+}));
+
+describe('evaluateIpAllowlist', () => {
+  const base = {
+    mode: 'enforce' as const,
+    allowlist: ['203.0.113.0/24'],
+    clientIp: '203.0.113.10' as string | undefined,
+    isPlatformAdmin: false,
+  };
+
+  it('allows when the client IP matches', () => {
+    expect(evaluateIpAllowlist(base)).toEqual({ decision: 'allow' });
+  });
+
+  it('denies when the client IP does not match', () => {
+    expect(evaluateIpAllowlist({ ...base, clientIp: '198.51.100.1' })).toEqual({
+      decision: 'deny',
+      reason: 'not_in_list',
+    });
+  });
+
+  it('skips when mode is off', () => {
+    expect(evaluateIpAllowlist({ ...base, mode: 'off', clientIp: '198.51.100.1' })).toEqual({
+      decision: 'skip',
+      reason: 'mode_off',
+    });
+  });
+
+  it('skips when the allowlist is empty or undefined', () => {
+    expect(evaluateIpAllowlist({ ...base, allowlist: [] })).toEqual({ decision: 'skip', reason: 'empty_list' });
+    expect(evaluateIpAllowlist({ ...base, allowlist: undefined })).toEqual({ decision: 'skip', reason: 'empty_list' });
+  });
+
+  it('denies (fail-closed) when the client IP is not trustable', () => {
+    // Flipped for SR2-16: an allowlist-protected partner must not be silently
+    // bypassed when the true client IP cannot be determined.
+    expect(evaluateIpAllowlist({ ...base, clientIp: undefined })).toEqual({
+      decision: 'deny',
+      reason: 'untrusted_ip',
+    });
+  });
+
+  it('skips for platform admins (break-glass), even on a non-matching IP', () => {
+    expect(evaluateIpAllowlist({ ...base, clientIp: '198.51.100.1', isPlatformAdmin: true })).toEqual({
+      decision: 'skip',
+      reason: 'platform_admin',
+    });
+  });
+});
+
+describe('evaluateIpAllowlist — fail-closed on untrusted IP (SR2-16)', () => {
+  it('DENIES when an allowlist is configured but the client IP is not trustable (untrusted peer / spoofed header / no proxy-trust config)', () => {
+    // GUARD-BITE: this is RED today (returns { decision: 'skip', reason: 'untrusted_ip' }
+    // and isBlocked(skip)===false ⇒ the request is silently allowed past the allowlist).
+    const d = evaluateIpAllowlist({
+      mode: 'enforce',
+      allowlist: ['203.0.113.0/24'],
+      clientIp: undefined,
+      isPlatformAdmin: false,
+    });
+    expect(d).toEqual({ decision: 'deny', reason: 'untrusted_ip' });
+    expect(isBlocked(d)).toBe(true);
+  });
+
+  it('does NOT deny when there is no allowlist (empty list) even if the IP is untrustable', () => {
+    const d = evaluateIpAllowlist({ mode: 'enforce', allowlist: [], clientIp: undefined, isPlatformAdmin: false });
+    expect(d).toEqual({ decision: 'skip', reason: 'empty_list' });
+  });
+
+  it('does NOT deny a platform admin even with an allowlist + untrustable IP', () => {
+    const d = evaluateIpAllowlist({ mode: 'enforce', allowlist: ['203.0.113.0/24'], clientIp: undefined, isPlatformAdmin: true });
+    expect(d).toEqual({ decision: 'skip', reason: 'platform_admin' });
+  });
+
+  it('does NOT deny when enforcement mode is off', () => {
+    const d = evaluateIpAllowlist({ mode: 'off', allowlist: ['203.0.113.0/24'], clientIp: undefined, isPlatformAdmin: false });
+    expect(d).toEqual({ decision: 'skip', reason: 'mode_off' });
+  });
+
+  it('still allows a trusted client IP that is in the list, and denies one that is not (regression)', () => {
+    expect(evaluateIpAllowlist({ mode: 'enforce', allowlist: ['203.0.113.5/32'], clientIp: '203.0.113.5', isPlatformAdmin: false }))
+      .toEqual({ decision: 'allow' });
+    expect(evaluateIpAllowlist({ mode: 'enforce', allowlist: ['203.0.113.5/32'], clientIp: '198.51.100.9', isPlatformAdmin: false }))
+      .toEqual({ decision: 'deny', reason: 'not_in_list' });
+  });
+});
+
+describe('readPartnerAllowlist caching', () => {
+  let limit: any;
+  beforeEach(async () => {
+    const mod = await import('../db');
+    limit = (mod.db as any).__limit;
+    limit.mockReset();
+    clearPartnerAllowlistCache('p1');
+  });
+
+  it('caches the result and serves the second call without a DB read', async () => {
+    limit.mockResolvedValueOnce([{ settings: { security: { ipAllowlist: ['10.0.0.0/8'] } } }]);
+    expect(await readPartnerAllowlist('p1')).toEqual(['10.0.0.0/8']);
+    expect(await readPartnerAllowlist('p1')).toEqual(['10.0.0.0/8']);
+    expect(limit).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns [] when no allowlist is set', async () => {
+    limit.mockResolvedValueOnce([{ settings: {} }]);
+    expect(await readPartnerAllowlist('p1')).toEqual([]);
+  });
+
+  it('throws and does not cache when the partner row is missing', async () => {
+    limit
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ settings: { security: { ipAllowlist: ['10.0.0.0/8'] } } }]);
+
+    await expect(readPartnerAllowlist('p1')).rejects.toThrow('ipAllowlist: partner p1 not found');
+    expect(await readPartnerAllowlist('p1')).toEqual(['10.0.0.0/8']);
+    expect(limit).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads from the DB again after cache invalidation', async () => {
+    limit
+      .mockResolvedValueOnce([{ settings: { security: { ipAllowlist: ['10.0.0.0/8'] } } }])
+      .mockResolvedValueOnce([{ settings: { security: { ipAllowlist: ['192.0.2.0/24'] } } }]);
+
+    expect(await readPartnerAllowlist('p1')).toEqual(['10.0.0.0/8']);
+    expect(limit).toHaveBeenCalledTimes(1);
+
+    clearPartnerAllowlistCache('p1');
+
+    expect(await readPartnerAllowlist('p1')).toEqual(['192.0.2.0/24']);
+    expect(limit).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('enforceIpAllowlist', () => {
+  let limit: any;
+  const c = { req: { header: vi.fn() } };
+
+  beforeEach(async () => {
+    const mod = await import('../db');
+    limit = (mod.db as any).__limit;
+    limit.mockReset();
+    serviceMocks.getTrustedClientIpOrUndefined.mockReset();
+    serviceMocks.writeAuditEvent.mockReset();
+    delete process.env.IP_ALLOWLIST_ENFORCEMENT_MODE;
+    clearPartnerAllowlistCache('partner-deny');
+    clearPartnerAllowlistCache('partner-admin');
+  });
+
+  it('denies a non-matching trusted IP and writes an audit event', async () => {
+    limit.mockResolvedValueOnce([{ settings: { security: { ipAllowlist: ['10.0.0.0/8'] } } }]);
+    serviceMocks.getTrustedClientIpOrUndefined.mockReturnValue('203.0.113.10');
+
+    const decision = await enforceIpAllowlist(c, {
+      partnerId: 'partner-deny',
+      isPlatformAdmin: false,
+      actorId: 'user-1',
+      actorEmail: 'admin@example.com',
+    });
+
+    expect(decision).toEqual({ decision: 'deny', reason: 'not_in_list' });
+    expect(serviceMocks.writeAuditEvent).toHaveBeenCalledWith(
+      c,
+      expect.objectContaining({
+        action: 'ip_allowlist.denied',
+        resourceId: 'partner-deny',
+        result: 'denied',
+      }),
+    );
+  });
+
+  it('skips for platform admins on non-matching IPs and writes a bypass audit event', async () => {
+    limit.mockResolvedValueOnce([{ settings: { security: { ipAllowlist: ['10.0.0.0/8'] } } }]);
+    serviceMocks.getTrustedClientIpOrUndefined.mockReturnValue('203.0.113.10');
+
+    const decision = await enforceIpAllowlist(c, {
+      partnerId: 'partner-admin',
+      isPlatformAdmin: true,
+      actorId: 'admin-1',
+      actorEmail: 'platform@example.com',
+    });
+
+    expect(decision).toEqual({ decision: 'skip', reason: 'platform_admin' });
+    expect(serviceMocks.writeAuditEvent).toHaveBeenCalledWith(
+      c,
+      expect.objectContaining({
+        action: 'ip_allowlist.bypass_platform_admin',
+        resourceId: 'partner-admin',
+        result: 'success',
+      }),
+    );
+  });
+
+  it('reads the allowlist outside the request RLS context (system scope)', async () => {
+    // Regression: org-scoped requests have an empty accessible_partner_ids,
+    // so reading partners under the request context throws "partner not
+    // found" and locks every customer-org user out. The read must exit the
+    // request context and run under the system context instead.
+    const mod = await import('../db');
+    vi.mocked(mod.runOutsideDbContext).mockClear();
+    vi.mocked(mod.withSystemDbAccessContext).mockClear();
+    clearPartnerAllowlistCache('partner-ctx');
+    limit.mockResolvedValueOnce([{ settings: { security: { ipAllowlist: ['10.0.0.0/8'] } } }]);
+    serviceMocks.getTrustedClientIpOrUndefined.mockReturnValue('10.1.2.3');
+
+    const decision = await enforceIpAllowlist(c, {
+      partnerId: 'partner-ctx',
+      isPlatformAdmin: false,
+    });
+
+    expect(decision).toEqual({ decision: 'allow' });
+    expect(vi.mocked(mod.runOutsideDbContext)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mod.withSystemDbAccessContext)).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips without reading the allowlist when partnerId is null', async () => {
+    const decision = await enforceIpAllowlist(c, {
+      partnerId: null,
+      isPlatformAdmin: false,
+    });
+
+    expect(decision).toEqual({ decision: 'skip', reason: 'no_partner' });
+    expect(limit).not.toHaveBeenCalled();
+  });
+
+  // The tests in this block otherwise all sit on the PRE-boot fallback branch
+  // (isConfigInitialized defaults to false), which production never takes.
+  // This one exercises the branch that actually runs in a booted API.
+  it('skips without reading the allowlist when the VALIDATED config says off', async () => {
+    configMocks.isConfigInitialized.mockImplementation(() => true);
+    configMocks.getConfig.mockReturnValue({ IP_ALLOWLIST_ENFORCEMENT_MODE: 'off' });
+    serviceMocks.getTrustedClientIpOrUndefined.mockReturnValue('203.0.113.10');
+
+    try {
+      const decision = await enforceIpAllowlist(c, {
+        partnerId: 'partner-deny',
+        isPlatformAdmin: false,
+      });
+
+      expect(decision).toEqual({ decision: 'skip', reason: 'mode_off' });
+      expect(limit).not.toHaveBeenCalled();
+    } finally {
+      configMocks.isConfigInitialized.mockImplementation(() => false);
+      configMocks.getConfig.mockReset();
+    }
+  });
+
+  it('skips without reading the allowlist when enforcement mode is off', async () => {
+    process.env.IP_ALLOWLIST_ENFORCEMENT_MODE = 'off';
+    serviceMocks.getTrustedClientIpOrUndefined.mockReturnValue('203.0.113.10');
+
+    const decision = await enforceIpAllowlist(c, {
+      partnerId: 'partner-deny',
+      isPlatformAdmin: false,
+    });
+
+    expect(decision).toEqual({ decision: 'skip', reason: 'mode_off' });
+    expect(limit).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #2896 — the enforcement mode is read from the VALIDATED config, so the
+// value the boot enum accepted is the value the request path acts on. The raw
+// process.env read this replaced let getConfig() and the runtime disagree.
+// ---------------------------------------------------------------------------
+describe('ipAllowlistMode', () => {
+  const originalEnv = process.env.IP_ALLOWLIST_ENFORCEMENT_MODE;
+
+  beforeEach(() => {
+    configMocks.getConfig.mockReset();
+    // mockImplementation, NOT mockReset: the hoisted `() => false` is what keeps
+    // the other describes in this file on the pre-boot branch, and mockReset
+    // would strip it for anything declared after this block.
+    configMocks.isConfigInitialized.mockImplementation(() => false);
+    delete process.env.IP_ALLOWLIST_ENFORCEMENT_MODE;
+  });
+
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.IP_ALLOWLIST_ENFORCEMENT_MODE;
+    else process.env.IP_ALLOWLIST_ENFORCEMENT_MODE = originalEnv;
+  });
+
+  describe('once validateConfig() has run', () => {
+    beforeEach(() => {
+      configMocks.isConfigInitialized.mockImplementation(() => true);
+    });
+
+    it('returns the validated off', () => {
+      configMocks.getConfig.mockReturnValue({ IP_ALLOWLIST_ENFORCEMENT_MODE: 'off' });
+      expect(ipAllowlistMode()).toBe('off');
+    });
+
+    it('returns the validated enforce', () => {
+      configMocks.getConfig.mockReturnValue({ IP_ALLOWLIST_ENFORCEMENT_MODE: 'enforce' });
+      expect(ipAllowlistMode()).toBe('enforce');
+    });
+
+    // The divergence #2896 describes: config says one thing, raw env another.
+    // The validated value must win, so getConfig() and the guard never disagree.
+    it('ignores a process.env value that contradicts the validated config', () => {
+      process.env.IP_ALLOWLIST_ENFORCEMENT_MODE = 'enforce';
+      configMocks.getConfig.mockReturnValue({ IP_ALLOWLIST_ENFORCEMENT_MODE: 'off' });
+      expect(ipAllowlistMode()).toBe('off');
+    });
+
+    // The security-relevant direction, and the one that actually occurs: the
+    // unit setup sets the env var to 'off' globally, and a stale droplet .env
+    // looks identical. An implementation that ORed the two sources, or consulted
+    // env first and only fell through to config when env was unset, would pass
+    // the test above and silently disable enforcement fleet-wide.
+    it('enforces when the validated config says enforce and process.env says off', () => {
+      process.env.IP_ALLOWLIST_ENFORCEMENT_MODE = 'off';
+      configMocks.getConfig.mockReturnValue({ IP_ALLOWLIST_ENFORCEMENT_MODE: 'enforce' });
+      expect(ipAllowlistMode()).toBe('enforce');
+    });
+  });
+
+  describe('before validateConfig() has run', () => {
+    it('falls back to the raw env read for an exact off', () => {
+      process.env.IP_ALLOWLIST_ENFORCEMENT_MODE = 'off';
+      expect(ipAllowlistMode()).toBe('off');
+      expect(configMocks.getConfig).not.toHaveBeenCalled();
+    });
+
+    it('enforces when unset', () => {
+      expect(ipAllowlistMode()).toBe('enforce');
+      expect(configMocks.getConfig).not.toHaveBeenCalled();
+    });
+
+    // Fail closed: the pre-boot window keeps the original strict-equality
+    // semantics rather than guessing at near-misses.
+    it.each(['Off', 'OFF', 'disabled', 'false'])('enforces on the near-miss %s', (value) => {
+      process.env.IP_ALLOWLIST_ENFORCEMENT_MODE = value;
+      expect(ipAllowlistMode()).toBe('enforce');
+    });
+  });
+});

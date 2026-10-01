@@ -1,0 +1,1719 @@
+/**
+ * Discovery Worker
+ *
+ * BullMQ worker that dispatches network discovery scan commands to agents
+ * and processes results when they come back via WebSocket.
+ */
+
+import { Queue, Worker, Job, type JobsOptions } from 'bullmq';
+import * as dbModule from '../db';
+import {
+  discoveryProfiles,
+  discoveryJobs,
+  discoveredAssets,
+  networkTopology,
+  networkBaselines,
+  networkKnownGuests,
+  networkChangeEvents,
+  organizations,
+  devices,
+  deviceNetwork
+} from '../db/schema';
+import type { DiscoveryProfileAlertSettings } from '../db/schema';
+import { eq, and, or, sql, inArray, type SQL } from 'drizzle-orm';
+import { normalizeMac, buildApprovalDecision } from '../services/assetApproval';
+import { getBullMQConnection } from '../services/redis';
+import { isReusableState } from '../services/bullmqUtils';
+import { attachWorkerObservability } from './workerObservability';
+import { dispatchCommandToAgent, isAgentConnectedAnywhere } from '../services/agentCommandRelay';
+import type { AgentCommand } from '../routes/agentWs';
+import { isCronDue } from '../services/cronDue';
+import { utcMsFromOffsetlessDbTimestamp } from '../utils/offsetlessTimestamp';
+import { lookupMacVendor, inferAssetTypeFromVendor } from '../services/macVendorLookup';
+import { resolveAssetIdentity, type ResolvedAssetIdentity } from '../services/assetIdentity';
+import {
+  buildClassificationWrite,
+  type DiscoveredAssetDetectionSource,
+} from '../services/discoveredAssetClassification';
+import type { discoveredAssetTypeEnum } from '../db/schema';
+import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
+import { buildEventFingerprint, normalizeBaselineScanSchedule } from '../services/networkBaseline';
+import { createDiscoveryJobIfIdle } from '../services/discoveryJobCreation';
+import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
+import { decryptSnmpCommunities, decryptSnmpCredentials } from '../services/snmpSecrets';
+import {
+  discoveryQueueJobDataSchema,
+  type DiscoveryQueueJobData,
+  type QueueActorMeta,
+  withQueueMeta,
+} from './queueSchemas';
+import { reconcileTopology } from './reconcileTopology';
+
+const { db } = dbModule;
+const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const withSystem = dbModule.withSystemDbAccessContext;
+  return typeof withSystem === 'function' ? withSystem(fn) : fn();
+};
+
+// Queue name
+const DISCOVERY_QUEUE = 'discovery';
+
+// Singleton queue instance
+let discoveryQueue: Queue | null = null;
+
+/**
+ * Get or create the discovery queue
+ */
+export function getDiscoveryQueue(): Queue {
+  if (!discoveryQueue) {
+    discoveryQueue = new Queue(DISCOVERY_QUEUE, {
+      connection: getBullMQConnection()
+    });
+  }
+  return discoveryQueue;
+}
+
+// Job data types
+
+interface DispatchScanJobData {
+  type: 'dispatch-scan';
+  jobId: string;
+  profileId: string;
+  orgId: string;
+  siteId: string;
+  agentId?: string | null;
+}
+
+interface ScheduleProfilesJobData {
+  type: 'schedule-profiles';
+}
+
+interface ProcessResultsJobData {
+  type: 'process-results';
+  jobId: string;
+  profileId?: string;
+  orgId: string;
+  siteId: string;
+  hosts: DiscoveredHostResult[];
+  hostsScanned: number;
+  hostsDiscovered: number;
+  adjacency?: DeviceAdjacency[];
+}
+
+// LLDP/CDP adjacency contract (mirrors the agent payload; see issue #1728).
+export interface LldpNeighbor {
+  localPort: string;
+  localIfName?: string;
+  remoteChassisId: string;
+  remotePortId: string;
+  remoteSysName?: string;
+}
+export interface CdpNeighbor {
+  localPort: string;
+  remoteDeviceId: string;
+  remotePortId: string;
+  remoteAddress?: string;
+}
+export interface FdbEntry {
+  mac: string;
+  bridgePort: number;
+  ifName?: string;
+  vlan?: number;
+}
+export interface DeviceAdjacency {
+  sourceDeviceIp: string;
+  sourceChassisId?: string;
+  lldp: LldpNeighbor[];
+  cdp: CdpNeighbor[];
+  fdb: FdbEntry[];
+}
+
+export interface DiscoveredHostResult {
+  ip: string;
+  mac?: string;
+  hostname?: string;
+  netbiosName?: string;
+  assetType: string;
+  manufacturer?: string;
+  model?: string;
+  openPorts?: Array<{ port: number; service: string }>;
+  osFingerprint?: string;
+  snmpData?: {
+    sysDescr?: string;
+    sysObjectId?: string;
+    sysName?: string;
+  };
+  responseTimeMs?: number;
+  methods: string[];
+  firstSeen?: string;
+  lastSeen?: string;
+}
+type DiscoveryJobData = DiscoveryQueueJobData;
+type DiscoveredAssetType = typeof discoveredAssetTypeEnum.enumValues[number];
+
+const PRIVILEGED_JOB_OPTIONS = {
+  attempts: 3,
+  backoff: {
+    type: 'exponential' as const,
+    delay: 1_000,
+  },
+};
+
+const DISCOVERY_REPEATABLE_META: QueueActorMeta = {
+  actorType: 'system',
+  actorId: null,
+  source: 'worker:discovery:schedule-profiles',
+};
+
+const DISCOVERY_DISPATCH_META: QueueActorMeta = {
+  actorType: 'system',
+  actorId: null,
+  source: 'worker:discovery:dispatch-scan',
+};
+
+const DISCOVERY_RESULT_META: QueueActorMeta = {
+  actorType: 'agent',
+  actorId: null,
+  source: 'route:agentWs:discovery-result',
+};
+
+/**
+ * Create the discovery worker
+ */
+export function createDiscoveryWorker(): Worker<DiscoveryJobData> {
+  return new Worker<DiscoveryJobData>(
+    DISCOVERY_QUEUE,
+    async (job: Job<DiscoveryJobData>) => {
+      const data = parseQueueJobData(DISCOVERY_QUEUE, job, discoveryQueueJobDataSchema);
+      // dispatch-scan is handled OUTSIDE the blanket context below (final-review
+      // fix, #4084/#1105): processDispatchScan calls the agentCommandRelay
+      // facade (isAgentConnectedAnywhere, dispatchCommandToAgent — Redis/WS
+      // I/O) and manages its own short-lived system DB contexts around just
+      // its reads/writes, so no pooled connection sits idle-in-transaction
+      // across that I/O.
+      if (data.type === 'dispatch-scan') {
+        assertQueueJobName(DISCOVERY_QUEUE, job, 'dispatch-scan');
+        return await processDispatchScan(data);
+      }
+      return runWithSystemDbAccess(async () => {
+        switch (data.type) {
+          case 'schedule-profiles':
+            assertQueueJobName(DISCOVERY_QUEUE, job, 'schedule-profiles');
+            return await processScheduleProfiles();
+          case 'process-results':
+            assertQueueJobName(DISCOVERY_QUEUE, job, 'process-results');
+            return await processResults(data);
+          default:
+            throw new Error(`Unknown job type: ${(data as { type: string }).type}`);
+        }
+      });
+    },
+    {
+      connection: getBullMQConnection(),
+      concurrency: 5,
+      lockDuration: 300_000,
+      stalledInterval: 60_000,
+      maxStalledCount: 2,
+    }
+  );
+}
+
+type ProfileSchedule = {
+  type?: 'manual' | 'cron' | 'interval';
+  cron?: string;
+  intervalMinutes?: number;
+  timezone?: string;
+};
+
+function normalizeSchedule(raw: unknown): ProfileSchedule | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const record = raw as Record<string, unknown>;
+  const type = typeof record.type === 'string' ? record.type : '';
+  if (type !== 'manual' && type !== 'cron' && type !== 'interval') return null;
+
+  const intervalMinutesRaw = typeof record.intervalMinutes === 'number'
+    ? record.intervalMinutes
+    : Number(record.intervalMinutes ?? NaN);
+  const intervalMinutes = Number.isFinite(intervalMinutesRaw) && intervalMinutesRaw > 0
+    ? Math.floor(intervalMinutesRaw)
+    : undefined;
+
+  return {
+    type,
+    cron: typeof record.cron === 'string' ? record.cron : undefined,
+    intervalMinutes,
+    timezone: typeof record.timezone === 'string' ? record.timezone : undefined
+  };
+}
+
+function resolveScheduleTimeZone(value?: string): string {
+  const candidate = value?.trim() || 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate });
+    return candidate;
+  } catch {
+    return 'UTC';
+  }
+}
+
+async function validateRequestedAgentForDiscovery(
+  requestedAgentId: string,
+  orgId: string,
+  siteId: string
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const [agentDevice] = await db
+    .select({
+      agentId: devices.agentId,
+      orgId: devices.orgId,
+      siteId: devices.siteId,
+      status: devices.status
+    })
+    .from(devices)
+    .where(eq(devices.agentId, requestedAgentId))
+    .limit(1);
+
+  if (!agentDevice) {
+    return { ok: false, message: 'Requested agent not found' };
+  }
+
+  if (agentDevice.orgId !== orgId) {
+    return { ok: false, message: 'Requested agent does not belong to this organization' };
+  }
+
+  if (agentDevice.siteId !== siteId) {
+    return { ok: false, message: 'Requested agent does not belong to this site' };
+  }
+
+  if (agentDevice.status !== 'online') {
+    return { ok: false, message: 'Requested agent is not online' };
+  }
+
+  return { ok: true };
+}
+
+async function insertDiscoveryChangeEvent(values: typeof networkChangeEvents.$inferInsert): Promise<boolean> {
+  const now = new Date();
+  const profilePredicate = values.profileId
+    ? eq(networkChangeEvents.profileId, values.profileId)
+    : sql`${networkChangeEvents.profileId} IS NULL`;
+  const fingerprint = buildEventFingerprint(values.eventType, values.ipAddress, {
+    macAddress: values.macAddress,
+    hostname: values.hostname,
+    assetType: values.assetType ?? null,
+    previousState: values.previousState,
+    currentState: values.currentState
+  });
+
+  const recentEvents = await db
+    .select({
+      eventType: networkChangeEvents.eventType,
+      ipAddress: networkChangeEvents.ipAddress,
+      macAddress: networkChangeEvents.macAddress,
+      hostname: networkChangeEvents.hostname,
+      assetType: networkChangeEvents.assetType,
+      previousState: networkChangeEvents.previousState,
+      currentState: networkChangeEvents.currentState
+    })
+    .from(networkChangeEvents)
+    .where(and(
+      eq(networkChangeEvents.baselineId, values.baselineId),
+      profilePredicate,
+      eq(networkChangeEvents.eventType, values.eventType),
+      eq(networkChangeEvents.ipAddress, values.ipAddress),
+      sql`${networkChangeEvents.detectedAt} >= ${new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString()}`
+    ))
+    .limit(25);
+
+  const duplicate = recentEvents.some((event) => (
+    buildEventFingerprint(event.eventType, event.ipAddress, {
+      macAddress: event.macAddress,
+      hostname: event.hostname,
+      assetType: event.assetType ?? null,
+      previousState: event.previousState,
+      currentState: event.currentState
+    }) === fingerprint
+  ));
+
+  if (duplicate) {
+    return false;
+  }
+
+  await db.insert(networkChangeEvents).values(values);
+  return true;
+}
+
+async function hasActiveJob(profileId: string): Promise<boolean> {
+  const [active] = await db
+    .select({ id: discoveryJobs.id })
+    .from(discoveryJobs)
+    .where(
+      and(
+        eq(discoveryJobs.profileId, profileId),
+        sql`${discoveryJobs.status} in ('scheduled', 'running')`
+      )
+    )
+    .limit(1);
+  return Boolean(active);
+}
+
+async function enqueueScheduledProfileRun(
+  profileId: string,
+  orgId: string,
+  siteId: string
+): Promise<{ queued: boolean; jobId: string | null }> {
+  const created = await createDiscoveryJobIfIdle({
+    profileId,
+    orgId,
+    siteId,
+  });
+
+  const createdJobId = created?.job.id ?? null;
+  if (!created || !createdJobId) {
+    return { queued: false, jobId: null };
+  }
+
+  if (!created.created) {
+    return { queued: false, jobId: createdJobId };
+  }
+
+  try {
+    await enqueueDiscoveryScan(createdJobId, profileId, orgId, siteId, null);
+    return { queued: true, jobId: createdJobId };
+  } catch (error) {
+    console.error(`[DiscoveryWorker] Failed to enqueue scheduled scan for profile ${profileId}:`, error);
+    await db.update(discoveryJobs).set({
+      status: 'failed',
+      completedAt: new Date(),
+      errors: { message: 'Failed to enqueue scheduled profile scan' },
+      updatedAt: new Date()
+    }).where(eq(discoveryJobs.id, createdJobId));
+    return { queued: false, jobId: createdJobId };
+  }
+}
+
+async function expireStaleRunningJobs(): Promise<number> {
+  const staleThreshold = new Date(Date.now() - 15 * 60 * 1000); // 15 minutes
+  const staleJobs = await db
+    .select({ id: discoveryJobs.id })
+    .from(discoveryJobs)
+    .where(
+      and(
+        eq(discoveryJobs.status, 'running'),
+        sql`${discoveryJobs.updatedAt} < ${staleThreshold.toISOString()}::timestamptz`
+      )
+    );
+
+  if (staleJobs.length === 0) return 0;
+
+  for (const job of staleJobs) {
+    await db
+      .update(discoveryJobs)
+      .set({
+        status: 'failed',
+        completedAt: new Date(),
+        errors: { message: 'Job timed out after 15 minutes without completing' },
+        updatedAt: new Date()
+      })
+      .where(eq(discoveryJobs.id, job.id));
+  }
+
+  console.warn(`[DiscoveryWorker] Expired ${staleJobs.length} stale running job(s)`);
+  return staleJobs.length;
+}
+
+/**
+ * Whether an interval-scheduled discovery profile is due, given the most
+ * recent job's run timestamp.
+ *
+ * `discovery_jobs.scheduled_at` / `.created_at` are `timestamp(...)` columns
+ * with no `withTimezone: true` (`db/schema/discovery.ts:132,139`), so the
+ * driver hands back the UTC wall clock re-read as this process's LOCAL time
+ * and `getTime()` is wrong by the host's offset (#4059 gap 2 — see
+ * `utils/offsetlessTimestamp.ts`). Subtracting that from a true-instant `now`
+ * skews the elapsed interval by the same amount: on a host west of UTC the
+ * last run reads as more recent than it was, so interval discovery silently
+ * stops firing for up to the host's offset; east of UTC it fires early.
+ *
+ * Exported as a pure seam so this is assertable without a database — see
+ * `discoveryWorker.intervalDue.test.ts`, registered in `vitest.config.tz.ts`.
+ */
+export function isIntervalScheduleDue(
+  latestRunAt: Date | null,
+  now: Date,
+  thresholdMs: number,
+): boolean {
+  if (!latestRunAt) return true;
+  return now.getTime() - utcMsFromOffsetlessDbTimestamp(latestRunAt) >= thresholdMs;
+}
+
+async function processScheduleProfiles(): Promise<{ enqueued: number }> {
+  const now = new Date();
+  const minuteStart = new Date(now);
+  minuteStart.setSeconds(0, 0);
+  const minuteEnd = new Date(minuteStart.getTime() + 60 * 1000);
+
+  // Clean up stale running jobs that may be blocking scheduled scans
+  try {
+    await expireStaleRunningJobs();
+  } catch (err) {
+    console.error('[DiscoveryWorker] Failed to expire stale jobs:', err);
+  }
+
+  const profiles = await db
+    .select({
+      id: discoveryProfiles.id,
+      orgId: discoveryProfiles.orgId,
+      siteId: discoveryProfiles.siteId,
+      schedule: discoveryProfiles.schedule
+    })
+    .from(discoveryProfiles)
+    .where(eq(discoveryProfiles.enabled, true));
+
+  if (profiles.length === 0) return { enqueued: 0 };
+
+  let enqueued = 0;
+
+  for (const profile of profiles) {
+    const schedule = normalizeSchedule(profile.schedule);
+    if (!schedule || schedule.type === 'manual') continue;
+
+    if (await hasActiveJob(profile.id)) {
+      continue;
+    }
+
+    if (schedule.type === 'interval') {
+      const intervalMinutes = schedule.intervalMinutes ?? 60;
+      const thresholdMs = intervalMinutes * 60 * 1000;
+
+      const [latest] = await db
+        .select({
+          scheduledAt: discoveryJobs.scheduledAt,
+          createdAt: discoveryJobs.createdAt
+        })
+        .from(discoveryJobs)
+        .where(eq(discoveryJobs.profileId, profile.id))
+        .orderBy(sql`${discoveryJobs.scheduledAt} desc nulls last, ${discoveryJobs.createdAt} desc`)
+        .limit(1);
+
+      const latestRunAt = latest?.scheduledAt ?? latest?.createdAt ?? null;
+      if (!isIntervalScheduleDue(latestRunAt, now, thresholdMs)) continue;
+
+      const result = await enqueueScheduledProfileRun(profile.id, profile.orgId, profile.siteId);
+      if (result.queued) enqueued++;
+      continue;
+    }
+
+    if (schedule.type === 'cron') {
+      const cronExpression = schedule.cron?.trim();
+      if (!cronExpression) continue;
+
+      const timeZone = resolveScheduleTimeZone(schedule.timezone);
+      if (!isCronDue(cronExpression, timeZone, now)) continue;
+
+      const [existingMinuteJob] = await db
+        .select({ id: discoveryJobs.id })
+        .from(discoveryJobs)
+        .where(
+          and(
+            eq(discoveryJobs.profileId, profile.id),
+            sql`${discoveryJobs.scheduledAt} >= ${minuteStart.toISOString()}::timestamptz`,
+            sql`${discoveryJobs.scheduledAt} < ${minuteEnd.toISOString()}::timestamptz`
+          )
+        )
+        .limit(1);
+
+      if (existingMinuteJob) continue;
+
+      const result = await enqueueScheduledProfileRun(profile.id, profile.orgId, profile.siteId);
+      if (result.queued) enqueued++;
+    }
+  }
+
+  if (enqueued > 0) {
+    console.log(`[DiscoveryWorker] Scheduled ${enqueued} discovery profile scan job(s)`);
+  }
+
+  return { enqueued };
+}
+
+/**
+ * Outcome of the dispatch-scan read/select phase (final-review fix, #4084 /
+ * #1105). Discriminated so each terminal cause (profile missing, requested
+ * agent invalid, no candidate agent) is distinct rather than inferred from
+ * guard order.
+ */
+type DispatchScanInputs =
+  | { status: 'profile-missing' }
+  | { status: 'invalid-agent' }
+  | { status: 'no-agent' }
+  | {
+      status: 'ok';
+      profile: typeof discoveryProfiles.$inferSelect;
+      agentId: string;
+      requestedAgentId: string | null;
+      selectionSource: 'requested' | 'site-auto';
+    };
+
+/**
+ * Phase 1 of a dispatch-scan job: load the profile and resolve/validate the
+ * execution agent, inside ONE short system DB context. Every early-failure
+ * write (`markJobFailed`) that can be determined from these reads alone
+ * happens here too, since none of it involves Redis or the agent WebSocket.
+ * The connectivity check (`isAgentConnectedAnywhere`) is NOT here — that is
+ * Redis I/O via the agentCommandRelay facade and must run with no context
+ * held (#1105).
+ */
+async function loadDispatchScanInputs(data: DispatchScanJobData): Promise<DispatchScanInputs> {
+  const [profile] = await db
+    .select()
+    .from(discoveryProfiles)
+    .where(eq(discoveryProfiles.id, data.profileId))
+    .limit(1);
+
+  if (!profile) {
+    await markJobFailed(data.jobId, 'Profile not found');
+    return { status: 'profile-missing' };
+  }
+
+  // Find an online agent to run the scan
+  let agentId = data.agentId;
+  const requestedAgentId = data.agentId ?? null;
+  const selectionSource: 'requested' | 'site-auto' = requestedAgentId ? 'requested' : 'site-auto';
+  if (requestedAgentId) {
+    const validation = await validateRequestedAgentForDiscovery(requestedAgentId, data.orgId, data.siteId);
+    if (!validation.ok) {
+      await markJobFailed(data.jobId, validation.message);
+      return { status: 'invalid-agent' };
+    }
+  }
+  if (!agentId) {
+    // Pick an online agent from the same site.
+    //
+    // Quick Support exclusion: ephemeral devices (`devices.isEphemeral`) live in
+    // the hidden per-partner 'quick_support' org and are a stranger's personal
+    // machine borrowed for one ~20-minute session. That org stays inside
+    // technicians' accessibleOrgIds for RLS reasons, so a bare "any online
+    // device here" pick could conscript a home PC into network-scanning the
+    // stranger's own LAN.
+    const [onlineAgent] = await db
+      .select({ agentId: devices.agentId })
+      .from(devices)
+      .where(
+        and(
+          eq(devices.orgId, data.orgId),
+          eq(devices.isEphemeral, false),
+          eq(devices.siteId, data.siteId),
+          eq(devices.status, 'online')
+        )
+      )
+      .limit(1);
+
+    agentId = onlineAgent?.agentId ?? null;
+  }
+
+  if (!agentId) {
+    console.warn(
+      `[DiscoveryWorker] No candidate agent found for job ${data.jobId} (profile=${data.profileId}, org=${data.orgId}, site=${data.siteId}, source=${selectionSource})`
+    );
+    await markJobFailed(data.jobId, 'No online agent available for this site');
+    return { status: 'no-agent' };
+  }
+
+  return { status: 'ok', profile, agentId, requestedAgentId, selectionSource };
+}
+
+/**
+ * Dispatch a discovery scan command to an agent
+ */
+async function processDispatchScan(data: DispatchScanJobData): Promise<{
+  dispatched: boolean;
+  agentId: string | null;
+  durationMs: number;
+}> {
+  const startTime = Date.now();
+
+  // Phase 1 — profile load, agent validation/selection and every terminal
+  // failure write reachable from those reads alone: ONE short system DB
+  // context, which then CLOSES before any Redis or WS I/O.
+  const inputs = await runWithSystemDbAccess(() => loadDispatchScanInputs(data));
+
+  if (inputs.status !== 'ok') {
+    return { dispatched: false, agentId: null, durationMs: Date.now() - startTime };
+  }
+
+  const { profile, agentId, requestedAgentId, selectionSource: initialSelectionSource } = inputs;
+
+  // Phase 2 — connectivity check with NO DB context open (#1105).
+  if (!(await isAgentConnectedAnywhere(agentId))) {
+    console.warn(
+      `[DiscoveryWorker] Selected agent is not websocket-connected for job ${data.jobId} (agent=${agentId}, requestedAgent=${requestedAgentId ?? 'none'}, source=${initialSelectionSource})`
+    );
+    await runWithSystemDbAccess(() => markJobFailed(data.jobId, 'No online agent available for this site'));
+    return { dispatched: false, agentId: null, durationMs: Date.now() - startTime };
+  }
+
+  const selectionSource = requestedAgentId ? initialSelectionSource : 'site-auto';
+  console.log(
+    `[DiscoveryWorker] Selected agent ${agentId} for job ${data.jobId} (profile=${data.profileId}, org=${data.orgId}, site=${data.siteId}, source=${selectionSource}${requestedAgentId ? `, requestedAgent=${requestedAgentId}` : ''})`
+  );
+
+  // Build the command payload from the profile
+  const command: AgentCommand = {
+    id: data.jobId, // Use job ID as command ID so results correlate
+    type: 'network_discovery',
+    payload: {
+      jobId: data.jobId,
+      subnets: profile.subnets ?? [],
+      excludeIps: profile.excludeIps ?? [],
+      methods: profile.methods ?? [],
+      portRanges: profile.portRanges ?? [],
+      snmpCommunities: decryptSnmpCommunities(profile.snmpCommunities),
+      snmpCredentials: decryptSnmpCredentials(profile.snmpCredentials),
+      deepScan: profile.deepScan ?? false,
+      identifyOS: profile.identifyOS ?? false,
+      resolveHostnames: profile.resolveHostnames ?? false,
+      timeout: profile.timeout ?? 2,
+      concurrency: profile.concurrency ?? 128
+    }
+  };
+
+  // Phase 3 — the WS/relay dispatch itself, no DB context open (#1105).
+  const outcome = await dispatchCommandToAgent(agentId, command);
+  if (outcome.status !== 'sent') {
+    await runWithSystemDbAccess(() =>
+      markJobFailed(
+        data.jobId,
+        outcome.status === 'offline'
+          ? 'Failed to send command to agent'
+          : `Failed to send command to agent (dispatch outcome ${outcome.status})`,
+      )
+    );
+    return { dispatched: false, agentId, durationMs: Date.now() - startTime };
+  }
+
+  // Phase 4 — job status flip to running: its own short system DB context.
+  await runWithSystemDbAccess(() =>
+    db
+      .update(discoveryJobs)
+      .set({
+        status: 'running',
+        agentId,
+        startedAt: new Date(),
+        updatedAt: new Date()
+      })
+      .where(eq(discoveryJobs.id, data.jobId))
+  );
+
+  console.log(`[DiscoveryWorker] Scan dispatched to agent ${agentId} for job ${data.jobId}`);
+  return { dispatched: true, agentId, durationMs: Date.now() - startTime };
+}
+
+// Exposed for the wave 3.5b (#4084) dispatch-facade migration tests — mirrors
+// snmpWorker.ts's __testables pattern. Each handler here manages its own
+// short-lived system DB context(s) around just its reads/writes (final-review
+// fix, #1105), so calling it directly is safe from a context standpoint.
+export const __testables = {
+  processDispatchScan,
+};
+
+/**
+ * Identity for one scanned host (spec §9, D6).
+ *
+ * Exported so it can be unit-tested without a database; `processResults` is the
+ * only caller, and it is the single point BOTH the INSERT and the UPDATE branch
+ * read manufacturer/model from. Manual precedence is enforced afterwards, in
+ * SQL, by buildScanUpdateSet — not here.
+ */
+export function resolveScanIdentity(
+  host: DiscoveredHostResult,
+  nicVendor: string | null,
+): ResolvedAssetIdentity {
+  return resolveAssetIdentity({
+    sysObjectId: host.snmpData?.sysObjectId ?? null,
+    sysDescr: host.snmpData?.sysDescr ?? null,
+    snmpData: (host.snmpData ?? null) as Record<string, unknown> | null,
+    macVendor: nicVendor,
+    current: { manufacturer: host.manufacturer ?? null, model: host.model ?? null },
+  });
+}
+
+/**
+ * The scan's UPDATE set for an already-known asset (#5213).
+ *
+ * A scan re-finding a manual row updates it IN PLACE — one identity, no
+ * duplicate, which is the whole point of keeping the (org_id, ip_address)
+ * index — but it must not overwrite what the operator typed. `asset_type` is
+ * already covered by `type_source = 'manual'`
+ * (services/discoveredAssetClassification.ts). `hostname` / `manufacturer` /
+ * `model` were NOT, and they are exactly the fields an operator fills in on a
+ * printer that DNS does not resolve, so each is written as a guarded CASE
+ * evaluated by Postgres against the STORED row (never against the SELECT above,
+ * which can go stale mid-scan — the same race #3011 was about).
+ *
+ * `label` needs no guard: the scan never writes it (assetData has no `label`
+ * key). Do not add one.
+ */
+export function buildScanUpdateSet(
+  assetData: Record<string, unknown>,
+  classification: { type: DiscoveredAssetType; source: DiscoveredAssetDetectionSource } | null,
+): PgUpdateSetSource<typeof discoveredAssets> {
+  const updateSet: PgUpdateSetSource<typeof discoveredAssets> = {
+    ...(assetData as PgUpdateSetSource<typeof discoveredAssets>),
+  };
+  // Spec §4.3 — every writer of `is_online` dates and attributes its verdict.
+  // A scan sighting is a `scan`-sourced observation taken now; `last_seen_at`
+  // keeps its own meaning (last POSITIVE sighting) and is untouched here.
+  updateSet.statusObservedAt = new Date();
+  updateSet.statusSource = 'scan';
+  for (const col of ['hostname', 'manufacturer', 'model'] as const) {
+    const proposed = assetData[col] ?? null;
+    updateSet[col] = sql`case when ${discoveredAssets.source} = 'manual'
+                              then ${discoveredAssets[col]}
+                              else ${proposed} end`;
+  }
+  if (classification) {
+    const write = buildClassificationWrite(classification.source, {
+      assetType: sql`${classification.type}`,
+      detectedAssetType: sql`${classification.type}`,
+    });
+    updateSet.assetType = write.assetType;
+    updateSet.detectedAssetType = write.detectedAssetType;
+    updateSet.detectedTypeSource = write.detectedTypeSource;
+  }
+  return updateSet;
+}
+
+/**
+ * Conditions selecting the assets the "went offline" sweep may consider (#5213).
+ *
+ * The `is_online = true` condition ALREADY excludes a never-scanned manual row
+ * (born `is_online = false`), so the `last_seen_at IS NOT NULL` condition is
+ * belt and braces — but it is the condition that states the intent, and it
+ * survives someone "helpfully" defaulting `is_online` to true later. The create
+ * route must never set `is_online`; the route test (W02) asserts that.
+ */
+export function buildMonitoredAssetConditions(
+  orgId: string,
+  siteId: string,
+  profileSubnets: string[],
+): SQL<unknown>[] {
+  const conditions: SQL<unknown>[] = [
+    eq(discoveredAssets.orgId, orgId),
+    eq(discoveredAssets.siteId, siteId),
+    eq(discoveredAssets.approvalStatus, 'approved'),
+    eq(discoveredAssets.isOnline, true),
+    sql`${discoveredAssets.lastSeenAt} is not null`,
+  ];
+  const subnetPredicates = profileSubnets
+    .map((subnet) => subnet.trim())
+    .filter(Boolean)
+    .map((subnet) => sql`${discoveredAssets.ipAddress} <<= ${subnet}::inet`);
+  if (subnetPredicates.length > 0) {
+    conditions.push(or(...subnetPredicates)!);
+  }
+  return conditions;
+}
+
+/**
+ * Process discovery results — upsert discovered assets
+ */
+export async function processResults(data: ProcessResultsJobData): Promise<{
+  newAssets: number;
+  updatedAssets: number;
+  durationMs: number;
+}> {
+  const startTime = Date.now();
+
+  // Check if job was cancelled before processing results
+  const [currentJob] = await db
+    .select({ status: discoveryJobs.status })
+    .from(discoveryJobs)
+    .where(eq(discoveryJobs.id, data.jobId))
+    .limit(1);
+
+  if (currentJob?.status === 'cancelled') {
+    console.log(`[DiscoveryWorker] Job ${data.jobId} was cancelled — skipping result processing`);
+    return { newAssets: 0, updatedAssets: 0, durationMs: Date.now() - startTime };
+  }
+
+  // ── Resolve profileId ─────────────────────────────────────────────────
+  let profileId = data.profileId;
+  if (!profileId) {
+    const [jobRow] = await db
+      .select({ profileId: discoveryJobs.profileId })
+      .from(discoveryJobs)
+      .where(eq(discoveryJobs.id, data.jobId))
+      .limit(1);
+    profileId = jobRow?.profileId;
+  }
+
+  // ── Load profile alertSettings ────────────────────────────────────────
+  const defaultAlertSettings: DiscoveryProfileAlertSettings = {
+    enabled: false, alertOnNew: false, alertOnDisappeared: false, alertOnChanged: false, changeRetentionDays: 90
+  };
+  let alertSettings: DiscoveryProfileAlertSettings = defaultAlertSettings;
+  let profileSubnets: string[] = [];
+  if (profileId) {
+    const [profile] = await db
+      .select({
+        alertSettings: discoveryProfiles.alertSettings,
+        id: discoveryProfiles.id,
+        subnets: discoveryProfiles.subnets
+      })
+      .from(discoveryProfiles)
+      .where(eq(discoveryProfiles.id, profileId))
+      .limit(1);
+    alertSettings = (profile?.alertSettings as DiscoveryProfileAlertSettings | null) ?? defaultAlertSettings;
+    profileSubnets = profile?.subnets ?? [];
+  }
+
+  // ── Load known guest MACs ─────────────────────────────────────────────
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, data.orgId))
+    .limit(1);
+
+  const knownGuests = org?.partnerId ? await db
+    .select({ macAddress: networkKnownGuests.macAddress })
+    .from(networkKnownGuests)
+    .where(eq(networkKnownGuests.partnerId, org.partnerId))
+  : [];
+  const knownGuestMacs = new Set(knownGuests.map(g => g.macAddress));
+
+  // ── Load existing assets for approval comparison ──────────────────────
+  const scannedIps = data.hosts.map(h => h.ip).filter(Boolean);
+  const scannedExistingAssets = scannedIps.length > 0
+    ? await db.select({
+        id: discoveredAssets.id,
+        ipAddress: discoveredAssets.ipAddress,
+        macAddress: discoveredAssets.macAddress,
+        hostname: discoveredAssets.hostname,
+        approvalStatus: discoveredAssets.approvalStatus,
+        isOnline: discoveredAssets.isOnline
+      }).from(discoveredAssets).where(
+        and(
+          eq(discoveredAssets.orgId, data.orgId),
+          eq(discoveredAssets.siteId, data.siteId),
+          inArray(discoveredAssets.ipAddress, scannedIps),
+        )
+      )
+    : [];
+  const existingByIp = new Map(scannedExistingAssets.map(a => [a.ipAddress, a]));
+
+  const monitoredAssetConditions = buildMonitoredAssetConditions(
+    data.orgId,
+    data.siteId,
+    profileSubnets,
+  );
+  const monitoredExistingAssets = await db
+    .select({
+      id: discoveredAssets.id,
+      ipAddress: discoveredAssets.ipAddress,
+      macAddress: discoveredAssets.macAddress,
+      hostname: discoveredAssets.hostname,
+      approvalStatus: discoveredAssets.approvalStatus,
+      isOnline: discoveredAssets.isOnline
+    })
+    .from(discoveredAssets)
+    .where(and(...monitoredAssetConditions));
+
+  // ── Resolve or auto-create baseline for change event tracking ────────
+  let resolvedBaselineId: string | null = null;
+  try {
+    const [existing] = await db
+      .select({ id: networkBaselines.id })
+      .from(networkBaselines)
+      .where(and(eq(networkBaselines.orgId, data.orgId), eq(networkBaselines.siteId, data.siteId)))
+      .limit(1);
+
+    if (existing) {
+      resolvedBaselineId = existing.id;
+    } else if (profileId && data.hosts.length > 0) {
+      // Derive subnet from the first host's IP (assume /24)
+      const firstIp = data.hosts[0]!.ip;
+      const parts = firstIp.split('.');
+      const subnet = parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.0/24` : '0.0.0.0/0';
+
+      const [created] = await db
+        .insert(networkBaselines)
+        .values({
+          orgId: data.orgId,
+          siteId: data.siteId,
+          subnet,
+          // SEC-2026-09-05-146: this baseline is created by the system on the
+          // back of a scan, so there is no principal whose revocation could ever
+          // stop a recurring schedule on it. Leaving scan_schedule NULL was not
+          // neutral: normalizeBaselineScanSchedule reads NULL back as
+          // `enabled: true` and compareBaselineScan then PERSISTS that, turning
+          // the row into an enabled recurring schedule with no envelope —
+          // permanently blocked by the dispatch gate and invisible to the
+          // migration's quarantine sweep. Start it explicitly disabled; an
+          // operator arms it (and becomes its authority) by saving the schedule.
+          scanSchedule: normalizeBaselineScanSchedule({ enabled: false }),
+        })
+        .onConflictDoNothing()
+        .returning({ id: networkBaselines.id });
+
+      if (created) {
+        resolvedBaselineId = created.id;
+        console.log(`[DiscoveryWorker] Auto-created baseline ${resolvedBaselineId} for org=${data.orgId} site=${data.siteId} subnet=${subnet}`);
+      } else {
+        // Race: another process created it — re-fetch
+        const [refetched] = await db
+          .select({ id: networkBaselines.id })
+          .from(networkBaselines)
+          .where(and(eq(networkBaselines.orgId, data.orgId), eq(networkBaselines.siteId, data.siteId)))
+          .limit(1);
+        resolvedBaselineId = refetched?.id ?? null;
+      }
+    }
+  } catch (baselineErr) {
+    console.error('[DiscoveryWorker] Failed to resolve/create baseline — network change events for this scan will be dropped:', baselineErr instanceof Error ? baselineErr.message : baselineErr);
+  }
+
+  let newCount = 0;
+  let updatedCount = 0;
+  let changeEventsCreated = 0;
+  let hostErrors = 0;
+
+  for (const host of data.hosts) {
+    if (!host.ip) continue;
+
+    try {
+    // Check if asset already exists (by org + IP)
+    const [existing] = await db
+      .select({
+        id: discoveredAssets.id,
+        typeSource: discoveredAssets.typeSource,
+        detectedTypeSource: discoveredAssets.detectedTypeSource,
+        autoLinkSuppressedAt: discoveredAssets.autoLinkSuppressedAt
+      })
+      .from(discoveredAssets)
+      .where(
+        and(
+          eq(discoveredAssets.orgId, data.orgId),
+          eq(discoveredAssets.siteId, data.siteId),
+          sql`${discoveredAssets.ipAddress} = ${host.ip}`
+        )
+      )
+      .limit(1);
+
+    // Identity is resolved SERVER-side now (spec §9): the IANA enterprise arc
+    // of the sysObjectID outranks the NIC OUI, and the raw sysObjectID can no
+    // longer reach `model`. The OUI vendor is still computed — it remains the
+    // last manufacturer fallback and W01 exposes it separately as `nicVendor`.
+    const nicVendor = host.mac ? lookupMacVendor(host.mac) : null;
+    const identity = resolveScanIdentity(host, nicVendor);
+    const resolvedManufacturer = identity.manufacturer;
+
+    // What did this scan actually manage to classify, and how strong is that
+    // evidence? The agent's own classification is real observation (ports, SNMP,
+    // OS fingerprint); falling back to the MAC OUI vendor string is a guess that
+    // only narrows the product CATEGORY. They rank differently (#3187), so the
+    // difference has to be recorded, not flattened into one 'auto'.
+    //
+    // `null` means "this scan has no opinion" — NOT "the device is of unknown
+    // type". `mapAssetType` returns 'unknown' for both the agent saying it
+    // couldn't tell and for an unrecognised type string, and writing that back
+    // would erase a classification made by a better-informed source. PR #3185
+    // fixed exactly this on the UniFi path; this is the agent-scan half.
+    const agentType = mapAssetType(host.assetType);
+    const classification: { type: DiscoveredAssetType; source: DiscoveredAssetDetectionSource } | null =
+      agentType !== 'unknown'
+        ? { type: agentType, source: 'agent_scan' }
+        : (() => {
+            const inferred = resolvedManufacturer
+              ? inferAssetTypeFromVendor(resolvedManufacturer)
+              : null;
+            return inferred ? { type: inferred, source: 'vendor_oui' as const } : null;
+          })();
+
+    // assetType/detectedAssetType are deliberately NOT in here — they are applied
+    // per-branch below, guarded by the precedence rules (#3011, #3187).
+    const assetData = {
+      ipAddress: host.ip,
+      macAddress: host.mac ?? null,
+      hostname: host.hostname ?? null,
+      netbiosName: host.netbiosName ?? null,
+      manufacturer: resolvedManufacturer,
+      model: identity.model,
+      openPorts: host.openPorts ?? null,
+      osFingerprint: host.osFingerprint ? { os: host.osFingerprint } : null,
+      snmpData: host.snmpData ?? null,
+      responseTimeMs: host.responseTimeMs ?? null,
+      discoveryMethods: host.methods?.map(mapMethod) ?? [],
+      lastSeenAt: new Date(),
+      lastJobId: data.jobId,
+      updatedAt: new Date()
+    };
+
+    let upsertedAssetId: string | null = null;
+    let alreadyLinked = false;
+    let autoLinkedDeviceId: string | null = null;
+
+    if (existing) {
+      // A scan with no opinion writes neither type column, leaving whatever a
+      // better-informed source already decided. When it does have one, all three
+      // type columns are written as guarded SQL CASE expressions: the manual
+      // override and the classifier ranking are both resolved against the stored
+      // row inside the UPDATE, never from the SELECT above, because both can
+      // change in between (a user saving a manual type mid-scan is precisely the
+      // race #3011 was about).
+      // Typed against the real column list, and the classification columns are
+      // assigned one at a time: drizzle silently DROPS set keys that name no
+      // column, and `Object.assign` would defeat the check (its signature does
+      // not constrain the source's keys to the target's).
+      // #5213: hostname/manufacturer/model are additionally guarded against
+      // clobbering an operator's manual row. See buildScanUpdateSet.
+      const updateSet = buildScanUpdateSet(assetData, classification);
+      await db
+        .update(discoveredAssets)
+        .set(updateSet)
+        .where(eq(discoveredAssets.id, existing.id));
+      upsertedAssetId = existing.id;
+      updatedCount++;
+
+      // Preserve only same-site links. Older code could auto-link an asset to
+      // an org-sibling site's device when private IPs or MACs collided.
+      const [currentAsset] = await db
+        .select({
+          linkedDeviceId: discoveredAssets.linkedDeviceId,
+          linkedDeviceSiteId: devices.siteId,
+        })
+        .from(discoveredAssets)
+        .leftJoin(devices, eq(devices.id, discoveredAssets.linkedDeviceId))
+        .where(eq(discoveredAssets.id, existing.id))
+        .limit(1);
+      alreadyLinked = !!currentAsset?.linkedDeviceId
+        && currentAsset.linkedDeviceSiteId === data.siteId;
+      if (currentAsset?.linkedDeviceId && !alreadyLinked) {
+        await db
+          .update(discoveredAssets)
+          .set({ linkedDeviceId: null, linkSource: null })
+          .where(and(
+            eq(discoveredAssets.id, existing.id),
+            eq(discoveredAssets.siteId, data.siteId),
+          ));
+      }
+    } else {
+      // Net-new row, so there is nothing to outrank — write the classification
+      // straight in. With no opinion, asset_type falls to its 'unknown' column
+      // default and both detection columns stay NULL, which is what lets the
+      // next classifier of any strength claim the row.
+      const [inserted] = await db.insert(discoveredAssets).values({
+        orgId: data.orgId,
+        siteId: data.siteId,
+        ...assetData,
+        ...(classification
+          ? {
+              assetType: classification.type,
+              detectedAssetType: classification.type,
+              detectedTypeSource: classification.source,
+            }
+          : {}),
+        typeSource: 'auto',
+        // #5213 — insert side only. A scan that later re-finds a manual row
+        // must not relabel it (see buildScanUpdateSet, which omits `source`).
+        source: 'scan'
+      }).returning({ id: discoveredAssets.id });
+      upsertedAssetId = inserted?.id ?? null;
+      newCount++;
+    }
+
+    // Auto-link: match discovered asset to enrolled device by MAC or IP.
+    // Skip entirely (no match attempt, no write) when a user has manually
+    // unlinked this asset — auto_link_suppressed_at is cleared only by a
+    // manual (re-)link, never by this worker. See design doc A.3.
+    const autoLinkSuppressed = !!existing?.autoLinkSuppressedAt;
+    if (upsertedAssetId && !alreadyLinked && !autoLinkSuppressed && (assetData.macAddress || assetData.ipAddress)) {
+      try {
+        const conditions = [];
+        if (assetData.macAddress) conditions.push(eq(deviceNetwork.macAddress, assetData.macAddress));
+        if (assetData.ipAddress) conditions.push(eq(deviceNetwork.ipAddress, assetData.ipAddress));
+
+        if (conditions.length > 0) {
+          const [match] = await db
+            .select({ deviceId: deviceNetwork.deviceId })
+            .from(deviceNetwork)
+            .innerJoin(devices, eq(devices.id, deviceNetwork.deviceId))
+            .where(and(
+              eq(devices.orgId, data.orgId),
+              eq(devices.siteId, data.siteId),
+              or(...conditions),
+            ))
+            .limit(1);
+
+          if (match) {
+            await db
+              .update(discoveredAssets)
+              .set({ linkedDeviceId: match.deviceId, approvalStatus: 'approved', linkSource: 'auto' })
+              .where(eq(discoveredAssets.id, upsertedAssetId));
+            autoLinkedDeviceId = match.deviceId;
+
+            // Mirror the asset's type onto the linked device (discovery > auto,
+            // but never > manual).
+            //
+            // The value is read back OUT OF THE ASSET ROW inside this statement
+            // rather than taken from `classification`. The asset write above is
+            // precedence-guarded in SQL, so the type that actually landed may not
+            // be the one this scan proposed — propagating our own guess would put
+            // the rejected value on the device and reintroduce the flap one table
+            // over (#3187). Reading the settled value instead means every scan
+            // re-converges device_role on the asset, so a device can never be
+            // stranded on a stale role by a classifier that is now outranked.
+            //
+            // Both guards are in the statement too, for the same reason the asset
+            // write's are: `existing` was read before the asset UPDATE and a user
+            // can pin a type in between. This also replaces the separate SELECT
+            // that used to fetch device_role_source, so the whole propagation is
+            // now one statement. IS DISTINCT FROM rather than <>: the column is
+            // NOT NULL DEFAULT 'auto' today, but a null-safe comparison keeps the
+            // carve-out correct if that ever relaxes.
+            if (classification) {
+              await db.update(devices)
+                .set({
+                  deviceRole: sql`(select ${discoveredAssets.assetType} from ${discoveredAssets} where ${discoveredAssets.id} = ${upsertedAssetId})`,
+                  deviceRoleSource: 'discovery',
+                  updatedAt: new Date(),
+                })
+                .where(and(
+                  eq(devices.id, match.deviceId),
+                  // Neither a technician's ('manual') nor a Fleet Design
+                  // correction the technician approved ('ai', W03 #5653) is
+                  // overwritten by a discovery guess.
+                  sql`coalesce(${devices.deviceRoleSource}, 'auto') not in ('manual', 'ai')`,
+                  sql`exists (select 1 from ${discoveredAssets} where ${discoveredAssets.id} = ${upsertedAssetId} and ${discoveredAssets.typeSource} <> 'manual' and ${discoveredAssets.assetType} <> 'unknown')`,
+                ));
+            }
+          }
+        }
+      } catch (linkErr) {
+        console.warn(`[DiscoveryWorker] Auto-link failed for ${host.ip}:`, linkErr);
+      }
+    }
+
+    // ── Approval decision ─────────────────────────────────────────────────
+    const existingForApproval = existingByIp.get(host.ip) ?? null;
+    const guestMac = normalizeMac(host.mac);
+    const isGuest = !!guestMac && knownGuestMacs.has(guestMac);
+
+    const decision = autoLinkedDeviceId || alreadyLinked
+      ? { approvalStatus: 'approved' as const, shouldAlert: false }
+      : buildApprovalDecision({
+          existingAsset: existingForApproval
+            ? { approvalStatus: existingForApproval.approvalStatus, macAddress: existingForApproval.macAddress }
+            : null,
+          incomingMac: host.mac,
+          isKnownGuest: isGuest,
+          alertSettings
+        });
+
+    // Update approvalStatus and isOnline
+    if (upsertedAssetId) {
+      await db.update(discoveredAssets)
+        .set({
+          approvalStatus: decision.approvalStatus,
+          isOnline: true,
+          // Spec §4.3 — this is the second place a scan writes is_online, and
+          // it runs AFTER buildScanUpdateSet's upsert, so it would otherwise
+          // leave a newer verdict wearing the older stamp.
+          statusObservedAt: new Date(),
+          statusSource: 'scan',
+        })
+        .where(eq(discoveredAssets.id, upsertedAssetId));
+    }
+
+    // Log change event if needed
+    if (decision.shouldAlert && decision.eventType && profileId && resolvedBaselineId) {
+      try {
+        const inserted = await insertDiscoveryChangeEvent({
+          orgId: data.orgId,
+          siteId: data.siteId,
+          baselineId: resolvedBaselineId,
+          profileId: profileId,
+          eventType: decision.eventType,
+          ipAddress: host.ip,
+          macAddress: host.mac ?? null,
+          hostname: host.hostname ?? null,
+          assetType: mapAssetType(host.assetType),
+          previousState: existingForApproval
+            ? { macAddress: existingForApproval.macAddress, hostname: existingForApproval.hostname }
+            : null,
+          currentState: { macAddress: host.mac, hostname: host.hostname, assetType: host.assetType }
+        });
+        if (inserted) {
+          changeEventsCreated++;
+        }
+      } catch (changeErr) {
+        console.warn(
+          `[DiscoveryWorker] Failed to log change event for ${host.ip}:`,
+          changeErr instanceof Error ? changeErr.message : changeErr
+        );
+      }
+    }
+    } catch (hostErr) {
+      hostErrors++;
+      console.error(
+        `[DiscoveryWorker] Failed to process discovered host ${host.ip}:`,
+        hostErr instanceof Error ? hostErr.message : hostErr
+      );
+    }
+  }
+
+  if (hostErrors > 0) {
+    console.warn(`[DiscoveryWorker] ${hostErrors}/${data.hosts.length} host(s) failed to process for job ${data.jobId}`);
+  }
+
+  // ── Bootstrap change events when alerts are first enabled ────────────
+  // If alerts are enabled with alertOnNew, zero change events were created
+  // during this scan, and no events have EVER been created for this profile,
+  // generate new_device events for all hosts in this scan. This handles the
+  // case where alerts are enabled after assets already exist.
+  if (
+    alertSettings.enabled &&
+    alertSettings.alertOnNew &&
+    changeEventsCreated === 0 &&
+    profileId &&
+    resolvedBaselineId &&
+    data.hosts.length > 0
+  ) {
+    try {
+      const [anyExistingEvent] = await db
+        .select({ id: networkChangeEvents.id })
+        .from(networkChangeEvents)
+        .where(eq(networkChangeEvents.profileId, profileId))
+        .limit(1);
+
+      if (!anyExistingEvent) {
+        let bootstrapped = 0;
+        for (const host of data.hosts) {
+          if (!host.ip) continue;
+          try {
+            const inserted = await insertDiscoveryChangeEvent({
+              orgId: data.orgId,
+              siteId: data.siteId,
+              baselineId: resolvedBaselineId,
+              profileId,
+              eventType: 'new_device',
+              ipAddress: host.ip,
+              macAddress: host.mac ?? null,
+              hostname: host.hostname ?? null,
+              assetType: mapAssetType(host.assetType),
+              previousState: null,
+              currentState: { macAddress: host.mac, hostname: host.hostname, assetType: host.assetType }
+            });
+            if (inserted) {
+              bootstrapped++;
+            }
+          } catch (bootstrapErr) {
+            console.warn(
+              `[DiscoveryWorker] Failed to bootstrap change event for ${host.ip}:`,
+              bootstrapErr instanceof Error ? bootstrapErr.message : bootstrapErr
+            );
+          }
+        }
+        if (bootstrapped > 0) {
+          console.log(
+            `[DiscoveryWorker] Bootstrapped ${bootstrapped} new_device change event(s) for profile ${profileId} (first alert-enabled scan)`
+          );
+        }
+      }
+    } catch (bootstrapQueryErr) {
+      console.warn(
+        '[DiscoveryWorker] Failed to check for existing change events during bootstrap:',
+        bootstrapQueryErr instanceof Error ? bootstrapQueryErr.message : bootstrapQueryErr
+      );
+    }
+  }
+
+  // ── Mark approved assets not seen in this scan as offline ─────────────
+  if (scannedIps.length > 0) {
+    const seenIps = new Set(data.hosts.map(h => h.ip));
+    for (const asset of monitoredExistingAssets) {
+      // #5213: ip_address is nullable now, while network_change_events.ip_address
+      // is inet NOT NULL. An IP-less asset can never legitimately reach here (it
+      // cannot have been "seen" by an IP scan — buildMonitoredAssetConditions
+      // requires is_online = true AND last_seen_at IS NOT NULL, and only the
+      // IP-matched scan branch ever sets those), so this narrows the type AND
+      // states the guard. It is unreachable by design, which is exactly why it
+      // LOGS rather than skipping silently: if it ever fires, an invariant broke
+      // (e.g. a writer started defaulting is_online to true on a manual row) and
+      // a bare `continue` would hide that regression instead of surfacing it.
+      if (!asset.ipAddress) {
+        console.warn(
+          `[DiscoveryWorker] Invariant violated: monitored asset ${asset.id} reached the ` +
+          'disappeared sweep with a NULL ip_address — skipping. A row with no IP should ' +
+          'never be is_online=true with a non-null last_seen_at (#5213).'
+        );
+        continue;
+      }
+      if (!seenIps.has(asset.ipAddress) && asset.approvalStatus === 'approved' && asset.isOnline) {
+        await db.update(discoveredAssets)
+          .set({
+            isOnline: false,
+            // Spec §4.3 — THE stamp that matters most. Before this, the sweep
+            // wrote is_online = false without touching any timestamp, so the
+            // row said "offline" with no way to tell whether that verdict was
+            // five minutes or five weeks old. deriveReachability refuses to
+            // rank an undated negative at all, so an unstamped sweep result is
+            // silently ignored — this line is what makes the sweep count.
+            statusObservedAt: new Date(),
+            statusSource: 'scan',
+          })
+          .where(eq(discoveredAssets.id, asset.id));
+
+        // Log disappeared event if configured
+        if (alertSettings.enabled && alertSettings.alertOnDisappeared && profileId && resolvedBaselineId) {
+          try {
+            await insertDiscoveryChangeEvent({
+              orgId: data.orgId,
+              siteId: data.siteId,
+              baselineId: resolvedBaselineId,
+              profileId,
+              eventType: 'device_disappeared',
+              ipAddress: asset.ipAddress,
+              macAddress: asset.macAddress ?? null,
+              hostname: asset.hostname ?? null,
+              previousState: { approvalStatus: asset.approvalStatus, isOnline: true },
+              currentState: { isOnline: false }
+            });
+          } catch (disappearedErr) {
+            console.warn(
+              `[DiscoveryWorker] Failed to log disappeared event for ${asset.ipAddress}:`,
+              disappearedErr instanceof Error ? disappearedErr.message : disappearedErr
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // Reconcile topology: materialize measured infra↔infra edges from LLDP/CDP adjacency.
+  try {
+    await reconcileTopology(data.orgId, data.siteId, data.hosts, data.adjacency ?? []);
+  } catch (err) {
+    console.error(`[DiscoveryWorker] Topology reconciliation failed for job ${data.jobId}:`, err);
+  }
+
+  // Update the job record
+  await db
+    .update(discoveryJobs)
+    .set({
+      status: 'completed',
+      completedAt: new Date(),
+      hostsScanned: data.hostsScanned,
+      hostsDiscovered: data.hostsDiscovered,
+      newAssets: newCount,
+      updatedAt: new Date()
+    })
+    .where(eq(discoveryJobs.id, data.jobId));
+
+  // If this discovery job was launched by a network baseline, enqueue comparison.
+  const [baseline] = await db
+    .select({
+      id: networkBaselines.id,
+      orgId: networkBaselines.orgId,
+      siteId: networkBaselines.siteId
+    })
+    .from(networkBaselines)
+    .where(eq(networkBaselines.lastScanJobId, data.jobId))
+    .limit(1);
+
+  if (baseline) {
+    try {
+      const { enqueueBaselineComparison } = await import('./networkBaselineWorker');
+      await enqueueBaselineComparison(
+        baseline.id,
+        data.jobId,
+        baseline.orgId,
+        baseline.siteId,
+        data.hosts
+      );
+    } catch (error) {
+      console.error(
+        `[DiscoveryWorker] Failed to enqueue baseline comparison for baseline=${baseline.id} job=${data.jobId}:`,
+        error instanceof Error ? error.message : error
+      );
+      throw error; // Let BullMQ retry
+    }
+  }
+
+  console.log(`[DiscoveryWorker] Job ${data.jobId} completed: ${newCount} new, ${updatedCount} updated`);
+  return { newAssets: newCount, updatedAssets: updatedCount, durationMs: Date.now() - startTime };
+}
+
+/**
+ * Map agent asset type string to DB enum value
+ */
+function mapAssetType(agentType: string): DiscoveredAssetType {
+  const typeMap: Record<string, DiscoveredAssetType> = {
+    workstation: 'workstation',
+    server: 'server',
+    printer: 'printer',
+    router: 'router',
+    switch: 'switch',
+    firewall: 'firewall',
+    access_point: 'access_point',
+    phone: 'phone',
+    iot: 'iot',
+    camera: 'camera',
+    nas: 'nas',
+    // Fallbacks for older agent versions that send invalid type strings
+    windows: 'workstation',
+    linux: 'workstation',
+    web: 'unknown',
+  };
+  return typeMap[agentType] ?? 'unknown';
+}
+
+/**
+ * Map agent method name to DB enum value
+ */
+function mapMethod(method: string): any {
+  const methodMap: Record<string, string> = {
+    arp: 'arp',
+    ping: 'ping',
+    ports: 'port_scan',
+    port_scan: 'port_scan',
+    snmp: 'snmp',
+    wmi: 'wmi',
+    ssh: 'ssh',
+    mdns: 'mdns',
+    netbios: 'netbios',
+  };
+  return methodMap[method] ?? method;
+}
+
+export async function cleanupSpeculativeTopologyLinks(
+  orgId: string,
+  siteId: string
+): Promise<number> {
+  const deleted = await db
+    .delete(networkTopology)
+    .where(
+      and(
+        eq(networkTopology.orgId, orgId),
+        eq(networkTopology.siteId, siteId),
+        eq(networkTopology.sourceType, 'discovered_asset'),
+        eq(networkTopology.targetType, 'discovered_asset'),
+        or(
+          eq(networkTopology.connectionType, 'ethernet'),
+          eq(networkTopology.connectionType, 'routed')
+        )!
+      )
+    )
+    .returning({ id: networkTopology.id });
+
+  return deleted.length;
+}
+
+async function markJobFailed(jobId: string, error: string): Promise<void> {
+  await db
+    .update(discoveryJobs)
+    .set({
+      status: 'failed',
+      completedAt: new Date(),
+      errors: { message: error },
+      updatedAt: new Date()
+    })
+    .where(eq(discoveryJobs.id, jobId));
+}
+
+/**
+ * Enqueue a discovery scan
+ */
+export async function enqueueDiscoveryScan(
+  jobId: string,
+  profileId: string,
+  orgId: string,
+  siteId: string,
+  agentId?: string | null,
+  meta: QueueActorMeta = DISCOVERY_DISPATCH_META,
+): Promise<string> {
+  const queue = getDiscoveryQueue();
+  const job = await addUniqueDiscoveryJob(
+    queue,
+    'dispatch-scan',
+    discoveryQueueJobDataSchema.parse(withQueueMeta({
+      type: 'dispatch-scan',
+      jobId,
+      profileId,
+      orgId,
+      siteId,
+      agentId
+    }, meta)),
+    `discovery-dispatch-${jobId}`,
+    {
+      ...PRIVILEGED_JOB_OPTIONS,
+      removeOnComplete: { count: 50 },
+      removeOnFail: { count: 100 }
+    }
+  );
+  return job.id!;
+}
+
+/**
+ * Enqueue processing of discovery results
+ */
+export async function enqueueDiscoveryResults(
+  jobId: string,
+  orgId: string,
+  siteId: string,
+  hosts: DiscoveredHostResult[],
+  hostsScanned: number,
+  hostsDiscovered: number,
+  profileId?: string,
+  adjacency?: DeviceAdjacency[],
+  meta: QueueActorMeta = DISCOVERY_RESULT_META,
+): Promise<string> {
+  const queue = getDiscoveryQueue();
+  const job = await addUniqueDiscoveryJob(
+    queue,
+    'process-results',
+    discoveryQueueJobDataSchema.parse(withQueueMeta({
+      type: 'process-results',
+      jobId,
+      profileId,
+      orgId,
+      siteId,
+      hosts,
+      hostsScanned,
+      hostsDiscovered,
+      adjacency
+    }, meta)),
+    `discovery-result-${jobId}`,
+    {
+      ...PRIVILEGED_JOB_OPTIONS,
+      removeOnComplete: { count: 50 },
+      removeOnFail: { count: 100 }
+    }
+  );
+  return job.id!;
+}
+
+async function addUniqueDiscoveryJob(
+  queue: Queue,
+  name: string,
+  data: DispatchScanJobData | ProcessResultsJobData | ScheduleProfilesJobData,
+  jobId: string,
+  opts: Omit<JobsOptions, 'jobId'> = {},
+) {
+  const existing = await queue.getJob(jobId);
+  if (existing) {
+    const state = await existing.getState();
+    if (isReusableState(state)) {
+      return existing;
+    }
+    await existing.remove().catch((error) => {
+      console.error(`[DiscoveryWorker] Failed to remove stale job ${jobId}:`, error);
+    });
+  }
+
+  return queue.add(name, data, {
+    jobId,
+    ...opts,
+  });
+}
+
+async function scheduleRecurringProfilePlanner(): Promise<void> {
+  const queue = getDiscoveryQueue();
+
+  const newJob = await queue.add(
+    'schedule-profiles',
+    discoveryQueueJobDataSchema.parse(
+      withQueueMeta({ type: 'schedule-profiles' as const }, DISCOVERY_REPEATABLE_META)
+    ),
+    {
+      repeat: {
+        every: 60 * 1000
+      },
+      attempts: 1,
+      removeOnComplete: { count: 10 },
+      removeOnFail: { count: 20 }
+    }
+  );
+
+  const repeatable = await queue.getRepeatableJobs();
+  for (const job of repeatable) {
+    if (job.name === 'schedule-profiles' && job.key !== newJob.repeatJobKey) {
+      await queue.removeRepeatableByKey(job.key);
+    }
+  }
+
+  console.log('[DiscoveryWorker] Scheduled repeatable profile scheduler (every 60s)');
+}
+
+// Worker instance (kept for cleanup)
+let discoveryWorkerInstance: Worker<DiscoveryJobData> | null = null;
+
+/**
+ * Initialize discovery worker
+ * Call this during app startup
+ */
+export async function initializeDiscoveryWorker(): Promise<void> {
+  try {
+    discoveryWorkerInstance = createDiscoveryWorker();
+    attachWorkerObservability(discoveryWorkerInstance, 'discoveryWorker');
+
+    discoveryWorkerInstance.on('error', (error) => {
+      console.error('[DiscoveryWorker] Worker error:', error);
+    });
+
+    discoveryWorkerInstance.on('failed', (job, error) => {
+      console.error(`[DiscoveryWorker] Job ${job?.id} failed:`, error);
+
+      // Update the discoveryJobs row so the UI doesn't show "running" forever
+      const jobType = job?.data?.type;
+      if (jobType === 'process-results' || jobType === 'dispatch-scan') {
+        const jobId = (job!.data as { jobId: string }).jobId;
+        runWithSystemDbAccess(async () => {
+          await db
+            .update(discoveryJobs)
+            .set({
+              status: 'failed',
+              completedAt: new Date(),
+              errors: { message: error?.message ?? 'Unknown worker error' },
+              updatedAt: new Date()
+            })
+            .where(eq(discoveryJobs.id, jobId));
+        }).catch((dbErr) => {
+          console.error(`[DiscoveryWorker] Failed to mark job ${jobId} as failed in DB:`, dbErr);
+        });
+      }
+    });
+
+    discoveryWorkerInstance.on('completed', (job, result) => {
+      if (job.data.type === 'process-results' && result && typeof result === 'object' && 'newAssets' in result) {
+        const r = result as { newAssets: number; updatedAssets: number };
+        if (r.newAssets > 0 || r.updatedAssets > 0) {
+          console.log(`[DiscoveryWorker] Results processed: ${r.newAssets} new, ${r.updatedAssets} updated`);
+        }
+      }
+    });
+
+    await scheduleRecurringProfilePlanner();
+
+    console.log('[DiscoveryWorker] Discovery worker initialized');
+  } catch (error) {
+    console.error('[DiscoveryWorker] Failed to initialize:', error);
+    throw error;
+  }
+}
+
+/**
+ * Shutdown discovery worker gracefully
+ */
+export async function shutdownDiscoveryWorker(): Promise<void> {
+  if (discoveryWorkerInstance) {
+    await discoveryWorkerInstance.close();
+    discoveryWorkerInstance = null;
+  }
+
+  if (discoveryQueue) {
+    await discoveryQueue.close();
+    discoveryQueue = null;
+  }
+
+  console.log('[DiscoveryWorker] Discovery worker shut down');
+}

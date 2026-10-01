@@ -1,0 +1,135 @@
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { ShieldOff, LogOut, Rocket } from 'lucide-react';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+interface StatusInfo {
+  status: string;
+  message: string | null;
+  actionUrl: string | null;
+  actionLabel: string | null;
+  meetingUrl: string | null;
+  meetingLabel: string | null;
+}
+
+function isSafeUrl(url: string): boolean {
+  try {
+    const p = new URL(url, window.location.origin).protocol;
+    return p === 'http:' || p === 'https:';
+  } catch { return false; }
+}
+
+export default function AccountInactiveScreen() {
+  const { t } = useTranslation('auth');
+  const [info, setInfo] = useState<StatusInfo | null>(null);
+  const [loading, setLoading] = useState(true);
+  const logout = useAuthStore((s) => s.logout);
+
+  useEffect(() => {
+    const defaultMessages: Record<string, string> = {
+      pending: t('accountInactive.defaultMessages.pending', {
+        defaultValue: 'Your account is being set up. Please check back shortly.',
+      }),
+      suspended: t('accountInactive.defaultMessages.suspended', {
+        defaultValue: 'Your account has been suspended. Please contact your administrator.',
+      }),
+      churned: t('accountInactive.defaultMessages.churned', {
+        defaultValue: 'Your account is no longer active. Please contact support.',
+      }),
+    };
+
+    fetchWithAuth('/partner/me')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data || data.status === 'active') {
+          window.location.href = '/';
+          return;
+        }
+        setInfo({
+          status: data.status,
+          message: data.statusMessage ?? defaultMessages[data.status] ?? t('accountInactive.defaultMessages.generic', { defaultValue: 'Your account is not active.' }),
+          actionUrl: data.statusActionUrl,
+          actionLabel: data.statusActionLabel,
+          meetingUrl: data.statusMeetingUrl,
+          meetingLabel: data.statusMeetingLabel,
+        });
+      })
+      .catch(() => {
+        setInfo({
+          status: 'unknown',
+          message: t('accountInactive.defaultMessages.loadFailed', { defaultValue: 'Unable to load account status. Please try again later.' }),
+          actionUrl: null,
+          actionLabel: null,
+          meetingUrl: null,
+          meetingLabel: null,
+        });
+      })
+      .finally(() => setLoading(false));
+  }, [t]);
+
+  const handleLogout = () => {
+    logout();
+    window.location.href = '/login';
+  };
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background">
+        <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+      <div className="w-full max-w-md space-y-6 text-center">
+        <div className={`mx-auto flex h-16 w-16 items-center justify-center rounded-full ${info?.status === 'pending' ? 'bg-primary/10' : 'bg-muted'}`}>
+          {info?.status === 'pending'
+            ? <Rocket className="h-8 w-8 text-primary" />
+            : <ShieldOff className="h-8 w-8 text-muted-foreground" />}
+        </div>
+
+        <div className="space-y-2">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {info?.status === 'pending'
+              ? t('accountInactive.pendingTitle', { defaultValue: 'Almost There!' })
+              : t('accountInactive.title', { defaultValue: 'Account Inactive' })}
+          </h1>
+          <p className="text-muted-foreground">{info?.message}</p>
+        </div>
+
+        <div className="flex flex-col gap-3">
+          {info?.actionUrl && isSafeUrl(info.actionUrl) && (
+            <a
+              href={info.actionUrl}
+              className="inline-flex items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-xs hover:bg-primary/90"
+            >
+              {info.actionLabel ?? t('accountInactive.takeAction', { defaultValue: 'Take Action' })}
+            </a>
+          )}
+          {info?.status === 'pending' && info.meetingUrl && isSafeUrl(info.meetingUrl) && (
+            <a
+              href={info.meetingUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center justify-center rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted"
+            >
+              {info.meetingLabel ?? t('accountInactive.bookMeeting', { defaultValue: 'Book a call with us' })}
+            </a>
+          )}
+          <button
+            onClick={handleLogout}
+            className="inline-flex items-center justify-center gap-2 rounded-md border px-4 py-2 text-sm font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <LogOut className="h-4 w-4" />
+            {t('common.signOut', { defaultValue: 'Sign Out' })}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

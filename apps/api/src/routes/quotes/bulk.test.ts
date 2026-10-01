@@ -1,0 +1,101 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+vi.mock('../../services/quoteService', () => ({ deleteDraftQuote: vi.fn() }));
+vi.mock('../../services/quoteLifecycle', () => ({ sendQuote: vi.fn() }));
+vi.mock('../../services/quoteTypes', () => ({
+  QuoteServiceError: class QuoteServiceError extends Error {
+    constructor(msg: string, public status = 400, public code?: string) { super(msg); }
+  },
+}));
+const gate = vi.hoisted(() => ({ permGate: async (_c: any, next: any) => next() }));
+vi.mock('../../middleware/auth', () => ({
+  authMiddleware: async (c: any, next: any) => {
+    c.set('auth', { user: { id: 'u1' }, partnerId: 'p1', orgId: null, scope: 'partner', accessibleOrgIds: null });
+    await next();
+  },
+  requireScope: () => async (c: any, next: any) => gate.permGate(c, next),
+  requirePermission: () => async (c: any, next: any) => gate.permGate(c, next),
+  dbAccessContextFromAuth: () => ({ scope: 'partner', orgId: null, accessibleOrgIds: null }),
+}));
+// runBulkIsolated wraps each item in withDbAccessContext + runOutsideDbContext;
+// stub both as passthroughs so the loop logic runs without a real DB connection.
+// Spread the REAL module: mounting quoteRoutes now pulls in the accept-on-behalf
+// route's graph, which reads other `db` exports at import time. Only the two
+// context helpers the bulk loop actually runs are stubbed to passthroughs — the
+// rest are never called here, and importActual opens no connection.
+vi.mock('../../db', async (importActual) => {
+  const actual = await importActual<typeof import('../../db')>();
+  return {
+    ...actual,
+    withDbAccessContext: (_ctx: any, fn: any) => fn(),
+    runOutsideDbContext: (fn: any) => fn(),
+  };
+});
+
+import { quoteRoutes } from './index';
+import { deleteDraftQuote } from '../../services/quoteService';
+import { sendQuote } from '../../services/quoteLifecycle';
+import { QuoteServiceError } from '../../services/quoteTypes';
+
+const A = '11111111-1111-1111-1111-111111111111';
+const B = '22222222-2222-2222-2222-222222222222';
+
+function post(path: string, body: unknown) {
+  return quoteRoutes.request(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+describe('quote bulk routes', () => {
+  beforeEach(() => { vi.clearAllMocks(); gate.permGate = async (_c: any, next: any) => next(); });
+
+  it('bulk-delete deletes each id and reports counts', async () => {
+    (deleteDraftQuote as any).mockResolvedValue(undefined);
+    const res = await post('/bulk-delete', { ids: [A, B] });
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toMatchObject({ total: 2, succeeded: 2, skipped: 0, failed: 0 });
+    expect(deleteDraftQuote).toHaveBeenCalledTimes(2);
+  });
+
+  it('bulk-delete tallies non-draft skips without failing the request', async () => {
+    (deleteDraftQuote as any)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new QuoteServiceError('Quote is not a draft', 409, 'NOT_A_DRAFT'));
+    const res = await post('/bulk-delete', { ids: [A, B] });
+    expect(res.status).toBe(200);
+    const data = (await res.json()).data;
+    expect(data).toMatchObject({ succeeded: 1, skipped: 1 });
+    expect(data.skippedReasons).toEqual({ NOT_A_DRAFT: 1 });
+  });
+
+  it('bulk-send sends each draft, then delivers its email after that item committed', async () => {
+    // #3905 — the per-item deferred is invoked by runBulkIsolated's
+    // afterItemCommit hook, i.e. after the item's own transaction commits.
+    const deliverEmail = vi.fn(async () => ({ quote: { id: A }, emailed: true }));
+    (sendQuote as any).mockResolvedValue({ quote: { id: A, orgId: 'org1' }, acceptUrl: 'http://x/q/t', deliverEmail });
+    const res = await post('/bulk-send', { ids: [A] });
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toMatchObject({ succeeded: 1 });
+    expect(sendQuote).toHaveBeenCalledWith(A, expect.anything());
+    expect(deliverEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts a bulk-send item as succeeded even when its deferred email fails', async () => {
+    // Delivery is best-effort and never rejects, so a mail failure must not
+    // turn a COMMITTED send into a reported bulk failure.
+    (sendQuote as any).mockResolvedValue({
+      quote: { id: A, orgId: 'org1' }, acceptUrl: 'http://x/q/t',
+      deliverEmail: vi.fn(async () => ({ quote: { id: A }, emailed: false, emailReason: 'send_failed' })),
+    });
+    const res = await post('/bulk-send', { ids: [A] });
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toMatchObject({ succeeded: 1, failed: 0, skipped: 0 });
+  });
+
+  it('rejects an empty id list with 400', async () => {
+    const res = await post('/bulk-delete', { ids: [] });
+    expect(res.status).toBe(400);
+  });
+});

@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import SoftwarePage from '../../components/software/SoftwarePage';
+---
+
+<DashboardLayout titleKey="titles.softwareInventory">
+  <SoftwarePage client:load defaultTab="inventory" />
+</DashboardLayout>

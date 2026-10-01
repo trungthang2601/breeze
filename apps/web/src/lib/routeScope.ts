@@ -1,0 +1,218 @@
+//
+// Single source of truth for how every page relates to the org context
+// switcher. Each route claims exactly one RouteScopeKind; the shell renders
+// scope indicators, prompts, and gating from that claim instead of every page
+// inventing its own behavior. To classify a new page, add its pattern here —
+// the routeScope contract test fails on any page missing from this registry.
+//
+// Kinds and what the shell does with them:
+//   org-or-all       Fleet-state page. Honors the selected org; aggregates
+//                    fleet-wide in All-organizations view (org column appears).
+//   org-required     Meaningless without one org (network discovery, org
+//                    settings). In fleet view the shell shows a standard
+//                    "choose an organization" affordance.
+//   org-record       Pins its org from the URL, not from the switcher. Unlike
+//                    org-required it is never blocked by fleet view — the page
+//                    already knows which org it is about and passes an explicit
+//                    orgIdOverride on every request. The shell shows no scope
+//                    line (the record's own header states the org, and flags a
+//                    switcher pointing elsewhere), and a context switch
+//                    navigates away rather than reloading someone else's
+//                    customer under the same URL.
+//   catalog          Partner-wide library (scripts, alert templates). The org
+//                    selection never narrows it: fetchWithAuth injects NO
+//                    orgId here, and the scope line states the page is shared.
+//   partner-settings MSP-level configuration; the org selection is not the
+//                    page's subject (it may still be a create-target inside
+//                    forms).
+//   device           Scoped to a single device/session (remote surfaces).
+//   self             The signed-in user's own surface (profile, account).
+//   auth             Unauthenticated / auth flows.
+//   platform         Hosting-platform admin surfaces.
+//
+// Scope test for future pages: "what's the state of my fleet?" → org-or-all;
+// "what's in my catalog / what tools have I configured?" → catalog or
+// partner-settings; "this only makes sense inside one customer" → org-required.
+
+export type RouteScopeKind =
+  | 'org-or-all'
+  | 'org-required'
+  | 'org-record'
+  | 'catalog'
+  | 'partner-settings'
+  | 'device'
+  | 'self'
+  | 'auth'
+  | 'platform';
+
+// First match wins — put narrow exceptions before their broader prefix.
+// Exported for the routeScope contract test (reachability / shadowing check).
+// Not for runtime consumers — classification goes through getRouteScope.
+export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
+  // --- exceptions that must precede broader prefixes ---
+  // Execution history is device/org state living under the global /scripts prefix.
+  { pattern: /^\/scripts\/[^/]+\/executions(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/settings\/alert-templates(\/.*)?$/, kind: 'catalog' }, // partner-wide alert-template catalog (#1425)
+  // The organizations LIST is the org picker itself (works fleet-wide); the
+  // per-org detail pages need one org. The singular /settings/organization is a
+  // 301 stub to the LIST, so it takes the LIST's kind (it never renders its own
+  // shell — the classification only has to be self-consistent).
+  // The organization RECORD pins its org from the URL (spec D2). It neither
+  // requires nor follows the OrgSwitcher; the page owns its own scoping.
+  { pattern: /^\/organizations\/[^/]+(\/.*)?$/, kind: 'org-record' },
+  // The organizations BOARD (account-readiness directory, W02): the org picker
+  // itself, so it works fleet-wide like the settings list it replaced.
+  { pattern: /^\/organizations\/?$/, kind: 'partner-settings' },
+  { pattern: /^\/settings\/organizations\/[^/]+(\/.*)?$/, kind: 'org-required' },
+  { pattern: /^\/settings\/organizations$/, kind: 'partner-settings' },
+  { pattern: /^\/settings\/organization$/, kind: 'partner-settings' },
+  { pattern: /^\/settings\/profile$/, kind: 'self' },
+  { pattern: /^\/approvals$/, kind: 'self' },
+  { pattern: /^\/account\/inactive$/, kind: 'auth' },
+  { pattern: /^\/account(\/.*)?$/, kind: 'self' },
+
+  // --- catalog (the only kind that suppresses orgId injection) ---
+  { pattern: /^\/scripts(\/.*)?$/, kind: 'catalog' }, // script library / new / detail+edit
+  { pattern: /^\/alert-templates(\/.*)?$/, kind: 'catalog' },
+
+  // --- org-required ---
+  { pattern: /^\/discovery(\/.*)?$/, kind: 'org-required' },
+  { pattern: /^\/monitoring(\/.*)?$/, kind: 'org-required' },
+  // Their APIs 400 without an org (backup dashboard, C2C connections/jobs,
+  // DR plans) — the pages render OrgRequiredState in fleet view.
+  { pattern: /^\/backup(\/.*)?$/, kind: 'org-required' },
+  { pattern: /^\/c2c(\/.*)?$/, kind: 'org-required' },
+  { pattern: /^\/dr(\/.*)?$/, kind: 'org-required' },
+  // Runtime extension pages: ExtensionPageContextV1.organizationId is a
+  // required non-empty field, and ExtensionPageHost wraps its content in
+  // OrgRequiredGate — same shape as backup/c2c/dr above.
+  { pattern: /^\/extensions(\/.*)?$/, kind: 'org-required' },
+
+  // --- fleet-state (org-or-all) ---
+  // NOTE: /patches is intentionally org-or-all, NOT catalog. It honours the org
+  // switcher so single-org actions (approve/decline/defer, compliance export,
+  // create-ring) can attach an explicit orgId when a specific org is selected,
+  // while the patch list + compliance READ views still work in All-orgs mode
+  // (partner scope). Marking it catalog made the orgId provider return null,
+  // stripping the auto-injected ?orgId= and 400ing every partner action with
+  // >1 accessible org.
+  { pattern: /^\/$/, kind: 'org-or-all' },
+  // Execution-trace runs list/detail (wave 6.1, #3828): GET /ai/agents/runs
+  // filters via `auth.orgCondition`, same fleet-vs-single-org semantics as
+  // /devices below. The agent CONFIG surface (/settings/ai-agents) stays
+  // partner-settings — this is fleet execution state, not catalog config.
+  { pattern: /^\/ai-agents\/runs(\/.*)?$/, kind: 'org-or-all' },
+  // P2-6 (#4193): fleet value accounting — honours the org switcher (single
+  // org) and aggregates across accessible orgs in All-organizations view.
+  { pattern: /^\/ai-agents\/impact$/, kind: 'org-or-all' },
+  // Fleet Designer W03 (#5653): a Fleet Design belongs to exactly one org —
+  // there is no fleet-wide aggregation of "what to watch on this device".
+  // The page carries its own org picker (independent of the global switcher,
+  // since starting a design run always needs one concrete orgId even in
+  // All-organizations view) — org-required is the closest existing kind to
+  // "meaningless without one org", same posture as discovery/monitoring.
+  { pattern: /^\/ai-agents\/fleet-design$/, kind: 'org-required' },
+  // Operator task detail (#5205 W07): a task belongs to one org, resolved by
+  // the API from the task id, so the page works under any org context.
+  { pattern: /^\/operator\/tasks\/[^/]+$/, kind: 'org-or-all' },
+  // AI script proposal detail (#5618 W06): same shape — GET /ai/script-
+  // proposals/:id resolves the org from the proposal id, not a query param.
+  { pattern: /^\/ai-script-proposals\/[^/]+$/, kind: 'org-or-all' },
+  { pattern: /^\/devices(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/alerts(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/patches(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/automations(\/.*)?$/, kind: 'org-or-all' },
+  // #5288 — Jobs is the new nav home for automations (same page component,
+  // same org-scope semantics); /automations/* now just redirects here.
+  { pattern: /^\/jobs(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/vulnerabilities$/, kind: 'org-or-all' },
+  { pattern: /^\/security(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/sensitive-data(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/peripherals(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/pam$/, kind: 'org-or-all' },
+  { pattern: /^\/ai-risk$/, kind: 'org-or-all' },
+  { pattern: /^\/ai-for-office$/, kind: 'org-or-all' },
+  { pattern: /^\/incidents(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/fleet(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/cis-hardening(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/analytics(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/audit(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/audit-baselines(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/logs(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/tickets(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/billing(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/contracts(\/.*)?$/, kind: 'org-or-all' },
+  // W03 IA split: the agreements area is the same fleet-state surface the
+  // Templates/Documents tabs were under /contracts, so it keeps that page's
+  // scope verbatim — moving the routes must not also change org-context
+  // behavior. (An argument exists for 'catalog' on the template library; it
+  // would stop orgId injection and widen the list, so it is a separate call.)
+  { pattern: /^\/agreements(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/reports(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/configuration-policies(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/policies(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/software(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/software-inventory(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/software-policies(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/snmp(\/.*)?$/, kind: 'org-or-all' },
+  { pattern: /^\/dns-security$/, kind: 'org-or-all' },
+  { pattern: /^\/onedrive$/, kind: 'org-or-all' },
+  { pattern: /^\/workspace$/, kind: 'org-or-all' },
+
+  // --- partner-settings ---
+  { pattern: /^\/settings(\/.*)?$/, kind: 'partner-settings' },
+  { pattern: /^\/integrations(\/.*)?$/, kind: 'partner-settings' },
+  { pattern: /^\/partner(\/.*)?$/, kind: 'partner-settings' },
+
+  // --- device / self / auth / platform ---
+  { pattern: /^\/remote(\/.*)?$/, kind: 'device' },
+  { pattern: /^\/profile$/, kind: 'self' },
+  { pattern: /^\/timesheet$/, kind: 'self' },
+  { pattern: /^\/admin(\/.*)?$/, kind: 'platform' },
+  { pattern: /^\/(login|register|register-partner|forgot-password|reset-password|accept-invite|setup|auth|404|500)(\/.*)?$/, kind: 'auth' },
+  { pattern: /^\/oauth(\/.*)?$/, kind: 'auth' },
+  // Public Quick Support landing page. The one-time code in the URL is the only
+  // credential — an end user reaching it has no Breeze account at all.
+  { pattern: /^\/quick$/, kind: 'auth' },
+];
+
+function normalize(pathname: string): string {
+  return pathname.replace(/\/+$/, '') || '/';
+}
+
+/**
+ * Classify a pathname against the registry. Returns null for unregistered
+ * routes — the contract test keeps that set empty for real pages, so a null
+ * at runtime means "a route we don't know", which callers should treat as
+ * org-or-all-like (inject the org, show nothing special).
+ */
+export function getRouteScope(pathname: string): RouteScopeKind | null {
+  const normalized = normalize(pathname);
+  for (const { pattern, kind } of ROUTE_SCOPES) {
+    if (pattern.test(normalized)) return kind;
+  }
+  return null;
+}
+
+/**
+ * Single-DOCUMENT workspace pages (quote/invoice detail). They keep their
+ * org-or-all classification (orgId injection etc.), but ContextScopeLine skips
+ * the fleet line here: the page's subject is one document whose customer is
+ * named right in its header, so "Showing all organizations" adds nothing — and
+ * as the only scroll-away content above the workspace's pinned header chrome,
+ * it was what made that header travel before locking.
+ */
+export function isSingleDocumentRoute(pathname: string): boolean {
+  return /^\/billing\/(quotes|invoices)\/[^/]+$/.test(normalize(pathname));
+}
+
+/**
+ * Back-compat predicate used by the org-id injection chokepoint
+ * (stores/orgStore.ts registerOrgIdProvider): catalog routes ignore the org
+ * selector entirely, so no orgId is injected. Injection semantics are
+ * deliberately unchanged from the pre-registry routeScope: ONLY catalog routes
+ * skip injection.
+ */
+export function isGlobalScopeRoute(pathname: string): boolean {
+  return getRouteScope(pathname) === 'catalog';
+}

@@ -1,0 +1,369 @@
+/**
+ * Authentication Integration Tests
+ *
+ * These tests run against real PostgreSQL and Redis instances in Docker.
+ * They test the full authentication flow including:
+ * - User registration
+ * - Login with password verification
+ * - JWT token generation and validation
+ * - Session management
+ *
+ * Prerequisites:
+ *   docker compose -f docker-compose.test.yml up -d
+ *
+ * Run:
+ *   pnpm test:integration
+ */
+import { describe, it, expect, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+import { authRoutes } from '../../routes/auth';
+import { authMiddleware } from '../../middleware/auth';
+import {
+  createUser,
+  createPartner,
+  setupTestEnvironment,
+  createIntegrationTestClient
+} from './db-utils';
+import { getTestDb } from './setup';
+import { users } from '../../db/schema';
+import { eq } from 'drizzle-orm';
+
+// Import setup to initialize database connection
+import './setup';
+
+describe('Auth Integration Tests', () => {
+  let app: Hono;
+  let testPartnerId: string;
+
+  beforeEach(async () => {
+    app = new Hono();
+    app.route('/auth', authRoutes);
+    // users.partner_id is NOT NULL; every createUser call below needs a
+    // partner to point at. Recreated per test because cleanupDatabase()
+    // truncates partners in beforeEach.
+    const partner = await createPartner();
+    testPartnerId = partner.id;
+  });
+
+  describe('POST /auth/register', () => {
+    it('should register a new user and return tokens', async () => {
+      const res = await app.request('/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'newuser@example.com',
+          password: 'SecurePass123!',
+          name: 'New User'
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.tokens).toBeDefined();
+      expect(body.tokens.accessToken).toBeDefined();
+      expect(body.tokens.refreshToken).toBeUndefined();
+      expect(body.user).toBeDefined();
+      expect(body.user.email).toBe('newuser@example.com');
+
+      // Verify user was created in database
+      const db = getTestDb();
+      const [dbUser] = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, 'newuser@example.com'))
+        .limit(1);
+
+      expect(dbUser).toBeDefined();
+      if (!dbUser) {
+        throw new Error('Expected created user to exist');
+      }
+      expect(dbUser.name).toBe('New User');
+      expect(dbUser.status).toBe('active');
+    });
+
+    it('should return generic success for duplicate email (prevents enumeration)', async () => {
+      // Create existing user
+      await createUser({ partnerId: testPartnerId, email: 'existing@example.com' });
+
+      const res = await app.request('/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'existing@example.com',
+          password: 'SecurePass123!',
+          name: 'Duplicate User'
+        })
+      });
+
+      // Security: API returns 200 with generic message to prevent email enumeration
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      // Should NOT return tokens for duplicate registration
+      expect(body.tokens).toBeUndefined();
+    });
+
+    it('should reject weak passwords', async () => {
+      const res = await app.request('/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'weakpass@example.com',
+          password: 'weak',
+          name: 'Weak Pass User'
+        })
+      });
+
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('POST /auth/login', () => {
+    it('should login with valid credentials', async () => {
+      // Create user with known password
+      await createUser({
+        partnerId: testPartnerId,
+        email: 'login@example.com',
+        password: 'MyPassword123!',
+        withMembership: true // security review #2: login requires a membership
+      });
+
+      const res = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'login@example.com',
+          password: 'MyPassword123!'
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.tokens).toBeDefined();
+      expect(body.user).toBeDefined();
+      expect(body.mfaRequired).toBe(false);
+    });
+
+    it('should reject invalid password', async () => {
+      await createUser({
+        partnerId: testPartnerId,
+        email: 'wrongpass@example.com',
+        password: 'CorrectPass123!'
+      });
+
+      const res = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'wrongpass@example.com',
+          password: 'WrongPassword123!'
+        })
+      });
+
+      expect(res.status).toBe(401);
+    });
+
+    it('should reject disabled user login', async () => {
+      await createUser({
+        partnerId: testPartnerId,
+        email: 'disabled@example.com',
+        password: 'MyPassword123!',
+        status: 'disabled'
+      });
+
+      const res = await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'disabled@example.com',
+          password: 'MyPassword123!'
+        })
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it('should update lastLoginAt on successful login', async () => {
+      const user = await createUser({
+        partnerId: testPartnerId,
+        email: 'lastlogin@example.com',
+        password: 'MyPassword123!',
+        withMembership: true // security review #2: login requires a membership
+      });
+
+      expect(user.lastLoginAt).toBeNull();
+
+      await app.request('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'lastlogin@example.com',
+          password: 'MyPassword123!'
+        })
+      });
+
+      // Check that lastLoginAt was updated
+      const db = getTestDb();
+      const [updatedUser] = await db
+        .select()
+        .from(users)
+        .where(eq(users.id, user.id))
+        .limit(1);
+
+      expect(updatedUser).toBeDefined();
+      if (!updatedUser) {
+        throw new Error('Expected user row to exist');
+      }
+      expect(updatedUser.lastLoginAt).not.toBeNull();
+    });
+  });
+
+  describe('GET /auth/me', () => {
+    it('should return current user with valid token', async () => {
+      const env = await setupTestEnvironment();
+
+      app.use('/auth/*', authMiddleware);
+
+      const res = await app.request('/auth/me', {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${env.token}` }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.user).toBeDefined();
+      expect(body.user.id).toBe(env.user.id);
+      expect(body.user.email).toBe(env.user.email);
+    });
+
+    it('should reject request without token', async () => {
+      app.use('/auth/*', authMiddleware);
+
+      const res = await app.request('/auth/me', {
+        method: 'GET'
+      });
+
+      expect(res.status).toBe(401);
+    });
+  });
+
+  describe('POST /auth/refresh', () => {
+    it('should refresh tokens with valid refresh token', async () => {
+      // First register to get tokens
+      const registerRes = await app.request('/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'refresh@example.com',
+          password: 'SecurePass123!',
+          name: 'Refresh User'
+        })
+      });
+
+      const cookieHeader = registerRes.headers.get('set-cookie') ?? '';
+      const refreshCookie = cookieHeader
+        .split(',')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith('breeze_refresh_token='));
+      expect(refreshCookie).toBeDefined();
+      const refreshCookieValue = refreshCookie?.split(';')[0];
+      expect(refreshCookieValue).toBeDefined();
+      if (!refreshCookieValue) {
+        throw new Error('Expected refresh cookie value');
+      }
+      const csrfCookie = cookieHeader
+        .split(',')
+        .map((part) => part.trim())
+        .find((part) => part.startsWith('breeze_csrf_token='));
+      const csrfCookieValue = csrfCookie?.split(';')[0];
+      expect(csrfCookieValue).toBeDefined();
+      if (!csrfCookieValue) {
+        throw new Error('Expected CSRF cookie value');
+      }
+      const csrfHeaderValue = decodeURIComponent(csrfCookieValue.split('=')[1] ?? '');
+      expect(csrfHeaderValue.length).toBeGreaterThan(0);
+
+      // Now refresh
+      const refreshRes = await app.request('/auth/refresh', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-breeze-csrf': csrfHeaderValue,
+          Cookie: `${refreshCookieValue}; ${csrfCookieValue}`
+        },
+        body: JSON.stringify({})
+      });
+
+      expect(refreshRes.status).toBe(200);
+      const body = await refreshRes.json();
+      expect(body.tokens).toBeDefined();
+      expect(body.tokens.accessToken).toBeDefined();
+      expect(body.tokens.refreshToken).toBeUndefined();
+      // Note: tokens may be identical if generated within same second due to JWT iat
+    });
+
+    it('should reject invalid refresh token', async () => {
+      const res = await app.request('/auth/refresh', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-breeze-csrf': 'test-csrf-token',
+          Cookie: 'breeze_refresh_token=invalid-refresh-token; breeze_csrf_token=test-csrf-token'
+        },
+        body: JSON.stringify({})
+      });
+
+      expect(res.status).toBe(401);
+    });
+  });
+});
+
+describe('Multi-Tenant Integration Tests', () => {
+  it('should isolate data between organizations', async () => {
+    const app = new Hono();
+    app.use(authMiddleware);
+    app.get('/test/org', (c) => {
+      const auth = c.get('auth');
+      return c.json({ orgId: auth.orgId });
+    });
+
+    // Create two separate test environments (different orgs)
+    const client1 = await createIntegrationTestClient(app);
+    const client2 = await createIntegrationTestClient(app);
+
+    // Verify they have different org IDs
+    expect(client1.env.organization.id).not.toBe(client2.env.organization.id);
+
+    // Each client should see their own org
+    const res1 = await client1.get('/test/org');
+    const res2 = await client2.get('/test/org');
+
+    const body1 = await res1.json();
+    const body2 = await res2.json();
+
+    expect(body1.orgId).toBe(client1.env.organization.id);
+    expect(body2.orgId).toBe(client2.env.organization.id);
+  });
+
+  it('should support partner-scoped access', async () => {
+    const app = new Hono();
+    app.use(authMiddleware);
+    app.get('/test/scope', (c) => {
+      const auth = c.get('auth');
+      return c.json({
+        scope: auth.scope,
+        partnerId: auth.partnerId,
+        orgId: auth.orgId
+      });
+    });
+
+    const client = await createIntegrationTestClient(app, { scope: 'partner' });
+    const res = await client.get('/test/scope');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.scope).toBe('partner');
+    expect(body.partnerId).toBe(client.env.partner.id);
+    expect(body.orgId).toBeNull();
+  });
+});

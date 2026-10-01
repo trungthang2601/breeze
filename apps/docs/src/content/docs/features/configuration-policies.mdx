@@ -1,0 +1,417 @@
+---
+title: Configuration Policies
+description: Bundle patch, alert, maintenance, compliance, and backup settings into hierarchical policies with scoped assignments and automatic drift remediation.
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Configuration Policies let you bundle device settings — patches, alerts, maintenance windows, compliance rules, and more — into reusable templates and apply them to any scope of your fleet. Policies evaluate automatically on a schedule and can auto-remediate drift without manual intervention.
+
+Policies are **hierarchical**: settings cascade from the broadest scope down to the most specific, and more specific assignments always win.
+
+```
+Breeze Defaults  (lowest priority — read-only, always present)
+  └── Partner
+        └── Organization
+              └── Site
+                    └── Device Group
+                          └── Device  (highest priority — always wins)
+```
+
+### Policy ownership: organization vs. partner-wide
+
+A policy is owned at one of two scopes:
+
+- **Organization** — the policy belongs to a single customer organization and can only be assigned within that org's hierarchy. This is the default.
+- **Partner-wide (all orgs)** — the policy belongs to your partner account and can apply across **every** organization you manage. Use this for fleet-wide standards you want enforced everywhere without recreating the policy per customer.
+
+You choose the ownership scope when creating the policy. Partner-wide policies can only be created and managed by partner-level users with full access to every organization under the partner (not users restricted to a subset of organizations); organization-scoped users see partner-wide policies in their effective configuration but cannot edit them.
+
+Backup settings cannot be configured on a partner-wide policy — see [Backup](#backup) below.
+
+## Baseline policies (inheritance)
+
+A policy can optionally have one **parent** — a baseline policy it inherits feature settings from. This lets an MSP define a standard baseline once (e.g. "Standard Workstation Baseline") and have every customer-specific policy build on it, instead of copy-pasting the same patch schedule, alert thresholds, and maintenance windows into every org.
+
+**Effective links of a policy** = the policy's own feature links, plus, for any feature type the policy has no link of its own for, the parent's link for that type. In other words: a child's own configuration always wins; anything the child hasn't touched falls through to the parent.
+
+You set the parent when **creating** a policy: choose **Link to Existing** on the New Policy screen and pick a baseline from the list. The parent cannot be changed after the policy is created.
+
+### Which policies can be a parent
+
+| A child that is... | ...can inherit from |
+|---|---|
+| Organization-owned | a policy in the **same organization**, or a **partner-wide** policy owned by the same partner |
+| Partner-wide | only another **partner-wide** policy owned by the same partner |
+
+Only **one level** of inheritance is supported — a baseline policy cannot itself have a parent. If a candidate baseline already has a parent, it won't appear as an eligible baseline for a new policy.
+
+### Overriding and reverting an inherited feature
+
+Open any feature tab on a child policy. If the feature comes from the parent, the tab shows a **Configured (inherited)** badge and the settings are shown read-only, seeded from the parent's configuration:
+
+- Click **Override** to save a copy of the inherited settings as the policy's own link — the tab becomes editable and future parent changes no longer affect this policy for that feature.
+- Click **Revert to Parent** on an overridden feature to delete the policy's own link and fall back to the parent's again.
+
+<Aside type="caution">
+  **The parent's `Active`/`Inactive`/`Archived` status does not gate inheritance.** Archiving a baseline policy does not silently strip security, patch, or backup configuration from every policy that inherits from it — only the *child's own* status controls whether its assignments are evaluated, exactly as for a policy with no parent. Before archiving a widely-inherited baseline, check its Overview tab for the "Inherited by N policies" list to see the blast radius.
+</Aside>
+
+### Deleting a baseline
+
+A policy that other policies inherit from cannot be deleted while those children still reference it — the delete is refused with a list of the policies that need to be moved off it first (deleted, or given a different or no parent) before the baseline itself can be removed. This prevents deleting a widely-used baseline from silently un-configuring every policy built on it.
+
+### MFA and inherited patch / maintenance settings
+
+If a baseline carries a Patch Management or Maintenance Windows feature — both of which require a session with satisfied multi-factor authentication to add or change directly — creating a **new** policy linked to that baseline requires the same MFA session, since the new policy immediately gains that gated configuration through inheritance.
+
+## Feature types
+
+A policy can bundle multiple feature types:
+
+| Feature | What it controls |
+|---|---|
+| **Patch Management** | Auto-approval, schedule, reboot policy |
+| **Alert Rules** | CPU/RAM/disk thresholds, offline detection, event log alerts -- conditions, severity, cooldown, notification templates |
+| **Maintenance Windows** | Recurrence, duration, alert/patch/automation suppression |
+| **Compliance Rules** | Desired-state rules, enforcement level, remediation script |
+| **Backup** | Schedule and retention |
+| **Security** | Security policy settings |
+| **Monitoring** | Agent-side service & process watches, check interval, auto-restart |
+| **Monitors** | Attaches [monitors](/features/monitors/) -- objects that bundle a condition, severity, delivery, and response actions -- to this policy's scope |
+| **Automation** | Event triggers, cron schedules, bulk actions |
+| **Privileged Access** | Windows UAC elevation prompt capture for [privileged access management](/features/pam/) |
+| **Vulnerability Scanning** | Turns on daily CVE correlation for the scope (off by default) -- see [vulnerability management](/features/vulnerability-management/) |
+| **Event Log Forwarding** | Destination and filters for shipping device event logs to an external store -- see [Event Log Forwarding](/features/event-log-forwarding/) |
+| **Software Policy** | Allowlist/blocklist/audit enforcement evaluated during software inventory scans -- see [Software Policies](/features/software-policies/) |
+| **Sensitive Data Discovery** | Scan schedule and rules for PII, credentials, and other sensitive data on endpoints -- see [Sensitive Data Discovery](/features/sensitive-data/) |
+| **Peripheral Control** | USB, Bluetooth, and Thunderbolt device allow/block rules -- see [Peripheral Control](/features/peripheral-control/) |
+| **Warranty** | Warning and critical expiry thresholds that raise alerts before a device's warranty lapses -- see [Warranty Tracking](/features/warranty-tracking/) |
+| **Breeze Helper** | Tray icon and menu options (portal link, device info, request support) for the [Breeze Helper](/agents/helper/) app |
+| **Remote Access** | MFA and consent requirements for Remote Desktop and Remote Terminal sessions -- see [Remote Access](/features/remote-access/) |
+| **OneDrive Helper** | Silent sign-in, Files On-Demand, Known Folder Move, and SharePoint library auto-mount -- see [OneDrive Helper](/features/onedrive-helper/) |
+| **Device Lifecycle** | Days to retain a removed device before it is permanently purged |
+
+Each feature can be configured in one of two modes:
+
+- **Linked** — points to an existing policy object by ID (e.g., an existing alert rule). Changes to the linked object propagate automatically. Not available for `monitoring` — use inline instead.
+- **Inline** — settings are stored directly in the policy. Useful for simple configurations that don't need to be shared. Required for `monitoring`, `backup`, and `security` feature types.
+
+## Alerts vs. Monitoring
+
+**Alert Rules** and **Monitoring** are two different feature types that often get confused because both can raise an alert:
+
+- **Alert Rules** are **server-evaluated**. They watch CPU/RAM/disk usage against a threshold, detect when a device goes offline, or fire on Windows Event Log / macOS unified log / Linux journal entries. Breeze collects device metrics automatically -- Alert Rules need no prerequisite Monitoring feature, or any other feature, to work.
+- **Monitoring** is **agent-side**. It watches specific Windows services or processes you name (e.g. `Spooler`, `sshd`, `node`), reports whether each one is running, and can automatically restart one that stops. It does not evaluate metric thresholds or event logs itself.
+
+A single policy can carry both a Monitoring feature and an Alert Rules feature at the same time -- for example, watching the `Spooler` service with auto-restart while also alerting on disk usage above 90%. See [Creating Alert Rules](/features/alerts/#creating-alert-rules) and [Service & Process Monitoring](/features/service-monitoring/) for how to configure each.
+
+Don't confuse either of these with the separate **Monitors** feature (a third, similarly-named thing): a [monitor](/features/monitors/) is a single authored object -- condition, severity, delivery, and response actions together -- that compiles into an Alert Rule and an Automation for you, rather than requiring you to wire the two together by hand.
+
+If the same kind of threshold is set on Alert Rules feature links at different levels of the policy hierarchy (e.g. a disk-space rule on both the organization and one of its sites), the **most specific (closest) level to the device wins** -- the same closest-wins rule that governs every other policy setting, described above.
+
+<Aside type="note">
+  Metric alert rules and event log alerts used to be configured as part of the Monitoring feature. During the 2026-07-30 alerts/monitoring consolidation, any such rules on existing policies were automatically moved to that policy's Alert Rules feature -- no rules were lost, but they're edited on the **Alert Rules** tab now rather than **Monitoring**.
+</Aside>
+
+## Enforcement modes
+
+Compliance rules support three enforcement levels:
+
+| Mode | Behaviour |
+|---|---|
+| `monitor` | Report non-compliance only. No action taken. |
+| `warn` | Log a warning and send notifications. |
+| `enforce` | Auto-remediate using the linked remediation script. Falls back to `warn` if no script is set. |
+
+## Creating a policy
+
+<Steps>
+
+1. Navigate to **Fleet Management → Config Policies**.
+
+2. Click **New Policy**, then choose **Configure New** to start from scratch, or **Link to Existing** to inherit from a baseline policy (see [Baseline policies](#baseline-policies-inheritance) above). Choosing **Link to Existing** adds a picker of eligible baselines — filtered to the ones your chosen ownership scope is allowed to inherit from.
+
+3. Enter a **Name** and optional **Description**.
+
+4. If you're a partner-level user with full access to every organization, an **Apply to** picker appears: choose **All organizations (partner-wide)** to apply the policy across every organization you manage, or **A specific organization** and pick the target org from the dropdown. Users scoped to a single organization (or with access to only some organizations) don't see this picker — their policy is always scoped to their own organization. Note that Backup settings can't be configured on a partner-wide policy.
+
+5. Set **Status** to **Active**. Inactive and archived policies are not evaluated by the scheduler.
+
+6. Click **Save** to open the policy detail editor.
+
+</Steps>
+
+## Adding features to a policy
+
+Open the policy detail editor and click the tab for the feature you want to configure.
+
+### Patch Management
+
+| Field | Description |
+|---|---|
+| **Auto-approve** | Automatically approve patches matching the configured criteria |
+| **Schedule** | Frequency (daily/weekly/monthly) and time of day for patch runs |
+| **Reboot policy** | How to handle required reboots after patching |
+| **Manage Windows Update exclusively through Breeze** | Windows-only. Off by default. When on, the agent suppresses the device's native Windows Update automatic-install channel (it sets the `NoAutoUpdate` registry value under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU`) so that device only receives updates through Breeze's schedule and approval rings — no surprise reboots or out-of-band patches. Turning it back off returns update control to native Windows Update. |
+
+Patch Management is available on partner-wide (all organizations) policies — an [update ring](/features/update-rings/) can be linked directly, and the policy patches devices across every organization you manage. Behind the scenes, deployments are still tracked per organization: creating a deployment job from a partner-wide policy produces one job per organization with matching devices, so each customer's patch history and compliance reporting stay separate even though the schedule and approval rules are defined once.
+
+### Alert Rules
+
+Add one or more alert conditions. Each condition requires:
+
+- **Metric** — what to measure (e.g., `cpu_percent`, `disk_percent`)
+- **Operator** — comparison (`gt`, `lt`, `eq`)
+- **Value** — the threshold
+- **Severity** — `critical`, `high`, `medium`, `low`, or `info`
+- **Cooldown minutes** — minimum time between repeated alerts for the same device
+- **Auto-resolve** — automatically resolve the alert when the condition clears
+
+Optionally link a title and message template to control notification formatting.
+
+Each rule can also carry its own delivery settings, independent of any organization-wide default:
+
+- **Notification channels** (`notificationChannelIds`) — specific channels to notify. If left unset, delivery falls back to notification routing rules, then the organization's default channels.
+- **Escalation policy** (`escalationPolicyId`) — an [escalation policy](/features/alerts/#escalation-policies) to attach, so an alert from this rule that goes unacknowledged notifies progressively broader audiences over time.
+
+<Aside type="note">
+  These two fields exist on both a config-policy Alert Rule and a standalone alert rule. Before this option existed, a config-policy alert rule had no way to attach an escalation policy and always fell back to the organization's default notification channels.
+</Aside>
+
+### Maintenance Windows
+
+| Field | Description |
+|---|---|
+| **Recurrence** | Day of week or month when the window applies |
+| **Start time** | Local time the window begins |
+| **Duration** | Length of the window in **hours** |
+| **Suppress Alerts** | Silence alert notifications during the window |
+| **Suppress Patching** | Skip scheduled patch jobs during the window |
+| **Suppress Automations** | Skip automation triggers during the window |
+| **Suppress Scripts** | Skip scheduled script execution during the window |
+
+### Compliance Rules
+
+| Field | Description |
+|---|---|
+| **Name** | A label for this rule |
+| **Rule definition** | The desired-state condition to evaluate |
+| **Enforcement level** | `monitor`, `warn`, or `enforce` |
+| **Check interval** | How often to re-evaluate (minutes) |
+| **Remediation script** | Script to run when `enforce` mode detects non-compliance |
+
+### Backup
+
+<Aside type="caution">
+  Backup is **not available on partner-wide (all organizations) policies**. Backup settings are always tied to a single organization, so a policy owned at the partner level has no organization to attach them to — attempting to add or save a Backup feature link on a partner-wide policy is rejected. Configure Backup on an organization-owned policy instead.
+</Aside>
+
+Backup feature links use **inline settings** stored in the `config_policy_backup_settings` table (one row per feature link).
+
+| Field | Type | Description |
+|---|---|---|
+| **Backup Mode** | enum | What to back up: `file` (default), `hyperv`, `mssql`, or `system_image` |
+| **Schedule** | JSONB | Frequency (`daily`, `weekly`, `monthly`), time (`HH:MM`), timezone, day of week/month |
+| **Retention** | JSONB | `keepDaily`, `keepWeekly`, `keepMonthly` snapshot counts |
+| **Paths** | JSONB array | Directories to include (file mode only) |
+| **Targets** | JSONB | Mode-specific targeting with optional exclude lists (Hyper-V and MSSQL modes) |
+
+**Backup modes:**
+
+- **File** — backs up directories listed in the Paths field.
+- **Hyper-V** — exports all discovered VMs by default. Set `targets.excludeVms` to skip specific VMs by name.
+- **MSSQL** — backs up all discovered databases by default. Set `targets.excludeDatabases` to skip specific databases.
+- **System Image** — full system image capture with no additional targeting needed.
+
+Hyper-V and MSSQL modes use **all-by-default targeting** — newly created VMs or databases are automatically included on the next scheduled backup run without any policy changes.
+
+When a backup feature is linked to a configuration policy, the schedule, retention, and mode settings in the policy override whatever is set on the standalone backup configuration. The policy system resolves which backup settings apply to a device using the same hierarchical precedence rules as other feature types (device-level wins over group, site, org, partner).
+
+<Aside type="tip">
+  Use the effective configuration endpoint to verify which backup schedule a specific device will receive: `GET /configuration-policies/effective/:deviceId`
+</Aside>
+
+### Security, Monitoring, Automation
+
+Configure security policy settings for **Security**; check intervals and targets for **Monitoring**; and event triggers, cron schedules, and action chains for **Automation**.
+
+### Vulnerability Scanning
+
+The **Vulnerability** feature is a single on/off toggle that controls whether the devices in the policy's scope are scanned for CVEs. It is configured **inline** (the on/off state lives in the policy) and is **off by default** -- a device with no vulnerability policy is never scanned, and its Vulnerabilities tab stays empty.
+
+Open the policy's **Vulnerability** tab, switch **Enable vulnerability scanning** on, save, and assign the policy. Because resolution is closest-wins, a device- or group-level setting of *off* overrides an organization-wide *on*. Once a scope is enabled, Breeze correlates its software and OS inventory against the CVE feeds once a day. If a policy exists but no device resolves to *on*, the daily job is simply a no-op -- it never falls back to scanning everything. The findings themselves are reviewed and acted on in [Vulnerability Management](/features/vulnerability-management/), not on this tab.
+
+## Assigning a policy
+
+Open the policy detail editor → **Assignments** tab. What you see depends on who owns the policy.
+
+### Partner library policy
+
+The tab is an organization checklist, not a level picker.
+
+<Steps>
+
+1. Optionally set **Role Filter** and **OS Filter**. Leave them empty to apply to every device in the chosen organizations.
+
+2. Turn on **All organizations (partner-wide)** to apply the policy across every organization you manage, or check individual organizations.
+
+3. Assigned rows show the role and OS filters that were saved with that assignment. To change filters, turn the assignment off and on again with the new chips selected.
+
+</Steps>
+
+A partner-wide "servers only" assignment reaches server-role devices in every assigned organization. Workstations skip it. You cannot put two different role sets on the same policy at the same target; make a second policy if servers and workstations need different settings.
+
+### Organization policy
+
+<Steps>
+
+1. Choose a **Level**: Organization, Site, Device Group, or Device.
+
+2. For Site, Device Group, or Device, select the specific target. An organization-level assignment always targets the policy's own organization.
+
+3. Optionally set the same **Role Filter** and **OS Filter**. Empty means every device in that target.
+
+4. Set a **Priority** number. When two policies at the same level both define the same feature, the lower priority number wins (priority `1` takes precedence over priority `2`).
+
+5. Click **Assign**.
+
+</Steps>
+
+<Aside>
+  A device-level assignment always takes precedence over all group, site, organization, and partner assignments, regardless of priority number. A partner-wide assignment is the broadest scope and is overridden by any more-specific assignment.
+</Aside>
+
+## Per-device compliance status
+
+Each device's detail page surfaces how that device measures against every compliance rule from its assigned policies — separate from the Effective Configuration view. Open any device page and select the **Compliance** tab to see a row for every assigned policy's compliance rules, including the rule name, current status (compliant, non-compliant, pending, or error), the last evaluation time, and any remediation attempts. This makes it easy to audit a single machine's standing without leaving the device page.
+
+The underlying endpoint is:
+
+```
+GET /policies/compliance/device/:deviceId
+```
+
+## Breeze Defaults baseline
+
+Every Breeze deployment ships with a built-in set of **Breeze Defaults** that sit at the bottom of the resolution hierarchy. These defaults are read-only — you cannot edit or delete them — but every policy you create at any level overrides them.
+
+To inspect the current defaults, navigate to **Fleet Management → Config Policies → Defaults** (or go directly to **/configuration-policies/defaults**). The page lists every setting that Breeze ships with, shows its current value, and indicates whether it is **Active** (in effect for devices with no overriding policy) or **Not enforced** (the feature is present in defaults but not turned on by default).
+
+Examples of shipped defaults:
+
+| Setting | Default state |
+|---------|---------------|
+| Remote Access | Active (on) |
+| PAM / UAC capture | Not enforced (off by default) |
+| Vulnerability Scanning | Not enforced (off by default) |
+
+Each row on the Defaults page includes a **Create override policy** shortcut that opens the policy editor pre-configured for that feature, so you can add a partner- or org-level override without navigating away.
+
+### Defaults in the Effective Configuration tab
+
+When a device has no policy assigned for a particular feature, the **Effective Configuration** tab on the device page attributes that value to **Breeze Defaults** and shows a **Not enforced** badge next to it, making it clear that the setting comes from the built-in layer rather than an explicit policy.
+
+## Viewing effective configuration
+
+To see the merged settings a specific device will receive:
+
+1. Navigate to the device's detail page.
+2. Open the **Effective Configuration** tab.
+3. The page shows the resolved settings for each feature type and which policy in the inheritance chain provided each value — including **Breeze Defaults** for any feature not covered by an assigned policy. When the assigned policy itself has no link for a feature and the value came from its [baseline parent](#baseline-policies-inheritance) instead, the card also shows **"Inherited from &lt;baseline name&gt;"** — two different kinds of inheritance can stack: the hierarchy chain (which *policy* is assigned) and the baseline relationship (which *policy's own settings* apply).
+
+```
+GET /configuration-policies/effective/:deviceId
+```
+
+Use `POST /configuration-policies/effective/:deviceId/diff` to preview how a policy change would affect a device's effective configuration before saving. The request body accepts:
+
+```json
+{
+  "add": [{ "configPolicyId": "uuid", "level": "site", "targetId": "uuid", "priority": 1 }],
+  "remove": ["assignment-uuid"]
+}
+```
+
+The response returns both `current` and `proposed` effective configurations for comparison.
+
+## Patch jobs
+
+Policies with a Patch Management feature can trigger deployment jobs:
+
+```
+POST /configuration-policies/:id/patch-job
+```
+
+Request body:
+
+```json
+{
+  "deviceIds": ["uuid-1", "uuid-2"],
+  "name": "Optional job name",
+  "scheduledAt": "2026-03-01T02:00:00Z"
+}
+```
+
+For each device, Breeze checks:
+
+- Whether the device exists and is accessible — inaccessible devices are listed in `skipped.inaccessibleDeviceIds`
+- Whether the device is inside an active maintenance window with patching suppression — suppressed devices are listed in `skipped.maintenanceSuppressedDeviceIds`
+- Whether the device ID is valid — invalid IDs are listed in `skipped.missingDeviceIds`
+- Whether the device belongs to the policy's organization (org-owned policy) or to an organization under the policy's partner (partner-wide policy) — devices outside that scope are rejected with a `403` rather than silently skipped, since patching someone else's fleet is never allowed
+
+The job is created with the schedule defined in the policy's patch settings (e.g., weekly on Sunday at 2 AM). Targeting devices from a partner-wide policy creates one job per organization that has matching devices, so a single request can produce several jobs — the response lists every job created, each with its own `orgId` and device count.
+
+## API reference
+
+All paths are relative to `/api/v1`.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/configuration-policies` | List policies |
+| POST | `/configuration-policies` | Create policy |
+| GET | `/configuration-policies/eligible-parents` | List baseline policies eligible as a parent for a given ownership scope (`?ownerScope=organization&orgId=…` or `?ownerScope=partner`) |
+| GET | `/configuration-policies/:id` | Get policy — includes `parentPolicyId`, an embedded `parentPolicy` (read-only, with its own feature links), and `childPolicies` |
+| PATCH | `/configuration-policies/:id` | Update metadata |
+| DELETE | `/configuration-policies/:id` | Delete (cascades to features and assignments). Returns `409` with the list of dependent policies if any policy still inherits from this one. |
+| GET | `/configuration-policies/:id/features` | List feature links |
+| POST | `/configuration-policies/:id/features` | Add feature |
+| PATCH | `/configuration-policies/:id/features/:linkId` | Update feature settings |
+| DELETE | `/configuration-policies/:id/features/:linkId` | Remove feature |
+| GET | `/configuration-policies/:id/assignments` | List assignments |
+| POST | `/configuration-policies/:id/assignments` | Assign policy to a target |
+| DELETE | `/configuration-policies/:id/assignments/:aid` | Unassign |
+| GET | `/configuration-policies/effective/:deviceId` | Resolve effective config for a device |
+| POST | `/configuration-policies/effective/:deviceId/diff` | Preview change diff |
+| GET | `/configuration-policies/assignments/target` | List assignments for a target |
+| POST | `/configuration-policies/:id/patch-job` | Create patch deployment job |
+| GET | `/configuration-policies/:id/patch-settings` | Get patch settings for a policy |
+| GET | `/configuration-policies/:id/resolve-patch-config/:deviceId` | Resolve patch config for a specific device |
+
+When creating a policy, set `ownerScope` to `organization` (the default) or `partner`. With `ownerScope: "partner"` the policy is owned partner-wide and any supplied `orgId` is ignored — the partner is always derived from the caller's own token, never trusted from the request body. Creating a partner-wide policy requires partner scope (a `403` is returned otherwise). When assigning a partner-wide policy, use `level: "partner"`; the target is resolved from the caller's own partner, so no `targetId` is required.
+
+To create a policy that inherits from a baseline, pass `parentPolicyId` in the create request body — see [Baseline policies](#baseline-policies-inheritance) above for which parents a given ownership scope may reference. An invalid, cross-tenant, or already-nested parent is rejected with `400 { "error": "INVALID_PARENT_POLICY" }` — a single error for every rejection reason, so the response can't be used to probe which policy IDs exist.
+
+When calling the features endpoints, the `featureType` value must be one of: `patch`, `alert_rule`, `backup`, `security`, `monitoring`, `monitors`, `maintenance`, `compliance`, `automation`, `event_log`, `software_policy`, `sensitive_data`, `peripheral_control`, `warranty`, `helper`, `remote_access`, `pam`, `onedrive_helper`, `vulnerability`, `device_lifecycle`. `monitors` (plural) is the [Monitors](/features/monitors/) feature -- distinct from `monitoring` (singular), which is the agent-side service/process watch feature.
+
+## Troubleshooting
+
+**Policy not applying to a device**
+
+Check that the policy is assigned at some level in the hierarchy. Open the device's Effective Configuration tab — if the policy is not listed in the inheritance chain, it has not been assigned to any scope the device belongs to.
+
+**Compliance check not running**
+
+Ensure the policy status is **Active** and `checkIntervalMinutes` is set. The evaluation worker scans for due policies every 60 seconds; setting `checkIntervalMinutes` to 1 means a rule will be checked within 60 seconds of becoming due.
+
+**Patch job skipping devices**
+
+Check all three skipped lists in the response: `missingDeviceIds`, `inaccessibleDeviceIds`, and `maintenanceSuppressedDeviceIds`. A device in an active maintenance window with **Suppress Patching** enabled will be skipped automatically.
+
+**Enforcement not remediating**
+
+Enforcement mode must be set to `enforce` and a remediation script must be linked. Without a script, `enforce` falls back to `warn` behaviour.
+
+**Feature type conflict between policies at the same level**
+
+When two policies at the same hierarchy level both define the same feature type, the one with the lower **Priority** number wins (priority `1` beats priority `2`). If priorities are equal, results are non-deterministic — assign distinct priorities to resolve the conflict.

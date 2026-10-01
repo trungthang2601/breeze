@@ -1,0 +1,502 @@
+package backup
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/backup/providers"
+)
+
+// VerifyResult holds the outcome of a backup integrity check.
+type VerifyResult struct {
+	SnapshotID    string `json:"snapshotId"`
+	Status        string `json:"status"` // passed, failed, partial
+	FilesVerified int    `json:"filesVerified"`
+	// FilesSizeOnly counts files verified by size only because the manifest
+	// carried no checksum for them (an older manifest, or a checksum that
+	// failed to compute at backup time). Non-zero means "passed" is weaker than
+	// a full checksum verification — size-only can't catch same-size bit-rot.
+	FilesSizeOnly int `json:"filesSizeOnly,omitempty"`
+	FilesFailed   int `json:"filesFailed"`
+	// FilesIncomplete is the number of files the BACKUP run could not upload,
+	// read from the manifest's incompleteFiles (#6350). These files are absent
+	// from the manifest's file list, so verification can never observe them
+	// directly — without this the check walks only what was stored, finds it
+	// all present, and reports `passed` with zero failures on a restore point
+	// that is knowingly missing data. Non-zero forces Status off `passed`.
+	FilesIncomplete int      `json:"filesIncomplete,omitempty"`
+	SizeBytes       int64    `json:"sizeBytes"`
+	DurationMs      int64    `json:"durationMs"`
+	FailedFiles     []string `json:"failedFiles,omitempty"`
+	// Warnings carries advisory notes that did not fail a file — currently
+	// only a size/checksum mismatch on a Volatile entry (#5581): the source
+	// kept changing while it was backed up, so the manifest describes the
+	// last pre-upload measurement rather than any single instant, and a
+	// mismatch against it is expected rather than corruption.
+	Warnings []string `json:"warnings,omitempty"`
+	Error    string   `json:"error,omitempty"`
+}
+
+// TestRestoreResult holds the outcome of a test restore operation.
+type TestRestoreResult struct {
+	SnapshotID         string   `json:"snapshotId"`
+	Status             string   `json:"status"`
+	FilesVerified      int      `json:"filesVerified"`
+	FilesFailed        int      `json:"filesFailed"`
+	SizeBytes          int64    `json:"sizeBytes"`
+	RestoreTimeSeconds int      `json:"restoreTimeSeconds"`
+	RestorePath        string   `json:"restorePath"`
+	CleanedUp          bool     `json:"cleanedUp"`
+	FailedFiles        []string `json:"failedFiles,omitempty"`
+	// Warnings carries advisory notes that did not fail a file — see
+	// VerifyResult.Warnings.
+	Warnings []string `json:"warnings,omitempty"`
+	Error    string   `json:"error,omitempty"`
+}
+
+// VerifyIntegrity checks a snapshot's manifest and validates each file
+// can be downloaded and read from the provider.
+func VerifyIntegrity(provider providers.BackupProvider, snapshotID string) (*VerifyResult, error) {
+	return VerifyIntegrityContext(context.Background(), provider, snapshotID)
+}
+
+func VerifyIntegrityContext(ctx context.Context, provider providers.BackupProvider, snapshotID string) (*VerifyResult, error) {
+	start := time.Now()
+	result := &VerifyResult{SnapshotID: snapshotID}
+
+	if err := ctx.Err(); err != nil {
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result, err
+	}
+
+	// Download and parse manifest
+	manifestKey := path.Join(snapshotRootDir, snapshotID, snapshotManifestKey)
+	tempManifest, err := os.CreateTemp("", "verify-manifest-*.json")
+	if err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("failed to create temp file: %v", err)
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result, nil
+	}
+	tempManifestPath := tempManifest.Name()
+	_ = tempManifest.Close()
+	defer os.Remove(tempManifestPath)
+
+	if err := provider.Download(manifestKey, tempManifestPath); err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("manifest not found: %v", err)
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result, nil
+	}
+	if err := ctx.Err(); err != nil {
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result, err
+	}
+
+	manifestData, err := os.ReadFile(tempManifestPath)
+	if err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("failed to read manifest: %v", err)
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result, nil
+	}
+
+	var snapshot Snapshot
+	if err := json.Unmarshal(manifestData, &snapshot); err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("invalid manifest JSON: %v", err)
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result, nil
+	}
+
+	// Verify each file by downloading through the provider
+	for _, file := range snapshot.Files {
+		if err := ctx.Err(); err != nil {
+			result.DurationMs = time.Since(start).Milliseconds()
+			return result, err
+		}
+		if !file.HasContent() {
+			// Content-less entry (symlink/directory): no uploaded object to
+			// verify — see SnapshotFile.HasContent's doc comment.
+			continue
+		}
+		tempFile, err := os.CreateTemp("", "verify-file-*")
+		if err != nil {
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("temp file create failed", "phase", "verify", "backupPath", file.BackupPath, "error", err.Error())
+			continue
+		}
+		tempPath := tempFile.Name()
+		_ = tempFile.Close()
+
+		// Download the file from provider (provider validates gzip on .gz files)
+		dlErr := provider.Download(file.BackupPath, tempPath)
+		if err := ctx.Err(); err != nil {
+			_ = os.Remove(tempPath)
+			result.DurationMs = time.Since(start).Milliseconds()
+			return result, err
+		}
+		if dlErr != nil {
+			os.Remove(tempPath)
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("download failed", "phase", "verify", "backupPath", file.BackupPath, "error", dlErr.Error())
+			continue
+		}
+
+		// Validate the downloaded object against the manifest so SILENT
+		// corruption (bit-rot, truncation, tampering) is caught — not just a
+		// missing object. Downloading proves presence; without this a wrong-bytes
+		// object passed as "verified" (the remote/cloud providers, unlike
+		// LocalProvider, do not gzip-validate, and the manifest previously stored
+		// no checksum). Size is always checked; the SHA-256 is checked whenever
+		// the manifest carries one (manifests written before checksums were added
+		// do not — those are counted as size-only via FilesSizeOnly).
+		info, statErr := os.Stat(tempPath)
+		if statErr != nil || info == nil {
+			os.Remove(tempPath)
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("stat failed", "phase", "verify", "backupPath", file.BackupPath, "error", errString(statErr))
+			continue
+		}
+		if info.Size() != file.Size {
+			if file.Volatile {
+				// The source kept changing while it was backed up (#5581):
+				// the manifest's Size describes the last pre-upload
+				// measurement, not necessarily the object's current state.
+				// Advisory only — count the file verified, don't fail it.
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("%s: size differs from manifest (manifest %d, actual %d) — file was volatile during backup", file.BackupPath, file.Size, info.Size()))
+				log.Warn("volatile file size mismatch (advisory, not a failure)", "phase", "verify", "backupPath", file.BackupPath,
+					"expectedBytes", file.Size, "actualBytes", info.Size())
+			} else {
+				os.Remove(tempPath)
+				result.FilesFailed++
+				result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+				log.Warn("size mismatch", "phase", "verify", "backupPath", file.BackupPath,
+					"expectedBytes", file.Size, "actualBytes", info.Size())
+				continue
+			}
+		}
+		if file.Checksum != "" {
+			if !checksumMatches(tempPath, file.Checksum) {
+				if file.Volatile {
+					result.Warnings = append(result.Warnings,
+						fmt.Sprintf("%s: checksum differs from manifest (manifest %s) — file was volatile during backup", file.BackupPath, file.Checksum))
+					log.Warn("volatile file checksum mismatch (advisory, not a failure)", "phase", "verify", "backupPath", file.BackupPath,
+						"expected", file.Checksum)
+				} else {
+					_ = os.Remove(tempPath)
+					result.FilesFailed++
+					result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+					log.Warn("checksum mismatch", "phase", "verify", "backupPath", file.BackupPath,
+						"expected", file.Checksum)
+					continue
+				}
+			}
+		} else {
+			result.FilesSizeOnly++
+		}
+		result.SizeBytes += info.Size()
+		os.Remove(tempPath)
+		result.FilesVerified++
+	}
+
+	// Determine status
+	result.FilesIncomplete = snapshot.IncompleteFiles
+	total := result.FilesVerified + result.FilesFailed
+	switch {
+	case total == 0:
+		result.Status = "failed"
+		result.Error = "no files in snapshot"
+	case result.FilesFailed == 0:
+		result.Status = "passed"
+	case result.FilesVerified == 0:
+		result.Status = "failed"
+	default:
+		result.Status = "partial"
+	}
+
+	// A snapshot whose backup run could not upload every file is an incomplete
+	// restore point, however clean the stored objects are. Downgrade `passed`
+	// and say what is missing, so an operator is not told a snapshot is
+	// verified when files are known to be absent from it (#6350).
+	if snapshot.IncompleteFiles > 0 {
+		if result.Status == "passed" {
+			result.Status = "partial"
+		}
+		result.Warnings = append(result.Warnings, incompleteSnapshotWarning(&snapshot))
+		log.Warn("snapshot manifest reports files that never uploaded; verification cannot be a pass",
+			"phase", "verify", "snapshotId", snapshotID,
+			"incompleteFiles", snapshot.IncompleteFiles,
+			"filesVerified", result.FilesVerified)
+	}
+
+	result.DurationMs = time.Since(start).Milliseconds()
+	return result, nil
+}
+
+// maxVerifyIncompletePathsReported caps how many missing source paths the
+// warning names; the manifest itself already caps what it stores.
+const maxVerifyIncompletePathsReported = 5
+
+// incompleteSnapshotWarning renders the manifest's recorded upload failures as
+// an operator-readable warning line.
+func incompleteSnapshotWarning(snapshot *Snapshot) string {
+	msg := fmt.Sprintf("%d file(s) never uploaded during the backup run and are absent from this snapshot", snapshot.IncompleteFiles)
+	names := snapshot.IncompleteFilePaths
+	if len(names) == 0 {
+		return msg
+	}
+	shown := names
+	if len(shown) > maxVerifyIncompletePathsReported {
+		shown = shown[:maxVerifyIncompletePathsReported]
+	}
+	msg += ": " + strings.Join(shown, "; ")
+	if len(names) > len(shown) {
+		msg += fmt.Sprintf(" (+%d more)", len(names)-len(shown))
+	}
+	return msg
+}
+
+// errString renders an error for a structured log attribute. The log shipper
+// JSON-marshals attrs and a raw error marshals to {}, so errors are logged as
+// strings. Used where the error may be nil (a stat that returned nil info
+// without an error), which err.Error() would panic on.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+const restoreTestPrefix = "breeze-restore-test"
+
+// TestRestore downloads a snapshot to a private directory beneath workRoot and
+// verifies each file. workRoot must be the privileged agent data directory.
+// progressFn is called after each file with (current, total) counts. Can be nil.
+func TestRestore(provider providers.BackupProvider, snapshotID, workRoot string, progressFn func(current, total int)) (*TestRestoreResult, error) {
+	return TestRestoreContext(context.Background(), provider, snapshotID, workRoot, progressFn)
+}
+
+func TestRestoreContext(ctx context.Context, provider providers.BackupProvider, snapshotID, workRoot string, progressFn func(current, total int)) (*TestRestoreResult, error) {
+	start := time.Now()
+	result := &TestRestoreResult{SnapshotID: snapshotID}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if err := validateSnapshotID(snapshotID); err != nil {
+		return nil, err
+	}
+	operationRoot, ephemeral, err := prepareRestoreWorkRoot(workRoot)
+	if err != nil {
+		return nil, fmt.Errorf("prepare test-restore work root: %w", err)
+	}
+	if ephemeral {
+		defer func() { _ = os.RemoveAll(operationRoot) }()
+	}
+
+	// Download and parse manifest
+	manifestKey := path.Join(snapshotRootDir, snapshotID, snapshotManifestKey)
+	tempManifest, err := os.CreateTemp(operationRoot, "restore-manifest-*.json")
+	if err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("failed to create temp file: %v", err)
+		return result, nil
+	}
+	tempManifestPath := tempManifest.Name()
+	_ = tempManifest.Close()
+	defer os.Remove(tempManifestPath)
+
+	if err := provider.Download(manifestKey, tempManifestPath); err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("manifest not found: %v", err)
+		return result, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+
+	manifestData, err := os.ReadFile(tempManifestPath)
+	if err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("failed to read manifest: %v", err)
+		return result, nil
+	}
+
+	var snapshot Snapshot
+	if err := json.Unmarshal(manifestData, &snapshot); err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("invalid manifest JSON: %v", err)
+		return result, nil
+	}
+
+	// Create a fresh, unguessable directory for every run. The parent is
+	// restricted to the privileged agent account by prepareRestoreWorkRoot.
+	restoreDir, err := os.MkdirTemp(operationRoot, restoreTestPrefix+"-")
+	if err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("failed to create restore dir: %v", err)
+		return result, nil
+	}
+	if err := os.Chmod(restoreDir, 0o700); err != nil {
+		_ = os.RemoveAll(restoreDir)
+		return nil, fmt.Errorf("restrict test-restore directory: %w", err)
+	}
+	result.RestorePath = restoreDir
+
+	cancelResult := func(cancelErr error) (*TestRestoreResult, error) {
+		result.RestoreTimeSeconds = int(time.Since(start).Seconds())
+		if cleanErr := os.RemoveAll(restoreDir); cleanErr != nil {
+			log.Warn("cleanup after cancellation failed", "phase", "restore", "path", restoreDir, "error", cleanErr.Error())
+			result.CleanedUp = false
+		} else {
+			result.CleanedUp = true
+		}
+		return result, cancelErr
+	}
+
+	// Restore each file
+	total := len(snapshot.Files)
+	for i, file := range snapshot.Files {
+		if err := ctx.Err(); err != nil {
+			return cancelResult(err)
+		}
+		if !file.HasContent() {
+			// Content-less entry (symlink/directory): no uploaded object to
+			// restore — see SnapshotFile.HasContent's doc comment. The real
+			// restore path (restore.go) recreates these directly; a test
+			// restore's job is only to prove the uploaded OBJECTS round-trip.
+			if progressFn != nil {
+				progressFn(i+1, total)
+			}
+			continue
+		}
+		relative, pathErr := restoreRelativePath(restoreSourcePath(file))
+		if pathErr != nil {
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("invalid restore path", "phase", "restore", "sourcePath", restoreSourcePath(file), "error", pathErr.Error())
+			if progressFn != nil {
+				progressFn(i+1, total)
+			}
+			continue
+		}
+		destPath := filepath.Join(restoreDir, relative)
+		if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("create target dir failed", "phase", "restore", "destPath", destPath, "error", err.Error())
+			if progressFn != nil {
+				progressFn(i+1, total)
+			}
+			continue
+		}
+
+		dlErr := provider.Download(file.BackupPath, destPath)
+		if err := ctx.Err(); err != nil {
+			return cancelResult(err)
+		}
+		info, statErr := os.Stat(destPath)
+		switch {
+		case dlErr != nil:
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("download failed", "phase", "restore", "backupPath", file.BackupPath, "error", dlErr.Error())
+		case statErr != nil || info == nil:
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("stat failed", "phase", "restore", "backupPath", file.BackupPath, "error", errString(statErr))
+		case info.Size() != file.Size && !file.Volatile:
+			// A real test-restore must confirm the bytes came back intact, not
+			// just that a file appeared (same blind spot as VerifyIntegrity).
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("size mismatch", "phase", "restore", "backupPath", file.BackupPath,
+				"expectedBytes", file.Size, "actualBytes", info.Size())
+		case file.Checksum != "" && !file.Volatile && !checksumMatches(destPath, file.Checksum):
+			result.FilesFailed++
+			result.FailedFiles = append(result.FailedFiles, file.BackupPath)
+			log.Warn("checksum mismatch", "phase", "restore", "backupPath", file.BackupPath,
+				"expected", file.Checksum)
+		default:
+			if file.Volatile && (info.Size() != file.Size || (file.Checksum != "" && !checksumMatches(destPath, file.Checksum))) {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("%s: differs from manifest — file was volatile during backup", file.BackupPath))
+				log.Warn("volatile file mismatch (advisory, not a failure)", "phase", "restore", "backupPath", file.BackupPath)
+			}
+			result.FilesVerified++
+			result.SizeBytes += info.Size()
+		}
+
+		if progressFn != nil {
+			progressFn(i+1, total)
+		}
+	}
+
+	// Determine status
+	switch {
+	case result.FilesVerified+result.FilesFailed == 0:
+		result.Status = "failed"
+		result.Error = "no files in snapshot"
+	case result.FilesFailed == 0:
+		result.Status = "passed"
+	case result.FilesVerified == 0:
+		result.Status = "failed"
+	default:
+		result.Status = "partial"
+	}
+
+	// Same rule as VerifyIntegrityContext (#6350): a test restore of a snapshot
+	// that is knowingly missing files restored everything it was given, which
+	// is not the same as a complete restore point.
+	if snapshot.IncompleteFiles > 0 {
+		if result.Status == "passed" {
+			result.Status = "partial"
+		}
+		result.Warnings = append(result.Warnings, incompleteSnapshotWarning(&snapshot))
+		log.Warn("snapshot manifest reports files that never uploaded; test restore cannot be a pass",
+			"phase", "restore", "snapshotId", snapshotID,
+			"incompleteFiles", snapshot.IncompleteFiles,
+			"filesVerified", result.FilesVerified)
+	}
+
+	result.RestoreTimeSeconds = int(time.Since(start).Seconds())
+
+	// Cleanup
+	if cleanErr := os.RemoveAll(restoreDir); cleanErr != nil {
+		log.Warn("cleanup failed", "phase", "restore", "path", restoreDir, "error", cleanErr.Error())
+		result.CleanedUp = false
+	} else {
+		result.CleanedUp = true
+	}
+
+	return result, nil
+}
+
+// CleanupRestoreDir removes a test restore directory after validating the path
+// is within the expected prefix to prevent path traversal.
+func CleanupRestoreDir(dirPath, workRoot string) error {
+	operationRoot, ephemeral, err := prepareRestoreWorkRoot(workRoot)
+	if err != nil {
+		return err
+	}
+	if ephemeral {
+		defer func() { _ = os.RemoveAll(operationRoot) }()
+		return errors.New("cleanup requires a configured restore work root")
+	}
+	relative, err := filepath.Rel(operationRoot, filepath.Clean(dirPath))
+	if err != nil || filepath.Dir(relative) != "." || !strings.HasPrefix(filepath.Base(relative), restoreTestPrefix+"-") {
+		return fmt.Errorf("path %q is outside the configured test-restore root", dirPath)
+	}
+	return os.RemoveAll(dirPath)
+}

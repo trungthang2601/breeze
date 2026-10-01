@@ -1,0 +1,1121 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+import { roleRoutes } from './roles';
+
+vi.mock('../services/permissions', () => ({
+  clearPermissionCache: vi.fn(),
+  getUserPermissions: vi.fn().mockResolvedValue({
+    permissions: [{ resource: '*', action: '*' }],
+    partnerId: 'partner-123',
+    orgId: null,
+    roleId: 'role-admin',
+    scope: 'partner'
+  }),
+  hasPermission: vi.fn((userPerms: any, resource: string, action: string) =>
+    userPerms.permissions.some((p: any) =>
+      (p.resource === resource || p.resource === '*') &&
+      (p.action === action || p.action === '*')
+    )
+  ),
+  isAssignablePermission: vi.fn((permission: any) =>
+    permission.resource !== '*' &&
+    permission.action !== '*' &&
+    ['users:read', 'users:write', 'users:delete', 'devices:read', 'devices:write']
+      .includes(`${permission.resource}:${permission.action}`)
+  ),
+  PERMISSIONS: {
+    USERS_READ: { resource: 'users', action: 'read' },
+    USERS_WRITE: { resource: 'users', action: 'write' },
+    USERS_DELETE: { resource: 'users', action: 'delete' },
+    DEVICES_READ: { resource: 'devices', action: 'read' },
+    DEVICES_WRITE: { resource: 'devices', action: 'write' },
+    ADMIN_ALL: { resource: '*', action: '*' }
+  }
+}));
+
+vi.mock('../db', () => ({
+  db: {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          limit: vi.fn(() => Promise.resolve([]))
+        }))
+      }))
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn(() => ({
+        returning: vi.fn(() => Promise.resolve([]))
+      }))
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => Promise.resolve([]))
+        }))
+      }))
+    })),
+    delete: vi.fn(() => ({
+      where: vi.fn(() => Promise.resolve())
+    })),
+    transaction: vi.fn()
+  },
+  runOutsideDbContext: vi.fn((fn: () => any) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => any) => fn())
+}));
+
+vi.mock('../db/schema', () => ({
+  roles: {},
+  permissions: {},
+  rolePermissions: {},
+  partnerUsers: {},
+  organizationUsers: {},
+  users: {},
+  organizations: {}
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      scope: 'partner',
+      partnerId: 'partner-123',
+      partnerOrgAccess: 'all',
+      orgId: null,
+      user: { id: 'user-123', email: 'test@example.com' }
+    });
+    return next();
+  }),
+  requirePermission: vi.fn(() => (c: any, next: any) => next()),
+  requireMfa: vi.fn(() => (c: any, next: any) => next())
+}));
+
+import { db } from '../db';
+import { clearPermissionCache, getUserPermissions, isAssignablePermission } from '../services/permissions';
+import { authMiddleware } from '../middleware/auth';
+// Pull the REAL assignable-permissions list from the un-mocked services module so
+// the regression-guard loop can iterate the actual canonical set. The rest of
+// this file relies on the mocked services module above; we use
+// vi.importActual here to bypass the mock for just this constant.
+const { ASSIGNABLE_PERMISSIONS: REAL_ASSIGNABLE_PERMISSIONS } = await vi.importActual<
+  typeof import('../services/permissions')
+>('../services/permissions');
+
+// #3524: resolvePartnerFocusedOrgId does a `select({type}).from(organizations)
+// .where().limit(1)` to exclude the hidden quick_support org. Queue this FIRST on
+// db.select for any request that supplies a valid focused/target orgId.
+function mockOrgTypeLookup(type: 'customer' | 'quick_support' = 'customer') {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ type }]) })
+    })
+  } as any);
+}
+
+describe('role routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        scope: 'partner',
+        partnerId: 'partner-123',
+        partnerOrgAccess: 'all',
+        orgId: null,
+        user: { id: 'user-123', email: 'test@example.com' }
+      });
+      return next();
+    });
+    app = new Hono();
+    app.route('/roles', roleRoutes);
+  });
+
+  it.each(['selected', 'none'] as const)(
+    'rejects partner orgAccess=%s before querying partner-global roles',
+    async (partnerOrgAccess) => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess,
+          orgId: null,
+          accessibleOrgIds: [],
+          user: { id: 'user-123', email: 'test@example.com' },
+        });
+        return next();
+      });
+
+      const res = await app.request('/roles');
+
+      expect(res.status).toBe(403);
+      expect(db.select).not.toHaveBeenCalled();
+    },
+  );
+
+  describe('GET /roles', () => {
+    it('should list partner roles with user counts', async () => {
+      const now = new Date();
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              {
+                id: 'role-1',
+                name: 'Admin',
+                description: null,
+                scope: 'partner',
+                isSystem: true,
+                parentRoleId: null,
+                createdAt: now,
+                updatedAt: now
+              },
+              {
+                id: 'role-2',
+                name: 'Operator',
+                description: 'Custom role',
+                scope: 'partner',
+                isSystem: false,
+                parentRoleId: 'role-1',
+                createdAt: now,
+                updatedAt: now
+              }
+            ])
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              groupBy: vi.fn().mockResolvedValue([{ roleId: 'role-2', count: 3, activeCount: 2 }])
+            })
+          })
+        } as any);
+
+      const res = await app.request('/roles', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(2);
+      expect(body.data[1].parentRoleName).toBe('Admin');
+      expect(body.data[1].userCount).toBe(3);
+      // Only status='active' members — the population the AI-agent recipient
+      // resolver can notify (#5048 QA); a role with none is flagged in the
+      // agent forms.
+      expect(body.data[1].activeUserCount).toBe(2);
+      expect(body.data[0].activeUserCount).toBe(0);
+    });
+
+    // #3524: a partner focused on one org (web client injects ?orgId=) must ALSO
+    // see that org's org-scoped roles, or the role they just created is invisible
+    // and the SSO org-provider picker stays empty (the fix would be inert).
+    it('partner with a valid ?orgId merges the focused org’s org-scoped roles + counts', async () => {
+      const ORG = '22222222-2222-4222-8222-222222222222';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: (id: string) => id === ORG
+        });
+        return next();
+      });
+      const now = new Date();
+      mockOrgTypeLookup('customer'); // resolvePartnerFocusedOrgId quick_support check
+      vi.mocked(db.select)
+        // 1) partner-scoped roles
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              { id: 'p1', name: 'Partner Admin', description: null, scope: 'partner', isSystem: true, parentRoleId: null, createdAt: now, updatedAt: now }
+            ])
+          })
+        } as any)
+        // 2) focused org's org-scoped roles
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              { id: 'o1', name: 'Org Tech', description: null, scope: 'organization', isSystem: false, parentRoleId: null, createdAt: now, updatedAt: now }
+            ])
+          })
+        } as any)
+        // 3) partner_users counts
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ groupBy: vi.fn().mockResolvedValue([{ roleId: 'p1', count: 2 }]) })
+          })
+        } as any)
+        // 4) organization_users counts for the focused org
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ groupBy: vi.fn().mockResolvedValue([{ roleId: 'o1', count: 5 }]) })
+          })
+        } as any);
+
+      const res = await app.request(`/roles?orgId=${ORG}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(2);
+      const org = body.data.find((r: any) => r.id === 'o1');
+      expect(org).toMatchObject({ scope: 'organization', userCount: 5 });
+      const partner = body.data.find((r: any) => r.id === 'p1');
+      expect(partner).toMatchObject({ scope: 'partner', userCount: 2 });
+    });
+
+    it('partner with an ?orgId OUTSIDE its tree gets only partner roles (no merge)', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: () => false
+        });
+        return next();
+      });
+      const now = new Date();
+      // Only the partner-roles select + partner_users counts run — no org query,
+      // because canAccessOrg rejects the injected orgId.
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([
+              { id: 'p1', name: 'Partner Admin', description: null, scope: 'partner', isSystem: true, parentRoleId: null, createdAt: now, updatedAt: now }
+            ])
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ groupBy: vi.fn().mockResolvedValue([]) })
+          })
+        } as any);
+
+      const res = await app.request('/roles?orgId=99999999-9999-4999-8999-999999999999', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].scope).toBe('partner');
+    });
+
+    it('should reject missing partner/org context', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'system',
+          partnerId: null,
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' }
+        });
+        return next();
+      });
+
+      const res = await app.request('/roles', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(403);
+    });
+  });
+
+  describe('POST /roles', () => {
+    it('should create a role and assign permissions', async () => {
+      const roleInsertValues = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([
+          {
+            id: 'role-3',
+            name: 'Operator',
+            description: null,
+            scope: 'partner',
+            isSystem: false,
+            parentRoleId: null,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          }
+        ])
+      });
+      const rolePermissionsValues = vi.fn().mockResolvedValue(undefined);
+      const txInsert = vi
+        .fn()
+        .mockReturnValueOnce({ values: roleInsertValues })
+        .mockReturnValueOnce({ values: rolePermissionsValues });
+
+      vi.mocked(db.transaction).mockImplementation(async (fn) => {
+        return fn({ insert: txInsert } as any);
+      });
+
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([])
+          })
+        })
+      } as any);
+
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([{ id: 'perm-1' }])
+        })
+      } as any);
+
+      const res = await app.request('/roles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Operator',
+          permissions: [{ resource: 'devices', action: 'read' }]
+        })
+      });
+
+      expect(res.status).toBe(201);
+      expect(rolePermissionsValues).toHaveBeenCalledWith([
+        { roleId: 'role-3', permissionId: 'perm-1' }
+      ]);
+    });
+
+    it('rejects inheriting wildcard permissions from a parent role', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                {
+                  id: '11111111-1111-4111-8111-111111111111',
+                  scope: 'partner',
+                  isSystem: true,
+                  partnerId: null,
+                  orgId: null
+                }
+              ])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                {
+                  id: '11111111-1111-4111-8111-111111111111',
+                  name: 'Admin',
+                  parentRoleId: null
+                }
+              ])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            innerJoin: vi.fn().mockReturnValue({
+              where: vi.fn().mockResolvedValue([{ resource: '*', action: '*' }])
+            })
+          })
+        } as any);
+
+      const res = await app.request('/roles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Inherited Admin',
+          parentRoleId: '11111111-1111-4111-8111-111111111111',
+          permissions: []
+        })
+      });
+
+      expect(res.status).toBe(403);
+      expect(vi.mocked(db.transaction)).not.toHaveBeenCalled();
+    });
+
+    // #3524: a partner admin targets a specific org so the role is ORGANIZATION-
+    // scoped (the SSO default-role picker only offers org-scoped, non-system
+    // roles). The org must be inside the partner's own tree.
+    const TARGET_ORG_ID = '22222222-2222-4222-8222-222222222222';
+
+    it('partner caller with an accessible orgId mints an ORG-scoped role for that org', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: (id: string) => id === TARGET_ORG_ID
+        });
+        return next();
+      });
+
+      const roleInsertValues = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([
+          {
+            id: 'role-org-1',
+            name: 'Org Operator',
+            description: null,
+            scope: 'organization',
+            isSystem: false,
+            parentRoleId: null,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          }
+        ])
+      });
+      const rolePermissionsValues = vi.fn().mockResolvedValue(undefined);
+      const txInsert = vi
+        .fn()
+        .mockReturnValueOnce({ values: roleInsertValues })
+        .mockReturnValueOnce({ values: rolePermissionsValues });
+      vi.mocked(db.transaction).mockImplementation(async (fn) => fn({ insert: txInsert } as any));
+      mockOrgTypeLookup('customer'); // resolvePartnerFocusedOrgId quick_support check
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'perm-1' }]) })
+      } as any);
+
+      const res = await app.request('/roles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Org Operator',
+          orgId: TARGET_ORG_ID,
+          permissions: [{ resource: 'devices', action: 'read' }]
+        })
+      });
+
+      expect(res.status).toBe(201);
+      // The inserted row is org-scoped to the target org, with NO partnerId —
+      // this is what makes it appear in that org's SSO default-role picker.
+      expect(roleInsertValues).toHaveBeenCalledTimes(1);
+      const inserted = roleInsertValues.mock.calls[0]![0] as Record<string, unknown>;
+      expect(inserted).toMatchObject({ scope: 'organization', orgId: TARGET_ORG_ID });
+      expect(inserted.partnerId).toBeUndefined();
+    });
+
+    // Regression for the #3577 review: RolesPage attaches `orgId` for EVERY
+    // org-token user, so treating any `body.orgId` as a partner-focus request
+    // 403'd org admins out of creating a role on their OWN org. Asserting the
+    // API contract, not just the request-body shape the web test checks.
+    it('lets an ORG-scope caller create a role while naming its own orgId', async () => {
+      const OWN_ORG = '33333333-3333-4333-8333-333333333333';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'organization',
+          partnerId: null,
+          orgId: OWN_ORG,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: (id: string) => id === OWN_ORG
+        });
+        return next();
+      });
+
+      const roleInsertValues = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([
+          { id: 'orole-9', name: 'Org Operator', description: null, scope: 'organization', isSystem: false, parentRoleId: null, createdAt: new Date(), updatedAt: new Date() }
+        ])
+      });
+      const txInsert = vi
+        .fn()
+        .mockReturnValueOnce({ values: roleInsertValues })
+        .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) });
+      vi.mocked(db.transaction).mockImplementation(async (fn) => fn({ insert: txInsert } as any));
+
+      // NO org-type lookup is queued: naming your own org is a no-op re-scope,
+      // so resolvePartnerFocusedOrgId must never run for this caller.
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) })
+        })
+      } as any);
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'perm-9' }]) })
+      } as any);
+
+      const res = await app.request('/roles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Org Operator',
+          orgId: OWN_ORG,
+          permissions: [{ resource: 'devices', action: 'read' }]
+        })
+      });
+
+      // Before the fix this was a hard 403 on the caller's own organization.
+      expect(res.status).toBe(201);
+      const inserted = roleInsertValues.mock.calls[0]![0] as Record<string, unknown>;
+      expect(inserted).toMatchObject({ scope: 'organization', orgId: OWN_ORG });
+    });
+
+    it('rejects an orgId outside the caller’s tree with 403 and never opens a txn', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          // Simulates an org that belongs to a DIFFERENT partner — canAccessOrg
+          // returns false for it (buildOrgAccessClosures over this partner's
+          // accessible orgs).
+          canAccessOrg: () => false
+        });
+        return next();
+      });
+
+      const res = await app.request('/roles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Cross-tenant Role',
+          orgId: '33333333-3333-4333-8333-333333333333',
+          permissions: []
+        })
+      });
+
+      expect(res.status).toBe(403);
+      expect(vi.mocked(db.transaction)).not.toHaveBeenCalled();
+    });
+
+    // #3524 Finding 3: the hidden quick_support org is internal-only and must not
+    // hold user-facing roles, even though it sits in the partner's accessible
+    // orgs. resolvePartnerFocusedOrgId drops it, so create 403s.
+    it('rejects an orgId that resolves to the hidden quick_support org', async () => {
+      const QS = '44444444-4444-4444-8444-444444444444';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: (id: string) => id === QS // in the tree, but quick_support
+        });
+        return next();
+      });
+      mockOrgTypeLookup('quick_support'); // resolvePartnerFocusedOrgId sees the type and rejects
+
+      const res = await app.request('/roles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'QS Role', orgId: QS, permissions: [] })
+      });
+
+      expect(res.status).toBe(403);
+      expect(vi.mocked(db.transaction)).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /roles/:id', () => {
+    it('should return a role with permissions and user count', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                {
+                  id: 'role-1',
+                  name: 'Admin',
+                  description: null,
+                  scope: 'partner',
+                  isSystem: true,
+                  parentRoleId: null,
+                  partnerId: null,
+                  orgId: null,
+                  createdAt: new Date(),
+                  updatedAt: new Date()
+                }
+              ])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            innerJoin: vi.fn().mockReturnValue({
+              where: vi.fn().mockResolvedValue([{ resource: 'devices', action: 'view' }])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ count: 2 }])
+          })
+        } as any);
+
+      const res = await app.request('/roles/role-1', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.permissions).toHaveLength(1);
+      expect(body.userCount).toBe(2);
+    });
+
+    // #3524 Finding 2: a partner focused on an org (?orgId=, injected by the web
+    // client) can READ that org's org-scoped role — the whole role lifecycle now
+    // honors the focused org, not just create+list. Without resolveActingScope
+    // this 404s (partner scope can't match an org-scoped role).
+    it('partner with ?orgId can fetch that org’s org-scoped role', async () => {
+      const ORG = '22222222-2222-4222-8222-222222222222';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: (id: string) => id === ORG
+        });
+        return next();
+      });
+      // NOTE the order: the ROLE is read first, and only then is its org
+      // validated. The acting scope is derived from the role's own axis, so the
+      // role has to be in hand before we know which axis to resolve.
+      vi.mocked(db.select)
+        // role lookup
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { id: 'orole-1', name: 'Org Tech', description: null, scope: 'organization', isSystem: false, parentRoleId: null, partnerId: null, orgId: ORG, createdAt: new Date(), updatedAt: new Date() }
+              ])
+            })
+          })
+        } as any);
+      mockOrgTypeLookup('customer'); // resolvePartnerFocusedOrgId, now AFTER the role read
+      vi.mocked(db.select)
+        // permissions
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            innerJoin: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ resource: 'devices', action: 'view' }]) })
+          })
+        } as any)
+        // org user count
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ count: 4 }]) })
+        } as any);
+
+      const res = await app.request(`/roles/orole-1?orgId=${ORG}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.scope).toBe('organization');
+      expect(body.userCount).toBe(4);
+    });
+  });
+
+  describe('PATCH /roles/:id', () => {
+    // #3524 defense-in-depth: a partner acting as org A must not mutate a
+    // A focused org must not become a way to reach another partner's roles: the
+    // partner axis is resolved from the role, and ownership is still asserted
+    // against the caller's own partnerId.
+    it('refuses to PATCH a partner-scoped role owned by a different partner', async () => {
+      const ORG = '22222222-2222-4222-8222-222222222222';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: (id: string) => id === ORG
+        });
+        return next();
+      });
+      // The role belongs to ANOTHER partner. No focused org can reach across
+      // that boundary, so the axis check must still reject it.
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([
+              { id: 'role-x', isSystem: false, scope: 'partner', partnerId: 'partner-OTHER', orgId: ORG }
+            ])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/roles/role-x?orgId=${ORG}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Renamed' })
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    // A partner has umbrella access to every org in its tree, so RLS will
+    // happily return org B's role to a partner focused on org A. The acting
+    // scope must therefore stay bound to the org the REQUEST names: otherwise a
+    // stale role id silently retargets a destructive PATCH at the wrong
+    // customer, while the UI and the audit trail both say org A.
+    it('refuses to PATCH an org role belonging to an org other than the one named in ?orgId=', async () => {
+      const ORG_A = '22222222-2222-4222-8222-222222222222';
+      const ORG_B = '44444444-4444-4444-8444-444444444444';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          // Both orgs are inside this partner's tree.
+          canAccessOrg: (id: string) => id === ORG_A || id === ORG_B
+        });
+        return next();
+      });
+
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([
+              { id: 'orole-B', isSystem: false, scope: 'organization', partnerId: null, orgId: ORG_B }
+            ])
+          })
+        })
+      } as any);
+      mockOrgTypeLookup('customer'); // ORG_A resolves fine — it is just the wrong org
+
+      const res = await app.request(`/roles/orole-B?orgId=${ORG_A}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Renamed' })
+      });
+
+      expect(res.status).toBe(404);
+      expect(vi.mocked(db.transaction)).not.toHaveBeenCalled();
+    });
+
+    // Regression for the #3577 review: `fetchWithAuth` injects `?orgId=` into
+    // EVERY request and `orgStore` auto-selects an org, so a partner admin
+    // always sends one. Deriving the acting scope from that param alone flipped
+    // every request to organization scope and 404'd every partner-scoped role,
+    // while GET /roles kept listing them — a role you could see but never open.
+    it('lets a partner focused on an org still PATCH a PARTNER-scoped role', async () => {
+      const ORG = '22222222-2222-4222-8222-222222222222';
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          scope: 'partner',
+          partnerId: 'partner-123',
+          partnerOrgAccess: 'all',
+          orgId: null,
+          user: { id: 'user-123', email: 'test@example.com' },
+          canAccessOrg: (id: string) => id === ORG
+        });
+        return next();
+      });
+
+      vi.mocked(db.select)
+        // role lookup — partner axis, owned by the caller
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                { id: 'prole-1', isSystem: false, scope: 'partner', partnerId: 'partner-123', orgId: null }
+              ])
+            })
+          })
+        } as any)
+        // getAssignedUserIdsForRoles — resolves on the PARTNER axis, which is
+        // the whole point: a focused org must not send this down the org branch.
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) })
+        } as any)
+        // permissions for the response payload
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            innerJoin: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) })
+          })
+        } as any);
+
+      const txUpdate = vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([
+              { id: 'prole-1', name: 'Renamed', description: null, scope: 'partner', isSystem: false, parentRoleId: null, updatedAt: new Date() }
+            ])
+          })
+        })
+      });
+      vi.mocked(db.transaction).mockImplementation(async (fn: any) =>
+        fn({ update: txUpdate, delete: vi.fn(), insert: vi.fn() } as any)
+      );
+
+      const res = await app.request(`/roles/prole-1?orgId=${ORG}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Renamed' })
+      });
+
+      // Before the fix this was a 404 purely because ?orgId= was present.
+      expect(res.status).toBe(200);
+    });
+
+    it('should update a role and its permissions', async () => {
+      const rolePerms = [{ resource: 'devices', action: 'write' }];
+
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                {
+                  id: 'role-2',
+                  isSystem: false,
+                  scope: 'partner',
+                  partnerId: 'partner-123',
+                  orgId: null
+                }
+              ])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([])
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ userId: 'affected-user-1' }])
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            innerJoin: vi.fn().mockReturnValue({
+              where: vi.fn().mockResolvedValue(rolePerms)
+            })
+          })
+        } as any);
+
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([{ id: 'perm-2' }])
+        })
+      } as any);
+
+      const txUpdate = vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([
+              {
+                id: 'role-2',
+                name: 'Operator',
+                description: null,
+                scope: 'partner',
+                isSystem: false,
+                parentRoleId: null,
+                updatedAt: new Date()
+              }
+            ])
+          })
+        })
+      });
+      const txDelete = vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(undefined)
+      });
+      const txInsert = vi.fn().mockReturnValue({
+        values: vi.fn().mockResolvedValue(undefined)
+      });
+
+      vi.mocked(db.transaction).mockImplementation(async (fn) => {
+        return fn({ update: txUpdate, delete: txDelete, insert: txInsert } as any);
+      });
+
+      const res = await app.request('/roles/role-2', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Operator',
+          permissions: [{ resource: 'devices', action: 'write' }]
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.permissions).toEqual(rolePerms);
+      expect(txDelete).toHaveBeenCalled();
+      expect(txInsert).toHaveBeenCalled();
+      expect(clearPermissionCache).toHaveBeenCalledWith('affected-user-1');
+    });
+
+    it('rejects wildcard permissions in custom role updates', async () => {
+      const res = await app.request('/roles/role-2', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          permissions: [{ resource: '*', action: '*' }]
+        })
+      });
+
+      expect(res.status).toBe(403);
+      expect(vi.mocked(db.transaction)).not.toHaveBeenCalled();
+    });
+
+    it('rejects permissions the caller does not hold', async () => {
+      vi.mocked(getUserPermissions).mockResolvedValueOnce({
+        permissions: [{ resource: 'users', action: 'write' }],
+        partnerId: 'partner-123',
+        orgId: null,
+        roleId: 'role-user-manager',
+        scope: 'partner'
+      } as any);
+
+      const res = await app.request('/roles/role-2', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          permissions: [{ resource: 'devices', action: 'write' }]
+        })
+      });
+
+      expect(res.status).toBe(403);
+      expect(vi.mocked(db.transaction)).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('DELETE /roles/:id', () => {
+    it('should delete a custom role', async () => {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([
+                {
+                  id: 'role-2',
+                  isSystem: false,
+                  scope: 'partner',
+                  partnerId: 'partner-123',
+                  orgId: null
+                }
+              ])
+            })
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ count: 0 }])
+          })
+        } as any)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ count: 0 }])
+          })
+        } as any);
+
+      const txDelete = vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(undefined)
+      });
+      vi.mocked(db.transaction).mockImplementation(async (fn) => {
+        return fn({ delete: txDelete } as any);
+      });
+
+      const res = await app.request('/roles/role-2', {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+    });
+  });
+
+  // Regression guard for issue #801: every entry in ASSIGNABLE_PERMISSIONS must
+  // be accepted by POST /roles. If a future change to the registry breaks this
+  // contract (or the UI rebuilds itself off a stale list), this test catches it
+  // before it ships.
+  describe('POST /roles — ASSIGNABLE_PERMISSIONS coverage (regression for #801)', () => {
+    it.each(REAL_ASSIGNABLE_PERMISSIONS.map((p) => [p.resource, p.action]))(
+      'accepts %s:%s',
+      async (resource, action) => {
+        // Use the real allowlist gate for this loop.
+        vi.mocked(isAssignablePermission).mockImplementation((permission: any) =>
+          REAL_ASSIGNABLE_PERMISSIONS.some(
+            (p) => p.resource === permission.resource && p.action === permission.action
+          )
+        );
+
+        const roleInsertValues = vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([
+            {
+              id: `role-${resource}-${action}`,
+              name: `T-${resource}-${action}`,
+              description: null,
+              scope: 'partner',
+              isSystem: false,
+              parentRoleId: null,
+              createdAt: new Date(),
+              updatedAt: new Date()
+            }
+          ])
+        });
+        const rolePermissionsValues = vi.fn().mockResolvedValue(undefined);
+        const txInsert = vi
+          .fn()
+          .mockReturnValueOnce({ values: roleInsertValues })
+          .mockReturnValueOnce({ values: rolePermissionsValues });
+
+        vi.mocked(db.transaction).mockImplementation(async (fn) => {
+          return fn({ insert: txInsert } as any);
+        });
+
+        // For getOrCreatePermission: first SELECT returns empty, then INSERT returns id.
+        vi.mocked(db.select).mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([])
+            })
+          })
+        } as any);
+        vi.mocked(db.insert).mockReturnValueOnce({
+          values: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{ id: `perm-${resource}-${action}` }])
+          })
+        } as any);
+
+        // Caller has wildcard, so hasPermission allows everything. No need to
+        // remock that.
+        vi.mocked(getUserPermissions).mockResolvedValue({
+          permissions: [{ resource: '*', action: '*' }],
+          partnerId: 'partner-123',
+          orgId: null,
+          roleId: 'role-admin',
+          scope: 'partner'
+        } as any);
+
+        const res = await app.request('/roles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: `T-${resource}-${action}`,
+            permissions: [{ resource, action }]
+          })
+        });
+
+        expect(res.status, `expected 201 for ${resource}:${action}`).toBe(201);
+      }
+    );
+  });
+});

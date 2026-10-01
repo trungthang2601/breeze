@@ -1,0 +1,523 @@
+import { and, eq, isNull, SQL } from 'drizzle-orm';
+import type { z } from 'zod';
+import { patchInlineSettingsSchema, policyAppRuleSchema } from '@breeze/shared/validators';
+import { db } from '../db';
+import { readWithPartnerAxisVisibility } from '../db/partnerAxisRead';
+import { captureException } from './sentry';
+import {
+  configurationPolicies,
+  configPolicyFeatureLinks,
+  configPolicyEffectiveFeatureLinks,
+  configPolicyPatchSettings,
+  patchPolicies,
+} from '../db/schema';
+import type { AuthContext } from '../middleware/auth';
+import { resolvePartnerIdForOrg } from '../routes/patches/helpers';
+
+export type PatchInlineSettings = z.infer<typeof patchInlineSettingsSchema>;
+export type PatchReferenceClassification =
+  | 'valid_ring'
+  | 'legacy_patch_policy'
+  | 'config_policy_uuid'
+  | 'missing_target'
+  | 'null';
+
+export type PatchEffectiveStatus = 'ok' | 'needs_repair' | 'invalid_reference';
+
+export interface PatchInventoryRow {
+  configPolicyId: string;
+  configPolicyName: string;
+  // null for partner-wide policies (#1724).
+  orgId: string | null;
+  featureLinkId: string;
+  referencedTargetId: string | null;
+  classification: PatchReferenceClassification;
+  normalizedSettingsPresent: boolean;
+  inlineSettingsValid: boolean;
+  effectiveStatus: PatchEffectiveStatus;
+}
+
+export interface PatchRingResolution {
+  classification: PatchReferenceClassification;
+  valid: boolean;
+  ringId: string | null;
+  ringName: string | null;
+  categoryRules: Record<string, unknown>[];
+  /** Ring category include allowlist / exclude denylist (#2117). API/AI-only. */
+  categories: string[];
+  excludeCategories: string[];
+  autoApprove: Record<string, unknown> | boolean;
+}
+
+export interface PolicyLocalPatchConfig {
+  /** The policy this config was loaded FOR — the assigned policy. */
+  configPolicyId: string;
+  configPolicyName: string;
+  // null for partner-wide policies (#1724).
+  orgId: string | null;
+  featureLinkId: string;
+  featurePolicyId: string | null;
+  /**
+   * The policy that AUTHORED the patch link (#5080). Equal to `configPolicyId`
+   * for an authored link; the parent's id when the link is inherited. The
+   * scheduler still acts as `configPolicyId` — this is provenance.
+   */
+  sourcePolicyId: string;
+  inherited: boolean;
+  settings: PatchInlineSettings;
+  ring: PatchRingResolution;
+}
+
+export interface PatchInventorySummary {
+  total: number;
+  ok: number;
+  needsRepair: number;
+  invalidReference: number;
+}
+
+/** Coerce a stored text[] column to a clean string[], tolerating null/garbage. */
+function coerceCategoryList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === 'string' && v.length > 0);
+}
+
+export function normalizePatchInlineSettings(settings: unknown): PatchInlineSettings {
+  return patchInlineSettingsSchema.parse(settings ?? {});
+}
+
+export function tryNormalizePatchInlineSettings(settings: unknown): {
+  valid: boolean;
+  settings: PatchInlineSettings;
+} {
+  const parsed = patchInlineSettingsSchema.safeParse(settings ?? {});
+  if (parsed.success) {
+    return { valid: true, settings: parsed.data };
+  }
+  return {
+    valid: false,
+    settings: normalizePatchInlineSettings({}),
+  };
+}
+
+/**
+ * Normalizes the feature link's stored inline JSON for the load path, but —
+ * unlike the bare `tryNormalizePatchInlineSettings` — never *silently*
+ * collapses a corrupt document to defaults. Zod parses the whole document, so
+ * a single malformed field (one bad app entry, a legacy '2:00' scheduleTime)
+ * would otherwise wipe every safety rule (app block/pin rules, deferral) with
+ * nothing in any log, and the executor's fail-closed warnings never fire
+ * because job snapshots are built from this already-sanitized output.
+ *
+ * On whole-document failure this warns + reports to Sentry, then salvages the
+ * JSON-only safety fields per-entry (mirroring the executor's per-entry
+ * posture): each raw `apps` entry that individually passes
+ * `policyAppRuleSchema`, and `autoApproveDeferralDays` when it is a valid
+ * non-negative integer <= 60.
+ */
+function normalizeStoredInlineSettingsWithSalvage(
+  raw: unknown,
+  context: { configPolicyId: string; featureLinkId: string }
+): PatchInlineSettings {
+  const normalized = tryNormalizePatchInlineSettings(raw);
+  if (normalized.valid) return normalized.settings;
+
+  const ident = `config policy ${context.configPolicyId} (feature link ${context.featureLinkId})`;
+  console.warn(
+    `[configPolicyPatching] Stored patch inline settings failed validation for ${ident}; ` +
+      'using defaults and salvaging app rules / deferral per-entry'
+  );
+  captureException(
+    new Error(
+      `Stored patch inline settings failed validation for ${ident}; defaults applied with per-entry salvage`
+    )
+  );
+
+  const settings = normalized.settings;
+  const rawObj: Record<string, unknown> =
+    raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+
+  if (Array.isArray(rawObj.apps)) {
+    const salvagedApps: PatchInlineSettings['apps'] = [];
+    // Same canonical dedup key as patchInlineSettingsSchema's superRefine —
+    // duplicates would make the downstream whole-document re-parse throw.
+    const seenAppKeys = new Set<string>();
+    for (const [index, entry] of rawObj.apps.entries()) {
+      const parsedApp = policyAppRuleSchema.safeParse(entry);
+      if (!parsedApp.success) {
+        console.warn(
+          `[configPolicyPatching] Dropping invalid app rule at index ${index} for ${ident}: ` +
+            parsedApp.error.issues.map((issue) => issue.message).join('; ')
+        );
+        continue;
+      }
+      const canonicalSource = parsedApp.data.source === 'custom' ? 'third_party' : parsedApp.data.source;
+      const key = `${canonicalSource}|${parsedApp.data.packageId.toLowerCase()}`;
+      if (seenAppKeys.has(key)) {
+        console.warn(
+          `[configPolicyPatching] Dropping duplicate app rule at index ${index} for ${ident} (${key})`
+        );
+        continue;
+      }
+      if (salvagedApps.length >= 200) {
+        // patchInlineSettingsSchema caps apps at 200; exceeding it would make
+        // the downstream re-parse throw.
+        console.warn(
+          `[configPolicyPatching] Dropping app rule at index ${index} for ${ident}: salvage cap of 200 reached`
+        );
+        continue;
+      }
+      seenAppKeys.add(key);
+      salvagedApps.push(parsedApp.data);
+    }
+    settings.apps = salvagedApps;
+  }
+
+  const rawDeferral = rawObj.autoApproveDeferralDays;
+  if (
+    typeof rawDeferral === 'number' &&
+    Number.isInteger(rawDeferral) &&
+    rawDeferral >= 0 &&
+    rawDeferral <= 60
+  ) {
+    settings.autoApproveDeferralDays = rawDeferral;
+  }
+
+  return settings;
+}
+
+export async function resolvePatchPolicyReference(
+  // patch_policies is partner-axis (scoped by partner_id, no org_id). Partner-wide
+  // config policies (#1724) carry orgId === null; callers resolve a partnerId from
+  // the org (or, for a partner-wide policy, derive it directly) before calling here,
+  // so a null partnerId short-circuits to the empty/'null' classification just as a
+  // missing featurePolicyId does.
+  partnerId: string | null,
+  featurePolicyId: string | null
+): Promise<PatchRingResolution> {
+  if (!featurePolicyId || !partnerId) {
+    return {
+      classification: 'null',
+      valid: true,
+      ringId: null,
+      ringName: null,
+      categoryRules: [],
+      categories: [],
+      excludeCategories: [],
+      autoApprove: {},
+    };
+  }
+
+  // System context (#2822). `patch_policies` is partner-axis, and the four
+  // routes in routes/configurationPolicies/patchJobs.ts that consume this are
+  // requireScope('organization','partner','system'). Under an org-scoped
+  // caller the read returned zero rows and fell through to
+  // `classification: 'missing_target', valid: false` — so the UI reported a
+  // perfectly good update ring as "invalid" (400 on POST /:id/patch-job,
+  // `ok: 0` on GET /patch-inventory) while the scheduler, which runs
+  // system-scoped, happily executed that same job. Self-tenanted by the
+  // caller-derived `partnerId`, so no cross-partner reach.
+  const [patchPolicy] = await readWithPartnerAxisVisibility(() =>
+    db
+      .select({
+        id: patchPolicies.id,
+        kind: patchPolicies.kind,
+        name: patchPolicies.name,
+        categoryRules: patchPolicies.categoryRules,
+        categories: patchPolicies.categories,
+        excludeCategories: patchPolicies.excludeCategories,
+        autoApprove: patchPolicies.autoApprove,
+      })
+      .from(patchPolicies)
+      .where(and(eq(patchPolicies.id, featurePolicyId), eq(patchPolicies.partnerId, partnerId)))
+      .limit(1)
+  );
+
+  if (patchPolicy) {
+    if (patchPolicy.kind === 'ring') {
+      return {
+        classification: 'valid_ring',
+        valid: true,
+        ringId: patchPolicy.id,
+        ringName: patchPolicy.name,
+        categoryRules: Array.isArray(patchPolicy.categoryRules) ? patchPolicy.categoryRules : [],
+        categories: coerceCategoryList(patchPolicy.categories),
+        excludeCategories: coerceCategoryList(patchPolicy.excludeCategories),
+        autoApprove: (patchPolicy.autoApprove ?? {}) as Record<string, unknown> | boolean,
+      };
+    }
+    return {
+      classification: 'legacy_patch_policy',
+      valid: false,
+      ringId: null,
+      ringName: null,
+      categoryRules: [],
+      categories: [],
+      excludeCategories: [],
+      autoApprove: {},
+    };
+  }
+
+  const [configPolicy] = await db
+    .select({ id: configurationPolicies.id })
+    .from(configurationPolicies)
+    .where(eq(configurationPolicies.id, featurePolicyId))
+    .limit(1);
+
+  if (configPolicy) {
+    return {
+      classification: 'config_policy_uuid',
+      valid: false,
+      ringId: null,
+      ringName: null,
+      categoryRules: [],
+      categories: [],
+      excludeCategories: [],
+      autoApprove: {},
+    };
+  }
+
+  return {
+    classification: 'missing_target',
+    valid: false,
+    ringId: null,
+    ringName: null,
+    categoryRules: [],
+    categories: [],
+    excludeCategories: [],
+    autoApprove: {},
+  };
+}
+
+export async function loadPolicyLocalPatchConfig(
+  configPolicyId: string
+): Promise<PolicyLocalPatchConfig | null> {
+  // EFFECTIVE (#5080). Once the patch scheduler enumerates through the view, a
+  // child that inherits its parent's patch link is discovered as a candidate;
+  // reading the authored table here would return null and silently skip it.
+  // The link id is the parent's when inherited, on purpose — the normalized
+  // `config_policy_patch_settings` join below keys on it unchanged.
+  const [row] = await db
+    .select({
+      configPolicyId: configurationPolicies.id,
+      configPolicyName: configurationPolicies.name,
+      orgId: configurationPolicies.orgId,
+      partnerId: configurationPolicies.partnerId,
+      featureLinkId: configPolicyEffectiveFeatureLinks.id,
+      featurePolicyId: configPolicyEffectiveFeatureLinks.featurePolicyId,
+      storedInlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
+      sourcePolicyId: configPolicyEffectiveFeatureLinks.sourcePolicyId,
+      inherited: configPolicyEffectiveFeatureLinks.inherited,
+      patchSettings: configPolicyPatchSettings,
+    })
+    .from(configurationPolicies)
+    .innerJoin(
+      configPolicyEffectiveFeatureLinks,
+      and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'patch')
+      )
+    )
+    .leftJoin(
+      configPolicyPatchSettings,
+      eq(configPolicyPatchSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id)
+    )
+    .where(eq(configurationPolicies.id, configPolicyId))
+    .limit(1);
+
+  if (!row) return null;
+
+  const storedInline = normalizeStoredInlineSettingsWithSalvage(row.storedInlineSettings, {
+    configPolicyId: row.configPolicyId,
+    featureLinkId: row.featureLinkId,
+  });
+  // Constraint: autoApproveDeferralDays and apps have no columns on
+  // config_policy_patch_settings — they live only in the feature link's
+  // inline JSON. The mixed sourcing below (columns for everything else,
+  // storedInline for these two) is therefore intentional, not an oversight.
+  const settings = row.patchSettings
+    ? normalizePatchInlineSettings({
+        sources: row.patchSettings.sources,
+        autoApprove: row.patchSettings.autoApprove,
+        autoApproveSeverities: row.patchSettings.autoApproveSeverities ?? [],
+        autoApproveDeferralDays: storedInline.autoApproveDeferralDays,
+        apps: storedInline.apps,
+        scheduleFrequency: row.patchSettings.scheduleFrequency,
+        scheduleTime: row.patchSettings.scheduleTime,
+        scheduleDayOfWeek: row.patchSettings.scheduleDayOfWeek ?? undefined,
+        scheduleDayOfMonth: row.patchSettings.scheduleDayOfMonth ?? undefined,
+        offlineBehavior: row.patchSettings.offlineBehavior,
+        rebootPolicy: row.patchSettings.rebootPolicy,
+        rebootDelayMinutes: row.patchSettings.rebootDelayMinutes,
+        rebootAllowDeferral: row.patchSettings.rebootAllowDeferral,
+        rebootMaxDeferrals: row.patchSettings.rebootMaxDeferrals,
+        rebootDeferralMinutes: row.patchSettings.rebootDeferralMinutes,
+        exclusiveWindowsUpdate: row.patchSettings.exclusiveWindowsUpdate,
+      })
+    : storedInline;
+
+  // Partner-wide config policies (#1724) carry partnerId directly and orgId === null;
+  // org-scoped policies derive the partner from their org. Prefer the explicit
+  // partnerId so partner-wide policies still resolve their (partner-axis) patch ring.
+  const partnerId = row.partnerId ?? (row.orgId ? await resolvePartnerIdForOrg(row.orgId) : null);
+  if (!partnerId) {
+    console.warn(
+      `[configPolicyPatching] orphaned org has no partner — cannot resolve patch ring`,
+      { orgId: row.orgId, configPolicyId: row.configPolicyId }
+    );
+    return null;
+  }
+  const ring = await resolvePatchPolicyReference(partnerId, row.featurePolicyId);
+
+  return {
+    configPolicyId: row.configPolicyId,
+    configPolicyName: row.configPolicyName,
+    orgId: row.orgId,
+    featureLinkId: row.featureLinkId,
+    featurePolicyId: row.featurePolicyId,
+    sourcePolicyId: row.sourcePolicyId,
+    inherited: row.inherited,
+    settings,
+    ring,
+  };
+}
+
+export async function backfillMissingPatchSettings(): Promise<{
+  repaired: number;
+  repairedFromInline: number;
+  repairedWithDefaults: number;
+}> {
+  // AUTHORED (#5080): repairs the normalized row behind each real link. Through
+  // the view one parent link would surface once per inheriting child, and this
+  // would try to insert the same feature_link_id several times.
+  const rows = await db
+    .select({
+      featureLinkId: configPolicyFeatureLinks.id,
+      storedInlineSettings: configPolicyFeatureLinks.inlineSettings,
+    })
+    .from(configPolicyFeatureLinks)
+    .leftJoin(
+      configPolicyPatchSettings,
+      eq(configPolicyPatchSettings.featureLinkId, configPolicyFeatureLinks.id)
+    )
+    .where(
+      and(
+        eq(configPolicyFeatureLinks.featureType, 'patch'),
+        isNull(configPolicyPatchSettings.id)
+      )
+    );
+
+  let repaired = 0;
+  let repairedFromInline = 0;
+  let repairedWithDefaults = 0;
+
+  for (const row of rows) {
+    const normalized = tryNormalizePatchInlineSettings(row.storedInlineSettings);
+    await db.insert(configPolicyPatchSettings).values({
+      featureLinkId: row.featureLinkId,
+      sources: normalized.settings.sources,
+      autoApprove: normalized.settings.autoApprove,
+      autoApproveSeverities: normalized.settings.autoApproveSeverities,
+      scheduleFrequency: normalized.settings.scheduleFrequency,
+      scheduleTime: normalized.settings.scheduleTime,
+      scheduleDayOfWeek: normalized.settings.scheduleDayOfWeek,
+      scheduleDayOfMonth: normalized.settings.scheduleDayOfMonth,
+      offlineBehavior: normalized.settings.offlineBehavior,
+      rebootPolicy: normalized.settings.rebootPolicy,
+      rebootDelayMinutes: normalized.settings.rebootDelayMinutes,
+      rebootAllowDeferral: normalized.settings.rebootAllowDeferral,
+      rebootMaxDeferrals: normalized.settings.rebootMaxDeferrals,
+      rebootDeferralMinutes: normalized.settings.rebootDeferralMinutes,
+      exclusiveWindowsUpdate: normalized.settings.exclusiveWindowsUpdate,
+    });
+    repaired += 1;
+    if (normalized.valid) repairedFromInline += 1;
+    else repairedWithDefaults += 1;
+  }
+
+  return { repaired, repairedFromInline, repairedWithDefaults };
+}
+
+async function buildPatchInventory(conditions: SQL[]): Promise<PatchInventoryRow[]> {
+  // AUTHORED (#5080): the editor-facing "which policies have a broken patch
+  // reference" report. It names the policy that must be FIXED, so an inherited
+  // copy of a parent's link would report the same defect once per child.
+  const rows = await db
+    .select({
+      configPolicyId: configurationPolicies.id,
+      configPolicyName: configurationPolicies.name,
+      orgId: configurationPolicies.orgId,
+      partnerId: configurationPolicies.partnerId,
+      featureLinkId: configPolicyFeatureLinks.id,
+      referencedTargetId: configPolicyFeatureLinks.featurePolicyId,
+      storedInlineSettings: configPolicyFeatureLinks.inlineSettings,
+      patchSettingsId: configPolicyPatchSettings.id,
+    })
+    .from(configPolicyFeatureLinks)
+    .innerJoin(configurationPolicies, eq(configPolicyFeatureLinks.configPolicyId, configurationPolicies.id))
+    .leftJoin(configPolicyPatchSettings, eq(configPolicyPatchSettings.featureLinkId, configPolicyFeatureLinks.id))
+    .where(and(...conditions));
+
+  const inventory: PatchInventoryRow[] = [];
+
+  // TODO: batch-fetch patch policy references to avoid N+1 queries
+  for (const row of rows) {
+    // Prefer the policy's own partnerId (set for partner-wide policies, #1724);
+    // fall back to deriving it from the org for org-scoped policies.
+    const rowPartnerId = row.partnerId ?? (row.orgId ? await resolvePartnerIdForOrg(row.orgId) : null);
+    if (!rowPartnerId) {
+      console.warn(
+        `[configPolicyPatching] orphaned org has no partner — classifying as missing_target`,
+        { orgId: row.orgId, configPolicyId: row.configPolicyId }
+      );
+    }
+    const classification = rowPartnerId
+      ? (await resolvePatchPolicyReference(rowPartnerId, row.referencedTargetId)).classification
+      : 'missing_target';
+    const inlineSettingsValid = patchInlineSettingsSchema.safeParse(row.storedInlineSettings ?? {}).success;
+    const normalizedSettingsPresent = Boolean(row.patchSettingsId);
+    const effectiveStatus: PatchEffectiveStatus =
+      classification === 'legacy_patch_policy' ||
+      classification === 'config_policy_uuid' ||
+      classification === 'missing_target'
+        ? 'invalid_reference'
+        : normalizedSettingsPresent && inlineSettingsValid
+          ? 'ok'
+          : 'needs_repair';
+
+    inventory.push({
+      configPolicyId: row.configPolicyId,
+      configPolicyName: row.configPolicyName,
+      orgId: row.orgId,
+      featureLinkId: row.featureLinkId,
+      referencedTargetId: row.referencedTargetId,
+      classification,
+      normalizedSettingsPresent,
+      inlineSettingsValid,
+      effectiveStatus,
+    });
+  }
+
+  return inventory;
+}
+
+export function summarizePatchInventory(rows: PatchInventoryRow[]): PatchInventorySummary {
+  return {
+    total: rows.length,
+    ok: rows.filter((row) => row.effectiveStatus === 'ok').length,
+    needsRepair: rows.filter((row) => row.effectiveStatus === 'needs_repair').length,
+    invalidReference: rows.filter((row) => row.effectiveStatus === 'invalid_reference').length,
+  };
+}
+
+export async function listPatchInventory(auth: AuthContext): Promise<PatchInventoryRow[]> {
+  const conditions: SQL[] = [eq(configPolicyFeatureLinks.featureType, 'patch')];
+  const orgCond = auth.orgCondition(configurationPolicies.orgId as any);
+  if (orgCond) conditions.push(orgCond);
+
+  return buildPatchInventory(conditions);
+}
+
+/** @internal System-only — returns unscoped data across all orgs. Do not call from request handlers. */
+export async function listAllPatchInventory(): Promise<PatchInventoryRow[]> {
+  return buildPatchInventory([eq(configPolicyFeatureLinks.featureType, 'patch')]);
+}

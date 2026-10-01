@@ -1,0 +1,167 @@
+import { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+import { ResponsiveTable, DataCard, CardField, CardActions } from '../shared/ResponsiveTable';
+
+export type Site = {
+  id: string;
+  name: string;
+  timezone: string;
+  deviceCount: number;
+};
+
+/**
+ * Below this many sites the list needs neither a count nor a search box: the
+ * eye takes in the rows faster than it could type a filter, and the chrome
+ * ("1 of 1 sites", an empty search field) read as an unfinished page. Mirrors
+ * `OrgSwitcher`'s `SEARCH_THRESHOLD`. Exported for the test.
+ */
+export const SITE_SEARCH_THRESHOLD = 6;
+
+type SiteListProps = {
+  sites: Site[];
+  onAddSite?: () => void;
+  onEdit?: (site: Site) => void;
+  onDelete?: (site: Site) => void;
+  onSiteClick?: (site: Site) => void;
+};
+
+export default function SiteList({ sites, onAddSite, onEdit, onDelete, onSiteClick }: SiteListProps) {
+  const { t } = useTranslation('settings');
+  const [query, setQuery] = useState('');
+
+  const filteredSites = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+
+    if (!normalizedQuery) {
+      return sites;
+    }
+
+    return sites.filter(site => site.name.toLowerCase().includes(normalizedQuery));
+  }, [query, sites]);
+
+  // Row pieces shared by the desktop table and the mobile cards.
+  const renderSiteName = (site: Site) =>
+    onSiteClick ? (
+      <button
+        type="button"
+        onClick={() => onSiteClick(site)}
+        className="text-left text-primary hover:underline"
+      >
+        {site.name}
+      </button>
+    ) : (
+      site.name
+    );
+
+  const renderActions = (site: Site) => (
+    <div className="flex justify-end gap-2">
+      <button
+        type="button"
+        onClick={() => onSiteClick ? onSiteClick(site) : onEdit?.(site)}
+        aria-label={t('siteList.actions.editSite', { name: site.name })}
+        className="inline-flex h-8 items-center rounded-md border px-2.5 text-xs font-medium hover:bg-muted"
+      >
+        {t('common:actions.edit')}
+      </button>
+      <button
+        type="button"
+        onClick={() => onDelete?.(site)}
+        aria-label={t('siteList.actions.deleteSite', { name: site.name })}
+        className="inline-flex h-8 items-center rounded-md border border-destructive/40 px-2.5 text-xs font-medium text-destructive hover:bg-destructive/10"
+      >
+        {t('common:actions.delete')}
+      </button>
+    </div>
+  );
+
+  return (
+    <div className="rounded-lg border bg-card p-6 shadow-xs">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">
+            {t('siteList.title')}
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            {t('siteList.count', { filtered: filteredSites.length, total: sites.length })}
+          </p>
+        </div>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <input
+            type="search"
+            placeholder={t('siteList.searchPlaceholder')}
+            aria-label={t('siteList.searchPlaceholder')}
+            value={query}
+            onChange={event => setQuery(event.target.value)}
+            className="h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-56"
+          />
+          <button
+            type="button"
+            onClick={onAddSite}
+            className="flex h-9 w-full items-center justify-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground transition hover:opacity-90 sm:w-auto"
+          >
+            {t('siteList.actions.add')}
+          </button>
+        </div>
+      </div>
+
+      <ResponsiveTable
+        className="mt-6"
+        table={
+          <table className="min-w-full divide-y">
+            <thead className="bg-muted/40">
+              <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                <th className="px-4 py-3">{t('common:labels.name')}</th>
+                <th className="px-4 py-3">{t('siteList.columns.timezone')}</th>
+                <th className="px-4 py-3">{t('siteList.columns.devices')}</th>
+                <th className="px-4 py-3 text-right">{t('common:labels.actions')}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {filteredSites.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="px-4 py-6 text-center text-sm text-muted-foreground">
+                    {t('siteList.empty')}
+                  </td>
+                </tr>
+              ) : (
+                filteredSites.map(site => (
+                  <tr key={site.id} className="transition hover:bg-muted/40">
+                    <td className="px-4 py-3 text-sm font-medium">{renderSiteName(site)}</td>
+                    <td className="px-4 py-3 text-sm">{site.timezone}</td>
+                    <td className="px-4 py-3 text-sm tabular-nums">{site.deviceCount}</td>
+                    <td className="px-4 py-3 text-right">{renderActions(site)}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        }
+        cards={
+          filteredSites.length === 0 ? (
+            <DataCard>
+              <p className="py-2 text-center text-sm text-muted-foreground">
+                {t('siteList.empty')}
+              </p>
+            </DataCard>
+          ) : (
+            filteredSites.map(site => (
+              <DataCard key={site.id}>
+                <div className="text-sm font-semibold">{renderSiteName(site)}</div>
+                <div className="mt-3 space-y-2 border-t pt-3">
+                  <CardField label={t('siteList.columns.timezone')}>
+                    <span className="text-sm">{site.timezone}</span>
+                  </CardField>
+                  <CardField label={t('siteList.columns.devices')}>
+                    <span className="text-sm">{site.deviceCount}</span>
+                  </CardField>
+                </div>
+                <CardActions>{renderActions(site)}</CardActions>
+              </DataCard>
+            ))
+          )
+        }
+      />
+    </div>
+  );
+}

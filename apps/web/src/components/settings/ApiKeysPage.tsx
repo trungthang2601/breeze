@@ -1,0 +1,392 @@
+import '@/lib/i18n';
+import { useTranslation } from 'react-i18next';
+import { useState, useEffect, useCallback } from 'react';
+import ApiKeyList, { type ApiKey } from './ApiKeyList';
+import ApiKeyForm, { CreatedKeyModal, type ApiKeyFormValues } from './ApiKeyForm';
+import { fetchWithAuth } from '../../stores/auth';
+import { useOrgStore } from '../../stores/orgStore';
+import { navigateTo } from '@/lib/navigation';
+
+type ModalMode = 'closed' | 'create' | 'view' | 'rotate' | 'revoke';
+
+export default function ApiKeysPage() {
+  const { t } = useTranslation('settings');
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [modalMode, setModalMode] = useState<ModalMode>('closed');
+  const [selectedKey, setSelectedKey] = useState<ApiKey | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [createdKey, setCreatedKey] = useState<string | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [isAdmin, setIsAdmin] = useState(false);
+  // API keys are org-scoped objects. With an org context the key inherits it;
+  // in fleet view (no org selected) the create form asks for the target org
+  // up front instead of erroring after submit.
+  const currentOrgId = useOrgStore((s) => s.currentOrgId);
+  const organizations = useOrgStore((s) => s.organizations);
+
+  const fetchApiKeys = useCallback(async (page = 1) => {
+    try {
+      setLoading(true);
+      setError(undefined);
+      const response = await fetchWithAuth(`/api-keys?page=${page}`);
+      if (!response.ok) {
+        if (response.status === 401) {
+          void navigateTo('/login', { replace: true });
+          return;
+        }
+        throw new Error(t('apiKeysPage.failedToFetchAPIKeys'));
+      }
+      const data = await response.json();
+      setApiKeys(data.data ?? data.apiKeys ?? []);
+      const pagination = data.pagination;
+      if (pagination) {
+        setTotalPages(Math.ceil(pagination.total / pagination.limit) || 1);
+        setCurrentPage(pagination.page ?? page);
+      }
+      setIsAdmin(data.isAdmin ?? false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('apiKeysPage.anErrorOccurred'));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchApiKeys();
+  }, [fetchApiKeys]);
+
+  const handleCreate = () => {
+    setSelectedKey(null);
+    setModalMode('create');
+  };
+
+  const handleView = (apiKey: ApiKey) => {
+    setSelectedKey(apiKey);
+    setModalMode('view');
+  };
+
+  const handleRotate = (apiKey: ApiKey) => {
+    setSelectedKey(apiKey);
+    setModalMode('rotate');
+  };
+
+  const handleRevoke = (apiKey: ApiKey) => {
+    setSelectedKey(apiKey);
+    setModalMode('revoke');
+  };
+
+  const handleCloseModal = () => {
+    setModalMode('closed');
+    setSelectedKey(null);
+  };
+
+  const handleCloseCreatedKeyModal = () => {
+    setCreatedKey(null);
+  };
+
+  const handlePageChange = (page: number) => {
+    fetchApiKeys(page);
+  };
+
+  const handleCreateSubmit = async (values: ApiKeyFormValues) => {
+    setSubmitting(true);
+    try {
+      const targetOrgId = values.orgId ?? currentOrgId;
+      if (!targetOrgId) {
+        throw new Error(t('apiKeysPage.noOrganizationSelected'));
+      }
+      const response = await fetchWithAuth('/api-keys', {
+        method: 'POST',
+        body: JSON.stringify({ ...values, orgId: targetOrgId })
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => null);
+        throw new Error(err?.error || t('apiKeysPage.failedToCreateAPIKey'));
+      }
+
+      const data = await response.json();
+      setCreatedKey(data.key);
+      await fetchApiKeys(currentPage);
+      handleCloseModal();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('apiKeysPage.anErrorOccurred'));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleConfirmRotate = async () => {
+    if (!selectedKey) return;
+
+    setSubmitting(true);
+    try {
+      const response = await fetchWithAuth(`/api-keys/${selectedKey.id}/rotate`, {
+        method: 'POST'
+      });
+
+      if (!response.ok) {
+        throw new Error(t('apiKeysPage.failedToRotateAPIKey'));
+      }
+
+      const data = await response.json();
+      setCreatedKey(data.key);
+      await fetchApiKeys(currentPage);
+      handleCloseModal();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('apiKeysPage.anErrorOccurred'));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleConfirmRevoke = async () => {
+    if (!selectedKey) return;
+
+    setSubmitting(true);
+    try {
+      const response = await fetchWithAuth(`/api-keys/${selectedKey.id}`, {
+        method: 'DELETE'
+      });
+
+      if (!response.ok) {
+        throw new Error(t('apiKeysPage.failedToRevokeAPIKey'));
+      }
+
+      await fetchApiKeys(currentPage);
+      handleCloseModal();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('apiKeysPage.anErrorOccurred'));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('apiKeysPage.loadingAPIKeys')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && apiKeys.length === 0) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        <button
+          type="button"
+          onClick={() => fetchApiKeys()}
+          className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+        >
+          {t('apiKeysPage.tryAgain')}</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">{t('apiKeysPage.aPIKeys')}</h1>
+          <p className="text-muted-foreground">
+            {t('apiKeysPage.manageAPIKeysForProgrammaticAccessToYourAccount')}</p>
+        </div>
+        <button
+          type="button"
+          onClick={handleCreate}
+          className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90"
+        >
+          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+          </svg>
+          {t('apiKeysPage.createKey')}</button>
+      </div>
+
+      {error && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      <ApiKeyList
+        apiKeys={apiKeys}
+        onView={handleView}
+        onRotate={handleRotate}
+        onRevoke={handleRevoke}
+        currentPage={currentPage}
+        totalPages={totalPages}
+        onPageChange={handlePageChange}
+      />
+
+      {/* Create Modal */}
+      {modalMode === 'create' && (
+        <ApiKeyForm
+          isOpen
+          onSubmit={handleCreateSubmit}
+          onCancel={handleCloseModal}
+          loading={submitting}
+          title={t('apiKeysPage.createAPIKey')}
+          description={t('apiKeysPage.createANewAPIKeyWithSpecificPermissions')}
+          isAdmin={isAdmin}
+          organizations={!currentOrgId ? organizations : undefined}
+        />
+      )}
+
+      {/* View Modal */}
+      {modalMode === 'view' && selectedKey && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
+          <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-xs">
+            <h2 className="text-lg font-semibold">{t('apiKeysPage.aPIKeyDetails')}</h2>
+            <div className="mt-4 space-y-4">
+              <div>
+                <label className="text-xs font-medium uppercase text-muted-foreground">{t('apiKeysPage.name')}</label>
+                <p className="mt-1 text-sm font-medium">{selectedKey.name}</p>
+              </div>
+              <div>
+                <label className="text-xs font-medium uppercase text-muted-foreground">{t('apiKeysPage.keyPrefix')}</label>
+                <p className="mt-1 font-mono text-sm">{selectedKey.keyPrefix}...</p>
+              </div>
+              <div>
+                <label className="text-xs font-medium uppercase text-muted-foreground">{t('apiKeysPage.status')}</label>
+                <p className="mt-1 text-sm capitalize">{selectedKey.status}</p>
+              </div>
+              <div>
+                <label className="text-xs font-medium uppercase text-muted-foreground">{t('apiKeysPage.scopes')}</label>
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {selectedKey.scopes.map(scope => (
+                    <span
+                      key={scope}
+                      className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-xs font-medium"
+                    >
+                      {scope}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-medium uppercase text-muted-foreground">{t('apiKeysPage.created')}</label>
+                  <p className="mt-1 text-sm">
+                    {new Date(selectedKey.createdAt).toLocaleDateString()}
+                  </p>
+                </div>
+                <div>
+                  <label className="text-xs font-medium uppercase text-muted-foreground">{t('apiKeysPage.lastUsed')}</label>
+                  <p className="mt-1 text-sm">
+                    {selectedKey.lastUsedAt
+                      ? new Date(selectedKey.lastUsedAt).toLocaleDateString()
+                      : t('apiKeysPage.never')}
+                  </p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-medium uppercase text-muted-foreground">{t('apiKeysPage.expires')}</label>
+                  <p className="mt-1 text-sm">
+                    {selectedKey.expiresAt
+                      ? new Date(selectedKey.expiresAt).toLocaleDateString()
+                      : t('apiKeysPage.never')}
+                  </p>
+                </div>
+                <div>
+                  <label className="text-xs font-medium uppercase text-muted-foreground">{t('apiKeysPage.rateLimit')}</label>
+                  <p className="mt-1 text-sm">
+                    {selectedKey.rateLimit
+                      ? t('apiKeysPage.requestsPerHour', { count: selectedKey.rateLimit })
+                      : t('apiKeysPage.default')}
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="mt-6 flex justify-end">
+              <button
+                type="button"
+                onClick={handleCloseModal}
+                className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+              >
+                {t('apiKeysPage.close')}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Rotate Confirmation Modal */}
+      {modalMode === 'rotate' && selectedKey && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
+          <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-xs">
+            <h2 className="text-lg font-semibold">{t('apiKeysPage.rotateAPIKey')}</h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t('apiKeysPage.areYouSureYouWantToRotate')}{' '}
+              <span className="font-medium">{selectedKey.name}</span>{t('apiKeysPage.thisWillGenerateANewKeyAndInvalidateTheCurrentOneImmedia')}</p>
+            <div className="mt-4 rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+              <p className="text-xs text-amber-800">
+                {t('apiKeysPage.anyApplicationsUsingThisKeyWillNeedToBeUpdatedWithTheNew')}</p>
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={handleCloseModal}
+                className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+              >
+                {t('apiKeysPage.cancel')}</button>
+              <button
+                type="button"
+                onClick={handleConfirmRotate}
+                disabled={submitting}
+                className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {submitting ? t('apiKeysPage.rotating') : t('apiKeysPage.rotateKey')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Revoke Confirmation Modal */}
+      {modalMode === 'revoke' && selectedKey && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 px-4 py-8">
+          <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-xs">
+            <h2 className="text-lg font-semibold">{t('apiKeysPage.revokeAPIKey')}</h2>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t('apiKeysPage.areYouSureYouWantToRevoke')}{' '}
+              <span className="font-medium">{selectedKey.name}</span>{t('apiKeysPage.thisActionCannotBeUndone')}</p>
+            <div className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 p-3">
+              <p className="text-xs text-destructive">
+                {t('apiKeysPage.anyApplicationsUsingThisKeyWillImmediatelyLoseAccess')}</p>
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={handleCloseModal}
+                className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+              >
+                {t('apiKeysPage.cancel')}</button>
+              <button
+                type="button"
+                onClick={handleConfirmRevoke}
+                disabled={submitting}
+                className="inline-flex h-10 items-center justify-center rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {submitting ? t('apiKeysPage.revoking') : t('apiKeysPage.revokeKey')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Created Key Modal */}
+      <CreatedKeyModal
+        isOpen={!!createdKey}
+        apiKey={createdKey ?? ''}
+        onClose={handleCloseCreatedKeyModal}
+      />
+    </div>
+  );
+}

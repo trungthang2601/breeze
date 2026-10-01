@@ -1,0 +1,160 @@
+import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, customType, primaryKey, integer, bigint } from 'drizzle-orm/pg-core';
+import { partners, organizations } from './orgs';
+
+// Postgres `bytea` mapped to a Node Buffer. postgres.js returns bytea columns
+// as Buffers and accepts Buffers/Uint8Arrays on write, so this is a thin
+// pass-through. Postgres TOASTs values over ~2 KB out-of-line, so wide blobs
+// don't bloat the base row — but SELECTs naming the column still pay the full
+// read; size-only checks should use octet_length() instead.
+export const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType() {
+    return 'bytea';
+  },
+});
+
+export const userStatusEnum = pgEnum('user_status', ['active', 'invited', 'disabled']);
+export const roleScopeEnum = pgEnum('role_scope', ['system', 'partner', 'organization']);
+export const orgAccessEnum = pgEnum('org_access', ['all', 'selected', 'none']);
+export const mfaMethodEnum = pgEnum('mfa_method', ['totp', 'sms', 'passkey']);
+
+export const users = pgTable('users', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  // Primary tenant: every user belongs to exactly one MSP (partner).
+  // partnerId is always set; orgId is NULL for partner-level staff and
+  // set for customer-org users (or for the MSP's own internal-org staff).
+  // A composite FK on (org_id, partner_id) → organizations(id, partner_id)
+  // enforces that the org, when set, belongs to the user's partner.
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  orgId: uuid('org_id').references(() => organizations.id),
+  email: varchar('email', { length: 255 }).notNull().unique(),
+  name: varchar('name', { length: 255 }).notNull(),
+  passwordHash: text('password_hash'),
+  mfaSecret: text('mfa_secret'),
+  mfaEnabled: boolean('mfa_enabled').notNull().default(false),
+  mfaRecoveryCodes: jsonb('mfa_recovery_codes'),
+  phoneNumber: text('phone_number'),
+  phoneVerified: boolean('phone_verified').notNull().default(false),
+  mfaMethod: mfaMethodEnum('mfa_method'),
+  status: userStatusEnum('status').notNull().default('invited'),
+  // Why the user is disabled. 'partner_suspended' is set by partner suspension
+  // so unsuspend re-enables exactly those users; NULL means disabled for some
+  // other reason (compromise, off-boarding, manual admin action) and unsuspend
+  // must leave them alone. See #917 (L-5).
+  disabledReason: text('disabled_reason'),
+  // avatarUrl holds the internal serving URL (`/api/v1/users/<id>/avatar`) when
+  // an avatar exists, NULL otherwise. The bytes live in avatarData (bytea) on
+  // this same row — stored in the DB rather than a filesystem volume so uploads
+  // work across replicas and don't depend on volume permissions (#1059).
+  avatarUrl: text('avatar_url'),
+  avatarData: bytea('avatar_data'),
+  avatarMime: text('avatar_mime'),
+  // timestamptz in the migration — withTimezone must match or db:check-drift
+  // flags it (the sibling users timestamps are legacy timestamp-without-tz).
+  avatarUpdatedAt: timestamp('avatar_updated_at', { withTimezone: true }),
+  lastLoginAt: timestamp('last_login_at'),
+  passwordChangedAt: timestamp('password_changed_at'),
+  setupCompletedAt: timestamp('setup_completed_at'),
+  preferences: jsonb('preferences'),
+  emailVerifiedAt: timestamp('email_verified_at'),
+  // Platform-level admin flag — bootstrapped from BREEZE_PLATFORM_ADMINS env
+  // var at API startup, gates the cross-tenant /admin/* endpoints (e.g.
+  // suspend-for-abuse). Intentionally lives outside the partner role system.
+  isPlatformAdmin: boolean('is_platform_admin').notNull().default(false),
+  // Durable authentication-state epochs (core-auth hardening PR 1). Advanced by
+  // services/authLifecycle.ts inside the same transaction as the mutation that
+  // invalidates prior credentials. Access/refresh JWTs carry auth_epoch +
+  // mfa_epoch; a stale claim is rejected in authMiddleware / on /refresh.
+  authEpoch: integer('auth_epoch').notNull().default(1),
+  mfaEpoch: integer('mfa_epoch').notNull().default(1),
+  emailEpoch: integer('email_epoch').notNull().default(1),
+  permissionsEpoch: bigint('permissions_epoch', { mode: 'number' }).notNull().default(0),
+  // SR2-17: the address the user has ASKED to move to. users.email remains the
+  // verified, authoritative identity (login, password reset, CF Access and SSO
+  // all match on it and MUST NOT match this) until a purpose='email_change'
+  // verification token proves control of this address. Cleared on commit and on
+  // cancellation. Deliberately not unique — see the migration.
+  pendingEmail: varchar('pending_email', { length: 255 }),
+  pendingEmailRequestedAt: timestamp('pending_email_requested_at', { withTimezone: true }),
+  passwordResetEpoch: integer('password_reset_epoch').notNull().default(1),
+  // #5306 — MFA enrolment grace (services/mfaEnrollmentGrace.ts). A single,
+  // NONRENEWABLE grant: mfaEnrollmentDeadline is written exactly once (the
+  // grant statement matches only `IS NULL`), so nothing — re-login, a role
+  // change, an admin factor reset, the kill switch toggling — can reopen or
+  // extend a window. The effective deadline is
+  // min(deadline, grantedAt + partner security.mfaEnrollmentGraceDays), so a
+  // partner may shorten an in-flight window but never lengthen it.
+  mfaEnrollmentDeadline: timestamp('mfa_enrollment_deadline', { withTimezone: true }),
+  mfaEnrollmentGraceGrantedAt: timestamp('mfa_enrollment_grace_granted_at', { withTimezone: true }),
+  // Claim stamps for the two nudges, written only AFTER a successful send so a
+  // failed delivery retries on the next sweep instead of being suppressed.
+  mfaEnrollmentNoticeSentAt: timestamp('mfa_enrollment_notice_sent_at', { withTimezone: true }),
+  mfaEnrollmentRemindedAt: timestamp('mfa_enrollment_reminded_at', { withTimezone: true }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+});
+
+export const roles = pgTable('roles', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').references(() => partners.id),
+  orgId: uuid('org_id').references(() => organizations.id),
+  parentRoleId: uuid('parent_role_id'),
+  scope: roleScopeEnum('scope').notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  description: text('description'),
+  isSystem: boolean('is_system').notNull().default(false),
+  // When true, members of this role must have MFA enabled — the auth
+  // middleware short-circuits to 428 Precondition Required until they
+  // complete enrollment. Used to satisfy the cyber-insurance baseline
+  // "MFA enforced on admin accounts." Seeded true for the privileged
+  // partner-admin slug.
+  forceMfa: boolean('force_mfa').notNull().default(false),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+});
+
+export const permissions = pgTable('permissions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  resource: varchar('resource', { length: 100 }).notNull(),
+  action: varchar('action', { length: 50 }).notNull(),
+  description: text('description')
+});
+
+export const rolePermissions = pgTable('role_permissions', {
+  roleId: uuid('role_id').notNull().references(() => roles.id),
+  permissionId: uuid('permission_id').notNull().references(() => permissions.id),
+  constraints: jsonb('constraints')
+}, (t) => ({
+  // A role holds a given permission at most once. Composite PK both de-dups and
+  // makes the seed's ON-conflict (23505) path real, so re-seeding is idempotent.
+  pk: primaryKey({ columns: [t.roleId, t.permissionId] })
+}));
+
+export const partnerUsers = pgTable('partner_users', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  userId: uuid('user_id').notNull().references(() => users.id),
+  roleId: uuid('role_id').notNull().references(() => roles.id),
+  orgAccess: orgAccessEnum('org_access').notNull().default('none'),
+  orgIds: uuid('org_ids').array(),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+});
+
+export const organizationUsers = pgTable('organization_users', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  userId: uuid('user_id').notNull().references(() => users.id),
+  roleId: uuid('role_id').notNull().references(() => roles.id),
+  siteIds: uuid('site_ids').array(),
+  deviceGroupIds: uuid('device_group_ids').array(),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+});
+
+export const sessions = pgTable('sessions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').notNull().references(() => users.id),
+  tokenHash: text('token_hash').notNull(),
+  ipAddress: varchar('ip_address', { length: 45 }),
+  userAgent: text('user_agent'),
+  expiresAt: timestamp('expires_at').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+});

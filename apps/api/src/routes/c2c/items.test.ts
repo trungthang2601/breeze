@@ -1,0 +1,202 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+
+import { c2cItemsRoutes } from './items';
+
+const ORG_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const { permissionGate, mfaGate } = vi.hoisted(() => ({
+  permissionGate: { deny: false },
+  mfaGate: { deny: false },
+}));
+
+function chainMock(resolvedValue: unknown = []) {
+  const chain: Record<string, any> = {};
+  for (const method of ['from', 'where', 'limit', 'returning', 'values']) {
+    chain[method] = vi.fn(() => Object.assign(Promise.resolve(resolvedValue), chain));
+  }
+  return Object.assign(Promise.resolve(resolvedValue), chain);
+}
+
+const selectMock = vi.fn(() => chainMock([]));
+const insertMock = vi.fn(() => chainMock([]));
+const captureSubjectMock = vi.fn();
+
+vi.mock('../../db', () => ({
+  db: {
+    select: (...args: unknown[]) => selectMock(...(args as [])),
+    insert: (...args: unknown[]) => insertMock(...(args as [])),
+  },
+  runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+}));
+
+vi.mock('../../db/schema', () => ({
+  c2cBackupItems: {
+    id: 'c2c_backup_items.id',
+    orgId: 'c2c_backup_items.org_id',
+    configId: 'c2c_backup_items.config_id',
+  },
+  c2cBackupJobs: {
+    id: 'c2c_backup_jobs.id',
+    orgId: 'c2c_backup_jobs.org_id',
+    configId: 'c2c_backup_jobs.config_id',
+    status: 'c2c_backup_jobs.status',
+    createdAt: 'c2c_backup_jobs.created_at',
+    updatedAt: 'c2c_backup_jobs.updated_at',
+    startedAt: 'c2c_backup_jobs.started_at',
+    completedAt: 'c2c_backup_jobs.completed_at',
+    itemsProcessed: 'c2c_backup_jobs.items_processed',
+    errorLog: 'c2c_backup_jobs.error_log',
+  },
+  c2cConnections: {
+    id: 'c2c_connections.id',
+    orgId: 'c2c_connections.org_id',
+  },
+}));
+
+vi.mock('../../services/auditEvents', () => ({
+  writeRouteAudit: vi.fn(),
+}));
+
+vi.mock('../../services/recoveryAuthorizationSubject', () => ({
+  captureRecoveryAuthorizationSubject: (...args: unknown[]) => captureSubjectMock(...args),
+}));
+
+const queueAddMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('../../jobs/c2cEnqueue', () => ({
+  enqueueC2cRestore: vi.fn((...args: unknown[]) => queueAddMock(...(args as []))),
+}));
+
+let authState = {
+  user: { id: 'user-123' },
+  scope: 'organization' as const,
+  partnerId: null,
+  orgId: ORG_ID,
+  token: { sub: 'user-123' },
+};
+
+vi.mock('../../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', authState);
+    return next();
+  }),
+  requirePermission: vi.fn(() => (c: any, next: any) => {
+    if (permissionGate.deny) {
+      return c.json({ error: 'Permission denied' }, 403);
+    }
+    return next();
+  }),
+  requireMfa: vi.fn(() => (c: any, next: any) => {
+    if (mfaGate.deny) {
+      return c.json({ error: 'MFA required' }, 403);
+    }
+    return next();
+  }),
+}));
+
+import { authMiddleware } from '../../middleware/auth';
+
+describe('c2c items routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    permissionGate.deny = false;
+    mfaGate.deny = false;
+    captureSubjectMock.mockResolvedValue({
+      authorizationPrincipalKind: 'user_session',
+      authorizationPrincipalId: 'user-123',
+      authorizationGrantRevision: 'rev-1',
+      authorizationState: 'pending',
+      authorizationDenialCode: null,
+      authorizationCheckedAt: null,
+    });
+    app = new Hono();
+    app.use('*', authMiddleware);
+    app.route('/c2c', c2cItemsRoutes);
+  });
+
+  it('requires explicit write permission and MFA before restoring C2C items', async () => {
+    permissionGate.deny = true;
+    const deniedPermission = await app.request('/c2c/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        itemIds: ['11111111-1111-4111-8111-111111111111'],
+      }),
+    });
+    expect(deniedPermission.status).toBe(403);
+
+    permissionGate.deny = false;
+    mfaGate.deny = true;
+    const deniedMfa = await app.request('/c2c/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        itemIds: ['11111111-1111-4111-8111-111111111111'],
+      }),
+    });
+    expect(deniedMfa.status).toBe(403);
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(queueAddMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects restore requests that span multiple configs', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([
+        { id: '11111111-1111-4111-8111-111111111111', configId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' },
+        { id: '22222222-2222-4222-8222-222222222222', configId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' },
+      ])
+    );
+
+    const res = await app.request('/c2c/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        itemIds: [
+          '11111111-1111-4111-8111-111111111111',
+          '22222222-2222-4222-8222-222222222222',
+        ],
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: 'All restore items must belong to the same backup configuration',
+    });
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(queueAddMock).not.toHaveBeenCalled();
+  });
+
+  it('persists restore kind and the live request subject before enqueue', async () => {
+    const itemId = '11111111-1111-4111-8111-111111111111';
+    const insertChain = chainMock([{
+      id: '44444444-4444-4444-8444-444444444444',
+      status: 'pending',
+      createdAt: new Date('2026-08-24T12:00:00.000Z'),
+    }]);
+    selectMock.mockReturnValueOnce(chainMock([{ id: itemId, configId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }]));
+    insertMock.mockReturnValueOnce(insertChain);
+
+    const response = await app.request('/c2c/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ itemIds: [itemId] }),
+    });
+
+    expect(response.status).toBe(201);
+    expect(captureSubjectMock).toHaveBeenCalledWith(
+      authState,
+      ORG_ID,
+      expect.objectContaining({ operation: 'c2c_restore', requiredAiTool: 'restore_c2c_items' }),
+    );
+    expect(insertChain.values).toHaveBeenCalledWith(expect.objectContaining({
+      operationKind: 'restore',
+      authorizationPrincipalKind: 'user_session',
+      authorizationPrincipalId: 'user-123',
+      authorizationGrantRevision: 'rev-1',
+    }));
+    expect(queueAddMock).toHaveBeenCalledOnce();
+  });
+});

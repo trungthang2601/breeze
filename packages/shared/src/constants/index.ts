@@ -1,0 +1,166 @@
+export * from './errorCodes';
+// Permission registry (resource:action grants) + derived literal-union types.
+export * from './permissions';
+
+// Canonical configuration-policy feature types (single source of truth shared
+// by api, agent helpers, and the web layer). See ./configFeatureTypes.ts (#2004).
+export * from './configFeatureTypes';
+
+// Canonical in-app notification types shared by API filters and web UI.
+export * from './notificationTypes';
+
+// Agent file-transfer caps mirrored from the Go agent, so the web layer can
+// pre-flight a transfer instead of learning the limit from a failed round trip.
+export * from './agentFileTransfer';
+// HP CMSL licence identifier — the thing a warranty feature link's recorded
+// consent is compared against (#5511 D2). Leaf module, no imports.
+export * from './hpCmsl';
+
+// OS Types
+export const OS_TYPES = ['windows', 'macos', 'linux'] as const;
+
+// Device Status
+export const DEVICE_STATUSES = ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending'] as const;
+
+// Alert Severities
+export const ALERT_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
+
+// Alert Statuses
+export const ALERT_STATUSES = ['active', 'acknowledged', 'resolved', 'suppressed', 'dismissed'] as const;
+
+// Script Languages
+export const SCRIPT_LANGUAGES = ['powershell', 'bash', 'python', 'cmd'] as const;
+
+// Script Run As
+export const SCRIPT_RUN_AS = ['system', 'user', 'elevated'] as const;
+
+// Execution Statuses — canonical source is ../types (EXECUTION_STATUSES), which
+// also carries the transient 'cancelling' state (#3525). Re-exported here so
+// existing `from '../constants'` imports keep working.
+export { EXECUTION_STATUSES } from '../types';
+
+// Role Scopes
+export const ROLE_SCOPES = ['system', 'partner', 'organization'] as const;
+
+// User Statuses
+export const USER_STATUSES = ['active', 'invited', 'disabled'] as const;
+
+// Notification Channel Types
+export const NOTIFICATION_CHANNEL_TYPES = ['email', 'slack', 'teams', 'webhook', 'pagerduty', 'sms', 'pushover'] as const;
+
+// Audit Actor Types — the runtime source for the `actor_type` Postgres enum,
+// the shared `ActorType` union, the audit query validator, the AI tool schemas
+// and the OpenAPI spec. 'agent' is the Go device agent; 'ai_agent' is the
+// autonomous AI agent principal.
+//
+// Widen HERE and nowhere else. Type positions pick the new value up for free;
+// the two runtime surfaces that cannot (the Drizzle `pgEnum` and the OpenAPI
+// JSON) are pinned by apps/api/src/db/schema/audit.enums.test.ts. A new value
+// still needs a migration (`ALTER TYPE ... ADD VALUE`) — the Postgres type is
+// authored by hand-written SQL and is NOT derived from this array (#3908).
+export const ACTOR_TYPES = ['user', 'api_key', 'agent', 'system', 'ai_agent'] as const;
+
+// Audit Results — same contract as ACTOR_TYPES above, for the `audit_result`
+// Postgres enum. 'dispatched' is the neutral outcome for commands audited at
+// enqueue time, before the agent has reported back — see commandQueue.ts and
+// issue #4225. It must never be conflated with 'success': the dispatch-time
+// audit row cannot yet know whether the command actually succeeded.
+export const AUDIT_RESULTS = ['success', 'failure', 'denied', 'dispatched'] as const;
+
+// Remote Session Types
+export const REMOTE_SESSION_TYPES = ['terminal', 'desktop', 'file_transfer'] as const;
+
+// Partner Plans
+export const PARTNER_PLANS = ['free', 'pro', 'enterprise', 'unlimited'] as const;
+
+// Built-in Permissions
+export const PERMISSIONS = {
+  DEVICES: {
+    READ: 'devices:read',
+    WRITE: 'devices:write',
+    DELETE: 'devices:delete',
+    EXECUTE: 'devices:execute'
+  },
+  SCRIPTS: {
+    READ: 'scripts:read',
+    WRITE: 'scripts:write',
+    DELETE: 'scripts:delete',
+    EXECUTE: 'scripts:execute'
+  },
+  ALERTS: {
+    READ: 'alerts:read',
+    WRITE: 'alerts:write',
+    ACKNOWLEDGE: 'alerts:acknowledge',
+    RESOLVE: 'alerts:resolve'
+  },
+  AUTOMATIONS: {
+    READ: 'automations:read',
+    WRITE: 'automations:write',
+    DELETE: 'automations:delete',
+    EXECUTE: 'automations:execute'
+  },
+  USERS: {
+    READ: 'users:read',
+    WRITE: 'users:write',
+    DELETE: 'users:delete',
+    ADMIN: 'users:admin'
+  },
+  ORGS: {
+    READ: 'orgs:read',
+    WRITE: 'orgs:write',
+    DELETE: 'orgs:delete',
+    ADMIN: 'orgs:admin'
+  },
+  AUDIT: {
+    READ: 'audit:read',
+    EXPORT: 'audit:export'
+  },
+  REMOTE: {
+    TERMINAL: 'remote:terminal',
+    DESKTOP: 'remote:desktop',
+    FILE_TRANSFER: 'remote:file_transfer'
+  }
+} as const;
+
+// Default heartbeat interval (seconds)
+export const DEFAULT_HEARTBEAT_INTERVAL = 60;
+
+// Default metrics collection interval (seconds)
+export const DEFAULT_METRICS_INTERVAL = 30;
+
+// Default script timeout (seconds)
+export const DEFAULT_SCRIPT_TIMEOUT = 300;
+
+// Default alert cooldown (minutes)
+export const DEFAULT_ALERT_COOLDOWN = 15;
+
+// Default policy check interval (minutes)
+export const DEFAULT_POLICY_CHECK_INTERVAL = 60;
+
+// Pagination defaults
+export const DEFAULT_PAGE_SIZE = 50;
+export const MAX_PAGE_SIZE = 100;
+
+// Max ids accepted by a single bulk billing action (quotes/invoices/contracts).
+// Each id runs sequentially in its own short transaction, so this bounds both
+// request latency and connection-pool pressure. Shared by the Zod request
+// schemas (server enforcement) and the web bulk runners (client-side guard +
+// friendly message) so the two can never drift.
+export const BULK_ID_LIMIT = 50;
+
+// Hard cap on one AI-agent approvals batch decide (services/approvals/
+// batchDecide.ts's `BATCH_MAX`, which re-exports this). Matches the inbox
+// page size, so "select everything on this page" is always expressible in
+// one call. Shared by the server's enforcement (`loadHomogeneousBatch`
+// 422s `batch_too_large` past it) and the web inbox's client-side guard
+// (#4460) so the two can never drift — the group tap is refused inline
+// instead of round-tripping to learn the cap the hard way.
+export const APPROVAL_BATCH_MAX = 50;
+
+// Session timeouts
+export const ACCESS_TOKEN_EXPIRY = '15m';
+export const REFRESH_TOKEN_EXPIRY = '7d';
+export const SESSION_EXPIRY_HOURS = 24;
+
+// Ticket comment attachments (W08 #3902)
+export * from './ticketAttachments';

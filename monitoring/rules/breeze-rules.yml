@@ -1,0 +1,385 @@
+groups:
+  - name: breeze-api-alerts
+    interval: 30s
+    rules:
+      # The `job` selector is a regex because production runs one scrape job per
+      # region (breeze-api-us, breeze-api-eu) while the bundled compose stack uses
+      # the bare `breeze-api`. Every ratio is evaluated `by (job)` so a bad region
+      # is not diluted by a healthy one sharing the same expression.
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{job=~"breeze-api.*", status_class="5xx"}[5m])) by (job)
+            /
+            sum(rate(http_requests_total{job=~"breeze-api.*"}[5m])) by (job)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High HTTP error rate on {{ $labels.job }}"
+          description: "Error rate is {{ $value | humanizePercentage }} over the last 5 minutes"
+          runbook_url: "https://docs.breeze.local/runbooks/high-error-rate"
+
+      - alert: SlowResponseTime
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{job=~"breeze-api.*"}[5m])) by (le)
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow response times on Breeze API"
+          description: "95th percentile response time is {{ $value | humanizeDuration }}"
+          runbook_url: "https://docs.breeze.local/runbooks/slow-response"
+
+      - alert: APIServiceDown
+        expr: up{job=~"breeze-api.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Breeze API service is down"
+          description: "The API service has been unreachable for more than 2 minutes"
+          runbook_url: "https://docs.breeze.local/runbooks/api-down"
+
+      - alert: EndpointLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{job=~"breeze-api.*"}[5m])) by (le, route)
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency on endpoint {{ $labels.route }}"
+          description: "95th percentile latency is {{ $value | humanizeDuration }}"
+
+      - alert: High4xxRate
+        expr: |
+          (
+            sum(rate(http_requests_total{job=~"breeze-api.*", status_class="4xx"}[5m])) by (job)
+            /
+            sum(rate(http_requests_total{job=~"breeze-api.*"}[5m])) by (job)
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rate of 4xx errors on {{ $labels.job }}"
+          description: "4xx error rate is {{ $value | humanizePercentage }}"
+
+  - name: breeze-infrastructure-alerts
+    interval: 30s
+    rules:
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down"
+          description: "Redis has been unreachable for more than 2 minutes"
+
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis memory usage is high"
+          description: "Redis is using {{ $value | humanizePercentage }} of available memory"
+
+      - alert: PostgresDown
+        expr: up{job="postgres"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is down"
+          description: "PostgreSQL has been unreachable for more than 2 minutes"
+
+      - alert: PostgresConnectionPoolSaturated
+        expr: pg_stat_activity_count / pg_settings_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connection pool is saturated"
+          description: "{{ $value | humanizePercentage }} of connections are in use"
+
+      - alert: DiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+           / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) < 0.15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space on {{ $labels.mountpoint }}"
+          description: "Only {{ $value | humanizePercentage }} of disk space remaining"
+
+  - name: breeze-business-alerts
+    interval: 1m
+    rules:
+      # Grouped `by (job)` — without it, one healthy region keeps the global sum
+      # above zero and a region whose agents have all gone silent never alerts.
+      - alert: NoAgentHeartbeats
+        expr: |
+          sum(rate(agent_heartbeat_total{job=~"breeze-api.*"}[5m])) by (job) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No agent heartbeats received by {{ $labels.job }}"
+          description: "No agents have checked in to {{ $labels.job }} for the last 5 minutes"
+
+      # Deadman guards. The root cause of the 2026-08-07 capacity-evidence gap was
+      # that a series with NO PRODUCER makes every rule built on it evaluate
+      # against an empty vector — and an empty vector never fires. `HighErrorRate`,
+      # `SlowResponseTime`, `EndpointLatencyHigh` and `NoAgentHeartbeats` were all
+      # silently green for months for exactly that reason. `up` cannot catch it:
+      # the scrape succeeds, the series is simply absent.
+      #
+      # These fire if the producers are ever unwired again (e.g. the global
+      # `metricsMiddleware` mount being dropped from index.ts in a refactor).
+      - alert: CapacityMetricsMissing
+        expr: |
+          absent(http_requests_total{job=~"breeze-api.*"})
+          or absent(http_request_duration_seconds_count{job=~"breeze-api.*"})
+          or absent(agent_heartbeat_total{job=~"breeze-api.*"})
+          or absent(breeze_active_devices{job=~"breeze-api.*"})
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Breeze API capacity metrics are absent from the scrape"
+          description: "A SOC 2 A1.1 capacity series has no producer. Alerts built on it are silently passing, not healthy."
+
+      # The fleet gauges keep their last good values when a refresh fails, so a
+      # dead refresher looks like a perfectly stable fleet. Freshness is the only
+      # way to tell those apart. 0 = never succeeded since the process started.
+      - alert: FleetGaugesStale
+        expr: |
+          breeze_fleet_gauges_last_refresh_timestamp_seconds == 0
+          or (time() - breeze_fleet_gauges_last_refresh_timestamp_seconds) > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "breeze_active_devices has not refreshed on {{ $labels.job }}"
+          description: "The fleet-gauge query is failing or timing out; device and organization counts are stale or never read."
+
+      - alert: AlertProcessingBacklog
+        expr: |
+          breeze_alert_queue_length > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Alert processing backlog detected"
+          description: "{{ $value }} alerts waiting to be processed"
+
+      - alert: BackupDispatchFailuresDetected
+        expr: |
+          increase(breeze_backup_dispatch_failures_total{job=~"breeze-api.*"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup or restore start failures detected"
+          description: "{{ $value }} backup, restore, or verification start failure(s) occurred in the last 15 minutes"
+
+      - alert: RestoreTimeoutsDetected
+        expr: |
+          increase(breeze_restore_timeouts_total{job=~"breeze-api.*"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Restore commands are timing out"
+          description: "{{ $value }} restore command timeout(s) occurred in the last 15 minutes"
+
+      - alert: ScheduledVerificationSkipsDetected
+        expr: |
+          increase(breeze_backup_verification_skips_total{job=~"breeze-api.*"}[1h]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduled backup verification runs are being skipped"
+          description: "{{ $value }} scheduled verification skip(s) occurred in the last hour"
+
+  # Anomaly-detection alerts (launch-readiness CRITICAL #5). Thresholds are
+  # deliberately coarse starting points — tune after observing real baselines
+  # in production. The `tenant` label is redacted unless METRICS_INCLUDE_ORG_ID
+  # is enabled, so the `by (tenant)` breakdown collapses to a single series in
+  # the default (redacted) configuration and these still fire on aggregate.
+  - name: breeze-anomaly-alerts
+    interval: 1m
+    rules:
+      - alert: FailedLoginSpike
+        expr: |
+          sum(increase(breeze_failed_logins_total{job=~"breeze-api.*"}[5m])) by (tenant) > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated failed-login rate (possible credential stuffing)"
+          description: "{{ $value }} failed logins in 5m for tenant {{ $labels.tenant }} — investigate for credential stuffing / brute force"
+          runbook_url: "https://docs.breeze.local/runbooks/failed-login-spike"
+
+      - alert: EnrollmentSpike
+        expr: |
+          sum(increase(breeze_agent_enrollments_total{job=~"breeze-api.*"}[10m])) by (tenant) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unusual agent-enrollment rate"
+          description: "{{ $value }} enrollment attempts in 10m for tenant {{ $labels.tenant }} — verify this matches an expected rollout, not a leaked enrollment key"
+          runbook_url: "https://docs.breeze.local/runbooks/enrollment-spike"
+
+      - alert: CommandDispatchSpike
+        expr: |
+          sum(increase(breeze_commands_dispatched_total{job=~"breeze-api.*"}[5m])) by (tenant) > 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unusual command-dispatch rate"
+          description: "{{ $value }} commands dispatched in 5m for tenant {{ $labels.tenant }} — possible compromised account fanning out commands"
+          runbook_url: "https://docs.breeze.local/runbooks/command-dispatch-spike"
+
+      # #1374 / #5162 (W07 Task 3): after W05/W06 ship, a mobile approver device
+      # is expected to hold an L4-trusted attestation basis. A SUSTAINED
+      # non-zero denial rate means technicians are stuck unable to approve
+      # critical-tier requests (PAM elevation, destructive/blocklist overrides)
+      # from mobile — most likely because they haven't re-enrolled on an
+      # attested app build yet. `basis` distinguishes which non-trusted basis is
+      # driving it (`unattested`, `legacy_unattested`, `ios_keychain_rsa_app_attest`).
+      - alert: AuthenticatorL4BasisDenied
+        expr: |
+          breeze:authenticator_l4_basis:rate15m{outcome="denied"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Critical-tier approvals denied on platform_bound_basis={{ $labels.basis }}"
+          description: "A sustained non-zero rate of L4 (critical-tier) approval denials on basis {{ $labels.basis }} over the last 15m. Technicians on this basis cannot approve privileged access / destructive actions from mobile until re-enrolled on an attested app build (#1374)."
+          runbook_url: "https://docs.breeze.local/runbooks/authenticator-l4-basis-denied"
+
+  - name: breeze-backup-alerts
+    interval: 60s
+    rules:
+      # Emitted by internal/ops/restore-test-encrypted.sh via node_exporter's
+      # textfile collector after every weekly restore drill. A 0 means the last
+      # drill could not prove the off-region backup restorable. Before this rule
+      # existed a failed drill on 2026-08-30 sat unnoticed for four days.
+      - alert: BackupRestoreTestFailed
+        expr: breeze_db_restore_test_success == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Off-region backup restore drill failed ({{ $labels.region }})"
+          description: "The last restore test for bucket {{ $labels.bucket }} failed. The backup is not proven restorable. See /var/log/breeze-restore-test.log on the region host."
+
+      # Dead-man: the drill runs weekly. If the last *successful* drill is more
+      # than 8 days old — or the metric is absent because the cron, the host, or
+      # the textfile collector died — nobody is proving restorability.
+      - alert: BackupRestoreTestStale
+        expr: |
+          (time() - breeze_db_restore_test_last_success_timestamp_seconds) > 8 * 86400
+          or breeze_db_restore_test_last_success_timestamp_seconds == 0
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful backup restore drill in 8+ days ({{ $labels.region }})"
+          description: "Last successful restore drill for {{ $labels.bucket }} is older than 8 days. Check the Sunday cron and the restore-test log."
+
+      - alert: BackupRestoreTestMetricsMissing
+        expr: absent(breeze_db_restore_test_success)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "breeze_db_restore_test_success metric is absent"
+          description: "No region host is publishing restore-drill metrics. Either the textfile collector directory is missing or node_exporter is not scraped."
+
+  - name: breeze-recording-rules
+    interval: 30s
+    rules:
+      - record: breeze:http_requests:rate5m
+        expr: sum(rate(http_requests_total{job=~"breeze-api.*"}[5m])) by (status_class, method, route)
+
+      - record: breeze:http_error_rate:ratio5m
+        expr: |
+          sum(rate(http_requests_total{job=~"breeze-api.*", status_class="5xx"}[5m]))
+          /
+          sum(rate(http_requests_total{job=~"breeze-api.*"}[5m]))
+
+      - record: breeze:http_request_duration:avg5m
+        expr: |
+          sum(rate(http_request_duration_seconds_sum{job=~"breeze-api.*"}[5m])) by (route)
+          /
+          sum(rate(http_request_duration_seconds_count{job=~"breeze-api.*"}[5m])) by (route)
+
+      - record: breeze:http_request_duration:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{job=~"breeze-api.*"}[5m])) by (le)
+          )
+
+      - record: breeze:http_request_duration:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job=~"breeze-api.*"}[5m])) by (le)
+          )
+
+      - record: breeze:devices:active_count
+        expr: sum(breeze_active_devices)
+
+      - record: breeze:backup_dispatch_failures:increase15m
+        expr: sum(increase(breeze_backup_dispatch_failures_total{job=~"breeze-api.*"}[15m])) by (operation, reason)
+
+      - record: breeze:restore_timeouts:increase15m
+        expr: sum(increase(breeze_restore_timeouts_total{job=~"breeze-api.*"}[15m])) by (command_type)
+
+      - record: breeze:backup_verification_skips:increase1h
+        expr: sum(increase(breeze_backup_verification_skips_total{job=~"breeze-api.*"}[1h])) by (verification_type, reason)
+
+      # `breeze:http_requests:rate5m_by_org` was removed with the `org_id` label on
+      # http_requests_total. It never produced per-tenant data in production — the
+      # label was redacted to a single literal there — and left in place it would
+      # now silently collapse to one unlabelled series that reads as a per-org
+      # breakdown. Per-tenant volume lives in breeze_commands_dispatched_total and
+      # breeze_agent_enrollments_total, which carry a deliberate `tenant` label.
+
+      - record: breeze:redis_ops:rate5m
+        expr: sum(rate(redis_commands_processed_total[5m]))
+
+      - record: breeze:postgres_query_duration:avg5m
+        expr: |
+          rate(pg_stat_statements_seconds_total[5m])
+          /
+          rate(pg_stat_statements_calls_total[5m])
+
+      - record: breeze:failed_logins:increase5m
+        expr: sum(increase(breeze_failed_logins_total{job=~"breeze-api.*"}[5m])) by (reason, tenant)
+
+      - record: breeze:agent_enrollments:increase10m
+        expr: sum(increase(breeze_agent_enrollments_total{job=~"breeze-api.*"}[10m])) by (result, tenant)
+
+      - record: breeze:commands_dispatched:increase5m
+        expr: sum(increase(breeze_commands_dispatched_total{job=~"breeze-api.*"}[5m])) by (type, actor, tenant)
+
+      # #1374 / #5162 (W07 Task 3): backs both AuthenticatorL4BasisDenied above
+      # and the Grafana "L4 basis outcomes" panel — `denied` for what's actually
+      # blocking approvals today, `would_deny` for the SAME signal on a fleet
+      # where BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED is (or is ever reverted
+      # to) false, so the blast radius of the flag stays visible either way.
+      - record: breeze:authenticator_l4_basis:rate15m
+        expr: sum(rate(breeze_authenticator_l4_basis_total[15m])) by (basis, outcome)

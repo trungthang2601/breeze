@@ -1,0 +1,576 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const { dbSelectMock, authRef, getScopedTicketOr404Mock, timeServiceMocks } = vi.hoisted(() => ({
+  dbSelectMock: vi.fn(),
+  authRef: {
+    current: {
+      scope: 'partner' as string,
+      user: { id: 'u-1', name: 'Tess Tech', email: 'tess@msp.example', isPlatformAdmin: false },
+      partnerId: 'p-1' as string | null,
+      orgId: null as string | null,
+      accessibleOrgIds: null as string[] | null,
+      orgCondition: () => undefined,
+      canAccessOrg: (_id: string) => true as boolean
+    }
+  },
+  getScopedTicketOr404Mock: vi.fn(),
+  timeServiceMocks: {
+    addTicketPart: vi.fn(),
+    updateTicketPart: vi.fn(),
+    deleteTicketPart: vi.fn(),
+    listTimeEntries: vi.fn(),
+    getTicketBillingSummary: vi.fn(),
+    getTicketTimeEntryDefaults: vi.fn(),
+    listBillables: vi.fn()
+  }
+}));
+
+vi.mock('../../middleware/auth', async () => ({
+  authMiddleware: vi.fn(async (c: any, next: any) => {
+    if (!authRef.current) {
+      return c.json({ error: 'Not authenticated' }, 401);
+    }
+    c.set('auth', authRef.current);
+    await next();
+  }),
+  requireScope: () => async (c: any, next: any) => {
+    if (!c.get('auth')) {
+      return c.json({ error: 'Not authenticated' }, 401);
+    }
+    await next();
+  },
+  requirePermission: () => async (_c: any, next: any) => next(),
+  requireMfa: () => async (_c: any, next: any) => next(),
+  siteAccessCheck: (await vi.importActual<typeof import('../../middleware/auth')>('../../middleware/auth')).siteAccessCheck,
+}));
+
+// #4211 (W01) — aiDrafts.ts (mounted under ticketsRoutes) now imports
+// getLatestTicketProposal, which pulls in runTrace.ts's real dependency
+// chain (alertVerdicts/sweepFindings -> actionIntents/intentService ->
+// aiTools.ts) — heavier than this file's own minimal `../../db/schema`
+// mock below supports. This suite never exercises the ai-proposal routes
+// (that's aiDrafts.test.ts), so stub the module out entirely.
+vi.mock('../../services/aiTicketProposal', () => ({
+  getLatestTicketProposal: vi.fn(),
+}));
+
+vi.mock('../../db', () => ({
+  runOutsideDbContext: (fn: () => unknown) => fn(),
+  withSystemDbAccessContext: (fn: () => unknown) => fn(),
+  db: {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => {
+          // Support both: direct await (GET /:id/parts list) and .limit(1) (part lookup)
+          const result = dbSelectMock() ?? [];
+          return {
+            limit: vi.fn(() => dbSelectMock() ?? []),
+            then: (resolve: (value: unknown) => unknown, reject: (reason?: unknown) => unknown) =>
+              Promise.resolve(result).then(resolve, reject)
+          };
+        })
+      }))
+    }))
+  }
+}));
+
+vi.mock('../../db/schema', () => ({
+  tickets: {
+    id: 'id', orgId: 'orgId', partnerId: 'partnerId', status: 'status',
+    priority: 'priority', assignedTo: 'assignedTo', categoryId: 'categoryId',
+    internalNumber: 'internalNumber', subject: 'subject', createdAt: 'createdAt',
+    updatedAt: 'updatedAt', dueDate: 'dueDate', deviceId: 'deviceId',
+    source: 'source', slaBreachedAt: 'sla_breached_at', firstResponseAt: 'first_response_at',
+    responseSlaMinutes: 'response_sla_minutes', resolutionSlaMinutes: 'resolution_sla_minutes',
+    slaPausedAt: 'sla_paused_at', slaPausedMinutes: 'sla_paused_minutes',
+    slaBreachReason: 'sla_breach_reason'
+  },
+  ticketComments: { ticketId: 'ticketId', deletedAt: 'deletedAt', createdAt: 'createdAt' },
+  ticketCategories: {},
+  ticketAlertLinks: { ticketId: 'ticketId', alertId: 'alertId', id: 'id', linkType: 'linkType' },
+  alerts: { id: 'id', title: 'title', severity: 'severity', status: 'status', deviceId: 'deviceId' },
+  devices: { id: 'id', hostname: 'hostname', orgId: 'orgId', siteId: 'siteId' },
+  organizations: { id: 'id', name: 'name', currencyCode: 'currencyCode' },
+  users: { id: 'id', name: 'name' },
+  timeEntries: {
+    id: 'id', ticketId: 'ticketId', orgId: 'orgId', userId: 'userId',
+    startedAt: 'startedAt', endedAt: 'endedAt', durationMinutes: 'durationMinutes',
+    description: 'description', isBillable: 'isBillable', billingStatus: 'billingStatus',
+    hourlyRate: 'hourlyRate', isApproved: 'isApproved', addedBy: 'addedBy'
+  },
+  // #5783 W01: ticketChecklistService is reachable from routes/tickets/index.ts,
+  // and its module-scope CHECKLIST_ORDER reads these columns at import time.
+  ticketChecklistItems: {
+    id: 'id', orgId: 'orgId', ticketId: 'ticketId', label: 'label', detail: 'detail',
+    position: 'position', doneAt: 'doneAt', doneByUserId: 'doneByUserId', source: 'source',
+    sourceTemplateItemId: 'sourceTemplateItemId', createdBy: 'createdBy',
+    createdAt: 'createdAt', updatedAt: 'updatedAt',
+  },
+  ticketParts: {
+    id: 'id', ticketId: 'ticketId', orgId: 'orgId', addedBy: 'addedBy',
+    description: 'description', quantity: 'quantity', unitPrice: 'unitPrice',
+    costBasis: 'costBasis', isBillable: 'isBillable', billingStatus: 'billingStatus',
+    createdAt: 'createdAt', updatedAt: 'updatedAt'
+  }
+}));
+
+vi.mock('./tickets', async () => {
+  const actual = await vi.importActual<typeof import('./tickets')>('./tickets');
+  return {
+    ...actual,
+    getScopedTicketOr404: getScopedTicketOr404Mock
+  };
+});
+
+vi.mock('../../services/timeEntryService', async () => {
+  const actual = await vi.importActual<typeof import('../../services/timeEntryService')>('../../services/timeEntryService');
+  return { ...actual, ...timeServiceMocks };
+});
+
+vi.mock('../../services/sensitiveReadAudit', () => ({
+  auditSensitiveRead: vi.fn(),
+}));
+
+import { ticketsRoutes } from './index';
+import { TimeEntryServiceError } from '../../services/timeEntryService';
+import { auditSensitiveRead } from '../../services/sensitiveReadAudit';
+
+const TICKET_ID = '3f2f1d8e-1111-4222-8333-444455556666';
+const PART_ID   = 'aaaabbbb-cccc-dddd-eeee-ffff00001111';
+
+function resetMocks() {
+  vi.clearAllMocks();
+  authRef.current = {
+    scope: 'partner',
+    user: { id: 'u-1', name: 'Tess Tech', email: 'tess@msp.example', isPlatformAdmin: false },
+    partnerId: 'p-1',
+    orgId: null,
+    accessibleOrgIds: null,
+    orgCondition: () => undefined,
+    canAccessOrg: (_id: string) => true
+  };
+}
+
+describe('parts routes', () => {
+  beforeEach(resetMocks);
+
+  it('404s when the ticket is out of scope (site gate via getScopedTicketOr404)', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue(null);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/parts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: 'SSD', quantity: 1 })
+    });
+    expect(res.status).toBe(404);
+    expect(timeServiceMocks.addTicketPart).not.toHaveBeenCalled();
+  });
+
+  it('creates a part on an in-scope ticket', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.addTicketPart.mockResolvedValue({ id: PART_ID });
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/parts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: 'SSD', quantity: 1, unitPrice: 120 })
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.data).toHaveProperty('id', PART_ID);
+  });
+
+  it('rejects billed on create before ticket lookup or service work', async () => {
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/parts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: 'SSD', quantity: 1, billingStatus: 'billed' })
+    });
+    expect(res.status).toBe(400);
+    expect(getScopedTicketOr404Mock).not.toHaveBeenCalled();
+    expect(timeServiceMocks.addTicketPart).not.toHaveBeenCalled();
+  });
+
+  it('passes a catalogItemId through to the service (#1368 catalog link)', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.addTicketPart.mockResolvedValue({ id: PART_ID });
+    const catalogItemId = '9f3a1b2c-1111-4222-8333-444455556666';
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/parts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: 'SSD', quantity: 1, unitPrice: 120, catalogItemId })
+    });
+    expect(res.status).toBe(201);
+    expect(timeServiceMocks.addTicketPart).toHaveBeenCalledWith(
+      TICKET_ID,
+      expect.objectContaining({ catalogItemId }),
+      expect.anything(),
+    );
+  });
+
+  it('rejects a non-UUID catalogItemId (400, no service call)', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/parts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: 'SSD', quantity: 1, unitPrice: 120, catalogItemId: 'not-a-uuid' })
+    });
+    expect(res.status).toBe(400);
+    expect(timeServiceMocks.addTicketPart).not.toHaveBeenCalled();
+  });
+
+  it('GET /:id/parts returns part list for in-scope ticket', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    dbSelectMock.mockResolvedValue([{ id: PART_ID, ticketId: TICKET_ID, description: 'SSD' }]);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/parts`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body.data)).toBe(true);
+  });
+
+  it('GET /:id/parts 404s for out-of-scope ticket', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue(null);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/parts`);
+    expect(res.status).toBe(404);
+  });
+
+  it('PATCH /parts/:id resolves scope through the parent ticket', async () => {
+    dbSelectMock.mockReturnValueOnce([{ id: PART_ID, ticketId: TICKET_ID }]);
+    getScopedTicketOr404Mock.mockResolvedValue(null); // parent out of scope
+    const res = await ticketsRoutes.request(`/parts/${PART_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quantity: 2 })
+    });
+    expect(res.status).toBe(404);
+    expect(timeServiceMocks.updateTicketPart).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /parts/:id updates a part on an in-scope ticket', async () => {
+    dbSelectMock.mockReturnValueOnce([{ id: PART_ID, ticketId: TICKET_ID }]);
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.updateTicketPart.mockResolvedValue({ id: PART_ID, quantity: '2' });
+    const res = await ticketsRoutes.request(`/parts/${PART_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quantity: 2 })
+    });
+    expect(res.status).toBe(200);
+    expect(timeServiceMocks.updateTicketPart).toHaveBeenCalled();
+  });
+
+  it('rejects billed on update before part or ticket lookup and service work', async () => {
+    const res = await ticketsRoutes.request(`/parts/${PART_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ billingStatus: 'billed' })
+    });
+    expect(res.status).toBe(400);
+    expect(dbSelectMock).not.toHaveBeenCalled();
+    expect(getScopedTicketOr404Mock).not.toHaveBeenCalled();
+    expect(timeServiceMocks.updateTicketPart).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /parts/:id 404s for out-of-scope ticket', async () => {
+    dbSelectMock.mockReturnValueOnce([{ id: PART_ID, ticketId: TICKET_ID }]);
+    getScopedTicketOr404Mock.mockResolvedValue(null);
+    const res = await ticketsRoutes.request(`/parts/${PART_ID}`, { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    expect(timeServiceMocks.deleteTicketPart).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /parts/:id deletes a part on an in-scope ticket', async () => {
+    dbSelectMock.mockReturnValueOnce([{ id: PART_ID, ticketId: TICKET_ID }]);
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.deleteTicketPart.mockResolvedValue(undefined);
+    const res = await ticketsRoutes.request(`/parts/${PART_ID}`, { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    expect(timeServiceMocks.deleteTicketPart).toHaveBeenCalled();
+  });
+
+  // #6589 — the service now refuses a zero-row delete; the route must surface
+  // that as a 409 rather than its usual `{ deleted: true }`.
+  it('DELETE /parts/:id surfaces a lost-delete race as 409 PART_DELETE_LOST', async () => {
+    dbSelectMock.mockReturnValueOnce([{ id: PART_ID, ticketId: TICKET_ID }]);
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.deleteTicketPart.mockRejectedValue(
+      new TimeEntryServiceError('Part could not be deleted — reload and retry', 409, 'PART_DELETE_LOST')
+    );
+
+    const res = await ticketsRoutes.request(`/parts/${PART_ID}`, { method: 'DELETE' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'PART_DELETE_LOST' });
+  });
+
+  it('GET /:id/time-entries 404s for out-of-scope ticket', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue(null);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/time-entries`);
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /:id/time-entries returns entries for in-scope ticket', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.listTimeEntries.mockResolvedValue({ entries: [], total: 0 });
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/time-entries`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveProperty('data');
+    expect(body).toHaveProperty('total', 0);
+  });
+
+  it('GET /:id/billing-summary 404s for out-of-scope ticket', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue(null);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /:id/billing-summary returns summary for in-scope ticket', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.getTicketBillingSummary.mockResolvedValue({
+      time: {
+        totalMinutes: 60,
+        billableMinutes: 60,
+        billableAmounts: [{ currencyCode: 'USD', amount: '125.00' }]
+      },
+      parts: {
+        partsCount: 1,
+        billableTotals: [{ currencyCode: 'USD', amount: '99.00' }]
+      }
+    });
+    timeServiceMocks.getTicketTimeEntryDefaults.mockResolvedValue({ hourlyRate: '125.00', currencyCode: 'USD', isBillable: true });
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.time.billableAmounts[0].amount).toBe('125.00');
+  });
+
+  // #6466: billableMinutes counts every billable row (COALESCE minutes, no
+  // rate filter), but billableAmounts only counts rows with a rate — so the
+  // route stamps missingRateCount from a route-local query, independent of
+  // whatever getTicketBillingSummary itself returns.
+  it('GET /:id/billing-summary stamps missingRateCount from rate-less billable entries', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.getTicketBillingSummary.mockResolvedValue({
+      time: { totalMinutes: 90, billableMinutes: 30, billableAmounts: [] },
+      parts: { partsCount: 0, billableTotals: [] }
+    });
+    timeServiceMocks.getTicketTimeEntryDefaults.mockResolvedValue(null);
+    dbSelectMock.mockReturnValueOnce([{ n: 2 }]);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.time.billableMinutes).toBe(30);
+    expect(body.data.time.missingRateCount).toBe(2);
+  });
+
+  it('GET /:id/billing-summary defaults missingRateCount to 0 when every billable entry has a rate', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.getTicketBillingSummary.mockResolvedValue({
+      time: { totalMinutes: 60, billableMinutes: 60, billableAmounts: [{ currencyCode: 'USD', amount: '125.00' }] },
+      parts: { partsCount: 0, billableTotals: [] }
+    });
+    timeServiceMocks.getTicketTimeEntryDefaults.mockResolvedValue(null);
+    dbSelectMock.mockReturnValueOnce([{ n: 0 }]);
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.time.missingRateCount).toBe(0);
+  });
+
+  // #5321: the ticket quick-add prefills its rate from here and warns when the
+  // resolved default is null — without it a billable entry is logged rate-less
+  // and only fails later with ALL_MISSING_RATE 409 on "Create invoice".
+  it('GET /:id/billing-summary carries the time-entry billing defaults', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.getTicketBillingSummary.mockResolvedValue({
+      time: { totalMinutes: 0, billableMinutes: 0, billableAmounts: [] },
+      parts: { partsCount: 0, billableTotals: [] }
+    });
+    timeServiceMocks.getTicketTimeEntryDefaults.mockResolvedValue({ hourlyRate: null, currencyCode: 'EUR', isBillable: true });
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.defaults).toEqual({ hourlyRate: null, currencyCode: 'EUR', isBillable: true });
+  });
+
+  // Review finding: the summary read never depended on organizations/partner
+  // data. A ticket whose org or partner cannot be resolved must not take the
+  // whole panel down just because the (advisory) defaults lookup failed.
+  it('still returns the summary when the defaults lookup fails, with defaults null', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.getTicketBillingSummary.mockResolvedValue({
+      time: { totalMinutes: 60, billableMinutes: 60, billableAmounts: [] },
+      parts: { partsCount: 0, billableTotals: [] }
+    });
+    timeServiceMocks.getTicketTimeEntryDefaults.mockRejectedValue(
+      new TimeEntryServiceError('Ticket partner is unresolvable', 400, 'PARTNER_UNRESOLVABLE')
+    );
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.time.totalMinutes).toBe(60);
+      expect(body.data.defaults).toBeNull();
+      // Swallowed for the client, never for the operator.
+      expect(errSpy).toHaveBeenCalled();
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('propagates an unexpected (non-service) defaults fault instead of hiding it', async () => {
+    getScopedTicketOr404Mock.mockResolvedValue({ id: TICKET_ID, orgId: 'o-1', deviceId: null });
+    timeServiceMocks.getTicketBillingSummary.mockResolvedValue({
+      time: { totalMinutes: 0, billableMinutes: 0, billableAmounts: [] },
+      parts: { partsCount: 0, billableTotals: [] }
+    });
+    timeServiceMocks.getTicketTimeEntryDefaults.mockRejectedValue(new Error('connection terminated'));
+    const res = await ticketsRoutes.request(`/${TICKET_ID}/billing-summary`);
+    expect(res.status).toBe(500);
+  });
+});
+
+describe('GET /export/billables.csv', () => {
+  beforeEach(resetMocks);
+
+  it('returns CSV with headers and no cost_basis column', async () => {
+    timeServiceMocks.listBillables.mockResolvedValue({
+      rows: [{
+        kind: 'time', date: new Date('2026-06-10T10:00:00Z'), orgName: 'Acme',
+        ticketNumber: 'T-2026-0001', description: 'fix', technician: 'Tess',
+        quantity: '0.50', rate: '125.00', amount: '62.50',
+        currencyCode: 'USD',
+        billingStatus: 'not_billed', isApproved: true
+      }],
+      totalsByCurrency: []
+    });
+    const res = await ticketsRoutes.request('/export/billables.csv?from=2026-06-01&to=2026-06-30');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/csv');
+    const body = await res.text();
+    const headerLine = body.split('\n')[0];
+    const dataLine = body.split('\n')[1]?.replaceAll('"', '');
+    expect(headerLine).toBe('"type","date","organization","ticket","description","technician","quantity","rate","amount","currency","billing_status","approved"');
+    expect(body).toContain('T-2026-0001');
+    expect(dataLine).toContain(',62.50,USD,not_billed,');
+    expect(body).not.toContain('cost');
+    expect(auditSensitiveRead).toHaveBeenCalledWith(expect.anything(), {
+      action: 'billing.billables.download',
+      orgId: null,
+      resourceType: 'billing_export',
+      resourceId: 'billables',
+      format: 'csv',
+      rowCount: 1,
+      byteCount: Buffer.byteLength(body, 'utf8'),
+    });
+  });
+
+  // #6461: a missingRate row must render as an explicit gap marker in the CSV,
+  // never as a fabricated $0.00 amount, and must not appear in totalsByCurrency.
+  it('renders a missingRate row as MISSING_RATE, never a $0.00 amount', async () => {
+    timeServiceMocks.listBillables.mockResolvedValue({
+      rows: [{
+        kind: 'time', date: new Date('2026-06-10T10:00:00Z'), orgName: 'Acme',
+        ticketNumber: 'T-2026-0002', description: 'no rate set', technician: 'Tess',
+        quantity: '0.50', rate: null, amount: null, missingRate: true,
+        currencyCode: 'USD',
+        billingStatus: 'not_billed', isApproved: true
+      }],
+      totalsByCurrency: []
+    });
+    const res = await ticketsRoutes.request('/export/billables.csv?from=2026-06-01&to=2026-06-30');
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    const dataLine = body.split('\n')[1]?.replaceAll('"', '');
+    expect(dataLine).toContain(',MISSING_RATE,USD,not_billed,');
+    // Every csvRow cell is quoted (see csvExport.escapeCsvCell), so checking
+    // the raw `body` for an unquoted ',0.00,USD,' would never match even
+    // without the fix — assert against the de-quoted `dataLine` instead.
+    expect(dataLine).not.toContain(',0.00,');
+  });
+
+  it('rejects missing date params with 400', async () => {
+    const res = await ticketsRoutes.request('/export/billables.csv');
+    expect(res.status).toBe(400);
+    expect(timeServiceMocks.listBillables).not.toHaveBeenCalled();
+    expect(auditSensitiveRead).not.toHaveBeenCalled();
+  });
+
+  it('audits an organization-filtered export to the requested authorized org', async () => {
+    const orgId = '11111111-1111-4111-8111-111111111111';
+    authRef.current.canAccessOrg = (id: string) => id === orgId;
+    timeServiceMocks.listBillables.mockResolvedValue({ rows: [], totalsByCurrency: [] });
+
+    const res = await ticketsRoutes.request(
+      `/export/billables.csv?from=2026-06-01&to=2026-06-30&orgId=${orgId}`,
+    );
+    const body = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(auditSensitiveRead).toHaveBeenCalledWith(expect.anything(), {
+      action: 'billing.billables.download',
+      orgId,
+      resourceType: 'billing_export',
+      resourceId: 'billables',
+      format: 'csv',
+      rowCount: 0,
+      byteCount: Buffer.byteLength(body, 'utf8'),
+    });
+  });
+
+  it('does not query or audit a denied organization export', async () => {
+    authRef.current.canAccessOrg = () => false;
+    const deniedOrgId = '22222222-2222-4222-8222-222222222222';
+
+    const res = await ticketsRoutes.request(
+      `/export/billables.csv?from=2026-06-01&to=2026-06-30&orgId=${deniedOrgId}`,
+    );
+
+    expect(res.status).toBe(403);
+    expect(timeServiceMocks.listBillables).not.toHaveBeenCalled();
+    expect(auditSensitiveRead).not.toHaveBeenCalled();
+  });
+
+  it('does not audit a row serialization failure', async () => {
+    timeServiceMocks.listBillables.mockResolvedValue({
+      rows: [{
+        kind: 'time',
+        date: new Date(Number.NaN),
+        orgName: 'Acme',
+        ticketNumber: 'T-1',
+        description: 'fix',
+        technician: 'Tess',
+        quantity: '1',
+        rate: '1',
+        amount: '1',
+        currencyCode: 'USD',
+        billingStatus: 'not_billed',
+        isApproved: true,
+      }],
+      totalsByCurrency: []
+    });
+
+    const res = await ticketsRoutes.request(
+      '/export/billables.csv?from=2026-06-01&to=2026-06-30',
+    );
+
+    expect(res.status).toBe(500);
+    expect(auditSensitiveRead).not.toHaveBeenCalled();
+  });
+
+  it('keeps successful CSV bytes unchanged when audit delivery is non-blocking', async () => {
+    timeServiceMocks.listBillables.mockResolvedValue({ rows: [], totalsByCurrency: [] });
+    vi.mocked(auditSensitiveRead).mockImplementationOnce(() => {
+      void Promise.reject(new Error('audit backend unavailable')).catch(() => undefined);
+    });
+
+    const res = await ticketsRoutes.request(
+      '/export/billables.csv?from=2026-06-01&to=2026-06-30',
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(
+      '"type","date","organization","ticket","description","technician","quantity","rate","amount","currency","billing_status","approved"',
+    );
+  });
+});

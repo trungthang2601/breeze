@@ -1,0 +1,37 @@
+{
+  "name": "@breeze/ext-workspace",
+  "version": "0.2.0",
+  "private": true,
+  "license": "SEE LICENSE IN ../LICENSE",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build:web": "tsup --config tsup.web.config.ts",
+    "lint": "eslint src",
+    "test": "vitest run --config vitest.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@breeze/extension-sdk": "workspace:*",
+    "@breeze/extension-web-sdk": "workspace:*",
+    "@breeze/shared": "workspace:*",
+    "drizzle-orm": "0.45.2",
+    "hono": "4.13.8",
+    "mailparser": "^3.9.14",
+    "v9u-smb2": "^1.0.6",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@breeze/extension-testkit": "workspace:*",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^26.6.2",
+    "dotenv": "17.4.2",
+    "happy-dom": "^20.11.0",
+    "postgres": "3.4.9",
+    "tsup": "8.5.1",
+    "tsx": "^4.23.13",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}

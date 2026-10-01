@@ -1,0 +1,195 @@
+/**
+ * Resolves the storage destination (provider + providerConfig) for a
+ * backup_configs row.
+ *
+ * VERIFY and RESTORE agent commands need to read a snapshot back from the
+ * same bucket/share the BACKUP command wrote it to. `backupWorker.ts`
+ * already attaches `provider` + `providerConfig` to `backup_run` commands
+ * (see processDispatchBackup) — this helper produces the same shape so
+ * backup_verify / backup_test_restore / backup_restore commands can carry
+ * it too. Deliberately does NOT apply the storage-encryption patch that
+ * backupWorker layers onto write commands (resolveBackupStorageEncryptionPlan)
+ * — verify/restore only need to READ, and callers here don't have (nor
+ * need) an encryption-plan decision to make.
+ */
+import { and, eq } from 'drizzle-orm';
+import { db } from '../db';
+import { backupConfigs } from '../db/schema';
+import { resolveBackupStorageEncryptionPlan } from './backupEncryption';
+import { canonicalizeS3CredentialFields } from '../routes/backup/schemas';
+
+/**
+ * #6511: a config stored under the AWS-idiomatic accessKeyId/
+ * secretAccessKey spelling (accepted by this API's own S3 config validator
+ * before that write path was canonicalized, and by any config that predates
+ * this fix — no backfill migration) must still dispatch to the agent under
+ * the canonical accessKey/secretKey spelling it reads. Copies first so
+ * canonicalization never mutates the caller's already-fetched row object.
+ */
+function withCanonicalS3Credentials(
+  provider: string,
+  providerConfig: Record<string, unknown>
+): Record<string, unknown> {
+  if (provider !== 's3') return providerConfig;
+  const copy = { ...providerConfig };
+  canonicalizeS3CredentialFields(copy);
+  return copy;
+}
+
+export type BackupProviderConfig = {
+  provider: string;
+  providerConfig: Record<string, unknown>;
+};
+
+/**
+ * A snapshot / backup job written before destination tracking existed carries
+ * a NULL `configId`, so we can't reconstruct the exact bucket/share it was
+ * written to. We deliberately do NOT fall back to the device's CURRENT
+ * effective config — the snapshot's objects live at the destination used AT
+ * WRITE TIME, which may differ from where the device backs up today; reading
+ * the current bucket could look in the wrong place. So callers surface a
+ * CLEARER error (not a fallback) that distinguishes this legacy case from a
+ * genuine misconfiguration (configId set but no config resolves).
+ */
+export const SNAPSHOT_PREDATES_DESTINATION_TRACKING_MESSAGE =
+  'This snapshot predates backup destination tracking: its storage destination was not recorded when it was written, so it cannot be automatically restored or verified. Restore or verify it manually against the original storage destination.';
+
+export const BACKUP_DESTINATION_CONFIG_NOT_FOUND_MESSAGE =
+  'Backup destination configuration not found for this snapshot';
+
+export type BackupDestinationErrorReason = 'legacy_snapshot' | 'config_not_found';
+
+/**
+ * Builds the operator-facing error for a verify/restore request that could not
+ * resolve a provider config. When `configId` is null the snapshot predates
+ * destination tracking (auto-restore/verify impossible) — a distinct, non-
+ * misleading message; otherwise the referenced config is genuinely missing.
+ */
+export function resolveBackupDestinationError(
+  configId: string | null | undefined
+): { reason: BackupDestinationErrorReason; message: string } {
+  return configId == null
+    ? { reason: 'legacy_snapshot', message: SNAPSHOT_PREDATES_DESTINATION_TRACKING_MESSAGE }
+    : { reason: 'config_not_found', message: BACKUP_DESTINATION_CONFIG_NOT_FOUND_MESSAGE };
+}
+
+/**
+ * Looks up `backup_configs` by id, scoped to `orgId` (tenant-safe — a
+ * mismatched org returns null exactly like a missing row). Returns null
+ * when no config can be resolved; callers must fail the verify/restore
+ * request rather than dispatch a command the agent can't act on.
+ */
+export async function resolveBackupProviderConfig(
+  configId: string,
+  orgId: string
+): Promise<BackupProviderConfig | null> {
+  const [config] = await db
+    .select({
+      provider: backupConfigs.provider,
+      providerConfig: backupConfigs.providerConfig,
+    })
+    .from(backupConfigs)
+    .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+    .limit(1);
+
+  if (!config) return null;
+
+  const providerConfig = (config.providerConfig as Record<string, unknown> | null) ?? {};
+  return {
+    provider: config.provider,
+    providerConfig: withCanonicalS3Credentials(config.provider, providerConfig),
+  };
+}
+
+/**
+ * Command-payload shape for a WRITE (backup) command's storage destination —
+ * mirrors the `storageEncryption` block backup_run/mssql_backup/hyperv_backup
+ * payloads already carry (see prepareBackupDispatchTargets below and
+ * applyCommandStorageEncryption on the agent side).
+ */
+export type BackupWriteCommandDestination = {
+  provider: string;
+  providerConfig: Record<string, unknown>;
+  storageEncryption:
+    | { required: false; mode: 'disabled' }
+    | { required: true; mode: 's3-sse-s3' | 's3-sse-kms'; keyReference: string | null };
+};
+
+export type BackupWriteDestinationResult =
+  | { ok: true; destination: BackupWriteCommandDestination }
+  | { ok: false; reason: 'config_not_found'; message: string }
+  | { ok: false; reason: 'encryption_unsupported'; message: string };
+
+/**
+ * Builds the write-command destination payload (provider + providerConfig +
+ * storageEncryption) from an already-fetched backup_configs row — the SAME
+ * encryption-plan logic apps/api/src/jobs/backupWorker.ts's
+ * prepareBackupDispatchTargets applies when it fans a profile out to
+ * backup_run/mssql_backup/hyperv_backup commands (D20b item A). Callers that
+ * already have the full row in hand (backupWorker.ts) should call this
+ * directly; callers that only have a configId (the on-demand mssql/hyperv
+ * backup routes) should use resolveBackupWriteCommandDestination below, which
+ * fetches the row first.
+ *
+ * Pure — no DB access — so it's exercised without a database in tests.
+ */
+export function buildBackupWriteCommandDestination(config: {
+  provider: string;
+  providerConfig: unknown;
+  encryption: boolean | null | undefined;
+}): BackupWriteDestinationResult {
+  const rawProviderConfig = (config.providerConfig as Record<string, unknown> | null) ?? {};
+  const providerConfig = withCanonicalS3Credentials(config.provider, rawProviderConfig);
+  const encryptionPlan = resolveBackupStorageEncryptionPlan({
+    encryption: config.encryption,
+    provider: config.provider,
+    providerConfig,
+  });
+
+  if (encryptionPlan.required && encryptionPlan.status === 'unsupported') {
+    return { ok: false, reason: 'encryption_unsupported', message: encryptionPlan.reason };
+  }
+
+  const commandProviderConfig =
+    encryptionPlan.required && encryptionPlan.status === 'enforced'
+      ? { ...providerConfig, ...encryptionPlan.providerConfigPatch }
+      : providerConfig;
+
+  return {
+    ok: true,
+    destination: {
+      provider: config.provider,
+      providerConfig: commandProviderConfig,
+      storageEncryption: encryptionPlan.required
+        ? { required: true, mode: encryptionPlan.mode, keyReference: encryptionPlan.keyReference }
+        : { required: false, mode: 'disabled' },
+    },
+  };
+}
+
+/**
+ * DB-querying counterpart of buildBackupWriteCommandDestination for callers
+ * that only have a configId + orgId (on-demand mssql/hyperv backup routes —
+ * D20b item A). Tenant-safe the same way resolveBackupProviderConfig is: a
+ * mismatched org resolves to config_not_found exactly like a missing row.
+ */
+export async function resolveBackupWriteCommandDestination(
+  configId: string,
+  orgId: string
+): Promise<BackupWriteDestinationResult> {
+  const [config] = await db
+    .select({
+      provider: backupConfigs.provider,
+      providerConfig: backupConfigs.providerConfig,
+      encryption: backupConfigs.encryption,
+    })
+    .from(backupConfigs)
+    .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+    .limit(1);
+
+  if (!config) {
+    return { ok: false, reason: 'config_not_found', message: BACKUP_DESTINATION_CONFIG_NOT_FOUND_MESSAGE };
+  }
+
+  return buildBackupWriteCommandDestination(config);
+}

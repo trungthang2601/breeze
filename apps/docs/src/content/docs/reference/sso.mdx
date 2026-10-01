@@ -1,0 +1,633 @@
+---
+title: Single Sign-On (SSO)
+description: "Configure OIDC and SAML identity providers for organization SSO in Breeze RMM: attribute mapping, provisioning, enforcement, and partner-wide login."
+sidebar:
+  order: 11
+  label: SSO
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Breeze RMM supports single sign-on through OpenID Connect (OIDC), at both the organization and the partner level. `saml` exists as a provider type and preset list, but SAML login is **not yet implemented end to end** -- see [Setting Up SAML](#setting-up-saml) below. SSO allows users to authenticate with their existing identity provider (IdP) instead of managing separate Breeze passwords. Each organization can configure one active SSO provider for its own users, and a partner (MSP) can configure a partner-owned provider for its own technicians (see [Partner-Wide SSO](#partner-wide-sso-technician-login)). Either kind of provider can optionally enforce SSO-only login to disable password-based authentication.
+
+---
+
+## Key Concepts
+
+| Concept | Description |
+|---------|-------------|
+| **SSO Provider** | A configured identity provider (IdP) record tied to a single owner (an organization or the partner). |
+| **Owner scope** | A provider is owned by either an **organization** (customer SSO) or the **partner** (MSP technician SSO) — exactly one of the two, never both. |
+| **Provider type** | `oidc` (OpenID Connect) or `saml` (SAML 2.0). |
+| **Provider status** | `inactive` (default on creation), `testing`, or `active`. Only `active` providers are used for login. |
+| **Auto-provisioning** | When enabled (default), users who authenticate via SSO are automatically created in Breeze if they do not already exist. |
+| **SSO enforcement** | When `enforceSSO` is `true`, password-based login is disabled for the organization. Users must authenticate through the IdP. |
+| **Allowed domains** | Comma-separated list of email domains. If set, only users with matching email domains can authenticate via SSO. |
+| **Attribute mapping** | Maps IdP claim names to Breeze user fields (`email`, `name`, `firstName`, `lastName`, `groups`). |
+| **PKCE** | Proof Key for Code Exchange. Breeze uses PKCE (S256 method) for all OIDC authorization requests to prevent authorization code interception. |
+| **Provider presets** | Built-in configurations for common IdPs (Azure AD, Okta, Google Workspace, Auth0) that pre-fill scopes, attribute mappings, and endpoint URLs. |
+
+---
+
+## Supported Providers
+
+### OIDC Presets
+
+Breeze ships with built-in presets that auto-configure scopes, attribute mappings, and discovery URLs:
+
+| Preset ID | Provider | Issuer Template | Scopes |
+|-----------|----------|-----------------|--------|
+| `azure-ad` | Microsoft Azure AD | `https://login.microsoftonline.com/{tenant}/v2.0` | `openid profile email` |
+| `okta` | Okta | `https://{domain}.okta.com` | `openid profile email groups` |
+| `google` | Google Workspace | `https://accounts.google.com` | `openid profile email` |
+| `auth0` | Auth0 | `https://{domain}.auth0.com` | `openid profile email` |
+
+### SAML Presets
+
+| Preset ID | Provider | SSO URL Template |
+|-----------|----------|-----------------|
+| `azure-ad-saml` | Microsoft Azure AD (SAML) | `https://login.microsoftonline.com/{tenant}/saml2` |
+| `okta-saml` | Okta (SAML) | `https://{domain}.okta.com/app/{appId}/sso/saml` |
+| `onelogin-saml` | OneLogin (SAML) | `https://{domain}.onelogin.com/trust/saml2/http-post/sso/{appId}` |
+| `adfs-saml` | AD FS | `https://{adfs-server}/adfs/ls` |
+| `google-saml` | Google Workspace (SAML) | `https://accounts.google.com/o/saml2/idp?idpid={idpId}` |
+
+You can retrieve the full list of presets (including attribute mappings) from the API:
+
+```bash
+curl https://breeze.yourdomain.com/api/v1/sso/presets \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+## Setting Up OIDC
+
+<Steps>
+1. **Register Breeze in your IdP.** Create an application/client in your identity provider. Set the redirect URI to `https://breeze.yourdomain.com/api/v1/sso/callback`. Note the Client ID and Client Secret.
+
+2. **Create the provider in Breeze.** Use the `POST /api/v1/sso/providers` endpoint. If you specify a `preset` and an `issuer`, Breeze will auto-discover the authorization, token, userinfo, and JWKS endpoints via the `.well-known/openid-configuration` document.
+
+3. **Test the configuration.** Use the `POST /api/v1/sso/providers/:id/test` endpoint to verify that Breeze can reach the IdP's discovery document.
+
+4. **Activate the provider.** Set the status to `active` via `POST /api/v1/sso/providers/:id/status`.
+
+5. **Optionally enforce SSO.** Update the provider with `enforceSSO: true` to disable password login for the organization.
+</Steps>
+
+<Tabs>
+  <TabItem label="Azure AD">
+    ```bash
+    curl -X POST https://breeze.yourdomain.com/api/v1/sso/providers \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "orgId": "ORG_UUID",
+        "name": "Azure AD",
+        "type": "oidc",
+        "preset": "azure-ad",
+        "issuer": "https://login.microsoftonline.com/YOUR_TENANT_ID/v2.0",
+        "clientId": "YOUR_CLIENT_ID",
+        "clientSecret": "YOUR_CLIENT_SECRET"
+      }'
+    ```
+  </TabItem>
+  <TabItem label="Okta">
+    ```bash
+    curl -X POST https://breeze.yourdomain.com/api/v1/sso/providers \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "orgId": "ORG_UUID",
+        "name": "Okta",
+        "type": "oidc",
+        "preset": "okta",
+        "issuer": "https://your-domain.okta.com",
+        "clientId": "YOUR_CLIENT_ID",
+        "clientSecret": "YOUR_CLIENT_SECRET"
+      }'
+    ```
+  </TabItem>
+  <TabItem label="Google Workspace">
+    ```bash
+    curl -X POST https://breeze.yourdomain.com/api/v1/sso/providers \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "orgId": "ORG_UUID",
+        "name": "Google Workspace",
+        "type": "oidc",
+        "preset": "google",
+        "issuer": "https://accounts.google.com",
+        "clientId": "YOUR_CLIENT_ID",
+        "clientSecret": "YOUR_CLIENT_SECRET"
+      }'
+    ```
+  </TabItem>
+  <TabItem label="Custom OIDC">
+    ```bash
+    curl -X POST https://breeze.yourdomain.com/api/v1/sso/providers \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "orgId": "ORG_UUID",
+        "name": "Corporate IdP",
+        "type": "oidc",
+        "issuer": "https://idp.corp.example.com",
+        "clientId": "YOUR_CLIENT_ID",
+        "clientSecret": "YOUR_CLIENT_SECRET",
+        "scopes": "openid profile email",
+        "attributeMapping": {
+          "email": "email",
+          "name": "display_name",
+          "firstName": "given_name",
+          "lastName": "family_name",
+          "groups": "groups"
+        }
+      }'
+    ```
+  </TabItem>
+</Tabs>
+
+### OIDC Discovery
+
+When you provide an `issuer` URL and the provider type is `oidc`, Breeze automatically fetches the IdP's `.well-known/openid-configuration` document and populates:
+
+- `authorizationUrl` -- Authorization endpoint
+- `tokenUrl` -- Token endpoint
+- `userInfoUrl` -- UserInfo endpoint
+- `jwksUrl` -- JSON Web Key Set URI
+
+If discovery fails (for example, if the IdP does not support well-known configuration), a warning is logged but the provider is still created. You can manually set these URLs via the `PATCH` endpoint afterward.
+
+---
+
+## Setting Up SAML
+
+<Aside type="caution">
+  **SAML login is not implemented.** `saml` is a valid value for a provider's `type` column and the SSO service module contains standalone SAML XML helpers (metadata building, AuthnRequest construction, response parsing), but no route wires them up: there is no ACS endpoint, and the SSO login routes serve OIDC only -- picking a SAML-typed provider at login returns a `400` ("Only OIDC login is currently supported"). Do not point an IdP at a `/sso/saml/acs` URL; nothing listens there. Configure an OIDC connection instead (most IdPs, including Azure AD, Okta, and Google Workspace, support it).
+</Aside>
+
+---
+
+## SSO Login Flow
+
+The OIDC login flow follows the Authorization Code + PKCE pattern:
+
+<Steps>
+1. **User types their email and tabs away.** The login page has no `orgId` to check yet, so it calls `POST /api/v1/auth/sso-discovery` with the address instead (see [Login Page Discovery](#login-page-discovery)). A positive answer replaces the password field with a **"Sign in with \{provider\}"** button.
+2. **User clicks "Sign in with \{provider\}".** The browser navigates to `GET /api/v1/sso/login/:orgId`.
+3. **Breeze generates PKCE challenge and state.** A cryptographic `state`, `nonce`, and PKCE `codeVerifier`/`codeChallenge` pair are generated. The PKCE verifier, nonce, and redirect path are stored server-side in the `sso_sessions` table (10-minute TTL); the `state` is additionally bound to the initiating browser via a signed, HttpOnly cookie (`breeze_sso_state`, `SameSite=Lax`, `Secure` in production, scoped to the callback path, 10-minute Max-Age). The cookie carries an HMAC-SHA256 signature of the state (keyed on `APP_ENCRYPTION_KEY`/`SECRET_ENCRYPTION_KEY`, distinct from the JWT secret).
+4. **Redirect to IdP.** Breeze redirects the user to the IdP's authorization endpoint with the PKCE challenge, state, nonce, and redirect URI.
+5. **User authenticates at IdP.** The user signs in at the identity provider.
+6. **IdP redirects back.** The IdP redirects to `GET /api/v1/sso/callback` with an authorization `code` and `state` parameter.
+7. **Breeze validates the browser binding, then claims the state.** The `state` returned by the IdP is verified against the `breeze_sso_state` cookie using a constant-time comparison (`crypto.timingSafeEqual`) before anything else runs — a callback that did not originate from the same browser that started the flow is rejected. Only after the binding check does Breeze atomically consume the session row (`DELETE ... RETURNING` on a matching, non-expired `state`), which makes each state strictly single-use and immune to replay.
+8. **Code exchange.** Breeze exchanges the authorization code for tokens at the IdP's token endpoint, including the PKCE `codeVerifier`.
+9. **ID token verification.** If an ID token is returned, Breeze verifies the issuer, audience, expiration, and nonce claims.
+10. **User info retrieval.** Breeze calls the IdP's UserInfo endpoint to get the user's profile.
+11. **Attribute mapping.** The IdP's claims are mapped to Breeze user fields using the configured `attributeMapping`.
+12. **Domain check.** If `allowedDomains` is set, the user's email domain is validated.
+13. **User provisioning.** If the user does not exist and `autoProvision` is enabled, a new Breeze user is created and assigned to the organization with the provider's `defaultRoleId`.
+14. **Session creation.** Breeze creates a JWT token pair (access + refresh) and a session record.
+15. **Redirect to app.** The user is redirected to the original page with a short-lived token exchange code in the URL fragment (`#ssoCode=...`).
+16. **Token exchange.** The frontend calls `POST /api/v1/sso/exchange` with the code to receive the JWT tokens.
+</Steps>
+
+```
+Browser          Breeze API          Identity Provider
+  │                  │                      │
+  │── GET /sso/login/:orgId ──►│            │
+  │                  │── Generate PKCE ──►  │
+  │◄── 302 Redirect ─│──────────────────►   │
+  │                  │                      │
+  │──────── Authenticate ──────────────────►│
+  │                  │                      │
+  │◄──── Redirect with code ────────────────│
+  │                  │                      │
+  │── GET /sso/callback?code=...&state=... ►│
+  │                  │── Exchange code ────►│
+  │                  │◄── Tokens ──────────│
+  │                  │── Get user info ───►│
+  │                  │◄── Profile ─────────│
+  │                  │                      │
+  │◄── 302 /#ssoCode=... ──│               │
+  │                  │                      │
+  │── POST /sso/exchange ──►│              │
+  │◄── { accessToken, refreshToken } ──────│
+```
+
+<Aside type="tip">
+  The token exchange code expires after 2 minutes and can only be used once. This prevents the JWT tokens from appearing in browser history or server logs.
+</Aside>
+
+---
+
+## Sign-In Hardening
+
+Breeze applies several defenses to the SSO sign-in path. They are on by default and require no configuration; the notes below are for security reviewers and administrators assessing the platform.
+
+### Verified Email Required
+
+A sign-in is only accepted when the identity provider attests that the user's email address is **verified**. If the IdP affirmatively reports the mailbox as unverified, the sign-in is rejected -- on every path, including a user whose identity is **already linked** to Breeze. This prevents a provider (or a mis-scoped attribute mapping) from asserting an address the IdP has not actually proven.
+
+When an IdP simply omits the verification claim (some enterprise providers do), Breeze does not take the silence on faith. For first-time account matching or just-in-time creation on an organization provider, it instead requires that the email's domain has been **proven to belong to the organization** through Breeze's own DNS domain-verification. A user whose identity is already linked is exempt, so turning this on never locks out an existing user.
+
+<Aside type="note">
+  A rejected sign-in redirects to the login page with an `sso_email_unverified` (or, during identity linking, `email_unverified`) error, and the rejection is written to the audit log with the reason and the claim's source.
+</Aside>
+
+### Tighter Session Binding
+
+Each login round-trip is bound to the browser that started it (see [SSO Login Flow](#sso-login-flow) for the signed state cookie) **and** to the exact configuration generation of the provider it began under. If a provider is disabled or reconfigured while a sign-in is still in flight -- even within the short session window -- that in-flight attempt is invalidated at the callback rather than completing against stale settings. Login sessions that predate this binding are treated as invalid, not trusted.
+
+### Gated Just-in-Time Provisioning
+
+When a provider auto-creates users on first sign-in, the **default role** it assigns is a standing delegation: every future new user inherits it. Breeze verifies that the administrator configuring that default role is actually entitled to grant it -- both when the role is saved and again, against that administrator's **current** permissions, each time a brand-new user is about to be provisioned. A delegation can no longer outlive the authority of the person who set it.
+
+A consequence for existing deployments: a provider that was configured **before this gate existed**, or whose configuring administrator has since been deactivated, stops provisioning **brand-new** users until an entitled administrator re-saves the default role (which re-anchors the check to a live account). **Existing users are unaffected** -- this only governs first-time creation, never sign-ins for users who already have an account.
+
+### Discovery Protected Against Unsafe Endpoints
+
+When Breeze auto-discovers a provider's endpoints from its issuer URL, it refuses any endpoint that is not HTTPS or that resolves to an internal / private-network address, so a configured issuer cannot be used to make the server reach into your private network. These persisted endpoints are re-validated at every login, and changing a provider's issuer requires a fresh, successful discovery -- a provider's token and key endpoints can never be left pointing at an IdP the issuer no longer names.
+
+<Aside type="note">
+  Self-hosted deployments that legitimately run an internal IdP on a private address can permit it; hosted, multi-tenant deployments always enforce the strict public-endpoint rule. A discovery that is blocked returns an operator-facing reason (for example, "OIDC discovery returned an endpoint that is not HTTPS") and no provider is created or updated.
+</Aside>
+
+---
+
+## Provider Configuration
+
+### Create Provider Schema
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `ownerScope` | `organization` or `partner` | No | `organization` | Who owns the provider. `organization` creates a customer SSO provider; `partner` creates a partner-wide provider for the MSP's own technicians. |
+| `orgId` | `uuid` | Depends | Inferred for org-scoped users | Target organization. Ignored when `ownerScope` is `partner` — a partner provider is owned by the caller's partner, never an organization. |
+| `name` | `string` | Yes | -- | Display name (1--255 characters). |
+| `type` | `oidc` or `saml` | Yes | -- | Provider protocol. |
+| `preset` | `string` | No | -- | Preset ID (e.g., `azure-ad`, `okta`). Pre-fills scopes and attribute mapping. |
+| `issuer` | `url` | No | -- | IdP issuer URL. Triggers OIDC discovery when set. |
+| `clientId` | `string` | No | -- | OAuth 2.0 Client ID. |
+| `clientSecret` | `string` | No | -- | OAuth 2.0 Client Secret. Encrypted at rest. |
+| `scopes` | `string` | No | From preset or `openid profile email` | Space-separated OAuth scopes. |
+| `attributeMapping` | `object` | No | From preset or `{ email: "email", name: "name" }` | Maps IdP claims to Breeze fields. |
+| `autoProvision` | `boolean` | No | `true` | Create Breeze users on first SSO login. |
+| `defaultRoleId` | `uuid` | No | -- | Role assigned to auto-provisioned users. Must be an org-scoped role in the target org (or, for partner providers, a partner-scoped role belonging to your partner). |
+| `allowedDomains` | `string` | No | -- | Comma-separated email domains. Empty means all domains are allowed. |
+| `enforceSSO` | `boolean` | No | `false` | Disable password login for the organization. |
+| `trustsIdpMfa` | `boolean` | No | `false` | Treat the IdP's own MFA assertion (`amr: mfa` in the id_token) as satisfying Breeze's MFA-gated routes. See [Satisfying Breeze MFA with your IdP](#satisfying-breeze-mfa-with-your-idp). |
+
+<Aside type="caution">
+  The `clientSecret` is encrypted before storage using the server's encryption key. It is never returned in API responses. The `hasClientSecret` boolean field indicates whether a secret is configured.
+</Aside>
+
+<Aside type="note">
+  Creating a provider with `ownerScope: "partner"` requires a **partner-scope session** with partner-wide policy management rights (access to all of the partner's organizations). Organization-scoped sessions can only create organization providers.
+</Aside>
+
+### Provider Statuses
+
+| Status | Description |
+|--------|-------------|
+| `inactive` | Default on creation. The provider is not used for login. |
+| `testing` | Intermediate state for validation. Not used for login. |
+| `active` | The provider is live. Users can authenticate via SSO. Only one active provider per organization is used for login. |
+
+### Attribute Mapping Object
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `email` | `string` | Yes | IdP claim name that contains the user's email address. |
+| `name` | `string` | Yes | IdP claim name for the user's display name. |
+| `firstName` | `string` | No | IdP claim name for the user's first name. Used as fallback when `name` is unavailable. |
+| `lastName` | `string` | No | IdP claim name for the user's last name. Used with `firstName` to construct the display name. |
+| `groups` | `string` | No | IdP claim name for group membership. Expected to be an array of strings. |
+
+---
+
+## Account Mapping and Provisioning
+
+When a user authenticates via SSO, Breeze follows this logic:
+
+<Steps>
+1. **Email lookup.** The mapped `email` attribute is used to find an existing Breeze user (case-insensitive).
+2. **Existing user found.** The user's SSO identity link (`user_sso_identities` table) is created or updated with the latest profile, tokens, and login timestamp. The user is logged in.
+3. **No existing user + auto-provision disabled.** The login is rejected with a "user not found" error. An administrator must create the Breeze account first.
+4. **No existing user + auto-provision enabled.** A new Breeze user is created with the mapped email and name. The user is added to the organization with the provider's `defaultRoleId`. SSO-provisioned users have no password set.
+5. **Organization membership check.** The user must have an `organization_users` record for the provider's organization. If not, the login is rejected with "no org access".
+</Steps>
+
+<Aside type="tip">
+  When auto-provisioning is enabled, always set a `defaultRoleId` pointing to an organization-scoped role. Without it, auto-provisioned users will be rejected with a "default role required" error.
+</Aside>
+
+### SSO Identity Links
+
+Each user-provider combination creates a record in the `user_sso_identities` table that stores:
+
+- **External ID** (`sub` claim from the IdP)
+- **Email** from the IdP
+- **Profile** data (full UserInfo response)
+- **Access and refresh tokens** (encrypted at rest)
+- **Token expiration** timestamp
+- **Last login** timestamp
+
+This link is updated on every SSO login, keeping the profile and tokens current.
+
+---
+
+## SSO Enforcement
+
+When `enforceSSO` is set to `true` on an **active** provider, password-based login is refused for the organization. This is enforced **server-side**, on every password attempt, regardless of what the login page shows — it is not something the frontend can opt out of by not checking first.
+
+A user who submits a password anyway gets the same generic **"Invalid email or password"** as a genuinely wrong password — deliberately, so the response reveals nothing that discovery has not already told the caller. If a user reports being unable to sign in with a password they are sure is correct, check whether their organization enforces SSO before assuming a credential problem.
+
+<Aside type="caution">
+  Before enabling SSO enforcement, ensure that at least one administrator account can still access the system. Consider keeping a break-glass account with password login or testing the SSO flow thoroughly in `testing` status first.
+</Aside>
+
+### Login Page Discovery
+
+The dashboard login page does not know an organization's `orgId` (and so cannot call `GET /sso/check/:orgId`) until a user has already picked that organization — which, for a first-time visitor typing an email address, hasn't happened yet. When a user tabs out of the email field, the page instead calls the public, unauthenticated `POST /api/v1/auth/sso-discovery` with the address. If it names a provider, the password field and submit button are replaced with a **"Sign in with \{provider\}"** button and a **"Sign in with password instead"** link — the password path stays reachable, since discovery is a convenience, not the enforcement point.
+
+```json
+// POST /api/v1/auth/sso-discovery
+// { "email": "user@example.com" }
+{
+  "sso": {
+    "providerName": "Azure AD",
+    "loginUrl": "/api/v1/sso/login/ORG_UUID",
+    "enforceSSO": true
+  }
+}
+```
+
+Discovery answers `{ "sso": null }` whenever it can't give a safe, unambiguous answer:
+
+- **It is keyed on the email's domain, never on the address itself**, and never reads the `users` table — a real address and a made-up one at the same domain get the identical answer. This is deliberate: a distinguishable answer per address would be an account-existence oracle.
+- **The domain must be verified.** Only a domain the organization has proven ownership of via DNS (the same domain-verification mechanism behind [Verified Email Required](#verified-email-required), `sso_verified_domains`) is eligible. An org with `allowedDomains` configured but no *verified* domain gets `{ "sso": null }` — `allowedDomains` is unverified free text and is deliberately not used here, since a hostile tenant on a shared instance could otherwise claim someone else's domain and have discovery point their users at an attacker-controlled IdP.
+- **If two organizations have verified the same domain, discovery refuses to guess** and returns `{ "sso": null }`.
+- **The named provider is the org's oldest active provider** — the same one `GET /api/v1/sso/login/:orgId` launches — not necessarily the one with `enforceSSO` set. If that provider is SAML rather than OIDC, discovery also returns `{ "sso": null }`, since the login entry route only supports OIDC today.
+
+An organization that hasn't verified a domain sees the password form exactly as before — this is pre-existing behavior, not a regression introduced by discovery.
+
+---
+
+## Partner-Wide SSO (Technician Login)
+
+While an organization provider signs in a customer's users, a **partner-owned provider** authenticates the MSP's own technicians. Create one with `ownerScope: "partner"` (see [Create Provider Schema](#create-provider-schema)).
+
+### Login Entry Point
+
+When an active partner provider exists, the main login page shows a **"Sign in with \{provider\}"** button — before any organization is chosen. The button appears only on **self-hosted deployments that resolve to exactly one partner** (`IS_HOSTED` not set to `true`). Hosted and multi-partner instances never show it: exposing one tenant's IdP on a shared login page would leak tenant information, so those deployments continue to use per-organization SSO entry points.
+
+If more than one partner provider is active, the button deterministically targets the **oldest active** provider (by creation time), so activating a second provider never silently changes the login page. The button starts the standard OIDC flow via `GET /api/v1/sso/login/partner/:partnerId`.
+
+### Identity-First Sign-In (No Auto-Provisioning)
+
+Partner-axis sign-in is **identity-first** and never provisions accounts. An IdP identity that Breeze does not recognize is rejected and told to request an invite from an administrator — unlike organization providers, there is no just-in-time user creation on the partner axis. Technician accounts must exist (via invite) before they can sign in with SSO.
+
+A partner provider's `defaultRoleId`, when set, must be a **partner-scoped role** belonging to your partner.
+
+### Enforcement on the Login Page
+
+When a partner provider has `enforceSSO: true`, the login page **collapses** the password form behind a **"Sign in with password instead"** toggle rather than removing it. Actual enforcement happens server-side per user at login time — a technician governed by the enforcing provider cannot sign in with a password even if the form is revealed, while organization users on the same instance are unaffected.
+
+### Password Reset and SSO Enforcement
+
+The forgot-password and reset-password flows honor SSO enforcement. A partner-scoped technician whose partner provider has `enforceSSO: true` cannot reset a password: the request still returns the generic success response (so account existence is never revealed), but **no reset email is sent**. The same rule applies to organization users under an enforcing organization provider.
+
+### Satisfying Breeze MFA with your IdP
+
+By default, Breeze never accepts an IdP's own multi-factor authentication as satisfying its own MFA-gated routes (mutating SSO provider config, PAM checkouts, and similar sensitive actions) — every account, SSO-provisioned or not, must separately satisfy Breeze's own MFA requirement on those routes. Set `trustsIdpMfa: true` on a provider (organization or partner-owned) to change that: when the id_token from that provider's login includes `amr: mfa` — an [RFC 8176](https://www.rfc-editor.org/rfc/rfc8176) Authentication Method Reference claim meaning the user completed multi-factor authentication at the IdP — Breeze treats MFA as satisfied for that sign-in.
+
+Two things to know before turning this on:
+
+- **Your IdP must actually send the claim.** Most identity providers only include `amr` in the id_token when explicitly configured to (an app-registration or claims-mapping setting on the IdP side, not a Breeze setting). Consult your IdP's documentation. If the claim is absent, `trustsIdpMfa` has no effect and Breeze continues to require its own MFA step.
+- **This is fail-safe, not fail-open.** `trustsIdpMfa` defaults to `false` on every provider, and a missing or unrecognized `amr` value is treated as "MFA not satisfied" rather than being assumed. Enabling it is always an explicit, reviewable opt-in per provider.
+
+---
+
+## Login Page Branding
+
+Partner administrators can brand the login screen itself — separate from any SSO configuration. Under **Settings → Partner Settings → Branding → Login Branding**, you can set:
+
+| Field | Constraints |
+|-------|-------------|
+| **Logo** | An HTTPS URL, or a base64 `data:` URI containing a PNG, JPEG, or WebP image. |
+| **Accent color** | A `#rrggbb` hex color (enforced by the database as well as the API). |
+| **Headline** | Free text, maximum 120 characters. |
+
+The API surface is `GET`/`PUT /api/v1/partners/me/login-branding`. The `PUT` is a **full replace**: any field omitted from the request is cleared, not preserved.
+
+Login branding renders under the same rule as the partner SSO button: only on self-hosted deployments that resolve to exactly one partner. It is distinct from [organization and portal branding](/features/branding/), which covers post-login surfaces (dashboard, end-user portal, and email templates).
+
+---
+
+## Linking Your SSO Identity
+
+Users can link an SSO identity to their existing Breeze account themselves, from **Settings → Profile → Connect SSO**. Linking runs the normal sign-in round trip at the IdP and then attaches the resulting identity to the signed-in account, so future SSO logins match by identity rather than email.
+
+If linking fails, the profile page surfaces one of these errors:
+
+| Error | Meaning |
+|-------|---------|
+| `email_mismatch` | The email asserted by the IdP does not match your Breeze account's email. |
+| `identity_in_use` | This IdP identity is already linked to a different Breeze user. |
+| `user_gone` | Your account was removed while the linking flow was in progress. |
+
+---
+
+## Database Schema
+
+### `sso_providers` Table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `uuid` | Primary key. |
+| `org_id` | `uuid` | Organization this provider belongs to (foreign key, nullable). Set for organization providers. |
+| `partner_id` | `uuid` | Partner this provider belongs to (foreign key, nullable). Set for partner-wide providers. Exactly one of `org_id`/`partner_id` must be set — enforced by a database CHECK constraint. |
+| `name` | `varchar(255)` | Display name. |
+| `type` | `sso_provider_type` enum | `oidc` or `saml`. |
+| `status` | `sso_provider_status` enum | `active`, `inactive`, or `testing`. |
+| `issuer` | `varchar(500)` | IdP issuer URL. |
+| `client_id` | `varchar(255)` | OAuth Client ID. |
+| `client_secret` | `text` | Encrypted OAuth Client Secret. |
+| `authorization_url` | `varchar(500)` | Authorization endpoint (auto-discovered or manual). |
+| `token_url` | `varchar(500)` | Token endpoint. |
+| `userinfo_url` | `varchar(500)` | UserInfo endpoint. |
+| `jwks_url` | `varchar(500)` | JWKS URI. |
+| `scopes` | `varchar(500)` | Space-separated scopes. Default: `openid profile email`. |
+| `entity_id` | `varchar(500)` | SAML Entity ID. |
+| `sso_url` | `varchar(500)` | SAML SSO URL. |
+| `certificate` | `text` | SAML signing certificate. |
+| `attribute_mapping` | `jsonb` | Maps IdP claims to Breeze fields. |
+| `auto_provision` | `boolean` | Auto-create users. Default: `true`. |
+| `default_role_id` | `uuid` | Role for auto-provisioned users. |
+| `allowed_domains` | `varchar(1000)` | Comma-separated allowed email domains. |
+| `enforce_sso` | `boolean` | Disable password login. Default: `false`. |
+| `created_by` | `uuid` | User who created the provider (foreign key). |
+| `created_at` | `timestamp` | Creation timestamp. |
+| `updated_at` | `timestamp` | Last update timestamp. |
+
+### `user_sso_identities` Table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `uuid` | Primary key. |
+| `user_id` | `uuid` | Breeze user (foreign key). |
+| `provider_id` | `uuid` | SSO provider (foreign key). |
+| `external_id` | `varchar(255)` | User's `sub` claim from the IdP. |
+| `email` | `varchar(255)` | Email from the IdP. |
+| `profile` | `jsonb` | Full UserInfo/SAML profile data. |
+| `access_token` | `text` | Encrypted IdP access token. |
+| `refresh_token` | `text` | Encrypted IdP refresh token. |
+| `token_expires_at` | `timestamp` | Token expiration. |
+| `last_login_at` | `timestamp` | Last SSO login timestamp. |
+| `created_at` | `timestamp` | Record creation. |
+| `updated_at` | `timestamp` | Last update. |
+
+### `sso_sessions` Table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `uuid` | Primary key. |
+| `provider_id` | `uuid` | SSO provider (foreign key). |
+| `state` | `varchar(64)` | Login-flow state parameter (unique). Used to look up and atomically consume the session; CSRF protection is enforced by binding this value to the initiating browser via the signed `breeze_sso_state` cookie (see [SSO Login Flow](#sso-login-flow)). |
+| `nonce` | `varchar(64)` | ID token nonce. |
+| `code_verifier` | `varchar(128)` | PKCE code verifier. |
+| `redirect_url` | `varchar(500)` | Post-login redirect path. |
+| `expires_at` | `timestamp` | Session expiration (10 minutes from creation). |
+| `created_at` | `timestamp` | Creation timestamp. |
+
+<Aside type="note">
+  The `nonce`, `code_verifier`, and `redirect_url` are intentionally kept server-side in this table and are never placed in the browser cookie — only the `state`-binding HMAC travels to the client. The session row is consumed (deleted) atomically on the first valid callback, so it cannot be replayed even within the TTL window.
+</Aside>
+
+### `partner_login_branding` Table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `partner_id` | `uuid` | Primary key (foreign key to `partners`). One row per partner. |
+| `logo_url` | `text` | HTTPS URL or base64 image data URI for the login logo. |
+| `accent_color` | `varchar(7)` | `#rrggbb` hex accent color (CHECK-constrained). |
+| `headline` | `varchar(120)` | Login page headline text. |
+| `created_at` | `timestamp` | Creation timestamp. |
+| `updated_at` | `timestamp` | Last update timestamp. |
+
+---
+
+## API Reference
+
+All routes are prefixed with `/api/v1/sso`, except where a full path starting with `/api/v1/` is shown.
+
+### Provider Management (Authenticated)
+
+| Method | Path | Permission | Description |
+|--------|------|------------|-------------|
+| `GET` | `/sso/presets` | Authenticated | List available provider presets with their default configurations. |
+| `GET` | `/sso/providers` | Authenticated | List SSO providers for the organization. Accepts `orgId` query parameter. Pass `?scope=partner` (partner-scope session required) to list the partner's own providers instead. |
+| `GET` | `/sso/providers/:id` | Authenticated | Get provider details. The `clientSecret` is not returned; `hasClientSecret` indicates if one is set. |
+| `POST` | `/sso/providers` | `organizations:write` + MFA | Create a new SSO provider. Returns with `status: inactive`. |
+| `PATCH` | `/sso/providers/:id` | `organizations:write` + MFA | Update provider configuration. |
+| `DELETE` | `/sso/providers/:id` | `organizations:write` + MFA | Delete a provider and all associated sessions and identity links. |
+| `POST` | `/sso/providers/:id/status` | `organizations:write` + MFA | Set provider status (`active`, `inactive`, `testing`). |
+| `POST` | `/sso/providers/:id/test` | `organizations:write` + MFA | Test OIDC provider configuration by running discovery. |
+| `GET` | `/api/v1/partners/me/login-branding` | Partner scope | Get the partner's login page branding. |
+| `PUT` | `/api/v1/partners/me/login-branding` | Partner scope + partner-wide policy rights | Replace the partner's login page branding. Omitted fields are cleared. |
+
+### Login Flow (Public)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/sso/check/:orgId` | None | Check if SSO is enabled for an organization. Returns provider name, type, enforcement status, and login URL. |
+| `POST` | `/api/v1/auth/sso-discovery` | None | Home-realm discovery by email domain (see [Login Page Discovery](#login-page-discovery)). Body: `{ "email": "..." }`. Always returns `{ "sso": null }` or `{ "sso": { "providerName", "loginUrl", "enforceSSO": true } }` — never an account-existence signal. Rate-limited per client. |
+| `GET` | `/sso/login/:orgId` | None | Initiate SSO login for an organization. Generates PKCE + state and redirects to the IdP. |
+| `GET` | `/sso/login/partner/:partnerId` | None | Initiate partner-wide SSO login (technician sign-in). Uses the oldest active partner provider. |
+| `GET` | `/api/v1/auth/login-context` | None | Login-page context: partner login branding and the partner SSO button target. Returns empty values on hosted or multi-partner deployments. |
+| `GET` | `/sso/callback` | None | IdP callback. Exchanges code for tokens, provisions user, creates session. Redirects to the app with a token exchange code. |
+| `POST` | `/sso/exchange` | None | Exchange a one-time SSO code for JWT access and refresh tokens. |
+
+---
+
+## Audit Logging
+
+SSO operations are recorded in the audit log:
+
+| Action | Trigger |
+|--------|---------|
+| `sso.provider.create` | Provider created. Includes type and status. |
+| `sso.provider.update` | Provider configuration changed. Includes list of changed fields. |
+| `sso.provider.delete` | Provider deleted. |
+| `sso.provider.status.update` | Provider status changed (active/inactive/testing). |
+| `sso.provider.test` | Provider configuration tested. |
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PUBLIC_URL` or `PUBLIC_APP_URL` or `DASHBOARD_URL` | Yes (one of) | Base URL of the Breeze dashboard. Used to construct the SSO callback URI (`{base}/api/v1/sso/callback`). Falls back to `http://localhost:3000`. |
+| `SECRET_ENCRYPTION_KEY` or `APP_ENCRYPTION_KEY` | Yes | Used to encrypt/decrypt the `clientSecret` at rest. |
+
+---
+
+## Troubleshooting
+
+### "No active SSO provider for this organization" (404)
+
+The `GET /sso/login/:orgId` endpoint could not find a provider with `status: active` for the given organization. Verify that:
+- A provider exists for the organization.
+- The provider status has been set to `active` via `POST /sso/providers/:id/status`.
+
+### "Provider is not fully configured"
+
+The provider is missing one or more of `clientId`, `clientSecret`, or `issuer`. Update the provider via `PATCH /sso/providers/:id` with the missing values.
+
+### "OIDC discovery failed"
+
+Breeze could not fetch the `.well-known/openid-configuration` document from the issuer URL. Check that:
+- The issuer URL is correct and reachable from the Breeze API server.
+- The IdP's discovery endpoint returns a valid JSON document.
+- No firewall or proxy is blocking the connection.
+
+### "session_expired" redirect
+
+The SSO session (state parameter) has expired, or the callback could not be matched to the browser that started the flow. SSO sessions are valid for 10 minutes, and the `breeze_sso_state` cookie that binds the flow to the originating browser shares that lifetime. The user should retry the login flow in the same browser. If this happens frequently, check for clock skew between the Breeze server and the IdP, and confirm the browser is not stripping the `SameSite=Lax` callback cookie (for example, when the IdP redirect crosses an unexpected origin).
+
+### "domain_not_allowed" redirect
+
+The user's email domain is not in the provider's `allowedDomains` list. Update the provider to include the domain, or remove the `allowedDomains` restriction.
+
+### "user_not_found" redirect
+
+The user does not exist in Breeze and `autoProvision` is disabled on the provider. Either:
+- Enable auto-provisioning on the provider (`autoProvision: true`).
+- Create the user account manually before they attempt SSO login.
+
+### "default_role_required" redirect
+
+Auto-provisioning is enabled but no `defaultRoleId` is configured on the provider, or the configured role does not exist as an organization-scoped role. Set a valid `defaultRoleId` via `PATCH /sso/providers/:id`.
+
+### "no_org_access" redirect
+
+The user exists in Breeze but does not have an `organization_users` record for the provider's organization. Add the user to the organization or enable auto-provisioning with a `defaultRoleId`.
+
+### "Invalid or expired token exchange code" (400)
+
+The one-time SSO code passed to `POST /sso/exchange` has either:
+- Already been consumed (codes are single-use).
+- Expired (codes are valid for 2 minutes).
+- Been corrupted during the redirect.
+
+The user should retry the SSO login flow.
+
+### SSO callback redirects to `/login?error=sso_error`
+
+An unhandled error occurred during the callback. Check the Breeze API server logs for the full error message. Common causes include:
+- Network connectivity issues between Breeze and the IdP's token endpoint.
+- Mismatched `clientSecret` (the secret in the IdP does not match what was configured in Breeze).
+- ID token verification failure (wrong issuer, audience, or expired token).
+- Nonce mismatch (indicates a replay attack or stale session).

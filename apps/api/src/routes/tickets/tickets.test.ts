@@ -1,0 +1,2191 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+
+const { serviceMocks, ticketTriageMocks, dbSelectMock, dbGroupByMock, authRef, lastWhereArgs, lastOrderByArgs, writeRouteAuditMock, lastSelectColumns } = vi.hoisted(() => {
+  const lastSelectColumns: unknown[] = [];
+  const lastWhereArgs: { conditions: unknown[] }[] = [];
+  const lastOrderByArgs: unknown[][] = [];
+  return {
+    serviceMocks: {
+      createTicket: vi.fn(),
+      changeTicketStatus: vi.fn(),
+      assignTicket: vi.fn(),
+      addTicketComment: vi.fn(),
+      linkAlertToTicket: vi.fn(),
+      unlinkAlertFromTicket: vi.fn(),
+      updateTicketFields: vi.fn(),
+      getAssigneeForValidation: vi.fn(),
+      editTicketComment: vi.fn(),
+      deleteTicketComment: vi.fn(),
+      softDeleteTicket: vi.fn(),
+      restoreTicket: vi.fn(),
+      listRequestersForOrg: vi.fn(),
+    },
+    ticketTriageMocks: {
+      getTicketTriageSuggestion: vi.fn(),
+      evaluateTicketTriage: vi.fn(),
+    },
+    dbSelectMock: vi.fn(),
+    dbGroupByMock: vi.fn(),
+    writeRouteAuditMock: vi.fn(),
+    lastWhereArgs,
+    lastOrderByArgs,
+    lastSelectColumns,
+    /** Mutable ref so individual tests can override the injected auth context. */
+    authRef: {
+      current: {
+        scope: 'partner' as string,
+        user: { id: 'u-1', name: 'Tess Tech', email: 'tess@msp.example', isPlatformAdmin: false },
+        partnerId: 'p-1' as string | null,
+        orgId: null as string | null,
+        accessibleOrgIds: ['org-1', '3f2f1d8e-1111-4222-8333-444455556666'] as string[] | null,
+        orgCondition: () => undefined,
+        canAccessOrg: (_id: string) => true as boolean
+      }
+    }
+  };
+});
+
+vi.mock('../../services/auditEvents', () => ({
+  writeRouteAudit: writeRouteAuditMock
+}));
+
+vi.mock('../../services/ticketService', async () => {
+  const actual = await vi.importActual<typeof import('../../services/ticketService')>('../../services/ticketService');
+  return { ...actual, ...serviceMocks };
+});
+
+vi.mock('../../services/ticketTriage', () => ticketTriageMocks);
+
+// #4211 (W01) — aiDrafts.ts (mounted under ticketsRoutes) now imports
+// getLatestTicketProposal, which pulls in runTrace.ts's real dependency
+// chain (alertVerdicts/sweepFindings -> actionIntents/intentService ->
+// aiTools.ts) — a much heavier module graph than this file's own minimal
+// `../../db/schema` mock below supports. This suite never exercises the
+// ai-proposal routes (that's aiDrafts.test.ts), so stub the module out
+// entirely rather than widen the schema mock for an unrelated endpoint.
+vi.mock('../../services/aiTicketProposal', () => ({
+  getLatestTicketProposal: vi.fn(),
+}));
+
+vi.mock('../../services/mlFeedbackEmitters', () => ({
+  emitTicketTriageFeedback: vi.fn(),
+}));
+
+// Mirror the REAL middleware contract: authMiddleware is the ONLY thing that
+// populates c.get('auth'); requireScope 401s when it is missing (exactly the
+// production failure mode when authMiddleware isn't wired into the router —
+// regression for the Phase 1a routes shipping without it).
+vi.mock('../../middleware/auth', async () => ({
+  authMiddleware: vi.fn(async (c: any, next: any) => {
+    if (!authRef.current) {
+      return c.json({ error: 'Not authenticated' }, 401);
+    }
+    c.set('auth', authRef.current);
+    // Mirror the real permission middleware for the handful of handlers that
+    // read c.get('permissions') directly (archived-view + bulk-delete gates).
+    const perms = (authRef.current as any).permissions;
+    if (perms) c.set('permissions', perms);
+    await next();
+  }),
+  requireScope: () => async (c: any, next: any) => {
+    if (!c.get('auth')) {
+      return c.json({ error: 'Not authenticated' }, 401);
+    }
+    await next();
+  },
+  requirePermission: () => async (_c: any, next: any) => next(),
+  requireMfa: () => async (_c: any, next: any) => next(),
+  // Real implementation, not a re-implementation: siteAccessCheck is a pure
+  // function and the single source of truth for site-allowlist semantics —
+  // re-exporting it keeps these route tests honest if those semantics change.
+  siteAccessCheck: (await vi.importActual<typeof import('../../middleware/auth')>('../../middleware/auth')).siteAccessCheck,
+}));
+
+vi.mock('../../db', () => ({
+  // Passthroughs for the service's system-scope validation reads (RLS concern,
+  // invisible to these mocked-db tests).
+  runOutsideDbContext: (fn: () => unknown) => fn(),
+  withSystemDbAccessContext: (fn: () => unknown) => fn(),
+  db: {
+    select: vi.fn((cols?: unknown) => ({
+      // Recorded so a test can prove the attachment feed query never selects
+      // the bytea `data` column (spec D10).
+      ...(lastSelectColumns.push(cols) ? {} : {}),
+      from: vi.fn(() => ({
+        leftJoin: vi.fn(() => ({
+          leftJoin: vi.fn(() => ({
+            leftJoin: vi.fn(() => ({
+              leftJoin: vi.fn(() => ({
+                // 4 leftJoins: list/detail endpoints (tickets + orgs + devices + users + ticketStatuses)
+                where: vi.fn((...args: unknown[]) => {
+                  lastWhereArgs.push({ conditions: args });
+                  return {
+                    orderBy: vi.fn((...orderArgs: unknown[]) => {
+                      lastOrderByArgs.push(orderArgs);
+                      return {
+                        limit: vi.fn(() => ({ offset: vi.fn(() => dbSelectMock()) }))
+                      };
+                    }),
+                    limit: vi.fn(() => dbSelectMock())
+                  };
+                })
+              })),
+              // 3 leftJoins: fallback
+              where: vi.fn((...args: unknown[]) => {
+                lastWhereArgs.push({ conditions: args });
+                return {
+                  orderBy: vi.fn((...orderArgs: unknown[]) => {
+                    lastOrderByArgs.push(orderArgs);
+                    return {
+                    limit: vi.fn(() => ({ offset: vi.fn(() => dbSelectMock()) }))
+                    };
+                  }),
+                  limit: vi.fn(() => dbSelectMock())
+                };
+              })
+            })),
+            where: vi.fn(() => ({
+              orderBy: vi.fn(() => ({
+                limit: vi.fn(() => ({ offset: vi.fn(() => dbSelectMock()) }))
+              }))
+            }))
+          })),
+          // single leftJoin → where (e.g. ticketAlertLinks joined with alerts)
+          where: vi.fn(() => Promise.resolve(dbSelectMock() ?? []))
+        })),
+        where: vi.fn((...args: unknown[]) => {
+          lastWhereArgs.push({ conditions: args });
+          const result = {
+          orderBy: vi.fn(() => Promise.resolve(dbSelectMock())),
+          groupBy: vi.fn(() => dbGroupByMock()),
+          // getScopedTicketOr404 and GET /:id single-row lookups both use .limit(1)
+          limit: vi.fn(() => dbSelectMock()),
+          then: (resolve: (value: unknown) => unknown, reject: (reason?: unknown) => unknown) =>
+            Promise.resolve(dbSelectMock()).then(resolve, reject)
+          };
+          return result;
+        })
+      }))
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([])) }))
+      }))
+    }))
+  }
+}));
+vi.mock('../../db/schema', () => ({
+  tickets: {
+    id: 'id', orgId: 'orgId', partnerId: 'partnerId', status: 'status',
+    priority: 'priority', assignedTo: 'assignedTo', categoryId: 'categoryId',
+    internalNumber: 'internalNumber', subject: 'subject', createdAt: 'createdAt',
+    updatedAt: 'updatedAt', dueDate: 'dueDate', deviceId: 'deviceId',
+    source: 'source', slaBreachedAt: 'sla_breached_at', firstResponseAt: 'first_response_at',
+    responseSlaMinutes: 'response_sla_minutes', resolutionSlaMinutes: 'resolution_sla_minutes',
+    slaPausedAt: 'sla_paused_at', slaPausedMinutes: 'sla_paused_minutes',
+    slaBreachReason: 'sla_breach_reason', statusId: 'statusId',
+    deletedAt: 'deletedAt', deletedBy: 'deletedBy'
+  },
+  ticketStatuses: { id: 'id', name: 'name', color: 'color' },
+  ticketComments: { ticketId: 'ticketId', deletedAt: 'deletedAt', createdAt: 'createdAt' },
+  ticketCategories: {},
+  ticketAlertLinks: { ticketId: 'ticketId', alertId: 'alertId', id: 'id', linkType: 'linkType' },
+  alerts: { id: 'id', title: 'title', severity: 'severity', status: 'status', deviceId: 'deviceId' },
+  devices: { id: 'id', hostname: 'hostname', orgId: 'orgId', siteId: 'siteId' },
+  organizations: { id: 'id', name: 'name' },
+  users: { id: 'id', name: 'name' },
+  // Required by timeEntryService module-scope const entrySelection (imported via export.ts)
+  timeEntries: {
+    id: 'id', ticketId: 'ticketId', orgId: 'orgId', userId: 'userId', partnerId: 'partnerId',
+    startedAt: 'startedAt', endedAt: 'endedAt', durationMinutes: 'durationMinutes',
+    description: 'description', isBillable: 'isBillable', billingStatus: 'billingStatus',
+    hourlyRate: 'hourlyRate', isApproved: 'isApproved', addedBy: 'addedBy', runningTimerId: 'runningTimerId'
+  },
+  // #5783 W01: ticketChecklistService is reachable from routes/tickets/index.ts,
+  // and its module-scope CHECKLIST_ORDER reads these columns at import time.
+  ticketChecklistItems: {
+    id: 'id', orgId: 'orgId', ticketId: 'ticketId', label: 'label', detail: 'detail',
+    position: 'position', doneAt: 'doneAt', doneByUserId: 'doneByUserId', source: 'source',
+    sourceTemplateItemId: 'sourceTemplateItemId', createdBy: 'createdBy',
+    createdAt: 'createdAt', updatedAt: 'updatedAt',
+  },
+  ticketParts: {
+    id: 'id', ticketId: 'ticketId', orgId: 'orgId', addedBy: 'addedBy',
+    description: 'description', quantity: 'quantity', unitPrice: 'unitPrice',
+    costBasis: 'costBasis', isBillable: 'isBillable', billingStatus: 'billingStatus',
+    createdAt: 'createdAt', updatedAt: 'updatedAt'
+  }
+}));
+
+// Import the hub router (./index), not ./tickets directly — the hub is what
+// apps/api/src/index.ts mounts and is where authMiddleware is applied.
+import { ticketsRoutes } from './index';
+// Real class (the service mock spreads importActual), so handleServiceError's
+// instanceof check in the route works against errors thrown by the mocks.
+import { TicketServiceError } from '../../services/ticketService';
+import { evaluateTicketTriage, getTicketTriageSuggestion } from '../../services/ticketTriage';
+import { emitTicketTriageFeedback } from '../../services/mlFeedbackEmitters';
+
+const TICKET_ID = '3f2f1d8e-1111-4222-8333-444455556666';
+const ORG_ID    = '3f2f1d8e-1111-4222-8333-444455556666';
+const CONTACT_ID = '9c8d7e6f-2222-4333-8444-555566667777';
+const STUB_TICKET = { id: TICKET_ID, orgId: 'org-1', partnerId: 'p-1', subject: 'Printer' };
+
+const DEFAULT_AUTH = {
+  scope: 'partner' as string,
+  user: { id: 'u-1', name: 'Tess Tech', email: 'tess@msp.example', isPlatformAdmin: false },
+  partnerId: 'p-1' as string | null,
+  orgId: null as string | null,
+  accessibleOrgIds: ['org-1', ORG_ID] as string[] | null,
+  orgCondition: () => undefined,
+  canAccessOrg: (_id: string) => true as boolean
+};
+
+function makeApp() {
+  const app = new Hono();
+  app.route('/tickets', ticketsRoutes);
+  return app;
+}
+
+function resetAuth() {
+  authRef.current = { ...DEFAULT_AUTH, canAccessOrg: () => true };
+  lastWhereArgs.length = 0;
+  lastOrderByArgs.length = 0;
+}
+
+describe('GET /tickets', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('returns paginated data', async () => {
+    dbSelectMock.mockResolvedValue([{ id: 't-1', internalNumber: 'T-2026-0001', subject: 'Printer' }]);
+    const res = await makeApp().request('/tickets?statusGroup=open');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toHaveProperty('data');
+    expect(body).toHaveProperty('pagination');
+  });
+
+  it('selects SLA fields and returns them in list rows (SLA chips)', async () => {
+    dbSelectMock.mockResolvedValue([
+      {
+        id: 't-1',
+        internalNumber: 'T-2026-0001',
+        subject: 'Printer',
+        responseSlaMinutes: 60,
+        resolutionSlaMinutes: 240,
+        slaPausedAt: null,
+        slaPausedMinutes: 15,
+        slaBreachReason: null
+      }
+    ]);
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data[0]).toMatchObject({
+      responseSlaMinutes: 60,
+      resolutionSlaMinutes: 240,
+      slaPausedAt: null,
+      slaPausedMinutes: 15,
+      slaBreachReason: null
+    });
+
+    // The selection object passed to db.select must include the column —
+    // the mock returns rows verbatim, so assert the query shape too.
+    const { db } = await import('../../db');
+    const selectionCalls = (db.select as any).mock.calls.filter(
+      (args: unknown[]) => args[0] && typeof args[0] === 'object'
+    );
+    const listSelection = selectionCalls.find(
+      (args: any[]) => args[0] && 'internalNumber' in args[0] && 'subject' in args[0]
+    )?.[0];
+    expect(listSelection).toMatchObject({
+      responseSlaMinutes: 'response_sla_minutes',
+      resolutionSlaMinutes: 'resolution_sla_minutes',
+      slaPausedAt: 'sla_paused_at',
+      slaPausedMinutes: 'sla_paused_minutes',
+      slaBreachReason: 'sla_breach_reason'
+    });
+  });
+
+  it('GET /tickets?slaState=breached filters on sla_breached_at IS NOT NULL', async () => {
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request('/tickets?slaState=breached');
+    expect(res.status).toBe(200);
+
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastWhereArgs[0]!.conditions);
+    expect(serialized).toContain('sla_breached_at');
+    expect(serialized).toContain('IS NOT NULL');
+  });
+
+  it('GET /tickets?slaState=breaching ORs breached with the at-risk expression', async () => {
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request('/tickets?slaState=breaching');
+    expect(res.status).toBe(200);
+
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastWhereArgs[0]!.conditions);
+    expect(serialized).toContain('sla_breached_at');
+    expect(serialized).toContain('OR');
+    expect(serialized).toContain('sla_paused_at');
+    expect(serialized).toContain('response_sla_minutes');
+    expect(serialized).toContain('resolution_sla_minutes');
+  });
+
+  it('default (non-archived) list excludes soft-deleted tickets (deleted_at IS NULL)', async () => {
+    // Phase 6: the default GET /tickets branch appends isNull(tickets.deletedAt)
+    // so soft-deleted tickets never appear in the staff queue. The `deleted=only`
+    // archived view is gated + tested separately; this guards the DEFAULT branch.
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(200);
+
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastWhereArgs[0]!.conditions);
+    expect(serialized).toContain('deletedAt');
+    expect(serialized).toContain('is null');
+  });
+
+  it('triage sort orders breached first, then at-risk, then priority', async () => {
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request('/tickets?sort=triage');
+    expect(res.status).toBe(200);
+
+    expect(lastOrderByArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastOrderByArgs[0]);
+    const breachedIndex = serialized.indexOf('sla_breached_at');
+    const atRiskIndex = serialized.indexOf('sla_paused_at');
+    const priorityIndex = serialized.indexOf('urgent');
+    expect(breachedIndex).toBeGreaterThanOrEqual(0);
+    expect(atRiskIndex).toBeGreaterThan(breachedIndex);
+    expect(priorityIndex).toBeGreaterThan(atRiskIndex);
+  });
+
+  it('rejects an invalid statusGroup', async () => {
+    const res = await makeApp().request('/tickets?statusGroup=weird');
+    expect(res.status).toBe(400);
+  });
+
+  it('403 when partner scope has null partnerId (broken context)', async () => {
+    authRef.current = { ...DEFAULT_AUTH, scope: 'partner', partnerId: null };
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Partner context required');
+  });
+
+  it('rejects an explicit orgId outside the partner user org allowlist', async () => {
+    authRef.current = { ...DEFAULT_AUTH, canAccessOrg: () => false };
+
+    const res = await makeApp().request(`/tickets?orgId=${ORG_ID}`);
+
+    expect(res.status).toBe(403);
+    expect(dbSelectMock).not.toHaveBeenCalled();
+  });
+
+  it('scoped org query includes a WHERE arg (org scope adds condition)', async () => {
+    authRef.current = {
+      ...DEFAULT_AUTH,
+      scope: 'organization',
+      orgId: ORG_ID,
+      partnerId: null,
+      canAccessOrg: () => true
+    };
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(200);
+    // At least one where call was recorded with a defined condition arg
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    expect(lastWhereArgs[0]!.conditions.length).toBeGreaterThan(0);
+  });
+
+  it('403 when organization scope has no orgId', async () => {
+    authRef.current = { ...DEFAULT_AUTH, scope: 'organization', orgId: null, partnerId: null };
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Organization context required');
+  });
+
+  it('applies a deviceId filter condition when ?deviceId= is provided', async () => {
+    const DEVICE_ID = '9a8b7c6d-1111-4222-8333-444455556666';
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request(`/tickets?deviceId=${DEVICE_ID}`);
+    expect(res.status).toBe(200);
+    // The where condition is and(partnerCond, eq(tickets.deviceId, DEVICE_ID));
+    // the mocked schema column is the string 'deviceId', so the serialized SQL
+    // must mention both the column and the bound uuid value.
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastWhereArgs[0]!.conditions);
+    expect(serialized).toContain('deviceId');
+    expect(serialized).toContain(DEVICE_ID);
+  });
+
+  it('rejects a non-uuid deviceId', async () => {
+    const res = await makeApp().request('/tickets?deviceId=not-a-uuid');
+    expect(res.status).toBe(400);
+  });
+
+  it('constrains the unfiltered partner list to the user accessible org ids (org_access=selected)', async () => {
+    // org_access='selected' partner with a concrete accessible-org set hitting
+    // GET /tickets without an explicit ?orgId=. The base partner branch must
+    // narrow to inArray(orgId, accessibleOrgIds) — parity with detail/stats —
+    // not rely on RLS alone.
+    authRef.current = { ...DEFAULT_AUTH, accessibleOrgIds: ['org-selected-a', 'org-selected-b'] };
+    dbSelectMock.mockResolvedValue([]);
+
+    const res = await makeApp().request('/tickets');
+
+    expect(res.status).toBe(200);
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastWhereArgs[0]!.conditions);
+    expect(serialized).toContain('org-selected-a');
+    expect(serialized).toContain('org-selected-b');
+  });
+});
+
+describe('POST /tickets', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('creates via ticketService and returns 201', async () => {
+    serviceMocks.createTicket.mockResolvedValue({ id: 't-1', internalNumber: 'T-2026-0001' });
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'Printer offline' })
+    });
+    expect(res.status).toBe(201);
+    expect(serviceMocks.createTicket).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: 'Printer offline', source: 'manual' }),
+      expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('passes formId and formResponses through to createTicket', async () => {
+    serviceMocks.createTicket.mockResolvedValue({ id: 't-9', internalNumber: 'T-2026-0009' });
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        orgId: ORG_ID,
+        formId: '9a8b7c6d-1111-4222-8333-444455556666',
+        formResponses: { affected_user: 'jdoe@client.example' }
+      })
+    });
+    expect(res.status).toBe(201);
+    expect(serviceMocks.createTicket).toHaveBeenCalledWith(
+      expect.objectContaining({
+        formId: '9a8b7c6d-1111-4222-8333-444455556666',
+        formResponses: { affected_user: 'jdoe@client.example' }
+      }),
+      expect.anything()
+    );
+  });
+
+  it('400s on a missing subject', async () => {
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID })
+    });
+    expect(res.status).toBe(400);
+  });
+
+  // #5367: the mobile New-ticket form names the requester CONTACT. The route
+  // spreads the parsed body, so this asserts the SCHEMA carries the field —
+  // an omitted key is stripped silently and the ticket lands with no requester.
+  it('passes requesterContactId through to createTicket', async () => {
+    serviceMocks.createTicket.mockResolvedValue({ id: 't-5', internalNumber: 'T-2026-0005' });
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'Printer offline', requesterContactId: CONTACT_ID })
+    });
+    expect(res.status).toBe(201);
+    expect(serviceMocks.createTicket).toHaveBeenCalledWith(
+      expect.objectContaining({ requesterContactId: CONTACT_ID, source: 'manual' }),
+      expect.anything()
+    );
+  });
+
+  it('400s on a non-uuid requesterContactId before reaching the service', async () => {
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'x', requesterContactId: 'not-a-uuid' })
+    });
+    expect(res.status).toBe(400);
+    expect(serviceMocks.createTicket).not.toHaveBeenCalled();
+  });
+
+  // The same-org rule stays where it already is — `assertRequesterContactInOrg`
+  // in the service, which runs before the ticket number is allocated. The route
+  // only has to surface it; this pins the status/code the client sees.
+  it('surfaces the service cross-org contact rejection as 400 with its code', async () => {
+    const { TicketServiceError } = await vi.importActual<typeof import('../../services/ticketService')>('../../services/ticketService');
+    serviceMocks.createTicket.mockRejectedValue(
+      new TicketServiceError('Requester contact must belong to the ticket organization', 400, 'REQUESTER_CONTACT_WRONG_ORG')
+    );
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'x', requesterContactId: CONTACT_ID })
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'REQUESTER_CONTACT_WRONG_ORG' });
+  });
+
+  it('maps TicketServiceError status through (404 org)', async () => {
+    const { TicketServiceError } = await vi.importActual<typeof import('../../services/ticketService')>('../../services/ticketService');
+    serviceMocks.createTicket.mockRejectedValue(new TicketServiceError('Organization not found', 404));
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'x' })
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it('403 when canAccessOrg returns false for the body orgId', async () => {
+    authRef.current = { ...DEFAULT_AUTH, canAccessOrg: () => false };
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'Unauthorized ticket' })
+    });
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Access to this organization denied');
+    expect(serviceMocks.createTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /tickets/requesters', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('returns the org requesters for an accessible org', async () => {
+    serviceMocks.listRequestersForOrg.mockResolvedValue([
+      { id: 'pu-1', name: 'Jane Doe', email: 'jane@example.com' }
+    ]);
+    const res = await makeApp().request(`/tickets/requesters?orgId=${ORG_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual([{ id: 'pu-1', name: 'Jane Doe', email: 'jane@example.com' }]);
+    expect(serviceMocks.listRequestersForOrg).toHaveBeenCalledWith(ORG_ID);
+  });
+
+  it('403s when the caller cannot access the org (cross-tenant)', async () => {
+    authRef.current = { ...DEFAULT_AUTH, canAccessOrg: () => false };
+    const res = await makeApp().request(`/tickets/requesters?orgId=${ORG_ID}`);
+    expect(res.status).toBe(403);
+    expect(serviceMocks.listRequestersForOrg).not.toHaveBeenCalled();
+  });
+
+  it('400s on a missing or malformed orgId', async () => {
+    expect((await makeApp().request('/tickets/requesters')).status).toBe(400);
+    expect((await makeApp().request('/tickets/requesters?orgId=not-a-uuid')).status).toBe(400);
+    expect(serviceMocks.listRequestersForOrg).not.toHaveBeenCalled();
+  });
+
+  it('is not captured by the /:id param route', async () => {
+    serviceMocks.listRequestersForOrg.mockResolvedValue([]);
+    const res = await makeApp().request(`/tickets/requesters?orgId=${ORG_ID}`);
+    // A 200 (not the 400 that an :id uuid-param would produce for "requesters") proves ordering.
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('GET /tickets/stats', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('aggregates open / unassigned / mine / breached counts via groupBy and returns atRisk', async () => {
+    // auth user id is 'u-1' (set in requireScope mock above)
+    // Rows: open+assigned-to-u1+not-breached(3), new+unassigned+breached(2)
+    const mockRows = [
+      { status: 'open', assignedTo: 'u-1', breached: false, count: 3 },
+      { status: 'new',  assignedTo: null,   breached: true,  count: 2 }
+    ];
+    dbGroupByMock.mockResolvedValue(mockRows);
+    dbSelectMock.mockResolvedValue([{ atRisk: 4 }]);
+
+    const res = await makeApp().request('/tickets/stats');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    // open: both rows have open-statuses ('open','new') → 3+2 = 5
+    // unassigned: row 2 has no assignedTo → 2
+    // mine: row 1 has assignedTo === 'u-1' → 3
+    // breached: row 2 has breached=true → 2
+    expect(body.data).toEqual({ open: 5, unassigned: 2, mine: 3, breached: 2, atRisk: 4 });
+
+    // Ensure groupBy was used (not orderBy) — the mock resolves via dbGroupByMock
+    expect(dbGroupByMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('excludes soft-deleted tickets from queue counts (deleted_at IS NULL)', async () => {
+    // Phase 6: /stats appends isNull(tickets.deletedAt) so soft-deleted tickets
+    // never inflate the queue tab / dashboard-widget counts.
+    dbGroupByMock.mockResolvedValue([]);
+    dbSelectMock.mockResolvedValue([{ atRisk: 0 }]);
+    const res = await makeApp().request('/tickets/stats');
+    expect(res.status).toBe(200);
+
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastWhereArgs[0]!.conditions);
+    expect(serialized).toContain('deletedAt');
+    expect(serialized).toContain('is null');
+  });
+
+  it('403 when partner scope has null partnerId (broken context)', async () => {
+    authRef.current = { ...DEFAULT_AUTH, scope: 'partner', partnerId: null };
+    const res = await makeApp().request('/tickets/stats');
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Partner context required');
+  });
+
+  it('narrows counts to the requested orgId, matching GET /tickets', async () => {
+    // A partner-scoped caller viewing one org's ticket queue must get that
+    // org's counts, not partner-wide counts — same bug shape as the /tickets
+    // list, which already applies q.orgId (line ~302 above). accessibleOrgIds
+    // deliberately does NOT include ORG_ID, so a pass here can only come from
+    // an explicit orgId condition the handler adds — not from the ambient
+    // partner-wide inArray(accessibleOrgIds) scope condition.
+    authRef.current = {
+      ...DEFAULT_AUTH,
+      scope: 'partner',
+      partnerId: 'p-1',
+      accessibleOrgIds: ['some-other-org'],
+      canAccessOrg: () => true,
+    };
+    dbGroupByMock.mockResolvedValue([]);
+    dbSelectMock.mockResolvedValue([{ atRisk: 0 }]);
+
+    const res = await makeApp().request(`/tickets/stats?orgId=${ORG_ID}`);
+
+    expect(res.status).toBe(200);
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(lastWhereArgs[0]!.conditions);
+    expect(serialized).toContain(ORG_ID);
+  });
+
+  it('403s when the requested orgId is outside the caller access', async () => {
+    authRef.current = { ...DEFAULT_AUTH, scope: 'partner', partnerId: 'p-1', canAccessOrg: () => false };
+
+    const res = await makeApp().request(`/tickets/stats?orgId=${ORG_ID}`);
+
+    expect(res.status).toBe(403);
+    expect(dbGroupByMock).not.toHaveBeenCalled();
+    expect(dbSelectMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /tickets/:id — scoped pre-check', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('constrains partner ticket lookup to the user accessible org ids', async () => {
+    authRef.current = { ...DEFAULT_AUTH, accessibleOrgIds: ['org-visible'] };
+    dbSelectMock.mockResolvedValue([]);
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+
+    expect(res.status).toBe(404);
+    expect(lastWhereArgs.length).toBeGreaterThan(0);
+    expect(JSON.stringify(lastWhereArgs[0]!.conditions)).toContain('org-visible');
+  });
+
+  it('returns 404 when getScopedTicketOr404 finds no row even if service would succeed', async () => {
+    // The scoped SELECT returns nothing (out-of-scope or missing ticket)
+    dbSelectMock.mockResolvedValue([]);
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Ticket not found');
+  });
+
+  it('returns the ticket when the scoped lookup resolves a row', async () => {
+    // First call: getScopedTicketOr404 (the .limit(1) select)
+    // Second call onwards: decoration + child queries (alertLinks) — return empty arrays
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET]) // scoped ticket lookup
+      .mockResolvedValue([]);               // decoration + alert links child queries
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toMatchObject({ id: TICKET_ID, subject: 'Printer' });
+  });
+
+  it('decorates the detail response with orgName, deviceHostname, assigneeName', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET]) // scoped ticket lookup
+      .mockResolvedValueOnce([{ orgName: 'Acme Corp', deviceHostname: 'WS-042', assigneeName: 'Tess Tech' }]) // decoration query
+      .mockResolvedValue([]);               // alert links child query
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Strictly additive: raw row fields still present alongside the decoration.
+    expect(body.data).toMatchObject({
+      id: TICKET_ID,
+      subject: 'Printer',
+      orgName: 'Acme Corp',
+      deviceHostname: 'WS-042',
+      assigneeName: 'Tess Tech'
+    });
+    expect(body.data).toHaveProperty('comments');
+    expect(body.data).toHaveProperty('alertLinks');
+  });
+
+  it('decoration is null-safe for tickets with no device or assignee', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET]) // scoped ticket lookup
+      .mockResolvedValueOnce([{ orgName: 'Acme Corp', deviceHostname: null, assigneeName: null }]) // left joins miss
+      .mockResolvedValue([]);               // alert links child query
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.orgName).toBe('Acme Corp');
+    expect(body.data.deviceHostname).toBeNull();
+    expect(body.data.assigneeName).toBeNull();
+  });
+
+  it('decoration falls back to nulls when the decoration query returns no row', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET]) // scoped ticket lookup
+      .mockResolvedValue([]);               // decoration returns nothing + alert links
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.orgName).toBeNull();
+    expect(body.data.deviceHostname).toBeNull();
+    expect(body.data.assigneeName).toBeNull();
+  });
+
+  it('returns soft-deleted comments to staff as tombstones with empty content', async () => {
+    const deletedAt = new Date('2026-06-20T10:00:00Z').toISOString();
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET])  // scoped ticket lookup
+      .mockResolvedValueOnce([])             // decoration query
+      .mockResolvedValueOnce([              // comments query
+        { id: 'c-1', ticketId: TICKET_ID, content: 'visible', deletedAt: null,  editedAt: null, createdAt: new Date().toISOString() },
+        { id: 'c-2', ticketId: TICKET_ID, content: 'secret',  deletedAt: deletedAt, editedAt: null, createdAt: new Date().toISOString() }
+      ])
+      .mockResolvedValue([]);               // alert links
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const comments = body.data.comments;
+
+    // Non-deleted comment: real content, deleted:false
+    const live = comments.find((c: any) => c.id === 'c-1');
+    expect(live).toBeTruthy();
+    expect(live.content).toBe('visible');
+    expect(live.deleted).toBe(false);
+
+    // Deleted comment: tombstone with empty content — prior text must not reach client
+    const tomb = comments.find((c: any) => c.id === 'c-2');
+    expect(tomb).toBeTruthy();
+    expect(tomb.deleted).toBe(true);
+    expect(tomb.content).toBe('');  // prior text must not leak to the client
+  });
+});
+
+describe('ticket triage suggestion routes', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('GET /tickets/triage-evaluation returns scoped evaluation summary', async () => {
+    vi.mocked(evaluateTicketTriage).mockResolvedValue({
+      labelWindowDays: 90,
+      totalLabels: 3,
+      acceptedSuggestionLabels: 1,
+      manualOverrideLabels: 2,
+      rejectedSuggestionLabels: 0,
+      categoryLabels: 1,
+      priorityLabels: 1,
+      assigneeLabels: 1,
+      overrideRate: 0.67,
+    });
+
+    const res = await makeApp().request('/tickets/triage-evaluation?labelWindowDays=90');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.summary.overrideRate).toBe(0.67);
+    expect(vi.mocked(evaluateTicketTriage)).toHaveBeenCalledWith(expect.objectContaining({
+      labelWindowDays: 90,
+    }));
+  });
+
+  it('GET /tickets/triage-evaluation can scope evaluation to one accessible org', async () => {
+    vi.mocked(evaluateTicketTriage).mockResolvedValue({
+      labelWindowDays: 30,
+      totalLabels: 1,
+      acceptedSuggestionLabels: 1,
+      manualOverrideLabels: 0,
+      rejectedSuggestionLabels: 0,
+      categoryLabels: 0,
+      priorityLabels: 1,
+      assigneeLabels: 0,
+      overrideRate: 0,
+    });
+
+    const res = await makeApp().request(`/tickets/triage-evaluation?labelWindowDays=30&orgId=${ORG_ID}`);
+
+    expect(res.status).toBe(200);
+    expect(vi.mocked(evaluateTicketTriage)).toHaveBeenCalledWith({
+      orgIds: [ORG_ID],
+      labelWindowDays: 30,
+    });
+  });
+
+  it('GET /tickets/triage-evaluation propagates the caller site ceiling', async () => {
+    authRef.current = {
+      ...DEFAULT_AUTH,
+      scope: 'organization',
+      orgId: ORG_ID,
+      partnerId: null,
+      allowedSiteIds: ['site-visible'],
+    } as typeof authRef.current;
+    vi.mocked(evaluateTicketTriage).mockResolvedValue({
+      labelWindowDays: 90,
+      totalLabels: 0,
+      acceptedSuggestionLabels: 0,
+      manualOverrideLabels: 0,
+      rejectedSuggestionLabels: 0,
+      categoryLabels: 0,
+      priorityLabels: 0,
+      assigneeLabels: 0,
+      overrideRate: null,
+    });
+
+    const res = await makeApp().request('/tickets/triage-evaluation');
+
+    expect(res.status).toBe(200);
+    expect(vi.mocked(evaluateTicketTriage)).toHaveBeenCalledWith({
+      orgIds: [ORG_ID],
+      labelWindowDays: 90,
+      allowedSiteIds: ['site-visible'],
+    });
+
+    authRef.current = { ...authRef.current, allowedSiteIds: [] } as typeof authRef.current;
+    const zeroSiteRes = await makeApp().request('/tickets/triage-evaluation');
+    expect(zeroSiteRes.status).toBe(200);
+    expect(vi.mocked(evaluateTicketTriage)).toHaveBeenLastCalledWith({
+      orgIds: [ORG_ID],
+      labelWindowDays: 90,
+      allowedSiteIds: [],
+    });
+  });
+
+  it('GET /tickets/triage-evaluation rejects inaccessible explicit org scope', async () => {
+    authRef.current = {
+      ...DEFAULT_AUTH,
+      canAccessOrg: () => false,
+    };
+
+    const res = await makeApp().request(`/tickets/triage-evaluation?orgId=${ORG_ID}`);
+
+    expect(res.status).toBe(403);
+    expect(vi.mocked(evaluateTicketTriage)).not.toHaveBeenCalled();
+  });
+
+  it('GET /tickets/:id/triage-suggestion returns a scoped suggestion', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    vi.mocked(getTicketTriageSuggestion).mockResolvedValue({
+      enabled: true,
+      flagSource: 'org_settings',
+      suggestion: {
+        modelVersion: 'ticket-triage-rules-v0',
+        confidence: 0.72,
+        priority: 'high',
+        categoryId: null,
+        categoryName: null,
+        reasons: ['high-impact keywords'],
+      },
+    });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/triage-suggestion`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.suggestion.priority).toBe('high');
+    expect(vi.mocked(getTicketTriageSuggestion)).toHaveBeenCalledWith(expect.objectContaining({ id: TICKET_ID }));
+  });
+
+  it('POST /tickets/:id/triage-suggestion/apply tags update as suggestion feedback', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    vi.mocked(getTicketTriageSuggestion).mockResolvedValue({
+      enabled: true,
+      flagSource: 'org_settings',
+      suggestion: {
+        modelVersion: 'ticket-triage-rules-v0',
+        confidence: 0.72,
+        priority: 'high',
+        categoryId: null,
+        categoryName: null,
+        reasons: ['high-impact keywords'],
+      },
+    });
+    serviceMocks.updateTicketFields.mockResolvedValue({ ...STUB_TICKET, priority: 'high' });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/triage-suggestion/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priority: 'high' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(serviceMocks.updateTicketFields).toHaveBeenCalledWith(
+      TICKET_ID,
+      { priority: 'high' },
+      expect.objectContaining({
+        userId: 'u-1',
+        triageFeedbackSource: 'suggestion',
+        triageFeedbackMetadata: {
+          modelVersion: 'ticket-triage-rules-v0',
+          suggestedPriority: 'high',
+          suggestedCategoryId: null,
+          suggestedCategoryName: null,
+          confidence: 0.72,
+          reasons: ['high-impact keywords'],
+        },
+      }),
+    );
+  });
+
+  it('POST /tickets/:id/triage-suggestion/apply rejects stale suggested values', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    vi.mocked(getTicketTriageSuggestion).mockResolvedValue({
+      enabled: true,
+      flagSource: 'org_settings',
+      suggestion: {
+        modelVersion: 'ticket-triage-rules-v0',
+        confidence: 0.72,
+        priority: 'high',
+        categoryId: null,
+        categoryName: null,
+        reasons: ['high-impact keywords'],
+      },
+    });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/triage-suggestion/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priority: 'urgent' }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(serviceMocks.updateTicketFields).not.toHaveBeenCalled();
+  });
+
+  it('POST /tickets/:id/triage-suggestion/reject records explicit rejection feedback', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    vi.mocked(getTicketTriageSuggestion).mockResolvedValue({
+      enabled: true,
+      flagSource: 'org_settings',
+      suggestion: {
+        modelVersion: 'ticket-triage-rules-v0',
+        confidence: 0.72,
+        priority: 'high',
+        categoryId: '00000000-0000-4000-8000-000000000123',
+        categoryName: 'Hardware',
+        reasons: ['matched Hardware'],
+      },
+    });
+    vi.mocked(emitTicketTriageFeedback).mockResolvedValue(undefined);
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/triage-suggestion/reject`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: 'Wrong queue' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(emitTicketTriageFeedback).toHaveBeenCalledWith(expect.objectContaining({
+      orgId: STUB_TICKET.orgId,
+      ticketId: TICKET_ID,
+      eventType: 'ticket.triage_rejected',
+      dedupeKey: 'reject:ticket-triage-rules-v0:high:00000000-0000-4000-8000-000000000123',
+      outcome: 'rejected',
+      actorUserId: 'u-1',
+      metadata: expect.objectContaining({
+        acceptedSuggestion: false,
+        rejectedSuggestion: true,
+        modelVersion: 'ticket-triage-rules-v0',
+        suggestedPriority: 'high',
+        suggestedCategoryId: '00000000-0000-4000-8000-000000000123',
+        note: 'Wrong queue',
+      }),
+    }));
+    expect(serviceMocks.updateTicketFields).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /tickets/:id/status', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('calls changeTicketStatus with id, status, opts, actor and returns 200', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]); // getScopedTicketOr404
+    serviceMocks.changeTicketStatus.mockResolvedValue({ ...STUB_TICKET, status: 'resolved' });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'resolved', resolutionNote: 'Fixed it' })
+    });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.changeTicketStatus).toHaveBeenCalledWith(
+      TICKET_ID,
+      expect.objectContaining({ status: 'resolved' }),
+      expect.objectContaining({ resolutionNote: 'Fixed it' }),
+      expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('returns 404 when scoped pre-check finds no ticket', async () => {
+    dbSelectMock.mockResolvedValueOnce([]); // getScopedTicketOr404 → not found
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'open' })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.changeTicketStatus).not.toHaveBeenCalled();
+  });
+
+  it('maps 409 TicketServiceError through from service', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    const { TicketServiceError } = await vi.importActual<typeof import('../../services/ticketService')>('../../services/ticketService');
+    serviceMocks.changeTicketStatus.mockRejectedValue(new TicketServiceError('Cannot transition', 409));
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'pending' })
+    });
+    expect(res.status).toBe(409);
+  });
+});
+
+describe('POST /tickets/:id/assign', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  const ASSIGNEE_ID = '5a6b7c8d-1234-4321-abcd-000011112222';
+
+  it('calls assignTicket with id, assigneeId, actor and returns 200', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    serviceMocks.assignTicket.mockResolvedValue({ ...STUB_TICKET, assignedTo: ASSIGNEE_ID });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/assign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assigneeId: ASSIGNEE_ID })
+    });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.assignTicket).toHaveBeenCalledWith(
+      TICKET_ID,
+      ASSIGNEE_ID,
+      expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('returns 404 when scoped pre-check finds no ticket', async () => {
+    dbSelectMock.mockResolvedValueOnce([]);
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/assign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assigneeId: ASSIGNEE_ID })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe('DELETE /tickets/:id — soft-delete', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('calls softDeleteTicket and returns 200', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]); // getScopedTicketOr404
+    serviceMocks.softDeleteTicket.mockResolvedValue({ id: TICKET_ID });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.softDeleteTicket).toHaveBeenCalledWith(
+      TICKET_ID,
+      expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('returns 404 when the ticket is out of scope / already deleted (scoped pre-check empty)', async () => {
+    dbSelectMock.mockResolvedValueOnce([]); // getScopedTicketOr404 excludes deleted rows
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.softDeleteTicket).not.toHaveBeenCalled();
+  });
+
+  it('maps a 409 TicketServiceError (already deleted) through from the service', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    serviceMocks.softDeleteTicket.mockRejectedValue(new TicketServiceError('Ticket already deleted', 409));
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, { method: 'DELETE' });
+    expect(res.status).toBe(409);
+  });
+});
+
+describe('POST /tickets/:id/restore', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('calls restoreTicket (finding the deleted row) and returns 200', async () => {
+    dbSelectMock.mockResolvedValueOnce([{ ...STUB_TICKET, deletedAt: new Date().toISOString() }]); // getScopedTicketOr404 includeDeleted
+    serviceMocks.restoreTicket.mockResolvedValue({ ...STUB_TICKET, deletedAt: null });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/restore`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.restoreTicket).toHaveBeenCalledWith(
+      TICKET_ID,
+      expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('returns 404 when the id is out of scope', async () => {
+    dbSelectMock.mockResolvedValueOnce([]);
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/restore`, { method: 'POST' });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.restoreTicket).not.toHaveBeenCalled();
+  });
+});
+
+const MANAGE_PERMS = { permissions: [{ resource: 'tickets', action: 'manage' }] };
+
+describe('GET /tickets?deleted=only — archived queue gate', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('403s without ticket-management permission (no permissions on context)', async () => {
+    const res = await makeApp().request('/tickets?deleted=only');
+    expect(res.status).toBe(403);
+  });
+
+  it('returns the archived queue for a ticket-manager', async () => {
+    (authRef.current as any).permissions = MANAGE_PERMS;
+    dbSelectMock.mockResolvedValue([{ id: 't-1', subject: 'Spam', deletedAt: new Date().toISOString() }]);
+    const res = await makeApp().request('/tickets?deleted=only');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data[0]).toMatchObject({ deletedAt: expect.any(String) });
+  });
+});
+
+describe('POST /tickets/bulk — delete action', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('403s when the caller lacks tickets:manage', async () => {
+    const res = await makeApp().request('/tickets/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticketIds: [TICKET_ID], action: 'delete' })
+    });
+    expect(res.status).toBe(403);
+    expect(serviceMocks.softDeleteTicket).not.toHaveBeenCalled();
+  });
+
+  it('soft-deletes each in-scope ticket for a manager', async () => {
+    (authRef.current as any).permissions = MANAGE_PERMS;
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]); // getScopedTicketOr404 for the one id
+    serviceMocks.softDeleteTicket.mockResolvedValue({ id: TICKET_ID });
+
+    const res = await makeApp().request('/tickets/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticketIds: [TICKET_ID], action: 'delete' })
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toMatchObject({ updated: 1, total: 1 });
+    expect(serviceMocks.softDeleteTicket).toHaveBeenCalledWith(TICKET_ID, expect.objectContaining({ userId: 'u-1' }));
+  });
+});
+
+describe('POST /tickets/:id/comments', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('calls addTicketComment and returns 201', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    serviceMocks.addTicketComment.mockResolvedValue({
+      comment: { id: 'c-1', content: 'On it', isPublic: true },
+      firstResponseStamped: true
+    });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'On it', isPublic: true })
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.data).toMatchObject({ id: 'c-1', content: 'On it' });
+  });
+
+  it('returns 404 when scoped pre-check finds no ticket', async () => {
+    dbSelectMock.mockResolvedValueOnce([]);
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hi', isPublic: false })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.addTicketComment).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /tickets/:id/alerts', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('calls linkAlertToTicket and returns 201', async () => {
+    const ALERT_ID = '4f3f2e9f-2222-4333-9444-555566667777';
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET])          // ticket fetch
+      .mockResolvedValueOnce([{ deviceId: null }]);  // alert row (site gate)
+    serviceMocks.linkAlertToTicket.mockResolvedValue({ id: 'link-1', ticketId: TICKET_ID, alertId: ALERT_ID });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ alertId: ALERT_ID })
+    });
+    expect(res.status).toBe(201);
+    expect(serviceMocks.linkAlertToTicket).toHaveBeenCalledWith(
+      TICKET_ID,
+      ALERT_ID,
+      expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('returns 404 when scoped pre-check finds no ticket', async () => {
+    const ALERT_ID = '4f3f2e9f-2222-4333-9444-555566667777';
+    dbSelectMock.mockResolvedValueOnce([]);
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ alertId: ALERT_ID })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.linkAlertToTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe('DELETE /tickets/:id/alerts/:alertId', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  const ALERT_ID = '4f3f2e9f-2222-4333-9444-555566667777';
+
+  it('calls unlinkAlertFromTicket and returns 200', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([STUB_TICKET])          // ticket fetch
+      .mockResolvedValueOnce([{ deviceId: null }]);  // alert row (site gate)
+    serviceMocks.unlinkAlertFromTicket.mockResolvedValue({ ticketId: TICKET_ID, alertId: ALERT_ID });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts/${ALERT_ID}`, {
+      method: 'DELETE'
+    });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.unlinkAlertFromTicket).toHaveBeenCalledWith(
+      TICKET_ID,
+      ALERT_ID,
+      expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('returns 404 when scoped pre-check finds no ticket', async () => {
+    dbSelectMock.mockResolvedValueOnce([]);
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts/${ALERT_ID}`, {
+      method: 'DELETE'
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.unlinkAlertFromTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /tickets/:id — delegates to updateTicketFields', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('returns 404 when the scoped pre-check finds no ticket (out of scope) and never calls the service', async () => {
+    dbSelectMock.mockResolvedValueOnce([]); // getScopedTicketOr404: no row
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject: 'Updated subject' })
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Ticket not found');
+    expect(serviceMocks.updateTicketFields).not.toHaveBeenCalled();
+  });
+
+  it('returns the updated ticket from the service when it is in scope', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]); // scoped pre-check
+    serviceMocks.updateTicketFields.mockResolvedValue({ ...STUB_TICKET, subject: 'Updated subject' });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject: 'Updated subject' })
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toMatchObject({ subject: 'Updated subject' });
+
+    expect(serviceMocks.updateTicketFields).toHaveBeenCalledWith(
+      TICKET_ID,
+      expect.objectContaining({ subject: 'Updated subject' }),
+      expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('400s on an empty body without calling the service', async () => {
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'No fields to update');
+    expect(serviceMocks.updateTicketFields).not.toHaveBeenCalled();
+  });
+
+  // No dbSelectMock setup needed for the hint tests: the 400 fires before the scoped DB lookup.
+  it('400 with a status-route hint when only status is sent', async () => {
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'open' })
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/POST \/tickets\/:id\/status/);
+  });
+
+  it('400 with the status hint when status is mixed into an otherwise-valid body (no silent drop)', async () => {
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priority: 'high', status: 'closed' })
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/POST \/tickets\/:id\/status/);
+    // priority must NOT be applied while status is silently dropped
+    expect(serviceMocks.updateTicketFields).not.toHaveBeenCalled();
+  });
+
+  it('400 with an assign-route hint when only assigneeId is sent', async () => {
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assigneeId: '22222222-2222-4222-8222-222222222222' })
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/POST \/tickets\/:id\/assign/);
+  });
+
+  describe('deviceId reassignment cross-org guard (enforced by the service)', () => {
+    const DEVICE_ID = '9a8b7c6d-1111-4222-8333-444455556666';
+
+    it('400s when the new deviceId belongs to a different org', async () => {
+      dbSelectMock.mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1' }]); // scoped pre-check
+      serviceMocks.updateTicketFields.mockRejectedValue(
+        new TicketServiceError('Device must belong to the same organization as the ticket', 400)
+      );
+
+      const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: DEVICE_ID })
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/same organization/i);
+    });
+
+    it('404s when the new deviceId does not exist', async () => {
+      dbSelectMock.mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1' }]);
+      serviceMocks.updateTicketFields.mockRejectedValue(new TicketServiceError('Device not found', 404));
+
+      const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: DEVICE_ID })
+      });
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body).toHaveProperty('error', 'Device not found');
+    });
+
+    it('404s when the scoped ticket lookup finds no row (out of scope)', async () => {
+      dbSelectMock.mockResolvedValueOnce([]);
+
+      const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: DEVICE_ID })
+      });
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body).toHaveProperty('error', 'Ticket not found');
+      expect(serviceMocks.updateTicketFields).not.toHaveBeenCalled();
+    });
+
+    it('updates when the new deviceId belongs to the ticket org', async () => {
+      dbSelectMock.mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1' }]);
+      serviceMocks.updateTicketFields.mockResolvedValue({ ...STUB_TICKET, deviceId: DEVICE_ID });
+
+      const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: DEVICE_ID })
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toMatchObject({ deviceId: DEVICE_ID });
+      expect(serviceMocks.updateTicketFields).toHaveBeenCalledWith(
+        TICKET_ID,
+        expect.objectContaining({ deviceId: DEVICE_ID }),
+        expect.objectContaining({ userId: 'u-1' })
+      );
+    });
+
+    it('clearing deviceId (null) passes the null through to the service', async () => {
+      dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+      serviceMocks.updateTicketFields.mockResolvedValue({ ...STUB_TICKET, deviceId: null });
+
+      const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: null })
+      });
+      expect(res.status).toBe(200);
+      expect(serviceMocks.updateTicketFields).toHaveBeenCalledWith(
+        TICKET_ID,
+        expect.objectContaining({ deviceId: null }),
+        expect.objectContaining({ userId: 'u-1' })
+      );
+    });
+  });
+});
+
+describe('POST /tickets/bulk', () => {
+  const T1 = 'aaaaaaaa-1111-4222-8333-444455556666';
+  const T2 = 'bbbbbbbb-1111-4222-8333-444455556666';
+  const ASSIGNEE_ID = '5a6b7c8d-1234-4321-abcd-000011112222';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetAuth();
+    // Request-level pre-validation resolves the assignee once before the loop;
+    // default to a same-partner user so per-test mocks stay focused.
+    serviceMocks.getAssigneeForValidation.mockResolvedValue({ id: ASSIGNEE_ID, partnerId: 'p-1' });
+  });
+
+  const post = (body: unknown) =>
+    makeApp().request('/tickets/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+
+  it('bulk assign: scope-checks each id, calls assignTicket per ticket, aggregates and audits', async () => {
+    dbSelectMock.mockResolvedValue([STUB_TICKET]); // every scoped lookup resolves
+    serviceMocks.assignTicket.mockResolvedValue({ ...STUB_TICKET, assignedTo: ASSIGNEE_ID });
+
+    const res = await post({ ticketIds: [T1, T2], action: 'assign', assigneeId: ASSIGNEE_ID });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual({ updated: 2, skipped: 0, failed: 0, skippedReasons: {}, total: 2 });
+
+    expect(serviceMocks.assignTicket).toHaveBeenCalledTimes(2);
+    expect(serviceMocks.assignTicket).toHaveBeenCalledWith(T1, ASSIGNEE_ID, expect.objectContaining({ userId: 'u-1' }));
+    expect(serviceMocks.assignTicket).toHaveBeenCalledWith(T2, ASSIGNEE_ID, expect.objectContaining({ userId: 'u-1' }));
+
+    // One bulk-level audit entry (mirrors alerts bulk), on top of per-ticket service audits.
+    expect(writeRouteAuditMock).toHaveBeenCalledTimes(1);
+    expect(writeRouteAuditMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'ticket.bulk_assign',
+        resourceType: 'ticket',
+        details: expect.objectContaining({ ticketIds: [T1, T2], updated: 2, skipped: 0 })
+      })
+    );
+  });
+
+  it('bulk assign with null assigneeId (unassign) passes null to the service', async () => {
+    dbSelectMock.mockResolvedValue([STUB_TICKET]);
+    serviceMocks.assignTicket.mockResolvedValue({ ...STUB_TICKET, assignedTo: null });
+
+    const res = await post({ ticketIds: [T1], action: 'assign', assigneeId: null });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.assignTicket).toHaveBeenCalledWith(T1, null, expect.objectContaining({ userId: 'u-1' }));
+  });
+
+  it('bulk status: an FSM-invalid transition counts as skipped, not failed, and does not abort the loop', async () => {
+    dbSelectMock.mockResolvedValue([STUB_TICKET]);
+    serviceMocks.changeTicketStatus
+      .mockResolvedValueOnce({ ...STUB_TICKET, status: 'pending' })
+      .mockRejectedValueOnce(new TicketServiceError('Cannot transition ticket from closed to pending', 409, 'INVALID_TRANSITION'));
+
+    const res = await post({ ticketIds: [T1, T2], action: 'status', status: 'pending' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual({ updated: 1, skipped: 1, failed: 0, skippedReasons: { INVALID_TRANSITION: 1 }, total: 2 });
+    expect(serviceMocks.changeTicketStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it('unexpected per-id errors count as failed without aborting the loop', async () => {
+    dbSelectMock.mockResolvedValue([STUB_TICKET]);
+    serviceMocks.changeTicketStatus
+      .mockRejectedValueOnce(new Error('connection reset'))
+      .mockResolvedValueOnce({ ...STUB_TICKET, status: 'closed' });
+
+    const res = await post({ ticketIds: [T1, T2], action: 'status', status: 'closed' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual({ updated: 1, skipped: 0, failed: 1, skippedReasons: {}, total: 2 });
+  });
+
+  it('rejects status=resolved with 400 (resolution note is per-ticket) without calling the service', async () => {
+    const res = await post({ ticketIds: [T1], action: 'status', status: 'resolved' });
+    expect(res.status).toBe(400);
+    expect(serviceMocks.changeTicketStatus).not.toHaveBeenCalled();
+  });
+
+  it('out-of-scope ids count as skipped and never reach the service or the audit log', async () => {
+    dbSelectMock.mockResolvedValue([]); // scoped lookup finds nothing
+    const res = await post({ ticketIds: [T1], action: 'assign', assigneeId: ASSIGNEE_ID });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual({ updated: 0, skipped: 1, failed: 0, skippedReasons: { OUT_OF_SCOPE: 1 }, total: 1 });
+    expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+    expect(writeRouteAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown assignee with a request-level 400 before touching any ticket', async () => {
+    serviceMocks.getAssigneeForValidation.mockResolvedValue(null);
+    const res = await post({ ticketIds: [T1, T2], action: 'assign', assigneeId: ASSIGNEE_ID });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toHaveProperty('error', 'Assignee not found');
+    expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+    expect(writeRouteAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a cross-partner assignee with a request-level 400 for partner-scope callers', async () => {
+    serviceMocks.getAssigneeForValidation.mockResolvedValue({ id: ASSIGNEE_ID, partnerId: 'p-OTHER' });
+    const res = await post({ ticketIds: [T1], action: 'assign', assigneeId: ASSIGNEE_ID });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toHaveProperty('error', 'Assignee must belong to the same partner as the ticket');
+    expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+  });
+
+  it('skips assignee pre-validation when unassigning (null assigneeId)', async () => {
+    dbSelectMock.mockResolvedValue([STUB_TICKET]);
+    serviceMocks.assignTicket.mockResolvedValue({ ...STUB_TICKET, assignedTo: null });
+    const res = await post({ ticketIds: [T1], action: 'assign', assigneeId: null });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.getAssigneeForValidation).not.toHaveBeenCalled();
+  });
+
+  it('400s on an empty ticketIds array', async () => {
+    const res = await post({ ticketIds: [], action: 'assign', assigneeId: ASSIGNEE_ID });
+    expect(res.status).toBe(400);
+    expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+  });
+
+  it('400s when action=assign omits assigneeId (refine)', async () => {
+    const res = await post({ ticketIds: [T1], action: 'assign' });
+    expect(res.status).toBe(400);
+    expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe('site-axis scoping — per-ticket routes', () => {
+  const SITE_AUTH = {
+    ...DEFAULT_AUTH,
+    scope: 'organization' as string,
+    orgId: 'org-1' as string | null,
+    partnerId: null as string | null,
+    allowedSiteIds: ['site-1']
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = SITE_AUTH as typeof authRef.current;
+  });
+
+  it('GET /tickets/:id returns 404 for a ticket whose device is outside the caller sites', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                            // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /tickets/:id returns 404 when the ticket device has no site (restricted caller)', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: null }]);                                    // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /tickets/:id keeps deviceless tickets visible to site-restricted callers', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch
+      .mockResolvedValueOnce([{ orgName: 'Org', deviceHostname: null, assigneeName: null }]) // decoration
+      .mockResolvedValueOnce([]); // alert links
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('POST /tickets/:id/assign is blocked (404) for an out-of-site ticket', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                            // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/assign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assigneeId: null })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.assignTicket).not.toHaveBeenCalled();
+  });
+
+  it('GET /tickets/:id returns 404 for a device-bound ticket when the allowlist is empty', async () => {
+    authRef.current = { ...SITE_AUTH, allowedSiteIds: [] } as typeof authRef.current;
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-1' }]);                                // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('unrestricted callers (no allowedSiteIds) skip the device lookup entirely', async () => {
+    authRef.current = { ...DEFAULT_AUTH } as typeof authRef.current; // partner scope, unrestricted
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, deviceId: 'd-1' }])                                  // ticket fetch
+      .mockResolvedValueOnce([{ orgName: 'Org', deviceHostname: 'host', assigneeName: null }])       // decoration
+      .mockResolvedValueOnce([]);                                                                     // alert links
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`);
+    expect(res.status).toBe(200);
+  });
+
+  // The remaining per-ticket routes all resolve through getScopedTicketOr404 —
+  // these pin the BINDING (a refactor inlining any route's ticket fetch would
+  // silently drop the site gate; nothing else in the tree fails when that
+  // happens because these handlers don't query device tables directly).
+  it('POST /tickets/:id/status is blocked (404) for an out-of-site ticket', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                            // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'open' })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.changeTicketStatus).not.toHaveBeenCalled();
+  });
+
+  it('POST /tickets/:id/comments is blocked (404) for an out-of-site ticket', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                            // device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'should not land', isPublic: false })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.addTicketComment).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /tickets/:id/alerts/:alertId is blocked (404) for an out-of-site ticket', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                            // device fetch
+    const res = await makeApp().request(
+      `/tickets/${TICKET_ID}/alerts/9a8b7c6d-2222-4333-8444-555566667777`,
+      { method: 'DELETE' }
+    );
+    expect(res.status).toBe(404);
+    expect(serviceMocks.unlinkAlertFromTicket).not.toHaveBeenCalled();
+  });
+
+  it('POST /tickets/bulk counts an out-of-site ticket as skipped (OUT_OF_SCOPE)', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                            // device fetch
+    const res = await makeApp().request('/tickets/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticketIds: [TICKET_ID], action: 'status', status: 'open' })
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual({ updated: 0, skipped: 1, failed: 0, skippedReasons: { OUT_OF_SCOPE: 1 }, total: 1 });
+    expect(serviceMocks.changeTicketStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe('site-axis scoping — alert-link routes gate on the ALERT device', () => {
+  const SITE_AUTH = {
+    ...DEFAULT_AUTH,
+    scope: 'organization' as string,
+    orgId: 'org-1' as string | null,
+    partnerId: null as string | null,
+    allowedSiteIds: ['site-1']
+  };
+  const ALERT_ID = '4f3f2e9f-2222-4333-9444-555566667777';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = SITE_AUTH as typeof authRef.current;
+  });
+
+  it('POST /tickets/:id/alerts returns 404 when the alert device is outside the caller site scope', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch (deviceless, in scope)
+      .mockResolvedValueOnce([{ deviceId: 'd-2' }])                                // alert row
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                          // alert device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ alertId: ALERT_ID })
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toHaveProperty('error', 'Alert not found');
+    expect(serviceMocks.linkAlertToTicket).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /tickets/:id/alerts/:alertId applies the same gate', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch (deviceless, in scope)
+      .mockResolvedValueOnce([{ deviceId: 'd-2' }])                                // alert row
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                          // alert device fetch
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts/${ALERT_ID}`, {
+      method: 'DELETE'
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toHaveProperty('error', 'Alert not found');
+    expect(serviceMocks.unlinkAlertFromTicket).not.toHaveBeenCalled();
+  });
+
+  it('alert links for in-site devices still work for restricted users', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch (deviceless, in scope)
+      .mockResolvedValueOnce([{ deviceId: 'd-2' }])                                // alert row
+      .mockResolvedValueOnce([{ siteId: 'site-1' }]);                              // alert device fetch (allowed)
+    serviceMocks.linkAlertToTicket.mockResolvedValue({ id: 'link-1', ticketId: TICKET_ID, alertId: ALERT_ID });
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ alertId: ALERT_ID })
+    });
+    expect(res.status).toBe(201);
+    expect(serviceMocks.linkAlertToTicket).toHaveBeenCalledWith(
+      TICKET_ID, ALERT_ID, expect.objectContaining({ userId: 'u-1' })
+    );
+  });
+
+  it('deviceless alerts stay linkable for restricted users (no device lookup)', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch
+      .mockResolvedValueOnce([{ deviceId: null }]);                                // alert row (deviceless)
+    serviceMocks.linkAlertToTicket.mockResolvedValue({ id: 'link-1', ticketId: TICKET_ID, alertId: ALERT_ID });
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ alertId: ALERT_ID })
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it('a nonexistent alert row 404s before the service call', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch
+      .mockResolvedValueOnce([]);                                                  // alert row: missing
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ alertId: ALERT_ID })
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toHaveProperty('error', 'Alert not found');
+    expect(serviceMocks.linkAlertToTicket).not.toHaveBeenCalled();
+  });
+});
+
+describe('ticketSiteScopeCondition — tri-state contract', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  const authWith = (allowedSiteIds?: string[]) =>
+    ({ ...DEFAULT_AUTH, scope: 'organization', orgId: 'org-1', allowedSiteIds }) as never;
+
+  it('returns undefined for unrestricted callers and builds no subquery', async () => {
+    const { ticketSiteScopeCondition } = await import('./tickets');
+    const { db } = await import('../../db');
+    expect(ticketSiteScopeCondition(authWith(undefined))).toBeUndefined();
+    expect(vi.mocked(db.select)).not.toHaveBeenCalled();
+  });
+
+  it('returns a deviceless-only condition (no devices subquery) for an empty allowlist', async () => {
+    const { ticketSiteScopeCondition } = await import('./tickets');
+    const { db } = await import('../../db');
+    const cond = ticketSiteScopeCondition(authWith([]));
+    // A falsy-check regression (treating [] like undefined = unrestricted)
+    // would return undefined here and let a zero-site user list everything.
+    expect(cond).toBeDefined();
+    // ...and the deviceless-only branch never consults devices.
+    expect(vi.mocked(db.select)).not.toHaveBeenCalled();
+  });
+
+  it('builds the devices IN-subquery for a populated allowlist', async () => {
+    const { ticketSiteScopeCondition } = await import('./tickets');
+    const { db } = await import('../../db');
+    const cond = ticketSiteScopeCondition(authWith(['site-1', 'site-2']));
+    expect(cond).toBeDefined();
+    expect(vi.mocked(db.select)).toHaveBeenCalledTimes(1); // the subquery
+  });
+});
+
+describe('site-axis scoping — list and stats', () => {
+  const SITE_AUTH = {
+    ...DEFAULT_AUTH,
+    scope: 'organization' as string,
+    orgId: 'org-1' as string | null,
+    partnerId: null as string | null,
+    allowedSiteIds: ['site-1']
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = SITE_AUTH as typeof authRef.current;
+  });
+
+  it('GET /tickets returns 403 when filtering by an out-of-site deviceId', async () => {
+    dbSelectMock.mockResolvedValueOnce([{ siteId: 'site-OTHER' }]); // device lookup
+    const res = await makeApp().request('/tickets?deviceId=9a8b7c6d-2222-4333-8444-555566667777');
+    expect(res.status).toBe(403);
+    expect(await res.json()).toHaveProperty('error', 'Device not found or access denied');
+  });
+
+  it('GET /tickets returns 403 when filtering by a nonexistent deviceId', async () => {
+    dbSelectMock.mockResolvedValueOnce([]); // device lookup
+    const res = await makeApp().request('/tickets?deviceId=9a8b7c6d-2222-4333-8444-555566667777');
+    expect(res.status).toBe(403);
+  });
+
+  it('GET /tickets succeeds for a site-restricted caller (condition applied, no crash)', async () => {
+    dbSelectMock.mockResolvedValue([]); // list rows (subquery is built, never executed)
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toEqual([]);
+  });
+
+  it('GET /tickets/stats succeeds for a site-restricted caller', async () => {
+    dbGroupByMock.mockResolvedValue([
+      { status: 'open', assignedTo: 'u-1', breached: false, count: 2 }
+    ]);
+    const res = await makeApp().request('/tickets/stats');
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toMatchObject({ open: 2, mine: 2 });
+  });
+});
+
+describe('site-axis scoping — write guards', () => {
+  const SITE_AUTH = {
+    ...DEFAULT_AUTH,
+    scope: 'organization' as string,
+    orgId: 'org-1' as string | null,
+    partnerId: null as string | null,
+    allowedSiteIds: ['site-1']
+  };
+  const DEVICE_ID = '9a8b7c6d-2222-4333-8444-555566667777';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    authRef.current = SITE_AUTH as typeof authRef.current;
+  });
+
+  it('POST /tickets returns 403 for a deviceId outside the caller sites', async () => {
+    dbSelectMock.mockResolvedValueOnce([{ siteId: 'site-OTHER' }]); // device lookup
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'x', deviceId: DEVICE_ID })
+    });
+    expect(res.status).toBe(403);
+    expect(serviceMocks.createTicket).not.toHaveBeenCalled();
+  });
+
+  it('POST /tickets allows a deviceless create for a site-restricted caller', async () => {
+    serviceMocks.createTicket.mockResolvedValue({ id: 't-1', orgId: ORG_ID, internalNumber: 'T-2026-0042' });
+    const res = await makeApp().request('/tickets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orgId: ORG_ID, subject: 'x' })
+    });
+    expect(res.status).toBe(201);
+  });
+
+  it('PATCH /tickets/:id returns 403 when moving a ticket onto an out-of-site device', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: null }]) // ticket fetch (in scope: deviceless)
+      .mockResolvedValueOnce([{ siteId: 'site-OTHER' }]);                           // new device lookup
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: DEVICE_ID })
+    });
+    expect(res.status).toBe(403);
+    expect(serviceMocks.updateTicketFields).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /tickets/:id allows clearing the device (null) without a new-device lookup', async () => {
+    dbSelectMock
+      .mockResolvedValueOnce([{ ...STUB_TICKET, orgId: 'org-1', deviceId: 'd-1' }]) // ticket fetch
+      .mockResolvedValueOnce([{ siteId: 'site-1' }]);                                // existing device gate (Task 5)
+    serviceMocks.updateTicketFields.mockResolvedValue({ ...STUB_TICKET, deviceId: null });
+    const res = await makeApp().request(`/tickets/${TICKET_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: null })
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+// Regression: Phase 1a shipped these routes WITHOUT authMiddleware in the chain,
+// so over real HTTP every request 401'd ("Not authenticated") — requireScope
+// found no c.get('auth'). The old test mock had requireScope inject the auth
+// context itself, masking the missing middleware. This block proves the
+// middleware is actually wired: it must run (call count) and must be the thing
+// that rejects unauthenticated requests.
+describe('authMiddleware wiring', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('GET /tickets returns 401 Not authenticated when unauthenticated, via authMiddleware', async () => {
+    authRef.current = null as unknown as typeof authRef.current;
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(401);
+    const body = await res.json();
+    expect(body).toHaveProperty('error', 'Not authenticated');
+
+    // The middleware itself must be in the chain (not some other 401 source)
+    const { authMiddleware } = await import('../../middleware/auth');
+    expect(authMiddleware).toHaveBeenCalledTimes(1);
+  });
+
+  it('authMiddleware runs on authenticated requests too', async () => {
+    dbSelectMock.mockResolvedValue([]);
+    const res = await makeApp().request('/tickets');
+    expect(res.status).toBe(200);
+    const { authMiddleware } = await import('../../middleware/auth');
+    expect(authMiddleware).toHaveBeenCalledTimes(1);
+  });
+});
+
+const COMMENT_ID = 'cccccccc-1111-4222-8333-444455556666';
+const jsonHeaders = { 'Content-Type': 'application/json' };
+
+describe('PATCH /tickets/:id/comments/:commentId', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('edits a comment via the service and returns 200', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]); // getScopedTicketOr404
+    serviceMocks.editTicketComment.mockResolvedValue({
+      id: COMMENT_ID, content: 'new content', editedAt: new Date()
+    });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments/${COMMENT_ID}`, {
+      method: 'PATCH',
+      headers: jsonHeaders,
+      body: JSON.stringify({ content: 'new content' })
+    });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.editTicketComment).toHaveBeenCalledWith(
+      COMMENT_ID,
+      expect.objectContaining({ content: 'new content' }),
+      expect.objectContaining({ userId: 'u-1' }),
+      expect.objectContaining({ canManageAny: expect.any(Boolean) })
+    );
+  });
+
+  it('404s when the ticket is out of scope', async () => {
+    dbSelectMock.mockResolvedValueOnce([]); // getScopedTicketOr404 → not found
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments/${COMMENT_ID}`, {
+      method: 'PATCH',
+      headers: jsonHeaders,
+      body: JSON.stringify({ content: 'x' })
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.editTicketComment).not.toHaveBeenCalled();
+  });
+
+  it('maps TicketServiceError status through from service (403 forbidden)', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    serviceMocks.editTicketComment.mockRejectedValue(
+      new TicketServiceError('Not allowed to edit this comment', 403)
+    );
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments/${COMMENT_ID}`, {
+      method: 'PATCH',
+      headers: jsonHeaders,
+      body: JSON.stringify({ content: 'x' })
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('DELETE /tickets/:id/comments/:commentId', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('soft-deletes and returns 200', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]); // getScopedTicketOr404
+    serviceMocks.deleteTicketComment.mockResolvedValue({ id: COMMENT_ID, deletedAt: new Date() });
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments/${COMMENT_ID}`, {
+      method: 'DELETE',
+      headers: jsonHeaders
+    });
+    expect(res.status).toBe(200);
+    expect(serviceMocks.deleteTicketComment).toHaveBeenCalledWith(
+      COMMENT_ID,
+      expect.objectContaining({ userId: 'u-1' }),
+      expect.objectContaining({ canManageAny: expect.any(Boolean) })
+    );
+  });
+
+  it('404s when the ticket is out of scope', async () => {
+    dbSelectMock.mockResolvedValueOnce([]); // getScopedTicketOr404 → not found
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments/${COMMENT_ID}`, {
+      method: 'DELETE',
+      headers: jsonHeaders
+    });
+    expect(res.status).toBe(404);
+    expect(serviceMocks.deleteTicketComment).not.toHaveBeenCalled();
+  });
+
+  it('maps TicketServiceError status through from service (403 forbidden)', async () => {
+    dbSelectMock.mockResolvedValueOnce([STUB_TICKET]);
+    serviceMocks.deleteTicketComment.mockRejectedValue(
+      new TicketServiceError('Not allowed to delete this comment', 403)
+    );
+
+    const res = await makeApp().request(`/tickets/${TICKET_ID}/comments/${COMMENT_ID}`, {
+      method: 'DELETE',
+      headers: jsonHeaders
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('POST /tickets/:id/comments attachmentIds (W08 #3902)', () => {
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); });
+
+  it('accepts an empty body when attachmentIds are present and passes them to the service', async () => {
+    const attId = 'aaaaaaaa-1111-4222-8333-444455556666';
+    dbSelectMock.mockReturnValue([{ id: '3f2f1d8e-1111-4222-8333-444455556666', orgId: 'org-1', deviceId: null }]);
+    serviceMocks.addTicketComment.mockResolvedValue({ comment: { id: 'c-1' }, firstResponseStamped: false, attachments: [] });
+    const res = await makeApp().request('/tickets/3f2f1d8e-1111-4222-8333-444455556666/comments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: '', attachmentIds: [attId] }),
+    });
+    expect(res.status).toBe(201);
+    expect(serviceMocks.addTicketComment).toHaveBeenCalledWith(
+      '3f2f1d8e-1111-4222-8333-444455556666',
+      expect.objectContaining({ attachmentIds: [attId] }),
+      expect.anything(),
+    );
+  });
+
+  it('still 400s an empty comment with no attachments', async () => {
+    dbSelectMock.mockReturnValue([{ id: '3f2f1d8e-1111-4222-8333-444455556666', orgId: 'org-1', deviceId: null }]);
+    const res = await makeApp().request('/tickets/3f2f1d8e-1111-4222-8333-444455556666/comments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: '' }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('GET /tickets/:id comment attachments (W08 #3902)', () => {
+  const T = '3f2f1d8e-1111-4222-8333-444455556666';
+  const meta = (over: Record<string, unknown> = {}) => ({
+    id: 'att-1', commentId: 'c-1', contentType: 'image/png',
+    byteSize: 12, originalFilename: 'a.png', createdAt: new Date('2026-08-30T00:00:00Z'), ...over,
+  });
+
+  function rigDetail(commentRows: unknown[], attachmentRows: unknown[]) {
+    dbSelectMock
+      .mockReturnValueOnce([{ id: T, orgId: 'org-1', deviceId: null, deletedAt: null }]) // scoped ticket
+      .mockReturnValueOnce([{ orgName: 'O', deviceHostname: null, assigneeName: null, statusName: null, statusColor: null }])
+      .mockReturnValueOnce(commentRows)
+      .mockReturnValueOnce(attachmentRows)
+      .mockReturnValueOnce([]); // alert links
+  }
+
+  beforeEach(() => { vi.clearAllMocks(); resetAuth(); lastSelectColumns.length = 0; });
+
+  it('groups attachments onto their parent comment', async () => {
+    rigDetail(
+      [{ id: 'c-1', ticketId: T, content: 'see photo', deletedAt: null, createdAt: new Date() },
+       { id: 'c-2', ticketId: T, content: 'no photo', deletedAt: null, createdAt: new Date() }],
+      [meta(), meta({ id: 'att-2' })],
+    );
+    const res = await makeApp().request(`/tickets/${T}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.comments[0].attachments).toHaveLength(2);
+    expect(body.data.comments[1].attachments).toEqual([]);
+  });
+
+  it('blanks attachments on a soft-deleted comment (or a deleted comment still leaks its photos)', async () => {
+    rigDetail(
+      [{ id: 'c-1', ticketId: T, content: 'secret', deletedAt: new Date(), createdAt: new Date() }],
+      [meta()],
+    );
+    const body = await (await makeApp().request(`/tickets/${T}`)).json();
+    expect(body.data.comments[0].deleted).toBe(true);
+    expect(body.data.comments[0].content).toBe('');
+    expect(body.data.comments[0].attachments).toEqual([]);
+  });
+
+  it('never surfaces a pending (comment_id NULL) row in the feed', async () => {
+    rigDetail(
+      [{ id: 'c-1', ticketId: T, content: 'hi', deletedAt: null, createdAt: new Date() }],
+      [meta({ id: 'pending-1', commentId: null })],
+    );
+    const body = await (await makeApp().request(`/tickets/${T}`)).json();
+    expect(body.data.comments[0].attachments).toEqual([]);
+  });
+
+  it('selects the META columns only — `data` must never reach a ticket-detail response (D10)', async () => {
+    rigDetail([{ id: 'c-1', ticketId: T, content: 'hi', deletedAt: null, createdAt: new Date() }], [meta()]);
+    await makeApp().request(`/tickets/${T}`);
+    const withCols = lastSelectColumns.filter((c): c is Record<string, unknown> => !!c && typeof c === 'object');
+    const attachmentSelect = withCols.find((c) => 'originalFilename' in c && 'byteSize' in c);
+    expect(attachmentSelect, 'the attachment feed query must pass an explicit column map').toBeDefined();
+    expect(Object.keys(attachmentSelect!).sort()).toEqual(
+      ['byteSize', 'commentId', 'contentType', 'createdAt', 'id', 'originalFilename'],
+    );
+    expect(Object.keys(attachmentSelect!)).not.toContain('data');
+    expect(Object.keys(attachmentSelect!)).not.toContain('storageKey');
+  });
+});

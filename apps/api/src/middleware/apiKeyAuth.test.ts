@@ -1,0 +1,899 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+vi.mock('../db', () => ({
+  runOutsideDbContext: vi.fn((fn) => fn()),
+  db: {
+    select: vi.fn(),
+    update: vi.fn()
+  },
+  withDbAccessContext: vi.fn(async (_context, fn) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn())
+}));
+
+vi.mock('../db/schema', () => ({
+  apiKeys: {
+    id: 'id',
+    orgId: 'orgId',
+    name: 'name',
+    keyPrefix: 'keyPrefix',
+    keyHash: 'keyHash',
+    scopes: 'scopes',
+    expiresAt: 'expiresAt',
+    rateLimit: 'rateLimit',
+    usageCount: 'usageCount',
+    status: 'status',
+    createdBy: 'createdBy'
+  },
+  users: {
+    id: 'id',
+    status: 'status'
+  },
+  organizations: {}
+}));
+
+vi.mock('../services', () => ({
+  getRedis: vi.fn(),
+  rateLimiter: vi.fn()
+}));
+
+vi.mock('../services/tenantStatus', () => ({
+  getActiveOrgTenant: vi.fn().mockResolvedValue({ orgId: 'org-1', partnerId: 'partner-1' })
+}));
+
+vi.mock('../services/apiKeyAuthorization', () => ({
+  authorizeHumanApiKeyCreator: vi.fn(),
+  authorizeServicePrincipalKey: vi.fn()
+}));
+
+// Spread the real module rather than replacing it: schema modules evaluate
+// other drizzle-orm exports (notably `sql`, for partial-index predicates and
+// CHECK constraints) at import time, so a wholesale replacement breaks as soon
+// as one of them is pulled in transitively.
+vi.mock('drizzle-orm', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('drizzle-orm')>()),
+  eq: vi.fn((left, right) => ({ left, right })),
+  and: vi.fn()
+}));
+
+import type { Context } from 'hono';
+import { db, withDbAccessContext } from '../db';
+import { getRedis, rateLimiter } from '../services';
+import { getActiveOrgTenant } from '../services/tenantStatus';
+import { authorizeHumanApiKeyCreator, authorizeServicePrincipalKey } from '../services/apiKeyAuthorization';
+import * as apiKeyAuthModule from './apiKeyAuth';
+
+const { apiKeyAuthMiddleware, requireApiKeyScope } = apiKeyAuthModule;
+
+type TestContext = Context & {
+  _getResponseHeaders: () => Record<string, string>;
+};
+
+const createContext = (headers: Record<string, string | undefined> = {}): TestContext => {
+  const responseHeaders: Record<string, string> = {};
+  const store = new Map<string, unknown>();
+  const normalized = Object.fromEntries(
+    Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value])
+  );
+
+  return {
+    req: {
+      header: (name: string) => normalized[name.toLowerCase()]
+    },
+    header: (name: string, value: string) => {
+      responseHeaders[name] = value;
+    },
+    set: (key: string, value: unknown) => {
+      store.set(key, value);
+    },
+    get: (key: string) => store.get(key),
+    _getResponseHeaders: () => responseHeaders
+  } as TestContext;
+};
+
+const buildSelectMock = (result: unknown[]) =>
+  vi.mocked(db.select).mockReturnValue({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        limit: vi.fn().mockResolvedValue(result)
+      })
+    })
+  } as any);
+
+// The middleware now issues a second `db.select` for the creator lookup
+// (SR2-15 subset). Use this when a test needs the apiKeys lookup and the
+// creator-status lookup to return different rows, in call order.
+const buildSequentialSelectMock = (results: unknown[][]) => {
+  const mock = vi.mocked(db.select);
+  for (const result of results) {
+    mock.mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue(result)
+        })
+      })
+    } as any);
+  }
+  return mock;
+};
+
+describe('apiKeyAuth middleware', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getActiveOrgTenant).mockResolvedValue({ orgId: 'org-1', partnerId: 'partner-1' });
+    vi.mocked(getRedis).mockReturnValue({} as any);
+    vi.mocked(rateLimiter).mockResolvedValue({
+      allowed: true,
+      remaining: 299,
+      resetAt: new Date(Date.now() + 60_000)
+    });
+    vi.mocked(authorizeHumanApiKeyCreator).mockResolvedValue({
+      ok: true,
+      permissions: {} as any,
+      allowedSiteIds: undefined,
+      clampedScopes: ['devices:read']
+    });
+  });
+
+  it('rejects when X-API-Key header is missing', async () => {
+    const c = createContext();
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'Missing X-API-Key header'
+    });
+  });
+
+  it('rejects when API key format is invalid', async () => {
+    const c = createContext({ 'X-API-Key': 'invalid' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'Invalid API key format'
+    });
+    expect(db.select).not.toHaveBeenCalled();
+    expect(rateLimiter).toHaveBeenCalledWith({}, 'api_key_probe:unknown', 300, 60);
+  });
+
+  it('rejects when API key is not found', async () => {
+    buildSelectMock([]);
+    const c = createContext({ 'X-API-Key': 'brz_missing' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'Invalid API key'
+    });
+  });
+
+  it('rate limits API key probes before DB lookup', async () => {
+    const resetAt = new Date(Date.now() + 60_000);
+    vi.mocked(rateLimiter).mockResolvedValueOnce({
+      allowed: false,
+      remaining: 0,
+      resetAt
+    });
+    const c = createContext({ 'X-API-Key': 'brz_missing' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 429,
+      message: 'Too many API key authentication attempts'
+    });
+
+    expect(db.select).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expect(rateLimiter).toHaveBeenCalledWith({}, 'api_key_probe:unknown', 300, 60);
+  });
+
+  it('rejects when API key is inactive', async () => {
+    buildSelectMock([
+      {
+        id: 'key-1',
+        orgId: 'org-1',
+        name: 'Key',
+        keyPrefix: 'brz_',
+        keyHash: 'hash',
+        scopes: ['read'],
+        expiresAt: null,
+        rateLimit: 10,
+        usageCount: 0,
+        status: 'revoked',
+        createdBy: 'user-1'
+      }
+    ]);
+
+    const c = createContext({ 'X-API-Key': 'brz_revoked' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'API key is revoked'
+    });
+  });
+
+  it('expires and rejects when API key is past expiration', async () => {
+    buildSelectMock([
+      {
+        id: 'key-2',
+        orgId: 'org-1',
+        name: 'Key',
+        keyPrefix: 'brz_',
+        keyHash: 'hash',
+        scopes: ['read'],
+        expiresAt: new Date(Date.now() - 1000).toISOString(),
+        rateLimit: 10,
+        usageCount: 0,
+        status: 'active',
+        createdBy: 'user-1'
+      }
+    ]);
+
+    const updateWhere = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(db.update).mockReturnValueOnce({
+      set: vi.fn().mockReturnValue({
+        where: updateWhere
+      })
+    } as any);
+
+    const c = createContext({ 'X-API-Key': 'brz_expired' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'API key has expired'
+    });
+    expect(updateWhere).toHaveBeenCalled();
+  });
+
+  it('rejects when rate limit is exceeded and sets headers', async () => {
+    const resetAt = new Date(Date.now() + 60_000);
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    buildSelectMock([
+      {
+        id: 'key-3',
+        orgId: 'org-1',
+        name: 'Key',
+        keyPrefix: 'brz_',
+        keyHash: 'hash',
+        scopes: ['read'],
+        expiresAt: null,
+        rateLimit: 2,
+        usageCount: 3,
+        status: 'active',
+        createdBy: 'user-1'
+      }
+    ]);
+
+    vi.mocked(rateLimiter)
+      .mockResolvedValueOnce({
+        allowed: true,
+        remaining: 299,
+        resetAt
+      })
+      .mockResolvedValueOnce({
+        allowed: false,
+        remaining: 0,
+        resetAt
+      });
+
+    const c = createContext({ 'X-API-Key': 'brz_rate' });
+    const next = vi.fn();
+
+    try {
+      await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+        status: 429,
+        message: 'Rate limit exceeded'
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    const headers = c._getResponseHeaders();
+    expect(headers['X-RateLimit-Limit']).toBe('2');
+    expect(headers['X-RateLimit-Remaining']).toBe('0');
+    expect(headers['X-RateLimit-Reset']).toBe(String(Math.ceil(resetAt.getTime() / 1000)));
+    expect(headers['Retry-After']).toBe(String(Math.ceil((resetAt.getTime() - now) / 1000)));
+  });
+
+  it('rejects existing API keys whose owning organization or partner is inactive/deleted', async () => {
+    buildSelectMock([
+      {
+        id: 'key-inactive-owner',
+        orgId: 'org-deleted',
+        name: 'Key',
+        keyPrefix: 'brz_',
+        keyHash: 'hash',
+        scopes: ['read'],
+        expiresAt: null,
+        rateLimit: 10,
+        usageCount: 0,
+        status: 'active',
+        createdBy: 'user-1'
+      }
+    ]);
+    vi.mocked(getActiveOrgTenant).mockResolvedValue(null);
+
+    const c = createContext({ 'X-API-Key': 'brz_owner_deleted' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'API key owner is not active'
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('rejects when API key creator is disabled', async () => {
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-5',
+          orgId: 'org-1',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 10,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-disabled'
+        }
+      ],
+      [{ status: 'disabled' }]
+    ]);
+
+    const c = createContext({ 'X-API-Key': 'brz_creator_disabled' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'API key creator is not active'
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('rejects when API key creator lookup returns no row', async () => {
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-6',
+          orgId: 'org-1',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 10,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-missing'
+        }
+      ],
+      []
+    ]);
+
+    const c = createContext({ 'X-API-Key': 'brz_creator_missing' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'API key creator is not active'
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('fails closed (rejects, does not call next) when the creator-status lookup throws', async () => {
+    // Fail-closed constraint: a DB/RLS error during the creator lookup must
+    // NOT be swallowed into a pass. The lookup is intentionally NOT wrapped in
+    // try/catch, so the error propagates and the request is rejected. This test
+    // locks that intent against a future edit copying the fire-and-forget
+    // `.catch(err => console.error(...))` pattern used a few lines below for
+    // the usage-stats update.
+    const lookupError = new Error('creator lookup failed (RLS/DB)');
+    vi.mocked(db.select)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([
+              {
+                id: 'key-throw',
+                orgId: 'org-1',
+                name: 'Key',
+                keyPrefix: 'brz_',
+                keyHash: 'hash',
+                scopes: ['read'],
+                expiresAt: null,
+                rateLimit: 10,
+                usageCount: 0,
+                status: 'active',
+                createdBy: 'user-boom'
+              }
+            ])
+          })
+        })
+      } as any)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockRejectedValue(lookupError)
+          })
+        })
+      } as any);
+
+    const c = createContext({ 'X-API-Key': 'brz_creator_throw' });
+    const next = vi.fn();
+
+    await expect(apiKeyAuthMiddleware(c, next)).rejects.toThrow('creator lookup failed (RLS/DB)');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('allows access when the API key creator is active', async () => {
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-7',
+          orgId: 'org-1',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 10,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-active'
+        }
+      ],
+      [{ status: 'active' }]
+    ]);
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) })
+    } as any);
+
+    const c = createContext({ 'X-API-Key': 'brz_creator_active' });
+    const next = vi.fn();
+
+    await apiKeyAuthMiddleware(c, next);
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('sets context, headers, and calls next when API key is valid', async () => {
+    const resetAt = new Date(Date.now() + 60_000);
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-4',
+          orgId: 'org-2',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 5,
+          usageCount: 2,
+          status: 'active',
+          createdBy: 'user-2'
+        }
+      ],
+      // Distinct users row for the creator-status lookup.
+      [{ status: 'active' }]
+    ]);
+
+    vi.mocked(getRedis).mockReturnValue({} as any);
+    vi.mocked(rateLimiter).mockResolvedValue({
+      allowed: true,
+      remaining: 4,
+      resetAt
+    });
+
+    // apiKeyAuth awaits `db.update(...).set(...).where(...)` directly — the
+    // terminal value is the awaited `.where()` promise, no `.execute()` step.
+    const whereFn = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(db.update).mockReturnValueOnce({
+      set: vi.fn().mockReturnValue({
+        where: whereFn
+      })
+    } as any);
+
+    const c = createContext({ 'X-API-Key': 'brz_valid' });
+    const next = vi.fn();
+
+    await apiKeyAuthMiddleware(c, next);
+
+    const headers = c._getResponseHeaders();
+    expect(headers['X-RateLimit-Limit']).toBe('5');
+    expect(headers['X-RateLimit-Remaining']).toBe('4');
+    expect(headers['X-RateLimit-Reset']).toBe(String(Math.ceil(resetAt.getTime() / 1000)));
+    expect(c.get('apiKey')).toMatchObject({
+      id: 'key-4',
+      orgId: 'org-2',
+      partnerId: null,
+      // SR2-15: context scopes are the LIVE-clamped output of
+      // authorizeHumanApiKeyCreator (mocked to ['devices:read'] by the
+      // beforeEach default), not the raw stored key scope (['read']).
+      scopes: ['devices:read'],
+      rateLimit: 5,
+      createdBy: 'user-2'
+    });
+    expect(c.get('apiKeyOrgId')).toBe('org-2');
+    expect(next).toHaveBeenCalled();
+    expect(whereFn).toHaveBeenCalled();
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledWith(
+      {
+        scope: 'organization',
+        orgId: 'org-2',
+        accessibleOrgIds: ['org-2'],
+        accessiblePartnerIds: [],
+        currentPartnerId: null
+      },
+      expect.any(Function)
+    );
+  });
+
+  it('populates accessiblePartnerIds for MCP-provisioning keys so partner-axis RLS sees the key', async () => {
+    vi.mocked(getActiveOrgTenant).mockResolvedValue({ orgId: 'org-3', partnerId: 'partner-7' });
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-9',
+          orgId: 'org-3',
+          name: 'Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['read'],
+          expiresAt: null,
+          rateLimit: 5,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-3',
+          source: 'mcp_provisioning'
+        }
+      ],
+      [{ status: 'active' }]
+    ]);
+
+    vi.mocked(getRedis).mockReturnValue({} as any);
+    vi.mocked(rateLimiter).mockResolvedValue({
+      allowed: true,
+      remaining: 4,
+      resetAt: new Date(Date.now() + 60_000)
+    });
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) })
+    } as any);
+
+    const c = createContext({ 'X-API-Key': 'brz_valid' });
+    const next = vi.fn();
+
+    await apiKeyAuthMiddleware(c, next);
+
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledWith(
+      {
+        scope: 'organization',
+        orgId: 'org-3',
+        accessibleOrgIds: ['org-3'],
+        accessiblePartnerIds: ['partner-7'],
+        currentPartnerId: 'partner-7'
+      },
+      expect.any(Function)
+    );
+  });
+
+  it('keeps accessiblePartnerIds empty for non-MCP keys and skips the org→partner lookup', async () => {
+    // Two select calls expected: the api_keys lookup and the creator-status
+    // lookup (SR2-15 subset). Owner-tenant status is delegated to
+    // tenantStatus, so no third select happens for that.
+    buildSequentialSelectMock([
+      [
+        {
+          id: 'key-10',
+          orgId: 'org-4',
+          name: 'Agent Key',
+          keyPrefix: 'brz_',
+          keyHash: 'hash',
+          scopes: ['agent:read'],
+          expiresAt: null,
+          rateLimit: 100,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-4',
+          source: 'manual'
+        }
+      ],
+      [{ status: 'active' }]
+    ]);
+
+    vi.mocked(getRedis).mockReturnValue({} as any);
+    vi.mocked(rateLimiter).mockResolvedValue({
+      allowed: true,
+      remaining: 99,
+      resetAt: new Date(Date.now() + 60_000)
+    });
+    vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) })
+    } as any);
+
+    const c = createContext({ 'X-API-Key': 'brz_manualkey' });
+    const next = vi.fn();
+    await apiKeyAuthMiddleware(c, next);
+
+    expect(vi.mocked(withDbAccessContext)).toHaveBeenCalledWith(
+      {
+        scope: 'organization',
+        orgId: 'org-4',
+        accessibleOrgIds: ['org-4'],
+        accessiblePartnerIds: [],
+        currentPartnerId: null
+      },
+      expect.any(Function)
+    );
+    // api_keys lookup + creator-status lookup — owner status is delegated to
+    // tenantStatus, so no third select happens for that.
+    expect(db.select).toHaveBeenCalledTimes(2);
+  });
+
+  describe('SR2-15: live creator membership + permission-ceiling', () => {
+    it('rejects with 401 when the creator has lost tenant membership', async () => {
+      buildSequentialSelectMock([
+        [{ id: 'key-1', orgId: 'org-1', name: 'k', keyPrefix: 'brz_x', keyHash: 'h', scopes: ['devices:read'], expiresAt: null, rateLimit: 1000, usageCount: 0, status: 'active', createdBy: 'user-1', source: 'manual' }],
+        [{ status: 'active' }],   // creator status still active (PR1 check passes)…
+      ]);
+      vi.mocked(authorizeHumanApiKeyCreator).mockResolvedValue({ ok: false, reason: 'no_membership' });
+      const c = createContext({ 'X-API-Key': 'brz_membership_gone' });
+      const next = vi.fn();
+      await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({ status: 401 });
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    it('rejects with 401 when the creator no longer holds a stored scope (permission reduction)', async () => {
+      buildSequentialSelectMock([
+        [{ id: 'key-1', orgId: 'org-1', name: 'k', keyPrefix: 'brz_x', keyHash: 'h', scopes: ['devices:read', 'devices:write'], expiresAt: null, rateLimit: 1000, usageCount: 0, status: 'active', createdBy: 'user-1', source: 'manual' }],
+        [{ status: 'active' }],
+      ]);
+      vi.mocked(authorizeHumanApiKeyCreator).mockResolvedValue({ ok: false, reason: 'scope_exceeds_current_permissions' });
+      const c = createContext({ 'X-API-Key': 'brz_perm_reduced' });
+      await expect(apiKeyAuthMiddleware(c, vi.fn())).rejects.toMatchObject({ status: 401 });
+    });
+
+    it('passes the org AND the org-owning partner to the resolver (partner-axis keys)', async () => {
+      buildSequentialSelectMock([
+        [{ id: 'key-1', orgId: 'org-1', name: 'k', keyPrefix: 'brz_x', keyHash: 'h', scopes: ['devices:read'], expiresAt: null, rateLimit: 1000, usageCount: 0, status: 'active', createdBy: 'user-1', source: 'manual' }],
+        [{ status: 'active' }],
+      ]);
+      const next = vi.fn();
+      await apiKeyAuthMiddleware(createContext({ 'X-API-Key': 'brz_ok' }), next);
+      expect(authorizeHumanApiKeyCreator).toHaveBeenCalledWith(
+        expect.objectContaining({ createdBy: 'user-1', orgId: 'org-1', partnerId: 'partner-1', scopes: ['devices:read'] }),
+      );
+      expect(next).toHaveBeenCalled();
+    });
+
+    it('carries the LIVE-clamped scopes and allowedSiteIds into the request context', async () => {
+      buildSequentialSelectMock([
+        [{ id: 'key-1', orgId: 'org-1', name: 'k', keyPrefix: 'brz_x', keyHash: 'h', scopes: ['devices:read', 'devices:write'], expiresAt: null, rateLimit: 1000, usageCount: 0, status: 'active', createdBy: 'user-1', source: 'manual' }],
+        [{ status: 'active' }],
+      ]);
+      vi.mocked(authorizeHumanApiKeyCreator).mockResolvedValue({ ok: true, permissions: {} as any, allowedSiteIds: ['site-a'], clampedScopes: ['devices:read'] });
+      const c = createContext({ 'X-API-Key': 'brz_ok' });
+      await apiKeyAuthMiddleware(c, vi.fn());
+      const ctxKey = c.get('apiKey') as any;
+      expect(ctxKey.scopes).toEqual(['devices:read']);       // clamped, not the stored two
+      expect(ctxKey.allowedSiteIds).toEqual(['site-a']);
+    });
+  });
+
+  describe('SR2-15: service-principal keys branch on principalType', () => {
+    it('calls authorizeServicePrincipalKey (not the human resolver) and skips the creator-status lookup for a service key', async () => {
+      // Only ONE select (the api_keys row) — no second creator-status select,
+      // since a service-principal key has no human "creator active" gate.
+      buildSelectMock([
+        {
+          id: 'key-svc',
+          orgId: 'org-1',
+          name: 'CI bot key',
+          keyPrefix: 'brz_svc',
+          keyHash: 'h',
+          scopes: ['ai:read'],
+          expiresAt: null,
+          rateLimit: 1000,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-1',
+          source: 'manual',
+          principalType: 'service',
+          principalId: 'principal-1'
+        }
+      ]);
+      vi.mocked(authorizeServicePrincipalKey).mockResolvedValue({
+        ok: true,
+        permissions: null,
+        allowedSiteIds: undefined,
+        clampedScopes: ['ai:read']
+      });
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) })
+      } as any);
+
+      const c = createContext({ 'X-API-Key': 'brz_service' });
+      const next = vi.fn();
+      await apiKeyAuthMiddleware(c, next);
+
+      expect(authorizeServicePrincipalKey).toHaveBeenCalledWith({ principalId: 'principal-1', scopes: ['ai:read'] });
+      expect(authorizeHumanApiKeyCreator).not.toHaveBeenCalled();
+      expect(db.select).toHaveBeenCalledTimes(1);
+      expect(next).toHaveBeenCalled();
+
+      const ctxKey = c.get('apiKey') as any;
+      expect(ctxKey.principalType).toBe('service');
+      expect(ctxKey.principalId).toBe('principal-1');
+      expect(ctxKey.scopes).toEqual(['ai:read']);
+    });
+
+    it('rejects with 401 when authorizeServicePrincipalKey denies (disabled principal / fail-closed / scope exceeded)', async () => {
+      buildSelectMock([
+        {
+          id: 'key-svc-2',
+          orgId: 'org-1',
+          name: 'CI bot key',
+          keyPrefix: 'brz_svc',
+          keyHash: 'h',
+          scopes: ['ai:read'],
+          expiresAt: null,
+          rateLimit: 1000,
+          usageCount: 0,
+          status: 'active',
+          createdBy: 'user-1',
+          source: 'manual',
+          principalType: 'service',
+          principalId: 'principal-disabled'
+        }
+      ]);
+      vi.mocked(authorizeServicePrincipalKey).mockResolvedValue({ ok: false, reason: 'no_membership' });
+
+      const c = createContext({ 'X-API-Key': 'brz_service_denied' });
+      const next = vi.fn();
+
+      await expect(apiKeyAuthMiddleware(c, next)).rejects.toMatchObject({ status: 401 });
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    it('still runs the human creator-status + authorizeHumanApiKeyCreator path when principalType is the human default', async () => {
+      // Regression guard for the scope-freeze requirement: a human key
+      // (principalType 'human' or absent) must behave EXACTLY as before —
+      // creator-status select still runs, authorizeServicePrincipalKey is
+      // never invoked.
+      buildSequentialSelectMock([
+        [
+          {
+            id: 'key-human',
+            orgId: 'org-1',
+            name: 'k',
+            keyPrefix: 'brz_x',
+            keyHash: 'h',
+            scopes: ['devices:read'],
+            expiresAt: null,
+            rateLimit: 1000,
+            usageCount: 0,
+            status: 'active',
+            createdBy: 'user-1',
+            source: 'manual',
+            principalType: 'human',
+            principalId: null
+          }
+        ],
+        [{ status: 'active' }]
+      ]);
+
+      const c = createContext({ 'X-API-Key': 'brz_human' });
+      const next = vi.fn();
+      await apiKeyAuthMiddleware(c, next);
+
+      expect(authorizeHumanApiKeyCreator).toHaveBeenCalled();
+      expect(authorizeServicePrincipalKey).not.toHaveBeenCalled();
+      expect(db.select).toHaveBeenCalledTimes(2);
+      expect(next).toHaveBeenCalled();
+    });
+  });
+});
+
+describe('requireApiKeyScope middleware', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('rejects when apiKey is missing from context', async () => {
+    const c = createContext();
+    const next = vi.fn();
+
+    await expect(requireApiKeyScope('read')(c, next)).rejects.toMatchObject({
+      status: 401,
+      message: 'API key authentication required'
+    });
+  });
+
+  it('allows access when no scopes are required', async () => {
+    const c = createContext();
+    c.set('apiKey', { scopes: [] } as any);
+    const next = vi.fn();
+
+    await requireApiKeyScope()(c, next);
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('rejects when apiKey has no scopes', async () => {
+    const c = createContext();
+    c.set('apiKey', { scopes: [] } as any);
+    const next = vi.fn();
+
+    await expect(requireApiKeyScope('read')(c, next)).rejects.toMatchObject({
+      status: 403,
+      message: 'API key does not have required permissions'
+    });
+  });
+
+  it('does not honor wildcard scopes', async () => {
+    const c = createContext();
+    c.set('apiKey', { scopes: ['*'] } as any);
+    const next = vi.fn();
+
+    await expect(requireApiKeyScope('admin')(c, next)).rejects.toMatchObject({
+      status: 403,
+      message: 'API key does not have required permissions'
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('allows access when any required scope is present', async () => {
+    const c = createContext();
+    c.set('apiKey', { scopes: ['read'] } as any);
+    const next = vi.fn();
+
+    await requireApiKeyScope('write', 'read')(c, next);
+    expect(next).toHaveBeenCalled();
+  });
+
+  it('rejects when required scopes are missing', async () => {
+    const c = createContext();
+    c.set('apiKey', { scopes: ['read'] } as any);
+    const next = vi.fn();
+
+    await expect(requireApiKeyScope('write')(c, next)).rejects.toMatchObject({
+      status: 403,
+      message: 'API key does not have required permissions'
+    });
+  });
+});
+
+describe('API key auth + requireMfa interaction (intentional break)', () => {
+  // E.7: API-key-authenticated requests do NOT set the `auth` context value;
+  // they set `apiKey` instead. `requireMfa()` reads `auth` and rejects 401
+  // when missing — so any route gated with `requireMfa()` is effectively
+  // off-limits to API keys. This is intentional: API keys are unattended
+  // service-account credentials with no MFA factor, and silently waiving MFA
+  // for them would defeat the gate. If we ever want service-account access
+  // to MFA-gated routes, the right fix is a dedicated mechanism (signed
+  // intent, scoped capability), not a quiet bypass. This test exists so any
+  // future patch that "fixes" the 401 by short-circuiting requireMfa fails
+  // CI loudly.
+  it('API key auth cannot satisfy requireMfa (intentional break — service accounts need a dedicated path)', async () => {
+    const { requireMfa } = await import('./auth');
+    // Build a context that mimics a request handled by apiKeyAuthMiddleware:
+    // `apiKey` is set, but `auth` is NOT.
+    const c = createContext();
+    c.set('apiKey', { id: 'k', scopes: ['devices:write'] } as any);
+    const next = vi.fn();
+
+    await expect(requireMfa()(c, next)).rejects.toMatchObject({
+      status: 401,
+    });
+    expect(next).not.toHaveBeenCalled();
+    // Explicit timeout: the drizzle-orm mock above spreads the real module (so
+    // schema modules can evaluate `sql` at import time), which makes this
+    // test's dynamic import('./auth') pull a heavier graph than the 5s default
+    // allows. The assertion is unchanged.
+  }, 20000);
+});

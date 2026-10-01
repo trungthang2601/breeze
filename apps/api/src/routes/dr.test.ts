@@ -1,0 +1,941 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+import { drRoutes } from './dr';
+
+const ORG_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const PLAN_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const GROUP_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const EXECUTION_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const DEVICE_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+const OUT_OF_SITE_DEVICE_ID = '11111111-1111-4111-8111-111111111111';
+const SITE_A = '22222222-2222-4222-8222-222222222222';
+const SITE_B = '33333333-3333-4333-8333-333333333333';
+
+vi.mock('../services', () => ({}));
+
+const writeRouteAuditMock = vi.fn();
+const createDrExecutionAndEnqueueMock = vi.fn();
+const classifyDrExecutionAuthorizationErrorMock = vi.fn(() => null as unknown);
+
+function chainMock(resolvedValue: unknown = []) {
+  const chain: Record<string, any> = {};
+  for (const method of ['from', 'where', 'orderBy', 'limit', 'returning', 'values', 'set']) {
+    chain[method] = vi.fn(() => Object.assign(Promise.resolve(resolvedValue), chain));
+  }
+  return Object.assign(Promise.resolve(resolvedValue), chain);
+}
+
+const selectMock = vi.fn(() => chainMock([]));
+const insertMock = vi.fn(() => chainMock([]));
+const updateMock = vi.fn(() => chainMock([]));
+const deleteMock = vi.fn(() => chainMock([]));
+let authState = {
+  user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+  scope: 'organization' as const,
+  partnerId: null,
+  orgId: ORG_ID,
+  token: { sub: 'user-123' },
+  principal: { kind: 'user_session' as const },
+};
+/** null => the caller carries no site restriction (the pre-existing default). */
+let permissionsState: { allowedSiteIds: string[] | null } | null = null;
+
+vi.mock('../db', () => ({
+  db: {
+    select: (...args: unknown[]) => selectMock(...(args as [])),
+    insert: (...args: unknown[]) => insertMock(...(args as [])),
+    update: (...args: unknown[]) => updateMock(...(args as [])),
+    delete: (...args: unknown[]) => deleteMock(...(args as [])),
+  },
+  runOutsideDbContext: vi.fn((fn: () => any) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => any) => fn()),
+}));
+
+vi.mock('../db/schema', () => ({
+  drPlans: {
+    id: 'dr_plans.id',
+    orgId: 'dr_plans.org_id',
+    createdAt: 'dr_plans.created_at',
+  },
+  drPlanGroups: {
+    id: 'dr_plan_groups.id',
+    planId: 'dr_plan_groups.plan_id',
+    orgId: 'dr_plan_groups.org_id',
+    sequence: 'dr_plan_groups.sequence',
+    devices: 'dr_plan_groups.devices',
+  },
+  drExecutions: {
+    id: 'dr_executions.id',
+    orgId: 'dr_executions.org_id',
+    planId: 'dr_executions.plan_id',
+    createdAt: 'dr_executions.created_at',
+    status: 'dr_executions.status',
+  },
+  devices: {
+    id: 'devices.id',
+    orgId: 'devices.org_id',
+    siteId: 'devices.site_id',
+  },
+}));
+
+vi.mock('../services/auditEvents', () => ({
+  writeRouteAudit: (...args: unknown[]) => writeRouteAuditMock(...(args as [])),
+}));
+
+vi.mock('../services/drExecutionService', () => ({
+  createDrExecutionAndEnqueue: (...args: unknown[]) => createDrExecutionAndEnqueueMock(...(args as [])),
+  classifyDrExecutionAuthorizationError: (...args: unknown[]) =>
+    classifyDrExecutionAuthorizationErrorMock(...(args as [])),
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', authState);
+    return next();
+  }),
+  requireScope: vi.fn(() => (c: any, next: any) => next()),
+  requirePermission: vi.fn(() => (c: any, next: any) => {
+    if (permissionsState) c.set('permissions', permissionsState);
+    return next();
+  }),
+  requireMfa: vi.fn(() => (c: any, next: any) => next()),
+}));
+
+import { authMiddleware } from '../middleware/auth';
+
+describe('dr routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    permissionsState = null;
+    classifyDrExecutionAuthorizationErrorMock.mockReturnValue(null);
+    authState = {
+      user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+      scope: 'organization',
+      partnerId: null,
+      orgId: ORG_ID,
+      token: { sub: 'user-123' },
+      principal: { kind: 'user_session' },
+    };
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', authState);
+      return next();
+    });
+    app = new Hono();
+    app.use('*', authMiddleware);
+    app.route('/dr', drRoutes);
+  });
+
+  it('returns an empty DR plan list', async () => {
+    selectMock.mockReturnValueOnce(chainMock([]));
+
+    const res = await app.request('/dr/plans', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual([]);
+  });
+
+  it('creates a DR plan', async () => {
+    insertMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      description: 'Recover critical workloads',
+      status: 'draft',
+      rpoTargetMinutes: 15,
+      rtoTargetMinutes: 60,
+      createdBy: 'user-123',
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+      updatedAt: new Date('2026-03-29T00:00:00.000Z'),
+    }]));
+
+    const res = await app.request('/dr/plans', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        name: 'Primary Site Failover',
+        description: 'Recover critical workloads',
+        rpoTargetMinutes: 15,
+        rtoTargetMinutes: 60,
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    expect((await res.json()).data.id).toBe(PLAN_ID);
+  });
+
+  it('adds a group to a DR plan', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      status: 'draft',
+    }]));
+    // device-ownership check returns the assigned device as owned by this org
+    selectMock.mockReturnValueOnce(chainMock([{ id: DEVICE_ID }]));
+    insertMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Tier 1 Apps',
+      sequence: 1,
+      devices: [DEVICE_ID],
+      restoreConfig: {},
+      estimatedDurationMinutes: 30,
+    }]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}/groups`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        name: 'Tier 1 Apps',
+        sequence: 1,
+        devices: [DEVICE_ID],
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.data.id).toBe(GROUP_ID);
+    expect(body.data.planId).toBe(PLAN_ID);
+  });
+
+  it('creates a DR execution', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      status: 'active',
+    }]));
+    createDrExecutionAndEnqueueMock.mockResolvedValueOnce({
+      id: EXECUTION_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      executionType: 'rehearsal',
+      status: 'pending',
+      startedAt: new Date('2026-03-29T00:00:00.000Z'),
+      initiatedBy: 'user-123',
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+    });
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ executionType: 'rehearsal' }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.data.id).toBe(EXECUTION_ID);
+    expect(body.data.executionType).toBe('rehearsal');
+    expect(createDrExecutionAndEnqueueMock).toHaveBeenCalledWith({
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      executionType: 'rehearsal',
+      initiatedBy: 'user-123',
+      auth: authState,
+    });
+  });
+
+  it('should get single plan with groups', async () => {
+    // First select returns the plan
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      description: 'Recover critical workloads',
+      status: 'active',
+      rpoTargetMinutes: 15,
+      rtoTargetMinutes: 60,
+      createdBy: 'user-123',
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+      updatedAt: new Date('2026-03-29T00:00:00.000Z'),
+    }]));
+    // Second select returns the groups
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Tier 1 Apps',
+      sequence: 1,
+      devices: [DEVICE_ID],
+    }]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.id).toBe(PLAN_ID);
+    expect(body.data.groups).toHaveLength(1);
+    expect(body.data.groups[0].id).toBe(GROUP_ID);
+  });
+
+  it('should update plan', async () => {
+    // First select verifies the plan exists
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      status: 'draft',
+    }]));
+    // Update returns the updated plan
+    updateMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Updated Plan Name',
+      description: 'New description',
+      status: 'active',
+      rpoTargetMinutes: 10,
+      rtoTargetMinutes: 30,
+      createdBy: 'user-123',
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+      updatedAt: new Date('2026-03-29T01:00:00.000Z'),
+    }]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ name: 'Updated Plan Name', status: 'active' }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.name).toBe('Updated Plan Name');
+    expect(body.data.status).toBe('active');
+  });
+
+  it('should archive plan on delete', async () => {
+    // First select verifies the plan exists
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      status: 'active',
+    }]));
+    // Update sets status to archived
+    updateMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      status: 'archived',
+      updatedAt: new Date('2026-03-29T01:00:00.000Z'),
+    }]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.status).toBe('archived');
+  });
+
+  it('should update recovery group', async () => {
+    // First select verifies the group exists
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Tier 1 Apps',
+      sequence: 1,
+    }]));
+    // Update returns updated group
+    updateMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Tier 1 Critical',
+      sequence: 2,
+      devices: [DEVICE_ID],
+    }]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ name: 'Tier 1 Critical', sequence: 2 }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.name).toBe('Tier 1 Critical');
+    expect(body.data.sequence).toBe(2);
+  });
+
+  it('should delete recovery group', async () => {
+    // First select verifies the group exists
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+    }]));
+    // delete mock
+    deleteMock.mockReturnValueOnce(chainMock([]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ success: true });
+  });
+
+  it('returns DR execution history', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: EXECUTION_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      executionType: 'rehearsal',
+      status: 'completed',
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+    }]));
+
+    const res = await app.request('/dr/executions', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0].id).toBe(EXECUTION_ID);
+  });
+
+  it('should get single execution', async () => {
+    // First select returns the execution
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: EXECUTION_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      executionType: 'rehearsal',
+      status: 'running',
+      startedAt: new Date('2026-03-29T00:00:00.000Z'),
+      initiatedBy: 'user-123',
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+    }]));
+    // Second select returns the plan
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      status: 'active',
+    }]));
+    // Third select returns the groups
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Tier 1 Apps',
+      sequence: 1,
+    }]));
+
+    const res = await app.request(`/dr/executions/${EXECUTION_ID}`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.id).toBe(EXECUTION_ID);
+    expect(body.data.plan.id).toBe(PLAN_ID);
+    expect(body.data.groups).toHaveLength(1);
+  });
+
+  it('should abort a running execution', async () => {
+    // First select returns the execution
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: EXECUTION_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      executionType: 'rehearsal',
+      status: 'running',
+      startedAt: new Date('2026-03-29T00:00:00.000Z'),
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+    }]));
+    // Update returns the aborted execution
+    updateMock.mockReturnValueOnce(chainMock([{
+      id: EXECUTION_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      executionType: 'rehearsal',
+      status: 'aborted',
+      completedAt: new Date('2026-03-29T01:00:00.000Z'),
+    }]));
+
+    const res = await app.request(`/dr/executions/${EXECUTION_ID}/abort`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.status).toBe('aborted');
+  });
+
+  it('rejects group create with a foreign-org device', async () => {
+    // plan exists and belongs to org
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Primary Site Failover',
+      status: 'draft',
+    }]));
+    // device-ownership check returns 0 rows: device is not in this org
+    selectMock.mockReturnValueOnce(chainMock([]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}/groups`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        name: 'Tier 1 Apps',
+        devices: [DEVICE_ID],
+      }),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toContain('do not belong to this organization');
+    // must not persist the foreign device
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects group update with a foreign-org device', async () => {
+    // group exists and belongs to org
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Tier 1 Apps',
+      sequence: 1,
+    }]));
+    // device-ownership check returns 0 rows: device is not in this org
+    selectMock.mockReturnValueOnce(chainMock([]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ devices: [DEVICE_ID] }),
+    });
+
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toContain('do not belong to this organization');
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('allows group update that does not change devices (no ownership check)', async () => {
+    // group exists and belongs to org
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Tier 1 Apps',
+      sequence: 1,
+    }]));
+    updateMock.mockReturnValueOnce(chainMock([{
+      id: GROUP_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      name: 'Renamed',
+      sequence: 1,
+    }]));
+
+    const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ name: 'Renamed' }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.name).toBe('Renamed');
+    // only the group-existence select runs; no device-ownership select
+    expect(selectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('should reject aborting a completed execution', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: EXECUTION_ID,
+      planId: PLAN_ID,
+      orgId: ORG_ID,
+      executionType: 'rehearsal',
+      status: 'completed',
+      startedAt: new Date('2026-03-29T00:00:00.000Z'),
+      completedAt: new Date('2026-03-29T01:00:00.000Z'),
+      createdAt: new Date('2026-03-29T00:00:00.000Z'),
+    }]));
+
+    const res = await app.request(`/dr/executions/${EXECUTION_ID}/abort`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain('Cannot abort execution');
+  });
+
+  // ── Site scoping (#3653) ──────────────────────────────────────────────────
+  //
+  // RLS enforces the ORG axis only. The SITE axis is app-layer, so these routes
+  // are the sole barrier between a site-restricted technician and another
+  // site's disaster-recovery configuration.
+  describe('site scoping', () => {
+    /** Rows the org+site lookup returns for the ids a handler asks about. */
+    const deviceRows = [
+      { id: DEVICE_ID, siteId: SITE_A },
+      { id: OUT_OF_SITE_DEVICE_ID, siteId: SITE_B },
+    ];
+
+    function restrictToSiteA() {
+      permissionsState = { allowedSiteIds: [SITE_A] };
+    }
+
+    it('rejects a group create that includes an out-of-site device', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]));
+      selectMock.mockReturnValueOnce(chainMock(deviceRows));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Tier 1', devices: [DEVICE_ID, OUT_OF_SITE_DEVICE_ID] }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it('allows a group create whose devices are all inside the caller sites', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]));
+      selectMock.mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]));
+      insertMock.mockReturnValueOnce(chainMock([{ id: GROUP_ID, planId: PLAN_ID, orgId: ORG_ID }]));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Tier 1', devices: [DEVICE_ID] }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(insertMock).toHaveBeenCalled();
+    });
+
+    // The bypass that makes "validate the submitted array" insufficient: every
+    // id the caller submits is inside their grant, yet the write silently drops
+    // the out-of-site device already stored on the group.
+    it('rejects a group update that silently drops a stored out-of-site device', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{
+        id: GROUP_ID,
+        planId: PLAN_ID,
+        orgId: ORG_ID,
+        devices: [DEVICE_ID, OUT_OF_SITE_DEVICE_ID],
+      }]));
+      selectMock.mockReturnValueOnce(chainMock(deviceRows));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ devices: [DEVICE_ID] }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects deleting a group that holds an out-of-site device', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{
+        id: GROUP_ID,
+        devices: [DEVICE_ID, OUT_OF_SITE_DEVICE_ID],
+      }]));
+      selectMock.mockReturnValueOnce(chainMock(deviceRows));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(deleteMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects archiving a plan whose groups span sites the caller cannot reach', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]));
+      selectMock.mockReturnValueOnce(chainMock([{ devices: [DEVICE_ID, OUT_OF_SITE_DEVICE_ID] }]));
+      selectMock.mockReturnValueOnce(chainMock(deviceRows));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects updating a plan whose groups span sites the caller cannot reach', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]));
+      selectMock.mockReturnValueOnce(chainMock([{ devices: [DEVICE_ID, OUT_OF_SITE_DEVICE_ID] }]));
+      selectMock.mockReturnValueOnce(chainMock(deviceRows));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ status: 'archived' }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects aborting a recovery that targets out-of-site devices', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{
+        id: EXECUTION_ID,
+        planId: PLAN_ID,
+        orgId: ORG_ID,
+        status: 'running',
+      }]));
+      selectMock.mockReturnValueOnce(chainMock([{ devices: [DEVICE_ID, OUT_OF_SITE_DEVICE_ID] }]));
+      selectMock.mockReturnValueOnce(chainMock(deviceRows));
+
+      const res = await app.request(`/dr/executions/${EXECUTION_ID}/abort`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    it('allows aborting a recovery confined to the caller sites', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{
+        id: EXECUTION_ID,
+        planId: PLAN_ID,
+        orgId: ORG_ID,
+        status: 'running',
+      }]));
+      selectMock.mockReturnValueOnce(chainMock([{ devices: [DEVICE_ID] }]));
+      selectMock.mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]));
+      updateMock.mockReturnValueOnce(chainMock([{ id: EXECUTION_ID, status: 'aborted' }]));
+
+      const res = await app.request(`/dr/executions/${EXECUTION_ID}/abort`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).data.status).toBe('aborted');
+    });
+
+    // The stored guard runs first, so a group whose stored membership is fully
+    // in-site must still have its PROPOSED additions checked. Without this the
+    // proposed guard could be deleted and every other test would stay green.
+    it('rejects a group update that adds an out-of-site device', async () => {
+      restrictToSiteA();
+      selectMock.mockReturnValueOnce(chainMock([{
+        id: GROUP_ID,
+        planId: PLAN_ID,
+        orgId: ORG_ID,
+        devices: [DEVICE_ID],
+      }]));
+      selectMock.mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]));
+      selectMock.mockReturnValueOnce(chainMock([{ id: OUT_OF_SITE_DEVICE_ID, siteId: SITE_B }]));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ devices: [OUT_OF_SITE_DEVICE_ID] }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(updateMock).not.toHaveBeenCalled();
+    });
+
+    // An empty grant is the most locked-down state and the one a truthiness
+    // slip (`!allowedSiteIds`) would silently turn into "unrestricted".
+    it('denies a technician granted zero sites', async () => {
+      permissionsState = { allowedSiteIds: [] };
+      selectMock.mockReturnValueOnce(chainMock([{ id: GROUP_ID, devices: [DEVICE_ID] }]));
+      selectMock.mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(deleteMock).not.toHaveBeenCalled();
+    });
+
+    // authorizeStoredDevices deliberately omits the row-count parity check that
+    // authorizeProposedDevices has: an id whose device row is gone cannot be a
+    // restore target, and must not wedge maintenance of the group holding it.
+    it('does not let a deleted device block maintenance of its group', async () => {
+      restrictToSiteA();
+      const deletedDeviceId = '44444444-4444-4444-8444-444444444444';
+      selectMock.mockReturnValueOnce(chainMock([{
+        id: GROUP_ID,
+        devices: [DEVICE_ID, deletedDeviceId],
+      }]));
+      selectMock.mockReturnValueOnce(chainMock([{ id: DEVICE_ID, siteId: SITE_A }]));
+      deleteMock.mockReturnValueOnce(chainMock([]));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(deleteMock).toHaveBeenCalled();
+    });
+
+    // A device outside the org must report the org mismatch, never the site
+    // grant — the site verdict would confirm the id exists somewhere in-org.
+    it('reports an org mismatch ahead of the site grant', async () => {
+      restrictToSiteA();
+      const foreignDeviceId = '55555555-5555-4555-8555-555555555555';
+      selectMock.mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]));
+      selectMock.mockReturnValueOnce(chainMock([]));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Tier 1', devices: [foreignDeviceId] }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toMatch(/do not belong to this organization/);
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    // An unrestricted principal must not pay for the site barrier, and must not
+    // change behaviour: no extra lookup beyond the group existence check.
+    it('costs an unrestricted caller no additional device lookup', async () => {
+      selectMock.mockReturnValueOnce(chainMock([{ id: GROUP_ID, devices: [OUT_OF_SITE_DEVICE_ID] }]));
+      deleteMock.mockReturnValueOnce(chainMock([]));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/groups/${GROUP_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(selectMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── W05b Task 7: BARE_METAL_REBUILD needs BACKUP_WRITE on the trigger ────
+  describe('execution trigger with a BARE_METAL_REBUILD group', () => {
+    const bmrGroup = { id: GROUP_ID, planId: PLAN_ID, orgId: ORG_ID, devices: [DEVICE_ID], restoreConfig: { commandType: 'BARE_METAL_REBUILD' } };
+
+    it('returns 403 when the caller lacks backup:write', async () => {
+      permissionsState = { allowedSiteIds: null, permissions: [{ resource: 'devices', action: 'execute' }] } as any;
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]))
+        .mockReturnValueOnce(chainMock([bmrGroup]));
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ executionType: 'failover' }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('backup_write_required');
+      expect(createDrExecutionAndEnqueueMock).not.toHaveBeenCalled();
+    });
+
+    it('proceeds (201) when the caller holds backup:write', async () => {
+      permissionsState = { allowedSiteIds: null, permissions: [{ resource: 'devices', action: 'execute' }, { resource: 'backup', action: 'write' }] } as any;
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]))
+        .mockReturnValueOnce(chainMock([bmrGroup]));
+      createDrExecutionAndEnqueueMock.mockResolvedValueOnce({ id: EXECUTION_ID, planId: PLAN_ID, orgId: ORG_ID, executionType: 'failover', status: 'pending' });
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ executionType: 'failover' }),
+      });
+
+      expect(res.status).toBe(201);
+    });
+
+    it('does not require backup:write for a plan without the step', async () => {
+      permissionsState = { allowedSiteIds: null, permissions: [{ resource: 'devices', action: 'execute' }] } as any;
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]))
+        .mockReturnValueOnce(chainMock([{ ...bmrGroup, restoreConfig: { commandType: 'vm_restore_from_backup' } }]));
+      createDrExecutionAndEnqueueMock.mockResolvedValueOnce({ id: EXECUTION_ID, planId: PLAN_ID, orgId: ORG_ID, executionType: 'failover', status: 'pending' });
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ executionType: 'failover' }),
+      });
+
+      expect(res.status).toBe(201);
+    });
+  });
+
+  // ── Execution authorization errors (#3653) ────────────────────────────────
+  describe('execution authorization failures', () => {
+    it('reports a site-denied execution as 403 rather than a 500', async () => {
+      selectMock.mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]));
+      createDrExecutionAndEnqueueMock.mockRejectedValueOnce(new Error('site_access_denied'));
+      classifyDrExecutionAuthorizationErrorMock.mockReturnValue({
+        status: 403,
+        code: 'site_access_denied',
+      });
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ executionType: 'failover' }),
+      });
+
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe('site_access_denied');
+      expect(writeRouteAuditMock).not.toHaveBeenCalled();
+    });
+
+    // Only recognised authorization denials may be converted. A genuine fault
+    // must keep propagating, or this catch would swallow real breakage.
+    it('rethrows an unrecognised execution failure', async () => {
+      selectMock.mockReturnValueOnce(chainMock([{ id: PLAN_ID, orgId: ORG_ID, status: 'active' }]));
+      createDrExecutionAndEnqueueMock.mockRejectedValueOnce(new Error('redis is on fire'));
+      classifyDrExecutionAuthorizationErrorMock.mockReturnValue(null);
+
+      const res = await app.request(`/dr/plans/${PLAN_ID}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ executionType: 'failover' }),
+      });
+
+      expect(res.status).toBe(500);
+    });
+  });
+});

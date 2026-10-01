@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import SsoProvidersPage from '../../components/settings/SsoProvidersPage';
+---
+
+<DashboardLayout titleKey="titles.settingsSso">
+  <SsoProvidersPage client:load />
+</DashboardLayout>

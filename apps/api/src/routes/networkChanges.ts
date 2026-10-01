@@ -1,0 +1,461 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { and, desc, eq, gte, inArray, sql, type SQL } from 'drizzle-orm';
+import { z } from 'zod';
+import { db } from '../db';
+import {
+  alerts,
+  devices,
+  networkBaselines,
+  networkChangeEvents,
+  sites
+} from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { writeRouteAudit } from '../services/auditEvents';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
+import {
+  networkEventTypes,
+  optionalQueryBooleanSchema,
+  mapNetworkChangeRow,
+  resolveOrgId
+} from './networkShared';
+
+export const networkChangeRoutes = new Hono();
+
+const listNetworkChangesSchema = z.object({
+  orgId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
+  baselineId: z.string().guid().optional(),
+  profileId: z.string().guid().optional(),
+  eventType: z.enum(networkEventTypes).optional(),
+  acknowledged: optionalQueryBooleanSchema,
+  since: z.string().datetime().optional(),
+  limit: z.coerce.number().int().positive().max(200).optional(),
+  offset: z.coerce.number().int().min(0).optional()
+});
+
+const acknowledgeChangeSchema = z.object({
+  notes: z.string().max(2000).optional()
+});
+
+const linkDeviceSchema = z.object({
+  deviceId: z.string().guid()
+});
+
+const bulkAcknowledgeSchema = z.object({
+  eventIds: z.array(z.string().guid()).min(1).max(200),
+  notes: z.string().max(2000).optional()
+});
+
+async function getChangeEventWithAccess(
+  eventId: string,
+  auth: AuthContext
+): Promise<typeof networkChangeEvents.$inferSelect | null> {
+  const conditions: SQL[] = [eq(networkChangeEvents.id, eventId)];
+  const orgCondition = auth.orgCondition(networkChangeEvents.orgId);
+  if (orgCondition) {
+    conditions.push(orgCondition);
+  }
+
+  const [event] = await db
+    .select()
+    .from(networkChangeEvents)
+    .where(and(...conditions))
+    .limit(1);
+
+  return event ?? null;
+}
+
+/**
+ * Site-axis (sub-org) gate for a single change event. Site scope is an
+ * app-layer-only authz axis — RLS does NOT enforce it — and the by-id handlers
+ * (unlike GET /) historically skipped it, so a site-restricted org user could
+ * read/acknowledge/link events outside their allowed sites. Mirrors the GET /
+ * narrowing (`inArray(networkChangeEvents.siteId, allowedSiteIds)`): a
+ * restricted caller is denied for an event in a site outside the allowlist (or
+ * with no siteId). No-op for unrestricted callers (`perms` undefined or
+ * `allowedSiteIds` unset — partner/system scope, or org users with no
+ * restriction). Returns true when access is permitted.
+ */
+function changeEventInSiteScope(
+  perms: UserPermissions | undefined,
+  event: { siteId: string }
+): boolean {
+  if (!perms?.allowedSiteIds) return true;
+  return canAccessSite(perms, event.siteId);
+}
+
+networkChangeRoutes.use('*', authMiddleware);
+
+networkChangeRoutes.get(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` so the site narrowing below is live (only
+  // requirePermission sets it). DEVICES_READ is granted to every device-viewing role.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('query', listNetworkChangesSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    const orgResult = resolveOrgId(auth, query.orgId);
+    if ('error' in orgResult) {
+      return c.json({ error: orgResult.error }, orgResult.status);
+    }
+
+    const conditions: SQL[] = [];
+    if (orgResult.orgId) {
+      conditions.push(eq(networkChangeEvents.orgId, orgResult.orgId));
+    } else {
+      const orgCondition = auth.orgCondition(networkChangeEvents.orgId);
+      if (orgCondition) {
+        conditions.push(orgCondition);
+      }
+    }
+
+    if (query.siteId) {
+      // Validate that siteId belongs to the resolved org
+      if (orgResult.orgId) {
+        const [site] = await db
+          .select({ id: sites.id })
+          .from(sites)
+          .where(
+            and(
+              eq(sites.id, query.siteId),
+              eq(sites.orgId, orgResult.orgId)
+            )
+          )
+          .limit(1);
+
+        if (!site) {
+          return c.json({ error: 'Site not found for this organization' }, 404);
+        }
+      }
+      if (perms?.allowedSiteIds && !canAccessSite(perms, query.siteId)) {
+        return c.json({ error: 'Access to this site denied' }, 403);
+      }
+      conditions.push(eq(networkChangeEvents.siteId, query.siteId));
+    } else if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({
+          data: [],
+          pagination: {
+            limit: query.limit ?? 100,
+            offset: query.offset ?? 0,
+            total: 0
+          }
+        });
+      }
+      conditions.push(inArray(networkChangeEvents.siteId, perms.allowedSiteIds));
+    }
+
+    if (query.baselineId) {
+      conditions.push(eq(networkChangeEvents.baselineId, query.baselineId));
+    }
+
+    if (query.profileId) {
+      conditions.push(eq(networkChangeEvents.profileId, query.profileId));
+    }
+
+    if (query.eventType) {
+      conditions.push(eq(networkChangeEvents.eventType, query.eventType));
+    }
+
+    if (query.acknowledged !== undefined) {
+      conditions.push(eq(networkChangeEvents.acknowledged, query.acknowledged));
+    }
+
+    if (query.since) {
+      conditions.push(gte(networkChangeEvents.detectedAt, new Date(query.since)));
+    }
+
+    // Safeguard: prevent unbounded full-table scans for system-scope users
+    // with no filters. Require at least orgId or cap the result set.
+    if (conditions.length === 0) {
+      return c.json({ error: 'At least one filter (orgId, siteId, baselineId) is required' }, 400);
+    }
+
+    const where = and(...conditions);
+    const limit = query.limit ?? 100;
+    const offset = query.offset ?? 0;
+
+    const [countRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(networkChangeEvents)
+      .where(where);
+
+    const rows = await db
+      .select({
+        event: networkChangeEvents,
+        baselineSubnet: networkBaselines.subnet
+      })
+      .from(networkChangeEvents)
+      .leftJoin(networkBaselines, eq(networkChangeEvents.baselineId, networkBaselines.id))
+      .where(where)
+      .orderBy(desc(networkChangeEvents.detectedAt), desc(networkChangeEvents.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: rows.map(({ event, baselineSubnet }) => ({
+        ...mapNetworkChangeRow(event),
+        baselineSubnet
+      })),
+      pagination: {
+        limit,
+        offset,
+        total: Number(countRow?.count ?? 0)
+      }
+    });
+  }
+);
+
+networkChangeRoutes.get(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  // Populates c.get('permissions') so the allowedSiteIds site narrowing below runs (dead under requireScope alone — #1051 detector).
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const eventId = c.req.param('id')!;
+
+    const event = await getChangeEventWithAccess(eventId, auth);
+    if (!event || !changeEventInSiteScope(perms, event)) {
+      return c.json({ error: 'Network change event not found' }, 404);
+    }
+
+    const [baseline] = await db
+      .select({ id: networkBaselines.id, subnet: networkBaselines.subnet })
+      .from(networkBaselines)
+      .where(eq(networkBaselines.id, event.baselineId))
+      .limit(1);
+
+    return c.json({
+      ...mapNetworkChangeRow(event),
+      baselineSubnet: baseline?.subnet ?? null
+    });
+  }
+);
+
+networkChangeRoutes.post(
+  '/:id/acknowledge',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission('alerts', 'acknowledge'),
+  zValidator('json', acknowledgeChangeSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const eventId = c.req.param('id')!;
+    const body = c.req.valid('json');
+
+    const event = await getChangeEventWithAccess(eventId, auth);
+    if (!event || !changeEventInSiteScope(perms, event)) {
+      return c.json({ error: 'Network change event not found' }, 404);
+    }
+
+    if (event.acknowledged) {
+      return c.json({ error: 'Network change event is already acknowledged' }, 400);
+    }
+
+    const [updated] = await db
+      .update(networkChangeEvents)
+      .set({
+        acknowledged: true,
+        acknowledgedBy: auth.user.id,
+        acknowledgedAt: new Date(),
+        notes: body.notes ?? event.notes
+      })
+      .where(eq(networkChangeEvents.id, event.id))
+      .returning();
+
+    if (!updated) {
+      return c.json({ error: 'Failed to acknowledge network change event' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: updated.orgId,
+      action: 'network.change.acknowledge',
+      resourceType: 'network_change_event',
+      resourceId: updated.id,
+      resourceName: updated.ipAddress,
+      details: {
+        eventType: updated.eventType,
+        notes: body.notes ?? null
+      }
+    });
+
+    return c.json(mapNetworkChangeRow(updated));
+  }
+);
+
+networkChangeRoutes.post(
+  '/:id/link-device',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission('devices', 'write'),
+  // MFA is required here but deliberately not on acknowledge/bulk-acknowledge:
+  // this route is the only one that takes a caller-supplied device id and
+  // rewrites the associated alert's device attribution, matching the
+  // neighbouring discovery asset-link route. Acknowledgement only flips a flag
+  // on an event the caller can already see and creates no new relationship.
+  requireMfa(),
+  zValidator('json', linkDeviceSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const eventId = c.req.param('id')!;
+    const body = c.req.valid('json');
+
+    const event = await getChangeEventWithAccess(eventId, auth);
+    if (!event || !changeEventInSiteScope(perms, event)) {
+      return c.json({ error: 'Network change event not found' }, 404);
+    }
+
+    const deviceConditions: SQL[] = [eq(devices.id, body.deviceId)];
+    const orgCond = auth.orgCondition(devices.orgId);
+    if (orgCond) deviceConditions.push(orgCond);
+
+    const [device] = await db
+      .select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId })
+      .from(devices)
+      .where(and(...deviceConditions))
+      .limit(1);
+
+    if (!device || device.orgId !== event.orgId) {
+      return c.json({ error: 'Device not found in the same organization' }, 404);
+    }
+    // Site is an app-layer authorization axis — Postgres RLS does not defend
+    // it — so it only constrains callers that actually have a site ceiling.
+    // Unrestricted organization, partner and system callers already see every
+    // site in the org and are deliberately NOT gated here: `devices.site_id`
+    // and `network_change_events.site_id` are both NOT NULL, so a same-site
+    // requirement for them would add no authorization and would permanently
+    // block a legitimate roaming asset (scanned on one site's subnet, recorded
+    // against another site) from ever being linked by anyone.
+    if (perms?.allowedSiteIds) {
+      // Keep an inaccessible target opaque — the same 404 a wrong-org device
+      // gets — so this mutation is not a hidden-device existence oracle. The
+      // `typeof` arm is a fail-closed belt: the column is NOT NULL today, and
+      // a future nullable site must deny rather than fall through.
+      if (typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId)) {
+        return c.json({ error: 'Device not found in the same organization' }, 404);
+      }
+      // Both records are inside the ceiling at this point; a restricted caller
+      // still may not stitch two of their sites together, which is the
+      // attribution rewrite this repair exists to stop.
+      if (device.siteId !== event.siteId) {
+        return c.json({ error: 'Device does not belong to the same site as this network change event' }, 403);
+      }
+    }
+
+    const [updated] = await db
+      .update(networkChangeEvents)
+      .set({
+        linkedDeviceId: body.deviceId
+      })
+      .where(eq(networkChangeEvents.id, event.id))
+      .returning();
+
+    if (!updated) {
+      return c.json({ error: 'Failed to link device to network change event' }, 500);
+    }
+
+    if (updated.alertId) {
+      try {
+        await db
+          .update(alerts)
+          .set({ deviceId: body.deviceId })
+          .where(eq(alerts.id, updated.alertId));
+      } catch (error) {
+        console.warn(
+          `[NetworkChanges] Failed to update alert ${updated.alertId} deviceId during link-device:`,
+          error instanceof Error ? error.message : error
+        );
+        // Don't fail the request -- the primary link was already persisted
+      }
+    }
+
+    writeRouteAudit(c, {
+      orgId: updated.orgId,
+      action: 'network.change.link_device',
+      resourceType: 'network_change_event',
+      resourceId: updated.id,
+      resourceName: updated.ipAddress,
+      details: { deviceId: body.deviceId }
+    });
+
+    return c.json(mapNetworkChangeRow(updated));
+  }
+);
+
+networkChangeRoutes.post(
+  '/bulk-acknowledge',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission('alerts', 'acknowledge'),
+  zValidator('json', bulkAcknowledgeSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const body = c.req.valid('json');
+
+    const conditions: SQL[] = [inArray(networkChangeEvents.id, body.eventIds)];
+    const orgCondition = auth.orgCondition(networkChangeEvents.orgId);
+    if (orgCondition) {
+      conditions.push(orgCondition);
+    }
+
+    const accessibleEvents = await db
+      .select({ id: networkChangeEvents.id, orgId: networkChangeEvents.orgId, siteId: networkChangeEvents.siteId })
+      .from(networkChangeEvents)
+      .where(and(...conditions))
+      // Site-axis filter (RLS does not enforce site scope): drop events whose
+      // site is outside a restricted caller's allowlist before mutating. No-op
+      // for unrestricted callers (perms undefined / allowedSiteIds unset).
+      .then((events) => events.filter((event) => changeEventInSiteScope(perms, event)));
+
+    if (accessibleEvents.length === 0) {
+      return c.json({ error: 'No accessible network change events found' }, 404);
+    }
+
+    const eventIds = accessibleEvents.map((event) => event.id);
+
+    const updateValues: Partial<typeof networkChangeEvents.$inferInsert> = {
+      acknowledged: true,
+      acknowledgedBy: auth.user.id,
+      acknowledgedAt: new Date()
+    };
+    if (body.notes !== undefined) {
+      updateValues.notes = body.notes;
+    }
+
+    const updated = await db
+      .update(networkChangeEvents)
+      .set(updateValues)
+      .where(
+        and(
+          inArray(networkChangeEvents.id, eventIds),
+          eq(networkChangeEvents.acknowledged, false)
+        )
+      )
+      .returning({ id: networkChangeEvents.id, orgId: networkChangeEvents.orgId });
+
+    writeRouteAudit(c, {
+      orgId: updated[0]?.orgId ?? accessibleEvents[0]?.orgId ?? null,
+      action: 'network.change.bulk_acknowledge',
+      resourceType: 'network_change_event',
+      details: {
+        requestedCount: body.eventIds.length,
+        accessibleCount: eventIds.length,
+        updatedCount: updated.length
+      }
+    });
+
+    return c.json({
+      success: true,
+      acknowledgedCount: updated.length,
+      requestedCount: body.eventIds.length,
+      inaccessibleCount: body.eventIds.length - eventIds.length
+    });
+  }
+);

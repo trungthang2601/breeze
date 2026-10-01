@@ -1,0 +1,225 @@
+package collectors
+
+import (
+	"log/slog"
+	"sync"
+	"time"
+)
+
+// EventLogEntry represents a single event log entry (platform-agnostic)
+type EventLogEntry struct {
+	Timestamp string         `json:"timestamp"`
+	Level     string         `json:"level"`    // "info", "warning", "error", "critical"
+	Category  string         `json:"category"` // "security", "hardware", "application", "system"
+	Source    string         `json:"source"`
+	EventID   string         `json:"eventId"`
+	Message   string         `json:"message"`
+	Details   map[string]any `json:"details,omitempty"`
+}
+
+// validCategories defines the set of recognized event log categories.
+var validCategories = map[string]bool{
+	"security": true, "hardware": true,
+	"application": true, "system": true,
+}
+
+// levelOrder maps level strings to numeric order for comparison
+var levelOrder = map[string]int{
+	"info":     0,
+	"warning":  1,
+	"error":    2,
+	"critical": 3,
+}
+
+// EventLogCollector collects OS event logs on a per-platform basis
+type EventLogCollector struct {
+	mu              sync.Mutex
+	lastCollectTime time.Time
+	// sourceWatermarks tracks per-sub-collector watermarks on platforms whose
+	// sub-collectors can fail independently (darwin). Each source advances only
+	// when IT succeeds, so a persistently failing source (e.g. `log show`
+	// timing out) retries its own bounded window without freezing — and thereby
+	// unboundedly growing — the windows of the sources that keep succeeding.
+	// Sources fall back to lastCollectTime until their first success, which
+	// preserves the reliability collector's initial-lookback seeding.
+	sourceWatermarks map[string]time.Time
+	maxEvents        int
+	categories       []string
+	minimumLevel     string
+	intervalMinutes  int
+}
+
+// NewEventLogCollector creates a new EventLogCollector
+func NewEventLogCollector() *EventLogCollector {
+	return &EventLogCollector{
+		lastCollectTime: time.Now(),
+		maxEvents:       100,
+		categories:      []string{"security", "hardware", "application", "system"},
+		minimumLevel:    "info",
+		// 15m default (was 5m): each pass fans out subprocess work — on macOS a
+		// `log show` pass costs seconds of CPU even when it returns nothing
+		// (issue #2390) — and error-level events don't need 5-minute freshness.
+		// Server-configurable 1-60 via UpdateConfig.
+		intervalMinutes: 15,
+	}
+}
+
+// UpdateConfig updates the collector settings. Thread-safe via mutex.
+// Returns true if any setting actually changed.
+func (c *EventLogCollector) UpdateConfig(maxEvents int, categories []string, minimumLevel string, intervalMinutes int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	changed := false
+
+	if maxEvents >= 10 && maxEvents <= 500 && c.maxEvents != maxEvents {
+		c.maxEvents = maxEvents
+		changed = true
+	}
+	if len(categories) > 0 {
+		var valid []string
+		for _, cat := range categories {
+			if validCategories[cat] {
+				valid = append(valid, cat)
+			}
+		}
+		if len(valid) > 0 && !slicesEqual(c.categories, valid) {
+			c.categories = valid
+			changed = true
+		}
+	}
+	if _, ok := levelOrder[minimumLevel]; ok && c.minimumLevel != minimumLevel {
+		c.minimumLevel = minimumLevel
+		changed = true
+	}
+	if intervalMinutes >= 1 && intervalMinutes <= 60 && c.intervalMinutes != intervalMinutes {
+		c.intervalMinutes = intervalMinutes
+		changed = true
+	}
+	return changed
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// IntervalMinutes returns the configured collection interval.
+func (c *EventLogCollector) IntervalMinutes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.intervalMinutes
+}
+
+// Categories returns the configured categories to collect.
+func (c *EventLogCollector) Categories() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make([]string, len(c.categories))
+	copy(result, c.categories)
+	return result
+}
+
+// sourceSince returns the collection window start for a named sub-collector:
+// its own watermark once it has succeeded at least once, otherwise the shared
+// lastCollectTime seed.
+func (c *EventLogCollector) sourceSince(name string) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w, ok := c.sourceWatermarks[name]; ok {
+		return w
+	}
+	return c.lastCollectTime
+}
+
+// advanceSourceWatermark records that the named sub-collector successfully
+// collected through the given instant.
+func (c *EventLogCollector) advanceSourceWatermark(name string, to time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sourceWatermarks == nil {
+		c.sourceWatermarks = make(map[string]time.Time)
+	}
+	c.sourceWatermarks[name] = to
+}
+
+// eventLogSubCollector names one independent event-log source so its
+// watermark can advance separately from its siblings.
+type eventLogSubCollector struct {
+	name string
+	fn   func(since time.Time) ([]EventLogEntry, error)
+}
+
+// runEventLogSubCollectors runs the sub-collectors in parallel, each from its
+// own per-source watermark, and advances only the watermarks of the sources
+// that succeeded. A failing source retries its own window next pass (bounded:
+// the unified-log query clamps to unifiedLogMaxLookback, and re-collected
+// events from retried windows are absorbed server-side by the
+// device_event_logs dedup index + onConflictDoNothing) while healthy sources
+// keep advancing — one broken source must never freeze or starve the others.
+// Platform-neutral so the failure-isolation contract is testable on Linux CI.
+func (c *EventLogCollector) runEventLogSubCollectors(subs []eventLogSubCollector, passStart time.Time) []EventLogEntry {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var allEvents []EventLogEntry
+
+	wg.Add(len(subs))
+	for _, sc := range subs {
+		go func(sc eventLogSubCollector) {
+			defer wg.Done()
+			events, err := sc.fn(c.sourceSince(sc.name))
+			if err != nil {
+				slog.Warn("event log sub-collector error", "source", sc.name, "error", err.Error())
+				return
+			}
+			mu.Lock()
+			allEvents = append(allEvents, events...)
+			mu.Unlock()
+			c.advanceSourceWatermark(sc.name, passStart)
+		}(sc)
+	}
+	wg.Wait()
+
+	return allEvents
+}
+
+// readConfig reads categories, minimumLevel, and maxEvents under lock.
+func (c *EventLogCollector) readConfig() (categories []string, minLevel string, maxEvents int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cats := make([]string, len(c.categories))
+	copy(cats, c.categories)
+	return cats, c.minimumLevel, c.maxEvents
+}
+
+// categoryEnabled returns true if the given category is in the enabled list.
+func categoryEnabled(categories []string, category string) bool {
+	for _, c := range categories {
+		if c == category {
+			return true
+		}
+	}
+	return false
+}
+
+// filterByLevel removes entries below the minimum level threshold.
+func filterByLevel(events []EventLogEntry, minLevel string) []EventLogEntry {
+	threshold, ok := levelOrder[minLevel]
+	if !ok || threshold == 0 {
+		return events // "info" or unknown means keep all
+	}
+	filtered := make([]EventLogEntry, 0, len(events))
+	for _, e := range events {
+		if levelOrder[e.Level] >= threshold {
+			filtered = append(filtered, e)
+		}
+	}
+	return filtered
+}

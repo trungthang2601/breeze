@@ -1,0 +1,740 @@
+import { Hono } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { and, eq, or, sql, desc, gte, lte, inArray, type SQL } from 'drizzle-orm';
+import { db } from '../../db';
+import {
+  devices,
+  deviceSoftware,
+  deviceMetrics,
+  deviceHardware,
+  alerts,
+  alertRules
+} from '../../db/schema';
+import { authMiddleware, requirePermission, requireScope } from '../../middleware/auth';
+import { PERMISSIONS, canAccessSite, type UserPermissions } from '../../services/permissions';
+import {
+  resolveRequestReportAuthority,
+  resolveRequestReportAuthorityMap,
+  type OrgAxisLiveSiteScopeV1,
+} from '../../services/siteScope';
+import { ensureOrgAccess, getOrgIdsForAuth } from './helpers';
+import { dataQuerySchema } from './schemas';
+
+export const dataRoutes = new Hono();
+
+dataRoutes.use('*', authMiddleware);
+
+/** Zero-safe alerts-summary payload, returned before any database call. */
+function emptyAlertsSummary() {
+  return {
+    data: { bySeverity: {}, byStatus: {}, byDay: [], topRules: [] },
+    total: 0
+  };
+}
+
+function normalizeSiteIdList(siteIds: readonly string[]): string[] {
+  return [...new Set(siteIds)].sort((left, right) => left.localeCompare(right));
+}
+
+/**
+ * Device-level site condition for one exact-organization live scope.
+ * `unrestricted` adds no predicate; `restricted` binds its normalized UUIDs.
+ */
+function alertsDeviceSiteCondition(scope: OrgAxisLiveSiteScopeV1): SQL | undefined {
+  return scope.kind === 'restricted'
+    ? inArray(devices.siteId, normalizeSiteIdList(scope.siteIds))
+    : undefined;
+}
+
+/**
+ * One parameterized device predicate of `(devices.org_id = orgX AND
+ * siteCondition(scopeX))` branches for a partner multi-organization request.
+ * Denied and restricted-empty organizations get no branch at all, so an empty
+ * scope list returns `null` and the caller must answer zero-safe without
+ * querying. One organization's site set is never applied to another's rows.
+ */
+function alertsMultiOrgDeviceCondition(
+  scopes: readonly OrgAxisLiveSiteScopeV1[]
+): SQL | null {
+  const scopesByOrgId = new Map<string, OrgAxisLiveSiteScopeV1>();
+  for (const scope of scopes) {
+    if (scope.kind === 'restricted' && scope.siteIds.length === 0) continue;
+    if (!scopesByOrgId.has(scope.orgId)) scopesByOrgId.set(scope.orgId, scope);
+  }
+
+  const branches = [...scopesByOrgId.values()]
+    .sort((left, right) => left.orgId.localeCompare(right.orgId))
+    .map((scope) => {
+      const orgCondition = eq(devices.orgId, scope.orgId);
+      const siteCondition = alertsDeviceSiteCondition(scope);
+      return siteCondition ? and(orgCondition, siteCondition)! : orgCondition;
+    });
+
+  if (branches.length === 0) return null;
+  return branches.length === 1 ? branches[0]! : or(...branches)!;
+}
+
+function scopeAdmitsSite(scope: OrgAxisLiveSiteScopeV1, siteId: string): boolean {
+  return scope.kind === 'unrestricted' || scope.siteIds.includes(siteId);
+}
+
+function emptyMetricsData() {
+  return {
+    data: {
+      averages: { cpu: 0, ram: 0, disk: 0 },
+      topCpu: [],
+      topRam: [],
+      topDisk: []
+    }
+  };
+}
+
+// GET /reports/data/device-inventory - Device inventory data
+dataRoutes.get(
+  '/data/device-inventory',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_EXPORT.resource, PERMISSIONS.REPORTS_EXPORT.action),
+  zValidator('query', dataQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    const orgIds = await getOrgIdsForAuth(auth);
+    if (orgIds !== null && orgIds.length === 0) {
+      return c.json({ data: [], total: 0 });
+    }
+
+    // Build conditions. Ephemeral Quick Support devices sit in the hidden
+    // 'quick_support' org, which deliberately stays inside accessibleOrgIds so
+    // RLS lets a tech reach their own session — every report enumeration in
+    // this file has to exclude them explicitly.
+    const conditions: SQL[] = [eq(devices.isEphemeral, false)];
+
+    if (query.orgId) {
+      const hasAccess = await ensureOrgAccess(query.orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      conditions.push(eq(devices.orgId, query.orgId));
+    } else if (orgIds) {
+      conditions.push(inArray(devices.orgId, orgIds));
+    }
+
+    if (query.siteId) {
+      if (perms?.allowedSiteIds && !canAccessSite(perms, query.siteId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      conditions.push(eq(devices.siteId, query.siteId));
+    } else if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({ data: [], total: 0 });
+      }
+      conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
+    }
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const limit = Math.min(1000, Number.parseInt(query.limit ?? '100', 10) || 100);
+    const offset = Number.parseInt(query.offset ?? '0', 10) || 0;
+
+    // Get device inventory with hardware info
+    const deviceList = await db
+      .select({
+        id: devices.id,
+        hostname: devices.hostname,
+        displayName: devices.displayName,
+        osType: devices.osType,
+        osVersion: devices.osVersion,
+        architecture: devices.architecture,
+        agentVersion: devices.agentVersion,
+        status: devices.status,
+        lastSeenAt: devices.lastSeenAt,
+        enrolledAt: devices.enrolledAt,
+        tags: devices.tags,
+        siteId: devices.siteId,
+        cpuModel: deviceHardware.cpuModel,
+        cpuCores: deviceHardware.cpuCores,
+        ramTotalMb: deviceHardware.ramTotalMb,
+        diskTotalGb: deviceHardware.diskTotalGb,
+        manufacturer: deviceHardware.manufacturer,
+        model: deviceHardware.model,
+        serialNumber: deviceHardware.serialNumber
+      })
+      .from(devices)
+      .leftJoin(deviceHardware, eq(devices.id, deviceHardware.deviceId))
+      .where(whereCondition)
+      .orderBy(desc(devices.lastSeenAt), desc(devices.id))
+      .limit(limit)
+      .offset(offset);
+
+    // Get total count
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(devices)
+      .where(whereCondition);
+
+    return c.json({
+      data: deviceList,
+      total: Number(countResult[0]?.count ?? 0)
+    });
+  }
+);
+
+// GET /reports/data/software-inventory - Software across all devices
+dataRoutes.get(
+  '/data/software-inventory',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_EXPORT.resource, PERMISSIONS.REPORTS_EXPORT.action),
+  zValidator('query', dataQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    const orgIds = await getOrgIdsForAuth(auth);
+    if (orgIds !== null && orgIds.length === 0) {
+      return c.json({ data: [], total: 0 });
+    }
+
+    // Build conditions
+    const conditions: SQL[] = [eq(devices.isEphemeral, false)];
+
+    if (query.orgId) {
+      const hasAccess = await ensureOrgAccess(query.orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      conditions.push(eq(devices.orgId, query.orgId));
+    } else if (orgIds) {
+      conditions.push(inArray(devices.orgId, orgIds));
+    }
+
+    if (query.siteId) {
+      if (perms?.allowedSiteIds && !canAccessSite(perms, query.siteId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      conditions.push(eq(devices.siteId, query.siteId));
+    } else if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({ data: [], summary: [], total: 0 });
+      }
+      conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
+    }
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const limit = Math.min(1000, Number.parseInt(query.limit ?? '100', 10) || 100);
+    const offset = Number.parseInt(query.offset ?? '0', 10) || 0;
+
+    // Get software inventory with device info
+    const softwareList = await db
+      .select({
+        id: deviceSoftware.id,
+        name: deviceSoftware.name,
+        version: deviceSoftware.version,
+        publisher: deviceSoftware.publisher,
+        installDate: deviceSoftware.installDate,
+        isSystem: deviceSoftware.isSystem,
+        deviceId: deviceSoftware.deviceId,
+        deviceHostname: devices.hostname
+      })
+      .from(deviceSoftware)
+      .innerJoin(devices, eq(deviceSoftware.deviceId, devices.id))
+      .where(whereCondition)
+      .orderBy(deviceSoftware.name, deviceSoftware.id)
+      .limit(limit)
+      .offset(offset);
+
+    // Get total count
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(deviceSoftware)
+      .innerJoin(devices, eq(deviceSoftware.deviceId, devices.id))
+      .where(whereCondition);
+
+    // Get aggregated software summary
+    const softwareSummary = await db
+      .select({
+        name: deviceSoftware.name,
+        version: deviceSoftware.version,
+        deviceCount: sql<number>`count(distinct ${deviceSoftware.deviceId})`
+      })
+      .from(deviceSoftware)
+      .innerJoin(devices, eq(deviceSoftware.deviceId, devices.id))
+      .where(whereCondition)
+      .groupBy(deviceSoftware.name, deviceSoftware.version)
+      .orderBy(desc(sql`count(distinct ${deviceSoftware.deviceId})`))
+      .limit(50);
+
+    return c.json({
+      data: softwareList,
+      summary: softwareSummary,
+      total: Number(countResult[0]?.count ?? 0)
+    });
+  }
+);
+
+// GET /reports/data/alerts-summary - Alert statistics
+dataRoutes.get(
+  '/data/alerts-summary',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_EXPORT.resource, PERMISSIONS.REPORTS_EXPORT.action),
+  zValidator('query', dataQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+
+    const orgIds = await getOrgIdsForAuth(auth);
+    if (orgIds !== null && orgIds.length === 0) {
+      return c.json(emptyAlertsSummary());
+    }
+
+    if (query.orgId) {
+      const hasAccess = await ensureOrgAccess(query.orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+    }
+
+    // ── Authority mode: resolved once, before any aggregate query ───────────
+    // Organization tokens and any request naming an explicit organization
+    // derive one exact-organization scope so an organization membership's
+    // site_ids beats a broader partner fallback. A partner without an explicit
+    // organization gets one composite per-organization predicate. A system
+    // caller without an explicit organization is unrestricted per row.
+    let deviceScopeCondition: SQL | undefined;
+    const exactOrgId =
+      query.orgId ?? (auth.scope === 'organization' ? auth.orgId ?? undefined : undefined);
+
+    if (exactOrgId) {
+      const authorityResult = await resolveRequestReportAuthority(auth, exactOrgId, 'export');
+      if (!authorityResult.ok) {
+        return authorityResult.reason === 'empty_scope'
+          ? c.json(emptyAlertsSummary())
+          : c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      const scope = authorityResult.authority.scope;
+      // An org resolver never mints partner_wide (#3198 W01); refusing it here
+      // narrows the scope to the org axis these device predicates bind.
+      if (scope.kind === 'legacy_unscoped' || scope.kind === 'partner_wide') {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      if (query.siteId && !scopeAdmitsSite(scope, query.siteId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      deviceScopeCondition = alertsDeviceSiteCondition(scope);
+    } else if (auth.scope === 'organization') {
+      // Organization token without an organization: nothing is authorized.
+      return c.json(emptyAlertsSummary());
+    } else if (auth.scope === 'partner') {
+      const authorityMap = await resolveRequestReportAuthorityMap(auth, orgIds ?? [], 'export');
+      const authorizedScopes: OrgAxisLiveSiteScopeV1[] = [];
+      for (const result of authorityMap.values()) {
+        if (!result.ok) continue;
+        const scope = result.authority.scope;
+        if (scope.kind === 'legacy_unscoped' || scope.kind === 'partner_wide') continue;
+        authorizedScopes.push(scope);
+      }
+      const compositeCondition = alertsMultiOrgDeviceCondition(authorizedScopes);
+      if (!compositeCondition) {
+        return c.json(emptyAlertsSummary());
+      }
+      if (
+        query.siteId &&
+        !authorizedScopes.some((scope) => scopeAdmitsSite(scope, query.siteId!))
+      ) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      deviceScopeCondition = compositeCondition;
+    }
+
+    // Build conditions. `deviceScopeCondition` is a single object reused by
+    // every aggregate below — never re-expressed per query.
+    const conditions: SQL[] = [];
+
+    if (query.orgId) {
+      conditions.push(eq(alerts.orgId, query.orgId));
+    } else if (orgIds) {
+      conditions.push(inArray(alerts.orgId, orgIds));
+    }
+
+    if (deviceScopeCondition) {
+      conditions.push(deviceScopeCondition);
+    }
+
+    if (query.siteId) {
+      conditions.push(eq(devices.siteId, query.siteId));
+    }
+
+    if (query.startDate) {
+      conditions.push(gte(alerts.triggeredAt, new Date(query.startDate)));
+    }
+
+    if (query.endDate) {
+      conditions.push(lte(alerts.triggeredAt, new Date(query.endDate)));
+    }
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // Get counts by severity
+    const bySeverity = await db
+      .select({
+        severity: alerts.severity,
+        count: sql<number>`count(*)`
+      })
+      .from(alerts)
+      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .where(whereCondition)
+      .groupBy(alerts.severity);
+
+    // Get counts by status
+    const byStatus = await db
+      .select({
+        status: alerts.status,
+        count: sql<number>`count(*)`
+      })
+      .from(alerts)
+      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .where(whereCondition)
+      .groupBy(alerts.status);
+
+    // Get alerts by day (last 30 days)
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const byDay = await db
+      .select({
+        date: sql<string>`date_trunc('day', ${alerts.triggeredAt})::date`,
+        count: sql<number>`count(*)`
+      })
+      .from(alerts)
+      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .where(and(...conditions, gte(alerts.triggeredAt, thirtyDaysAgo)))
+      .groupBy(sql`date_trunc('day', ${alerts.triggeredAt})`)
+      .orderBy(sql`date_trunc('day', ${alerts.triggeredAt})`);
+
+    // Get top alerting rules
+    const topRules = await db
+      .select({
+        ruleId: alerts.ruleId,
+        ruleName: alertRules.name,
+        count: sql<number>`count(*)`
+      })
+      .from(alerts)
+      .innerJoin(alertRules, eq(alerts.ruleId, alertRules.id))
+      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .where(whereCondition)
+      .groupBy(alerts.ruleId, alertRules.name)
+      .orderBy(desc(sql`count(*)`))
+      .limit(10);
+
+    // Get total count
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(alerts)
+      .innerJoin(devices, eq(alerts.deviceId, devices.id))
+      .where(whereCondition);
+
+    return c.json({
+      data: {
+        bySeverity: Object.fromEntries(bySeverity.map(r => [r.severity, Number(r.count)])),
+        byStatus: Object.fromEntries(byStatus.map(r => [r.status, Number(r.count)])),
+        byDay: byDay.map(r => ({ date: r.date, count: Number(r.count) })),
+        topRules: topRules.map(r => ({ ruleId: r.ruleId, ruleName: r.ruleName, count: Number(r.count) }))
+      },
+      total: Number(countResult[0]?.count ?? 0)
+    });
+  }
+);
+
+// GET /reports/data/compliance - Compliance summary
+dataRoutes.get(
+  '/data/compliance',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_EXPORT.resource, PERMISSIONS.REPORTS_EXPORT.action),
+  zValidator('query', dataQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    const orgIds = await getOrgIdsForAuth(auth);
+    if (orgIds !== null && orgIds.length === 0) {
+      return c.json({ data: { overview: {}, byOsType: [], agentVersions: [], issues: [] } });
+    }
+
+    // Build conditions
+    const conditions: ReturnType<typeof eq>[] = [eq(devices.isEphemeral, false)];
+
+    if (query.orgId) {
+      const hasAccess = await ensureOrgAccess(query.orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      conditions.push(eq(devices.orgId, query.orgId));
+    } else if (orgIds) {
+      conditions.push(inArray(devices.orgId, orgIds));
+    }
+
+    if (query.siteId) {
+      if (perms?.allowedSiteIds && !canAccessSite(perms, query.siteId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      conditions.push(eq(devices.siteId, query.siteId));
+    } else if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({ data: { overview: {}, byOsType: [], agentVersions: [], issues: [] } });
+      }
+      conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
+    }
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // Get total device count
+    const totalDevices = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(devices)
+      .where(whereCondition);
+
+    // Get devices by status
+    const byStatus = await db
+      .select({
+        status: devices.status,
+        count: sql<number>`count(*)`
+      })
+      .from(devices)
+      .where(whereCondition)
+      .groupBy(devices.status);
+
+    // Get devices by OS type
+    const byOsType = await db
+      .select({
+        osType: devices.osType,
+        count: sql<number>`count(*)`
+      })
+      .from(devices)
+      .where(whereCondition)
+      .groupBy(devices.osType);
+
+    // Get agent version distribution
+    const agentVersions = await db
+      .select({
+        version: devices.agentVersion,
+        count: sql<number>`count(*)`
+      })
+      .from(devices)
+      .where(whereCondition)
+      .groupBy(devices.agentVersion)
+      .orderBy(desc(sql`count(*)`));
+
+    // Calculate compliance metrics
+    const total = Number(totalDevices[0]?.count ?? 0);
+    const onlineCount = byStatus.find(s => s.status === 'online')?.count ?? 0;
+    const offlineCount = byStatus.find(s => s.status === 'offline')?.count ?? 0;
+    const maintenanceCount = byStatus.find(s => s.status === 'maintenance')?.count ?? 0;
+    const pendingCount = byStatus.find(s => s.status === 'pending')?.count ?? 0;
+
+    // Get devices not seen in last 7 days (stale devices)
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    const staleDevices = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(devices)
+      .where(
+        conditions.length > 0
+          ? and(...conditions, lte(devices.lastSeenAt, sevenDaysAgo))
+          : lte(devices.lastSeenAt, sevenDaysAgo)
+      );
+
+    // Identify potential compliance issues
+    const issues = [];
+
+    const staleCount = Number(staleDevices[0]?.count ?? 0);
+    if (staleCount > 0) {
+      issues.push({
+        type: 'stale_devices',
+        severity: 'warning',
+        count: staleCount,
+        message: `${staleCount} device(s) haven't checked in for 7+ days`
+      });
+    }
+
+    if (agentVersions.length > 1) {
+      const latestVersion = agentVersions[0]?.version;
+      const outdatedCount = agentVersions
+        .filter(v => v.version !== latestVersion)
+        .reduce((sum, v) => sum + Number(v.count), 0);
+
+      if (outdatedCount > 0) {
+        issues.push({
+          type: 'outdated_agents',
+          severity: 'info',
+          count: outdatedCount,
+          message: `${outdatedCount} device(s) running outdated agent versions`
+        });
+      }
+    }
+
+    // Exclude pending (admin pre-created, not yet enrolled) from compliance denominator
+    const enrolledTotal = total - Number(pendingCount);
+    const complianceScore = enrolledTotal > 0 ? Math.round(((Number(onlineCount) + Number(maintenanceCount)) / enrolledTotal) * 100) : 100;
+
+    return c.json({
+      data: {
+        overview: {
+          totalDevices: total,
+          onlineDevices: Number(onlineCount),
+          offlineDevices: Number(offlineCount),
+          maintenanceDevices: Number(maintenanceCount),
+          pendingDevices: Number(pendingCount),
+          staleDevices: staleCount,
+          complianceScore
+        },
+        byOsType: byOsType.map(r => ({ osType: r.osType, count: Number(r.count) })),
+        agentVersions: agentVersions.map(r => ({ version: r.version, count: Number(r.count) })),
+        issues
+      }
+    });
+  }
+);
+
+// GET /reports/data/metrics - Performance metrics summary
+dataRoutes.get(
+  '/data/metrics',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_EXPORT.resource, PERMISSIONS.REPORTS_EXPORT.action),
+  zValidator('query', dataQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    const orgIds = await getOrgIdsForAuth(auth);
+    if (orgIds !== null && orgIds.length === 0) {
+      return c.json({ data: { averages: {}, topCpu: [], topRam: [], topDisk: [] } });
+    }
+
+    // Build conditions for devices
+    const deviceConditions: SQL[] = [eq(devices.isEphemeral, false)];
+
+    if (query.orgId) {
+      const hasAccess = await ensureOrgAccess(query.orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      deviceConditions.push(eq(devices.orgId, query.orgId));
+    } else if (orgIds) {
+      deviceConditions.push(inArray(devices.orgId, orgIds));
+    }
+
+    if (query.siteId) {
+      if (perms?.allowedSiteIds && !canAccessSite(perms, query.siteId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      deviceConditions.push(eq(devices.siteId, query.siteId));
+    } else if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json(emptyMetricsData());
+      }
+      deviceConditions.push(inArray(devices.siteId, perms.allowedSiteIds));
+    }
+
+    const deviceWhereCondition = deviceConditions.length > 0 ? and(...deviceConditions) : undefined;
+
+    // Get device IDs for the org
+    const orgDevices = await db
+      .select({ id: devices.id })
+      .from(devices)
+      .where(deviceWhereCondition);
+
+    const deviceIds = orgDevices.map(d => d.id);
+
+    if (deviceIds.length === 0) {
+      return c.json({
+        ...emptyMetricsData()
+      });
+    }
+
+    // Build time range conditions
+    const metricsConditions: ReturnType<typeof eq>[] = [
+      inArray(deviceMetrics.deviceId, deviceIds)
+    ];
+
+    if (query.startDate) {
+      metricsConditions.push(gte(deviceMetrics.timestamp, new Date(query.startDate)));
+    }
+
+    if (query.endDate) {
+      metricsConditions.push(lte(deviceMetrics.timestamp, new Date(query.endDate)));
+    }
+
+    const metricsWhereCondition = and(...metricsConditions);
+
+    // Get average metrics
+    const averages = await db
+      .select({
+        avgCpu: sql<number>`avg(${deviceMetrics.cpuPercent})`,
+        avgRam: sql<number>`avg(${deviceMetrics.ramPercent})`,
+        avgDisk: sql<number>`avg(${deviceMetrics.diskPercent})`
+      })
+      .from(deviceMetrics)
+      .where(metricsWhereCondition);
+
+    // Get latest metrics per device for top consumers
+    const latestMetrics = await db
+      .select({
+        deviceId: deviceMetrics.deviceId,
+        hostname: devices.hostname,
+        cpuPercent: deviceMetrics.cpuPercent,
+        ramPercent: deviceMetrics.ramPercent,
+        diskPercent: deviceMetrics.diskPercent,
+        timestamp: deviceMetrics.timestamp
+      })
+      .from(deviceMetrics)
+      .innerJoin(devices, eq(deviceMetrics.deviceId, devices.id))
+      .where(inArray(deviceMetrics.deviceId, deviceIds))
+      .orderBy(desc(deviceMetrics.timestamp))
+      .limit(100);
+
+    // Get unique latest metrics per device
+    const latestPerDevice = new Map<string, typeof latestMetrics[0]>();
+    for (const metric of latestMetrics) {
+      if (!latestPerDevice.has(metric.deviceId)) {
+        latestPerDevice.set(metric.deviceId, metric);
+      }
+    }
+
+    const latestArray = Array.from(latestPerDevice.values());
+
+    // Sort by each metric to get top consumers
+    const topCpu = [...latestArray]
+      .sort((a, b) => b.cpuPercent - a.cpuPercent)
+      .slice(0, 10)
+      .map(m => ({ deviceId: m.deviceId, hostname: m.hostname, value: m.cpuPercent }));
+
+    const topRam = [...latestArray]
+      .sort((a, b) => b.ramPercent - a.ramPercent)
+      .slice(0, 10)
+      .map(m => ({ deviceId: m.deviceId, hostname: m.hostname, value: m.ramPercent }));
+
+    const topDisk = [...latestArray]
+      .sort((a, b) => b.diskPercent - a.diskPercent)
+      .slice(0, 10)
+      .map(m => ({ deviceId: m.deviceId, hostname: m.hostname, value: m.diskPercent }));
+
+    return c.json({
+      data: {
+        averages: {
+          cpu: Math.round((averages[0]?.avgCpu ?? 0) * 10) / 10,
+          ram: Math.round((averages[0]?.avgRam ?? 0) * 10) / 10,
+          disk: Math.round((averages[0]?.avgDisk ?? 0) * 10) / 10
+        },
+        topCpu,
+        topRam,
+        topDisk
+      }
+    });
+  }
+);

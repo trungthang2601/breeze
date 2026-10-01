@@ -1,0 +1,763 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { and, eq, sql, desc, inArray } from 'drizzle-orm';
+import { db } from '../db';
+import { apiKeys } from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { createHash, randomBytes } from 'crypto';
+import { createAuditLogAsync } from '../services/auditService';
+import { getTrustedClientIpOrUndefined } from '../services/clientIp';
+import { PERMISSIONS, hasPermission, type UserPermissions } from '../services/permissions';
+import {
+  requiredPermissionsForApiKeyScopes,
+  validateApiKeyScopeDelegation,
+} from '../services/apiKeyScopes';
+import { authorizeHumanApiKeyCreator } from '../services/apiKeyAuthorization';
+import { getActiveOrgTenant } from '../services/tenantStatus';
+import {
+  DELEGATION_CEILING_DENIED_MESSAGE,
+  checkDelegationCeiling,
+} from '../services/delegationCeiling';
+
+export const apiKeyRoutes = new Hono();
+
+// ============================================
+// Helper Functions
+// ============================================
+
+function generateApiKey(): { fullKey: string; keyPrefix: string; keyHash: string } {
+  // Generate 32 random bytes and encode as base64url (43 chars)
+  const randomPart = randomBytes(32).toString('base64url').slice(0, 32);
+  const fullKey = `brz_${randomPart}`;
+  const keyPrefix = fullKey.slice(0, 12); // "brz_" + first 8 chars
+  const keyHash = createHash('sha256').update(fullKey).digest('hex');
+
+  return { fullKey, keyPrefix, keyHash };
+}
+
+function hashApiKey(key: string): string {
+  return createHash('sha256').update(key).digest('hex');
+}
+
+function getPagination(query: { page?: string; limit?: string }) {
+  const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(query.limit ?? '50', 10) || 50));
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+async function ensureOrgAccess(
+  orgId: string,
+  auth: Pick<AuthContext, 'scope' | 'orgId' | 'accessibleOrgIds' | 'canAccessOrg'>
+) {
+  if (auth.scope === 'organization') {
+    return auth.orgId === orgId;
+  }
+
+  if (auth.scope === 'partner') {
+    return auth.canAccessOrg(orgId);
+  }
+
+  // system scope has access to all
+  return true;
+}
+
+function writeApiKeyAudit(
+  c: any,
+  auth: { user: { id: string; email?: string } },
+  event: {
+    orgId: string;
+    action: string;
+    keyId?: string;
+    keyName?: string;
+    details?: Record<string, unknown>;
+  }
+): void {
+  createAuditLogAsync({
+    orgId: event.orgId,
+    actorId: auth.user.id,
+    actorEmail: auth.user.email,
+    action: event.action,
+    resourceType: 'api_key',
+    resourceId: event.keyId,
+    resourceName: event.keyName,
+    details: event.details,
+    ipAddress: getTrustedClientIpOrUndefined(c),
+    userAgent: c.req.header('user-agent'),
+    result: 'success'
+  });
+}
+
+/**
+ * Delegation ceiling for mutations of a live API key.
+ *
+ * Rotation regenerates the secret but changes nothing about what the key can
+ * do: its `scopes`, and the `created_by` user whose live permissions the key
+ * actually delegates from (see `buildAuthFromApiKey` / SR2-15), survive
+ * untouched. Handing the new plaintext to the rotator therefore hands them the
+ * key's whole authority. `ensureOrgAccess` only proves they may act in the
+ * key's ORG — that is not the same as being allowed to wield the key.
+ *
+ * So before returning plaintext or mutating a key another actor can use, assert
+ * the caller's own authority is a superset of the key's on all three axes
+ * (scope / permission / site). Creation already does the permission axis via
+ * `validateRequestedScopes`; update/revoke/rotation need the live credential
+ * authority because org membership alone is not key-management authority.
+ *
+ * Fails CLOSED for update/rotation if the key's delegating creator can no
+ * longer be authorized (off-boarded, role reduced, DB error). Such a key is
+ * already dead on the request path, so DELETE may still make that dead state
+ * durable; it cannot transfer or expand credential authority. That DELETE
+ * carve-out is only sound while "cannot be authorized" is accurate, which is
+ * why the creator lookup below resolves the key org's OWNING partner rather
+ * than the caller's — see the comment there.
+ */
+async function enforceApiKeyDelegationCeiling(
+  c: any,
+  auth: Pick<AuthContext, 'scope' | 'partnerId' | 'allowedSiteIds'>,
+  existingKey: {
+    orgId: string;
+    scopes: string[] | null;
+    createdBy: string;
+    principalType?: string | null;
+    principalId?: string | null;
+  },
+  options: { allowUnauthorizedCreatorRevocation?: boolean } = {},
+): Promise<{ response: Response } | null> {
+  const callerPermissions = c.get('permissions') as UserPermissions | undefined;
+  if (!callerPermissions) {
+    return { response: c.json({ error: DELEGATION_CEILING_DENIED_MESSAGE }, 403) };
+  }
+
+  const keyScopes = existingKey.scopes ?? [];
+  const isServicePrincipalKey =
+    existingKey.principalType === 'service' && !!existingKey.principalId;
+
+  // Service-principal keys delegate from the principal row, not a human, and
+  // are never site-restricted (authorizeServicePrincipalKey). Human keys
+  // delegate from their creator's LIVE permissions — resolve those so the
+  // credential's real scope/site reach is compared, not a mint-time guess.
+  let credentialScope: 'system' | 'partner' | 'organization' = 'organization';
+  let credentialSiteIds: string[] | undefined;
+
+  if (!isServicePrincipalKey) {
+    // Resolve the KEY ORG's owning partner, never the caller's. Org-session
+    // JWTs deliberately carry partnerId = null (middleware/auth.ts), and a
+    // Partner Admin creator has no `organization_users` row — so passing
+    // `auth.partnerId` leaves the partner axis unresolved for every org-scoped
+    // caller, and `getUserPermissions` reports a perfectly healthy
+    // partner-admin key as `no_membership`. That misclassification is what
+    // hands the revocation carve-out below a LIVE org-wide credential. The
+    // request path resolves the same way (middleware/apiKeyAuth.ts →
+    // getActiveOrgTenant().partnerId), so this is the axis the key actually
+    // authenticates on.
+    let ownerPartnerId: string | null = null;
+    let ownerTenantResolved = false;
+    try {
+      const ownerTenant = await getActiveOrgTenant(existingKey.orgId);
+      if (ownerTenant) {
+        ownerPartnerId = ownerTenant.partnerId;
+        ownerTenantResolved = true;
+      }
+    } catch {
+      // Leave `ownerTenantResolved` false: an errored tenant read must not be
+      // read as "no owning partner", which would resurrect the bug above.
+    }
+
+    const creator = await authorizeHumanApiKeyCreator({
+      createdBy: existingKey.createdBy,
+      orgId: existingKey.orgId,
+      partnerId: ownerPartnerId ?? auth.partnerId ?? null,
+      scopes: keyScopes,
+    });
+    if (!creator.ok) {
+      // Recovery carve-out, deliberately narrow. It applies ONLY when the
+      // owning partner was actually resolved (so `no_membership` is a real
+      // finding, not an artefact of an unresolved partner axis) AND the
+      // creator has no live membership on either axis. Such a key is already
+      // rejected on the request path, so revoking it merely makes a dead state
+      // durable — it cannot remove or transfer authority the caller lacks.
+      // Every other case falls through to the 403: `lookup_error` (the read
+      // failed, so nothing was established about the creator — a transient
+      // DB/Redis blip must not authorize revoking a LIVE key),
+      // `scope_exceeds_current_permissions`, and an unresolvable owning tenant.
+      if (
+        options.allowUnauthorizedCreatorRevocation &&
+        ownerTenantResolved &&
+        creator.reason === 'no_membership'
+      ) {
+        return null;
+      }
+      return {
+        response: c.json(
+          {
+            error: 'This key\'s owner can no longer be authorized; revoke it instead',
+            details: { reason: creator.reason },
+          },
+          403,
+        ),
+      };
+    }
+    credentialScope = creator.permissions?.scope ?? 'organization';
+    credentialSiteIds = creator.allowedSiteIds;
+  }
+
+  const ceiling = checkDelegationCeiling({
+    caller: { scope: auth.scope, allowedSiteIds: auth.allowedSiteIds },
+    credential: {
+      scope: credentialScope,
+      permissions: requiredPermissionsForApiKeyScopes(keyScopes),
+      allowedSiteIds: credentialSiteIds,
+    },
+    holdsPermission: (permission) =>
+      hasPermission(callerPermissions, permission.resource, permission.action),
+  });
+
+  if (!ceiling.ok) {
+    return {
+      response: c.json(
+        { error: ceiling.error, details: { violation: ceiling.violation, ...(ceiling.details ?? {}) } },
+        403,
+      ),
+    };
+  }
+
+  return null;
+}
+
+function validateRequestedScopes(c: any, scopes: string[]) {
+  const permissions = c.get('permissions') as UserPermissions | undefined;
+  const result = validateApiKeyScopeDelegation(scopes, permissions);
+
+  if (!result.ok) {
+    return {
+      response: c.json(
+        {
+          error: result.error,
+          ...(result.details ? { details: result.details } : {}),
+        },
+        result.status,
+      ),
+    };
+  }
+
+  return { scopes: result.scopes };
+}
+
+// ============================================
+// Validation Schemas
+// ============================================
+
+const listApiKeysSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  status: z.enum(['active', 'revoked', 'expired']).optional()
+});
+
+const createApiKeySchema = z.object({
+  orgId: z.string().guid(),
+  name: z.string().min(1).max(255),
+  scopes: z.array(z.string()).default([]),
+  expiresAt: z.string().datetime().nullable().optional(),
+  rateLimit: z.number().int().min(1).max(100000).nullable().optional().transform(v => v ?? 1000)
+});
+
+const updateApiKeySchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  scopes: z.array(z.string()).optional(),
+  rateLimit: z.number().int().min(1).max(100000).optional()
+});
+
+// ============================================
+// Routes
+// ============================================
+
+const keyIdParamSchema = z.object({ id: z.string().guid() });
+
+// Apply auth middleware to all routes
+apiKeyRoutes.use('*', authMiddleware);
+
+// GET /api-keys - List API keys for org (don't return keyHash)
+apiKeyRoutes.get(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action),
+  zValidator('query', listApiKeysSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+
+    // Build conditions array
+    const conditions: ReturnType<typeof eq>[] = [];
+
+    // Filter by org access based on scope
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      conditions.push(eq(apiKeys.orgId, auth.orgId));
+    } else if (auth.scope === 'partner') {
+      if (query.orgId) {
+        const hasAccess = await ensureOrgAccess(query.orgId, auth);
+        if (!hasAccess) {
+          return c.json({ error: 'Access to this organization denied' }, 403);
+        }
+        conditions.push(eq(apiKeys.orgId, query.orgId));
+      } else {
+        const orgIds = auth.accessibleOrgIds ?? [];
+        if (orgIds.length === 0) {
+          return c.json({
+            data: [],
+            pagination: { page, limit, total: 0 }
+          });
+        }
+        conditions.push(inArray(apiKeys.orgId, orgIds) as ReturnType<typeof eq>);
+      }
+    } else if (auth.scope === 'system') {
+      if (query.orgId) {
+        conditions.push(eq(apiKeys.orgId, query.orgId));
+      }
+    }
+
+    // Filter by status
+    if (query.status) {
+      conditions.push(eq(apiKeys.status, query.status));
+    }
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // Get total count
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(apiKeys)
+      .where(whereCondition);
+    const total = Number(countResult[0]?.count ?? 0);
+
+    // Get API keys (excluding keyHash for security)
+    const keyList = await db
+      .select({
+        id: apiKeys.id,
+        orgId: apiKeys.orgId,
+        name: apiKeys.name,
+        keyPrefix: apiKeys.keyPrefix,
+        scopes: apiKeys.scopes,
+        expiresAt: apiKeys.expiresAt,
+        lastUsedAt: apiKeys.lastUsedAt,
+        usageCount: apiKeys.usageCount,
+        rateLimit: apiKeys.rateLimit,
+        createdBy: apiKeys.createdBy,
+        createdAt: apiKeys.createdAt,
+        updatedAt: apiKeys.updatedAt,
+        status: apiKeys.status,
+        source: apiKeys.source
+      })
+      .from(apiKeys)
+      .where(whereCondition)
+      .orderBy(desc(apiKeys.createdAt), desc(apiKeys.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: keyList,
+      pagination: { page, limit, total },
+      isAdmin: auth.scope === 'system' || auth.scope === 'partner'
+    });
+  }
+);
+
+// POST /api-keys - Create new API key (return full key ONCE on creation)
+apiKeyRoutes.post(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action),
+  requireMfa(),
+  zValidator('json', createApiKeySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const data = c.req.valid('json');
+
+    // Verify org access
+    let orgId = data.orgId;
+
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      // Organization users can only create keys for their own org
+      if (orgId !== auth.orgId) {
+        return c.json({ error: 'Can only create API keys for your organization' }, 403);
+      }
+    } else if (auth.scope === 'partner') {
+      const hasAccess = await ensureOrgAccess(orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+    }
+    // System scope can create keys for any org
+
+    const scopeValidation = validateRequestedScopes(c, data.scopes);
+    if ('response' in scopeValidation) {
+      return scopeValidation.response;
+    }
+
+    // Generate the API key
+    const { fullKey, keyPrefix, keyHash } = generateApiKey();
+
+    // Create the API key record
+    const [apiKey] = await db
+      .insert(apiKeys)
+      .values({
+        orgId,
+        name: data.name,
+        keyHash,
+        keyPrefix,
+        scopes: scopeValidation.scopes,
+        expiresAt: data.expiresAt ? new Date(data.expiresAt) : null,
+        rateLimit: data.rateLimit,
+        createdBy: auth.user.id,
+        status: 'active'
+      })
+      .returning();
+
+    if (!apiKey) {
+      return c.json({ error: 'Failed to create API key' }, 500);
+    }
+
+    writeApiKeyAudit(c, auth, {
+      orgId: apiKey.orgId,
+      action: 'api_key.create',
+      keyId: apiKey.id,
+      keyName: apiKey.name,
+      details: {
+        scopes: apiKey.scopes,
+        rateLimit: apiKey.rateLimit,
+        expiresAt: apiKey.expiresAt
+      }
+    });
+
+    // Return the full key ONCE - it won't be retrievable later
+    return c.json({
+      id: apiKey.id,
+      orgId: apiKey.orgId,
+      name: apiKey.name,
+      key: fullKey, // Full key returned only on creation
+      keyPrefix: apiKey.keyPrefix,
+      scopes: apiKey.scopes,
+      expiresAt: apiKey.expiresAt,
+      rateLimit: apiKey.rateLimit,
+      createdBy: apiKey.createdBy,
+      createdAt: apiKey.createdAt,
+      status: apiKey.status,
+      warning: 'Store this API key securely. It will not be shown again.'
+    }, 201);
+  }
+);
+
+// GET /api-keys/:id - Get API key details
+apiKeyRoutes.get(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action),
+  zValidator('param', keyIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id: keyId } = c.req.valid('param');
+
+    // Get API key (excluding keyHash)
+    const [apiKey] = await db
+      .select({
+        id: apiKeys.id,
+        orgId: apiKeys.orgId,
+        name: apiKeys.name,
+        keyPrefix: apiKeys.keyPrefix,
+        scopes: apiKeys.scopes,
+        expiresAt: apiKeys.expiresAt,
+        lastUsedAt: apiKeys.lastUsedAt,
+        usageCount: apiKeys.usageCount,
+        rateLimit: apiKeys.rateLimit,
+        createdBy: apiKeys.createdBy,
+        createdAt: apiKeys.createdAt,
+        updatedAt: apiKeys.updatedAt,
+        status: apiKeys.status,
+        source: apiKeys.source
+      })
+      .from(apiKeys)
+      .where(eq(apiKeys.id, keyId))
+      .limit(1);
+
+    if (!apiKey) {
+      return c.json({ error: 'API key not found' }, 404);
+    }
+
+    // Check org access
+    const hasAccess = await ensureOrgAccess(apiKey.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    return c.json(apiKey);
+  }
+);
+
+// PATCH /api-keys/:id - Update name, scopes, rateLimit
+apiKeyRoutes.patch(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action),
+  requireMfa(),
+  zValidator('param', keyIdParamSchema),
+  zValidator('json', updateApiKeySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id: keyId } = c.req.valid('param');
+    const data = c.req.valid('json');
+
+    if (Object.keys(data).length === 0) {
+      return c.json({ error: 'No updates provided' }, 400);
+    }
+
+    // Get existing API key
+    const [existingKey] = await db
+      .select()
+      .from(apiKeys)
+      .where(eq(apiKeys.id, keyId))
+      .limit(1);
+
+    if (!existingKey) {
+      return c.json({ error: 'API key not found' }, 404);
+    }
+
+    // Check org access
+    const hasAccess = await ensureOrgAccess(existingKey.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    // Cannot update revoked or expired keys
+    if (existingKey.status !== 'active') {
+      return c.json({ error: `Cannot update ${existingKey.status} API key` }, 400);
+    }
+
+    // Name/rate/scope changes all alter a credential held by somebody else.
+    // Org access is insufficient when that live credential reaches sites or
+    // permissions outside the caller's own authority.
+    const ceilingDenial = await enforceApiKeyDelegationCeiling(c, auth, existingKey);
+    if (ceilingDenial) return ceilingDenial.response;
+
+    // Build updates object
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+
+    if (data.name !== undefined) updates.name = data.name;
+    if (data.scopes !== undefined) {
+      const scopeValidation = validateRequestedScopes(c, data.scopes);
+      if ('response' in scopeValidation) {
+        return scopeValidation.response;
+      }
+      updates.scopes = scopeValidation.scopes;
+    }
+    if (data.rateLimit !== undefined) updates.rateLimit = data.rateLimit;
+
+    const [updated] = await db
+      .update(apiKeys)
+      .set(updates)
+      .where(eq(apiKeys.id, keyId))
+      .returning({
+        id: apiKeys.id,
+        orgId: apiKeys.orgId,
+        name: apiKeys.name,
+        keyPrefix: apiKeys.keyPrefix,
+        scopes: apiKeys.scopes,
+        expiresAt: apiKeys.expiresAt,
+        lastUsedAt: apiKeys.lastUsedAt,
+        usageCount: apiKeys.usageCount,
+        rateLimit: apiKeys.rateLimit,
+        createdBy: apiKeys.createdBy,
+        createdAt: apiKeys.createdAt,
+        updatedAt: apiKeys.updatedAt,
+        status: apiKeys.status
+      });
+
+    if (updated) {
+      writeApiKeyAudit(c, auth, {
+        orgId: updated.orgId,
+        action: 'api_key.update',
+        keyId: updated.id,
+        keyName: updated.name,
+        details: {
+          changedFields: Object.keys(data),
+          scopes: updated.scopes,
+          rateLimit: updated.rateLimit
+        }
+      });
+    }
+
+    return c.json(updated);
+  }
+);
+
+// DELETE /api-keys/:id - Revoke API key (soft delete, set status=revoked)
+apiKeyRoutes.delete(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action),
+  requireMfa(),
+  zValidator('param', keyIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id: keyId } = c.req.valid('param');
+
+    // Get existing API key
+    const [existingKey] = await db
+      .select()
+      .from(apiKeys)
+      .where(eq(apiKeys.id, keyId))
+      .limit(1);
+
+    if (!existingKey) {
+      return c.json({ error: 'API key not found' }, 404);
+    }
+
+    // Check org access
+    const hasAccess = await ensureOrgAccess(existingKey.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    // Cannot revoke already revoked keys
+    if (existingKey.status === 'revoked') {
+      return c.json({ error: 'API key is already revoked' }, 400);
+    }
+
+    const ceilingDenial = await enforceApiKeyDelegationCeiling(c, auth, existingKey, {
+      allowUnauthorizedCreatorRevocation: true,
+    });
+    if (ceilingDenial) return ceilingDenial.response;
+
+    // Soft delete by setting status to revoked
+    const [revoked] = await db
+      .update(apiKeys)
+      .set({
+        status: 'revoked',
+        updatedAt: new Date()
+      })
+      .where(eq(apiKeys.id, keyId))
+      .returning({
+        id: apiKeys.id,
+        name: apiKeys.name,
+        keyPrefix: apiKeys.keyPrefix,
+        status: apiKeys.status,
+        updatedAt: apiKeys.updatedAt
+      });
+
+    if (revoked) {
+      writeApiKeyAudit(c, auth, {
+        orgId: existingKey.orgId,
+        action: 'api_key.revoke',
+        keyId: existingKey.id,
+        keyName: revoked.name,
+        details: {
+          keyPrefix: revoked.keyPrefix,
+          previousStatus: existingKey.status
+        }
+      });
+    }
+
+    return c.json({
+      success: true,
+      message: 'API key revoked successfully',
+      apiKey: revoked
+    });
+  }
+);
+
+// POST /api-keys/:id/rotate - Generate new key, invalidate old one
+apiKeyRoutes.post(
+  '/:id/rotate',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action),
+  requireMfa(),
+  zValidator('param', keyIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id: keyId } = c.req.valid('param');
+
+    // Get existing API key
+    const [existingKey] = await db
+      .select()
+      .from(apiKeys)
+      .where(eq(apiKeys.id, keyId))
+      .limit(1);
+
+    if (!existingKey) {
+      return c.json({ error: 'API key not found' }, 404);
+    }
+
+    // Check org access
+    const hasAccess = await ensureOrgAccess(existingKey.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    // Cannot rotate non-active keys
+    if (existingKey.status !== 'active') {
+      return c.json({ error: `Cannot rotate ${existingKey.status} API key` }, 400);
+    }
+
+    // §1.4 delegation ceiling: org access is not key access. Runs BEFORE any
+    // secret is generated or written.
+    const ceilingDenial = await enforceApiKeyDelegationCeiling(c, auth, existingKey);
+    if (ceilingDenial) return ceilingDenial.response;
+
+    // Generate new key
+    const { fullKey, keyPrefix, keyHash } = generateApiKey();
+
+    // Update the key with new hash and prefix
+    const [rotated] = await db
+      .update(apiKeys)
+      .set({
+        keyHash,
+        keyPrefix,
+        updatedAt: new Date(),
+        // Reset usage stats on rotation (optional - could preserve them)
+        usageCount: 0,
+        lastUsedAt: null
+      })
+      .where(eq(apiKeys.id, keyId))
+      .returning({
+        id: apiKeys.id,
+        orgId: apiKeys.orgId,
+        name: apiKeys.name,
+        keyPrefix: apiKeys.keyPrefix,
+        scopes: apiKeys.scopes,
+        expiresAt: apiKeys.expiresAt,
+        rateLimit: apiKeys.rateLimit,
+        createdBy: apiKeys.createdBy,
+        createdAt: apiKeys.createdAt,
+        updatedAt: apiKeys.updatedAt,
+        status: apiKeys.status
+      });
+
+    if (rotated) {
+      writeApiKeyAudit(c, auth, {
+        orgId: rotated.orgId,
+        action: 'api_key.rotate',
+        keyId: rotated.id,
+        keyName: rotated.name,
+        details: {
+          keyPrefix: rotated.keyPrefix,
+          previousKeyPrefix: existingKey.keyPrefix,
+          resetUsageCount: true
+        }
+      });
+    }
+
+    // Return the new full key ONCE
+    return c.json({
+      ...rotated,
+      key: fullKey, // New full key returned only on rotation
+      warning: 'Store this new API key securely. The old key has been invalidated and this new key will not be shown again.'
+    });
+  }
+);

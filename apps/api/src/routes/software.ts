@@ -1,0 +1,2909 @@
+import { Hono, type Context, type Next } from 'hono';
+import { zValidator, optionalJsonValidator } from '../lib/validation';
+import { z } from 'zod';
+import { and, eq, sql, desc, like, or, inArray, isNotNull, isNull, type SQL } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import {
+  softwareCatalog,
+  softwareVersions,
+  softwareDeployments,
+  deploymentResults,
+  softwareInventory,
+  softwareInstallMethods,
+  devices,
+  deviceCommands,
+} from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope, requireSiteAccess, type AuthContext } from '../middleware/auth';
+import { canManagePartnerWidePolicies } from '../services/partnerWideAccess';
+import { writeRouteAudit } from '../services/auditEvents';
+import { resolveDeploymentTargets } from '../services/deploymentTargetResolver';
+import {
+  getOrganizationSoftwareDownloadPolicy,
+  setOrganizationSoftwareDownloadPolicy,
+  setSiteSoftwareDownloadPolicy,
+} from '../services/softwareDownloadPolicy';
+import {
+  uploadBinary,
+  getPresignedUrl,
+  isS3Configured,
+  deleteObjects,
+  S3ConfigError,
+  S3OperationError,
+} from '../services/s3Storage';
+import {
+  parseStreamingMultipart,
+  MultipartError,
+  type StreamedMultipart,
+} from '../services/streamingUpload';
+import { captureException, captureMessage } from '../services/sentry';
+import { unlink, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
+import { softwareUploadRoutes } from './softwareUploads';
+import { softwareInstallMethodRoutes } from './softwareInstallMethods';
+import { packageSearchRoutes } from './packageSearch';
+import {
+  buildAndDispatchSoftwareInstalls,
+  createSoftwareDeployment,
+} from '../services/softwareDeployment';
+import {
+  dependencyFingerprintError,
+  fingerprintSoftwareInstallMethodDependency,
+  fingerprintSoftwareVersionDependency,
+} from '../services/softwareDependencyIdentity';
+import {
+  detectionRulesSchema,
+  softwareDownloadPolicySchema,
+  SOFTWARE_FILE_TYPES,
+  defaultSilentArgsForFileType,
+  deriveSoftwareFileTypeFromUrl,
+} from '@breeze/shared';
+import { terminalPayloadErasureSet } from '../services/sensitiveCommandPayload';
+import { applyAutomationActionTerminal } from '../services/automationActionResults';
+import {
+  ALLOWED_EXTENSIONS,
+  MAX_UPLOAD_SIZE,
+  getFileExtension,
+  authorizeCatalogItemRead,
+  resolveScopedOrgId,
+  setLatestSoftwareVersion,
+  insertLatestSoftwareVersion,
+  lockSoftwareCatalogForVersionInsert,
+  type AuthScopeContext,
+} from '../services/softwareVersionShared';
+
+export const softwareRoutes = new Hono();
+const requireSoftwareRead = requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action);
+const requireSoftwareWrite = requirePermission(PERMISSIONS.DEVICES_WRITE.resource, PERMISSIONS.DEVICES_WRITE.action);
+const requireSoftwareExecute = requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action);
+
+/**
+ * Organization download policy is an org-wide security control. Organization
+ * users with a site ceiling must not read or replace it; their supported
+ * boundary is the site overlay endpoint below. Partner/system access remains
+ * governed by the existing organization resolver.
+ *
+ * Treat any defined value as restricted, including a defensive runtime null.
+ */
+const requireOrgWideSoftwarePolicyAccess = async (c: Context, next: Next) => {
+  const auth = c.get('auth') as AuthContext;
+  if (auth.scope === 'organization' && auth.allowedSiteIds !== undefined) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+  return next();
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+type ResolveCatalogListScopeResult =
+  | { orgCondition?: SQL }
+  | { empty: true }
+  | { error: string; status: 400 | 403 };
+
+function resolveCatalogListScope(
+  auth: AuthScopeContext,
+  requestedOrgId?: string,
+): ResolveCatalogListScopeResult {
+  const scopedOrg = resolveScopedOrgId(auth, requestedOrgId);
+  if ('orgId' in scopedOrg) {
+    return { orgCondition: eq(softwareCatalog.orgId, scopedOrg.orgId) };
+  }
+
+  if (requestedOrgId || scopedOrg.status !== 400) return scopedOrg;
+
+  if (auth.scope === 'partner') {
+    const accessibleOrgIds = auth.accessibleOrgIds ?? [];
+    if (accessibleOrgIds.length === 0) return { empty: true };
+    return { orgCondition: inArray(softwareCatalog.orgId, accessibleOrgIds) };
+  }
+
+  if (auth.scope === 'system') {
+    return {};
+  }
+
+  return scopedOrg;
+}
+
+/**
+ * A software deployment is an indivisible parent: its target metadata and
+ * aggregate status describe every child device. Restricted callers may see or
+ * mutate it only when it has at least one result and every result still points
+ * to a live device in one of their allowed sites.
+ *
+ * Applied by every deployment-parent route: list, summary, get-by-id, cancel,
+ * retry and results. Uniformly, on purpose — a route that resolves the parent
+ * without it is an existence oracle for the ones that do.
+ *
+ * The aliased subqueries name `deployment_id`, `device_id` and `site_id` as raw
+ * SQL because Drizzle aliasing inside a `sql` template would not carry the
+ * column mapping. They are the physical names declared in
+ * `db/schema/software.ts:118-121` (`deployment_results.deployment_id`,
+ * `.device_id`) and `db/schema/devices.ts` (`devices.site_id`); a rename there
+ * must be mirrored here, and is caught by
+ * `__tests__/integration/softwareDeploymentSiteScope.integration.test.ts`,
+ * which runs this predicate against real Postgres.
+ */
+export function softwareDeploymentSiteScopePredicate(
+  deploymentIdColumn: typeof softwareDeployments.id,
+  permissions: UserPermissions | undefined,
+): SQL | undefined {
+  const allowedSiteIds = permissions?.allowedSiteIds;
+  if (allowedSiteIds === undefined) return undefined;
+  if (allowedSiteIds.length === 0) return sql`false`;
+
+  const allowedSites = sql.join(allowedSiteIds.map((siteId) => sql`${siteId}::uuid`), sql`, `);
+  return sql`
+    EXISTS (
+      SELECT 1 FROM ${deploymentResults} AS deployment_scope_result
+      WHERE deployment_scope_result.deployment_id = ${deploymentIdColumn}
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM ${deploymentResults} AS deployment_scope_result
+      LEFT JOIN ${devices} AS deployment_scope_device
+        ON deployment_scope_device.id = deployment_scope_result.device_id
+      WHERE deployment_scope_result.deployment_id = ${deploymentIdColumn}
+        AND (
+          deployment_scope_device.id IS NULL
+          OR deployment_scope_device.site_id IS NULL
+          OR deployment_scope_device.site_id NOT IN (${allowedSites})
+        )
+    )`;
+}
+
+/**
+ * Authorize a write against a catalog row fetched by id (dual-axis, #2135).
+ * Org-owned rows: the same resolved-org narrowing as the reads
+ * (authorizeCatalogItemRead) — a partner caller acting as org A must not
+ * mutate sibling org B's package, with the canAccessOrg fallback only in the
+ * org-less All-organizations view. Partner-wide rows (org_id NULL): system
+ * scope, or a full-partner admin of the owning partner.
+ * Returns null when allowed, else the error response to send. 404 (not 403)
+ * for foreign rows, matching the read routes' don't-reveal-existence behavior.
+ */
+function authorizeCatalogItemWrite(
+  auth: AuthContext,
+  item: { orgId: string | null; partnerId: string | null },
+  requestedOrgId: string | undefined,
+): { error: string; status: 403 | 404 } | null {
+  if (item.orgId !== null) {
+    return authorizeCatalogItemRead(auth, item.orgId, requestedOrgId);
+  }
+  if (auth.scope === 'system') return null;
+  if (auth.scope !== 'partner' || !auth.partnerId || item.partnerId !== auth.partnerId) {
+    return { error: 'Catalog item not found', status: 404 };
+  }
+  return canManagePartnerWidePolicies(auth)
+    ? null
+    : {
+        error: 'Modifying a partner-wide package requires full partner org access (orgAccess must be "all")',
+        status: 403,
+      };
+}
+
+type CatalogDeleteIdentity = {
+  id: string;
+  orgId: string | null;
+  partnerId: string | null;
+  integrationProvider: string | null;
+};
+
+type CatalogDeleteResult =
+  | { kind: 'deleted' }
+  | { kind: 'not_found' }
+  | { kind: 'blocked'; deploymentCount: number; inventoryCount: number };
+
+/**
+ * Delete one catalog and its uploaded objects under a complete deployment
+ * view. The request transaction is intentionally left before entering system
+ * scope: partner-wide packages may be referenced by suspended organizations,
+ * which request RLS correctly hides even from an `orgAccess=all` user.
+ *
+ * Authorization remains outside this helper. The authorization-relevant row
+ * identity is re-read under the lock and must exactly match the row the caller
+ * was authorized against, so the system context cannot widen the request.
+ */
+async function deleteCatalogAndUploadedObjects(
+  expected: CatalogDeleteIdentity,
+): Promise<CatalogDeleteResult> {
+  return runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    const [lockedCatalog] = await db.select({
+      id: softwareCatalog.id,
+      orgId: softwareCatalog.orgId,
+      partnerId: softwareCatalog.partnerId,
+      integrationProvider: softwareCatalog.integrationProvider,
+    })
+      .from(softwareCatalog)
+      .where(eq(softwareCatalog.id, expected.id))
+      .for('update');
+    if (
+      !lockedCatalog
+      || lockedCatalog.orgId !== expected.orgId
+      || lockedCatalog.partnerId !== expected.partnerId
+      || lockedCatalog.integrationProvider !== expected.integrationProvider
+    ) {
+      return { kind: 'not_found' };
+    }
+
+    // Canonical lock order is catalog -> versions -> install methods. Both
+    // deployment target FKs take KEY SHARE on their selected child, so locking
+    // every child makes the complete reference inventory stable until commit.
+    const storedVersions = await db.select({ s3Key: softwareVersions.s3Key })
+      .from(softwareVersions)
+      .where(eq(softwareVersions.catalogId, expected.id))
+      .orderBy(softwareVersions.id)
+      .for('update');
+    await db.select({ id: softwareInstallMethods.id })
+      .from(softwareInstallMethods)
+      .where(eq(softwareInstallMethods.catalogId, expected.id))
+      .orderBy(softwareInstallMethods.id)
+      .for('update');
+    const [deploymentRef] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(softwareDeployments)
+      .where(or(
+        inArray(
+          softwareDeployments.softwareVersionId,
+          db.select({ id: softwareVersions.id }).from(softwareVersions)
+            .where(eq(softwareVersions.catalogId, expected.id)),
+        ),
+        inArray(
+          softwareDeployments.installMethodId,
+          db.select({ id: softwareInstallMethods.id }).from(softwareInstallMethods)
+            .where(eq(softwareInstallMethods.catalogId, expected.id)),
+        ),
+      ));
+    const deploymentCount = deploymentRef?.count ?? 0;
+    const [inventoryRef] = await db.select({ count: sql<number>`count(*)::int` })
+      .from(softwareInventory)
+      .where(eq(softwareInventory.catalogId, expected.id));
+    const inventoryCount = inventoryRef?.count ?? 0;
+    if (deploymentCount > 0 || inventoryCount > 0) {
+      return { kind: 'blocked', deploymentCount, inventoryCount };
+    }
+
+    const objectKeys = storedVersions.map((version) => version.s3Key)
+      .filter((key): key is string => Boolean(key));
+    await deleteObjects(objectKeys);
+    await db.delete(softwareVersions).where(eq(softwareVersions.catalogId, expected.id));
+    await db.delete(softwareCatalog).where(eq(softwareCatalog.id, expected.id));
+    return { kind: 'deleted' };
+  }, 'software.catalog.delete'));
+}
+
+function getPagination(query: { page?: string; limit?: string }) {
+  const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(query.limit ?? '50', 10) || 50));
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+// limit/offset pagination (the per-device results endpoint) — defaults to 100
+// rows, hard-capped at 500 so a huge deployment can't be pulled in one request.
+function getLimitOffset(query: { limit?: string; offset?: string }) {
+  const limit = Math.min(500, Math.max(1, Number.parseInt(query.limit ?? '100', 10) || 100));
+  const offset = Math.max(0, Number.parseInt(query.offset ?? '0', 10) || 0);
+  return { limit, offset };
+}
+
+type SoftwareDeploymentAggregateStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'completed'
+  | 'completed_with_errors'
+  | 'failed'
+  | 'cancelled';
+
+export function computeSoftwareDeploymentAggregateStatus(
+  results: Array<{ status: string; count: number }>,
+): SoftwareDeploymentAggregateStatus {
+  const counts = new Map(results.map((result) => [result.status, Number(result.count)]));
+  const total = [...counts.values()].reduce((sum, count) => sum + count, 0);
+
+  if (total === 0) return 'pending';
+
+  const pendingCount = counts.get('pending') ?? 0;
+  const completedCount = counts.get('completed') ?? 0;
+  const failedCount = counts.get('failed') ?? 0;
+  const cancelledCount = counts.get('cancelled') ?? 0;
+  const inProgressCount = (
+    (counts.get('running') ?? 0) +
+    (counts.get('paused') ?? 0) +
+    (counts.get('downloading') ?? 0) +
+    (counts.get('installing') ?? 0) +
+    (counts.get('rollback') ?? 0)
+  );
+
+  if (inProgressCount > 0) return 'in_progress';
+  if (failedCount > 0) {
+    return completedCount > 0 ? 'completed_with_errors' : 'failed';
+  }
+  if (cancelledCount === total) return 'cancelled';
+  if (completedCount === total) return 'completed';
+  if (pendingCount === total) return 'pending';
+  if (pendingCount > 0 && completedCount > 0) return 'in_progress';
+
+  return 'in_progress';
+}
+
+/**
+ * Per-status result counts for one deployment, folded into the five buckets
+ * the UI progress bars care about (raw agent-side statuses like 'downloading'
+ * and 'installing' land in `inProgress`). `total` is the device count.
+ */
+export interface SoftwareDeploymentStatusCounts {
+  pending: number;
+  inProgress: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  total: number;
+}
+
+function emptyStatusCounts(): SoftwareDeploymentStatusCounts {
+  return { pending: 0, inProgress: 0, completed: 0, failed: 0, cancelled: 0, total: 0 };
+}
+
+function summarizeStatusCounts(
+  groups: Array<{ status: string; count: number }>,
+): SoftwareDeploymentStatusCounts {
+  const counts = emptyStatusCounts();
+  for (const { status, count } of groups) {
+    const n = Number(count);
+    counts.total += n;
+    switch (status) {
+      case 'pending':
+      case 'draft':
+        counts.pending += n;
+        break;
+      case 'completed':
+        counts.completed += n;
+        break;
+      case 'failed':
+        counts.failed += n;
+        break;
+      case 'cancelled':
+        counts.cancelled += n;
+        break;
+      default:
+        // running / paused / downloading / installing / rollback
+        counts.inProgress += n;
+    }
+  }
+  return counts;
+}
+
+interface DeploymentStatusEntry {
+  status: SoftwareDeploymentAggregateStatus;
+  counts: SoftwareDeploymentStatusCounts;
+}
+
+async function getDeploymentStatusMap(deploymentIds: string[]) {
+  if (deploymentIds.length === 0) {
+    return new Map<string, DeploymentStatusEntry>();
+  }
+
+  const rows = await db
+    .select({
+      deploymentId: deploymentResults.deploymentId,
+      status: deploymentResults.status,
+      count: sql<number>`count(*)::int`,
+    })
+    .from(deploymentResults)
+    .where(inArray(deploymentResults.deploymentId, deploymentIds))
+    .groupBy(deploymentResults.deploymentId, deploymentResults.status);
+
+  const grouped = new Map<string, Array<{ status: string; count: number }>>();
+  for (const row of rows) {
+    const bucket = grouped.get(row.deploymentId) ?? [];
+    bucket.push({ status: row.status, count: Number(row.count) });
+    grouped.set(row.deploymentId, bucket);
+  }
+
+  const statusMap = new Map<string, DeploymentStatusEntry>();
+  for (const deploymentId of deploymentIds) {
+    const groups = grouped.get(deploymentId) ?? [];
+    statusMap.set(deploymentId, {
+      status: computeSoftwareDeploymentAggregateStatus(groups),
+      counts: summarizeStatusCounts(groups),
+    });
+  }
+
+  return statusMap;
+}
+
+async function resolveSoftwareTargetDeviceIds(
+  orgId: string,
+  permissions: UserPermissions | undefined,
+  payload: {
+    targetType: 'devices' | 'groups' | 'sites' | 'all' | 'filter';
+    targetIds?: string[];
+    targetFilter?: unknown;
+  },
+) {
+  if (payload.targetType === 'sites') {
+    return {
+      error: 'Site targeting is not implemented for software deployments',
+      deviceIds: [] as string[],
+    };
+  }
+
+  const targetConfig =
+    payload.targetType === 'devices'
+      ? { type: 'devices' as const, deviceIds: payload.targetIds ?? [] }
+      : payload.targetType === 'groups'
+        ? { type: 'groups' as const, groupIds: payload.targetIds ?? [] }
+        : payload.targetType === 'filter'
+          ? { type: 'filter' as const, filter: payload.targetFilter as never }
+          : { type: 'all' as const };
+
+  const deviceIds = await resolveDeploymentTargets({ orgId, targetConfig });
+  if (deviceIds.length === 0) {
+    return {
+      error: 'No devices resolved for the selected target scope',
+      status: 400 as const,
+      deviceIds,
+    };
+  }
+
+  if (permissions?.allowedSiteIds) {
+    const rows = await db
+      .select({ id: devices.id, siteId: devices.siteId })
+      .from(devices)
+      .where(and(eq(devices.orgId, orgId), inArray(devices.id, deviceIds)));
+
+    const allowedIds = rows
+      .filter((device) => typeof device.siteId === 'string' && canAccessSite(permissions, device.siteId))
+      .map((device) => device.id);
+
+    if (payload.targetType === 'devices' && allowedIds.length !== deviceIds.length) {
+      return {
+        error: 'Access to one or more device sites denied',
+        status: 403 as const,
+        deviceIds: [] as string[],
+      };
+    }
+
+    if (allowedIds.length === 0) {
+      return {
+        error: 'No devices resolved for the selected target scope',
+        status: 400 as const,
+        deviceIds: allowedIds,
+      };
+    }
+
+    return { deviceIds: allowedIds };
+  }
+
+  return { deviceIds };
+}
+
+// ---------------------------------------------------------------------------
+// Zod schemas
+// ---------------------------------------------------------------------------
+
+const categorySchema = z.enum([
+  'browser', 'utility', 'compression', 'productivity',
+  'communication', 'developer', 'media', 'security'
+]);
+const platformSchema = z.enum(['windows', 'macos', 'linux']);
+
+const listCatalogSchema = z.object({
+  search: z.string().optional(),
+  q: z.string().optional(),
+  category: categorySchema.optional(),
+  platform: platformSchema.optional(),
+  page: z.string().optional(),
+  limit: z.string().optional()
+});
+
+const catalogSearchSchema = z.object({
+  q: z.string().min(1),
+  category: categorySchema.optional()
+});
+
+const catalogIdParamSchema = z.object({ id: z.string().guid() });
+
+const createCatalogSchema = z.object({
+  name: z.string().min(1).max(200),
+  vendor: z.string().max(200).optional(),
+  category: z.string().max(100).optional(),
+  description: z.string().max(2000).optional(),
+  iconUrl: z.string().url().optional(),
+  websiteUrl: z.string().url().optional(),
+  isManaged: z.boolean().optional(),
+  orgId: z.string().guid().optional(),
+  // Ownership axis (#2135 Partner-Wide First): 'partner' creates a package
+  // shared by every org under the caller's partner (org_id NULL). Create-only —
+  // ownership never changes after creation.
+  ownerScope: z.enum(['organization', 'partner']).optional()
+});
+
+const updateCatalogSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  vendor: z.string().max(200).optional(),
+  category: z.string().max(100).optional(),
+  description: z.string().max(2000).optional(),
+  iconUrl: z.string().url().optional(),
+  websiteUrl: z.string().url().optional(),
+  isManaged: z.boolean().optional()
+});
+
+const versionParamSchema = z.object({ id: z.string().guid() });
+const versionIdParamSchema = z.object({ id: z.string().guid(), versionId: z.string().guid() });
+
+const createVersionSchema = z.object({
+  version: z.string().min(1).max(100),
+  releaseDate: z.string().datetime().optional(),
+  releaseNotes: z.string().max(5000).optional(),
+  downloadUrl: z.string().url().optional(),
+  // Explicit installer type, overriding what the URL's extension implies. The
+  // agent switches on this to pick msiexec vs. direct exec, so a URL-created
+  // version that omits it (and whose URL carries no usable extension) still
+  // reaches the device as the historical 'exe' default.
+  fileType: z.enum(SOFTWARE_FILE_TYPES).optional(),
+  checksum: z.string().regex(/^[a-f0-9]{64}$/i).optional(),
+  fileSize: z.number().min(0).optional(),
+  supportedOs: z.array(platformSchema).optional(),
+  architecture: z.string().max(20).optional(),
+  silentInstallArgs: z.string().max(2000).optional(),
+  silentUninstallArgs: z.string().max(2000).optional(),
+  preInstallScript: z.string().optional(),
+  postInstallScript: z.string().optional(),
+  detectionRules: detectionRulesSchema.optional()
+});
+
+/**
+ * Host of a managed-software URL, for logging. Never the full URL: these carry
+ * presigned capability query strings, and a stored URL may still hold
+ * unresolved `{{org.name}}` deploy-time tokens that make `new URL()` throw.
+ */
+function safeUrlHost(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).host || 'unparseable';
+  } catch {
+    return 'unparseable';
+  }
+}
+
+// PATCH body: only provided keys change; explicit null clears a nullable
+// field (notes, URL, OS, args, detection rules — version/releaseDate/
+// architecture reject null). The binary-describing fields (checksum, fileSize,
+// s3Key) and scripts are not editable — replacing the installer means adding
+// a new version.
+const updateVersionSchema = z.object({
+  version: z.string().min(1).max(100).optional(),
+  releaseDate: z.string().datetime().optional(),
+  releaseNotes: z.string().max(5000).nullable().optional(),
+  downloadUrl: z.string().url().nullable().optional(),
+  supportedOs: z.array(platformSchema).nullable().optional(),
+  architecture: z.string().max(20).optional(),
+  silentInstallArgs: z.string().max(2000).nullable().optional(),
+  silentUninstallArgs: z.string().max(2000).nullable().optional(),
+  detectionRules: detectionRulesSchema.nullable().optional()
+});
+
+const listDeploymentsSchema = z.object({
+  status: z.enum(['pending', 'in_progress', 'completed', 'completed_with_errors', 'failed', 'cancelled']).optional(),
+  page: z.string().optional(),
+  limit: z.string().optional()
+});
+
+const deploymentIdParamSchema = z.object({ id: z.string().guid() });
+
+// Known deployment_results statuses (deploymentStatusEnum minus 'draft', which
+// results never take — they default to 'pending' at insert).
+const DEPLOYMENT_RESULT_STATUSES = [
+  'pending',
+  'running',
+  'paused',
+  'downloading',
+  'installing',
+  'completed',
+  'failed',
+  'cancelled',
+  'rollback',
+] as const;
+
+const listDeploymentResultsSchema = z.object({
+  status: z.enum(DEPLOYMENT_RESULT_STATUSES).optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+});
+
+const createDeploymentSchema = z.object({
+  name: z.string().min(1).max(255),
+  // Exactly one target: an uploaded/URL version, or a catalog item whose
+  // package-manager install methods the route resolves (winget/Homebrew).
+  softwareVersionId: z.string().guid().optional(),
+  catalogId: z.string().guid().optional(),
+  // Manager deploys only. 'exact' additionally requires a winget method on the
+  // item (validated in the handler — brew cannot pin a version).
+  versionMode: z.enum(['latest', 'exact']).optional(),
+  requestedVersion: z.string().min(1).max(64).optional(),
+  deploymentType: z.enum(['install', 'uninstall', 'update']),
+  targetType: z.enum(['devices', 'groups', 'sites', 'all', 'filter']),
+  targetIds: z.array(z.string().guid()).optional(),
+  targetFilter: z.unknown().optional(),
+  scheduleType: z.enum(['immediate', 'scheduled', 'maintenance']),
+  scheduledAt: z.string().datetime().optional(),
+  maintenanceWindowId: z.string().guid().optional(),
+  options: z.record(z.string(), z.unknown()).optional()
+}).superRefine((data, ctx) => {
+  // Mirrors software_deployments_one_target_chk: a deployment targets a
+  // version XOR a catalog item's install method.
+  if ((data.softwareVersionId == null) === (data.catalogId == null)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['softwareVersionId'],
+      message: 'Provide exactly one of softwareVersionId or catalogId',
+    });
+  }
+  if (data.catalogId == null && (data.versionMode || data.requestedVersion)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['versionMode'],
+      message: 'versionMode/requestedVersion apply only to package-manager (catalogId) deployments',
+    });
+  }
+  if (data.versionMode === 'exact' && !data.requestedVersion) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['requestedVersion'],
+      message: "requestedVersion is required when versionMode is 'exact'",
+    });
+  }
+  if (data.requestedVersion && data.versionMode !== 'exact') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['versionMode'],
+      message: "requestedVersion requires versionMode 'exact'",
+    });
+  }
+  // Reject what never runs (#1.4): nothing dispatches uninstall/update
+  // deployments today — accepting them inserted rows that sat pending forever.
+  if (data.deploymentType === 'uninstall' || data.deploymentType === 'update') {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['deploymentType'],
+      message: 'Uninstall/update deployments are not yet supported',
+    });
+  }
+  // A maintenance-window deployment without a window can never be evaluated by
+  // the scheduler — it would sit undispatched forever.
+  if (data.scheduleType === 'maintenance' && !data.maintenanceWindowId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['maintenanceWindowId'],
+      message: 'maintenanceWindowId is required for maintenance-window deployments',
+    });
+  }
+  if (data.scheduleType === 'scheduled') {
+    if (!data.scheduledAt) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['scheduledAt'],
+        message: 'scheduledAt is required for scheduled deployments',
+      });
+    } else if (new Date(data.scheduledAt).getTime() <= Date.now()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['scheduledAt'],
+        message: 'scheduledAt must be in the future',
+      });
+    }
+  }
+});
+
+const retryDeploymentSchema = z.object({
+  deviceIds: z.array(z.string().guid()).max(1000).optional(),
+});
+
+const cancelDeploymentSchema = z.object({
+  reason: z.string().max(500).optional()
+});
+
+const listInventorySchema = z.object({
+  deviceId: z.string().guid().optional(),
+  search: z.string().optional()
+});
+
+const inventoryParamSchema = z.object({ deviceId: z.string().guid() });
+
+const downloadPolicySiteParamSchema = z.object({ siteId: z.string().guid() });
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+softwareRoutes.use('*', authMiddleware);
+
+// ---------------------------------------------------------------------------
+// CATALOG ROUTES
+// ---------------------------------------------------------------------------
+
+// GET /catalog - List catalog items
+softwareRoutes.get(
+  '/catalog',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('query', listCatalogSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const scopeResult = resolveCatalogListScope(auth, c.req.query('orgId'));
+    if ('error' in scopeResult) return c.json({ error: scopeResult.error }, scopeResult.status);
+
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+    const searchTerm = query.search ?? query.q;
+
+    if ('empty' in scopeResult) {
+      return c.json({ data: [], pagination: { page, limit, total: 0 } });
+    }
+
+    const conditions: SQL[] = [];
+    // Include partner-scoped built-in (integration) packages alongside the caller's
+    // own org packages. RLS scopes built-ins to the caller's partner, so widening
+    // the WHERE here cannot leak another partner's rows. Partner-scope callers
+    // additionally see their own partner-wide custom packages (#2135) — gated on
+    // scope === 'partner' because org tokens never pass breeze_has_partner_access
+    // and must not get an app-layer condition RLS won't back.
+    if (scopeResult.orgCondition) {
+      const branches: SQL[] = [scopeResult.orgCondition, isNotNull(softwareCatalog.integrationProvider)];
+      if (auth.scope === 'partner' && auth.partnerId) {
+        branches.push(and(isNull(softwareCatalog.orgId), eq(softwareCatalog.partnerId, auth.partnerId))!);
+      }
+      conditions.push(or(...branches)!);
+    }
+    if (searchTerm) {
+      const term = `%${searchTerm}%`;
+      conditions.push(
+        or(
+          like(softwareCatalog.name, term),
+          like(softwareCatalog.vendor, term),
+          like(softwareCatalog.description, term)
+        )!
+      );
+    }
+    if (query.category) {
+      conditions.push(eq(softwareCatalog.category, query.category));
+    }
+    const whereClause = conditions.length > 0 ? and(...conditions)! : sql`true`;
+
+    const [items, countResult] = await Promise.all([
+      db.select({
+        id: softwareCatalog.id,
+        orgId: softwareCatalog.orgId,
+        partnerId: softwareCatalog.partnerId,
+        integrationProvider: softwareCatalog.integrationProvider,
+        name: softwareCatalog.name,
+        vendor: softwareCatalog.vendor,
+        description: softwareCatalog.description,
+        category: softwareCatalog.category,
+        iconUrl: softwareCatalog.iconUrl,
+        websiteUrl: softwareCatalog.websiteUrl,
+        isManaged: softwareCatalog.isManaged,
+        createdAt: softwareCatalog.createdAt,
+        // NOTE: the outer catalog id MUST be written as `${softwareCatalog}.id`
+        // (table-qualified), never `${softwareCatalog.id}`. Drizzle renders a
+        // bare column reference UNqualified ("id"), which inside these
+        // correlated sub-selects resolves against the SUBQUERY's own table —
+        // `software_versions.catalog_id = software_versions.id` — so every
+        // count came back 0 and every kinds array came back empty for every
+        // row. Proven against real Postgres in
+        // __tests__/integration/softwareInstallMethods.integration.test.ts.
+        versionCount: sql<number>`(SELECT count(*) FROM software_versions WHERE software_versions.catalog_id = ${softwareCatalog}.id)`,
+        // Package-manager items (winget/Homebrew) ship zero uploaded versions but
+        // are still deployable, so the list feed carries the enabled-method count
+        // and the distinct kinds the catalog cards badge with.
+        methodCount: sql<number>`(SELECT count(*) FROM software_install_methods WHERE software_install_methods.catalog_id = ${softwareCatalog}.id AND software_install_methods.enabled)`,
+        methodKinds: sql<string[]>`(SELECT coalesce(array_agg(DISTINCT software_install_methods.kind), ARRAY[]::varchar[]) FROM software_install_methods WHERE software_install_methods.catalog_id = ${softwareCatalog}.id AND software_install_methods.enabled)`,
+      }).from(softwareCatalog)
+        .where(whereClause)
+        .orderBy(softwareCatalog.name, softwareCatalog.id)
+        .limit(limit)
+        .offset(offset),
+      db.select({ count: sql<number>`count(*)` }).from(softwareCatalog)
+        .where(whereClause)
+    ]);
+
+    return c.json({
+      data: items,
+      pagination: { page, limit, total: Number(countResult[0]?.count ?? 0) }
+    });
+  }
+);
+
+// POST /catalog - Create catalog item
+softwareRoutes.post(
+  '/catalog',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  zValidator('json', createCatalogSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const payload = c.req.valid('json');
+
+    // Ownership axis (#2135): partner-wide packages are shared by every org
+    // under the partner, so creation is gated on the partner-wide capability —
+    // same gate as software policies. The partner is ALWAYS the caller's own.
+    let owner: { orgId: string | null; partnerId: string | null };
+    if (payload.ownerScope === 'partner') {
+      if (auth.scope !== 'system' && !auth.partnerId) {
+        return c.json({ error: 'Partner-wide packages require partner scope' }, 403);
+      }
+      if (!canManagePartnerWidePolicies(auth)) {
+        return c.json({ error: 'Partner-wide packages require full partner org access (orgAccess must be "all")' }, 403);
+      }
+      if (!auth.partnerId) {
+        // System scope has no partner of its own to stamp.
+        return c.json({ error: 'Partner-wide packages require partner scope' }, 403);
+      }
+      owner = { orgId: null, partnerId: auth.partnerId };
+    } else {
+      const orgResult = resolveScopedOrgId(auth, payload.orgId ?? c.req.query('orgId'));
+      if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+      owner = { orgId: orgResult.orgId, partnerId: null };
+    }
+
+    const [item] = await db.insert(softwareCatalog).values({
+      orgId: owner.orgId,
+      partnerId: owner.partnerId,
+      name: payload.name,
+      vendor: payload.vendor ?? null,
+      description: payload.description ?? null,
+      category: payload.category ?? null,
+      iconUrl: payload.iconUrl ?? null,
+      websiteUrl: payload.websiteUrl ?? null,
+      isManaged: payload.isManaged ?? false,
+    }).returning();
+
+    writeRouteAudit(c, {
+      orgId: owner.orgId,
+      action: 'software.catalog.create',
+      resourceType: 'software_catalog_item',
+      resourceId: item!.id,
+      resourceName: item!.name,
+      details: { vendor: item!.vendor },
+    });
+
+    return c.json({ data: item }, 201);
+  }
+);
+
+// GET /catalog/search - Search catalog
+softwareRoutes.get(
+  '/catalog/search',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('query', catalogSearchSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const query = c.req.valid('query');
+    const term = `%${query.q}%`;
+    // Same dual-axis widening as GET /catalog: built-ins for everyone, the
+    // caller's own partner-wide custom packages for partner scope (#2135) —
+    // search must not return a narrower set than the list it searches.
+    const scopeBranches: SQL[] = [eq(softwareCatalog.orgId, orgId), isNotNull(softwareCatalog.integrationProvider)];
+    if (auth.scope === 'partner' && auth.partnerId) {
+      scopeBranches.push(and(isNull(softwareCatalog.orgId), eq(softwareCatalog.partnerId, auth.partnerId))!);
+    }
+    const conditions = [
+      or(...scopeBranches)!,
+      or(
+        like(softwareCatalog.name, term),
+        like(softwareCatalog.vendor, term),
+        like(softwareCatalog.description, term)
+      )!
+    ];
+    if (query.category) {
+      conditions.push(eq(softwareCatalog.category, query.category));
+    }
+
+    const items = await db.select().from(softwareCatalog).where(and(...conditions));
+    return c.json({ data: items, total: items.length });
+  }
+);
+
+// GET /catalog/:id - Get catalog item
+softwareRoutes.get(
+  '/catalog/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('param', catalogIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+
+    const { id } = c.req.valid('param');
+    // Look up by id alone, then authorize in JS. RLS bounds what is visible:
+    // the caller's org rows, plus NULL-org partner rows — built-ins for any
+    // caller, but partner-wide custom packages only for partner-scope tokens
+    // (org tokens never pass breeze_has_partner_access, so those rows are
+    // simply invisible here and 404). Partner rows have org_id NULL, so an
+    // `eq(orgId)` filter would exclude them — matching the /deploy route (#1957).
+    // authorizeCatalogItemRead narrows org-owned rows to the request's resolved
+    // org (a partner caller acting as org A must not read sibling org B's
+    // package), falling back to canAccessOrg only in the org-less
+    // All-organizations view.
+    const [item] = await db.select().from(softwareCatalog)
+      .where(eq(softwareCatalog.id, id));
+    if (!item) return c.json({ error: 'Catalog item not found' }, 404);
+    const readError = authorizeCatalogItemRead(auth, item.orgId, c.req.query('orgId'));
+    if (readError) return c.json({ error: readError.error }, readError.status);
+
+    const [versionCount] = await db.select({ count: sql<number>`count(*)` })
+      .from(softwareVersions).where(eq(softwareVersions.catalogId, id));
+
+    return c.json({ data: { ...item, versionCount: Number(versionCount?.count ?? 0) } });
+  }
+);
+
+// PATCH /catalog/:id - Update catalog item
+softwareRoutes.patch(
+  '/catalog/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  zValidator('param', catalogIdParamSchema),
+  zValidator('json', updateCatalogSchema),
+  async (c) => {
+    const auth = c.get('auth');
+
+    const { id } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    const [existing] = await db.select().from(softwareCatalog)
+      .where(eq(softwareCatalog.id, id));
+    if (!existing) return c.json({ error: 'Catalog item not found' }, 404);
+    // Built-ins are provisioned in system context and stay immutable here.
+    if (existing.integrationProvider !== null && auth.scope !== 'system') {
+      return c.json({ error: 'Built-in integration packages cannot be modified' }, 403);
+    }
+    const denied = authorizeCatalogItemWrite(auth, existing, c.req.query('orgId'));
+    if (denied) return c.json({ error: denied.error }, denied.status);
+
+    const [updated] = await db.update(softwareCatalog)
+      .set(payload)
+      .where(eq(softwareCatalog.id, id))
+      .returning();
+
+    writeRouteAudit(c, {
+      orgId: existing.orgId,
+      action: 'software.catalog.update',
+      resourceType: 'software_catalog_item',
+      resourceId: id,
+      resourceName: updated!.name,
+      details: { updatedFields: Object.keys(payload) },
+    });
+
+    return c.json({ data: updated });
+  }
+);
+
+// DELETE /catalog/:id - Delete catalog item
+softwareRoutes.delete(
+  '/catalog/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  zValidator('param', catalogIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+
+    const { id } = c.req.valid('param');
+    const [existing] = await db.select().from(softwareCatalog)
+      .where(eq(softwareCatalog.id, id));
+    if (!existing) return c.json({ error: 'Catalog item not found' }, 404);
+    // Built-ins are provisioned in system context and stay immutable here.
+    if (existing.integrationProvider !== null && auth.scope !== 'system') {
+      return c.json({ error: 'Built-in integration packages cannot be deleted' }, 403);
+    }
+    const denied = authorizeCatalogItemWrite(auth, existing, c.req.query('orgId'));
+    if (denied) return c.json({ error: denied.error }, denied.status);
+
+    const deletion = await deleteCatalogAndUploadedObjects({
+      id: existing.id,
+      orgId: existing.orgId,
+      partnerId: existing.partnerId,
+      integrationProvider: existing.integrationProvider,
+    });
+    if (deletion.kind === 'not_found') {
+      return c.json({ error: 'Catalog item not found' }, 404);
+    }
+    if (deletion.kind === 'blocked') {
+      const dependencies = [
+        deletion.deploymentCount > 0
+          ? `${deletion.deploymentCount} deployment${deletion.deploymentCount === 1 ? '' : 's'}`
+          : null,
+        deletion.inventoryCount > 0
+          ? `${deletion.inventoryCount} inventory record${deletion.inventoryCount === 1 ? '' : 's'}`
+          : null,
+      ].filter((value): value is string => value !== null).join(' and ');
+      return c.json(
+        {
+          error: `Cannot delete: ${dependencies} still reference this software. Remove those references first.`,
+        },
+        409
+      );
+    }
+
+    writeRouteAudit(c, {
+      orgId: existing.orgId,
+      action: 'software.catalog.delete',
+      resourceType: 'software_catalog_item',
+      resourceId: existing.id,
+      resourceName: existing.name,
+    });
+
+    return c.json({ success: true, id });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// VERSION ROUTES
+// ---------------------------------------------------------------------------
+
+// GET /catalog/:id/versions - List versions for a catalog item
+softwareRoutes.get(
+  '/catalog/:id/versions',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('param', versionParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+
+    const { id } = c.req.valid('param');
+    // Partner-scoped rows (built-in EDR packages and partner-wide custom
+    // packages, #2135) have org_id NULL, so an `eq(orgId)` filter excludes the
+    // catalog row entirely and the endpoint 404s — which the deploy wizard
+    // renders as "No versions" with a grayed-out deploy. Look up by id and
+    // authorize in JS, mirroring the /deploy route: RLS binds a visible
+    // NULL-org row to the caller's own partner (system scope sees all).
+    // authorizeCatalogItemRead narrows org-owned rows to the request's
+    // resolved org; only the org-less All-organizations view falls back to
+    // canAccessOrg.
+    const [catalogItem] = await db.select().from(softwareCatalog)
+      .where(eq(softwareCatalog.id, id));
+    if (!catalogItem) return c.json({ error: 'Catalog item not found' }, 404);
+    const readError = authorizeCatalogItemRead(auth, catalogItem.orgId, c.req.query('orgId'));
+    if (readError) return c.json({ error: readError.error }, readError.status);
+
+    const versions = await db.select().from(softwareVersions)
+      .where(eq(softwareVersions.catalogId, id))
+      .orderBy(desc(softwareVersions.isLatest), desc(softwareVersions.releaseDate));
+
+    return c.json({ data: versions });
+  }
+);
+
+// POST /catalog/:id/versions - Create version (JSON metadata only)
+softwareRoutes.post(
+  '/catalog/:id/versions',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  zValidator('param', versionParamSchema),
+  zValidator('json', createVersionSchema),
+  async (c) => {
+    const auth = c.get('auth');
+
+    const { id } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    // Dual-axis fetch + write authorization (#2135): partner-wide packages have
+    // org_id NULL and take versions from full-partner admins only.
+    const [catalogItem] = await db.select().from(softwareCatalog)
+      .where(eq(softwareCatalog.id, id));
+    if (!catalogItem) return c.json({ error: 'Catalog item not found' }, 404);
+    const denied = authorizeCatalogItemWrite(auth, catalogItem, c.req.query('orgId'));
+    if (denied) return c.json({ error: denied.error }, denied.status);
+
+    // A URL-created version never recorded a fileType, so the dispatcher fell
+    // back to 'exe' and the agent exec'd the downloaded file directly — which
+    // fails at CreateProcess for an MSI (ERROR_BAD_EXE_FORMAT) and misroutes the
+    // operator's msiexec command into the MSI's own argv. Prefer an explicit
+    // fileType, otherwise infer from the URL; null keeps prior behavior.
+    const fileType = payload.fileType ?? deriveSoftwareFileTypeFromUrl(payload.downloadUrl);
+    const silentDefaults = defaultSilentArgsForFileType(fileType);
+
+    // Storing NULL means committing to a row we will later GUESS about at
+    // dispatch. The web forms warn about it, but an API/MCP/script client gets
+    // no such prompt, so record it server-side — otherwise nobody can even
+    // count how often this happens in production. Not a 400: an extensionless
+    // URL serving a real EXE is legitimate, and rejecting would break existing
+    // scripted clients.
+    if (payload.downloadUrl && fileType === null) {
+      captureMessage('software version created with undetermined installer type', {
+        eventCode: 'software_version_installer_type_unknown',
+      });
+    }
+
+    const version = await insertLatestSoftwareVersion(id, {
+      version: payload.version,
+      releaseDate: payload.releaseDate ? new Date(payload.releaseDate) : new Date(),
+      releaseNotes: payload.releaseNotes ?? null,
+      downloadUrl: payload.downloadUrl ?? null,
+      fileType,
+      checksum: payload.checksum ?? null,
+      fileSize: payload.fileSize ?? null,
+      supportedOs: payload.supportedOs ?? null,
+      architecture: payload.architecture ?? null,
+      silentInstallArgs: payload.silentInstallArgs || silentDefaults?.install || null,
+      silentUninstallArgs: payload.silentUninstallArgs || silentDefaults?.uninstall || null,
+      preInstallScript: payload.preInstallScript ?? null,
+      postInstallScript: payload.postInstallScript ?? null,
+      detectionRules: payload.detectionRules ?? null,
+    });
+
+    if (!version) {
+      return c.json({ error: 'Failed to create software version' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: catalogItem.orgId,
+      action: 'software.catalog.version.create',
+      resourceType: 'software_version',
+      resourceId: version.id,
+      resourceName: catalogItem.name,
+      details: { version: payload.version, fileType },
+    });
+
+    return c.json({ data: version }, 201);
+  }
+);
+
+// POST /catalog/:id/versions/upload - Upload package file
+softwareRoutes.post(
+  '/catalog/:id/versions/upload',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    if (!isS3Configured()) {
+      return c.json({ error: 'S3 storage is not configured' }, 503);
+    }
+
+    const catalogId = c.req.param('id')!;
+    const [catalogItem] = await db.select().from(softwareCatalog)
+      .where(and(eq(softwareCatalog.id, catalogId), eq(softwareCatalog.orgId, orgId)));
+    if (!catalogItem) return c.json({ error: 'Catalog item not found' }, 404);
+
+    // Stream the multipart body straight to a temp file via busboy, hashing as
+    // it arrives, instead of buffering the whole parsed File into the Node heap
+    // (which `c.req.parseBody()` does before the handler runs). Peak heap is now
+    // constant regardless of file size — the OOM vector from #1408. The file's
+    // extension is validated in `onFile` before any bytes are written to disk.
+    const tempDir = join(tmpdir(), 'breeze-uploads');
+    await mkdir(tempDir, { recursive: true });
+    const tempPath = join(tempDir, `${randomUUID()}.upload`);
+
+    let parsed: StreamedMultipart;
+    try {
+      parsed = await parseStreamingMultipart({
+        contentType: c.req.header('content-type'),
+        body: c.req.raw.body,
+        tempPath,
+        maxFileSize: MAX_UPLOAD_SIZE,
+        onFile: ({ filename }) => {
+          // Preserve the route's prior contract: disallowed extension -> 400.
+          const candidate = getFileExtension(filename || 'package');
+          if (!ALLOWED_EXTENSIONS.has(candidate)) {
+            throw new MultipartError(
+              `Unsupported file type: ${candidate}. Allowed: ${[...ALLOWED_EXTENSIONS].join(', ')}`,
+              400,
+            );
+          }
+        },
+      });
+    } catch (err) {
+      if (err instanceof MultipartError) {
+        return c.json({ error: err.message }, err.status);
+      }
+      // A non-MultipartError is an infrastructure failure (disk full, aborted
+      // body, malformed multipart) with no client status. Don't let it vanish
+      // into a blank 500 — capture it with request context, then surface a
+      // specific message so an out-of-disk condition is diagnosable.
+      captureException(err, c);
+      return c.json({ error: 'Failed to store uploaded package' }, 500);
+    }
+
+    const { fields, file } = parsed;
+    if (!file) {
+      return c.json({ error: 'file is required' }, 400);
+    }
+
+    try {
+      const version = typeof fields.version === 'string' ? fields.version.trim() : '';
+      if (!version) return c.json({ error: 'version is required' }, 400);
+
+      const originalFileName = file.filename || 'package';
+      const ext = getFileExtension(originalFileName);
+      // Defensive: onFile already rejected disallowed extensions before writing.
+      if (!ALLOWED_EXTENSIONS.has(ext)) {
+        return c.json({ error: `Unsupported file type: ${ext}. Allowed: ${[...ALLOWED_EXTENSIONS].join(', ')}` }, 400);
+      }
+
+      const fileType = ext.slice(1); // remove leading dot
+      const architecture = typeof fields.architecture === 'string' ? fields.architecture : null;
+      const releaseNotes = typeof fields.releaseNotes === 'string' ? fields.releaseNotes : null;
+      let silentInstallArgs = typeof fields.silentInstallArgs === 'string' ? fields.silentInstallArgs : null;
+      let silentUninstallArgs = typeof fields.silentUninstallArgs === 'string' ? fields.silentUninstallArgs : null;
+      const preInstallScript = typeof fields.preInstallScript === 'string' ? fields.preInstallScript : null;
+      const postInstallScript = typeof fields.postInstallScript === 'string' ? fields.postInstallScript : null;
+      // Detection rules arrive as a JSON-encoded field. Unlike supportedOs we do
+      // NOT silently drop a malformed value: detection rules are a deliberate
+      // install-safety config, so a parse/validation failure must surface as a
+      // 400 rather than quietly shipping a version that can't verify itself.
+      let detectionRules: unknown = null;
+      if (typeof fields.detectionRules === 'string' && fields.detectionRules.trim() !== '') {
+        let rawDetection: unknown;
+        try {
+          rawDetection = JSON.parse(fields.detectionRules);
+        } catch {
+          return c.json({ error: 'detectionRules must be valid JSON' }, 400);
+        }
+        const parsedDetection = detectionRulesSchema.safeParse(rawDetection);
+        if (!parsedDetection.success) {
+          return c.json({ error: 'detectionRules is invalid', details: parsedDetection.error.issues }, 400);
+        }
+        detectionRules = parsedDetection.data;
+      }
+
+      let supportedOs: string[] | null = null;
+      if (typeof fields.supportedOs === 'string') {
+        try {
+          supportedOs = JSON.parse(fields.supportedOs);
+        } catch {
+          // Malformed supportedOs silently dropped the OS-targeting field on the
+          // created version. Don't fail the upload (matches prior behavior), but
+          // make the discard visible rather than fully silent.
+          captureMessage('software upload: discarded malformed supportedOs', {
+            eventCode: 'software_upload_malformed_supported_os',
+          });
+        }
+      }
+
+      // Auto-detect MSI silent args
+      const silentDefaults = defaultSilentArgsForFileType(fileType);
+      if (silentDefaults && !silentInstallArgs) {
+        silentInstallArgs = silentDefaults.install;
+      }
+      if (silentDefaults && !silentUninstallArgs) {
+        silentUninstallArgs = silentDefaults.uninstall;
+      }
+
+      const checksum = file.checksum;
+      const fileSize = file.fileSize;
+
+      // Do not write object bytes unless the catalog parent is still live,
+      // and keep deletion serialized until the version FK is committed.
+      if (!await lockSoftwareCatalogForVersionInsert(catalogId)) {
+        return c.json({ error: 'Catalog item not found' }, 404);
+      }
+
+      // Generate version ID for S3 key path
+      const versionId = randomUUID();
+      const s3Key = `software/${orgId}/${catalogId}/${versionId}/${originalFileName}`;
+
+      // Upload to S3. Previously a bare call, so any storage fault (bad
+      // credentials, missing bucket, unreachable endpoint, MinIO TLS mismatch,
+      // region mismatch) reached the global handler as an opaque
+      // `500 Internal Server Error` and a self-hoster had no path from the
+      // symptom to a cause (#2794). Map it to a status that says whose problem
+      // it is, carrying the operator-actionable hint.
+      try {
+        await uploadBinary(tempPath, s3Key, checksum);
+      } catch (err) {
+        captureException(err, c);
+        // Misconfigured env => 503, matching the isS3Configured() gate above.
+        // `clientMessage`, not `message`: the latter can quote the raw
+        // S3_ENDPOINT value, which may carry inline credentials.
+        if (err instanceof S3ConfigError) {
+          return c.json({ error: err.clientMessage }, 503);
+        }
+        // Storage reachable-ish but failing => 502. The message is curated in
+        // classifyS3Failure and never echoes raw provider output.
+        if (err instanceof S3OperationError) {
+          return c.json({ error: err.message, storageFailure: err.failureCode }, 502);
+        }
+        return c.json(
+          {
+            error:
+              'Upload to object storage failed before the request was sent. Check the API server logs for details.',
+          },
+          502
+        );
+      }
+
+      let versionRecord: Awaited<ReturnType<typeof insertLatestSoftwareVersion>> | null = null;
+      try {
+        versionRecord = await insertLatestSoftwareVersion(catalogId, {
+          id: versionId,
+          version,
+          releaseDate: new Date(),
+          releaseNotes,
+          s3Key,
+          fileType,
+          originalFileName,
+          checksum,
+          fileSize,
+          supportedOs,
+          architecture,
+          silentInstallArgs,
+          silentUninstallArgs,
+          preInstallScript,
+          postInstallScript,
+          detectionRules,
+        });
+      } catch (err) {
+        captureException(err, c);
+      }
+
+      if (!versionRecord) {
+        await deleteObjects([s3Key]).catch((cleanupErr) => captureException(cleanupErr, c));
+        return c.json({ error: 'Failed to create uploaded software version' }, 500);
+      }
+
+      writeRouteAudit(c, {
+        orgId,
+        action: 'software.catalog.version.upload',
+        resourceType: 'software_version',
+        resourceId: versionRecord.id,
+        resourceName: catalogItem.name,
+        details: { version, fileType, fileSize, checksum },
+      });
+
+      return c.json({ data: versionRecord }, 201);
+    } finally {
+      // Clean up temp file
+      await unlink(tempPath).catch(() => {});
+    }
+  }
+);
+
+// PATCH /catalog/:id/versions/:versionId - Update version metadata
+softwareRoutes.patch(
+  '/catalog/:id/versions/:versionId',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  zValidator('param', versionIdParamSchema),
+  zValidator('json', updateVersionSchema),
+  async (c) => {
+    const auth = c.get('auth');
+
+    const { id, versionId } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    // Dual-axis fetch + write authorization (#2135) — see version create above.
+    const [catalogItem] = await db.select().from(softwareCatalog)
+      .where(eq(softwareCatalog.id, id));
+    if (!catalogItem) return c.json({ error: 'Catalog item not found' }, 404);
+    const denied = authorizeCatalogItemWrite(auth, catalogItem, c.req.query('orgId'));
+    if (denied) return c.json({ error: denied.error }, denied.status);
+
+    const [existingVersion] = await db.select().from(softwareVersions)
+      .where(and(
+        eq(softwareVersions.id, versionId),
+        eq(softwareVersions.catalogId, id),
+      ));
+    if (!existingVersion) return c.json({ error: 'Version not found' }, 404);
+
+    const updates: Record<string, unknown> = {};
+    if (payload.version !== undefined) updates.version = payload.version;
+    if (payload.releaseDate !== undefined) updates.releaseDate = new Date(payload.releaseDate);
+    if (payload.releaseNotes !== undefined) updates.releaseNotes = payload.releaseNotes;
+    if (payload.downloadUrl !== undefined) updates.downloadUrl = payload.downloadUrl;
+    if (payload.supportedOs !== undefined) updates.supportedOs = payload.supportedOs;
+    if (payload.architecture !== undefined) updates.architecture = payload.architecture;
+    if (payload.silentInstallArgs !== undefined) updates.silentInstallArgs = payload.silentInstallArgs;
+    if (payload.silentUninstallArgs !== undefined) updates.silentUninstallArgs = payload.silentUninstallArgs;
+    if (payload.detectionRules !== undefined) updates.detectionRules = payload.detectionRules;
+    if (Object.keys(updates).length === 0) {
+      return c.json({ error: 'No fields to update' }, 400);
+    }
+    // A URL-sourced version must not end up with neither URL nor uploaded file.
+    if (updates.downloadUrl === null && !existingVersion.s3Key) {
+      return c.json({ error: 'This version has no uploaded file — it needs a download URL' }, 400);
+    }
+
+    const [updated] = await db.update(softwareVersions)
+      .set(updates)
+      .where(eq(softwareVersions.id, versionId))
+      .returning();
+    if (!updated) return c.json({ error: 'Failed to update software version' }, 500);
+
+    writeRouteAudit(c, {
+      orgId: catalogItem.orgId,
+      action: 'software.catalog.version.update',
+      resourceType: 'software_version',
+      resourceId: versionId,
+      resourceName: catalogItem.name,
+      details: { version: updated.version, updatedFields: Object.keys(updates) },
+    });
+
+    return c.json({ data: updated });
+  }
+);
+
+// POST /catalog/:id/versions/:versionId/promote - Mark an existing version as latest
+softwareRoutes.post(
+  '/catalog/:id/versions/:versionId/promote',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  zValidator('param', versionIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+
+    const { id, versionId } = c.req.valid('param');
+    // Dual-axis fetch + write authorization (#2135) — see version create above.
+    const [catalogItem] = await db.select().from(softwareCatalog)
+      .where(eq(softwareCatalog.id, id));
+    if (!catalogItem) return c.json({ error: 'Catalog item not found' }, 404);
+    const denied = authorizeCatalogItemWrite(auth, catalogItem, c.req.query('orgId'));
+    if (denied) return c.json({ error: denied.error }, denied.status);
+
+    const [existingVersion] = await db.select().from(softwareVersions)
+      .where(and(
+        eq(softwareVersions.id, versionId),
+        eq(softwareVersions.catalogId, id),
+      ));
+    if (!existingVersion) return c.json({ error: 'Version not found' }, 404);
+
+    const promotedVersion = await db.transaction(async (tx) => {
+      return setLatestSoftwareVersion(tx, id, versionId);
+    });
+
+    if (!promotedVersion) {
+      return c.json({ error: 'Failed to promote software version' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: catalogItem.orgId,
+      action: 'software.catalog.version.promote',
+      resourceType: 'software_version',
+      resourceId: promotedVersion.id,
+      resourceName: catalogItem.name,
+      details: { version: promotedVersion.version },
+    });
+
+    return c.json({ data: promotedVersion });
+  }
+);
+
+// GET /catalog/:id/versions/:versionId/download-url - Get presigned download URL
+softwareRoutes.get(
+  '/catalog/:id/versions/:versionId/download-url',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  async (c) => {
+    const auth = c.get('auth');
+
+    const catalogId = c.req.param('id')!;
+    const versionId = c.req.param('versionId')!;
+
+    // Dual-axis read authorization: org rows are narrowed to the request's
+    // resolved org (canAccessOrg fallback only in the org-less All-orgs view);
+    // partner rows (org_id NULL) are already bound to the caller's partner by RLS.
+    const [catalogItem] = await db.select().from(softwareCatalog)
+      .where(eq(softwareCatalog.id, catalogId));
+    if (!catalogItem) return c.json({ error: 'Catalog item not found' }, 404);
+    const readError = authorizeCatalogItemRead(auth, catalogItem.orgId, c.req.query('orgId'));
+    if (readError) return c.json({ error: readError.error }, readError.status);
+
+    const [versionRecord] = await db.select().from(softwareVersions)
+      .where(and(eq(softwareVersions.id, versionId), eq(softwareVersions.catalogId, catalogId)));
+    if (!versionRecord) return c.json({ error: 'Version not found' }, 404);
+
+    if (versionRecord.s3Key) {
+      const url = await getPresignedUrl(versionRecord.s3Key, 3600);
+      return c.json({ data: { url, expiresIn: 3600 } });
+    }
+
+    if (versionRecord.downloadUrl) {
+      return c.json({ data: { url: versionRecord.downloadUrl, expiresIn: null } });
+    }
+
+    return c.json({ error: 'No download available for this version' }, 404);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// DEPLOYMENT ROUTES
+// ---------------------------------------------------------------------------
+
+// GET /deployments - List deployments
+softwareRoutes.get(
+  '/deployments',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('query', listDeploymentsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+
+    // NOTE on ?status=: the deployment status is a *computed aggregate* over
+    // grouped deployment_results (computeSoftwareDeploymentAggregateStatus),
+    // so filtering on it in SQL would mean re-expressing that derivation as a
+    // correlated subquery. Server-side aggregate filtering is intentionally
+    // not implemented; the param stays accepted for backwards compatibility
+    // but is ignored — clients filter the returned page on the computed
+    // `status` field instead. (Previously the route fetched every org row,
+    // filtered in JS and sliced — SQL pagination replaces that.)
+    const orgCondition = and(
+      eq(softwareDeployments.orgId, orgId),
+      softwareDeploymentSiteScopePredicate(
+        softwareDeployments.id,
+        c.get('permissions') as UserPermissions | undefined,
+      ),
+    );
+    const [items, countRows] = await Promise.all([
+      db.select().from(softwareDeployments)
+        .where(orgCondition)
+        .orderBy(desc(softwareDeployments.createdAt), desc(softwareDeployments.id))
+        .limit(limit)
+        .offset(offset),
+      db.select({ count: sql<number>`count(*)::int` })
+        .from(softwareDeployments)
+        .where(orgCondition),
+    ]);
+
+    const statusMap = await getDeploymentStatusMap(items.map((item) => item.id));
+    const enrichedItems = items.map((item) => {
+      const entry = statusMap.get(item.id);
+      return {
+        ...item,
+        status: entry?.status ?? 'pending',
+        counts: entry?.counts ?? emptyStatusCounts(),
+      };
+    });
+
+    return c.json({
+      data: enrichedItems,
+      pagination: { page, limit, total: Number(countRows[0]?.count ?? 0) }
+    });
+  }
+);
+
+// GET /deployments/summary - Aggregate counts for the overview cards.
+// MUST be registered before GET /deployments/:id: Hono matches routes in
+// registration order, so registering it later would let the :id route capture
+// 'summary' as a path param (and 400 on the uuid validation).
+softwareRoutes.get(
+  '/deployments/summary',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    // One grouped query: deployments LEFT JOIN results, grouped by
+    // (deployment, result status). A deployment with no result rows still
+    // appears (status NULL, count 0). The aggregate status per deployment is
+    // then derived in JS with the same computeSoftwareDeploymentAggregateStatus
+    // used everywhere else — no N+1, no per-deployment queries.
+    const rows = await db
+      .select({
+        deploymentId: softwareDeployments.id,
+        dispatchedAt: softwareDeployments.dispatchedAt,
+        createdAt: softwareDeployments.createdAt,
+        status: deploymentResults.status,
+        count: sql<number>`count(${deploymentResults.id})::int`,
+        lastCompletedAt: sql<string | Date | null>`max(${deploymentResults.completedAt})`,
+      })
+      .from(softwareDeployments)
+      .leftJoin(deploymentResults, eq(deploymentResults.deploymentId, softwareDeployments.id))
+      .where(and(
+        eq(softwareDeployments.orgId, orgId),
+        softwareDeploymentSiteScopePredicate(
+          softwareDeployments.id,
+          c.get('permissions') as UserPermissions | undefined,
+        ),
+      ))
+      .groupBy(
+        softwareDeployments.id,
+        softwareDeployments.dispatchedAt,
+        softwareDeployments.createdAt,
+        deploymentResults.status,
+      );
+
+    type SummaryAccumulator = {
+      dispatchedAt: unknown;
+      createdAt: unknown;
+      groups: Array<{ status: string; count: number }>;
+      /** epoch ms of max(deployment_results.completed_at); 0 = none */
+      lastCompletedAt: number;
+    };
+    const byDeployment = new Map<string, SummaryAccumulator>();
+    for (const row of rows) {
+      let entry = byDeployment.get(row.deploymentId);
+      if (!entry) {
+        entry = { dispatchedAt: row.dispatchedAt, createdAt: row.createdAt, groups: [], lastCompletedAt: 0 };
+        byDeployment.set(row.deploymentId, entry);
+      }
+      if (row.status != null) {
+        entry.groups.push({ status: row.status, count: Number(row.count) });
+      }
+      if (row.lastCompletedAt) {
+        const t = new Date(row.lastCompletedAt as string | Date).getTime();
+        if (Number.isFinite(t) && t > entry.lastCompletedAt) entry.lastCompletedAt = t;
+      }
+    }
+
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    let active = 0;
+    let scheduled = 0;
+    let completedLast7d = 0;
+    let failedLast7d = 0;
+    for (const entry of byDeployment.values()) {
+      const aggregate = computeSoftwareDeploymentAggregateStatus(entry.groups);
+      const terminal =
+        aggregate === 'completed' ||
+        aggregate === 'completed_with_errors' ||
+        aggregate === 'failed' ||
+        aggregate === 'cancelled';
+
+      if (!entry.dispatchedAt) {
+        // Awaiting the scheduler. A deployment cancelled before it ever
+        // dispatched is terminal and must not count as "scheduled" forever.
+        if (!terminal) scheduled++;
+        continue;
+      }
+      if (!terminal) {
+        // Dispatched with at least one pending/in-progress result.
+        active++;
+        continue;
+      }
+      // Terminal reference time: max(deployment_results.completed_at) is the
+      // moment the last device finished — the cheapest correct "when did this
+      // deployment end" already produced by the grouped query. Fallback to
+      // createdAt for degenerate rows that never got a completed_at.
+      const refTime = entry.lastCompletedAt
+        || new Date(entry.createdAt as string | Date).getTime();
+      if (refTime >= sevenDaysAgo) {
+        if (aggregate === 'completed') completedLast7d++;
+        else if (aggregate === 'failed' || aggregate === 'completed_with_errors') failedLast7d++;
+        // 'cancelled' deliberately counts in neither 7d bucket.
+      }
+    }
+
+    return c.json({ data: { active, scheduled, completedLast7d, failedLast7d } });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Package-manager (winget / Homebrew) deployment creation
+// ---------------------------------------------------------------------------
+
+/**
+ * Bucket resolved target devices by the platform whose install method will
+ * serve them. `servablePlatforms` is the set of platforms the catalog item
+ * actually has an ENABLED method for — a device on a platform outside that
+ * set (a Mac under a winget-only item) lands in `other` exactly like a Linux
+ * device does. `other` is attached to the FIRST created deployment so the
+ * fan-out records an explicit "No install method for this device OS
+ * (<osType>)" failure row per device; nothing is ever silently dropped.
+ */
+export function splitTargetsByPlatform(
+  deviceRows: { id: string; osType: string | null }[],
+  servablePlatforms: ReadonlyArray<'windows' | 'macos'> = ['windows', 'macos'],
+): { windows: string[]; macos: string[]; other: string[] } {
+  const servable = new Set(servablePlatforms);
+  const windows: string[] = [];
+  const macos: string[] = [];
+  const other: string[] = [];
+  for (const row of deviceRows) {
+    if (row.osType === 'windows' && servable.has('windows')) windows.push(row.id);
+    else if (row.osType === 'macos' && servable.has('macos')) macos.push(row.id);
+    else other.push(row.id);
+  }
+  return { windows, macos, other };
+}
+
+/**
+ * Deterministic method choice for a platform. A catalog item may legitimately
+ * carry BOTH a homebrew_cask and a homebrew_formula for macOS; row order from
+ * the DB is not defined, so the pick is spelled out rather than left to
+ * whichever row came back first. Casks (GUI apps) are preferred over formulae,
+ * matching what an MSP deploying a desktop app expects.
+ */
+export function pickInstallMethodForPlatform<
+  T extends { platform: string; kind: string },
+>(methods: readonly T[], platform: 'windows' | 'macos'): T | null {
+  const ofPlatform = methods.filter((m) => m.platform === platform);
+  if (ofPlatform.length === 0) return null;
+  const preference = platform === 'windows'
+    ? ['winget']
+    : ['homebrew_cask', 'homebrew_formula'];
+  for (const kind of preference) {
+    const match = ofPlatform.find((m) => m.kind === kind);
+    if (match) return match;
+  }
+  return ofPlatform[0]!;
+}
+
+type ManagerDeploymentPayload = {
+  name: string;
+  catalogId: string;
+  versionMode?: 'latest' | 'exact';
+  requestedVersion?: string;
+  deploymentType: 'install' | 'uninstall' | 'update';
+  targetType: 'devices' | 'groups' | 'sites' | 'all' | 'filter';
+  targetIds?: string[];
+  targetFilter?: unknown;
+  scheduleType: 'immediate' | 'scheduled' | 'maintenance';
+  scheduledAt?: string;
+  maintenanceWindowId?: string;
+  options?: Record<string, unknown>;
+};
+
+const PLATFORM_NAME_SUFFIX: Record<'windows' | 'macos', string> = {
+  windows: ' (Windows)',
+  macos: ' (macOS)',
+};
+
+/**
+ * A software_deployments row references exactly ONE install method
+ * (software_deployments_one_target_chk), but a catalog item may carry a
+ * winget method AND a Homebrew method. So when the resolved target set spans
+ * both platforms this creates one deployment per platform — each with its own
+ * install_method_id and a platform-suffixed name — keeping the column honest
+ * and every per-device result row unambiguous.
+ */
+async function createManagerDeployments(
+  c: Context,
+  orgId: string,
+  payload: ManagerDeploymentPayload,
+) {
+  const auth = c.get('auth');
+
+  const [catalogItem] = await db.select({
+    id: softwareCatalog.id,
+    orgId: softwareCatalog.orgId,
+    name: softwareCatalog.name,
+    integrationProvider: softwareCatalog.integrationProvider,
+  }).from(softwareCatalog)
+    .where(eq(softwareCatalog.id, payload.catalogId));
+  // Same ownership guard as the version path: built-ins (org_id NULL) are
+  // visible to everyone, an org-owned row must match the caller's org.
+  if (!catalogItem || (catalogItem.orgId !== null && catalogItem.orgId !== orgId)) {
+    return c.json({ error: 'Catalog item not found or access denied' }, 404);
+  }
+
+  const methods = await db.select().from(softwareInstallMethods)
+    .where(and(
+      eq(softwareInstallMethods.catalogId, catalogItem.id),
+      eq(softwareInstallMethods.enabled, true),
+    ));
+  if (methods.length === 0) {
+    return c.json({ error: 'This catalog item has no enabled install method to deploy' }, 400);
+  }
+
+  const versionMode = payload.versionMode ?? 'latest';
+  // Only winget can install a pinned version; Homebrew always installs the
+  // formula/cask's current version.
+  if (versionMode === 'exact' && !methods.some((m) => m.kind === 'winget')) {
+    return c.json(
+      { error: "versionMode 'exact' requires a winget install method on this catalog item" },
+      400,
+    );
+  }
+
+  const resolvedTargets = await resolveSoftwareTargetDeviceIds(
+    orgId,
+    c.get('permissions') as UserPermissions | undefined,
+    payload,
+  );
+  if (resolvedTargets.error) {
+    return c.json({ error: resolvedTargets.error }, resolvedTargets.status ?? 400);
+  }
+
+  const deviceRows = await db.select({ id: devices.id, osType: devices.osType })
+    .from(devices)
+    .where(and(eq(devices.orgId, orgId), inArray(devices.id, resolvedTargets.deviceIds)));
+  // Only platforms with an enabled method can be served; devices on the other
+  // platform fall into `split.other` and get failure rows.
+  const pickedMethods = {
+    windows: pickInstallMethodForPlatform(methods, 'windows'),
+    macos: pickInstallMethodForPlatform(methods, 'macos'),
+  };
+  const servablePlatforms = (['windows', 'macos'] as const).filter((p) => pickedMethods[p]);
+  const split = splitTargetsByPlatform(deviceRows, servablePlatforms);
+
+  // One group per platform that has BOTH an enabled method and target devices,
+  // Windows first for determinism.
+  const groups: {
+    platform: 'windows' | 'macos';
+    method: (typeof methods)[number];
+    deviceIds: string[];
+  }[] = [];
+  for (const platform of servablePlatforms) {
+    if (split[platform].length === 0) continue;
+    groups.push({ platform, method: pickedMethods[platform]!, deviceIds: [...split[platform]] });
+  }
+  if (groups.length === 0) {
+    // Nothing the item can serve (e.g. a winget-only item aimed at Macs).
+    // Still create ONE deployment so every target device gets a recorded
+    // failure row rather than a 201 covering nothing. Windows-first keeps the
+    // choice deterministic.
+    const fallbackPlatform = servablePlatforms[0]!;
+    groups.push({
+      platform: fallbackPlatform,
+      method: pickedMethods[fallbackPlatform]!,
+      deviceIds: [],
+    });
+  }
+  // Unservable devices ride along with the first deployment so the fan-out
+  // writes their "No install method for this device OS" result rows.
+  groups[0]!.deviceIds.push(...split.other);
+
+  const isSplit = groups.length > 1;
+  const results = [];
+  for (const group of groups) {
+    // Only winget can install a pinned version. In a split request the
+    // Homebrew half silently falls back to 'latest' rather than failing the
+    // whole request — brew is latest-only in phase 1.
+    const groupVersionMode = group.method.kind === 'winget' ? versionMode : 'latest';
+    const result = await createSoftwareDeployment({
+      orgId,
+      installMethodId: group.method.id,
+      versionMode: groupVersionMode,
+      requestedVersion: groupVersionMode === 'exact' ? payload.requestedVersion : undefined,
+      deploymentType: payload.deploymentType,
+      deviceIds: group.deviceIds,
+      scheduleType: payload.scheduleType,
+      createdBy: auth.user?.id ?? null,
+      name: isSplit ? `${payload.name}${PLATFORM_NAME_SUFFIX[group.platform]}` : payload.name,
+      scheduledAt: payload.scheduledAt ? new Date(payload.scheduledAt) : undefined,
+      maintenanceWindowId: payload.maintenanceWindowId ?? null,
+      // A split deployment records the devices it actually owns; an unsplit one
+      // preserves the caller's raw selection, same as the version path.
+      targetType: isSplit ? 'devices' : payload.targetType,
+      targetIds: isSplit ? group.deviceIds : payload.targetIds ?? null,
+      options:
+        payload.targetType === 'filter'
+          ? { ...(payload.options ?? {}), targetFilter: payload.targetFilter ?? null }
+          : payload.options ?? undefined,
+    });
+    results.push(result);
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'software.deployment.create',
+      resourceType: 'software_deployment',
+      resourceId: result.deploymentId,
+      resourceName: payload.name,
+      details: {
+        deploymentType: payload.deploymentType,
+        targetType: payload.targetType,
+        deviceCount: group.deviceIds.length,
+        installMethodId: group.method.id,
+        platform: group.platform,
+        kind: group.method.kind,
+        versionMode: groupVersionMode,
+      },
+    });
+  }
+
+  const deployments = results.map((r) => r.deployment);
+  if (results.every((r) => r.status === 'failed')) {
+    return c.json({
+      data: { id: results[0]!.deploymentId, status: 'failed', message: results[0]!.message },
+      deployments,
+    }, 200);
+  }
+  // `data` stays the (first) deployment object for parity with the version
+  // path; `deployments` carries every row a split produced.
+  return c.json({ data: deployments[0], deployments }, 201);
+}
+
+// POST /deployments - Create deployment
+softwareRoutes.post(
+  '/deployments',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareExecute,
+  requireMfa(),
+  zValidator('json', createDeploymentSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const payload = c.req.valid('json');
+
+    // Package-manager path: the request names a catalog item, not a version.
+    if (payload.catalogId) {
+      return createManagerDeployments(c, orgId, payload as ManagerDeploymentPayload);
+    }
+
+    // Verify version exists and get catalog info
+    const [versionRecord] = await db.select().from(softwareVersions)
+      .where(eq(softwareVersions.id, payload.softwareVersionId!));
+    if (!versionRecord) return c.json({ error: 'Software version not found' }, 404);
+
+    const [catalogItem] = await db.select({
+      id: softwareCatalog.id,
+      orgId: softwareCatalog.orgId,
+      name: softwareCatalog.name,
+      integrationProvider: softwareCatalog.integrationProvider,
+    }).from(softwareCatalog)
+      .where(eq(softwareCatalog.id, versionRecord.catalogId));
+    // RLS already restricts visibility to the caller's org rows + partner-scoped
+    // NULL-org rows (built-in EDR packages, and — for partner-scope tokens —
+    // partner-wide custom packages, #2135). Extra guard: an org-owned row must
+    // match the authenticated org; NULL-org rows are allowed and the deployment
+    // itself is stamped with the resolved context org.
+    if (!catalogItem || (catalogItem.orgId !== null && catalogItem.orgId !== orgId)) {
+      return c.json({ error: 'Catalog item not found or access denied' }, 404);
+    }
+
+    const resolvedTargets = await resolveSoftwareTargetDeviceIds(orgId, c.get('permissions') as UserPermissions | undefined, payload);
+    if (resolvedTargets.error) {
+      const status = resolvedTargets.status ?? 400;
+      return c.json({ error: resolvedTargets.error }, status);
+    }
+    const targetDeviceIds = resolvedTargets.deviceIds;
+
+    const result = await createSoftwareDeployment({
+      orgId,
+      softwareVersionId: payload.softwareVersionId,
+      deploymentType: payload.deploymentType,
+      deviceIds: targetDeviceIds,
+      scheduleType: payload.scheduleType,
+      createdBy: auth.user?.id ?? null,
+      name: payload.name,
+      scheduledAt: payload.scheduledAt ? new Date(payload.scheduledAt) : undefined,
+      maintenanceWindowId: payload.maintenanceWindowId ?? null,
+      targetType: payload.targetType,
+      targetIds: payload.targetIds ?? null,
+      options:
+        payload.targetType === 'filter'
+          ? { ...(payload.options ?? {}), targetFilter: payload.targetFilter ?? null }
+          : payload.options ?? undefined,
+    });
+
+    if (result.status === 'failed') {
+      return c.json({ data: { id: result.deploymentId, status: result.status, message: result.message } }, 200);
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'software.deployment.create',
+      resourceType: 'software_deployment',
+      resourceId: result.deploymentId,
+      resourceName: payload.name,
+      details: {
+        deploymentType: payload.deploymentType,
+        targetType: payload.targetType,
+        deviceCount: targetDeviceIds.length,
+      },
+    });
+
+    return c.json({ data: result.deployment }, 201);
+  }
+);
+
+// POST /deploy - Legacy deployment endpoint (used by DeploymentWizard)
+softwareRoutes.post(
+  '/deploy',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareExecute,
+  requireMfa(),
+  zValidator(
+    'json',
+    z.object({
+      softwareId: z.string().guid(),
+      version: z.string().min(1).max(64),
+      targets: z
+        .object({
+          deviceIds: z.array(z.string().guid()).max(1000).optional(),
+          siteIds: z.array(z.string().guid()).max(100).optional(),
+          deviceGroupIds: z.array(z.string().guid()).max(100).optional(),
+        })
+        .optional(),
+      configuration: z
+        .object({
+          scheduleType: z.enum(['immediate', 'scheduled', 'maintenance_window']).optional(),
+        })
+        .partial()
+        .optional(),
+    }).superRefine((data, ctx) => {
+      // Reject what never runs (#1.4): this legacy route carries no scheduledAt
+      // or maintenanceWindowId field, so a non-immediate deployment created here
+      // can never be picked up by the scheduler — it would sit pending forever.
+      const scheduleType = data.configuration?.scheduleType ?? 'immediate';
+      if (scheduleType !== 'immediate') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['configuration', 'scheduleType'],
+          message:
+            'Scheduled and maintenance-window deployments are not supported on this endpoint — use POST /software/deployments',
+        });
+      }
+    })
+  ),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const body = c.req.valid('json');
+    const softwareId = body.softwareId;
+    const version = body.version;
+    const deviceIds = body.targets?.deviceIds ?? [];
+
+    // Look up the catalog item + version. RLS restricts visibility to the caller's
+    // org rows + partner-scoped NULL-org rows (built-in EDR packages, and — for
+    // partner-scope tokens — partner-wide custom packages, #2135); the org guard
+    // below rejects a (visible) org-owned row that belongs to a different org.
+    const [catalogItem] = await db.select({
+      id: softwareCatalog.id,
+      orgId: softwareCatalog.orgId,
+      name: softwareCatalog.name,
+      integrationProvider: softwareCatalog.integrationProvider,
+    }).from(softwareCatalog)
+      .where(eq(softwareCatalog.id, softwareId));
+    if (!catalogItem || (catalogItem.orgId !== null && catalogItem.orgId !== orgId)) {
+      return c.json({ error: 'Catalog item not found' }, 404);
+    }
+
+    const [versionRecord] = await db.select().from(softwareVersions)
+      .where(and(eq(softwareVersions.catalogId, softwareId), eq(softwareVersions.version, version)));
+
+    if (!versionRecord) return c.json({ error: 'Version not found' }, 404);
+
+    let resolvedDeviceIds = await resolveDeploymentTargets({
+      orgId,
+      targetConfig: {
+        type: 'devices',
+        deviceIds: Array.isArray(deviceIds) ? deviceIds : [],
+      },
+    });
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    if (permissions?.allowedSiteIds && resolvedDeviceIds.length > 0) {
+      const rows = await db
+        .select({ id: devices.id, siteId: devices.siteId })
+        .from(devices)
+        .where(and(eq(devices.orgId, orgId), inArray(devices.id, resolvedDeviceIds)));
+      resolvedDeviceIds = rows
+        .filter((device) => typeof device.siteId === 'string' && canAccessSite(permissions, device.siteId))
+        .map((device) => device.id);
+      if (resolvedDeviceIds.length !== deviceIds.length) {
+        return c.json({ error: 'Access to one or more device sites denied' }, 403);
+      }
+    }
+    if (resolvedDeviceIds.length === 0) {
+      return c.json({ error: 'No devices resolved for the selected targets' }, 400);
+    }
+
+    // Delegate to the canonical create path (services/softwareDeployment.ts):
+    // deployment + per-device result inserts, presign, EDR resolution,
+    // installer-variable substitution, detection rules, failure pre-writes and
+    // honest WS-vs-queue dispatch — this route previously re-implemented all
+    // of that inline and had drifted. The legacy route exposes no
+    // force-reinstall toggle (no options => forceReinstall false, matching the
+    // old hardcode) and only ever creates immediate installs — the superRefine
+    // above rejects every other scheduleType, so `scheduleType` is 'immediate'
+    // by the time we get here.
+    const result = await createSoftwareDeployment({
+      orgId,
+      softwareVersionId: versionRecord.id,
+      deploymentType: 'install',
+      deviceIds: resolvedDeviceIds,
+      scheduleType: 'immediate',
+      createdBy: auth.user?.id ?? null,
+      name: `Deploy ${catalogItem.name} v${version}`,
+      targetType: 'devices',
+      targetIds: resolvedDeviceIds,
+    });
+
+    // Preserve the legacy failure contract: HTTP 200 with a failed status body
+    // (EDR resolution error / no installer available), no audit write.
+    //
+    // This route used to re-implement dispatch inline (S3 presign, EDR
+    // resolution, the Wave 6 Task 5 managed-software destination-policy gate,
+    // per-device WS send) and had drifted from the canonical path above it.
+    // It now fully delegates to createSoftwareDeployment — including the
+    // Wave 6 Task 5 policy gate, which lives once in the shared
+    // buildAndDispatchSoftwareInstalls fan-out (services/softwareDeployment.ts)
+    // so create/scheduler/retry all apply it identically instead of each
+    // route carrying its own copy.
+    if (result.status === 'failed') {
+      return c.json({ data: { id: result.deploymentId, status: 'failed', message: result.message } }, 200);
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'software.deployment.create',
+      resourceType: 'software_deployment',
+      resourceId: result.deploymentId,
+      resourceName: catalogItem.name,
+      details: { version, deviceCount: resolvedDeviceIds.length, deprecated: true },
+    });
+
+    // Legacy response shape: full row under `data` plus a top-level `id`.
+    return c.json({ data: result.deployment, id: result.deploymentId }, 201);
+  }
+);
+
+// GET /deployments/:id - Get deployment
+softwareRoutes.get(
+  '/deployments/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('param', deploymentIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const { id } = c.req.valid('param');
+    const [deployment] = await db.select().from(softwareDeployments)
+      .where(and(
+        eq(softwareDeployments.id, id),
+        eq(softwareDeployments.orgId, orgId),
+        softwareDeploymentSiteScopePredicate(
+          softwareDeployments.id,
+          c.get('permissions') as UserPermissions | undefined,
+        ),
+      ));
+    if (!deployment) return c.json({ error: 'Deployment not found' }, 404);
+
+    const statusMap = await getDeploymentStatusMap([deployment.id]);
+    const entry = statusMap.get(deployment.id);
+
+    return c.json({
+      data: {
+        ...deployment,
+        status: entry?.status ?? 'pending',
+        counts: entry?.counts ?? emptyStatusCounts(),
+      },
+    });
+  }
+);
+
+// POST /deployments/:id/cancel - Cancel deployment
+softwareRoutes.post(
+  '/deployments/:id/cancel',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareExecute,
+  requireMfa(),
+  zValidator('param', deploymentIdParamSchema),
+  zValidator('json', cancelDeploymentSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const { id } = c.req.valid('param');
+    const [deployment] = await db.select().from(softwareDeployments)
+      .where(and(
+        eq(softwareDeployments.id, id),
+        eq(softwareDeployments.orgId, orgId),
+        softwareDeploymentSiteScopePredicate(
+          softwareDeployments.id,
+          c.get('permissions') as UserPermissions | undefined,
+        ),
+      ));
+    if (!deployment) return c.json({ error: 'Deployment not found' }, 404);
+
+    // Update pending results to cancelled. `.returning()` surfaces which rows
+    // carried a queued device_commands link (offline-queue fallback) so the
+    // not-yet-delivered commands can be purged below.
+    const cancellationCompletedAt = new Date();
+    const flipped = await db.update(deploymentResults)
+      .set({ status: 'cancelled', completedAt: cancellationCompletedAt })
+      .where(and(
+        eq(deploymentResults.deploymentId, id),
+        eq(deploymentResults.status, 'pending')
+      ))
+      .returning({
+        id: deploymentResults.id,
+        deviceCommandId: deploymentResults.deviceCommandId,
+      });
+
+    for (const result of flipped) {
+      await applyAutomationActionTerminal({
+        source: 'cancellation',
+        deploymentResultId: result.id,
+        terminalStatus: 'cancelled',
+        completedAt: cancellationCompletedAt,
+      });
+    }
+
+    // Honest cancel: a queued-offline install must not execute when the agent
+    // eventually reconnects. Cancel the linked device_commands rows that are
+    // STILL 'pending' (not yet claimed by the agent) — mirrors the stale
+    // reaper's tier-2 guarded cancel, same result payload shape. Delivered
+    // ('sent') commands are left alone: in-flight installs run to completion
+    // by design, and their late results no-op against the already-cancelled
+    // result rows via the pending-status guard.
+    const queuedCommandIds = [
+      ...new Set(
+        flipped
+          .map((row) => row.deviceCommandId)
+          .filter((commandId): commandId is string => typeof commandId === 'string'),
+      ),
+    ];
+    let cancelledQueuedCommands = 0;
+    if (queuedCommandIds.length > 0) {
+      const cancelledCommands = await db.update(deviceCommands)
+        .set({
+          status: 'cancelled',
+          completedAt: new Date(),
+          result: {
+            status: 'cancelled',
+            error: 'Deployment cancelled before delivery',
+            cancelledBy: auth.user?.id ?? 'software-deployment-cancel',
+          },
+          ...terminalPayloadErasureSet(),
+        })
+        .where(and(
+          inArray(deviceCommands.id, queuedCommandIds),
+          eq(deviceCommands.status, 'pending'),
+        ))
+        .returning({ id: deviceCommands.id });
+      cancelledQueuedCommands = cancelledCommands.length;
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'software.deployment.cancel',
+      resourceType: 'software_deployment',
+      resourceId: id,
+      resourceName: deployment.name,
+      details: {
+        cancelledResultCount: flipped.length,
+        cancelledQueuedCommands,
+      },
+    });
+
+    const statusMap = await getDeploymentStatusMap([id]);
+    const entry = statusMap.get(id);
+
+    return c.json({
+      data: {
+        ...deployment,
+        status: entry?.status ?? 'cancelled',
+        counts: entry?.counts ?? emptyStatusCounts(),
+      },
+      cancelledQueuedCommands,
+    });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Retry dispatch helper
+// ---------------------------------------------------------------------------
+
+// Re-dispatch a retried device subset through the shared fan-out
+// (services/softwareDeployment.ts). `scopeToDeviceIds` restricts the shared
+// builder's failure pre-writes (EDR resolution error, missing installer,
+// unresolvable `{{...}}` variables) to the retried rows only — previously
+// COMPLETED rows are never clobbered to failed. The version/catalog lookups
+// live here because the builder takes them as inputs; if either row has been
+// deleted since the original dispatch, fail just the retried rows.
+async function redispatchSoftwareInstall(opts: {
+  deployment: typeof softwareDeployments.$inferSelect;
+  orgId: string;
+  deviceIds: string[];
+  createdBy: string | null;
+  /** Post-bump retryCount per device, keyed by deviceId — see the caller. */
+  deviceRetryCounts: Record<string, number>;
+}): Promise<{ dispatchedDeviceIds: string[]; error?: string }> {
+  const { deployment, orgId, deviceIds, createdBy, deviceRetryCounts } = opts;
+
+  const failTargets = async (errorMessage: string) => {
+    await db.update(deploymentResults)
+      .set({ status: 'failed', errorMessage, completedAt: new Date() })
+      .where(and(
+        eq(deploymentResults.deploymentId, deployment.id),
+        inArray(deploymentResults.deviceId, deviceIds),
+      ));
+  };
+
+  // Package-manager deployment: re-resolve the install method instead of a
+  // version. The version intent lives in `options` (written at create).
+  if (deployment.installMethodId) {
+    const [method] = await db.select().from(softwareInstallMethods)
+      .where(eq(softwareInstallMethods.id, deployment.installMethodId));
+    if (!method) {
+      const error = 'Install method no longer exists for this deployment';
+      await failTargets(error);
+      return { dispatchedDeviceIds: [], error };
+    }
+    const [managerCatalogItem] = await db.select({
+      id: softwareCatalog.id,
+      orgId: softwareCatalog.orgId,
+      name: softwareCatalog.name,
+      integrationProvider: softwareCatalog.integrationProvider,
+    }).from(softwareCatalog)
+      .where(eq(softwareCatalog.id, method.catalogId));
+    if (!managerCatalogItem) {
+      const error = 'Catalog item no longer exists for this deployment';
+      await failTargets(error);
+      return { dispatchedDeviceIds: [], error };
+    }
+    const dependencyError = dependencyFingerprintError(
+      deployment.dependencyFingerprint,
+      fingerprintSoftwareInstallMethodDependency(method, managerCatalogItem),
+    );
+    if (dependencyError) {
+      await failTargets(dependencyError);
+      return { dispatchedDeviceIds: [], error: dependencyError };
+    }
+    const opts = (deployment.options ?? null) as Record<string, unknown> | null;
+    const fanout = await buildAndDispatchSoftwareInstalls({
+      deploymentId: deployment.id,
+      orgId,
+      installMethod: method,
+      versionMode: opts?.versionMode === 'exact' ? 'exact' : 'latest',
+      requestedVersion: typeof opts?.requestedVersion === 'string' ? opts.requestedVersion : null,
+      catalogItem: managerCatalogItem,
+      deviceIds,
+      scopeToDeviceIds: deviceIds,
+      options: opts,
+      createdBy,
+      markDispatched: false,
+      deviceRetryCounts,
+    });
+    return {
+      dispatchedDeviceIds: fanout.dispatchedDeviceIds,
+      ...(fanout.status === 'failed' && fanout.message ? { error: fanout.message } : {}),
+    };
+  }
+
+  const [versionRecord] = await db.select().from(softwareVersions)
+    .where(eq(softwareVersions.id, deployment.softwareVersionId!));
+  if (!versionRecord) {
+    const error = 'Software version no longer exists for this deployment';
+    await failTargets(error);
+    return { dispatchedDeviceIds: [], error };
+  }
+
+  const [catalogItem] = await db.select({
+    id: softwareCatalog.id,
+    orgId: softwareCatalog.orgId,
+    name: softwareCatalog.name,
+    integrationProvider: softwareCatalog.integrationProvider,
+  }).from(softwareCatalog)
+    .where(eq(softwareCatalog.id, versionRecord.catalogId));
+  if (!catalogItem) {
+    const error = 'Catalog item no longer exists for this deployment';
+    await failTargets(error);
+    return { dispatchedDeviceIds: [], error };
+  }
+
+  const dependencyError = dependencyFingerprintError(
+    deployment.dependencyFingerprint,
+    fingerprintSoftwareVersionDependency(versionRecord, catalogItem),
+  );
+  if (dependencyError) {
+    await failTargets(dependencyError);
+    return { dispatchedDeviceIds: [], error: dependencyError };
+  }
+
+  // markDispatched: false — the deployment already carries its dispatched_at
+  // claim from the original run; a retry must not re-stamp it.
+  const fanout = await buildAndDispatchSoftwareInstalls({
+    deploymentId: deployment.id,
+    orgId,
+    versionRecord,
+    catalogItem,
+    deviceIds,
+    scopeToDeviceIds: deviceIds,
+    options: (deployment.options ?? null) as Record<string, unknown> | null,
+    createdBy,
+    markDispatched: false,
+    deviceRetryCounts,
+  });
+
+  return {
+    dispatchedDeviceIds: fanout.dispatchedDeviceIds,
+    ...(fanout.status === 'failed' && fanout.message ? { error: fanout.message } : {}),
+  };
+}
+
+// POST /deployments/:id/retry - Retry failed per-device results
+softwareRoutes.post(
+  '/deployments/:id/retry',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareExecute,
+  requireMfa(),
+  zValidator('param', deploymentIdParamSchema),
+  optionalJsonValidator(retryDeploymentSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const { id } = c.req.valid('param');
+    const { deviceIds } = c.req.valid('json');
+
+    // Strict parent, same as list/summary/get/cancel. The per-device retry
+    // narrowing below is not sufficient on its own: without this the parent
+    // still resolves for a site-restricted caller, so a deployment that
+    // `GET /deployments/:id` refuses to show is still confirmed to exist here
+    // (and remains mutable) — an existence oracle around the SEC-046 gate.
+    const [deployment] = await db.select().from(softwareDeployments)
+      .where(and(
+        eq(softwareDeployments.id, id),
+        eq(softwareDeployments.orgId, orgId),
+        softwareDeploymentSiteScopePredicate(
+          softwareDeployments.id,
+          c.get('permissions') as UserPermissions | undefined,
+        ),
+      ));
+    if (!deployment) return c.json({ error: 'Deployment not found' }, 404);
+
+    // Retrying an undispatched scheduled/maintenance deployment makes no sense —
+    // its rows are pending because the scheduler hasn't run it yet, not failed.
+    if (!deployment.dispatchedAt) {
+      return c.json(
+        { error: 'Deployment has not been dispatched yet — only deployments that already ran can be retried' },
+        409,
+      );
+    }
+
+    // Site is an app-layer concept only — RLS doesn't defend it — so a
+    // site-restricted caller must not be able to re-trigger installs on
+    // devices in sites outside their allowlist (see PR #864/#868).
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    let siteAllowedDeviceIds: string[] | null = null;
+    if (permissions?.allowedSiteIds) {
+      const orgDevices = await db
+        .select({ id: devices.id, siteId: devices.siteId })
+        .from(devices)
+        .where(eq(devices.orgId, orgId));
+      siteAllowedDeviceIds = orgDevices
+        .filter((device) => typeof device.siteId === 'string' && canAccessSite(permissions, device.siteId))
+        .map((device) => device.id);
+      if (siteAllowedDeviceIds.length === 0) {
+        return c.json({ retriedDeviceIds: [], skippedDeviceIds: deviceIds ?? [] });
+      }
+    }
+
+    // Flip targeted failed rows back to pending, bumping retryCount and
+    // clearing prior-attempt fields. .returning() tells us which rows actually
+    // flipped — requested devices that were not in failed status (or not part
+    // of this deployment), or outside the caller's site scope, are reported as
+    // skipped.
+    const conditions = [
+      eq(deploymentResults.deploymentId, id),
+      eq(deploymentResults.status, 'failed'),
+    ];
+    if (deviceIds && deviceIds.length > 0) {
+      conditions.push(inArray(deploymentResults.deviceId, deviceIds));
+    }
+    if (siteAllowedDeviceIds) {
+      conditions.push(inArray(deploymentResults.deviceId, siteAllowedDeviceIds));
+    }
+
+    // .returning() also carries the post-increment retryCount per device
+    // (not just deviceId) — the re-dispatch below MUST bake this NEW attempt
+    // number into the WS command id it builds so a late result from the
+    // attempt being retried can never be misattributed to this one (see
+    // dispatchSoftwareInstallToDevice / applySoftwareInstallResult). This
+    // UPDATE...RETURNING is the ordering guarantee: retryCount is bumped in
+    // the DB before redispatchSoftwareInstall (and therefore the new command
+    // id) is ever constructed.
+    const flipped = await db.update(deploymentResults)
+      .set({
+        status: 'pending',
+        retryCount: sql`${deploymentResults.retryCount} + 1`,
+        startedAt: null,
+        completedAt: null,
+        exitCode: null,
+        output: null,
+        errorMessage: null,
+        deviceCommandId: null,
+      })
+      .where(and(...conditions))
+      .returning({ deviceId: deploymentResults.deviceId, retryCount: deploymentResults.retryCount });
+
+    const retriedDeviceIds = flipped.map((row) => row.deviceId);
+    const retriedSet = new Set(retriedDeviceIds);
+    const skippedDeviceIds = (deviceIds ?? []).filter((deviceId) => !retriedSet.has(deviceId));
+    const deviceRetryCounts = Object.fromEntries(
+      flipped.map((row) => [row.deviceId, row.retryCount]),
+    );
+
+    let dispatchError: string | undefined;
+    if (retriedDeviceIds.length > 0) {
+      const dispatchResult = await redispatchSoftwareInstall({
+        deployment,
+        orgId,
+        deviceIds: retriedDeviceIds,
+        createdBy: auth.user?.id ?? null,
+        deviceRetryCounts,
+      });
+      dispatchError = dispatchResult.error;
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'software.deployment.retry',
+      resourceType: 'software_deployment',
+      resourceId: id,
+      resourceName: deployment.name,
+      details: {
+        retriedCount: retriedDeviceIds.length,
+        skippedCount: skippedDeviceIds.length,
+        ...(deviceIds && deviceIds.length > 0 ? { requestedDeviceIds: deviceIds } : {}),
+      },
+    });
+
+    return c.json({
+      retriedDeviceIds,
+      skippedDeviceIds,
+      ...(dispatchError ? { message: dispatchError } : {}),
+    });
+  }
+);
+
+// GET /deployments/:id/results - Get per-device results (enriched)
+softwareRoutes.get(
+  '/deployments/:id/results',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('param', deploymentIdParamSchema),
+  zValidator('query', listDeploymentResultsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const { id } = c.req.valid('param');
+    const query = c.req.valid('query');
+    const { limit, offset } = getLimitOffset(query);
+
+    // Strict parent, same as list/summary/get/cancel. The per-device result
+    // narrowing below is not sufficient on its own: without this the parent
+    // still resolves for a site-restricted caller, so a deployment that
+    // `GET /deployments/:id` refuses to show is still confirmed to exist here
+    // (returning 200 with an empty page) — an existence oracle around the
+    // SEC-046 gate.
+    const [deployment] = await db.select().from(softwareDeployments)
+      .where(and(
+        eq(softwareDeployments.id, id),
+        eq(softwareDeployments.orgId, orgId),
+        softwareDeploymentSiteScopePredicate(
+          softwareDeployments.id,
+          c.get('permissions') as UserPermissions | undefined,
+        ),
+      ));
+    if (!deployment) return c.json({ error: 'Deployment not found' }, 404);
+
+    const conditions: SQL[] = [eq(deploymentResults.deploymentId, id)];
+    if (query.status) {
+      conditions.push(eq(deploymentResults.status, query.status));
+    }
+    // Site is an app-layer concept only — RLS doesn't defend it — so a
+    // site-restricted caller must not see per-device results (hostname, exit
+    // code, output) for devices in sites outside their allowlist (#864/#868).
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    if (permissions?.allowedSiteIds) {
+      const orgDevices = await db
+        .select({ id: devices.id, siteId: devices.siteId })
+        .from(devices)
+        .where(eq(devices.orgId, orgId));
+      const siteAllowedDeviceIds = orgDevices
+        .filter((device) => typeof device.siteId === 'string' && canAccessSite(permissions, device.siteId))
+        .map((device) => device.id);
+      if (siteAllowedDeviceIds.length === 0) {
+        return c.json({ data: [], total: 0 });
+      }
+      conditions.push(inArray(deploymentResults.deviceId, siteAllowedDeviceIds));
+    }
+    const whereClause = and(...conditions);
+
+    // Single joined page query: devices for hostname (the UI must not render
+    // UUIDs or N+1-fetch device names), device_commands for the derived
+    // queuedOffline flag — a result still 'pending' whose offline-queued
+    // command has not been claimed by the agent yet ("queued — device
+    // offline", not a misleading in-progress spinner). COALESCE folds the
+    // NULLs from the left joins (WS-dispatched rows have no linked command)
+    // to false.
+    const [results, countRows] = await Promise.all([
+      db.select({
+        id: deploymentResults.id,
+        deploymentId: deploymentResults.deploymentId,
+        deviceId: deploymentResults.deviceId,
+        status: deploymentResults.status,
+        startedAt: deploymentResults.startedAt,
+        completedAt: deploymentResults.completedAt,
+        exitCode: deploymentResults.exitCode,
+        output: deploymentResults.output,
+        errorMessage: deploymentResults.errorMessage,
+        retryCount: deploymentResults.retryCount,
+        deviceCommandId: deploymentResults.deviceCommandId,
+        hostname: devices.hostname,
+        queuedOffline: sql<boolean>`coalesce(${deploymentResults.status} = 'pending' and ${deploymentResults.deviceCommandId} is not null and ${deviceCommands.status} = 'pending', false)`,
+      })
+        .from(deploymentResults)
+        .leftJoin(devices, eq(deploymentResults.deviceId, devices.id))
+        .leftJoin(deviceCommands, eq(deploymentResults.deviceCommandId, deviceCommands.id))
+        .where(whereClause)
+        .orderBy(devices.hostname, deploymentResults.deviceId, deploymentResults.id)
+        .limit(limit)
+        .offset(offset),
+      db.select({ count: sql<number>`count(*)::int` })
+        .from(deploymentResults)
+        .where(whereClause),
+    ]);
+
+    return c.json({ data: results, total: Number(countRows[0]?.count ?? 0) });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// INVENTORY ROUTES
+// ---------------------------------------------------------------------------
+
+// GET /inventory - List software inventory
+softwareRoutes.get(
+  '/inventory',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('query', listInventorySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const query = c.req.valid('query');
+
+    // Get devices for org, narrowed by the caller's site allowlist when set.
+    // Site is an app-layer concept only — RLS doesn't defend it — so a
+    // partner-scope user restricted to one site must not see inventory for
+    // devices in other sites within the same org. See PR #864/#868.
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    const orgDevices = await db
+      .select({ id: devices.id, siteId: devices.siteId })
+      .from(devices)
+      .where(eq(devices.orgId, orgId));
+    const allowedDeviceIds = orgDevices
+      .filter((device) => !permissions?.allowedSiteIds
+        || (typeof device.siteId === 'string' && canAccessSite(permissions, device.siteId)))
+      .map((device) => device.id);
+
+    if (allowedDeviceIds.length === 0) {
+      return c.json({ data: [], total: 0 });
+    }
+
+    // If caller filtered to a specific deviceId, verify it's in the allowed set
+    // — otherwise return 403 (do NOT silently return empty, which would be
+    // ambiguous with "device exists but has no inventory rows").
+    if (query.deviceId && !allowedDeviceIds.includes(query.deviceId)) {
+      return c.json({ error: 'Device not found or access denied' }, 403);
+    }
+
+    const conditions = [inArray(softwareInventory.deviceId, allowedDeviceIds)];
+    if (query.deviceId) {
+      conditions.push(eq(softwareInventory.deviceId, query.deviceId));
+    }
+    if (query.search) {
+      conditions.push(like(softwareInventory.name, `%${query.search}%`));
+    }
+
+    const items = await db.select().from(softwareInventory)
+      .where(and(...conditions))
+      .orderBy(softwareInventory.name);
+
+    return c.json({ data: items, total: items.length });
+  }
+);
+
+// GET /inventory/:deviceId - Get device software inventory
+softwareRoutes.get(
+  '/inventory/:deviceId',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareRead,
+  zValidator('param', inventoryParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const { deviceId } = c.req.valid('param');
+
+    // Verify device belongs to org AND caller's site allowlist (when set).
+    const [device] = await db.select({ id: devices.id, siteId: devices.siteId })
+      .from(devices)
+      .where(and(eq(devices.id, deviceId), eq(devices.orgId, orgId)));
+    if (!device) return c.json({ error: 'Device not found' }, 404);
+
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    if (permissions?.allowedSiteIds) {
+      if (typeof device.siteId !== 'string' || !canAccessSite(permissions, device.siteId)) {
+        return c.json({ error: 'Access to this site denied' }, 403);
+      }
+    }
+
+    const items = await db.select().from(softwareInventory)
+      .where(eq(softwareInventory.deviceId, deviceId))
+      .orderBy(softwareInventory.name);
+
+    return c.json({ data: items });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// PRIVATE SOFTWARE DOWNLOAD ORIGIN POLICY (Wave 6 Task 4, security remediation)
+// ---------------------------------------------------------------------------
+// Server-side counterpart to agent/internal/netpolicy (Tasks 1-3): the org-
+// and site-scoped allowlist of approved private origins the agent may dial
+// for managed-software downloads. Task 5 (not this file) sends the effective
+// allowlist with every managed-software command. Every endpoint here is
+// MFA-protected and requires devices:write, matching the brief — this is a
+// security-relevant policy surface, not a read-only informational one.
+
+// GET /download-policy - Effective (org-only, since no site is targeted)
+// approved-origins policy for the caller's org.
+softwareRoutes.get(
+  '/download-policy',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  requireOrgWideSoftwarePolicyAccess,
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const policy = await getOrganizationSoftwareDownloadPolicy(orgId);
+    return c.json({ data: policy });
+  }
+);
+
+// PUT /download-policy - Replace the organization's approved-origins policy.
+softwareRoutes.put(
+  '/download-policy',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  requireOrgWideSoftwarePolicyAccess,
+  zValidator('json', softwareDownloadPolicySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const payload = c.req.valid('json');
+    const result = await setOrganizationSoftwareDownloadPolicy(orgId, payload);
+    // A missing/RLS-invisible org (or a 0-row UPDATE despite the service's own
+    // prior SELECT finding a row) must not read as success — see the service's
+    // doc comment. Surfacing 404 here matches routes/orgs.ts's precedent for
+    // the same zero-row-write class of bug rather than returning 200 for a
+    // write that never persisted.
+    if (!result.ok) return c.json({ error: 'Organization not found' }, 404);
+
+    // Audit metadata is a count + version only — never the raw request URL or
+    // its query string (finding: policy-change audit rows must not carry URL
+    // query data). Written only on confirmed success, never for a rejected
+    // write.
+    writeRouteAudit(c, {
+      orgId,
+      action: 'software.downloadPolicy.update',
+      resourceType: 'organization',
+      resourceId: orgId,
+      details: {
+        version: result.policy.version,
+        approvedOriginCount: result.policy.approvedPrivateOrigins.length,
+      },
+    });
+
+    return c.json({ data: result.policy });
+  }
+);
+
+// PUT /download-policy/sites/:siteId - Replace a single site's approved-
+// origins policy. requireSiteAccess enforces the caller's site allowlist
+// (denied-site partner users get 403); the service additionally scopes the
+// site lookup to the resolved org, so a siteId belonging to a different org
+// 404s rather than silently writing (or reading) another tenant's row.
+softwareRoutes.put(
+  '/download-policy/sites/:siteId',
+  requireScope('organization', 'partner', 'system'),
+  requireSoftwareWrite,
+  requireMfa(),
+  requireSiteAccess('siteId'),
+  zValidator('param', downloadPolicySiteParamSchema),
+  zValidator('json', softwareDownloadPolicySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const { orgId } = orgResult;
+
+    const { siteId } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    const result = await setSiteSoftwareDownloadPolicy(orgId, siteId, payload);
+    if (!result.ok) return c.json({ error: 'Site not found' }, 404);
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'software.downloadPolicy.site.update',
+      resourceType: 'site',
+      resourceId: siteId,
+      details: {
+        version: result.policy.version,
+        approvedOriginCount: result.policy.approvedPrivateOrigins.length,
+      },
+    });
+
+    // Return the EFFECTIVE (org ∪ site) policy — what Task 5's dispatch path
+    // will actually send to devices at this site — not just the site's own
+    // delta, so the operator sees the real outcome of the write.
+    return c.json({ data: result.effective });
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Chunked upload sessions (issue #2951). Mounted after `use('*',
+// authMiddleware)` above, so the sub-router's handlers run behind auth.
+// ---------------------------------------------------------------------------
+softwareRoutes.route('/', softwareUploadRoutes);
+
+// ---------------------------------------------------------------------------
+// Package-manager (winget/Homebrew) install-method CRUD. Same mounting
+// pattern as softwareUploadRoutes above.
+// ---------------------------------------------------------------------------
+softwareRoutes.route('/', softwareInstallMethodRoutes);
+
+// ---------------------------------------------------------------------------
+// GET /software/package-search — winget/Homebrew typeahead. Same mounting
+// pattern as the sub-routers above.
+// ---------------------------------------------------------------------------
+softwareRoutes.route('/', packageSearchRoutes);

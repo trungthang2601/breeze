@@ -1,0 +1,659 @@
+---
+title: Remote Access
+description: Remote Desktop and Remote Terminal for managed devices over WebRTC, with TURN relay support, WebSocket fallback, and MFA-gated session permissions.
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Breeze provides two real-time access capabilities for managed devices: **Remote Desktop** (interactive screen viewing and control) and **Remote Terminal** (browser-based interactive shell). Each is a separate session type created through the same `/remote/sessions` API. File movement between the technician and the device is handled by the device Files tab (the system-tools file browser), not by a remote session.
+
+Remote desktop sessions use WebRTC as the primary transport. The Breeze server acts as a signaling relay during connection setup — it brokers the initial SDP offer/answer exchange and ICE candidate negotiation between the native viewer app and the device agent. Once the peer-to-peer connection is established, video, audio, and input data flow directly between the viewer and the agent and do not transit the Breeze server.
+
+The Breeze stack includes a **coturn TURN server** that relays WebRTC traffic when a direct peer-to-peer connection is not possible (symmetric NAT, restrictive firewalls). The API generates short-lived TURN credentials via a shared secret and distributes them to both the viewer and agent during ICE negotiation. See [Environment Variables](/deploy/environment/#webrtc--turn) for configuration.
+
+If WebRTC negotiation fails even with TURN (e.g., TURN is misconfigured or unreachable), the viewer automatically falls back to a WebSocket transport that relays JPEG frames through the Breeze server. The WebSocket fallback has reduced capabilities compared to WebRTC — no audio, no clipboard sync, no multi-monitor switching, and no low-latency cursor streaming.
+
+<Aside>
+  Multi-factor authentication (MFA) is required for all remote access sessions. Your role must also include the `remote:access` permission — see **Settings → Roles** if session creation returns "Access denied."
+</Aside>
+
+---
+
+## Remote Desktop
+
+Remote Desktop streams the device's screen to your browser and forwards your mouse and keyboard input back to the device in real time, giving you full interactive control as if you were physically present at the machine.
+
+### Starting a desktop session
+
+<Steps>
+
+1. Navigate to **Devices**, locate the target device, and open its detail page.
+
+2. Click **Connect** and select **Desktop**.
+
+3. A fullscreen viewer opens once the WebRTC connection is active.
+
+4. Mouse movement and clicks are captured and relayed to the device in real time.
+
+5. Keyboard input is forwarded directly — use the **Release Input** button or press **Escape** (if configured) to return control to your browser.
+
+</Steps>
+
+### Connection flow
+
+The browser and device negotiate a WebRTC peer-to-peer connection through the Breeze server:
+
+1. `POST /remote/sessions` with `type: "desktop"` — creates the session record.
+2. `GET /remote/ice-servers` — retrieve STUN/TURN server configuration.
+3. `POST /remote/sessions/:id/offer` — send the SDP offer from the browser.
+4. The authenticated device agent returns its answer and any endpoint consent verdict over its command-result channel.
+5. `POST /remote/sessions/:id/ice` — exchange ICE candidates.
+6. `POST /remote/sessions/:id/ws-ticket` — mint a one-time WebSocket ticket.
+7. Connect via WebSocket using the ticket.
+
+Once the P2P connection is active, screen data flows directly between the browser and the agent.
+
+### Session lease and revocation
+
+Because a desktop session is peer-to-peer, screen and input traffic flows straight between the viewer and the device once the connection is up — the Breeze server is no longer in that path. A **session lease** keeps the server in control anyway.
+
+The agent holds a short lease and renews it about every 25 seconds over its existing control connection. Each renewal re-checks, live, that the technician is still allowed to be there:
+
+- the session is still open and the user account is still active;
+- the user is still a member of the customer organisation the device belongs to;
+- their role, role permissions, and site scope have not changed since the session started;
+- the device is still inside their site scope;
+- multi-factor authentication is still satisfied under the current role policy;
+- the session's hard time limit has not been reached.
+
+The MFA check evaluates the role's *actual, effective* MFA policy, not just its raw flag — a Partner Admin who hasn't enrolled an MFA factor no longer has their desktop sessions revoked when MFA isn't actually required by policy.
+
+If any of those checks fails, the session ends within about half a minute: the agent stops capture and input, the viewer shows **Session ended: access revoked**, and the session record is marked disconnected. Removing a technician's membership or changing their role now ends their live sessions immediately as well, rather than only blocking the next one.
+
+If the server is briefly unreachable, the session is **not** dropped — the agent tolerates about 90 seconds of failed renewals before ending the session on its own. That way a short API or network hiccup does not disconnect anyone, while a device that genuinely cannot reach Breeze cannot hold a remote-control session open indefinitely.
+
+<Aside type="caution">
+  **Agent update required.** Only agents that support session leases can start a remote desktop session. If you click **Connect → Desktop** and see *"Remote desktop needs an agent update on this device"*, the agent has not yet reported lease support — agents update themselves automatically, so this normally clears within one heartbeat interval (about a minute). If you pin agent versions in a self-hosted deployment, update the pinned build before your technicians will be able to start desktop sessions again. Remote Terminal, the Files tab, and every other remote tool are unaffected.
+</Aside>
+
+### Session time limits
+
+Every remote desktop session has a hard limit of **12 hours**, enforced both by the server and independently by the agent. A remote-access configuration policy can shorten it through **Max session duration**, but nothing can extend it past 12 hours.
+
+<Aside type="note">
+  "Unlimited" is no longer a valid setting. A policy that stored `0` (formerly "no maximum") or a value above 12 hours now behaves as 12 hours, and saving a new value outside the 1–12 hour range is rejected. Existing policies keep working — they are simply capped.
+</Aside>
+
+The separate **Idle timeout** setting is unchanged, including `0` meaning "no idle timeout".
+
+### Windows Session 0 Support
+
+When the Breeze agent runs as a Windows service, it operates in Session 0 — an isolated session with no interactive desktop. Standard screen capture APIs (DXGI, GDI) and input injection all fail in Session 0.
+
+Breeze solves this with a **session broker** architecture:
+
+<Steps>
+
+1. The agent service detects it is running in Session 0 via `config.IsService`.
+
+2. The session broker enumerates active user sessions using the Windows Terminal Services API (WTS).
+
+3. When a remote desktop session is requested, the broker spawns a **SYSTEM-level helper process** into the target user's session using `CreateProcessAsUser` with session ID override.
+
+4. The helper process owns the entire WebRTC pipeline — DXGI screen capture, H264 encoding via Media Foundation, and WebRTC for streaming. The service only relays signaling messages (SDP offer/answer) over IPC.
+
+5. When the session ends, the helper process is torn down.
+
+</Steps>
+
+<details>
+<summary>Windows implementation details</summary>
+
+The helper uses a SYSTEM token (not `WTSQueryUserToken`) intentionally. SYSTEM can call `OpenInputDesktop(GENERIC_ALL)` which grants access to the UAC consent desktop and lock screen — something a user-level token cannot do.
+
+The `list_sessions` command returns available user sessions by merging the WTS session detector output with the broker's helper state, showing which sessions have active remote desktop connections.
+
+</details>
+
+### macOS and Linux Headless Support
+
+The same session broker architecture extends to macOS and Linux. When the agent runs as a LaunchDaemon (macOS) or systemd service (Linux), it has no display access. The agent detects this via the `IsHeadless` flag (checked by `hasConsole()` on Unix).
+
+In headless mode, all desktop and screenshot commands are routed through IPC to the Breeze Helper process running in the user's desktop session, rather than attempting direct screen capture which would silently fail. The Helper handles screen capture using platform-native APIs (Core Graphics on macOS, X11 on Linux).
+
+<Aside type="caution" title="Wayland sessions are not supported yet">
+  Remote desktop and screenshots on Linux require an X11 session. Wayland-only sessions -- the default GNOME and KDE sessions on current Ubuntu and Fedora releases, and wlroots compositors such as Hyprland and Sway -- cannot be captured. When the device has no X11 display at all, the device page reports **Wayland Unsupported** and the **Connect Desktop** button is disabled. On compositors that run XWayland for legacy apps, the agent may attach to that XWayland display instead, so a session can connect but shows only X11 application windows rather than the desktop. Terminal, scripts, and monitoring are unaffected either way. Where the login screen offers an X11 session, selecting it restores remote desktop. See [Supported Linux Distributions](/agents/installation/#supported-linux-distributions).
+</Aside>
+
+<Aside>
+  If no Helper process is connected when a remote desktop session is requested in headless mode, the agent returns an error immediately rather than streaming zero frames.
+</Aside>
+
+### Multi-Display Support
+
+Breeze supports multi-monitor remote desktop. The viewer can switch between displays on the target device. Each display is captured independently using DXGI Desktop Duplication.
+
+<Aside type="caution">
+  DXGI Desktop Duplication is delta-based — a static display with no visual changes produces zero frames. Breeze forces a desktop repaint using `InvalidateRect` and `RedrawWindow` after a monitor switch to ensure the first frame is captured immediately.
+</Aside>
+
+### Adaptive Bitrate
+
+The remote desktop pipeline uses adaptive bitrate control to maintain smooth streaming across varying network conditions. The encoder adjusts the H264 bitrate based on:
+
+- Measured network throughput between viewer and agent
+- Frame delivery latency
+- Packet loss rate
+
+The bitrate ramps up when conditions are good and drops when congestion is detected. Sessions start at a conservative bitrate and ramp up over the first seconds after connect (a brief slow-start), so expect image quality to sharpen shortly after the session opens. Each increase requires a short run of stable measurements to prevent oscillation — the first step after congestion is deliberately gentle, then consecutive clean steps accelerate, so recovery after a network dip completes in seconds rather than a minute.
+
+### Audio Streaming
+
+Remote desktop sessions can optionally stream system audio from the device to the viewer. Audio is captured from the device's default audio output and transmitted over a separate WebRTC audio track. Audio streaming is enabled by default on Windows.
+
+### Secure Desktop Capture
+
+Breeze can capture the Windows secure desktop (Ctrl+Alt+Del screen, UAC prompts, lock screen). This is possible because the helper process runs as SYSTEM with `GENERIC_ALL` access to the input desktop. Secure desktop capture is automatic — no additional configuration is required.
+
+### Session Consent & End-User Notification
+
+By default, when a technician starts a remote desktop session the person sitting at the device is told about it. You can tune this per [Configuration Policy](/features/configuration-policies/) on the **Remote Access** feature, choosing one of three session-prompt modes:
+
+| Mode | What the end user experiences |
+|------|-------------------------------|
+| **Off** | Nothing is shown. The session starts silently. |
+| **Notify** *(default)* | A desktop notification appears — "*Jordan Lee connected to your computer*" — and the session begins immediately. No approval is required. |
+| **Consent** | A dialog asks the user to **Allow** or **Deny** before the technician can see the screen. The technician's view does not start until the user allows it. |
+
+When a session is active, a small indicator ("*Jordan Lee is connected*" with a live timer) is shown at the top of the user's screen for the duration of the session, and a "*Remote session ended*" notice appears when the technician disconnects. Both can be turned off per policy.
+
+**What the end user sees in Consent mode**
+
+The consent dialog asks the user to allow or deny the remote session, with **Deny selected by default** — a privacy prompt never grants access on a stray keypress. If the user doesn't respond before the prompt times out, Breeze applies the policy's fallback (see below).
+
+**Settings (per Configuration Policy → Remote Access)**
+
+| Setting | Options | Default | Effect |
+|---------|---------|---------|--------|
+| Session prompt mode | Off / Notify / Consent | **Notify** | Whether the user is notified and/or must consent. |
+| When consent can't be asked | Proceed / Block | **Proceed** | What happens on an **unattended** machine, with no Helper installed, or when the user doesn't respond in time. **Proceed** connects anyway; **Block** refuses the session. An explicit **Deny** always blocks regardless of this setting. |
+| Notify on session end | On / Off | **On** | Whether the "session ended" notice is shown. |
+| Show active-session indicator | On / Off | **On** | Whether the top-of-screen indicator appears during the session. |
+| Technician identity shown | Name & email / Name only / Generic | **Name & email** | How much of the technician's identity is revealed to the end user. **Generic** shows "*A technician*" with no name or email. |
+
+<Aside>
+  These surfaces are drawn by the **Breeze Helper** running in the signed-in user's desktop session. On an unattended machine (no user logged in, or the Helper not installed), there is no one to notify or ask — in **Consent** mode, Breeze then applies the *"When consent can't be asked"* fallback. With **Proceed** (the default), unattended and headless machines are never locked out.
+</Aside>
+
+<Aside type="note">
+  **Upgrade behavior:** Because the default prompt mode is **Notify**, devices with the Breeze Helper installed begin showing a start notice for remote sessions after upgrade. To restore silent behavior, set the **Remote Access** feature on a Configuration Policy to prompt mode **Off**.
+</Aside>
+
+Every consent outcome is audit logged — granted, denied, or bypassed (with the reason, for example no user logged in).
+
+### GPU-Accelerated Streaming
+
+Remote desktop uses hardware GPU encoding when available for better performance. The agent supports NVIDIA (NVENC), AMD (AMF), and Intel (QuickSync) GPUs and auto-selects the best encoder based on the device's hardware.
+
+As of v0.89.0, hardware encoding on Windows is significantly more reliable and faster: a bug that caused Intel systems to silently fall back to software encoding has been fixed, encode latency is dramatically lower, and streams show fewer artifacts and less smearing at high resolutions. No configuration is needed — devices pick up the improvement with the agent update.
+
+If the hardware encoder stalls (for example, due to a driver issue), the agent automatically switches to a software encoder within approximately 600 milliseconds — previous builds took around 11 seconds to recover. Headless servers without a GPU use software rendering automatically with no configuration needed.
+
+### VNC Fallback and In-Window Switcher (macOS)
+
+Some macOS devices and scenarios — older releases, certain hardware configurations, or sessions started at the login screen — cannot use WebRTC remote desktop. Breeze auto-detects these situations and falls back to VNC via the built-in macOS Screen Sharing service.
+
+In the **Breeze Viewer** desktop app, you can switch between WebRTC and VNC transports inside the same session window. If WebRTC degrades or fails, the viewer hands off to VNC without closing the window or losing your place. When conditions improve, you can switch back. From the web app, the **Remote Desktop** button hands off to the viewer via a deep link when VNC is the right transport, so the experience is consistent whether you start from the browser or the app.
+
+When the fallback activates, the system tunnels VNC through the agent connection. When you disconnect, the VNC password is cleared — no credentials persist on the device.
+
+<Aside type="note">
+  The agent no longer disables Apple Remote Management on startup. If you use Screen Sharing alongside Breeze, it stays enabled. VNC fallback behavior is controlled by the `manageRemoteManagement` Configuration Policy flag (off by default). When VNC is needed and Screen Sharing is not already enabled, the agent returns an informative error asking you to enable the policy or enable Screen Sharing manually on the device.
+</Aside>
+
+### Session Switcher
+
+A dropdown in the remote desktop toolbar shows all active user sessions on the target device. Click a session to switch to it — there is no need to disconnect and reconnect.
+
+This is particularly useful on multi-user Windows servers and macOS machines with multiple logged-in users. If the switch fails for any reason, the viewer automatically recovers the previous session.
+
+### OS Keyboard Shortcuts
+
+The viewer toolbar includes a keyboard shortcut menu that adapts to the target device's operating system:
+
+- **Windows**: Ctrl+Alt+Del, Win+L, Win+R, and other system shortcuts
+- **macOS**: Cmd+Option+Esc, Cmd+Q, and other macOS shortcuts
+- **Linux**: Ctrl+Alt+Backspace and other Linux shortcuts
+
+Select a shortcut from the menu to inject it into the remote session. This avoids the problem of your local operating system intercepting the key combination before it reaches the viewer.
+
+### Login Screen Input (macOS)
+
+Keyboard and mouse input works at the macOS login screen during remote desktop sessions. You can type passwords and interact with login UI elements remotely. This uses a low-level input method that operates below the normal event system, so it functions even when no user session is active.
+
+The agent dynamically switches input handling when the console transitions to or from the login window, so keyboard and mouse keep working through sign-in and sign-out events without reconnecting the session.
+
+### Network Proxy
+
+Network Proxy lets you access web-based admin UIs on an agent's local network without a VPN — router web interfaces, NAS management panels, printer admin pages, switch management ports, and similar resources. There is no persistent tunnel: each request the browser makes to the target device is relayed as a separate command over the agent's existing connection, fetched locally by the agent, and returned. This keeps the network footprint minimal, but it does mean the target's own web UI runs through a per-request proxy rather than a raw socket — no WebSocket-based device UIs, and individual responses are capped at 16 MiB.
+
+**Starting a proxy session:**
+
+<Steps>
+
+1. Go to **Devices → Network** and open the discovered device's detail page.
+
+2. Find the open port for the service you want to reach (80, 443, 8080, and similar web ports are detected automatically) and click **Open Web UI** on that port.
+
+3. In the **Proxy to `ip:port`** popover, pick the agent to proxy **through**. This defaults to the agent that discovered the device on its network — not any device you've linked to this asset for identity purposes, since bridging traffic through the identity-linked device would be a loopback. Choose a different online agent if needed, set the scheme, and check **Allow self-signed certificate** up front if you already know the target uses one (common for printers, iLO/IPMI, and switches).
+
+4. Click **Connect**. The LAN device's web UI opens in a new tab.
+
+</Steps>
+
+<Aside type="note">
+  If the target device uses a self-signed certificate and you didn't check the box up front, the request fails with an untrusted-certificate error and the session shows a **Reconnect allowing self-signed certificate** button in place. Clicking it opens a fresh session to the same target with certificate verification skipped — it does not change any persistent trust settings, and it only applies to that session.
+</Aside>
+
+**Session lifetime:**
+
+A proxy session stays alive as long as it's actively used: each request slides the session's expiry forward, so there's no fixed cutoff while you're working — up to an absolute cap of 12 hours from when the session started. If the session sits idle for 10 minutes with no requests, it stops sliding and the page shows a **Session expired — Reconnect** state instead of silently failing behind the scenes. Clicking **Reconnect** reloads the embedded page from scratch, so any in-progress form state on the target device's own web UI (for example, a partially filled-out printer configuration page) is lost — save your work on the target's UI before stepping away for a while.
+
+**Security model:**
+
+- **Default-deny allowlists** control which destinations agents can proxy to. Configure allowlists per-site in **Settings → Remote Access**. Connecting through the popover automatically allowlists the single `ip:port` you connected to — it does not open the whole host.
+- **Source IP restrictions** limit which users or networks can open proxy sessions.
+- Idle timeout and an absolute 12-hour session cap apply to prevent long-lived, unattended sessions.
+- A built-in SSRF-safe blocklist prevents proxying to internal metadata endpoints and loopback addresses.
+- Each proxy session is associated with a specific user and fully audit logged.
+
+### Wake-on-LAN
+
+Wake-on-LAN powers on an offline device from the Breeze dashboard without visiting it physically. Because the Breeze server cannot send packets on your local network, the wake is relayed through another online agent on the same network as the target.
+
+**Requirements:**
+
+- The target device must have Wake-on-LAN enabled in its BIOS/UEFI (often labelled "Power on by LAN" or "Wake on Magic Packet").
+- The target must have checked in at least once so Breeze has its MAC address(es) and one or more recorded non-APIPA IPv4 subnets. APIPA addresses (`169.254.0.0/16`) are skipped — they're a sign of a broken DHCP lease and don't represent the real LAN.
+- At least one other agent must be online at the same site and on a matching subnet to relay the magic packet. Breeze tries every plausible candidate subnet recorded for the target, in priority order, until one succeeds.
+
+**Sending a wake:**
+
+<Steps>
+
+1. Go to **Devices** and open the offline device's detail page.
+
+2. Click **Actions** and select **Wake**.
+
+3. Breeze automatically chooses an online relay agent at the target's site and subnet, sends the magic packet, and reports the relay device and MAC addresses attempted.
+
+</Steps>
+
+If a wake cannot be sent, Breeze returns a specific reason rather than failing silently — the most common are: the target has no recorded MAC address, no known IPv4 subnet (only IPv6), or no online agent is available at its site and subnet to relay the packet. Every wake attempt — successful or not — is recorded in the audit log with the actor, target, relay device, MACs attempted, and result.
+
+### Pluggable Remote-Desktop Launcher
+
+By default, **Connect → Desktop** opens the built-in Breeze WebRTC desktop session. MSPs that standardise on a third-party tool (RustDesk, ScreenConnect, TeamViewer, AnyDesk, and similar) can configure Breeze to hand off to that tool instead, per partner.
+
+**Configuring a provider:**
+
+<Steps>
+
+1. Go to **Settings** and open **Remote Access** (under Security & Access; partner-level access required).
+
+2. Keep the built-in WebRTC desktop session (the default, which cannot be deleted), or click **Add provider**.
+
+3. Give the provider a name and a launch-URL template. The template supports placeholders that Breeze substitutes at click time:
+   - `{id}` — the device's per-tool identifier, read from a device custom field
+   - `{password}` — an optional preset password (URL-encoded automatically)
+   - `{customFieldKey}` — the value of any device custom field by key
+
+   Example: `rustdesk://{id}?password={password}` or `https://acme.screenconnect.com/Host#Access///{id}/Join`.
+
+4. Specify the custom-field key that holds each device's identifier (for example `rustdesk_id`), and optionally a preset password. Mark the provider **Enabled**, and **Default** if it should replace the built-in launcher.
+
+</Steps>
+
+Each device then needs that custom field populated with its identifier for the tool. When a user clicks **Connect → Desktop**, Breeze substitutes the values and either opens the URL in a new browser tab (`http`/`https`) or hands it to the operating system's protocol handler (any other scheme, e.g. `rustdesk://`). If the launcher can't issue a URL — provider disabled, no provider configured, device is missing the required custom field, or the resolved URL fails the scheme check — the UI surfaces the specific reason instead of silently falling back to WebRTC, so you can fix the configuration rather than guess why a click did nothing.
+
+**Security:**
+
+- Launch URLs are validated against an allowed-scheme list both when the template is saved and again when the URL is issued. Dangerous schemes (`javascript:`, `data:`, `vbscript:`, `file:`, `about:`, `chrome:`, `jar:`, `blob:`, `view-source:`, `filesystem:`) are rejected.
+- Preset passwords are stored server-side only and are never embedded in the web bundle or earlier API responses. The launch URL is issued one-shot in response to an explicit user click and each issuance is audit logged.
+
+**Per-technician preference.** Each technician can pick their own remote tool from the tenant's enabled providers under **Settings → Profile → Preferred remote tool**. The preference only selects among providers the partner has already configured — it can never add one — and only affects that user's own **Connect → Desktop** clicks. If the chosen provider is later disabled or deleted, launches fall back to the tenant default. The chooser is hidden from users without remote-access permission.
+
+---
+
+## Remote Terminal
+
+Remote Terminal opens an interactive shell session rendered in the browser using xterm.js. It is a PTY session on the device — keystrokes are sent to the device's shell and output is streamed back in real time, with full terminal emulation including colour, cursor control, and resizing.
+
+On Windows, terminal sessions use the modern **ConPTY** pseudo-console API, so colours, resizing, and interactive prompts behave the same as a local PowerShell window. macOS and Linux use a standard POSIX PTY.
+
+### Starting a terminal session
+
+<Steps>
+
+1. Navigate to **Devices**, locate the target device, and open its detail page.
+
+2. Click **Connect** and select **Terminal**.
+
+3. A browser terminal window opens. Wait for the **connected** indicator in the toolbar before typing — the terminal is ready only after the WebRTC P2P connection is fully established and the agent confirms the PTY is open.
+
+4. Resizing the browser window (or the terminal pane) automatically adjusts the PTY dimensions on the device.
+
+</Steps>
+
+### Connection flow
+
+The connection flow is identical to Remote Desktop:
+
+1. `POST /remote/sessions` with `type: "terminal"` — creates the session record.
+2. `GET /remote/ice-servers` — retrieve STUN/TURN configuration.
+3. `POST /remote/sessions/:id/offer` — send the SDP offer.
+4. `POST /remote/sessions/:id/ws-ticket` — mint the WebSocket ticket.
+5. Connect via WebSocket using the ticket.
+
+---
+
+## Quick Support (ad-hoc sessions)
+
+Quick Support connects you to a machine that runs **no permanently enrolled agent** — a customer's home PC, a prospect's laptop, a device not yet onboarded. Rather than enrolling the device for real, the end user runs a client that exists only for the duration of one session.
+
+<Steps>
+
+1. On **Remote Access → Quick Support**, create a session. Optionally attribute it to a customer organization and add a label (e.g. "Contoso — CFO laptop"). Attribution is for reporting only; it does not grant or change access to that customer's data.
+
+2. Breeze returns a one-time code (`234-567-892`) and a link. Codes are digits only (2–9, with no 0 or 1) and displayed in groups of three so they read cleanly over the phone. **The code is shown once and cannot be retrieved again.** It expires in 15 minutes. Codes issued before v0.105.0 that contain letters remain redeemable.
+
+3. Send the link or read the code out. The end user opens the link, downloads the client, and runs it. The code is embedded in the download's filename, so they normally never type it — the landing page also accepts manual code entry if they arrive without one.
+
+4. When the client connects, the session becomes **Ready** and a Connect button appears. From there it is an ordinary remote desktop session.
+
+5. **End session** revokes the client's credentials, tells it to remove itself, and drops its connection.
+
+</Steps>
+
+Clicking a row in the session history re-opens a live detail panel for that session — you can connect to (or end) a still-active session from history; only the one-time code stays create-time-only.
+
+<Aside type="caution">
+  Quick Support requires **partner scope**. An organization-scoped login cannot create these sessions. Sessions are visible to all technicians at your partner, not only their creator.
+</Aside>
+
+**What the end user's machine gets.** The client runs in the user's own session, is not installed as a service, and deletes itself when the session ends. It enrolls an *ephemeral* device that is deliberately invisible to the rest of Breeze: it never counts toward your device licence, never appears in device lists, reports or invoices, and is never patched, rebooted, backed up or alerted on. The reaper removes the device record six hours after the session ends.
+
+**How a session ends.** Whichever comes first: you end it; the end user closes the client (detected when the device goes offline); or the eight-hour hard cap expires. If the self-destruct command is ever lost, the client's own ten-minute dead-man switch shuts it down.
+
+<Aside>
+  Phase 1 ships a **Windows** client. macOS is planned. The elevated mode that allows control of UAC prompts is not yet available — the client currently runs with the end user's own privileges.
+</Aside>
+
+---
+
+## Session Lifecycle
+
+All session types follow the same state machine:
+
+```
+pending → connecting → active → disconnected / failed / denied
+```
+
+| State | Description |
+|-------|-------------|
+| `pending` | Session record created; device agent has not yet acknowledged the request |
+| `connecting` | Device acknowledged; SDP offer/answer exchange and ICE negotiation in progress |
+| `active` | WebRTC P2P connection established; data flowing between browser and device |
+| `disconnected` | Session ended normally — user closed it or the agent reported a clean disconnect |
+| `failed` | Connection could not be established, or an active connection dropped unexpectedly |
+| `denied` | The end user declined the connection at the consent prompt (or the policy's *"When consent can't be asked"* fallback was set to **Block**). The technician sees that the user denied the remote connection. |
+
+A session ended by the lease recheck (see [Session lease and revocation](#session-lease-and-revocation)) becomes `disconnected` with a recorded reason such as `revoked:membership_removed`, `revoked:permissions_changed`, `revoked:site_scope_lost` or `revoked:hard_deadline`, which appears in the session's history entry.
+
+When a session ends (`disconnected` or `failed`), the platform records `durationSeconds` (calculated from start time). The `bytesTransferred` field is available but must be supplied by the caller when ending the session via `POST /remote/sessions/:id/end`.
+
+---
+
+## Session Recording
+
+Breeze does not record sessions itself. What it provides is a place to attach a link to a recording produced elsewhere — for example, a screen-recording pipeline your organization runs alongside remote sessions — and a way for technicians to open that link later from the session's history entry.
+
+If the caller ending a session (`POST /remote/sessions/:id/end`) includes a `recordingUrl` in the request body, it is stored on the session. Only an absolute `http(s)` URL on an allow-listed origin (`RECORDING_URL_ALLOWED_ORIGINS`), or a same-origin path starting with `/`, is accepted — anything else is rejected.
+
+<Steps>
+
+1. Go to **Remote Access → Session History**.
+2. Click a row to open its details panel.
+3. If a recording link was attached when the session ended, a **Recording** section appears with a **View Recording** button that opens the link in a new tab. Sessions ended without a `recordingUrl` show no such section.
+
+</Steps>
+
+---
+
+## Rate Limits
+
+Breeze enforces per-organisation and per-user limits on concurrent remote access resources. When a limit is reached, the creation request returns `429 Too Many Requests`.
+
+| Resource | Per-org | Per-user |
+|----------|---------|----------|
+| Active sessions | 10 | 5 |
+
+These defaults are configurable via environment variables on the API server:
+
+| Variable | Default |
+|----------|---------|
+| `MAX_ACTIVE_REMOTE_SESSIONS_PER_ORG` | 10 |
+| `MAX_ACTIVE_REMOTE_SESSIONS_PER_USER` | 5 |
+
+To free session capacity, close active sessions from the Active Sessions list on the device detail page, or call `DELETE /remote/sessions/stale` — this marks `pending`, `connecting`, and `active` sessions as `disconnected`. Be aware this terminates any currently active sessions, not just stale ones.
+
+---
+
+## Security
+
+**MFA required for all remote access.** Every session creation request is gated by MFA verification at the route level. A valid MFA check must be present before a remote session can be created.
+
+**Server is a signaling relay for WebRTC.** The Breeze server brokers WebRTC negotiation (SDP offer/answer and ICE candidates). Once the P2P connection is established, device data does not transit the server. If the WebSocket fallback is active, frame data is relayed through the server but is not persisted.
+
+**All sessions are audit logged.** Every session creation, state transition, and termination is recorded with the actor identity, device identifier, start time, end time, duration in seconds, and bytes transferred. Audit records are immutable.
+
+**Consent is audit logged.** When session consent or notification is enabled by policy, each session records whether the end user granted, denied, or had consent bypassed (with the reason — for example, no user logged in), alongside the technician identity disclosed.
+
+**Remote access requires the `remote:access` permission.** This permission is not granted by default on all roles. Navigate to **Settings → Roles** if a user receives "Access denied" when creating a session.
+
+---
+
+## API Reference
+
+### Sessions
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/remote/sessions` | Create a session (body: `deviceId`, `type`) |
+| GET | `/remote/sessions` | List sessions (`?deviceId=&status=&type=&includeEnded=`) |
+| GET | `/remote/sessions/:id` | Get session details |
+| GET | `/remote/sessions/history` | Session statistics (total sessions, total duration, average duration) |
+| DELETE | `/remote/sessions/stale` | Terminate all pending, connecting, and active sessions |
+| GET | `/remote/ice-servers` | Get ICE/TURN server configuration for WebRTC |
+| POST | `/remote/sessions/:id/offer` | Send SDP offer from browser to device |
+| POST | `/remote/sessions/:id/ice` | Exchange ICE candidates between browser and device |
+| POST | `/remote/sessions/:id/ws-ticket` | Mint a one-time WebSocket ticket (required for terminal and desktop) |
+| POST | `/remote/sessions/:id/end` | End a session (optional body: `bytesTransferred`, `recordingUrl` — see [Session Recording](#session-recording)) |
+
+### Network Proxy Tunnels
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/remote/tunnels` | Create a tunnel session (body: `deviceId`, `targetHost`, `targetPort`) |
+| GET | `/remote/tunnels` | List active tunnel sessions (`?deviceId=&status=`) |
+| DELETE | `/remote/tunnels/:id` | Close a tunnel session |
+| GET | `/remote/tunnels/allowlists` | List proxy allowlists for a site |
+| POST | `/remote/tunnels/allowlists` | Create or update a proxy allowlist entry |
+| DELETE | `/remote/tunnels/allowlists/:id` | Remove a proxy allowlist entry |
+
+### Wake-on-LAN & Remote-Desktop Launcher
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/devices/:id/commands` | Body `{ "type": "wake" }` — dispatch a Wake-on-LAN magic packet to the device via an automatically selected relay agent. Returns the relay device and MACs attempted, or a specific failure reason. |
+| POST | `/mobile/devices/:id/actions` | Body `{ "action": "wake" }` — equivalent quick-action wake used by the mobile app. |
+| POST | `/devices/:id/remote-access-launch` | Issue a one-shot remote-desktop launch URL for the device's configured provider. Returns the resolved `launchUrl` and scheme, or `422` if no provider applies or the scheme is disallowed. |
+
+Remote-access providers are configured per partner under **Settings → Remote**; see [Pluggable Remote-Desktop Launcher](#pluggable-remote-desktop-launcher).
+
+### Events
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/events/ws` | Real-time event WebSocket — streams device status changes, alert triggers, and session lifecycle events |
+
+---
+
+## Linux viewer (AppImage)
+
+The Linux build of the Breeze Viewer ships as a single AppImage, `breeze-viewer-linux.AppImage`. Unlike the Windows MSI and the macOS DMG it is not installed — you download it, mark it executable, and run it once so it can register itself as the handler for `breeze://` links. Until that first run, choosing **Connect Desktop** in the console has nothing to hand the session to, and the download card reappears on every attempt.
+
+<Steps>
+
+1. Mark the download executable:
+
+   ```bash
+   chmod +x ~/Downloads/breeze-viewer-linux.AppImage
+   ```
+
+2. Run it once. A small "Breeze Viewer is ready" window confirms it launched and registered the `breeze://` scheme. You can close that window — the console reopens the viewer when a session starts.
+
+   ```bash
+   ~/Downloads/breeze-viewer-linux.AppImage
+   ```
+
+3. Confirm the scheme is claimed:
+
+   ```bash
+   xdg-mime query default x-scheme-handler/breeze
+   # → breeze-viewer.desktop
+   ```
+
+</Steps>
+
+Keep the AppImage at a stable path. The registration records the absolute path it was run from, so moving or deleting the file after the first run leaves `breeze://` pointing at a file that no longer exists — run it again from the new location to refresh the entry.
+
+### FUSE 2 is required
+
+The AppImage runtime mounts itself with FUSE 2 at launch. On a distribution that no longer ships FUSE 2 by default, the AppImage exits immediately with a message about `libfuse.so.2`, `dlopen`, or `fusermount`, and no window ever appears.
+
+The package that provides it was renamed as part of Debian's 64-bit `time_t` (`t64`) transition, which is why the familiar package name no longer resolves on current releases:
+
+| Distribution | Package to install |
+|---|---|
+| Debian 13 (trixie) and newer, Ubuntu 24.04 LTS and newer | `libfuse2t64` |
+| Debian 12 and older, Ubuntu 22.04 and older | `libfuse2` |
+| Fedora / RHEL | `fuse-libs` |
+| Arch | `fuse2` |
+| openSUSE | `libfuse2` (plus `fuse` for `fusermount`) |
+
+```bash
+# Debian 13 / Ubuntu 24.04+
+sudo apt install libfuse2t64
+```
+
+`sudo apt install libfuse2` also works on those releases — apt reports `Note, selecting 'libfuse2t64' instead of 'libfuse2'` and installs the renamed package. That message is informational, not an error.
+
+### Running without FUSE
+
+If you cannot install FUSE 2 — a hardened host, a container, or a policy that forbids the `fuse` kernel module — the AppImage can unpack itself to a temporary directory and run from there instead of mounting:
+
+```bash
+~/Downloads/breeze-viewer-linux.AppImage --appimage-extract-and-run
+```
+
+This works for a one-off session but is not a substitute for the first run above: the `Exec=` line written into the desktop entry does not carry the flag, so `breeze://` links launched from the console still take the FUSE path. To make the fallback permanent, set it in the environment the desktop session inherits:
+
+```bash
+# e.g. in ~/.profile
+export APPIMAGE_EXTRACT_AND_RUN=1
+```
+
+Extract-and-run unpacks the whole bundle on every launch, so sessions start noticeably slower and each launch writes to `$TMPDIR`. Installing FUSE 2 is the better outcome where it is allowed.
+
+### WebRTC needs webkit2gtk built with the GStreamer plugins
+
+The Linux viewer renders in webkit2gtk, the system WebView, rather than bundling its own browser engine. Whether WebRTC is available therefore depends on how your distribution compiled webkit2gtk and which GStreamer plugins are installed. This shows up two ways: on some builds `RTCPeerConnection` is not exposed at all, and on others it exists but fails the moment a connection is actually created.
+
+The viewer handles both. The first is detected before connecting, so WebRTC is skipped outright; the second is discovered on the first attempt, after which the viewer stops retrying WebRTC for the rest of the session. Either way it falls back to the WebSocket (JPEG) transport, a notice in the session window explains the switch, and the toolbar badge reads **WS** rather than **WebRTC**. The session still works; you lose the WebRTC-only features:
+
+| Available on WebSocket | Not available on WebSocket |
+|---|---|
+| Screen view, keyboard, mouse | Remote audio |
+| Paste as keystrokes | Clipboard sync |
+| Quality, scale and FPS limit | Multi-monitor switching |
+| Reconnect, session end | Bitrate control |
+| | Secure attention sequence (Ctrl+Alt+Del) |
+| | Switching between user sessions |
+| | Low-latency cursor streaming |
+
+<Aside type="note" title="Paste Text and keyboard layouts">
+  On a WebRTC session, **Paste Text** delivers the text literally, so accented
+  characters and symbols arrive as typed regardless of the keyboard layout on
+  either end. On the WebSocket fallback, paste is replayed as individual
+  keystrokes and is still interpreted through the remote machine's layout —
+  a non-US layout can turn `/` into `?` or drop characters. If pasted text
+  arrives mangled, check whether the toolbar badge reads **WS**.
+</Aside>
+
+To get WebRTC, install the GStreamer plugin sets webkit2gtk uses for it, then relaunch the viewer:
+
+```bash
+# Debian / Ubuntu
+sudo apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-libav
+
+# Fedora / RHEL
+sudo dnf install gstreamer1-plugins-base gstreamer1-plugins-good \
+  gstreamer1-plugins-bad-free gstreamer1-libav
+
+# Arch
+sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
+```
+
+<Aside type="note">
+  Some distributions ship a webkit2gtk built without WebRTC support regardless of which GStreamer plugins are present. If the viewer still reports no WebRTC after installing them, the WebSocket transport is the expected behavior on that host — remote desktop keeps working, at lower video quality.
+</Aside>
+
+### Viewer launches but no window appears
+
+If the process shows up in `ps` but nothing is drawn, FUSE is working and the problem is the desktop stack, not packaging — typically a host GTK module or `gvfs` build that is incompatible with the bundled runtime. Run the AppImage from a terminal and read the messages: `Failed to load module` and `undefined symbol` lines name the offending host library. Starting with a clean environment (`env -i DISPLAY=$DISPLAY HOME=$HOME ~/Downloads/breeze-viewer-linux.AppImage`) confirms whether a host module is being injected.
+
+---
+
+## Troubleshooting
+
+**Linux viewer does nothing when run.**
+The AppImage needs FUSE 2 to mount itself. On Debian 13 / Ubuntu 24.04+ the package is `libfuse2t64`, not `libfuse2`. See [Linux viewer (AppImage)](#linux-viewer-appimage) for the per-distribution package names and the `--appimage-extract-and-run` fallback.
+
+**Linux viewer always connects on the WebSocket transport, never WebRTC.**
+The host's webkit2gtk build does not expose `RTCPeerConnection`, so the viewer skips WebRTC and uses the WebSocket (JPEG) transport. The session window shows a notice saying so, and the browser console logs `WebRTC is unavailable in this WebView (no RTCPeerConnection global)`. Installing the GStreamer plugin sets usually restores it — see [WebRTC needs webkit2gtk built with the GStreamer plugins](#webrtc-needs-webkit2gtk-built-with-the-gstreamer-plugins). This is a property of the host, not of the device you are connecting to.
+
+**Session stuck in `connecting`.**
+WebRTC negotiation failed and the viewer has not yet fallen back to WebSocket. Confirm the device is online and the agent WebSocket connection is active (check the device detail page). Common causes:
+
+- **TURN not configured** — Verify `TURN_HOST` and `TURN_SECRET` are set in `.env` and the coturn container is running (`docker compose logs coturn`). If using an external TURN server, check its status via SSH.
+- **Firewall blocking TURN ports** — Coturn needs TCP and UDP port 3478, plus UDP ports in the relay range (default 49152–65535, or tightened to 49152–49252). Verify the ports are reachable with `nc -z -w 3 TURN_IP 3478` (TCP) and `nc -u -z -w 3 TURN_IP 3478` (UDP).
+- **Wrong `TURN_HOST`** — Must be the TURN server's public IP, not a private address. If Breeze is behind Cloudflare Tunnel, TURN must run on a separate host with its own public IP — see [TURN Server](/deploy/turn-server/).
+- **Shared secret mismatch** — `TURN_SECRET` in `.env` must exactly match `static-auth-secret` in the coturn config.
+
+The viewer should automatically fall back to the WebSocket transport after a timeout.
+
+**Poor video quality, high latency, or stalls — where are the WebRTC diagnostics?**
+While a desktop session is live, the device emits two periodic diagnostic lines: `Viewer WebRTC stats` (RTT, jitter, packet loss, frame drops as reported by the viewer) and `Desktop WebRTC metrics` (`captureMs`, `convertMs`, `encodeMs`, frames captured/encoded/sent, bandwidth). Both are shipped to **Devices → Select Device → Agent Logs** for the duration of the session regardless of `log_shipping_level`, so you do not need to lower the level to see them. Read `captureMs` against `encodeMs`: a high `captureMs` with a low `encodeMs` means the screen capturer is the bottleneck, not the encoder.
+
+On macOS with `isService=true` the desktop-helper writes the same lines locally to `/Library/Application Support/Breeze/logs/desktop-helper.log`; on Windows they are in `C:\ProgramData\Breeze\logs\user-helper.log`. If the helper logs `Log shipping disabled: helper config is missing required keys` at startup, the listed `agent.yaml` keys are absent and nothing from that process reaches Agent Logs — re-enrol or repair the config, then restart the helper.
+
+**Session limit hit (429).**
+The organisation or user limit on concurrent sessions has been reached. Call `DELETE /remote/sessions/stale` to free capacity, or navigate to the Active Sessions list and close sessions that are no longer needed.
+
+**Terminal garbled after resize.**
+This was a race condition in older builds where the browser sent a PTY resize message before the server `connected` acknowledgement was received. Current builds wait for the `connected` message before sending any data, including resize events. Update the agent to a current release.
+
+**"Access denied" when creating a session.**
+The user account does not have the `remote:access` permission. Navigate to **Settings → Roles**, locate the role assigned to the user, and enable `remote:access`. Changes take effect immediately without requiring re-login.

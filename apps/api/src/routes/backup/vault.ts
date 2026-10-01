@@ -1,0 +1,425 @@
+import { Hono } from 'hono';
+import { optionalJsonValidator, zValidator } from '../../lib/validation';
+import { z } from 'zod';
+import { eq, and, inArray } from 'drizzle-orm';
+import { db } from '../../db';
+import { devices, localVaults } from '../../db/schema';
+import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { writeRouteAudit } from '../../services/auditEvents';
+import { queueCommandForExecution, CommandTypes } from '../../services/commandQueue';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../../services/permissions';
+import { resolveScopedOrgId } from './helpers';
+import {
+  vaultCreateSchema,
+  vaultUpdateSchema,
+  vaultListSchema,
+  vaultSyncSchema,
+} from './schemas';
+
+export const vaultRoutes = new Hono();
+
+const vaultIdParam = z.object({ id: z.string().guid() });
+
+async function isDeviceSiteDenied(orgId: string, deviceId: string, permissions: UserPermissions | undefined): Promise<boolean> {
+  const [device] = await db
+    .select({ siteId: devices.siteId })
+    .from(devices)
+    .where(and(eq(devices.id, deviceId), eq(devices.orgId, orgId)))
+    .limit(1);
+  if (!device) return true;
+  if (!permissions?.allowedSiteIds) return false;
+  return typeof device.siteId !== 'string' || !canAccessSite(permissions, device.siteId);
+}
+
+async function resolveSiteAllowedDeviceIds(orgId: string, perms: UserPermissions | undefined): Promise<string[] | null> {
+  if (!perms?.allowedSiteIds) return null;
+  const orgDevices = await db.select({ id: devices.id, siteId: devices.siteId }).from(devices).where(eq(devices.orgId, orgId));
+  return orgDevices.filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId)).map((d) => d.id);
+}
+
+function isEmptySiteCeiling(permissions: UserPermissions | undefined): boolean {
+  const allowedSiteIds = permissions?.allowedSiteIds;
+  return allowedSiteIds !== undefined && (!Array.isArray(allowedSiteIds) || allowedSiteIds.length === 0);
+}
+
+async function updateVaultWithinCurrentSite(
+  orgId: string,
+  vaultId: string,
+  updateData: Record<string, unknown>,
+  permissions: UserPermissions | undefined,
+) {
+  const allowedSiteIds = permissions?.allowedSiteIds;
+  if (allowedSiteIds === undefined) {
+    const [row] = await db
+      .update(localVaults)
+      .set(updateData)
+      .where(and(eq(localVaults.id, vaultId), eq(localVaults.orgId, orgId)))
+      .returning();
+    return row;
+  }
+  if (!Array.isArray(allowedSiteIds) || allowedSiteIds.length === 0) return undefined;
+
+  // Device-first locking is shared with device-move paths. If the move wins,
+  // this re-read observes the new site and denies; if this lock wins, the move
+  // waits until the authorized vault mutation commits. The deviceId equality
+  // on the UPDATE is a final CAS against unsupported direct reassignment.
+  return db.transaction(async (tx) => {
+    const [vault] = await tx
+      .select({ deviceId: localVaults.deviceId })
+      .from(localVaults)
+      .where(and(eq(localVaults.id, vaultId), eq(localVaults.orgId, orgId)))
+      .limit(1);
+    if (!vault) return undefined;
+
+    const [device] = await tx
+      .select({ id: devices.id })
+      .from(devices)
+      .where(and(
+        eq(devices.id, vault.deviceId),
+        eq(devices.orgId, orgId),
+        inArray(devices.siteId, allowedSiteIds),
+      ))
+      .limit(1)
+      .for('update');
+    if (!device) return undefined;
+
+    const [row] = await tx
+      .update(localVaults)
+      .set(updateData)
+      .where(and(
+        eq(localVaults.id, vaultId),
+        eq(localVaults.orgId, orgId),
+        eq(localVaults.deviceId, vault.deviceId),
+      ))
+      .returning();
+    return row;
+  });
+}
+
+// GET /vault — list vaults for org (optional ?deviceId filter)
+vaultRoutes.get('/', requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action), zValidator('query', vaultListSchema), async (c) => {
+  const auth = c.get('auth');
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const { deviceId } = c.req.valid('query');
+  const permissions = c.get('permissions') as UserPermissions | undefined;
+
+  const conditions = [eq(localVaults.orgId, orgId)];
+  if (deviceId) {
+    if (await isDeviceSiteDenied(orgId, deviceId, permissions)) {
+      return c.json({ error: 'Device not found or access denied' }, 403);
+    }
+    conditions.push(eq(localVaults.deviceId, deviceId));
+  } else if (permissions?.allowedSiteIds) {
+    const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgId, permissions);
+    if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
+      return c.json({ data: [] });
+    }
+    conditions.push(inArray(localVaults.deviceId, allowedDeviceIds));
+  }
+
+  const rows = await db
+    .select()
+    .from(localVaults)
+    .where(and(...conditions));
+
+  return c.json({ data: rows.map(toVaultResponse) });
+});
+
+// POST /vault — create vault config
+vaultRoutes.post(
+  '/',
+  requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action),
+  requireMfa(),
+  zValidator('json', vaultCreateSchema),
+  async (c) => {
+  const auth = c.get('auth');
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const payload = c.req.valid('json');
+  if (await isDeviceSiteDenied(orgId, payload.deviceId, c.get('permissions') as UserPermissions | undefined)) {
+    return c.json({ error: 'Device not found or access denied' }, 403);
+  }
+  const now = new Date();
+
+  const [row] = await db
+    .insert(localVaults)
+    .values({
+      orgId,
+      deviceId: payload.deviceId,
+      vaultPath: payload.vaultPath,
+      vaultType: payload.vaultType,
+      retentionCount: payload.retentionCount,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .returning();
+
+  if (!row) {
+    return c.json({ error: 'Failed to create vault' }, 500);
+  }
+
+  writeRouteAudit(c, {
+    orgId,
+    action: 'backup.vault.create',
+    resourceType: 'local_vault',
+    resourceId: row.id,
+    details: {
+      deviceId: row.deviceId,
+      vaultPath: row.vaultPath,
+      vaultType: row.vaultType,
+    },
+  });
+
+  return c.json(toVaultResponse(row), 201);
+});
+
+// PATCH /vault/:id — update vault config
+vaultRoutes.patch(
+  '/:id',
+  requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action),
+  requireMfa(),
+  zValidator('param', vaultIdParam),
+  zValidator('json', vaultUpdateSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if (!orgId) {
+      return c.json({ error: 'orgId is required for this scope' }, 400);
+    }
+
+    const { id } = c.req.valid('param');
+    const payload = c.req.valid('json');
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    if (isEmptySiteCeiling(permissions)) {
+      return c.json({ error: 'Vault not found' }, 404);
+    }
+
+    const updateData: Record<string, unknown> = { updatedAt: new Date() };
+    if (payload.vaultPath !== undefined) updateData.vaultPath = payload.vaultPath;
+    if (payload.vaultType !== undefined) updateData.vaultType = payload.vaultType;
+    if (payload.retentionCount !== undefined) updateData.retentionCount = payload.retentionCount;
+    if (payload.isActive !== undefined) updateData.isActive = payload.isActive;
+
+    const row = await updateVaultWithinCurrentSite(orgId, id, updateData, permissions);
+
+    if (!row) {
+      return c.json({ error: 'Vault not found' }, 404);
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'backup.vault.update',
+      resourceType: 'local_vault',
+      resourceId: row.id,
+      details: { changedFields: Object.keys(payload) },
+    });
+
+    return c.json(toVaultResponse(row));
+  }
+);
+
+// DELETE /vault/:id — soft delete (set isActive=false)
+vaultRoutes.delete(
+  '/:id',
+  requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action),
+  requireMfa(),
+  zValidator('param', vaultIdParam),
+  async (c) => {
+  const auth = c.get('auth');
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const { id } = c.req.valid('param');
+  const permissions = c.get('permissions') as UserPermissions | undefined;
+  if (isEmptySiteCeiling(permissions)) {
+    return c.json({ error: 'Vault not found' }, 404);
+  }
+
+  const row = await updateVaultWithinCurrentSite(
+    orgId,
+    id,
+    { isActive: false, updatedAt: new Date() },
+    permissions,
+  );
+
+  if (!row) {
+    return c.json({ error: 'Vault not found' }, 404);
+  }
+
+  writeRouteAudit(c, {
+    orgId,
+    action: 'backup.vault.delete',
+    resourceType: 'local_vault',
+    resourceId: row.id,
+  });
+
+  return c.json({ deleted: true, id: row.id });
+});
+
+// POST /vault/:id/sync — trigger manual sync
+vaultRoutes.post(
+  '/:id/sync',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requireMfa(),
+  zValidator('param', vaultIdParam),
+  // The body is genuinely optional (`snapshotId` is the only field and it is
+  // `.optional()`), and the web client posts NO body while `fetchWithAuth`
+  // still sets `Content-Type: application/json`. Under the strict validator
+  // Hono called `c.req.json()` on that empty body and threw
+  // `400 Malformed JSON in request body` before the handler ever ran, so every
+  // Sync Now from the UI failed — invisibly, because the old handler swallowed
+  // the error. See the `optionalJsonValidator` docs in lib/validation.ts, which
+  // names this exact `fetchWithAuth` interaction.
+  optionalJsonValidator(vaultSyncSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+    if (!orgId) {
+      return c.json({ error: 'orgId is required for this scope' }, 400);
+    }
+
+    const { id } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    const [vault] = await db
+      .select()
+      .from(localVaults)
+      .where(and(eq(localVaults.id, id), eq(localVaults.orgId, orgId)))
+      .limit(1);
+
+    if (!vault) {
+      return c.json({ error: 'Vault not found' }, 404);
+    }
+
+    if (!vault.isActive) {
+      return c.json({ error: 'Vault is inactive' }, 400);
+    }
+
+    if (await isDeviceSiteDenied(orgId, vault.deviceId, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    // Update sync status to pending. The predicate repeats org_id and the
+    // device_id we just authorized: the vault was read in a separate statement
+    // above, so `id` alone would be a check-then-act window.
+    await db
+      .update(localVaults)
+      .set({
+        lastSyncStatus: 'pending',
+        lastSyncSnapshotId: payload.snapshotId ?? null,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(localVaults.id, id),
+        eq(localVaults.orgId, orgId),
+        eq(localVaults.deviceId, vault.deviceId),
+      ));
+
+    // Dispatch vault_sync command to the device
+    try {
+      const result = await queueCommandForExecution(
+        vault.deviceId,
+        CommandTypes.VAULT_SYNC,
+        { vaultId: vault.id, snapshotId: payload.snapshotId },
+        { userId: auth.user?.id, expectedOrgId: orgId }
+      );
+      if ('error' in result) {
+        throw new Error(result.error);
+      }
+    } catch (err) {
+      console.error('[Vault] Failed to dispatch sync command:', err);
+      await db.update(localVaults).set({
+        lastSyncStatus: 'failed',
+        lastSyncError: 'Failed to dispatch sync command to agent',
+        updatedAt: new Date(),
+      }).where(and(
+        eq(localVaults.id, id),
+        eq(localVaults.orgId, orgId),
+        eq(localVaults.deviceId, vault.deviceId),
+      ));
+      return c.json({ error: 'Failed to dispatch sync command to agent' }, 502);
+    }
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'backup.vault.sync',
+      resourceType: 'local_vault',
+      resourceId: vault.id,
+      details: { deviceId: vault.deviceId, snapshotId: payload.snapshotId },
+    });
+
+    return c.json({
+      id: vault.id,
+      status: 'pending',
+      deviceId: vault.deviceId,
+      snapshotId: payload.snapshotId ?? null,
+    });
+  }
+);
+
+// GET /vault/:id/status — get vault sync status
+vaultRoutes.get('/:id/status', requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action), zValidator('param', vaultIdParam), async (c) => {
+  const auth = c.get('auth');
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const { id } = c.req.valid('param');
+
+  const [vault] = await db
+    .select()
+    .from(localVaults)
+    .where(and(eq(localVaults.id, id), eq(localVaults.orgId, orgId)))
+    .limit(1);
+
+  if (!vault) {
+    return c.json({ error: 'Vault not found' }, 404);
+  }
+
+  // Site-scope is an app-layer-only authz axis; RLS does not defend it. The vault
+  // is resolved scoped only to orgId, so re-enforce the source device's site here
+  // (mirrors the LIST + sync paths). Fail closed on null/out-of-site siteId.
+  if (await isDeviceSiteDenied(orgId, vault.deviceId, c.get('permissions') as UserPermissions | undefined)) {
+    return c.json({ error: 'Access to this site denied' }, 403);
+  }
+
+  return c.json({
+    id: vault.id,
+    deviceId: vault.deviceId,
+    isActive: vault.isActive,
+    lastSyncAt: vault.lastSyncAt?.toISOString() ?? null,
+    lastSyncStatus: vault.lastSyncStatus,
+    lastSyncSnapshotId: vault.lastSyncSnapshotId,
+    syncSizeBytes: vault.syncSizeBytes,
+    lastSyncError: vault.lastSyncError ?? null,
+  });
+});
+
+function toVaultResponse(row: typeof localVaults.$inferSelect) {
+  return {
+    id: row.id,
+    deviceId: row.deviceId,
+    vaultPath: row.vaultPath,
+    vaultType: row.vaultType,
+    isActive: row.isActive,
+    retentionCount: row.retentionCount,
+    lastSyncAt: row.lastSyncAt?.toISOString() ?? null,
+    lastSyncStatus: row.lastSyncStatus,
+    lastSyncSnapshotId: row.lastSyncSnapshotId,
+    syncSizeBytes: row.syncSizeBytes,
+    lastSyncError: row.lastSyncError ?? null,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}

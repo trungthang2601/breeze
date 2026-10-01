@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../../layouts/DashboardLayout.astro';
+import PsaConnectionsPage from '../../../components/psa/PsaConnectionsPage';
+---
+
+<DashboardLayout titleKey="titles.integrationsPsa">
+  <PsaConnectionsPage client:load />
+</DashboardLayout>

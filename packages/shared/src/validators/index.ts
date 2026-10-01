@@ -1,0 +1,1324 @@
+import { z } from 'zod';
+import {
+  ACTOR_TYPES,
+  AUDIT_RESULTS,
+  OS_TYPES,
+  DEVICE_STATUSES,
+  ALERT_SEVERITIES,
+  SCRIPT_LANGUAGES,
+  SCRIPT_RUN_AS,
+  EXECUTION_STATUSES,
+  ROLE_SCOPES,
+  USER_STATUSES,
+  NOTIFICATION_CHANNEL_TYPES
+} from '../constants';
+import { DEVICE_ROLES } from './deviceRoles';
+import { alertRuleConditionSchema } from './alertRuleConditions';
+import { automationActionSchema, automationTriggerSchema } from './automationActions';
+import { canonicalizeTimezone, isValidIanaTimezone, UTC_TIMEZONE } from '../utils/timezone';
+
+// #5289 — moved to a leaf module to break a barrel cycle; see that file's header.
+export * from './automationActions';
+
+export * from './reliability';
+export * from './businessEmail';
+export * from './sendingDomains';
+export * from './remoteAccessLauncherScheme';
+export * from './httpUrl';
+export * from './currency';
+export * from './remoteAccessInlineSettings';
+export * from './warrantyInlineSettings';
+export * from './safeRelativePath';
+export * from './authenticator';
+export * from './catalog';
+export * from './invoices';
+export * from './contracts';
+export * from './workTypes';
+export * from './mlFeedback';
+export * from './quotes';
+export * from './contractTemplates';
+export * from './scriptProposals';
+export * from './maintenanceWindow';
+export * from './agentVersionPins';
+export * from './enrollmentDefaults';
+export * from './softwareDetection';
+export * from './softwareDownloadPolicy';
+export * from './systemCleanup';
+export * from './psa';
+export * from './deviceRoles';
+export * from './deviceFunctions';
+export * from './customFieldImport';
+export * from './alertRuleConditions';
+
+// ============================================
+// Device Roles
+// ============================================
+
+// Orthogonal virtualization attribute (issue #1387). A virtual/VDI box is still
+// a workstation (or server) — virtualization is a SECOND targeting axis, not a
+// device role. The agent derives the platform from SMBIOS hardware identity
+// strings (Manufacturer/Model/BIOS); these tokens are kept in sync with the
+// agent's classify.go virtualizationMarkers list.
+export const VIRTUALIZATION_PLATFORMS = [
+  'vmware', 'hyperv', 'virtualbox', 'qemu', 'kvm', 'xen', 'bochs', 'parallels'
+] as const;
+export type VirtualizationPlatform = typeof VIRTUALIZATION_PLATFORMS[number];
+
+// ============================================
+// Common Validators
+// ============================================
+
+export const paginationSchema = z.object({
+  page: z.coerce.number().min(1).default(1),
+  limit: z.coerce.number().min(1).max(100).default(50)
+});
+
+export const uuidSchema = z.string().guid();
+
+export const dateRangeSchema = z.object({
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional()
+});
+
+// ============================================
+// Auth Validators
+// ============================================
+
+export const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8)
+});
+
+export const registerSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  name: z.string().min(1).max(255)
+});
+
+export const forgotPasswordSchema = z.object({
+  email: z.string().email()
+});
+
+export const refreshTokenSchema = z.object({
+  refreshToken: z.string()
+});
+
+export const mfaVerifySchema = z.object({
+  code: z.string().length(6)
+});
+
+export const passwordResetSchema = z.object({
+  token: z.string(),
+  password: z.string().min(8)
+});
+
+// ============================================
+// Organization Validators
+// ============================================
+
+export const createOrgSchema = z.object({
+  name: z.string().min(1).max(255),
+  type: z.enum(['customer', 'internal']).default('customer'),
+  maxDevices: z.number().positive().optional(),
+  contractStart: z.coerce.date().optional(),
+  contractEnd: z.coerce.date().optional(),
+  billingContact: z.record(z.string(), z.unknown()).optional()
+});
+
+export const createSiteSchema = z.object({
+  name: z.string().min(1).max(255),
+  address: z.record(z.string(), z.unknown()).optional(),
+  timezone: z.string().default('UTC'),
+  contact: z.record(z.string(), z.unknown()).optional()
+});
+
+// ============================================
+// User Validators
+// ============================================
+
+export const inviteUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1).max(255),
+  roleId: z.string().guid(),
+  orgAccess: z.enum(['all', 'selected', 'none']).optional(),
+  orgIds: z.array(z.string().guid()).optional(),
+  siteIds: z.array(z.string().guid()).optional(),
+  deviceGroupIds: z.array(z.string().guid()).optional()
+});
+
+export const createRoleSchema = z.object({
+  name: z.string().min(1).max(100),
+  description: z.string().max(500).optional(),
+  scope: z.enum(ROLE_SCOPES),
+  permissions: z.array(z.string())
+});
+
+// ============================================
+// Device Validators
+// ============================================
+
+export const updateDeviceSchema = z.object({
+  // Nullable so callers can explicitly clear the display name; the
+  // devices.display_name column is nullable. Keep in sync with the route
+  // schema in apps/api/src/routes/devices/schemas.ts.
+  displayName: z.string().max(255).nullable().optional(),
+  siteId: z.string().guid().optional(),
+  tags: z.array(z.string().max(50)).max(20).optional()
+});
+
+export const createDeviceGroupSchema = z.object({
+  name: z.string().min(1).max(255),
+  siteId: z.string().guid().optional(),
+  type: z.enum(['static', 'dynamic']),
+  rules: z.record(z.string(), z.unknown()).optional(),
+  parentId: z.string().guid().optional()
+});
+
+export const deviceQuerySchema = paginationSchema.extend({
+  status: z.enum(DEVICE_STATUSES).optional(),
+  osType: z.enum(OS_TYPES).optional(),
+  siteId: z.string().guid().optional(),
+  groupId: z.string().guid().optional(),
+  search: z.string().optional()
+});
+
+// ============================================
+// Script Validators
+// ============================================
+
+// Feature #3 (severity-by-exit-code): exit code → AlertSeverity (or null = no alert).
+// Keys must be non-negative integer strings (e.g. "0", "1", "2"). Negative or
+// fractional codes are runtime-only (SIGKILL = -9 on Unix); the schema only
+// accepts the canonical wire-format representation.
+//
+// Lives here so route handlers, UI forms, and tests all import the same shape.
+export const alertSeverityValueSchema = z.enum(['critical', 'high', 'medium', 'low', 'info']);
+export const exitCodeSeverityMappingSchema = z.record(
+  z.string().regex(/^\d+$/, 'Exit codes must be non-negative integer strings'),
+  alertSeverityValueSchema.nullable()
+);
+
+export const createScriptSchema = z.object({
+  name: z.string().min(1).max(255),
+  description: z.string().max(2000).optional(),
+  category: z.string().max(100).optional(),
+  osTypes: z.array(z.enum(OS_TYPES)).min(1),
+  language: z.enum(SCRIPT_LANGUAGES),
+  content: z.string().min(1),
+  parameters: z.record(z.string(), z.unknown()).optional(),
+  timeoutSeconds: z.number().min(1).max(3600).default(300),
+  runAs: z.enum(SCRIPT_RUN_AS).default('system')
+});
+
+export const executeScriptSchema = z.object({
+  deviceIds: z.array(z.string().guid()).optional(),
+  groupId: z.string().guid().optional(),
+  parameters: z.record(z.string(), z.unknown()).optional()
+}).refine(
+  (data) => data.deviceIds?.length || data.groupId,
+  { message: 'Must provide either deviceIds or groupId' }
+);
+
+// ============================================
+// Automation Validators
+// ============================================
+
+export const createAutomationSchema = z.object({
+  name: z.string().min(1).max(255),
+  description: z.string().max(2000).optional(),
+  enabled: z.boolean().default(true),
+  trigger: automationTriggerSchema,
+  conditions: z.record(z.string(), z.unknown()).optional(),
+  actions: z.array(automationActionSchema).min(1),
+  onFailure: z.enum(['stop', 'continue', 'notify']).default('stop'),
+  notificationTargets: z.record(z.string(), z.unknown()).optional()
+});
+
+export const createPolicySchema = z.object({
+  name: z.string().min(1).max(255),
+  description: z.string().max(2000).optional(),
+  enabled: z.boolean().default(true),
+  targets: z.record(z.string(), z.unknown()),
+  rules: z.array(z.record(z.string(), z.unknown())).min(1),
+  enforcement: z.enum(['monitor', 'warn', 'enforce']).default('monitor'),
+  checkIntervalMinutes: z.number().min(5).max(1440).default(60),
+  remediationScriptId: z.string().guid().optional()
+});
+
+// ============================================
+// Alert Validators
+// ============================================
+
+export const createAlertRuleSchema = z.object({
+  name: z.string().min(1).max(255),
+  description: z.string().max(2000).optional(),
+  enabled: z.boolean().default(true),
+  severity: z.enum(ALERT_SEVERITIES),
+  targets: z.record(z.string(), z.unknown()),
+  conditions: z.record(z.string(), z.unknown()),
+  cooldownMinutes: z.number().min(1).max(1440).default(15),
+  escalationPolicyId: z.string().guid().optional(),
+  notificationChannels: z.array(z.record(z.string(), z.unknown())).optional(),
+  autoResolve: z.boolean().default(true)
+});
+
+export const alertQuerySchema = paginationSchema.extend({
+  status: z.enum(['active', 'acknowledged', 'resolved', 'suppressed', 'dismissed']).optional(),
+  severity: z.enum(ALERT_SEVERITIES).optional(),
+  deviceId: z.string().guid().optional()
+});
+
+// ============================================
+// mTLS Settings Validators
+// ============================================
+
+export const orgMtlsSettingsSchema = z.object({
+  certLifetimeDays: z.number().int().min(1).max(365).default(90),
+  expiredCertPolicy: z.enum(['auto_reissue', 'quarantine']).default('auto_reissue')
+});
+
+// ============================================
+// Helper Chat Settings Validators
+// ============================================
+
+export const orgHelperSettingsSchema = z.object({
+  enabled: z.boolean().default(false),
+});
+
+// ============================================
+// Log Forwarding Settings Validators
+// ============================================
+
+export const orgLogForwardingSettingsSchema = z.object({
+  enabled: z.boolean().default(false),
+  elasticsearchUrl: z.string().trim().optional(),
+  elasticsearchApiKey: z.string().trim().optional(),
+  elasticsearchUsername: z.string().trim().optional(),
+  elasticsearchPassword: z.string().optional(),
+  indexPrefix: z.string().min(1).max(100).default('breeze-logs'),
+}).superRefine((data, ctx) => {
+  if (!data.enabled) {
+    return;
+  }
+
+  if (!data.elasticsearchUrl) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['elasticsearchUrl'],
+      message: 'Log endpoint URL is required when log forwarding is enabled',
+    });
+  } else {
+    try {
+      const parsed = new URL(data.elasticsearchUrl);
+      if (parsed.protocol !== 'https:') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['elasticsearchUrl'],
+          message: 'Log endpoint URL must use HTTPS',
+        });
+      }
+    } catch {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['elasticsearchUrl'],
+        message: 'Log endpoint URL must be a valid URL',
+      });
+    }
+  }
+
+  const hasApiKey = Boolean(data.elasticsearchApiKey);
+  const hasBasicUser = Boolean(data.elasticsearchUsername);
+  const hasBasicPassword = Boolean(data.elasticsearchPassword);
+  const hasBasic = hasBasicUser || hasBasicPassword;
+
+  if (hasApiKey && hasBasic) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Choose either API key or username+password auth, not both',
+    });
+  }
+
+  if (!hasApiKey && !(hasBasicUser && hasBasicPassword)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Either API key or username+password required for log endpoint auth',
+    });
+  }
+});
+
+// ============================================
+// Agent Validators
+// ============================================
+
+export const agentEnrollSchema = z.object({
+  enrollmentKey: z.string(),
+  hostname: z.string(),
+  osType: z.enum(OS_TYPES),
+  osVersion: z.string(),
+  architecture: z.string(),
+  hardwareInfo: z.object({
+    cpuModel: z.string().optional(),
+    cpuCores: z.number().optional(),
+    ramTotalMb: z.number().optional(),
+    serialNumber: z.string().optional(),
+    manufacturer: z.string().optional(),
+    model: z.string().optional(),
+    motherboardManufacturer: z.string().optional(),
+    motherboardProduct: z.string().optional(),
+    motherboardVersion: z.string().optional()
+  }).optional()
+});
+
+export const agentHeartbeatSchema = z.object({
+  metrics: z.object({
+    cpuPercent: z.number().min(0).max(100),
+    ramPercent: z.number().min(0).max(100),
+    ramUsedMb: z.number().min(0),
+    diskPercent: z.number().min(0).max(100),
+    diskUsedGb: z.number().min(0),
+    diskActivityAvailable: z.boolean().optional(),
+    diskReadBytes: z.number().int().min(0).optional(),
+    diskWriteBytes: z.number().int().min(0).optional(),
+    diskReadBps: z.number().int().min(0).optional(),
+    diskWriteBps: z.number().int().min(0).optional(),
+    diskReadOps: z.number().int().min(0).optional(),
+    diskWriteOps: z.number().int().min(0).optional(),
+    networkInBytes: z.number().optional(),
+    networkOutBytes: z.number().optional(),
+    bandwidthInBps: z.number().int().min(0).optional(),
+    bandwidthOutBps: z.number().int().min(0).optional(),
+    interfaceStats: z.array(z.object({
+      name: z.string().min(1),
+      inBytesPerSec: z.number().int().min(0),
+      outBytesPerSec: z.number().int().min(0),
+      inBytes: z.number().int().min(0),
+      outBytes: z.number().int().min(0),
+      inPackets: z.number().int().min(0),
+      outPackets: z.number().int().min(0),
+      inErrors: z.number().int().min(0),
+      outErrors: z.number().int().min(0),
+      speed: z.number().int().min(0).optional()
+    })).max(100).optional(),
+    processCount: z.number().optional()
+  }),
+  status: z.enum(['ok', 'warning', 'error']),
+  agentVersion: z.string(),
+  pendingReboot: z.boolean().optional(),
+  lastUser: z.string().optional()
+});
+
+export const commandResultSchema = z.object({
+  status: z.enum(['completed', 'failed', 'timeout']),
+  exitCode: z.number().optional(),
+  stdout: z.string().optional(),
+  stderr: z.string().optional(),
+  durationMs: z.number()
+});
+
+// Active-VPN-client presence (#2139). This is the AGENT-sent wire shape for one
+// detected VPN — the API stamps `reportedAt` on ingest, so it is intentionally
+// absent here. Mirrors the VpnPresence type in ../types minus reportedAt.
+export const vpnProviderSchema = z.enum([
+  'wireguard',
+  'tailscale',
+  'netbird',
+  'zerotier',
+  'openvpn',
+  'cloudflare-warp',
+  'generic'
+]);
+
+export const vpnDetectionSourceSchema = z.enum(['interface', 'service', 'process', 'adapter']);
+
+// An inactive entry (client running, tunnel down) has no interface and no IPs,
+// so `interfaceName` may be empty — but only when `active` is false. An active
+// VPN without an interface would be a phantom, so the refine rejects it.
+export const vpnPresenceIngestSchema = z
+  .object({
+    provider: vpnProviderSchema,
+    active: z.boolean(),
+    interfaceName: z.string().max(128),
+    ipv4: z.string().max(45).optional(),
+    ipv6: z.string().max(45).optional(),
+    dnsName: z.string().max(255).optional(),
+    detectionSource: vpnDetectionSourceSchema
+  })
+  .refine((vpn) => !vpn.active || vpn.interfaceName.length > 0, {
+    message: 'interfaceName is required for an active VPN',
+    path: ['interfaceName']
+  });
+
+// ============================================
+// Filter Validators
+// ============================================
+
+export * from './filters';
+
+// ============================================
+// Audit Validators
+// ============================================
+
+export const auditQuerySchema = paginationSchema.merge(dateRangeSchema).extend({
+  actorId: z.string().guid().optional(),
+  actorType: z.enum(ACTOR_TYPES).optional(),
+  action: z.string().optional(),
+  resourceType: z.string().optional(),
+  resourceId: z.string().guid().optional(),
+  result: z.enum(AUDIT_RESULTS).optional()
+});
+
+// ============================================
+// Configuration Policy Validators
+// ============================================
+
+export const createConfigPolicySchema = z.object({
+  name: z.string().min(1).max(255),
+  description: z.string().optional(),
+  status: z.enum(['active', 'inactive', 'archived']).optional(),
+  orgId: z.string().guid().optional(),
+  // Ownership axis (#1724). 'organization' (default) = the classic org-scoped
+  // policy. 'partner' = partner-wide / all-orgs; the server derives the partner
+  // from the caller's own partner_id — a client-supplied partner id is NEVER
+  // trusted. orgId is ignored when ownerScope is 'partner'.
+  ownerScope: z.enum(['organization', 'partner']).optional(),
+  // One-level, create-only inheritance (#5080). Validated server-side against
+  // the ownership rule (same org, or partner-wide of the org's partner) and by
+  // the configuration_policies_parent_guard constraint trigger. Deliberately
+  // absent from updateConfigPolicySchema: parent_policy_id is immutable.
+  parentPolicyId: z.string().guid().optional(),
+});
+
+export const updateConfigPolicySchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  description: z.string().optional(),
+  status: z.enum(['active', 'inactive', 'archived']).optional(),
+});
+
+/**
+ * Private database-to-export material used to reconstruct patch settings.
+ * It is never valid in caller-controlled feature settings, regardless of the
+ * feature type or nesting depth.
+ */
+export const CONFIG_POLICY_PATCH_INLINE_MIRROR_KEY = '__breezePatchInlineMirror';
+
+export function containsConfigPolicyReservedKey(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false;
+
+  const pending: object[] = [value];
+  const visited = new WeakSet<object>();
+  let inspectedObjects = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    // JSON request bodies cannot contain cycles or shared object references.
+    // Service callers can, so reject those structures instead of risking an
+    // incomplete reservation scan. Bound work for the same fail-closed reason.
+    if (visited.has(current) || inspectedObjects >= 10_000) return true;
+    visited.add(current);
+    inspectedObjects += 1;
+
+    try {
+      for (const key of Object.keys(current)) {
+        if (key === CONFIG_POLICY_PATCH_INLINE_MIRROR_KEY) return true;
+        const nested = (current as Record<string, unknown>)[key];
+        if (nested !== null && typeof nested === 'object') pending.push(nested);
+      }
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+export const configFeatureInlineSettingsSchema = z
+  .record(z.string(), z.unknown())
+  .superRefine((settings, ctx) => {
+    if (containsConfigPolicyReservedKey(settings)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Reserved configuration feature material is not allowed',
+      });
+    }
+  });
+
+/**
+ * `device_lifecycle` inline settings (#2787 item 4): "permanently delete
+ * removed devices N days after removal".
+ *
+ * Pure JSONB (Pattern B) — no normalized table, same posture as pam /
+ * vulnerability. `.strict()` so an unknown key is rejected rather than
+ * persisted-and-echoed as if it took effect.
+ *
+ * `purgeRemovedAfterDays` is deliberately THREE-valued:
+ *   - absent   → the policy exists but says nothing; nothing is purged.
+ *   - null     → explicitly off. Meaningful in its own right: an org-level
+ *                link with null OVERRIDES a partner-wide window, which is how
+ *                one customer opts out of an MSP-wide retention rule.
+ *   - 1..3650  → the retention window in days.
+ *
+ * The floor is 1, not 0: this setting drives an IRREVERSIBLE delete, so
+ * "purge immediately" must not be expressible by a stray zero. The ceiling is
+ * ten years, past which the feature is indistinguishable from "off".
+ */
+export const deviceLifecycleInlineSettingsSchema = z
+  .object({
+    purgeRemovedAfterDays: z.number().int().min(1).max(3650).nullable().optional(),
+  })
+  .strict();
+
+export type DeviceLifecycleInlineSettings = z.infer<typeof deviceLifecycleInlineSettingsSchema>;
+
+export const addFeatureLinkSchema = z.object({
+  featureType: z.enum(['patch', 'alert_rule', 'backup', 'security', 'monitoring', 'maintenance', 'compliance', 'automation', 'event_log', 'software_policy', 'sensitive_data', 'peripheral_control', 'warranty', 'helper', 'remote_access', 'pam', 'onedrive_helper', 'vulnerability', 'device_lifecycle', 'monitors']),
+  featurePolicyId: z.string().guid().optional(),
+  inlineSettings: configFeatureInlineSettingsSchema.optional(),
+}).refine(
+  (data) => data.featurePolicyId || data.inlineSettings,
+  { message: 'At least one of featurePolicyId or inlineSettings is required' }
+);
+
+const patchSourceValueSchema = z.enum([
+  'os',
+  'third_party',
+  'custom',
+  'firmware',
+  'drivers',
+  'microsoft',
+  'apple',
+  'linux',
+]);
+
+/**
+ * Patch sources with no backing patch provider yet: they expand to an empty
+ * allow-set at approval time (see patchApprovalEvaluator.buildAllowedPatchSources).
+ * A selection made up ONLY of these would silently approve zero patches, so it
+ * is rejected rather than saved as a no-op. Keep in sync with that expander.
+ */
+const PROVIDERLESS_PATCH_SOURCES = new Set<string>(['firmware', 'drivers']);
+
+export const policyAppRuleSchema = z.object({
+  source: z.enum(['third_party', 'custom']),
+  packageId: z.string().min(1).max(256),
+  displayName: z.string().max(255).optional(),
+  action: z.enum(['block', 'pin']),
+  pinnedVersion: z.string().min(1).max(64).optional(),
+}).superRefine((data, ctx) => {
+  if (data.action === 'pin' && !data.pinnedVersion) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['pinnedVersion'],
+      message: 'Pinned version is required for pin rules.',
+    });
+  }
+});
+
+export type PolicyAppRule = z.infer<typeof policyAppRuleSchema>;
+
+/**
+ * Typed shape for an Update Ring's `patch_policies.autoApprove` JSONB column.
+ *
+ * Part of issue #1317 (move patch approval rules from Config Policy to Update
+ * Rings). The ring owns the WHAT-installs auto-approval gate: an enabled flag,
+ * the severities that auto-approve, and a deferral window (days after a patch's
+ * release before it is eligible to auto-approve). Empty `severities` while
+ * `enabled` approves no OS patches; `thirdPartyApps` independently opts
+ * third-party candidates in (dual consent with the policy's `sources`).
+ *
+ * The legacy/dormant `autoApprove` JSONB values (`{}`, `true`,
+ * `{ enabled: true, severities: [...] }` without `deferralDays`) all still
+ * parse downstream in patchApprovalEvaluator's `parseRingAutoApprove`, so this
+ * stricter writer schema does not crash on already-stored rings. Note the read
+ * path is fail-closed to MATCH this writer: an `enabled` ring with an empty
+ * severity set (including the legacy boolean `true`) auto-approves NOTHING, so
+ * a row that bypassed this schema (e.g. the manage_update_rings AI tool) can
+ * never become more permissive than an explicitly-written one.
+ */
+export const ringAutoApproveSchema = z.object({
+  enabled: z.boolean().default(false),
+  severities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).default([]),
+  deferralDays: z.number().int().min(0).max(365).default(0),
+  // Third-party (winget/Chocolatey/Homebrew + 'custom') auto-approval. Severity
+  // is not the control axis for these (they mostly ingest severity='unknown'),
+  // so this is a source-level toggle. Dual consent applies at evaluation: the
+  // config policy's `sources` must ALSO include 'third_party'.
+  //
+  // OPTIONAL (no default) on purpose: an omitted value means "writer predates
+  // this field" and the API write path preserves the ring's current setting
+  // (mergeRingAutoApproveWrite) instead of resetting it — a `.default(false)`
+  // would make an old-shape replay indistinguishable from an explicit opt-out.
+  thirdPartyApps: z.boolean().optional(),
+  // Hold for third-party candidates, anchored on releaseDate when present,
+  // first-seen otherwise (#2218). null = inherit deferralDays. Optional for
+  // the same old-shape-preservation reason as thirdPartyApps.
+  thirdPartyDeferralDays: z.number().int().min(0).max(365).nullable().optional(),
+  // Opt-in to auto-approving patches with no severity rating (severity IS NULL
+  // or the 'unknown' sentinel) — issue #3758. Fail-closed default: unrated
+  // patches never auto-approve unless this is explicitly true. OPTIONAL (no
+  // default) for the same old-shape-preservation reason as thirdPartyApps: an
+  // omitted value means "writer predates this field" and is preserved by
+  // mergeRingAutoApproveWrite, not reset to false.
+  autoApproveUnrated: z.boolean().optional(),
+}).superRefine((data, ctx) => {
+  if (data.enabled && data.severities.length === 0 && !data.thirdPartyApps) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['severities'],
+      message: 'Select at least one severity or enable third-party app auto-approval.',
+    });
+  }
+});
+
+export type RingAutoApprove = z.infer<typeof ringAutoApproveSchema>;
+
+const RING_AUTO_APPROVE_SEVERITIES = new Set(['critical', 'important', 'moderate', 'low']);
+
+/**
+ * Resolve an incoming `autoApprove` write against the stored row. The two
+ * third-party fields are OPTIONAL in `ringAutoApproveSchema` so a pre-2026-08
+ * client replaying the old `{enabled, severities, deferralDays}` shape (a
+ * script, a stale tab, an AI-tool partial write) cannot silently reset a
+ * ring's third-party opt-in it doesn't know about: absent fields carry over
+ * the stored row's effective values (same compat derivation as the API's
+ * parseRingAutoApprove — an absent stored `thirdPartyApps` derives from the
+ * stored severities); explicit values — including explicit `false` — always
+ * win. Pass `storedRaw: undefined` on create to stamp the explicit defaults.
+ */
+export function mergeRingAutoApproveWrite(
+  incoming: RingAutoApprove,
+  storedRaw: unknown
+): {
+  enabled: boolean;
+  severities: RingAutoApprove['severities'];
+  deferralDays: number;
+  thirdPartyApps: boolean;
+  thirdPartyDeferralDays: number | null;
+  autoApproveUnrated: boolean;
+} {
+  let storedThirdPartyApps = false;
+  let storedThirdPartyDeferralDays: number | null = null;
+  let storedAutoApproveUnrated = false;
+  if (storedRaw && typeof storedRaw === 'object') {
+    const stored = storedRaw as Record<string, unknown>;
+    const storedSeverities = Array.isArray(stored.severities)
+      ? stored.severities.filter(
+          (s): s is string => typeof s === 'string' && RING_AUTO_APPROVE_SEVERITIES.has(s)
+        )
+      : [];
+    storedThirdPartyApps =
+      'thirdPartyApps' in stored ? stored.thirdPartyApps === true : storedSeverities.length > 0;
+    const rawTp = stored.thirdPartyDeferralDays;
+    storedThirdPartyDeferralDays =
+      typeof rawTp === 'number' && Number.isInteger(rawTp) && rawTp >= 0 && rawTp <= 365
+        ? rawTp
+        : null;
+    storedAutoApproveUnrated = stored.autoApproveUnrated === true;
+  }
+  return {
+    enabled: incoming.enabled,
+    severities: incoming.severities,
+    deferralDays: incoming.deferralDays,
+    thirdPartyApps: incoming.thirdPartyApps ?? storedThirdPartyApps,
+    thirdPartyDeferralDays:
+      incoming.thirdPartyDeferralDays !== undefined
+        ? incoming.thirdPartyDeferralDays
+        : storedThirdPartyDeferralDays,
+    autoApproveUnrated: incoming.autoApproveUnrated ?? storedAutoApproveUnrated,
+  };
+}
+
+export const patchInlineSettingsSchema = z.object({
+  sources: z.array(patchSourceValueSchema).min(1).default(['os']),
+  autoApprove: z.boolean().default(false),
+  autoApproveSeverities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).default([]),
+  autoApproveDeferralDays: z.number().int().min(0).max(60).default(0),
+  apps: z.array(policyAppRuleSchema).max(200).default([]),
+  scheduleFrequency: z.enum(['daily', 'weekly', 'monthly']).default('weekly'),
+  scheduleTime: z.string().regex(/^([01]\d|2[0-3]):([0-5]\d)$/).default('02:00'),
+  scheduleDayOfWeek: z.enum(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']).default('sun'),
+  scheduleDayOfMonth: z.number().int().min(1).max(28).default(1),
+  // #5128 W3: what a scheduled install does when the device is offline at
+  // dispatch. 'queue' (the default) persists the install_patches command with a
+  // delivery deadline of min(patch TTL, next occurrence) so it runs on the
+  // device's next check-in; 'skip' is the pre-#5128 behaviour of recording the
+  // device as skipped and moving on.
+  offlineBehavior: z.enum(['skip', 'queue']).default('queue'),
+  rebootPolicy: z.enum(['never', 'if_required', 'always', 'maintenance_window']).default('if_required'),
+  // #3197: how long the logged-in user is warned before a patch-triggered
+  // reboot fires. Replaces the hardcoded 5-minute delay.
+  rebootDelayMinutes: z.number().int().min(1).max(1440).default(15),
+  // #3207: end-user reboot deferral budget. `rebootAllowDeferral` is the opt-in;
+  // there is deliberately no "don't warn the user" switch — #3197 made at least
+  // one warning an invariant and a silence toggle would re-create that defect.
+  rebootAllowDeferral: z.boolean().default(false),
+  rebootMaxDeferrals: z.number().int().min(0).max(10).default(3),
+  rebootDeferralMinutes: z.number().int().min(5).max(1440).default(60),
+  // #1872: enforce Breeze as the sole patch source on Windows endpoints. When
+  // true the agent suppresses the native Windows Update automatic-install
+  // channel (NoAutoUpdate=1); Breeze's own WUA-driven installs are unaffected.
+  exclusiveWindowsUpdate: z.boolean().default(false),
+}).superRefine((data, ctx) => {
+  if (data.autoApprove && data.autoApproveSeverities.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['autoApproveSeverities'],
+      message: 'Select at least one severity for auto-approval.',
+    });
+  }
+
+  if (data.sources.length > 0 && data.sources.every((s) => PROVIDERLESS_PATCH_SOURCES.has(s))) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['sources'],
+      message: 'The selected patch sources (firmware/drivers) have no patch provider yet and would approve nothing. Include at least one of: os, third_party, custom.',
+    });
+  }
+
+  // #3207: deferral enabled with a zero budget would render a "Postpone"
+  // affordance that can never be used — a UI lie, not a policy.
+  if (data.rebootAllowDeferral && data.rebootMaxDeferrals === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['rebootMaxDeferrals'],
+      message: 'rebootMaxDeferrals must be at least 1 when deferral is enabled.',
+    });
+  }
+
+  // 10080 minutes (7 days) is the agent's own ceiling on a scheduled reboot
+  // (handlers_patch.go rejects delayMinutes outside 1-10080). The API sets the
+  // hard deadline to delay + maxDeferrals x deferralMinutes, so the WHOLE sum
+  // has to stay inside that horizon: bounding only the deferral product would
+  // let a 1440-minute warning delay push the real deadline a day past it, and
+  // this comment would then be promising something the check did not deliver.
+  // With deferral off there is no deferral horizon at all and
+  // rebootDelayMinutes is bounded by its own 1-1440 range instead.
+  if (
+    data.rebootAllowDeferral
+    && data.rebootDelayMinutes + data.rebootMaxDeferrals * data.rebootDeferralMinutes > 10080
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['rebootDeferralMinutes'],
+      message: 'rebootDelayMinutes + rebootMaxDeferrals x rebootDeferralMinutes must not exceed 10080 minutes (7 days).',
+    });
+  }
+
+  const seen = new Set<string>();
+  for (const [i, app] of data.apps.entries()) {
+    // The approval evaluator matches 'third_party' and 'custom' as a single
+    // bucket, so canonicalize the source when deduping to mirror that.
+    const canonicalSource = app.source === 'custom' ? 'third_party' : app.source;
+    const key = `${canonicalSource}|${app.packageId.toLowerCase()}`;
+    if (seen.has(key)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['apps', i],
+        message: 'Duplicate app rule for the same source and package.',
+      });
+    }
+    seen.add(key);
+  }
+});
+
+export const eventLogInlineSettingsSchema = z.object({
+  retentionDays: z.number().int().min(7).max(365).default(30),
+  maxEventsPerCycle: z.number().int().min(10).max(500).default(100),
+  collectCategories: z.array(z.enum(['security', 'hardware', 'application', 'system'])).min(1).default(['security', 'hardware', 'application', 'system']),
+  minimumLevel: z.enum(['info', 'warning', 'error', 'critical']).default('info'),
+  // 15m default (was 5m) — each collection pass fans out subprocess work on
+  // the agent; on macOS a `log show` pass costs seconds of CPU even when it
+  // returns nothing (issue #2390). Still configurable 1-60.
+  collectionIntervalMinutes: z.number().int().min(1).max(60).default(15),
+  rateLimitPerHour: z.number().int().min(100).max(100000).default(12000),
+});
+
+export const sensitiveDataInlineSettingsSchema = z.object({
+  detectionClasses: z.array(z.enum(['credential', 'pci', 'phi', 'pii', 'financial'])).min(1).default(['credential']),
+  includePaths: z.array(z.string().min(1).max(2048)).max(256).default([]),
+  excludePaths: z.array(z.string().min(1).max(2048)).max(256).default([]),
+  fileTypes: z.array(z.string().min(1).max(32)).max(128).default([]),
+  maxFileSizeBytes: z.number().int().min(1024).max(1073741824).default(104857600),
+  workers: z.number().int().min(1).max(32).default(4),
+  timeoutSeconds: z.number().int().min(5).max(1800).default(300),
+  suppressPatternIds: z.array(z.string().min(1).max(80)).max(200).default([]),
+  scheduleType: z.enum(['manual', 'interval', 'cron']).default('manual'),
+  intervalMinutes: z.number().int().min(5).max(10080).optional(),
+  cron: z.string().max(120).optional(),
+  timezone: z.string().max(64).default('UTC'),
+});
+
+export const onedriveLibraryMappingSchema = z.object({
+  libraryId: z.string().min(1).max(1024),
+  displayName: z.string().min(1).max(255),
+  siteUrl: z.string().max(1024).nullable().optional(),
+  siteId: z.string().max(512).nullable().optional(),
+  webId: z.string().max(128).nullable().optional(),
+  listId: z.string().max(128).nullable().optional(),
+  targetingMode: z.enum(['everyone', 'graph_group', 'local_ad_group']).default('everyone'),
+  groupId: z.string().max(128).nullable().optional(),
+  groupName: z.string().max(255).nullable().optional(),
+  hiveScope: z.enum(['hkcu', 'hklm']).default('hkcu'),
+  enabled: z.boolean().default(true),
+}).superRefine((lib, ctx) => {
+  if (lib.targetingMode === 'graph_group' && !lib.groupId && !lib.groupName) {
+    ctx.addIssue({ code: 'custom', message: 'graph_group targeting requires groupId or groupName', path: ['groupId'] });
+  }
+  if (lib.targetingMode === 'local_ad_group' && !lib.groupName) {
+    ctx.addIssue({ code: 'custom', message: 'local_ad_group targeting requires groupName (agent resolves by name)', path: ['groupName'] });
+  }
+});
+
+export const onedriveHelperInlineSettingsSchema = z.object({
+  silentAccountConfig: z.boolean().default(true),
+  filesOnDemand: z.boolean().default(true),
+  kfmSilentOptIn: z.boolean().default(false),
+  kfmFolders: z.array(z.enum(['Desktop', 'Documents', 'Pictures'])).default(['Desktop', 'Documents', 'Pictures']),
+  kfmBlockOptOut: z.boolean().default(false),
+  tenantAssociationId: z.string().max(64).nullable().optional(),
+  restartOnChange: z.boolean().default(true),
+  libraries: z.array(onedriveLibraryMappingSchema).max(100).default([]),
+});
+
+export const alertRuleItemSchema = z.object({
+  name: z.string().min(1).max(200),
+  severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).default('medium'),
+  conditions: z.array(alertRuleConditionSchema).min(1).max(10),
+  cooldownMinutes: z.number().int().min(1).max(1440).default(5),
+  autoResolve: z.boolean().default(false),
+  autoResolveConditions: z.array(alertRuleConditionSchema).nullable().optional(),
+  titleTemplate: z.string().max(500).optional(),
+  messageTemplate: z.string().max(2000).optional(),
+  sortOrder: z.number().int().min(0).optional(),
+  // #5289 delivery parity: a config-policy alert rule could never say WHERE it
+  // notifies or WHICH escalation policy it uses, so those alerts silently fell
+  // back to org defaults while the standalone alert-rule path honoured both.
+  escalationPolicyId: z.string().uuid().nullable().optional(),
+  // `.nullable()` matches its siblings above and, critically, the READ path:
+  // assembleInlineSettings returns the raw column, which is NULL whenever the
+  // rule never set channels (config_policy_alert_rules.notification_channel_ids
+  // is nullable, decomposeInlineSettings writes `?? null`). Without it, reading
+  // a link and saving it straight back — the retire path, and every editor
+  // round trip — threw `expected array, received null` (#5653).
+  notificationChannelIds: z.array(z.string().uuid()).max(20).nullable().optional(),
+  rationale: z.string().trim().max(2000).nullable().optional(),
+});
+
+export const alertRuleInlineSettingsSchema = z.object({
+  items: z.array(alertRuleItemSchema).max(100).default([]),
+});
+
+/**
+ * Body of `POST /configuration-policies/:id/alert-rules/test` — evaluate one
+ * config-policy alert-rule DRAFT against a single device.
+ *
+ * It takes the CONDITIONS rather than a rule id on purpose. Config-policy alert
+ * rules are stored as `config_policy_alert_rules` rows whose ids are stripped by
+ * the read path and regenerated by the delete-then-recreate save path, so no
+ * stable id exists to address — and the editor needs to test what is on screen,
+ * including edits that have not been saved yet (#3988).
+ *
+ * `conditions` reuses the canonical write schema, so a draft the server would
+ * refuse to SAVE is also refused for a test rather than silently evaluated
+ * under different rules than the ones that will fire.
+ */
+export const testConfigPolicyAlertRuleSchema = z.object({
+  deviceId: z.string().uuid(),
+  conditions: z.array(alertRuleConditionSchema).min(1).max(10),
+});
+
+export const monitoringInlineSettingsSchema = z.object({
+  checkIntervalSeconds: z.number().int().min(10).max(3600).default(60),
+  watches: z.array(z.object({
+    watchType: z.enum(['service', 'process']),
+    name: z.string().min(1).max(255),
+    // These three are the only watch columns without NOT NULL
+    // (config_policy_monitoring_watches.display_name / cpu_threshold_percent /
+    // memory_threshold_mb). The write path stores an unset value as `?? null`
+    // and the read path returns that null verbatim, so the editor loads a saved
+    // watch carrying nulls and posts them straight back. `.optional()` alone
+    // rejected them, which made an existing policy impossible to re-save once
+    // any watch had an unset field (#3491, #3492). Keep in sync with the
+    // columns, same as updateDeviceSchema.displayName above. Consumers already
+    // treat null and undefined alike (`!= null` in agents/helpers.ts).
+    displayName: z.string().max(255).nullable().optional(),
+    enabled: z.boolean().default(true),
+    alertOnStop: z.boolean().default(true),
+    alertAfterConsecutiveFailures: z.number().int().min(1).max(100).default(2),
+    alertSeverity: z.enum(['critical', 'high', 'medium', 'low', 'info']).default('high'),
+    cpuThresholdPercent: z.number().min(0).max(100).nullable().optional(),
+    memoryThresholdMb: z.number().min(0).nullable().optional(),
+    thresholdDurationSeconds: z.number().int().min(0).max(86400).default(300),
+    autoRestart: z.boolean().default(false),
+    maxRestartAttempts: z.number().int().min(0).max(50).default(3),
+    restartCooldownSeconds: z.number().int().min(30).max(86400).default(300),
+    rationale: z.string().trim().max(2000).nullable().optional(),
+  })).max(200).default([]),
+  // Write barrier (2026-07-30 consolidation): server-evaluated rules moved to the
+  // alert_rule feature. Empty arrays from stale clients are tolerated; non-empty
+  // payloads are rejected so stale editor sessions can't resurrect ghost rules.
+  //
+  // Element type is `unknown`, not `never`: a `never` element emits its own
+  // "expected never, received object" issue FIRST, which shadows the pointer
+  // message for any consumer that reports `issues[0]` (the AI tool path does).
+  // `.max(0, ...)` on an unknown[] makes the pointer the only issue raised.
+  eventLogAlerts: z.array(z.unknown())
+    .max(0, 'Event log alert rules have moved to the Alerts feature of this policy')
+    .default([]),
+  alertRules: z.array(z.unknown())
+    .max(0, 'Metric alert rules have moved to the Alerts feature of this policy')
+    .default([]),
+});
+
+export const updateFeatureLinkSchema = z.object({
+  featurePolicyId: z.string().guid().nullable().optional(),
+  inlineSettings: configFeatureInlineSettingsSchema.nullable().optional(),
+});
+
+export const assignPolicySchema = z.object({
+  level: z.enum(['partner', 'organization', 'site', 'device_group', 'device']),
+  // Optional: for the 'partner' level the server derives the target from the
+  // caller's / policy's own partner_id (#1724) and ignores any client value.
+  // Required (enforced server-side) for all other levels.
+  targetId: z.string().guid().optional(),
+  priority: z.number().int().min(0).max(1000).optional(),
+  roleFilter: z.array(z.enum(DEVICE_ROLES)).optional(),
+  osFilter: z.array(z.enum(['windows', 'macos', 'linux'])).optional(),
+});
+
+export const diffSchema = z.object({
+  add: z.array(z.object({
+    configPolicyId: z.string().guid(),
+    level: z.enum(['partner', 'organization', 'site', 'device_group', 'device']),
+    targetId: z.string().guid(),
+    priority: z.number().int().min(0).optional(),
+  })).optional(),
+  remove: z.array(z.string().guid()).optional(),
+});
+
+export const listConfigPoliciesSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  status: z.enum(['active', 'inactive', 'archived']).optional(),
+  search: z.string().optional(),
+  orgId: z.string().guid().optional(),
+});
+
+export const targetQuerySchema = z.object({
+  level: z.enum(['partner', 'organization', 'site', 'device_group', 'device']),
+  targetId: z.string().guid(),
+});
+
+export const configPolicyIdParamSchema = z.object({ id: z.string().guid() });
+export const configPolicyLinkIdParamSchema = z.object({ id: z.string().guid(), linkId: z.string().guid() });
+export const configPolicyAssignmentIdParamSchema = z.object({ id: z.string().guid(), aid: z.string().guid() });
+export const configPolicyDeviceIdParamSchema = z.object({ deviceId: z.string().guid() });
+
+// ============================================
+// AI Validators
+// ============================================
+
+export * from './ai';
+export * from './aiAgents';
+export * from './aiAgentGraduation';
+export * from './aiAgentSchedules';
+export * from './aiOperator';
+export * from './orgNarrative';
+export * from './fleetDesign';
+export * from './fleetDesignApply';
+export * from './aiPatchPlan';
+export * from './ticketTriage';
+export * from './aiAgentImpact';
+export * from './aiAgentImpactMeasured';
+
+// ============================================
+// Tenant Variable Validators (#3409)
+// ============================================
+
+export * from './tenantVariables';
+export * from './variableTokens';
+export * from './scriptParameters';
+export * from './scriptParameterDefinitions';
+
+// ============================================
+// Ticket Validators
+// ============================================
+
+export * from './tickets';
+export * from './ticketForms';
+export * from './queryParams';
+export * from './timeEntries';
+export * from './portal';
+export * from './ticketConfig';
+export * from './retiredLabourPricing';
+export * from './partnerTicketingSettings';
+export * from './auditRetention';
+export * from './ticketPushPreferences';
+export * from './clientAiDlp';
+export * from './quickSupport';
+
+// ============================================
+// Backup Target Validators
+// ============================================
+
+export {
+  backupExcludePatternsSchema,
+  fileTargetsSchema,
+  hypervTargetsSchema,
+  mssqlTargetsSchema,
+  systemImageTargetsSchema,
+  backupModeSchema,
+  backupScheduleSchema,
+  backupRetentionSchema,
+  backupRetentionUpdateSchema,
+  backupInlineSettingsSchema,
+  backupProfileLinkedInlineSettingsSchema,
+  backupProfileSelectionsSchema,
+  enabledBackupSelections,
+  createBackupProfileSchema,
+  updateBackupProfileSchema,
+  type BackupMode,
+  type BackupSchedule,
+  type BackupRetention,
+  type BackupInlineSettings,
+  type BackupProfileSelections,
+  type CreateBackupProfileInput,
+  type UpdateBackupProfileInput,
+} from './backupTargets';
+export {
+  deliverableCadenceSchema,
+  deliverableCompletionModeSchema,
+  createDeliverableSchema,
+  updateDeliverableSchema,
+  listDeliverablesQuerySchema,
+  reportRunEvidenceRefSchema,
+  documentEvidenceRefSchema,
+  evidenceRefSchema,
+  addEvidenceSchema,
+  deliverOccurrenceSchema,
+  waiveOccurrenceSchema,
+  rescheduleOccurrenceSchema,
+  listOccurrencesQuerySchema,
+  type CreateDeliverableInput,
+  type UpdateDeliverableInput,
+  type DeliverOccurrenceInput,
+  type WaiveOccurrenceInput,
+  type RescheduleOccurrenceInput,
+  type AddEvidenceInput,
+  type EvidenceRef,
+} from './serviceDeliverables';
+export {
+  CHECKLIST_ITEM_SOURCES,
+  checklistItemSourceSchema,
+  checklistItemCreateSchema,
+  checklistItemPatchSchema,
+  checklistReorderSchema,
+  type ChecklistItemSource,
+  type ChecklistItemCreateInput,
+  type ChecklistItemPatchInput,
+  type ChecklistReorderInput,
+  checklistTemplateOwnerScopeSchema,
+  createChecklistTemplateSchema,
+  updateChecklistTemplateSchema,
+  createChecklistTemplateItemSchema,
+  updateChecklistTemplateItemSchema,
+  checklistTemplateItemReorderSchema,
+  listChecklistTemplatesQuerySchema,
+  applyChecklistTemplateSchema,
+  type ChecklistTemplateOwnerScope,
+  type CreateChecklistTemplateInput,
+  type UpdateChecklistTemplateInput,
+  type CreateChecklistTemplateItemInput,
+  type UpdateChecklistTemplateItemInput,
+  type ChecklistTemplateItemReorderInput,
+  type ListChecklistTemplatesQuery,
+  type ApplyChecklistTemplateInput,
+} from './ticketChecklists';
+export {
+  templateOwnerScopeSchema,
+  createTemplateItemSchema,
+  updateTemplateItemSchema,
+  createTemplateSetSchema,
+  updateTemplateSetSchema,
+  listTemplateSetsQuerySchema,
+  applyTemplateSetSchema,
+  MANAGED_EVIDENCE_REPORT_TYPES,
+  type ManagedEvidenceReportType,
+  type CreateTemplateItemInput,
+  type UpdateTemplateItemInput,
+  type CreateTemplateSetInput,
+  type UpdateTemplateSetInput,
+  type ApplyTemplateSetInput,
+  type TemplateOwnerScope,
+} from './deliverableTemplates';
+export {
+  keyDateKindSchema,
+  createKeyDateSchema,
+  updateKeyDateSchema,
+  type CreateKeyDateInput,
+  type UpdateKeyDateInput,
+} from './orgKeyDates';
+export {
+  orgDocumentCategorySchema,
+  uploadDocumentMetaSchema,
+  replaceDocumentMetaSchema,
+  updateDocumentSchema,
+  listDocumentsQuerySchema,
+  type OrgDocumentCategory,
+  type UploadDocumentMeta,
+  type ReplaceDocumentMeta,
+  type UpdateDocumentInput,
+  type ListDocumentsQuery,
+} from './orgDocuments';
+
+// #5289 — monitor definitions. monitors.ts imports automationActionSchema from
+// the ./automationActions leaf (never from this barrel), so this re-export
+// carries no initialisation-order hazard.
+export * from './monitors';
+
+// Tool sources (BYO MCP/OpenAPI, spec 2026-09-07)
+export * from './toolSources';
+
+// Intelligent network topology canonical wire contracts (#5996)
+export * from './topology';
+
+export * from './topologyCollection';
+
+export * from './topologyConfiguration';
+
+export * from './topologyDiagnostics';
+
+export { canonicalizeTopologyContext, canonicalizeTopologySection } from './topologyCollectionCanonical';
+
+export * from './billingProfiles';
+
+/**
+ * `maintenance` inline settings (issue #6312).
+ *
+ * The maintenance link is the canonical suppression source — `isInMaintenanceWindow`
+ * feeds every alert/patch/script/reboot consumer — and its evaluator
+ * (`featureConfigResolver.maintenanceOccurrenceStart`) DEGRADES rather than
+ * rejects: an unknown recurrence returns `null` (window never opens), an
+ * invalid timezone falls back to UTC with a console.warn, an unparseable
+ * `windowStart` anchors to midnight, and a non-positive `durationHours` makes
+ * `windowEnd <= windowStart` so the window is never active. Each of those
+ * leaves the operator with a 2xx and a policy that looks configured but
+ * suppresses nothing, visible only in server logs at evaluation time. This
+ * schema is the write-time gate that turns all four into a 400.
+ *
+ * Every field is optional with the default the pre-#6312 `typeof` coercion in
+ * `decomposeInlineSettings` applied, so a partial payload keeps behaving as it
+ * did; what changes is that a WRONG-TYPED or out-of-range value is now
+ * rejected instead of silently replaced by that default.
+ *
+ * `.strict()` so an unknown key is rejected rather than persisted-and-echoed
+ * from the JSONB mirror as if it took effect (same posture as
+ * device_lifecycle / remote_access).
+ */
+
+/** Bare time of day, e.g. "1:50", "01:50" or "01:50:00". */
+export const MAINTENANCE_TIME_OF_DAY_PATTERN = /^(\d{1,2}):(\d{2})(?::\d{2})?$/;
+/** Time component of a naive (zoneless) ISO-8601-ish datetime, e.g. "2026-03-15T02:00". */
+export const MAINTENANCE_DATETIME_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}[T ](\d{1,2}):(\d{2})/;
+/** Date-only form accepted for a `once` window, e.g. "2026-03-15". */
+export const MAINTENANCE_DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+/**
+ * A trailing `Z` or `±HH:MM` offset. Such a value names an *instant*, so its
+ * digits are not wall-clock time in the window's timezone. Legal for `once`
+ * (the evaluator renders it into the zone); rejected for a recurring cadence,
+ * where `parseRecurringWindowAnchor` treats it as unparseable.
+ *
+ * These four patterns are the single source of truth: `featureConfigResolver`
+ * imports them rather than keeping its own copies, so the write gate and the
+ * evaluator can never drift apart about what a stored value means.
+ */
+export const MAINTENANCE_EXPLICIT_UTC_OFFSET_PATTERN = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+
+export const MAINTENANCE_RECURRENCES = ['once', 'daily', 'weekly', 'monthly'] as const;
+
+/** True when `value` is a time-of-day a recurring window can be anchored to. */
+function isRecurringWindowAnchor(value: string): boolean {
+  if (MAINTENANCE_EXPLICIT_UTC_OFFSET_PATTERN.test(value)) return false;
+  const match =
+    MAINTENANCE_TIME_OF_DAY_PATTERN.exec(value) ?? MAINTENANCE_DATETIME_TIME_PATTERN.exec(value);
+  if (!match) return false;
+  return Number(match[1]) <= 23 && Number(match[2]) <= 59;
+}
+
+/** True when `value` is a start a `once` window can actually be anchored to. */
+function isOnceWindowStart(value: string): boolean {
+  if (MAINTENANCE_EXPLICIT_UTC_OFFSET_PATTERN.test(value)) {
+    return !Number.isNaN(new Date(value).getTime());
+  }
+  if (MAINTENANCE_DATE_ONLY_PATTERN.test(value)) {
+    return !Number.isNaN(new Date(`${value}T00:00:00Z`).getTime());
+  }
+  if (!MAINTENANCE_DATETIME_TIME_PATTERN.test(value)) return false;
+  return !Number.isNaN(new Date(`${value.replace(' ', 'T')}Z`).getTime());
+}
+
+export const maintenanceInlineSettingsSchema = z
+  .object({
+    recurrence: z.enum(MAINTENANCE_RECURRENCES).default('weekly'),
+    // Nullable AND empty-string-able: every pre-#4224 recurring row stored NULL
+    // and the web form posts "" for "no explicit anchor". Both normalize to
+    // null, which the evaluator reads as midnight.
+    // 30 = the config_policy_maintenance_settings.window_start varchar width;
+    // a longer value would otherwise reach Postgres and raise 22001 as a 500.
+    windowStart: z.string().max(30).nullish(),
+    // 72h ceiling matches the documented AI-tool contract; the floor is 1
+    // because a zero/negative duration yields a window that never opens.
+    durationHours: z.number().int().min(1).max(72).default(2),
+    timezone: z
+      .string()
+      .min(1)
+      .refine(isValidIanaTimezone, { message: 'Must be a valid IANA timezone (e.g. America/New_York)' })
+      // The refine above has already rejected anything canonicalizeTimezone
+      // would return null for, so the `??` is defensive-only and never a
+      // silent fallback on bad input — a non-IANA zone is a 400, not a UTC.
+      .transform((tz) => canonicalizeTimezone(tz) ?? UTC_TIMEZONE)
+      .default(UTC_TIMEZONE),
+    suppressAlerts: z.boolean().default(true),
+    suppressPatching: z.boolean().default(false),
+    suppressAutomations: z.boolean().default(false),
+    suppressScripts: z.boolean().default(false),
+    rebootIfPending: z.boolean().default(false),
+    // 1440 = one day of lead time; beyond that the notice precedes the previous
+    // occurrence of a daily window.
+    notifyBeforeMinutes: z.number().int().min(0).max(1440).default(15),
+    notifyOnStart: z.boolean().default(true),
+    notifyOnEnd: z.boolean().default(true),
+  })
+  .strict()
+  .transform((settings) => ({
+    ...settings,
+    windowStart: (settings.windowStart ?? '').trim() === '' ? null : settings.windowStart!.trim(),
+  }))
+  .superRefine((settings, ctx) => {
+    if (settings.recurrence === 'once') {
+      if (settings.windowStart === null) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['windowStart'],
+          message: "A 'once' maintenance window requires a windowStart; without one the window never opens",
+        });
+        return;
+      }
+      if (!isOnceWindowStart(settings.windowStart)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['windowStart'],
+          message: "windowStart for a 'once' window must be a datetime, e.g. 2026-03-15T02:00",
+        });
+      }
+      return;
+    }
+    if (settings.windowStart !== null && !isRecurringWindowAnchor(settings.windowStart)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['windowStart'],
+        message:
+          "windowStart for a recurring window must be an HH:MM local time of day (no 'Z' or UTC offset)",
+      });
+    }
+  });
+
+export type MaintenanceInlineSettings = z.infer<typeof maintenanceInlineSettingsSchema>;
+export * from './callerVerification';

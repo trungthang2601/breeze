@@ -1,0 +1,62 @@
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import ForgotPasswordForm from './ForgotPasswordForm';
+import StatusIcon from './StatusIcon';
+import { apiForgotPassword } from '../../stores/auth';
+// Initializes the shared i18next singleton. This page's layout has no Sidebar
+// (which is what pulls i18n in elsewhere), so without this every t() call here
+// renders its raw key.
+import '../../lib/i18n';
+
+export default function ForgotPasswordPage() {
+  const { t } = useTranslation('auth');
+  const [error, setError] = useState<string>();
+  const [loading, setLoading] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+
+  const handleSubmit = async (values: { email: string }) => {
+    setLoading(true);
+    setError(undefined);
+
+    const result = await apiForgotPassword(values.email);
+
+    if (!result.success) {
+      setError(result.error);
+      setLoading(false);
+      return;
+    }
+
+    setSubmitted(true);
+    setLoading(false);
+  };
+
+  if (submitted) {
+    return (
+      <div className="space-y-6 rounded-lg border bg-card p-6 shadow-xs">
+        <div className="space-y-2 text-center">
+          <StatusIcon variant="success" />
+          <h2 className="text-lg font-semibold">{t('forgotPassword.success.title', { defaultValue: 'Check your email' })}</h2>
+          <p className="text-sm text-muted-foreground">
+            {t('forgotPassword.success.description', {
+              defaultValue: 'If an account exists with that email, we have sent a password reset link.',
+            })}
+          </p>
+        </div>
+        <a
+          href="/login"
+          className="flex h-11 w-full items-center justify-center rounded-md border text-sm font-medium transition hover:bg-muted"
+        >
+          {t('common.backToSignIn', { defaultValue: 'Back to sign in' })}
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <ForgotPasswordForm
+      onSubmit={handleSubmit}
+      errorMessage={error}
+      loading={loading}
+    />
+  );
+}

@@ -1,0 +1,268 @@
+/**
+ * Real-DB tests for the per-partner Stripe API-key model (replaces Connect OAuth).
+ * The Stripe SDK is mocked; the encrypted-key storage + retrieval run against
+ * Postgres. Verifies: save validates the key + stores it encrypted with a display
+ * last4, getPartnerStripe rebuilds a client from the decrypted key, status
+ * reflects connected/disconnected, and disconnect clears the secret.
+ */
+import './setup';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { eq } from 'drizzle-orm';
+import { db, withSystemDbAccessContext, withDbAccessContext, type DbAccessContext } from '../../db';
+import { invoiceStripePayments, stripeConnectAccounts } from '../../db/schema/stripePayments';
+import { invoices } from '../../db/schema/invoices';
+import { createOrganization, createPartner } from './db-utils';
+import { isEncryptedSecret } from '../../services/secretCrypto';
+
+const { accountsRetrieveMock, eventsListMock, sessionsExpireMock } = vi.hoisted(() => ({
+  accountsRetrieveMock: vi.fn(),
+  eventsListMock: vi.fn().mockResolvedValue({ data: [], has_more: false }),
+  // SEC-150: savePartnerStripeKey now also probes Checkout WRITE access —
+  // a key that can create sessions but not expire them would collect money it
+  // can never be told to stop collecting. `resource_missing` on a bogus
+  // session id is the "you have the permission" answer.
+  sessionsExpireMock: vi.fn().mockRejectedValue(
+    Object.assign(new Error('No such checkout session'), { type: 'StripeInvalidRequestError', code: 'resource_missing' }),
+  ),
+}));
+vi.mock('stripe', () => ({
+  default: class MockStripe {
+    public _key: string;
+    accounts = { retrieve: accountsRetrieveMock };
+    events = { list: eventsListMock };
+    checkout = { sessions: { expire: sessionsExpireMock } };
+    constructor(key: string) { this._key = key; }
+  },
+}));
+
+import {
+  savePartnerStripeKey,
+  getPartnerStripe,
+  getPartnerStripeStatus,
+  disconnectPartnerStripe,
+  PartnerStripeError,
+} from '../../services/partnerStripe';
+
+const runDb = it.runIf(!!process.env.DATABASE_URL);
+function partnerCtx(partnerId: string): DbAccessContext {
+  return { scope: 'partner', orgId: null, accessibleOrgIds: null, accessiblePartnerIds: [partnerId], userId: null };
+}
+// Assembled from parts so the literal doesn't trip secret-scanning push protection
+// (it's a fake key, but matches the sk_test_ shape). Ends in 9999 → last4 assertion.
+const TEST_KEY = ['sk', 'test', '51ABCdefGHIjklMNOpqr9999'].join('_');
+
+describe('partner Stripe API-key credentials (breeze_app, real DB)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    accountsRetrieveMock.mockResolvedValue({ id: 'acct_partnerOwn', charges_enabled: true });
+    eventsListMock.mockResolvedValue({ data: [], has_more: false });
+  });
+
+  runDb('save validates the key, stores it encrypted with last4, and marks connected', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    const res = await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: TEST_KEY, userId: null }));
+    expect(res.stripeAccountId).toBe('acct_partnerOwn');
+    expect(res.last4).toBe('9999');
+
+    const [row] = await withSystemDbAccessContext(() => db.select().from(stripeConnectAccounts).where(eq(stripeConnectAccounts.partnerId, partner.id)));
+    expect(row!.status).toBe('connected');
+    expect(row!.stripeAccountId).toBe('acct_partnerOwn');
+    expect(row!.keyLast4).toBe('9999');
+    expect(row!.apiKey).toBeTruthy();
+    expect(row!.apiKey).not.toContain(TEST_KEY);     // stored encrypted, never plaintext
+    expect(isEncryptedSecret(row!.apiKey!)).toBe(true);
+  });
+
+  runDb('getPartnerStripe rebuilds a client from the decrypted key', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: TEST_KEY, userId: null }));
+    const client = await withSystemDbAccessContext(() => getPartnerStripe(partner.id)) as unknown as { _key: string };
+    expect(client._key).toBe(TEST_KEY); // decrypted round-trip
+  });
+
+  runDb('getPartnerStripe throws NO_STRIPE_KEY when the partner has not configured a key', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    await expect(withSystemDbAccessContext(() => getPartnerStripe(partner.id)))
+      .rejects.toMatchObject({ code: 'NO_STRIPE_KEY' });
+  });
+
+  runDb('status reflects connected → disconnected; disconnect clears the secret', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: TEST_KEY, userId: null }));
+    let status = await withSystemDbAccessContext(() => getPartnerStripeStatus(partner.id));
+    expect(status).toMatchObject({ connected: true, last4: '9999', stripeAccountId: 'acct_partnerOwn' });
+
+    await withSystemDbAccessContext(() => disconnectPartnerStripe(partner.id));
+    status = await withSystemDbAccessContext(() => getPartnerStripeStatus(partner.id));
+    expect(status.connected).toBe(false);
+    const [row] = await withSystemDbAccessContext(() => db.select().from(stripeConnectAccounts).where(eq(stripeConnectAccounts.partnerId, partner.id)));
+    expect(row!.apiKey).toBeNull(); // secret wiped on disconnect
+  });
+
+  runDb('save rejects a key Stripe refuses (invalid/revoked) and writes NO row', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    accountsRetrieveMock.mockRejectedValue(Object.assign(new Error('Invalid API Key provided'), { type: 'StripeAuthenticationError' }));
+    await expect(withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: ['sk', 'test', 'bogus000000000000000000'].join('_'), userId: null })))
+      .rejects.toMatchObject({ code: 'INVALID_STRIPE_KEY' });
+    const rows = await withSystemDbAccessContext(() => db.select().from(stripeConnectAccounts).where(eq(stripeConnectAccounts.partnerId, partner.id)));
+    expect(rows).toHaveLength(0); // validation precedes the insert — nothing persisted
+  });
+
+  // Key rotation: re-saving overwrites in place (one row), and no stale secret survives.
+  runDb('re-saving a key for the same partner overwrites it (no duplicate, no stale secret)', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    const keyA = ['sk', 'test', '51AAAAaaaa1111'].join('_');
+    const keyB = ['sk', 'test', '51BBBBbbbb2222'].join('_');
+    accountsRetrieveMock.mockResolvedValue({ id: 'acct_A', charges_enabled: true });
+    await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: keyA, userId: null }));
+    accountsRetrieveMock.mockResolvedValue({ id: 'acct_B', charges_enabled: true });
+    await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: keyB, userId: null }));
+
+    const rows = await withSystemDbAccessContext(() => db.select().from(stripeConnectAccounts).where(eq(stripeConnectAccounts.partnerId, partner.id)));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.stripeAccountId).toBe('acct_B');
+    expect(rows[0]!.keyLast4).toBe('2222');
+    const client = await withSystemDbAccessContext(() => getPartnerStripe(partner.id)) as unknown as { _key: string };
+    expect(client._key).toBe(keyB); // the new key, not the old one
+  });
+
+  runDb('rejects a different account while historical payment mappings need the old event stream', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    const org = await withSystemDbAccessContext(() => createOrganization({ partnerId: partner.id }));
+    accountsRetrieveMock.mockResolvedValue({ id: 'acct_old', charges_enabled: true });
+    await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: TEST_KEY, userId: null }));
+    await withSystemDbAccessContext(async () => {
+      const [invoice] = await db.insert(invoices).values({
+        partnerId: partner.id, orgId: org.id, status: 'draft', currencyCode: 'USD',
+      }).returning({ id: invoices.id });
+      await db.insert(invoiceStripePayments).values({
+        orgId: org.id, invoiceId: invoice!.id, stripeAccountId: 'acct_old',
+        stripeObjectType: 'checkout_session', stripeObjectId: 'cs_historical_account',
+        amount: '100.00', currency: 'USD', status: 'pending',
+      });
+    });
+
+    accountsRetrieveMock.mockResolvedValue({ id: 'acct_new', charges_enabled: true });
+    await expect(withSystemDbAccessContext(() => savePartnerStripeKey({
+      partnerId: partner.id, apiKey: ['sk', 'test', '51NEWaccount2222'].join('_'), userId: null,
+    }))).rejects.toMatchObject({ code: 'STRIPE_ACCOUNT_CHANGE_BLOCKED', status: 409 });
+    const [connection] = await withSystemDbAccessContext(() => db.select().from(stripeConnectAccounts)
+      .where(eq(stripeConnectAccounts.partnerId, partner.id)));
+    expect(connection!.stripeAccountId).toBe('acct_old');
+  });
+
+  // Two partners cannot both claim the same Stripe account (acct_uq). The second
+  // gets a friendly key error, not a raw 500, and persists no row.
+  runDb('save rejects a key whose Stripe account is already claimed by another partner', async () => {
+    const [a, b] = await withSystemDbAccessContext(async () => [await createPartner(), await createPartner()]);
+    const keyA = ['sk', 'test', '51SHAREDaaaa1111'].join('_');
+    const keyB = ['sk', 'test', '51SHAREDbbbb2222'].join('_');
+    accountsRetrieveMock.mockResolvedValue({ id: 'acct_shared', charges_enabled: true });
+    await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: a.id, apiKey: keyA, userId: null }));
+
+    // partner B pastes a (different) key that maps to the SAME Stripe account
+    await expect(withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: b.id, apiKey: keyB, userId: null })))
+      .rejects.toMatchObject({ code: 'INVALID_STRIPE_KEY' });
+    const rows = await withSystemDbAccessContext(() => db.select().from(stripeConnectAccounts).where(eq(stripeConnectAccounts.partnerId, b.id)));
+    expect(rows).toHaveLength(0); // acct_uq violation rolled back — nothing persisted for B
+  });
+
+  // REGRESSION #2189 — the cross-partner claim must surface as a typed error
+  // WITHOUT poisoning the partner-scoped request transaction. The old code let
+  // acct_uq raise a 23505 inside withDbAccessContext; postgres.js records the
+  // raw error and re-throws it at commit even after the service mapped it, so
+  // the route's friendly 400 was deterministically clobbered into a raw 500.
+  // The fix pre-checks the claim under a SYSTEM context on its own connection
+  // (partner-axis RLS hides the other partner's row from the request context,
+  // so an in-context pre-check would be silently vacuous). This test runs the
+  // duplicate attempt INSIDE one partner-scoped context — the route's exact
+  // shape — then keeps using the same transaction; both assertions fail
+  // against the old code (25P02 on the follow-up, raw re-throw at commit).
+  runDb('duplicate account claim inside a partner-scoped request context: typed error caught inline, transaction stays usable', async () => {
+    const [a, b] = await withSystemDbAccessContext(async () => [await createPartner(), await createPartner()]);
+    accountsRetrieveMock.mockResolvedValue({ id: 'acct_claimed2189', charges_enabled: true });
+    await withSystemDbAccessContext(() =>
+      savePartnerStripeKey({ partnerId: a.id, apiKey: ['sk', 'test', '51CLAIMEDaaaa1111'].join('_'), userId: null }));
+
+    const outcome = await withDbAccessContext(partnerCtx(b!.id), async () => {
+      let caught: unknown;
+      try {
+        await savePartnerStripeKey({ partnerId: b!.id, apiKey: ['sk', 'test', '51CLAIMEDbbbb2222'].join('_'), userId: null });
+      } catch (err) {
+        caught = err;
+      }
+      // Follow-up query in the SAME transaction — dies with 25P02 under the
+      // old code because the acct_uq violation aborted the transaction.
+      const rows = await db
+        .select({ id: stripeConnectAccounts.id })
+        .from(stripeConnectAccounts)
+        .where(eq(stripeConnectAccounts.partnerId, b!.id));
+      return { caught, rowCount: rows.length };
+    });
+
+    // Reaching here proves the context resolved (no raw re-throw at commit).
+    expect(outcome.caught).toBeInstanceOf(PartnerStripeError);
+    expect(outcome.caught).toMatchObject({
+      code: 'INVALID_STRIPE_KEY',
+      status: 400,
+      message: 'That Stripe account is already connected to another partner. Use a key for a different Stripe account.',
+    });
+    expect(outcome.rowCount).toBe(0); // nothing persisted for B
+  });
+
+  // The pre-check must not false-positive on the partner's OWN claim: rotating
+  // a key for the same Stripe account, inside the partner's own request
+  // context, still upserts in place.
+  runDb('re-saving the SAME account under the partner\'s own request context passes the pre-check (rotation)', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    accountsRetrieveMock.mockResolvedValue({ id: 'acct_rotate2189', charges_enabled: true });
+    const keyA = ['sk', 'test', '51ROTATEaaaa1111'].join('_');
+    const keyB = ['sk', 'test', '51ROTATEbbbb2222'].join('_');
+    await withDbAccessContext(partnerCtx(partner.id), () =>
+      savePartnerStripeKey({ partnerId: partner.id, apiKey: keyA, userId: null }));
+    const res = await withDbAccessContext(partnerCtx(partner.id), () =>
+      savePartnerStripeKey({ partnerId: partner.id, apiKey: keyB, userId: null }));
+    expect(res.last4).toBe('2222');
+
+    const rows = await withSystemDbAccessContext(() =>
+      db.select().from(stripeConnectAccounts).where(eq(stripeConnectAccounts.partnerId, partner.id)));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.keyLast4).toBe('2222');
+  });
+
+  // A live key (rk_live/sk_live) flips livemode — drives the test/live badge in the UI.
+  runDb('a live-mode key sets livemode=true', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    const liveKey = ['rk', 'live', '51LIVEkey9999'].join('_'); // restricted live key (recommended prod shape)
+    const res = await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: liveKey, userId: null }));
+    expect(res.livemode).toBe(true);
+    const status = await withSystemDbAccessContext(() => getPartnerStripeStatus(partner.id));
+    expect(status).toMatchObject({ connected: true, livemode: true });
+  });
+
+  // Functional tenant isolation (not just the mechanical RLS contract test): one
+  // partner's stored Stripe key must be invisible to another partner. A leak here is
+  // a direct financial-takeover vector.
+  runDb('partner B cannot see partner A\'s Stripe key (RLS)', async () => {
+    const { a, b } = await withSystemDbAccessContext(async () => ({ a: await createPartner(), b: await createPartner() }));
+    await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: a.id, apiKey: TEST_KEY, userId: null }));
+
+    // A, scoped to itself, sees connected.
+    const ownView = await withDbAccessContext(partnerCtx(a.id), () => getPartnerStripeStatus(a.id));
+    expect(ownView.connected).toBe(true);
+    // B, scoped to itself, querying A's id → RLS filters the row → not connected, no key leak.
+    const crossView = await withDbAccessContext(partnerCtx(b.id), () => getPartnerStripeStatus(a.id));
+    expect(crossView.connected).toBe(false);
+    // And B cannot build a client from A's key.
+    await expect(withDbAccessContext(partnerCtx(b.id), () => getPartnerStripe(a.id)))
+      .rejects.toMatchObject({ code: 'NO_STRIPE_KEY' });
+  });
+
+  runDb('getPartnerStripe throws NO_STRIPE_KEY after disconnect', async () => {
+    const partner = await withSystemDbAccessContext(() => createPartner());
+    await withSystemDbAccessContext(() => savePartnerStripeKey({ partnerId: partner.id, apiKey: TEST_KEY, userId: null }));
+    await withSystemDbAccessContext(() => disconnectPartnerStripe(partner.id));
+    await expect(withSystemDbAccessContext(() => getPartnerStripe(partner.id)))
+      .rejects.toMatchObject({ code: 'NO_STRIPE_KEY' });
+  });
+});

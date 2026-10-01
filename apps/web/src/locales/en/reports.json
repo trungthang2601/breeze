@@ -1,0 +1,1029 @@
+{
+  "analytics": {
+    "analyticsPage": {
+      "actions": {
+        "refresh": "Refresh",
+        "retry": "Retry"
+      },
+      "alertSeverity": {
+        "acknowledged": "Acknowledged",
+        "critical": "Critical",
+        "high": "High",
+        "low": "Low",
+        "medium": "Medium"
+      },
+      "dashboardOptions": {
+        "capacity": "Capacity Planning",
+        "operations": "Operations Overview",
+        "sla": "SLA Compliance"
+      },
+      "dateRanges": {
+        "customRange": "Custom range",
+        "last24Hours": "Last 24 hours",
+        "last30Days": "Last 30 days",
+        "last7Days": "Last 7 days"
+      },
+      "errors": {
+        "failedToLoadAnalytics": "Failed to load analytics data",
+        "unableToLoad": "Unable to load: {{sources}}"
+      },
+      "lastUpdated": "Updated {{time}}",
+      "subtitle": "Insights across your fleet and services",
+      "title": "Analytics",
+      "trend": {
+        "operationalHealth": "Operational health"
+      },
+      "widgets": {
+        "alertTable": {
+          "count": "Count",
+          "severity": "Severity",
+          "title": "Alert Statistics"
+        },
+        "capacity": {
+          "title": "Capacity Forecast"
+        },
+        "complianceGauge": {
+          "policiesEvaluated": "{{count}} policies evaluated",
+          "title": "Policy Compliance"
+        },
+        "osBreakdown": {
+          "subtitle": "Share of managed devices",
+          "title": "OS Distribution"
+        },
+        "performance": {
+          "cpu": "CPU",
+          "memory": "Memory",
+          "subtitle": "CPU and memory utilization",
+          "title": "Performance Trend"
+        },
+        "remoteSessions": {
+          "label": "Sessions in range",
+          "title": "Remote Sessions"
+        },
+        "uptime": {
+          "label": "Fleet uptime",
+          "title": "Uptime"
+        }
+      }
+    },
+    "capacityForecast": {
+      "actual": "Actual",
+      "critical": "Critical",
+      "criticalValue": "Critical {{value}}{{unit}}",
+      "current": "Current",
+      "description": "Capacity projection based on recent usage",
+      "trend": "Trend",
+      "warnValue": "Warn {{value}}{{unit}}",
+      "warning": "Warning"
+    },
+    "chartWidget": {
+      "noData": "No data available"
+    },
+    "dashboardGrid": {
+      "drag": "Drag",
+      "errors": {
+        "failedToLoadDashboard": "Failed to load dashboard"
+      },
+      "retry": "Retry"
+    },
+    "executiveSummary": {
+      "alertSummary": "Alert Summary",
+      "critical": "Critical",
+      "criticalAndWarningAlerts": "Critical and warning alerts",
+      "deviceOverview": "Device Overview",
+      "fleetAvailabilitySummary": "Fleet availability summary",
+      "last12Weeks": "Last 12 weeks",
+      "offline": "Offline",
+      "online": "Online",
+      "operationalHealth": "Operational health",
+      "totalDevices": "Total devices",
+      "uptime": "Uptime",
+      "warnings": "Warnings",
+      "weeklyTrend": "Weekly trend"
+    },
+    "gaugeWidget": {
+      "criticalValue": "Critical {{value}}",
+      "warnValue": "Warn {{value}}"
+    },
+    "queryBuilder": {
+      "aggregations": {
+        "average": "Average",
+        "maximum": "Maximum",
+        "minimum": "Minimum",
+        "p95": "P95",
+        "sum": "Sum"
+      },
+      "description": "Configure metrics and aggregation for your dashboard",
+      "errors": {
+        "failedToExecuteQuery": "Failed to execute query",
+        "noDevicesSelected": "No devices selected for query"
+      },
+      "labels": {
+        "aggregation": "Aggregation",
+        "endDate": "End date",
+        "metricName": "Metric name",
+        "metricType": "Metric type",
+        "startDate": "Start date",
+        "timeRange": "Time range"
+      },
+      "metricNames": {
+        "activeDevices": "Active Devices",
+        "automationRuns": "Automation Runs",
+        "cpuUtilization": "CPU Utilization",
+        "diskUsage": "Disk Usage",
+        "incidentCount": "Incident Count",
+        "loginVolume": "Login Volume",
+        "memoryUtilization": "Memory Utilization",
+        "mfaAdoption": "MFA Adoption",
+        "networkThroughput": "Network Throughput",
+        "patchCompliance": "Patch Compliance",
+        "remoteSessions": "Remote Sessions",
+        "responseTime": "Response Time",
+        "slaCompliance": "SLA Compliance",
+        "threatAlerts": "Threat Alerts",
+        "uptime": "Uptime",
+        "vulnerabilityScore": "Vulnerability Score"
+      },
+      "metricTypes": {
+        "availability": "Availability",
+        "performance": "Performance",
+        "security": "Security",
+        "usage": "Usage"
+      },
+      "runQuery": "Run Query",
+      "running": "Running...",
+      "timeRanges": {
+        "customRange": "Custom range",
+        "last1Hour": "Last 1 hour",
+        "last24Hours": "Last 24 hours",
+        "last30Days": "Last 30 days",
+        "last7Days": "Last 7 days"
+      },
+      "title": "Query Builder"
+    },
+    "slaComplianceCard": {
+      "defaultPeriodLabel": "Last 30 days",
+      "downtime": "Downtime {{value}}",
+      "incidents": "{{count}} incidents",
+      "status": {
+        "atRisk": "At risk",
+        "breach": "Breach",
+        "compliant": "Compliant"
+      },
+      "targetUptime": "Target {{target}}% uptime",
+      "title": "SLA Compliance"
+    },
+    "tableWidget": {
+      "filterPlaceholder": "Filter",
+      "noMatchingRecords": "No matching records"
+    },
+    "widgetRenderer": {
+      "unsupportedWidget": "Unsupported widget"
+    }
+  },
+  "reports": {
+    "dashboardWidgets": {
+      "accessDenied": "You don't have permission to view this dashboard data.",
+      "activeAlerts": "Active Alerts",
+      "averages": "Averages",
+      "complianceScore": "Compliance Score",
+      "cpu": "CPU",
+      "criticalCount": "{{count}} critical",
+      "disk": "Disk",
+      "errors": {
+        "loadDashboardData": "Failed to load dashboard data"
+      },
+      "issueCount": "{{count}} issue",
+      "issueCount_one": "{{count}} issue",
+      "issueCount_other": "{{count}} issues",
+      "lastUpdated": "Last updated: {{time}}",
+      "memory": "Memory",
+      "onlinePercent": "{{percent}} online",
+      "refresh": "Refresh",
+      "retry": "Retry",
+      "topCpuUsage": "Top CPU Usage",
+      "topDiskUsage": "Top Disk Usage",
+      "topMemoryUsage": "Top Memory Usage",
+      "totalDevices": "Total Devices"
+    },
+    "postureOptions": {
+      "requireBackupCoverage": "Require backup coverage",
+      "requireBackupCoverageHelp": "When optional, backup remains visible as neutral evidence and does not create a recommendation.",
+      "cancel": "Cancel",
+      "createReport": "Create report"
+    },
+    "lifecycleOptions": {
+      "cancel": "Cancel",
+      "createReport": "Create report",
+      "includeManualAssets": "Include hand-entered assets",
+      "includeManualAssetsHelp": "Manual assets with a purchase or warranty date appear alongside agent devices.",
+      "includeOtherEquipment": "List other equipment",
+      "includeOtherEquipmentHelp": "Printers, network and IoT hardware are listed without a replacement timeline.",
+      "replaceAgeYears": "Plan replacement after (years)",
+      "replaceAgeYearsHelp": "A computer is due for replacement this many years after purchase, or when its warranty ends if it is still covered and that runs longer.",
+      "serverReplaceAgeYears": "Plan server replacement after (years)",
+      "serverReplaceAgeYearsHelp": "Servers follow their own timeline and are listed in a separate section of the report."
+    },
+    "vulnerabilityManagementOptions": {
+      "cancel": "Cancel",
+      "createReport": "Create report",
+      "includeAccepted": "Include accepted risks and exceptions",
+      "includeAcceptedHelp": "Lists accepted and mitigated findings, flagging the ones whose acceptance expires in the next period.",
+      "severity": {
+        "critical": "Critical",
+        "high": "High",
+        "low": "Low",
+        "medium": "Medium"
+      },
+      "severityFloor": "Minimum severity to list",
+      "severityFloorHelp": "Findings below this severity are left out of the tables. It never hides an actively exploited (KEV) or high-EPSS finding — those are always counted and listed.",
+      "topN": "Remediation list length",
+      "topNHelp": "How many patchable findings the remediate-first table holds. The report states how many were withheld rather than truncating silently."
+    },
+    "reportBuilderPage": {
+      "configurationTitle": "Report Configuration",
+      "description": "Generate a one-time report without saving it.",
+      "errors": {
+        "exportFailed": "Export failed. Please try again.",
+        "generatePreview": "Failed to generate preview",
+        "generateReportPreview": "Failed to generate report preview"
+      },
+      "title": "Ad-hoc Report Builder"
+    },
+    "reportEditPage": {
+      "backToReports": "Back to Reports",
+      "description": "Update the configuration for \"{{name}}\".",
+      "errors": {
+        "fetchReport": "Failed to fetch report",
+        "generic": "An error occurred"
+      },
+      "loading": "Loading report...",
+      "notFound": "Report not found",
+      "reportsBreadcrumb": "Reports",
+      "title": "Edit Report"
+    },
+    "reportPreview": {
+      "charts": {
+        "alertsBySeverity": "Alerts by Severity",
+        "avgCpu": "Avg CPU",
+        "avgDisk": "Avg Disk",
+        "avgMemory": "Avg Memory",
+        "complianceIssues": "Compliance Issues",
+        "complianceScore": "Compliance Score",
+        "offline": "Offline",
+        "online": "Online",
+        "topAlertingRules": "Top Alerting Rules",
+        "topCpuConsumers": "Top CPU Consumers",
+        "totalDevices": "Total Devices"
+      },
+      "emptyDescription": "Configure your report settings and click Preview to see the data.",
+      "emptyTitle": "No preview available",
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "generated": "Generated {{date}}",
+      "generatedWithRecords": "Generated {{date}} - {{count}} records",
+      "generating": "Generating report preview...",
+      "noDataMatches": "No data matches the current filters.",
+      "pagination": {
+        "page": "Page {{current}} of {{total}}",
+        "showing": "Showing {{start}} to {{end}} of {{total}} records"
+      },
+      "refresh": "Refresh",
+      "lifecycle": {
+        "dueSoon": "Due soon",
+        "onTrack": "On track",
+        "otherEquipment": "Other equipment",
+        "recommendations": "What we recommend",
+        "replaceNow": "Replace now",
+        "unknownAge": "Purchase date unknown"
+      },
+      "vulnerabilityManagement": {
+        "critical": "Open critical",
+        "expiringExceptions": "Exceptions expiring next period",
+        "high": "Open high",
+        "highEpss": "Likely to be exploited",
+        "knownExploited": "Actively exploited (KEV)",
+        "notMeasured": "N/A"
+      },
+      "reportTypes": {
+        "ai_fleet_design": "Fleet Design",
+        "ai_org_narrative": "Weekly AI Operations Narrative",
+        "alert_summary": "Alert Summary",
+        "compliance": "Compliance Report",
+        "device_inventory": "Device Inventory",
+        "executive_summary": "Executive Summary",
+        "hardware_lifecycle": "Hardware Lifecycle",
+        "vulnerability_management": "Vulnerability Management",
+        "identity_access_review": "Identity & Access Review",
+        "performance": "Performance Report",
+        "security_compliance_posture": "Security & Compliance Posture",
+        "software_inventory": "Software Inventory",
+        "threat_detection_review": "Threat Detection Review",
+        "endpoint_management_review": "Endpoint Management Review"
+      },
+      "threatDetection": {
+        "agents": "Endpoints with a detection agent",
+        "breezeDevices": "Devices Breeze manages",
+        "carriedIn": "Carried in, still open",
+        "coverage": "Limits of this report",
+        "devicesWithoutAgent": "Managed devices with no agent",
+        "notMeasured": "N/A",
+        "opened": "Detections raised",
+        "resolved": "Detections resolved"
+      },
+      "tryAgain": "Try again",
+      "values": {
+        "no": "No",
+        "yes": "Yes"
+      },
+      "viewModes": {
+        "chart": "Chart",
+        "table": "Table"
+      },
+      "endpointManagement": {
+        "breezeWithoutIntune": "Breeze devices not enrolled",
+        "dataGaps": "What we could not measure",
+        "intuneDevices": "Enrolled in Intune",
+        "intuneWithoutBreezeLink": "Intune records not linked",
+        "noncompliant": "Not compliant",
+        "notMeasured": "N/A",
+        "staleEnrolments": "Stale enrolments"
+      },
+      "identityAccess": {
+        "notMeasured": "N/A",
+        "coverage": "Limits of this report",
+        "signins": "Interactive sign-ins",
+        "distinctUsers": "Accounts signing in",
+        "failures": "Sign-ins that failed",
+        "admins": "Accounts with an admin role",
+        "adminsWithoutMfa": "Administrators without MFA",
+        "mfaUnknown": "MFA state unknown",
+        "dormant": "Dormant accounts"
+      }
+    },
+    "reportsList": {
+      "actions": {
+        "delete": "Delete",
+        "edit": "Edit",
+        "generateNow": "Generate now"
+      },
+      "adhocReport": "Ad-hoc Report",
+      "aiNarrative": {
+        "managedBySchedule": "Managed by AI schedule",
+        "openLatest": "Open latest"
+      },
+      "confirmDelete": "Are you sure you want to delete \"{{name}}\"?",
+      "createReport": "Create Report",
+      "description": "Generate and schedule reports for your infrastructure.",
+      "download": "Download",
+      "emailRecipients": "Email recipients",
+      "emptyReportsDescription": "Create your first report to get started.",
+      "emptyReportsTitle": "No reports yet",
+      "emptyRunsDescription": "Generate a report to see it here.",
+      "emptyRunsTitle": "No recent runs",
+      "errors": {
+        "deleteReport": "Failed to delete report",
+        "downloadFailed": "Download failed",
+        "fetchReports": "Failed to fetch reports",
+        "generateReport": "Failed to generate report",
+        "generic": "An error occurred",
+        "noCompletedRun": "No completed narrative to open yet"
+      },
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "loading": "Loading reports...",
+      "never": "Never",
+      "success": {
+        "generated": "Report \"{{name}}\" generated."
+      },
+      "visibleInPortal": "Visible in customer portal",
+      "newReport": "New Report",
+      "nextOccurrence": "Next: {{next}}",
+      "reportTypes": {
+        "ai_fleet_design": "Fleet Design",
+        "ai_org_narrative": "Weekly AI Operations Narrative",
+        "alert_summary": "Alert Summary",
+        "compliance": "Compliance Report",
+        "device_inventory": "Device Inventory",
+        "executive_summary": "Executive Summary",
+        "hardware_lifecycle": "Hardware Lifecycle",
+        "vulnerability_management": "Vulnerability Management",
+        "identity_access_review": "Identity & Access Review",
+        "performance": "Performance Report",
+        "security_compliance_posture": "Security & Compliance Posture",
+        "software_inventory": "Software Inventory",
+        "threat_detection_review": "Threat Detection Review",
+        "endpoint_management_review": "Endpoint Management Review"
+      },
+      "runsTable": {
+        "actions": "Actions",
+        "completed": "Completed",
+        "report": "Report",
+        "started": "Started",
+        "status": "Status"
+      },
+      "schedules": {
+        "daily": "Daily",
+        "monthly": "Monthly",
+        "one_time": "One-time",
+        "weekly": "Weekly"
+      },
+      "status": {
+        "completed": "completed",
+        "failed": "failed",
+        "pending": "pending",
+        "running": "running"
+      },
+      "table": {
+        "actions": "Actions",
+        "format": "Format",
+        "lastGenerated": "Last Generated",
+        "name": "Name",
+        "schedule": "Schedule",
+        "type": "Type"
+      },
+      "tabs": {
+        "recentRuns": "Recent Runs",
+        "savedReports": "Saved Reports"
+      },
+      "templates": "Templates",
+      "title": "Reports",
+      "tryAgain": "Try again",
+      "unknownReport": "Unknown Report"
+    },
+    "reportBuilder": {
+      "actions": {
+        "cancel": "Cancel",
+        "generateReport": "Generate report",
+        "preview": "Preview",
+        "saveReport": "Save report",
+        "updateReport": "Update report"
+      },
+      "addCondition": "Add condition",
+      "addRecipient": "Add recipient",
+      "aggregation": "Aggregation",
+      "aggregationField": "Aggregation field",
+      "aggregationOptions": {
+        "avg": "Average",
+        "count": "Count",
+        "sum": "Sum"
+      },
+      "availableFields": "Available fields",
+      "chart": {
+        "notEnoughData": "Not enough data to chart.",
+        "pieChartPreview": "Pie chart preview"
+      },
+      "chartTypes": {
+        "bar": "Bar",
+        "line": "Line",
+        "pie": "Pie",
+        "table": "Table"
+      },
+      "dataSource": {
+        "activity": {
+          "includeSystem": {
+            "label": "Include system accounts"
+          },
+          "region": {
+            "label": "Region",
+            "options": {
+              "all": "All regions",
+              "apac": "APAC",
+              "emea": "EMEA",
+              "na": "North America"
+            }
+          },
+          "source": {
+            "label": "Activity source",
+            "options": {
+              "admin": "Admin actions",
+              "api": "API activity",
+              "auth": "Authentication",
+              "system": "System events"
+            }
+          },
+          "timeWindow": {
+            "label": "Time window",
+            "options": {
+              "last_24h": "Last 24 hours",
+              "last_30d": "Last 30 days",
+              "last_7d": "Last 7 days"
+            }
+          }
+        },
+        "alerts": {
+          "severity": {
+            "label": "Severity",
+            "options": {
+              "all": "All severities",
+              "critical": "Critical",
+              "high": "High",
+              "low": "Low",
+              "medium": "Medium"
+            }
+          },
+          "source": {
+            "label": "Alert source",
+            "options": {
+              "all": "All sources",
+              "monitoring": "Monitoring",
+              "operations": "Operations",
+              "security": "Security"
+            }
+          },
+          "status": {
+            "label": "Alert status",
+            "options": {
+              "acknowledged": "Acknowledged",
+              "all": "All statuses",
+              "open": "Open",
+              "resolved": "Resolved"
+            }
+          },
+          "timeWindow": {
+            "label": "Time window",
+            "options": {
+              "last_24h": "Last 24 hours",
+              "last_30d": "Last 30 days",
+              "last_7d": "Last 7 days"
+            }
+          }
+        },
+        "compliance": {
+          "includeExceptions": {
+            "label": "Include exceptions"
+          },
+          "policySet": {
+            "label": "Policy set",
+            "options": {
+              "cis": "CIS Benchmarks",
+              "custom": "Custom policies",
+              "hipaa": "HIPAA",
+              "iso27001": "ISO 27001"
+            }
+          },
+          "scope": {
+            "label": "Coverage scope",
+            "options": {
+              "all_devices": "All devices",
+              "by_group": "By device group",
+              "by_site": "By site"
+            }
+          },
+          "scoring": {
+            "label": "Scoring method",
+            "options": {
+              "pass_fail": "Pass / fail",
+              "weighted": "Weighted scoring"
+            }
+          }
+        },
+        "devices": {
+          "includeInactive": {
+            "label": "Include inactive devices"
+          },
+          "inventorySource": {
+            "label": "Inventory source",
+            "options": {
+              "agent": "Agent reported",
+              "cmdb": "CMDB import",
+              "combined": "Combined sources"
+            }
+          },
+          "ownership": {
+            "label": "Ownership",
+            "options": {
+              "all": "All devices",
+              "managed": "Managed devices",
+              "unmanaged": "Unmanaged devices"
+            }
+          },
+          "platform": {
+            "label": "Platform",
+            "options": {
+              "all": "All platforms",
+              "linux": "Linux",
+              "macos": "macOS",
+              "windows": "Windows"
+            }
+          },
+          "scope": {
+            "label": "Device scope",
+            "options": {
+              "all_devices": "All devices",
+              "by_site": "By site",
+              "by_tag": "By tag"
+            }
+          }
+        },
+        "patches": {
+          "approval": {
+            "label": "Approval state",
+            "options": {
+              "approved": "Approved",
+              "deployed": "Deployed",
+              "pending": "Pending approval"
+            }
+          },
+          "catalog": {
+            "label": "Patch catalog",
+            "options": {
+              "firmware": "Firmware and BIOS",
+              "os_updates": "OS updates",
+              "third_party": "Third-party apps"
+            }
+          },
+          "priority": {
+            "label": "Priority",
+            "options": {
+              "critical": "Critical",
+              "important": "Important",
+              "routine": "Routine"
+            }
+          },
+          "vendor": {
+            "label": "Vendor",
+            "options": {
+              "all": "All vendors",
+              "apple": "Apple",
+              "linux": "Linux",
+              "microsoft": "Microsoft"
+            }
+          }
+        }
+      },
+      "dataSourceSummary": "{{label}}: {{value}}",
+      "dayOfMonth": "Day of month",
+      "dayOfWeek": "Day of week",
+      "deviceFilterDescription": "Scope this report to devices matching the filter below.",
+      "emailDistributionList": "Email distribution list",
+      "errors": {
+        "generatePreview": "Failed to generate preview",
+        "generic": "An error occurred",
+        "loadLivePreview": "Failed to load live preview",
+        "reportNameRequired": "Report name is required.",
+        "saveReport": "Failed to save report",
+        "selectExportFormat": "Select at least one export format.",
+        "templateNameRequired": "Template name is required.",
+        "validEmail": "Enter a valid email address."
+      },
+      "exportFormats": {
+        "csv": {
+          "description": "Comma-separated values",
+          "label": "CSV"
+        },
+        "excel": {
+          "description": "Spreadsheet workbook",
+          "label": "Excel"
+        },
+        "pdf": {
+          "description": "Formatted document",
+          "label": "PDF"
+        }
+      },
+      "exportFormatsTitle": "Export formats",
+      "fields": {
+        "activity": {
+          "action": "Action",
+          "duration_seconds": "Duration (sec)",
+          "ip_address": "IP address",
+          "location": "Location",
+          "resource": "Resource",
+          "result": "Result",
+          "target": "Target",
+          "timestamp": "Timestamp",
+          "user": "User"
+        },
+        "alerts": {
+          "alert_id": "Alert ID",
+          "device": "Device",
+          "duration_minutes": "Duration (min)",
+          "resolved_at": "Resolved at",
+          "rule": "Rule",
+          "severity": "Severity",
+          "source": "Source",
+          "status": "Status",
+          "triggered_at": "Triggered at"
+        },
+        "compliance": {
+          "control_family": "Control family",
+          "device_count": "Devices",
+          "exception_count": "Exceptions",
+          "last_audit": "Last audit",
+          "policy": "Policy",
+          "score": "Score",
+          "status": "Status"
+        },
+        "devices": {
+          "cpu": "CPU usage",
+          "disk_usage": "Disk usage",
+          "hostname": "Hostname",
+          "last_seen": "Last seen",
+          "memory": "Memory usage",
+          "os": "OS",
+          "owner": "Owner",
+          "patch_level": "Patch level",
+          "serial": "Serial",
+          "site": "Site",
+          "status": "Status"
+        },
+        "patches": {
+          "approved_at": "Approved at",
+          "device_count": "Devices",
+          "missing_count": "Missing",
+          "patch_id": "Patch ID",
+          "release_date": "Release date",
+          "severity": "Severity",
+          "status": "Status",
+          "title": "Title",
+          "vendor": "Vendor"
+        }
+      },
+      "fieldsShared": {
+        "reportName": "Report name",
+        "saveAsTemplate": "Save as template",
+        "templateName": "Template name"
+      },
+      "filterModes": {
+        "deviceFilter": "Device Filter",
+        "recordFilters": "Record Filters"
+      },
+      "filterOperators": {
+        "contains": "Contains",
+        "gt": "Greater than",
+        "is": "Is",
+        "is_not": "Is not",
+        "lt": "Less than"
+      },
+      "groupBy": "Group by",
+      "groupedMetric": {
+        "avg": "Avg {{field}}",
+        "count": "Count",
+        "sum": "Sum {{field}}",
+        "value": "Value"
+      },
+      "livePreview": {
+        "description": "Updates as you configure the report.",
+        "loading": "Loading live preview...",
+        "noData": "No preview data for the current configuration.",
+        "previewRows": "Preview rows",
+        "title": "Live preview",
+        "untitledReport": "Untitled report"
+      },
+      "logic": {
+        "and": "AND",
+        "or": "OR"
+      },
+      "noFieldsSelected": "No fields selected yet.",
+      "noFilters": "No filters yet. Add your first condition.",
+      "noGrouping": "No grouping",
+      "noNumericFields": "No numeric fields",
+      "placeholders": {
+        "email": "name@company.com",
+        "reportName": "Monthly Security Overview",
+        "templateName": "Quarterly Compliance Pack",
+        "value": "Value"
+      },
+      "recipients": {
+        "contacts": "Organization contacts",
+        "legacy": "Legacy email addresses",
+        "convert": "Convert to contact",
+        "added": "Report recipient added",
+        "removed": "Report recipient removed",
+        "converted": "Email address converted to a contact",
+        "updateFailed": "Could not update the report recipients",
+        "convertFailed": "Could not convert this email address",
+        "mfaRequired": "Converting a recipient requires multi-factor authentication. Enable MFA in your profile and try again.",
+        "loadFailed": "Could not load the report recipients"
+      },
+      "previewTable": {
+        "selectFields": "Select fields to populate the preview table."
+      },
+      "reportTypes": {
+        "activity": {
+          "description": "User, admin, and system activity trails",
+          "label": "Activity"
+        },
+        "alerts": {
+          "description": "Alert volume, severity, and response performance",
+          "label": "Alerts"
+        },
+        "compliance": {
+          "description": "Audit readiness and policy alignment visibility",
+          "label": "Compliance"
+        },
+        "devices": {
+          "description": "Inventory and health posture across managed endpoints",
+          "label": "Devices"
+        },
+        "patches": {
+          "description": "Patch readiness, deployment status, and exposure",
+          "label": "Patches"
+        }
+      },
+      "runTime": "Run time",
+      "schedule": "Schedule",
+      "scheduleDetail": {
+        "day": "Day {{date}}",
+        "everyDay": "Every day"
+      },
+      "scheduleOptions": {
+        "daily": {
+          "label": "Daily"
+        },
+        "monthly": {
+          "label": "Monthly"
+        },
+        "weekly": {
+          "label": "Weekly"
+        }
+      },
+      "sections": {
+        "chartType": {
+          "description": "Choose how the report is visualized.",
+          "title": "Chart type"
+        },
+        "columns": {
+          "description": "Pick fields and drag to reorder.",
+          "title": "Columns and fields"
+        },
+        "dataSource": {
+          "description": "Configure the dataset for this report type.",
+          "title": "Data source"
+        },
+        "delivery": {
+          "description": "Set cadence, formats, and recipients.",
+          "title": "Schedule and delivery"
+        },
+        "filters": {
+          "description": "Filter report data by records or device properties.",
+          "title": "Filters"
+        },
+        "grouping": {
+          "description": "Summarize data with counts, sums, or averages.",
+          "title": "Grouping and aggregation"
+        },
+        "reportDetails": {
+          "description": "Name the report and decide if it becomes a template.",
+          "title": "Report details"
+        },
+        "reportType": {
+          "description": "Choose the kind of report you are building.",
+          "title": "Report type"
+        }
+      },
+      "selectedFields": "Selected fields",
+      "success": {
+        "created": "Report \"{{name}}\" saved.",
+        "updated": "Report \"{{name}}\" updated."
+      },
+      "values": {
+        "enabled": "Enabled",
+        "off": "Off",
+        "on": "On"
+      },
+      "weekDays": {
+        "friday": "Friday",
+        "monday": "Monday",
+        "saturday": "Saturday",
+        "sunday": "Sunday",
+        "thursday": "Thursday",
+        "tuesday": "Tuesday",
+        "wednesday": "Wednesday"
+      },
+      "where": "Where"
+    },
+    "reportTemplates": {
+      "blankConfigurationDescription": "Configure a report from scratch or start with a blank configuration.",
+      "createCustomTemplate": "Create Custom Template",
+      "custom": "Custom",
+      "description": "Start from curated templates and tailor the details before publishing.",
+      "errors": {
+        "createReport": "Failed to create report",
+        "fetchTemplates": "Failed to fetch report templates",
+        "loadTemplates": "Unable to load templates"
+      },
+      "formats": {
+        "csv": "CSV",
+        "excel": "Excel",
+        "pdf": "PDF"
+      },
+      "last30Days": "last 30 days",
+      "previewAlt": "{{name}} preview",
+      "reportTypes": {
+        "activity": "Activity",
+        "ai_fleet_design": "Fleet Design",
+        "ai_org_narrative": "Weekly AI Operations Narrative",
+        "alert_summary": "Alert Summary",
+        "alerts": "Alerts",
+        "compliance": "Compliance Report",
+        "device_inventory": "Device Inventory",
+        "devices": "Devices",
+        "executive_summary": "Executive Summary",
+        "hardware_lifecycle": "Hardware Lifecycle",
+        "vulnerability_management": "Vulnerability Management",
+        "identity_access_review": "Identity & Access Review",
+        "patches": "Patches",
+        "performance": "Performance Report",
+        "security_compliance_posture": "Security & Compliance Posture",
+        "software_inventory": "Software Inventory",
+        "threat_detection_review": "Threat Detection Review",
+        "endpoint_management_review": "Endpoint Management Review"
+      },
+      "schedules": {
+        "daily": "Daily",
+        "monthly": "Monthly",
+        "one_time": "One-time",
+        "weekly": "Weekly"
+      },
+      "spec": {
+        "cadence": "Cadence",
+        "defaultRange": "Default range",
+        "format": "Format"
+      },
+      "success": {
+        "created": "Created \"{{name}}\". Generate it from the Reports list."
+      },
+      "syncing": "Syncing templates...",
+      "template": "Template",
+      "templates": {
+        "alert_summary": {
+          "description": "Top alerts, severity trends, and response workload.",
+          "name": "Alert Summary Report"
+        },
+        "device_health": {
+          "description": "CPU, memory, and uptime trends with device health scoring.",
+          "name": "Device Health Report"
+        },
+        "executive_summary": {
+          "description": "High-level KPIs, risk posture, and strategic trends for leadership.",
+          "name": "Executive Summary"
+        },
+        "hardware_lifecycle": {
+          "description": "Customer-ready device replacement plan: age, warranty, replace-by dates and OS support status, with a staged recommendation.",
+          "name": "Hardware Lifecycle Report"
+        },
+        "vulnerability_management": {
+          "description": "Open findings by severity, with actively exploited (KEV) and high-EPSS findings called out separately, the patchable findings to remediate first, and the accepted-risk exceptions expiring next period.",
+          "name": "Vulnerability Management Report"
+        },
+        "identity_access_review": {
+          "name": "Identity & Access Review",
+          "description": "Interactive Microsoft 365 sign-ins for a period, with the identity inventory, dormant accounts, conditional access posture and remote-access client presence — and the window actually covered stated on the face of it."
+        },
+        "security_compliance_posture": {
+          "description": "Insurance/vetting-ready evidence: EDR coverage, encryption, firewall, patching, vulnerabilities, privileged access, and security integrations with percent-implemented rollups.",
+          "name": "Security & Compliance Posture (Insurance)"
+        },
+        "threat_detection_review": {
+          "description": "The threat detections held for a period, with the window actually covered stated on the face of it — never a zero for a source that was not connected.",
+          "name": "Threat Detection Review"
+        },
+        "endpoint_management_review": {
+          "description": "Microsoft Intune evidence: enrolment coverage, compliance breakdown with a 30-day trend, stale enrolments and licence seats, with the freshness of each sync stated.",
+          "name": "Intune Endpoint Management Review"
+        }
+      },
+      "title": "Report Templates",
+      "useTemplate": "Use template",
+      "useTemplateTitle": "Use {{name}}"
+    },
+    "threatDetectionOptions": {
+      "cancel": "Cancel",
+      "coverageNote": "The report prints the window it actually covers. If the detection source was not connected for part of the period, it says so instead of reporting zero.",
+      "createReport": "Create report",
+      "includeCarriedIn": "Include detections carried in",
+      "includeCarriedInHelp": "Detections that opened before this period and are still unresolved are listed alongside the period’s own.",
+      "topIncidents": "List at most (detections)",
+      "topIncidentsHelp": "Caps the detection table so a noisy month cannot produce a hundred-page PDF. The report states how many were withheld rather than truncating silently."
+    },
+    "endpointManagementOptions": {
+      "cancel": "Cancel",
+      "createReport": "Create report",
+      "includeLicences": "Include licence seats",
+      "includeLicencesHelp": "Shows seats in use against seats purchased for each Microsoft 365 product.",
+      "staleEnrolmentDays": "Flag enrolments idle for (days)",
+      "staleEnrolmentDaysHelp": "A device that has not checked in with Intune for this many days counts as a stale enrolment. Judged against the Intune sync cadence, not against the reporting period.",
+      "trendDays": "Compliance trend window (days)",
+      "trendDaysHelp": "How far back the daily compliance trend reads from Microsoft 365 posture rollups."
+    },
+    "identityAccessOptions": {
+      "cancel": "Cancel",
+      "createReport": "Create report",
+      "orgWideNote": "This report covers the whole organization. Microsoft 365 identity data has no site dimension, so it cannot be narrowed to particular sites — and an account limited to certain sites cannot run it at all.",
+      "dormantDays": "Treat an account as dormant after (days)",
+      "dormantDaysHelp": "Enabled accounts with no recorded successful sign-in in this many days are listed. An account never seen signing in is listed as “never observed”, which is not the same as a long gap.",
+      "homeCountries": "Expected sign-in countries (ISO codes)",
+      "homeCountriesHelp": "Two-letter country codes, separated by commas — for example US, CA. Sign-ins from outside the list are counted. Leave it empty and the section reads “not configured”, never “no foreign sign-ins”.",
+      "adminDetail": "Include administrator sign-in detail",
+      "adminDetailHelp": "Lists each interactive sign-in by an account holding an admin role, including the address it came from. This is the section an auditor reads first.",
+      "coverageNote": "The report covers interactive sign-ins only and prints the window it actually covers. Microsoft keeps sign-in logs for about 30 days and requires an Entra ID P1 or P2 licence to release them, so the first report after enabling collection is partial and says so."
+    }
+  }
+}

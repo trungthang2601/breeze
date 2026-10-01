@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import EnrollmentKeyManager from '../../components/settings/EnrollmentKeyManager';
+---
+
+<DashboardLayout titleKey="titles.settingsEnrollmentKeys">
+  <EnrollmentKeyManager client:load />
+</DashboardLayout>

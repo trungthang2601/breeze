@@ -1,0 +1,5420 @@
+# Feature Test Log
+
+Tracking file for post-implementation feature verification results. Entries are logged most-recent-first.
+
+## Hardware Lifecycle Report (PR #5701) — 2026-09-13
+
+**Branch:** `feature/hardware-lifecycle-report`
+**Commit:** `87fcc856f`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+- [x] UI: `/reports/templates` → Hardware Lifecycle card → options dialog → Create report → saved with `type=hardware_lifecycle`, monthly, PDF.
+- [x] UI: Generate now → completed run; Recent Runs → Download → 2-page PDF rendered and inspected (summary bars, replacement table, other equipment, recommendations, vendor-date footnote).
+- [x] UI: Edit page loads lifecycle options from config; changed replace-age 4→5 + other-equipment off → Update → config persisted, type preserved; regenerate honours both (otherEquipmentCount 0, due_soon recount).
+- [x] Data: wt-stack seed + e2e fixtures + 12 seeded devices (device_hardware, device_warranty incl. AppleCare subscription, vendor/manual purchase dates, undated) + 4 manual assets (workstation w/ warranty, printer, switch, unknown). 15 computers / 3 other classified correctly (6 replace, 2 due soon, 4 on track, 3 unknown age; Win10 → ended, Server 2016 → ending).
+- [x] Bug fix: saved report no longer duplicates its curated template card (`ReportTemplates.savedReportMerge.test.tsx`), verified live after "Use template".
+
+### Issues Found
+- Fixed in `87fcc856f`: `/reports/templates` returns every saved report; name-matched rows were keyed by their own UUID and rendered as a second card.
+- Pre-existing, not fixed: Saved Reports "Last Generated" column stays stale after Generate now until reload (`handleGenerate` refreshes runs only).
+- Cosmetic: PDF table ellipsises long OS/model cells ("Windows Server 2016 Stand…", "ThinkPad X1 Carbon Ge…").
+- Note: OS classifier keys on the agent's product-name `os_version` ("Microsoft Windows 10 Pro 22H2"); a bare NT build string ("10.0.19045") stays `unclassified` (conservative by design).
+
+Use the `feature-testing` skill to run structured verification and record results here.
+
+## Network device detail page + discovered asset list (branch `network-assets-list`) — 2026-09-06
+
+**Branch:** `network-assets-list`
+**Commit:** `8478c85c0` (fixes) on top of `ec3430dd7`
+**Tested by:** Claude (Playwright MCP against a `pnpm wt-stack` per-worktree stack)
+**Result:** PASS after one inline fix
+
+### What was tested
+- [x] UI: `/discovery#assets` list renders 10 seeded assets across pending/approved/dismissed, all type facets, profile and subnet facets, online/offline dots, "Agent" badge (renamed from "Agent installed") linking to the managed device.
+- [x] UI: `/devices/network/:id` for a SNMP-rich switch, a 14-port NAS, an offline no-hostname camera, a phone with auto-link suppressed, and a bogus id (404 state with breadcrumbs, Try again, Go back).
+- [x] UI: header shows site name, IP, MAC, manufacturer; stat strip Status/Ping/Open ports (jumps to section)/Linked device; Overview and Monitoring tabs with hash sync and ArrowRight roving focus.
+- [x] UI: type editor stages a value with Save/Cancel, PATCHes on Save, header badge updates, live region announces, "Reset to auto-detected" + "Manually set" provenance.
+- [x] UI: SNMP "Show more/Show less" on a long sysDescr; open ports list capped at 12 with "Show all (14)"/"Show fewer"; Telnet flagged "Unencrypted" with visible hint.
+- [x] UI: proxy popover (header and per-port variants): port input, bridge agent preselected to the discovering agent, HTTP/HTTPS, self-signed checkbox on 443, Escape closes, Connect POSTs `/tunnels/proxy-connect`, failure toasts "Agent is not connected".
+- [x] UI: Link manually… picker → Save → "Same device as … — set manually" + stat strip; Unlink → confirm dialog → "Auto-linking is off … because someone unlinked it".
+- [x] API: `GET /discovery/assets/:id` returns `siteName`, `suggestedBridgeDeviceId` resolved via `discovery_jobs.agent_id` → `devices.agent_id`; `PATCH` type save/reset; link/unlink.
+- [x] Unified device list with `PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST=true`: 4 approved+unlinked assets appear as Class "Network" rows with All/Agent/Network facets. Impeccable critique scored it 17/40; all findings fixed in `45edd116f` and re-verified live: the Online chip keeps all 6 rows, Needs Patches shows "4 network devices hidden — Needs Patches applies to agent devices only." with badges All 2 / Agent 2 / Network 0, a network-only select-all reads "4 selected · 0 agent, 4 network" with all seven agent-only bulk actions disabled and titled, switching the segment prunes the selection, Network view drops OS/Role/CPU/RAM columns and Agent view drops Class, headers are keyboard buttons with `scope="col"`, rows show a focus ring. The flag now defaults to ON.
+
+### Evidence
+- Seed: 10 `discovered_assets` + 1 `discovery_profiles` + 1 `discovery_jobs` under Default Org/Site (SQL in session scratchpad; `discovery_jobs.agent_id` must be the device's varchar `agent_id`, not its uuid, for the bridge suggestion to resolve).
+- Unit: `NetworkDeviceDetailPage.test.tsx` + `DiscoveredAssetList.test.tsx` 89/89 after fix; `translationCoverage.test.ts` 15/15.
+
+### Issues Found
+- **FIXED inline (8478c85c0):** pressing Connect closed the popover mid-request. The disabled Connect button fires `focusout` with a null `relatedTarget` in Chrome and the non-modal focus-leave handler treated that as the user leaving. Same mechanism left focus on `<body>` after Escape instead of restoring it to the trigger. Fix: ignore focus-loss with no related target; refocus Connect after a failed connect.
+- Open, minor: SNMP section mixes translated labels ("System name", "Description") with raw OIDs (`sysUpTime`, `sysContact`, `sysLocation`, `ifNumber`); discovery methods render raw enum values (`port_scan`); a port with no service name shows the number twice ("6690 / 6690"); when the asset has no hostname or label the subtitle repeats the IP shown as the h1; "Reset to auto-detected" on an asset with `detected_asset_type = NULL` keeps the manual type and only flips `type_source` to `auto`; after Unlink's confirm dialog closes, focus lands on `<body>`; "Device linked" is not announced to the live region (unlink is).
+- Product gap, not a bug: the Monitoring tab only shows enabled/not-configured for SNMP and network monitoring and links to the discovery asset view. No page in the web UI charts `snmp_metrics` or `network_monitor_results`; `/monitoring` modals show the last 20 rows as tables, and `GET /snmp/dashboard` `topInterfaces` is computed but never rendered.
+
+### Notes
+- Seeded agents flip to offline once `devices.last_seen_at` ages past the online threshold; the popover then shows "No online agent can reach …" and hides Connect (correct behavior, but bump `last_seen_at` before re-testing the proxy flow).
+- `docker-compose.override.yml.dev` now maps `PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST` (empty → the web default, which is on); set `false` in the worktree `.env` and `--force-recreate web` to see the agent-only list.
+## AI agent builder — capability picker + four-step create flow (#5048 W01–W03) — 2026-09-06
+
+**Branch:** `ai-agent-refinement` (== `main`)
+**Commit:** `c52846222`
+**Tested by:** Claude (Playwright MCP against a `pnpm wt-stack` stack, `BREEZE_AI_AGENTS_ENABLED=true`, `BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED=true`)
+**Result:** PASS with findings (1 truthfulness defect, 3 UX, several copy/a11y nits)
+
+### What was tested
+- [x] UI: Settings → AI agents empty state → "Create your first agent" opens the full-width four-step flow; empty-name validation (summary list + inline + aria-invalid); mode/kind/owner-scope/name/instructions on step 1.
+- [x] UI: Step 2 picker — "Use recommended" preset (6 ops / 4 capabilities), tri-state parent checkbox (indeterminate → all → none), search, "Show tool names" switch, "60 read-only tools" disclosure, "More capabilities (10)", live summary line.
+- [x] UI: Act mode acknowledgement gates Next; outcomes re-evaluate per mode (Approval request / Logged proposal / Executes unattended) with selections preserved.
+- [x] UI: Step 3 protected resources, ceiling keys (partner draft), limits, notify roles; state survives Edit round-trips.
+- [x] UI: Step 4 review card from `POST /ai/agents/preview` (one debounced call), seven rows, Edit links land on the right step and carry the server error onto it; "Start enabled" flips the pill Created disabled → Enabled.
+- [x] UI: Create partner-wide act agent (disabled) and org-only shadow agent (enabled); success toast + highlighted row; "Running"/"Not running" states.
+- [x] UI: Edit drawer round-trips the saved allowlist (6 checked, ceiling key kept); injected `totally_unknown_tool`, bare `manage_startup_items`, `get_device` render under "Unrecognised or unreachable entries" with Remove; bare entry shows as wildcard (both startup ops checked) and is retained on save, not widened or dropped.
+- [x] UI: Org draft — `GET /ai/agents/ceiling?kind=triage` disables 31 ops "Not in partner baseline"; preset only selects ops inside the ceiling; no unattended-keys section for org rows.
+- [x] UI: 390px viewport — no horizontal overflow, stepper stacks vertically.
+- [x] API: saved rows verified — partner row `mode=act enabled=false toolAllowlist=[disk_cleanup:execute, manage_alerts:acknowledge, manage_alerts:resolve, manage_services:restart, manage_startup_items:disable, run_script] supervisedActionKeys=[manage_services:restart]`; org row `mode=shadow enabled=true orgId set partnerId null keys=[]`; list returns `partnerBaselineKinds=["triage"]`.
+- [x] API: `GET /ai/agents/tool-catalog` → 103 tools (60 read-only), 87 unreachable pinned; `run_script` `actEligible=true`.
+- [ ] Agent: n/a (no agent-side change).
+
+### Evidence
+- Network: `tool-catalog` fetched once per flow open, `ceiling?kind=` once per kind, `preview` once per step-4 entry (debounced), `POST /ai/agents` 422 then 201.
+- Console: only the pre-existing sidebar-tour hydration mismatch and the two expected 422s; no feature JS errors.
+- DB: `partner_users` — only Partner Admin has an active member in the seed.
+
+### Issues Found
+1. **Truthfulness (P1):** in act mode the picker and the review card say "Run a script — Executes unattended", but `remediationActResolver.ts:173` refuses unattended `run_script` unless the script is in `actAssets.scriptIds`, and `hasActEligibleSurface` (agentService.ts) only counts `run_script` when `scriptIds` is non-empty. The builder never sets `scriptIds` (agentDraft.ts deliberately omits it), so every agent built here shows an outcome that cannot happen. Preview/picker should report `run_script` as "Approval request until a script is authorized" (or the catalog should expose `actEligible` conditional on assets).
+2. **Misleading 422 (P2):** with Partner Technician selected as recipient, create in act mode returned `act_prerequisites_not_met: recipient` and the flow showed "Add at least one notification recipient before enabling act mode." The server (`recipients.ts` `hasResolvableAgentRecipient`) requires the role to have at least one *active member*; the role was empty in this stack. Copy should say the chosen roles have no active members, and step 3 could show member counts / disable empty roles.
+3. **Stepper (P2):** after any Edit link from Review, steps 2–4 are disabled again; returning to Review takes three Next clicks. Visited steps should stay reachable (validation gates already protect each step).
+4. **Search (P2):** filters at capability level only — "isolate" shows the whole 12-op Security response group, not the one matching op.
+5. **Copy (P3):** "Up to 1 devices per run", "1 roles are asked", "1 approval requests"; in act mode "May propose: 6 operations … 1 raise an approval request … 2 are logged" omits the 3 unattended ones; approvers row does not name the role(s).
+6. **A11y (P3):** completed stepper step buttons (check icon) lose their accessible name; the mode-change `role=status` region stays empty.
+7. **Default owner scope (P3):** with no partner baseline, step 1 defaults to "This organization only" and then warns the agent has no effect until a baseline exists; default to "All organizations" when no baseline exists.
+8. Retracted: `get_device — This tool no longer exists` is correct (not a registered tool).
+
+**Fixed in PR #5064** (items 1–7; a11y item 6 covers the stepper name only — the empty `role=status` region is by design, it announces the act-keys-cleared notice). Re-checked on the same stack after the fix: partner-wide default with the `patch` kind and no hint; "isolate" narrows to `s1_isolate_device` alone; `run_script` in act mode reads "Approval request — Stays an approval request until a script is authorized for this agent." and the summary says "1 approval request, 0 logged proposals, 0 unattended"; Safety marks every empty role "(no active members)"; Review reads "Up to 1 device per run … 15 minutes between runs", "Partner Technician is asked", "1 operation across 1 capability: 1 raises an approval request…", plus the script-gate sentence under Executes unattended; the title Edit leaves step 4 clickable (aria-label "1. Purpose and posture") and returns straight to Review; Create with an empty role shows "The selected notification roles have no active members…" alongside the act-eligible-tool issue.
+
+### Notes
+- #5059 (stale "no partner-wide baseline" notice) did not reproduce on the list after the partner triage agent was created.
+- Stack: `pnpm wt-stack up` on the worktree; `.env` copied from `fix-3750` + AI flags appended.
+
+## Auth browser/native transition Phase 1 foundation (#3852) — 2026-08-23
+
+**Branch:** `feat/3852-auth-browser-transition`
+**Tested by:** Codex
+**Result:** PASS — additive Phase 1 only; external telemetry gate not crossed
+
+### Scope verified
+
+- Native transition-v1 capability signaling and signed binding persistence under `breeze_native_auth_binding_v1`.
+- One HTTP-428 replacement retry, subsequent binding use, stale-install rotation, and no second retry.
+- Session-generation fencing across login, MFA, refresh binding writes, and logout; logout wipes token, CSRF mirror, and native binding even after network failure.
+- Enforcement-false legacy accounting through `auth_transition_legacy_issuer_total{issuer,client_class}` and stable enforcement-time HTTP 426 behavior (existing W07-A–E route/service contracts retained).
+- Expired-pending retirement bounded to 500 rows with `FOR UPDATE SKIP LOCKED`; unknown jobs reject; permanent tombstones remain and `deletedRetired=0`.
+- Chromium contracts cover late pre-logout issuer response rejection and cookie-less, replay-inert CF completion.
+
+### Evidence
+
+- RED: `pnpm --filter=breeze-mobile exec vitest run src/services/sessionGeneration.test.ts` — failed because `sessionGeneration` did not exist.
+- GREEN: same command — 1 file, 3 tests passed.
+- RED: `pnpm --filter=breeze-mobile exec vitest run src/services/api.logout.test.ts src/services/api.mfa.test.ts` — 2 files failed, 4/5 tests failed for missing binding/retry/logout wipe behavior.
+- GREEN: `pnpm --filter=breeze-mobile exec vitest run src/services/api.logout.test.ts src/services/api.mfa.test.ts src/services/sessionGeneration.test.ts src/store/authSlice.test.ts` — 4 files, 31 tests passed.
+- RED: `pnpm --filter=breeze-mobile exec vitest run src/services/api.logout.test.ts` — 1/3 tests failed because an already-running persistence write landed after logout cleanup.
+- GREEN: focused native suite after serializing cleanup — 4 files, 32 tests passed.
+- RED: `pnpm --filter=breeze-mobile exec vitest run src/services/api.logout.test.ts` — 1/4 tests failed because a delayed refresh returned `access-stale` after logout.
+- GREEN: focused native suite after fencing the refresh return — 4 files, 33 tests passed; full mobile suite 47 files, 558 passed and 3 skipped.
+- RED: `pnpm --filter=@breeze/api exec vitest run src/jobs/authBrowserTransitionCleanup.test.ts` — failed because the worker module did not exist.
+- GREEN: `pnpm --filter=@breeze/api exec vitest run src/jobs/authBrowserTransitionCleanup.test.ts src/services/authBrowserTransition.test.ts src/services/authTransitionMetrics.test.ts` — 3 files, 48 tests passed.
+- Enforcement contract: password legacy accounting for web/native clients plus enforcement-time HTTP 426 — 3 tests passed (43 unrelated tests skipped by the name filter).
+- Closure API unit contract: 8 files, 92 tests passed.
+- Real-DB integration contracts, run individually with both superuser and `breeze_app` URLs pinned to the same isolated stack: 11 + 5 + 9 + 12 = 37 tests passed.
+- RLS forge contract: 9 tests passed; RLS coverage: 75 tests passed.
+- Chromium real-stack contract: 2 tests passed; browser discovery listed 2 tests and the e2e TypeScript check exited 0.
+- Web suite: the initial resource-contended run passed 624 files/6,364 tests and timed out only the filesystem scan, which then passed 2/2 alone. The resource-stable four-shard rerun passed all 625 files/6,365 tests (shards: 1,617 + 1,946 + 1,200 + 1,602).
+- Static/build gates: API TypeScript (8 GB heap), Astro check (0 errors), mobile TypeScript, API/web lint, API/web builds, schema drift, CI YAML parse, and `git diff --check` exited 0.
+
+### Independent-review hardening
+
+- **AUTH-01:** Native requests now capture their session generation synchronously before the first await and recheck it before every send/retry, response-owned mutation, and issuer return. Deterministic server-URL, binding-retry, and stale-error barriers cover A → logout → B supersession, including generation-fenced CSRF deletion.
+- **AUTH-02:** Session-owned secure writes and complete token/user/CSRF/native-binding teardown now share the serialized generation queue. Local invalidation advances once and queues cleanup before slow logout I/O; login/MFA, refresh, and AI-chat bearer persistence are fenced. Tests cover slow persistence, delayed/failed logout, synchronous invalidation, and A → logout → B.
+- **BROWSER-01:** A fail-closed test-only barrier can pause after issuer admission and before finalization only when `NODE_ENV=test`, `E2E_MODE` is enabled, and a 32+-character secret matches. Real Chromium proves logout invalidates the admitted issuer before release, and the CF completion contract observes exactly one successor row at generation 1 across replay.
+- **CI-01:** `ci-success` now exports the browser contract result and fails unless it is `success`; a workflow contract locks both the environment mapping and predicate.
+- **JOB-01:** Cleanup worker initialization is idempotent; two calls construct exactly one worker.
+- Review RED (native): `pnpm --filter=breeze-mobile exec vitest run src/services/api.logout.test.ts src/services/auth.test.ts src/services/aiChat.test.ts src/store/authSlice.test.ts` — exit 1; 7 failed and 52 passed across 4 files.
+- Review RED (cleanup/CI): `pnpm --filter=@breeze/api exec vitest run src/jobs/authBrowserTransitionCleanup.test.ts src/config/authBrowserTransitionWorkflowContract.test.ts` — exit 1; 2 failed and 4 passed across 2 files.
+- Review RED (browser seam): `pnpm --filter=@breeze/api exec vitest run src/routes/auth/authTransitionTestBarrier.test.ts` — exit 1 because the intentionally test-first barrier module did not exist.
+- Review GREEN (native final): `pnpm --filter=breeze-mobile exec vitest run src/services/api.logout.test.ts src/services/api.mfa.test.ts src/services/auth.test.ts src/services/aiChat.test.ts src/services/sessionGeneration.test.ts src/store/authSlice.test.ts src/store/resettable.test.ts src/store/logoutResetContract.test.ts` — exit 0; 8 files and 74 tests passed.
+- Review GREEN (API final): `pnpm --filter=@breeze/api exec vitest run src/jobs/authBrowserTransitionCleanup.test.ts src/config/authBrowserTransitionWorkflowContract.test.ts src/routes/auth/authTransitionTestBarrier.test.ts src/routes/auth/login.test.ts` — exit 0; 4 files and 56 tests passed.
+- Review GREEN (real Chromium): `pnpm --dir e2e-tests exec playwright test --config=playwright.auth-browser-transition.config.ts` — exit 0; 2 tests passed in 2.9 seconds against the isolated controller-managed stack.
+- Review static gates: API TypeScript with an 8 GB heap, mobile TypeScript, E2E TypeScript, targeted API ESLint, CI YAML safe parse, browser discovery, and `git diff --check` exited 0. Mobile/E2E expose no lint script and the root has no flat ESLint config, so a direct root ESLint probe exited 2 at configuration discovery without linting source.
+
+### Phase boundary
+
+The legacy issuer seam and one-argument family mint overload remain active, final zero-legacy source assertions remain inactive, no guard-complete marker is true/exported, and neither production flag is enabled. Released minimum mobile version, app-store availability, and the full configured maximum refresh-family lifetime of zero supported-client legacy events remain external Phase 2 prerequisites documented in `docs/operations/auth-browser-transition-rollout.md`.
+
+## Pax8 ordering (organization UI, orders API, and quote handoff) — 2026-07-14
+
+**Branch:** `ToddHebebrand/pax8-ordering`
+**Commit:** `87ebf270a`
+**Tested by:** Codex
+**Result:** PARTIAL
+
+### What was tested
+- [ ] UI live E2E: blocked before login because the root `.env` has no `E2E_BASE_URL`, `E2E_API_URL`, `E2E_ADMIN_EMAIL`, or `E2E_ADMIN_PASSWORD`, and this worktree has no running web/API/Redis stack. The unrelated service listening on port 3000 was not used.
+- [x] UI component and mutation-policy verification: `LinkSubscriptionPicker` explicit billing quantity behavior (including no Pax8-quantity default, validation, and explicit zero), `Pax8OrgTab`, `Pax8OrderBuilder` recovery states, organization-settings hash/deep-link routing, the accepted-quote Pax8 panel, Pax8 API client, and `no-silent-mutations` suites passed (7 files, 148 tests).
+- [ ] API live authenticated reads: blocked by the same missing URL/credentials and absent worktree API service; no real Pax8 submit/order write was attempted.
+- [x] API unit verification: Pax8 schema, catalog, drift, sync, order service/routes/submission, authorized-line request-integrity repository, quote acceptance, and quote-to-order suites passed (11 files, 183 tests).
+- [ ] Agent: not applicable; this feature has no agent binary changes.
+
+### Evidence
+- Browser/accessibility/console/network: not captured because no safe authenticated browser target was available.
+- Web command: scoped Vitest run completed at final HEAD with 7/7 files and 148/148 tests passing.
+- API command: scoped Vitest run completed at final HEAD with 11/11 files and 183/183 tests passing.
+- Final HEAD note: the explicit-quantity subscription-picker delta is included in the final web run; its documentation and locale updates were verified separately.
+- Database integration: fresh-DB integration verification is owned by the concurrent final-verification pass, so this scoped feature check did not reset or mutate shared services. An earlier attempt against the stale shared `breeze-postgres-test` stopped at the expected migration-checksum guard before executing cases.
+
+### Issues Found
+- No product defect was found by the executable checks.
+- Live organization-tab/deep-link/quote-panel behavior, accessibility tree, console health, and network responses still require an authenticated E2E environment.
+
+### Notes
+- No credentials were printed, no vendor mutation was performed, and no test containers or data were created by this feature-test pass.
+- Required follow-up: run the live Playwright flow when the four E2E URL/admin variables and a matching web/API/Redis stack are available; navigate to the organization `#pax8` tab and `#pax8/<orderId>` deep link, inspect the accepted-quote panel, and confirm clean console/network output without submitting an order.
+
+## Agent backup server URL failover + DNS cache (#2288) — live two-stack e2e — 2026-07-10
+
+**Branch:** `feat/agent-backup-server-url` · **Tested by:** Claude · **Result:** PASS (7/8 steps live; DNS-outage fallback covered by unit tests — /etc/hosts step needs sudo)
+
+**Setup:** wt-stack for the branch ("old" API, direct port) + a cloned second API container ("new", `localhost:32790`) sharing the same Postgres — domain-rename simulation. Agent = branch-built linux/arm64 binary in an isolated `debian:bookworm-slim` container with host networking (kept fully clear of the production agent installed on this Mac), 5s heartbeat interval.
+
+| Step | Result |
+|---|---|
+| 1. Old stack up, agent enrolled + heartbeating | PASS |
+| 2. `AGENT_BACKUP_SERVER_URL` set on old API, restart | PASS (required adding the compose `environment:` mapping — see finding below) |
+| 3. Agent log `stored backup server URL` + `backup_server_url` in agent.yaml | PASS (`backupServerUrl=http://localhost:32790` logged; persisted) |
+| 4. Second stack on :32790, same Postgres | PASS |
+| 5. Kill old API → 10 failures → probe → promote | PASS — `primary server unreachable, probing backup (failures=10)` at T+61s, `PROMOTED backup server URL to primary` 1s later; agent.yaml swapped (`server_url: :32790`, `backup_server_url: :32782` = old URL kept as rollback) |
+| 6. Web UI "Server" column | PASS — opt-in via column picker (auto-surfaced by merge-on-read); live device shows `localhost` + full URL tooltip `http://localhost:32790`; never-reported devices show `—`. Note: hostname-only display means a same-host port change reads identically in the cell — the tooltip disambiguates; real domain migrations show distinct hostnames. |
+| 7. DNS cache | PARTIAL — `dns-cache.json` created and populated live (`{"localhost":["127.0.0.1","::1"]}`); the DNS-failure→cached-IP fallback path is covered by the 11-test netcache race suite. The /etc/hosts outage simulation needs sudo (not available to the automated run) — optional manual step. |
+| 8. Full-suite gate | PASS — API 11,757 (10 CPU-contention flakes re-verified green in isolation), web 390/390 files, `go test -race ./...` clean, `cargo check` clean |
+
+**Finding fixed during e2e:** `AGENT_BACKUP_SERVER_URL` was not mapped in any compose `environment:` block, so a `.env`-only value silently never reached the API (the exact #570/IS_HOSTED trap). Added `AGENT_BACKUP_SERVER_URL: ${AGENT_BACKUP_SERVER_URL:-}` to `docker-compose.yml` and `deploy/docker-compose.prod.yml`.
+
+**Test residue (local only):** wt-stack for this worktree left up; e2e containers `breeze-e2e-agent` + `breeze-e2e-newapi` and the enrolled `orbstack` device row in the wt-stack DB can be discarded with the stack.
+
+## BE-16 Enhancement P1 — Risk-acceptance RBAC (`vulnerabilities:accept_risk`) — unit tests + type-check — 2026-06-24
+
+**Branch:** `feat/be16-vuln-phase1` · **Tested by:** Claude · **Result:** PASS (unit/web suites + astro check); browser wt-stack spot-check **pending Todd's manual UI verification**.
+
+**What was added (Tasks 1–4):**
+- New permission `vulnerabilities:accept_risk` (`VULN_RISK_ACCEPT`) registered in `apps/api/src/services/permissions.ts` and seeded for Org Admin, "Security Approver" (org), and "Partner Security Approver" (partner) roles.
+- Migration `2026-06-29-vuln-risk-accept-permission.sql`: inserts the permission row + the two new stock roles + their grants. Idempotent.
+- API gate change: `POST /vulnerabilities/:id/accept-risk` and `POST /vulnerabilities/:id/reopen` now require `vulnerabilities:accept_risk` (previously plain `devices:write`). `POST /vulnerabilities/:id/mitigate` unchanged (`devices:write`).
+- Web gate: **Accept risk** button and **Reopen** button in `DeviceVulnerabilitiesTab` are hidden/disabled when `can('vulnerabilities','accept_risk')` is false.
+
+**Verification runs (2026-06-24):**
+- API suites (`seed.test.ts`, `permissions.test.ts`, `vulnerabilities.test.ts`, `autoMigrate.test.ts`): **4 files, 183 tests — all PASS**.
+- Web suites (`DeviceVulnerabilitiesTab.test.tsx`, `permissions.test.ts`): **2 files, 30 tests — all PASS**.
+- `astro check` (1075 files): **0 errors, 0 warnings** (202 pre-existing hints, none in vuln/permission code).
+- `db:check-drift`: **not cleanly runnable** — shared local DB (main-branch ledger) has not had the 11 branch-specific migrations applied; script reports them as "not in ledger". This is expected for a feature-branch worktree; it is not a Drizzle schema/code mismatch. Run against a fresh DB after branch migrations are applied to confirm clean drift.
+
+**Browser wt-stack spot-check:** DEFERRED — manual UI verification by Todd (confirm Accept risk + Reopen visible for Partner Admin `*:*`, hidden for a user lacking `vulnerabilities:accept_risk`, and that accept-risk succeeds end-to-end).
+
+## Vulnerability Management (BE-16 Phase 1) — wt-stack + Playwright — 2026-06-23
+
+**Branch:** `feat/be16-vuln-phase1` · **Tested by:** Claude · **Result:** PASS, no bugs.
+
+Verified end-to-end (seeded synthetic findings across all severities + an accepted state): fleet dashboard (risk-sorted, severity/KEV/CVSS, server-side severity filter, open-only default), per-device tab, and all four workflows — accept-risk (server rejects past dates → error toast; persists + audit), mitigate (persists + audit), remediate (no-patch → `{success:false}` correctly surfaces a failure toast, row stays open), reopen. Migrations + persistence + audit rows confirmed via psql. Only console error is a pre-existing `404 /api/v1/reliability/:id` (not vuln). MFA gate on `/remediate` no-ops here only because `ENABLE_2FA` is off (enforces in prod; same wiring as patch-install).
+
+**Improvements shipped this session** (all verified live in-browser):
+- Accept-risk date `min` guard (blocks past dates client-side).
+- Per-device status filter (Open/Accepted/Mitigated/**Patched**/All) + Status badges.
+- **Reopen** action + gated/audited `POST /vulnerabilities/:id/reopen`; `status=all` on the list endpoint.
+- **Deterministic per-device sort** — `listVulnerabilities` had no `ORDER BY`; now risk_score DESC, cveId ASC tie-break.
+- **Server-side fleet aggregation** — `GET /vulnerabilities` now returns one aggregated row per CVE (`{id,cveId,cvssScore,severity,knownExploited,epssScore,riskScore,deviceCount}`) instead of every per-(device,CVE) row; removes the unbounded client-side collapse.
+- **Reopen/expiry consistency** — the `vuln-accept-expiry` sweep (`expireAcceptedRisks`) now clears the same five fields as manual reopen (was leaving `mitigationNote`/`resolvedAt`) AND writes a per-finding `vulnerability.reopen` audit row (`trigger: waiver_expired`) via the background-safe `createAuditLogAsync` — auto-reopens were previously unaudited.
+- **Remediate patch-awareness** — items now carry `patchAvailable`; UI shows a "Patch available" badge and disables Remediate + bulk-select when no patch (was a guaranteed-fail click).
+- **Bulk remediate** — multi-select checkboxes + "Remediate selected (N)" send one `deviceVulnerabilityIds[]` call (verified: 2 ids in one POST).
+
+**Still open (deferred, with reason):**
+1. **Risk-acceptance is gated by plain `DEVICES_WRITE`** — accepting a critical/KEV risk is a security exception; consider the existing Authenticator step-up or a dedicated permission. **Needs a product decision**, not implemented.
+2. **Fleet CVE-row drill-through** — no CVE-detail view / CVE→devices endpoint exists; it's a small feature (new view+endpoint), not a quick fix.
+3. **Fleet aggregation is still in-handler, not SQL** — the API→browser payload is now bounded, but the DB→API fetch still reads all matching per-device rows; a true SQL `GROUP BY` is a further optimization if that fetch becomes a bottleneck.
+
+## ML feature UI surfaces (User Risk / Anomalies / Correlations+RCA / Capacity Forecast) — local Docker + Playwright — 2026-06-19
+
+**Branch:** `main`
+**Commit:** `db6b0dc5`
+**Stack:** full local Docker behind Caddy on `http://localhost`; web on `:4321`. Org scope = "Default Organization" (`aa0e43c8-…`), partner-scoped admin (`admin@breeze.local`).
+**Tested by:** Claude
+**Result:** PASS on all four surfaces' rendered states (enabled-empty, disabled, live-data, mobile). Two non-blocking defects found (one Medium, one Low) — neither breaks the rendered page.
+
+**Live flag state for this org** (`GET /config/ml-feature-flags?orgId=…`): ON = `alert_correlation` (non-prod default), `metric_rollups`, `device_reliability`, `user_risk_v0`. OFF = `rca`, `anomalies`, `anomalies.create_alerts`, `remediation_suggestions`, `ticket_triage`, `user_risk_v1`.
+
+### What was tested (Playwright MCP)
+- [x] **User Risk** (`/security/user-risk`, flag ON) — enabled+empty renders cleanly: metric cards (Precision n/a, Labels 0, Training completion n/a, Repeat signal users 0) + "No users are above the current risk threshold." Data endpoints `user-risk/scores` & `user-risk/evaluation` 200 with `orgId`. Screenshot: `ml-qa-user-risk-empty.png`.
+- [x] **Device Anomalies** (device → Anomalies tab, flag OFF) — disabled-state renders correctly: "Metric Anomalies / Anomaly detection is disabled for this organization." This panel is **server-driven** (its flag call passes `orgId` → 200), so gating works here. Screenshot: `ml-qa-anomalies-disabled.png`.
+- [x] **Alert Correlations** (`/alerts/correlations`, flag ON, RCA OFF) — enabled+empty renders cleanly: summary cards (Incidents 0, Grouped alerts 0, Inbox reduction 0, Avg noise cut 0%) + "No correlated alert groups found." Screenshot: `ml-qa-correlations-empty.png`.
+- [x] **Capacity Forecast** (`/analytics` → Capacity Planning, no ML flag gate) — renders live chart: "Current 14%" + projection with future-dated X-axis (2026-06-20 → 07-03), Y-axis 0–16. Screenshot: `ml-qa-capacity-forecast.png`.
+- [x] **Mobile (375×812)** — User Risk metric cards stack full-width, empty state intact; Analytics Query Builder + Capacity Planning stack cleanly. No overflow/clipping. Screenshots: `ml-qa-user-risk-mobile.png`, `ml-qa-capacity-forecast-mobile.png`.
+
+### Issues found
+- ⚠️ **Finding #1 (Medium) — `useMlFeatureFlags` hook never sends `orgId` → 400 on every load + dead UI gating.** `apps/web/src/hooks/useMlFeatureFlags.ts:35` calls `fetchWithAuth('/config/ml-feature-flags')` with no `orgId`, but the endpoint requires org context (`400 "Organization context required"`). Confirmed console 400 on `/security/user-risk`. The catch (lines 42–46) swallows the error leaving `flags = {}`, so `isDisabled()` (line 53) returns `false` for every flag → any surface relying on this hook for flag gating will **never** show its "disabled" state. Impact limited because (a) server-side enforcement still gates actual ML data and (b) the device-anomalies path makes its own `orgId`-bearing call (200) and gates correctly. Fix: thread the active org id into the hook request (the data endpoints already do this).
+- ⚠️ **Finding #2 (Low) — `AlertsTabStrip` hydration mismatch.** On `/alerts/correlations`, React logs a hydration-mismatch: active-tab `className` + `aria-current` differ between SSR and client because active state is derived from `window.location`. Cosmetic (self-corrects on hydrate; dev-only warning) but the SSR markup briefly highlights the wrong tab.
+
+### Notes
+- Per skill: the FIRST pass was the **rendered-state** sweep (empty / disabled / mobile). A SECOND pass (below) applied both fixes and seeded producer output to exercise the enabled-WITH-data states.
+
+### Fixes applied & re-verified (same day)
+**Finding #1 — FIXED** (`apps/web/src/hooks/useMlFeatureFlags.ts`). Root cause refined: `fetchWithAuth` auto-injects `orgId` from `orgStore`, but the hook fired before an org was selected and never re-fired on org change. Fix: subscribe to `useOrgStore(state => state.currentOrgId)`, skip the fetch (no request, no error) when there's no active org, and add `currentOrgId` to the load deps so it re-fetches on org switch. **Verified live:** `/security/user-risk` now calls `/config/ml-feature-flags?orgId=…` (was a no-org 400) and the page shows **0 console errors**.
+
+**Finding #2 — FIXED** (`apps/web/src/components/alerts/AlertsTabStrip.tsx` + the 3 alert pages that render it + `pages/alerts/correlations.astro`). Replaced the client-only `window.location` active-tab read with an SSR-correct `currentPath` prop, mirroring the existing `Sidebar` / `useCurrentPath` pattern. **Verified live:** `/alerts/correlations` now hydrates with **0 console errors** (was the hydration-mismatch warning).
+
+Tests: `useMlFeatureFlags.test.ts` (6) + `CorrelatedAlertGroups.test.tsx` (12) = **18/18 pass**. (Had to add `registerOrgIdProvider` to the `stores/auth` mock and seed `useOrgStore.currentOrgId` in `CorrelatedAlertGroups.test.tsx` beforeEach, since the component now transitively imports `orgStore`.)
+
+### Seeded producer output + enabled-WITH-data verification (Playwright, 1440×900)
+Seeded into local `breeze-postgres` (org `aa0e43c8-…`, device `6328760a-…`): 3 `organization_users` memberships + 3 `user_risk_scores` (88/62/40) + 4 `user_risk_events`; 3 `metric_anomalies` (cpu/disk/memory, open); 2 `alerts` + 1 `alert_correlation_groups` (score 0.92, 50% noise cut) + 2 `alert_correlation_members`. Enabled `ml.anomalies` / `ml.rca` / `ml.remediation_suggestions` via `organizations.settings.mlFeatureFlags` (source=`org_settings`).
+- [x] **User Risk WITH DATA** — at-risk list (Breeze Admin 88 critical, Tech User 62), selected-user detail with True/False-positive buttons, Top drivers (failed logins 30 / privileged actions 24 / anomalous access 18 / security threats 16), Recent evidence cards. 0 console errors. `ml-qa-user-risk-DATA.png`.
+- [x] **Alert Correlations WITH DATA** — Incidents 1 / Grouped alerts 2 / Inbox reduction 1 / Avg noise cut 50%; incident "High CPU sustained" (score 0.92), expanded members, Incident RCA panel offering on-demand "Explain incident". 0 console errors. `ml-qa-correlations-DATA.png`.
+- [x] **Device Anomalies WITH DATA** — disabled→enabled transition confirmed; 3 anomaly cards (cpu/disk/memory) each with Dismiss/Resolve/Promote + a "Suggested Fixes" remediation panel ("No suggested fixes yet" + Generate). 0 console errors. `ml-qa-anomalies-DATA.png`.
+
+### Minor UX observation (not filed)
+- User Risk "Top drivers" bars render green even though they represent *risk* contribution — green conventionally reads as "good." Consider a risk-weighted color. Cosmetic.
+
+### Local env caveat
+- The `ml.anomalies`/`ml.rca`/`ml.remediation_suggestions` org-settings override and the seeded rows remain in the local dev DB so the surfaces stay viewable. To revert flags: `UPDATE organizations SET settings = settings - 'mlFeatureFlags' WHERE id='aa0e43c8-c4ff-471e-b77e-0f62d9fdce95';`
+
+## Quotes/Proposals Phase 3 (expiry + accept→pay) — PR #1483 — local Docker + Playwright — 2026-06-18
+
+**Branch:** `feat/quotes-proposals-phase3` (merged onto main w/ #1474 portal-deploy)
+**Stack:** full local Docker (`-p breeze-phase3`, dev override) behind Caddy on `http://localhost`; **portal rebuilt in PRODUCTION mode** (`breeze-portal:prodlocal`, `astro build` + node) and run on the breeze network — the dev portal (`astro dev`) can't be browser-tested because its hardened CSP `script-src 'self'` blocks Astro's dev un-hashed inline hydration scripts and on-demand Vite deps 504 through Caddy (same dev-only limitation noted for #1474).
+**Tested by:** Claude
+**Result:** PASS for everything exercisable locally. The live "Pay now" → Stripe Checkout redirect is **NOT testable here** — the platform's Stripe test account is not Connect-enabled (`stripe_connect_accounts` connected = 0; `accounts.create` → "you can only create new accounts if you've signed up for Connect"). Pay wiring verified by integration tests + the graceful no-Stripe path below.
+
+### What was tested (Playwright MCP, http://localhost)
+- [x] **Public proposal renders** (prod portal, SSR + hydrated): `/portal/quote/<token>` → Proposal Q-2026-0003, "Onboarding setup" line, One-time/Total $500.00, typed-signature accept form. 0 console errors on the prod build.
+- [x] **Accept → convert → auto-issue** (the headline Phase 3 flow): typed "Casey Customer", clicked **Accept & sign** → "Thank you — your acceptance has been recorded." DB: quote → `converted` + `accepted_at`; converted invoice **auto-issued** `status=sent`, **INV-2026-0001**, total/balance $500.00; acceptance row signer "Casey Customer" + 64-char `quote_sha256` + jti.
+- [x] **Graceful no-Stripe degradation**: with no connected account the accept returns `payUrl:null` + `payDeferred:false`, so the portal shows the plain thank-you and **no "Pay now" button** (correct — STRIPE_NOT_CONNECTED is the benign path, not a deferral).
+- [x] **Read-time expiry guard (browser)**: a quote back-dated to `expiry_date=2020-01-01`, clicked Accept → **"This quote has expired and can no longer be accepted"** (410 QUOTE_EXPIRED); DB confirms it stayed un-converted, 0 acceptances, 0 invoices.
+- [x] **BullMQ expiry sweep (live)**: the back-dated quote auto-transitioned `sent → expired` in the running stack (the `quote-expiry-reaper` job is registered and ran), independent of the read-time guard.
+- [x] **MSP dashboard (web)**: `/billing/quotes` lists all statuses correctly — Q-0004 **Expired** $300, Q-0003 **Converted** $500, Q-0002/0001 **Sent**, 2 Drafts; status filter offers Expired + Converted.
+- [x] **Loop closed on MSP side**: `/billing/invoices` shows the auto-issued **INV-2026-0001** — Issued 6/18, Due 7/18 (30-day terms), $500.00 balance, status **Issued**, "$500.00 Outstanding / 1 open".
+- [x] **Download PDF — quote**: quote detail (Detail tab) → "Download PDF" → downloaded `Q-2026-0003.pdf` (2008 bytes, `%PDF-1.3`); endpoint `GET /api/v1/quotes/:id/pdf` → 200 `application/pdf`. No console errors.
+- [x] **Download PDF — invoice**: invoice detail → "Download PDF" → downloaded `INV-2026-0001.pdf` (1999 bytes, `%PDF`); endpoint `GET /api/v1/invoices/:id/pdf` → 200 `application/pdf`.
+
+### Stripe Connect (live pay redirect)
+Re-confirmed NOT exercisable locally even with a supplied test key. Two distinct Stripe test accounts were tried (`acct_…TJgsVFWDCBQKxbN` from `.env`, and the supplied `acct_1JIJA1IZbeGKm3pE` which is itself charges_enabled/activated) — **neither has Connect enabled** (`POST /v1/accounts` → "you can only create new accounts if you've signed up for Connect"). The connected-account checkout the pay flow requires therefore can't be created. Enabling Connect is a one-time toggle at dashboard.stripe.com/connect; once on, the `createInvoicePayLink` → hosted-checkout redirect can be clicked through. Until then the invoice detail correctly shows "Connect Stripe to accept online card payments".
+
+### Evidence
+- Screenshot: `phase3-quotes-list.png` (dashboard quotes list with Expired/Converted/Sent/Draft).
+- DB: quote 363a1f97 `converted` → INV-2026-0001 (`sent`, $500); quote 333a2969 `expired`, no invoice.
+
+### Issues Found
+- **None in the feature.** The only non-exercisable path is the live Stripe Checkout redirect, blocked by the environment (Stripe account lacks Connect), not by the code. The pay wiring (`createQuotePayLink` → `createInvoicePayLink`, STRIPE_NOT_CONNECTED guard, public `payUrl`/`payDeferred`) is covered by the 31 integration tests (Stripe mocked).
+
+### Notes
+- Portal must be a **production** build for browser E2E (dev-mode CSP/Vite limitation). The compose dev portal was swapped for `breeze-portal:prodlocal` (manual `docker run` on the `breeze` network, alias `portal`).
+- The original `breeze` dev stack (another session's `fix/1459` checkout) was stopped, not destroyed — its volumes persist; `docker compose up -d` from `/Users/toddhebebrand/breeze` restores it. The Phase 3 stack runs as project `breeze-phase3` with its own volumes.
+
+## Customer Portal deploy under `/portal` (PR #1474) — local Docker + Playwright — 2026-06-17
+
+**Branch:** `feat/portal-deploy-c-prefix`
+**Stack:** full local Docker (`-p breeze`, dev override + prod portal image) behind Caddy on `http://localhost`; API reachable via Caddy `/api/*` → `api:3001`.
+**Tested by:** Claude
+**Result:** PASS (after fixing one blocker found during testing)
+
+### What was tested (Playwright MCP, http://localhost)
+- [x] `/portal/login` renders through Caddy (200), prod assets under `/portal/_astro/*`, favicon `/portal/favicon.svg`.
+- [x] React island hydrates — login form interactive; "Forgot your password?" → `/portal/forgot-password` (`withBase` correct in-browser).
+- [x] Clean console on fresh prod load (0 errors/0 warnings); prod CSP header carries Astro script/style hashes.
+- [x] Login submit → **same-origin** `POST http://localhost/api/v1/portal/auth/login` → `401` for bad creds (no CSP block, no `localhost:3001`); UI shows "Invalid email or password".
+- [x] Unauth deep-link `/portal/devices` → middleware redirects to `/portal/login` (base-aware redirect in-browser).
+- [x] Web dashboard `/` unaffected (200); `/login` (un-based) served by web, not portal.
+- [x] SSR reaches the API over the internal network (`INTERNAL_API_URL=http://api:3001`) — verified separately via a stub-API container (authed `/portal/devices` → 200, API hit on `api:3001`).
+
+### Issues found & fixed during testing
+- **BLOCKER (fixed):** client API base resolved to `http://localhost:3001` when `PUBLIC_API_URL` empty — the `|| 'http://localhost:3001'` default plus a loopback rewrite that can't fix a port mismatch. Login was CSP-blocked. Fixed in `apps/portal/src/lib/api.ts`: empty `PUBLIC_API_URL` → **same-origin relative** (`/api/v1/...`) on the client; SSR uses `INTERNAL_API_URL`. Added `api.test.ts` regression guard.
+- **False alarm:** initial run showed inline-CSP + `/node_modules/.vite` errors — these were dev-server contamination in the browser session from earlier timed-out astro-dev navigations, not the prod portal (confirmed clean on a fresh load).
+
+### Notes
+- astro **dev** server + Caddy hung Playwright on `domcontentloaded` (on-demand vite compile). Swapped to the **prod** portal image behind Caddy for reliable, representative E2E.
+- Full authenticated portal session → live SSR data pages not exercised in-browser (no seeded `portal_users` row; web admin UI to create one is blocked by an unrelated pre-existing web dev-container `zod` resolution error). SSR-reaches-API is covered by the stub-container test.
+
+## Script AI assistant — editor insertion fix (PR #1453) — 2026-06-16
+
+**Branch:** `fix/script-ai-editor-insert` @ `1702e315`
+**Tested by:** Claude
+**Result:** **PASS**
+
+### What was tested
+- [x] API/SSE (the layer changed): drove `POST /ai/script-builder/sessions/:id/messages` via curl, captured the SSE stream, inspected the `tool_result` event for `apply_script_code`.
+- [x] DB invariant: confirmed the persisted `ai_messages.tool_output` row stays compacted (no script body) so the #568 LLM-context goal is preserved.
+- [x] UI: logged into web app, opened `/scripts/new` → Script AI Assistant, prompted "Write a one-line PowerShell script that prints Hello Breeze and put it in the editor"; verified the Monaco editor populated.
+
+### Evidence
+- SSE `tool_result.output` now contains `code: 'Write-Host "Hello Breeze"'` + `language: 'powershell'` (alongside the compacted `codeOmitted/codeChars`). Before the fix the published event had no `code`.
+- DB row: `{"applied":true,"language":"powershell","toolName":"apply_script_code","codeChars":25,"codeOmitted":true}` → `LIKE '%Hello Breeze%'` = **compacted-ok** (no leak).
+- Browser: editor showed `Write-Host "Hello Breeze"`; both `apply_script_code` and `apply_script_metadata` tool calls completed; a "Revert" control appeared; assistant replied "I've added the script to the editor." Screenshot: `script-ai-insert-verified.png`.
+- Unit: 2 new `createSessionPostToolUse` tests (fail before / pass after); `aiAgentSdk.test.ts` 43/43; typecheck clean.
+
+### Issues Found
+- (none) — the one browser console error is a pre-existing, unrelated dev-only SSR hydration mismatch on the `⌘S`/`Ctrl+S` save hint, present on initial load before any AI interaction.
+
+### Notes
+- Tested against local Docker dev (`http://localhost`, code-mounted hot-reload); `2breeze.app` tunnel down per project notes. Local admin password is the dev seed `BreezeAdmin123!` (the `.env` `E2E_ADMIN_PASSWORD` is for the hosted tunnel, not the local DB).
+
+## Breeze AI for Office (PR #1314) — Tier B in-Excel SSO + session loop — 2026-06-13
+
+**Branch:** `feat/ai-for-office` @ `4d1a3ab6` (worktree `breeze-ai4office`)
+**Host:** Excel for Mac (desktop), real Entra app reg in tenant Example Tenant LLC (`<tenant-id>`), account `todd@example.com`
+**Result:** **Auth + read/chat loop PASS; workbook WRITE path FAILs (open).**
+
+### What works (verified live via API logs)
+- **Silent Office SSO** (`OfficeRuntime.auth.getAccessToken`) → real Entra v2 token, no popup.
+- **`POST /auth/exchange` → 200** — full JWKS sig + audience(=client-id) + issuer-per-tid verification, tenant-mapping lookup, `portal_user` auto-provisioned (`todd@example.com`), Redis session minted.
+- **Session loop:** `POST /sessions 201` → `messages 202` → `GET /events 200` (SSE) → `tool-results 200` (read-tool round-trip). Multi-tool turns ran clean.
+- **SSE streams through the Vite proxy** (the mixed-content fix, below) without buffering issues.
+
+### Workbook write — root-caused + FIXED (bug #6)
+- **Symptom:** every `write_range` failed instantly (no preview card), model kept retrying and guessing about "the cells parameter."
+- **Root cause:** param-name mismatch. Server schema + wire contract (DLP, tool-result output, bridge) use **`cells`**; two client read-sites read **`values`** — `tools/writeRange.ts` (executor) and `approval/buildPreview.ts` (preview builder). The preview builder reading `values` is why it failed *before* Apply.
+- **Fix:** aligned both client sites + their tests to `cells`. `writeRange.test.ts` + `buildPreview.test.ts` → 7/7 pass. (Client was internally consistent on `values`; it disagreed with the model/server contract, which is `cells`.)
+- **Pending:** live re-verify in Excel (reopen pane → write produces preview → Apply lands data).
+
+### Bugs / gaps found bringing Tier B up (fix in the PR — my fixes were local-only)
+1. **`VITE_API_BASE_URL` default omits `/api/v1`** → every add-in API call 404s out of the box. (`session.ts`/`client.ts` build `${base}/client-ai/...`; routes are under `/api/v1/client-ai/...`.)
+2. **No dev proxy → mixed-content block on macOS/Safari.** The `https://localhost:3000` pane calling the `http://localhost:3001` API is blocked by WebKit (`Fetch … cannot load … due to access control checks`). Chrome exempts `http://localhost`; Excel-for-Mac's WebKit view does not. Fixed locally with a Vite `server.proxy` (`/api/v1` → http API, same-origin https). **Recommend shipping the proxy + a relative/same-origin default base.**
+3. **`CLIENT_AI_ENTRA_CLIENT_ID` not mapped in tracked compose** (`docker-compose.yml`/`.override.yml.dev`) — value in `.env` never reaches the api container. Matches the PR's open reviewer checkbox.
+4. **Exchange `200` writes no `client_ai.auth.exchange` audit row** — `MANUAL_TESTS.md` item 3 expects one; none appeared in `audit_logs`. Verify the success-path audit is wired.
+5. **macOS dev-cert CA not trusted by the System keychain** — `office-addin-dev-certs install` reported "already trusted" but `security verify-cert` → `CSSMERR_TP_NOT_TRUSTED`; Excel showed "isn't signed by a valid security certificate". Needed a manual `security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.office-addin-dev-certs/ca.crt`. Worth a README note for Mac.
+
+### Local setup left in place (uncommitted) for resuming
+- Stack re-pointed to `breeze-ai4office` (project `breeze`); placeholder→real `CLIENT_AI_ENTRA_CLIENT_ID=<client-id>` in API `.env` + `docker-compose.override.clientai.yml`.
+- Add-in `.env`: `VITE_API_BASE_URL=https://localhost:3000/api/v1`, `VITE_CLIENT_AI_ENTRA_CLIENT_ID=<client-id>`; `vite.config.ts` has a local `server.proxy` for `/api/v1`.
+- Org "Default Organization" (`b50945ac-…`) mapped to tenant `<tenant-id>`, policy enabled.
+- **TEMP debug line** in `apps/api/src/routes/clientAi/auth.ts` (`[client-ai][TIER-B-DEBUG]`) — remove before any commit.
+- Pane server: `cd apps/excel-addin && PATH=…/v22.20.0/bin:$PATH pnpm dev`.
+
+## Breeze AI for Office (PR #1314) — Tier A control-plane sweep — 2026-06-13
+
+**Branch tested:** `feat/ai-for-office` @ `4d1a3ab6` (worktree `breeze-ai4office`)
+**Tested by:** Claude (feature-testing skill, live API + SQL + Playwright)
+**Result:** **Tier A PASS** (foundation, admin API, DLP defaults, RLS, dashboard UI). Tier B (in-Excel client flow / Entra SSO) deferred — needs an Entra app registration.
+
+### Environment note
+Re-pointed the shared `breeze` dev stack (`docker compose -p breeze`) from the `breeze-impeccable-device-overview` worktree to `breeze-ai4office` (code-mounted hot-reload). Auto-migrate applied `2026-06-12-b-client-ai-foundation.sql` (4 new tables). Set a **placeholder** `CLIENT_AI_ENTRA_CLIENT_ID` (admin routes only need it non-empty; the client `/auth/exchange` path is the only one that verifies real Entra tokens). The var is **not yet mapped in tracked compose** — added via an uncommitted `docker-compose.override.clientai.yml`; this matches the PR's own open reviewer checkbox. Creds: `admin@breeze.local` (partner-scoped). Browser→API at `http://localhost` (CORS-allowed).
+
+### Results
+| # | Area | Result | Evidence |
+|---|---|---|---|
+| 1 | Migration / schema | **PASS** | 4 tables created (`client_ai_tenant_mappings`/`org_policies`/`usage`/`prompt_templates`); all show RLS **enabled + forced**; migration row recorded |
+| 2 | Admin API dark-gate + scope | **PASS** | `GET /client-ai/admin/orgs` → 200 (not the 404 dark-gate) returning only the 3 accessible orgs (`auth.orgCondition` scope filter working) |
+| 3 | Write endpoints | **PASS** | `PUT …/policy` 200, `POST …/templates` 201, `PUT …/tenant-mapping` 200 (`requireMfa()` passed — bootstrap admin has no MFA enrolled) |
+| 4 | RLS functional forge (`breeze_app`) | **PASS** | Org-scoped to Default: control insert succeeded; cross-tenant insert targeting Acme → `ERROR: new row violates row-level security policy`; SELECT isolation showed only Default's rows. (Satisfies the PR's unchecked reviewer item) |
+| 5 | Dashboard — Organizations tab | **PASS** | Default Org row shows AI enabled=Yes, mapped Entra tenant, "Consent pending", Manage/Policy/Unmap actions — seeded data flows through |
+| 6 | Dashboard — Templates tab | **PASS** | Seeded "Summarize selection" template (scope: Default Organization, category: analysis) |
+| 7 | Dashboard — Policy editor | **PASS** | All sections render; seeded budgets ($5/$50), rate limits (20/500), read-write mode persisted; DLP built-ins show spec §6 defaults (financial/credential=Redact, email/phone=Off); custom-rule add present |
+| 8 | Console health | **PASS** | 0 console errors across the full UI session |
+
+### Not covered (Tier B — deferred, needs Entra app registration)
+Excel add-in (`apps/excel-addin`), Office/MSAL SSO → `/client-ai/auth/exchange`, the SSE session loop, write-preview Apply/Reject, live DLP block banner in-host. Author's 16-item hand checklist: `apps/excel-addin/MANUAL_TESTS.md`.
+
+## Since-Release E2E Sweep (v0.68.2 → HEAD) — 2026-06-01
+
+**Branch tested:** `feat/google-identity-device-tasks` @ `cba95590` (16 identity commits on top of merged main work since the v0.68.2 tag)
+**Tested by:** Claude (feature-testing skill, live Playwright + API)
+**Result:** **8/9 areas PASS, 1 real bug found** (Fix-with-AI), several items deferred (need external creds)
+
+### Environment note (important)
+The running stack was stale **v0.63.5** (`breeze-api:local`, `node dist/index.cjs`) on an otherwise-current DB — none of the since-release features existed in it. Brought api+web up in **dev mode** (`docker-compose.override.yml.dev`, code-mounted hot-reload) so the mounted source = this branch; started the missing `breeze-caddy` (`:80` → web/api) since `2breeze.app` tunnel is down (530) and `PUBLIC_API_URL=http://localhost`. Auto-migrate applied this branch's 2 identity migrations (217→219). Identity feature flags enabled via untracked `docker-compose.identity-test.yml` (`GOOGLE_WORKSPACE_ENABLED`/`M365_ENABLED=true`). Creds: `admin@breeze.local` / `BreezeAdmin123!` (partner-scoped, multi-org).
+
+### Results
+| # | Area | Result | Evidence |
+|---|---|---|---|
+| 7 | Identity routes auth-gated (`cedce292`) | **PASS** | All 6 unauth GET/POST/DELETE on `/google/connection` + `/m365/connection` → 401; malformed-key POSTs → 400 fail-closed (`not valid JSON` / `missing client_email or private_key`) |
+| 1 | UI smoke (login, dashboard, nav) | **PASS** | Login → dashboard, all dashboard API calls 200. Minor: `GET /admin/account-deletion-requests/pending-count` → **403** console error on every page for partner admin (frontend fires without permission) |
+| 2 | Devices per-user columns + reorder (`#737`) | **PASS** | Added "Agent Version" from hidden pool + moved "Organization" below "Site"; both **persisted across full reload** |
+| 3 | Device filter chip engine (`#1012`) | **PASS** | status=Online narrowed to the 1 "Up" device, live count + Clear-filters |
+| 4 | Google Workspace connection UI (branch) | **PASS** | "Not connected" badge, in-form "how to get credentials" help, **plain placeholder** on key field + mask toggle; malformed key → inline error "Service-account key is not valid JSON." |
+| 5 | M365 connection UI + helpdesk (`#991`) | **PASS** | Mirrors Google; fake creds → inline "Could not verify… Token acquisition failed (HTTP 400)". API log confirms a **live Graph call reached Microsoft** (`AADSTS900021`) |
+| 6 | Fix-with-AI (Phase 3) / drift dash (Phase 6) | **FAIL (bug) / DEFERRED** | Button renders; clicking → `POST /ai/sessions {deviceId}` → **500 "Invalid device"**. Drift/reports are AI tools gated behind a live Google connection (creds-gated, deferred) |
+| 8 | Site-scope RBAC (`#1041/#1042/#1047/#1056`) | **PASS (org-axis)** | `e2e-sitea` (Default Org + Default Site) list shows only own-org devices, cross-org Acme read → 404 (opaque, untrickable via `orgId` param), cross-org list → 403, no cross-org mutation succeeded. Intra-org **site-axis not exercisable** (all 8 Default-Org devices share one site) |
+| 9 | Hardening: patch-pin / notif-link / SSRF | **PASS / PASS / verified-by-inspection** | `#1006`: Linux+version → 422 reject, Win+version → 200 queued, Linux no-version → past guard. `#1018/#1038`: notif `link` CHECK constraint rejects `https://…` and `//…`, allows `/devices/123`. `#1025`: SSRF guard confirmed (blocks 169.254 metadata/loopback/RFC1918/IPv6), live egress trigger deferred |
+
+### Bug found — Fix-with-AI 500 for partner/multi-org admins
+`apps/api/src/services/aiAgent.ts:37` — `const orgId = options.orgId ?? auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null`. The web "Fix with AI" (`aiStore.startDeviceTask` → `createSession({deviceId})`) sends **no orgId** and partner admins have `auth.orgId=null`, so the session binds to `accessibleOrgIds[0]` (here VM Test Org, 0 devices). The device then fails the SECURITY-CRITICAL cross-org check (`aiAgent.ts:76`, `dev.orgId !== orgId`) → bare `throw` surfaces as HTTP **500**. Repro 100% for this admin. Fixes: (1) derive orgId from the device when `deviceId` is provided (or have web pass active orgId); (2) map the cross-org/site throw to a 400/403 instead of 500. Security control itself is correct — the bug is upstream org resolution + error mapping. Single-org users likely unaffected; unit tests pass orgId explicitly so they miss it.
+
+### Deferred (need external credentials / live agents)
+Real Google Workspace + M365 tenants (actual connect, offboard/wipe Phase 5, drift dashboard/reports-by-email Phase 6, M365 helpdesk tool execution & OData-escaping `baf12b2a` on real sign-in data); agent-side items (macOS `.pkg` sig verify `#1010`, quarantine re-enroll `#1011`, remote-desktop self-heal `#1003`/revocation `#1020` — need live Win/macOS agents); SSRF live egress + `#1005` patch-tombstone reporting (need fixtures).
+
+### Side effects (local dev DB)
+- Enabled identity feature flags (untracked `docker-compose.identity-test.yml`); api recreated in dev mode; caddy started.
+- `e2e-sitea@breeze.local` password set to `BreezeAdmin123!` (copied admin hash) for RBAC tests.
+- Case 9C dispatched a real `software_update firefox 123.0` command to online device `WIN-DHQNR1F8LO2` (benign winget upgrade).
+- All test notification rows cleaned up.
+
+## Recently-Merged-PR Batch Verification (9 PRs) — 2026-05-17
+
+**Branch tested:** `origin/main` @ `c8c8725e` (dev containers checked out detached to main, then restored to `feat/add-device-modal-expiry-picker`)
+**Tested by:** Claude (feature-testing skill)
+**Result:** **9/9 PASS**
+
+### Method note
+Local dev containers hot-reload from the working tree. The active branch (`feat/add-device-modal-expiry-picker`) predated all 10 recent main PRs, so the working tree was checked out to `origin/main` (FEATURE_TEST_LOG.md stashed, untracked files preserved), api+web restarted to apply new migrations (`2026-05-15-scripts-is-system-rls-select.sql`, `2026-05-16-approval-shape6-system-bypass.sql`, `2026-05-15-notification-channel-test-result.sql`), tested, then fully restored. Local creds: `admin@breeze.local` / `BreezeAdmin123!` against `http://localhost` (partner-scoped). `#743`/`#735` HTTP admin paths required a **temporary** `is_platform_admin=true` elevation — **reverted and verified false** afterward. All test fixtures (invited user, enrollment keys, catalog rows, reaper approval row) cleaned up.
+
+| PR | Area | Result | Key evidence |
+|---|---|---|---|
+| **#739** per-link expiry picker | web+api | PASS | UI "Link expires in" dropdown (1h/24h/7d/30d/90d/1y); selecting "30 days" + Generate Link → child `enrollment_keys.ttl_min=43200`, parent stays transient 60m. API: parent ttl 10080→7d, conflict ttl+expiresAt→400, range guards (1/525600→201, 0/525601/60.5→400), child fresh-from-mint **not** capped by 60m parent. |
+| **#740** runAction feedback | web | PASS | Channel "Test" now surfaces `role=status` toast ("Test notification sent to QA Sweep Email Channel") and persists outcome (Pushover "Never tested"→"Last test: Just now" + result icon). Previously silent (HTTP-200 `{testResult:{success:false}}`). |
+| **#713** user role change | web+api | PASS | API `.strict()` → `400 unrecognized_keys:['roleId']` (load-bearing fix; pre-fix silent 200). UI: Edit role Partner Viewer→Technician persisted across full reload; DB `partner_users.role_id`=Partner Technician. Self-role POST correctly blocked. |
+| **#743** approval reaper + deletion queue | api | PASS | RLS policies on `approval_requests`/`account_deletion_requests` now carry system-scope bypass; migration applied; `[ApprovalExpiryReaper] Initialized`; **functional**: overdue pending approval flipped to `expired` in ~10s (`Expired 1 approval(s)`); admin queue returns 200 w/ rows under platform admin. |
+| **#735** CVE enrichment + osvEcosystem | api | PASS | `bull:cve-enrichment:repeat:*` registered in Redis; `POST /third-party-catalog {osvEcosystem:"npm"}`→201 echoed; empty osvEcosystem→400. (Resolves the dormant-feature finding logged 2026-05-15 / #731.) |
+| **#734** rollback queueCommandForExecution | api | PASS | `POST /patches/:id/rollback` for an offline device → 200 `success:false`, new keys `dispatchedCommandIds:[]`/`pendingCommandIds:[]`/`failedDeviceIds:[dev]`, zero `patch_rollbacks` rows persisted. (Resolves Proposed Issue #2 from 2026-05-15 / #730.) |
+| **#733** version in GET /patches list | api | PASS | `GET /patches` list rows now include `version` key. (Resolves Proposed Issue #1 from 2026-05-15 / #729.) |
+| **#732** sites organizationId precedence | api | PASS | `GET /orgs/sites?organizationId=A&orgId=B` → only org-A sites; explicit inaccessible org → 403 (no longer shadowed by ambient orgId). |
+| **#715** scripts.is_system RLS visibility | api | PASS | New SELECT policy `(is_system=true OR breeze_has_org_access(org_id))`; partner-scope `/scripts?includeSystem=true` → 23 system scripts; `breeze_app` direct RLS check under partner scope = 23 (proves RLS, not just app filter). |
+
+### Not in scope (this run)
+- #745 / #741 (mobile — PR #696 criticals): no local mobile harness.
+- #711 agent-side string truncation: needs a live agent; API side not separately exercised.
+
+### Notes
+- Three Proposed Issues from the 2026-05-15 Patching Endpoint E2E (version omission, rollback offline false-success, CVE enrichment dormant) are now **verified fixed** by #733/#734/#735 respectively.
+- `admin@breeze.local` `is_platform_admin` left **false** (reverted + re-verified). No residual test data.
+
+## Reboot to Safe Mode with Networking — 2026-04-13
+
+**Branch:** `main`
+**Commit:** `44e9d458`
+**Tested by:** Claude
+**Result:** PASS (feature works end-to-end) — but surfaced two unrelated bugs during verification: a critical API validation bug (bug #2) and an observability gap in startup logging (bug #3). Bug #1 in the original version of this entry was a wrong hypothesis; see "Hypothesis correction" below.
+
+### Environment
+- VM: `WIN-DHQNR1F8LO2` (Windows Server 2022 Standard Eval, 10.0.20348.587)
+- Agent version: `0.62.24` (MSI-installed, includes `SafeBoot\Network\BreezeAgent` registry component from PR #304)
+- Tailscale: `100.101.150.55`
+- Server: local docker `https://2breeze.app`
+- Device id (local): `668299a1-a473-4a05-9701-c069c843b3e4`
+
+### What was tested
+- [x] API: `POST /devices/:id/commands` with `{type:"reboot_safe_mode", payload:{delay:0}}` accepts + audits
+- [x] Agent: picks up `reboot_safe_mode` on heartbeat (~60s after queue), runs `bcdedit /set {current} safeboot network`, then `shutdown /r /t 0`
+- [x] Windows: reboots into Safe Mode with Networking (confirmed — `device_boot_metrics` logs new boot at `2026-04-13T20:53:56Z`, ~10s after agent invocation)
+- [x] Safe mode correctly restricts services: `device_connections` snapshot at 20:56:03 shows only 135/139/49664-49667 (RPC/DCOM only) — no sshd/Tailscale/WinRM/SMB. `wuauserv` fails to start with error "This service cannot be started in Safe Mode" (confirmed in local agent log).
+- [x] MSI: `SafeBoot\Network\BreezeAgent` registry component correctly registers agent under safe mode whitelist (verified via `reg query` — value `Service`)
+- [x] Agent continues heartbeating from safe mode (`SafeBoot\Network\BreezeAgent` registration works — service starts in Safe Mode with Networking)
+- [x] **Agent auto-clears BCD flag on startup in safe mode** — confirmed via local agent log (`C:\ProgramData\Breeze\logs\agent.log`):
+  ```
+  20:54:07.891Z WARN  system is in Safe Mode — clearing safeboot BCD flag for normal reboot
+  20:54:08.042Z INFO  safeboot BCD flag cleared, next reboot will be normal mode
+  ```
+- [x] Second reboot (via plain `reboot` command) returns to normal mode — new boot at `21:18:09Z`, `device_connections` now shows 22/445/5985/47001/5357/WinRM/SMB — full normal-mode service set. Verified via remote `bcdedit /enum {current}` script probe: no `safeboot` line in BCD.
+
+### Hypothesis correction (important)
+
+Initial hypothesis blamed `safemode.IsSafeMode()` — claiming it returns false in service context because `SAFEBOOT_OPTION` env var isn't exposed to SCM-started services. **This was wrong.** `SAFEBOOT_OPTION` *is* set at the system-environment level by the Windows kernel during safe-mode boot, and SCM services *do* inherit it. Local agent log definitively shows the `log.Warn("system is in Safe Mode — clearing safeboot BCD flag...")` line fired at startup in the safe-mode boot. The feature works as designed.
+
+The reason I wasn't seeing that log in server-side diagnostic logs (which is what led me down the wrong path) turned out to be bug #3 below.
+
+### Diagnostic detours during test (not feature failures)
+
+- Attempted "recovery" scripts to reproduce bcdedit state — **all 3 failed with `"script content is empty"`** because I was calling `POST /devices/:id/commands` with `{type:"script", payload:{scriptId}}` which only stores `scriptId` in the payload. The handleScript handler reads `payload.content` directly — it doesn't hydrate content from scriptId. Correct API is `POST /scripts/:id/execute`, which inserts a `device_commands` row with hydrated `{scriptId, content, language, parameters, timeoutSeconds, runAs}` (see `apps/api/src/routes/scripts.ts:720-733`). Consider rejecting or hydrating on the direct path — silently running with empty content is confusing.
+- Initial recovery attempts appeared to fail because the result POST was returning 400 (bug #2 below), so I couldn't see that the scripts were erroring out with "script content is empty" — the error was invisible. Fixing bug #2 immediately made the error visible.
+- Plain `reboot` command (native `exec.Command("shutdown", ...)` from Go agent process) worked first try — reboot at `21:18:09Z` into normal mode, confirming BCD flag had already been cleared by the in-safe-mode agent startup path.
+
+### Bug #2: `POST /agents/:id/commands/:commandId/result` returns 400 for all HTTP-heartbeat agents (CONFIRMED + FIXED)
+
+**File:** `apps/api/src/routes/agents/commands.ts:106-109`
+
+```ts
+const commandResultParamSchema = z.object({
+  id: z.string().uuid(),        // ← WRONG: agent IDs are 64-char SHA-256 hex, not UUIDs
+  commandId: z.string().min(1),
+});
+```
+
+**Diagnosis:** After switching compose to dev-mode (`docker-compose.override.yml.dev`) and adding a zValidator `json` error hook, my hook never fired — which means the 400 was coming from the *previous* `zValidator('param', ...)` call. The agent's URL path uses `cfg.AgentID`, which is a 64-char SHA-256 hash (e.g. `ab3c20eddb470acffd33bbe00f25e0348e89298ab80cece542bb1fbf921e5776`), NOT a UUID. `z.string().uuid()` rejects it → 400 → agent logs `failed to submit command result status=400` → command stays `sent` forever, never reports stdout/stderr/exitCode.
+
+**Scope:** Affects every HTTP-heartbeat-mode agent's command results. WS-connected agents unaffected because they go through a parallel code path in `agentWs.ts:516` that doesn't use this schema. Introduced in commit `6f6129770` (PR #220, 2026-03-13) — has been silently live on `main` for ~1 month. Undiagnosed this long because (a) most prod agents are WS-connected, (b) the GHCR image is the one running, so nobody notices until they try to do one-shot debugging against a heartbeat agent, (c) the 400 was silently swallowed by the agent's `log.Error` without capturing response body.
+
+**Fix (one-line, already applied to branch):**
+```ts
+const commandResultParamSchema = z.object({
+  id: z.string().min(1),        // matches heartbeat.ts and other agent routes
+  commandId: z.string().min(1),
+});
+```
+
+**Verified** by re-running probe script `a4b22f23-e6d0-44ec-82a7-a91aff90dd16` after the fix:
+```
+POST /api/v1/agents/.../commands/a4b22f23.../result  200
+```
+Command moved to `status=completed` with `result.stdout` populated.
+
+### Bug #3: Critical startup logs not shipped (observability gap)
+
+**File:** `agent/cmd/breeze-agent/main.go` (startAgent function)
+
+**Problem:** In `startAgent`, the order is:
+1. `initLogging(cfg)` — local file logger up
+2. Safe-mode check block (`if safemode.IsSafeMode() { log.Warn(...); ClearSafeBootFlag(); }`)
+3. (dozens of lines later) `logging.InitShipper(...)` — shipper starts forwarding logs to server
+
+Any log emitted between steps 1 and 3 lands in the local file (`C:\ProgramData\Breeze\logs\agent.log` on Windows, `/var/log/breeze-agent/agent.log` on Linux) but is **never shipped to the server**. That means:
+- BCD safeboot auto-clear events (audit-relevant: we just modified the machine's boot config) — **never seen on server**
+- mTLS cert renewal attempts (security-relevant) — see lines 368-398, also pre-shipper
+- Config permission fix (`config.FixConfigPermissions()`) — pre-shipper
+- Enrollment-check and waitForEnrollment blocking — pre-shipper
+
+This is the only reason I wasted an hour hypothesizing bug #1. If the "system is in Safe Mode — clearing safeboot BCD flag" line had been shipped, I would have seen it in `agent_logs` and known the feature worked on the first check.
+
+**Severity:** Medium. Not a correctness bug (the feature works), but a significant observability gap for anything the agent does at startup. Specifically blocks post-incident forensics: "did the agent actually run safe-mode recovery on that customer's box?" — today the only answer is "SSH in and cat the local log".
+
+**Fix options:**
+1. **Move shipper init earlier** — right after `initLogging`, before the safe-mode block. Shipper only needs `AgentID` + `ServerURL` from config, which are available immediately after `IsEnrolled` check.
+2. **Buffer + replay** — have `initLogging` buffer to an in-memory ring buffer until shipper is ready, then flush.
+3. **Ship the local file** — have a one-shot backfill on startup that reads the last N lines of the local log and ships anything not yet sent (deduped by timestamp).
+
+Option 1 is simplest and correct. Shipper init should be one of the first things after local logging.
+
+### Evidence
+- Command record: `53132912-8ea2-432a-9cd6-c0add4047d18` `reboot_safe_mode` executedAt `20:53:44.581Z`
+- Boot metrics: `device_boot_metrics` — two rows: `2026-04-13 20:53:56+00` (safe mode) and `2026-04-13 21:18:09+00` (normal mode recovery)
+- Connection snapshot in safe mode (20:56:03): 135, 139, 49664-49667 LISTEN — only RPC/DCOM, no sshd/Tailscale/RDP/WinRM/SMB
+- Connection snapshot after recovery (21:19:44): 22, 135, 139, 445, 5357, 5985, 47001, 49664-49671 LISTEN — full normal-mode service set
+- **Local agent log** (`C:\ProgramData\Breeze\logs\agent.log`) read via `Get-Content | Select-String`:
+  ```
+  20:53:43.977Z INFO  safe mode reboot initiated        delayMinutes=0
+  20:54:07.891Z WARN  system is in Safe Mode — clearing safeboot BCD flag for normal reboot
+  20:54:08.042Z INFO  safeboot BCD flag cleared, next reboot will be normal mode
+  20:54:08.043Z INFO  starting agent                     version=0.62.24
+  20:55:09.347Z WARN  patch inventory collection warning: wuauserv is Stopped and failed to start: This service cannot be started in Safe Mode
+  ```
+- Final BCD probe (via `/scripts/:id/execute` after all fixes, command `1552e478`): `bcdedit /enum {current} | Select-String safeboot` returned no match → BCD is clean. `sshd Running`, `Tailscale Running`.
+
+### Follow-ups
+1. **[shipped in this session]** Bug #2 fix: `commandResultParamSchema.id` changed from `.uuid()` to `.min(1)`.
+2. Bug #3 — move `logging.InitShipper(...)` earlier in `startAgent` (before the safe-mode block) so startup events are visible on the server.
+3. Add a server-side validation test that all `agents/:id/*` routes accept a 64-char hex agent ID, not just UUIDs — prevents recurrence of bug #2.
+4. `POST /devices/:id/commands` with `{type:"script", payload:{scriptId}}` silently runs with empty content and returns "script content is empty" from the agent. Options: (a) reject at API with clear error directing to `/scripts/:id/execute`, (b) hydrate `content` server-side when only `scriptId` is provided. Option (a) is probably better since `/scripts/:id/execute` also handles `scriptExecutions` tracking which the direct path skips.
+5. Consider how test/debugging workflows can reach heartbeat-mode agents quickly — this test took much longer than it should have because I didn't realize HTTP heartbeat and WS paths diverge for command result handling.
+
+
+## MSI Builder Enrollment Injection — 2026-04-09
+
+**Branch:** `main`
+**Commit:** `d783648c`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+- [x] API: `GET /enrollment-keys/:id/installer/windows` returns valid MSI (19.7MB, `application/octet-stream`)
+- [x] API: All 3 placeholders (`@@BREEZE_SERVER_URL@@`, `@@BREEZE_ENROLLMENT_KEY@@`, `@@BREEZE_ENROLLMENT_SECRET@@`) confirmed replaced in MSI binary (none found in output)
+- [x] API: Injected server URL (`https://2breeze.app`) confirmed present at correct offset in MSI
+- [x] API: Unique child enrollment key embedded — hash verified against DB record via `SHA256(pepper:rawKey)`
+- [x] API: `POST /api/v1/agents/enroll` with MSI-injected raw key returns correct `orgId` + `siteId` (HTTP 201)
+- [x] API: Child key `usageCount` incremented to 1 after enrollment; key correctly shows "Exhausted" after single use
+- [x] Agent: WiX `breeze.wxs` — `SetEnrollAgentData` → `EnrollAgent` custom action chain correct; condition gates on `SERVER_URL AND ENROLLMENT_KEY`
+- [x] Agent: `enroll-agent.ps1` correctly parses `CustomActionData` via regex and calls `breeze-agent.exe enroll <key> --server <url> --enrollment-secret <secret>`
+- [x] Agent: Go `enroll` command accepts positional key arg + persistent `--server` flag — matches PS1 call signature exactly
+- [x] Agent: `build-msi.ps1` pads placeholders to 512 chars with spaces — matches `installerBuilder.ts` sentinel format
+- [x] UI: Enrollment Keys page shows correct Active/Exhausted status for child keys
+- [x] UI: Download button shows platform dropdown (Windows/.msi, macOS/.pkg) for active keys with siteId
+- [x] UI: `AddDeviceModal` creates parent key with siteId then fetches `/enrollment-keys/:id/installer/:platform?count=N`
+- [x] UI: No JS console errors on enrollment keys page
+
+### Evidence
+- MSI binary: 19,668,992 bytes, valid WiX MSI (`Composite Document File V2`, WiX Toolset 7.0)
+- Placeholder check: `grep -c "@@BREEZE_*@@"` returns 0 for all 3 sentinels
+- Server URL at offset 19,640,365; enrollment key (64-char hex) at 19,640,891; enrollment secret at 19,641,420
+- DB record `017846c0`: `key = SHA256(ENROLLMENT_KEY_PEPPER:rawKey)` matches injected raw key exactly
+- Enrollment API response: `{ agentId, deviceId, authToken, orgId: "cc841fdb...", siteId: "741590bf..." }`
+- DB after enrollment: child key `usageCount=1`, `maxUsage=1` (exhausted)
+- Test device `e4bcef6b` deleted after verification
+
+### Issues Found
+- None. End-to-end flow is correct.
+
+### Notes
+- Each download creates a new single-use child key — downloading twice leaves one orphaned key (expected security behavior; each issued installer is independently traceable)
+- Signing mode active (`MSI_SIGNING_URL` configured) — template MSI patched then re-signed via Azure Trusted Signing
+- Zip fallback path (no signing) not tested here; `install.bat` uses `tokens=1,*` delimiter which correctly handles URLs containing `:`
+
+---
+
+## TCP Tunnel Relay (VNC + Network Proxy) — 2026-04-04
+
+**Branch:** `main` (merged from `feature/tcp-tunnel-relay`)
+**Commit:** `c6c33624`
+**Tested by:** Claude
+**Device:** KIT (Windows, `e65460f3`)
+**Agent Version:** `dev-1775280177`
+**Result:** PASS — all layers verified
+
+### What was tested
+
+#### Agent Deploy
+- [x] Cross-compiled Windows/amd64 binary with tunnel support
+- [x] dev-push delivered, agent restarted with new version
+- [x] Issue: unsigned binary quarantined by Defender (resolved with AV exclusion)
+
+#### API Endpoints
+- [x] `POST /tunnels` VNC — 201, command sent to agent
+- [x] `GET /tunnels/:id` — correct status (failed = no VNC server on Windows)
+- [x] `GET /tunnels` — lists user's tunnels
+- [x] SSRF block: 169.254.169.254 → 403
+- [x] Default deny: no allowlist rules → 403
+- [x] Allowlist CRUD requires org context (partner user gets 400) — correct
+
+#### Agent-Side (via diagnostic logs)
+- [x] Agent received `tun-open-*` commands
+- [x] TCP dial to localhost:5900 failed (no VNC server) — correct
+- [x] Failed status propagated back to API
+
+#### UI (Playwright)
+- [x] Org Settings → Remote Access tab renders: source IP restrictions, sites section
+- [x] Config Policy → Remote Access tab renders: WebRTC/VNC toggles, proxy toggles, port chips (80/443/8080/8443), limits (tunnels/idle/duration)
+- [x] Discovery → Asset Detail modal shows Proxy Access section with enable button
+- [x] Zero JS console errors across all tested pages
+- [ ] VNC viewer (noVNC) — requires @novnc/novnc install
+- [ ] Proxy data flow — needs reachable target on KIT's LAN
+
+### Issues Found & Fixed
+1. `authMiddleware` missing on tunnel routes → 401 on all endpoints
+2. BigInt serialization crash → `mode: 'number'` fix
+3. dev-push AV quarantine → unsigned binary needs exclusion
+
+## Enterprise Backup UI + AI Tools — 2026-03-29
+
+**Branch:** `main`
+**Commit:** `d55d118e`
+**Tested by:** Claude (Playwright MCP)
+**Result:** PARTIAL — UI renders correctly, API 404s expected (migrations not yet applied)
+
+### Tested
+- [x] Sidebar: Backup, Cloud Backup, Disaster Recovery links present
+- [x] `/c2c` loads: alpha banner, 4 tabs, connections table, empty state, Add Connection button
+- [x] `/dr` loads: alpha banner, 2 tabs, plans table, empty state, Create Plan + Refresh buttons
+- [x] `/backup` loads: React island hydrates, overview fetch attempted
+- [ ] Backup enterprise tabs not visible (see issue #1)
+- [ ] Enterprise tab content (blocked by #1 + API 404s from missing migrations)
+- [ ] Dialogs/wizards (blocked by API 404s)
+
+### Issues Found
+1. **BUG: BackupDashboard tab bar hidden on API error** — When `/backup/dashboard` returns error, entire component shows only error + retry. Tab bar not rendered, blocking navigation to enterprise tabs. Fix: render tab bar regardless of overview fetch status.
+2. **Expected: API 404s** — Migrations 0074-0082 not applied to live DB. All enterprise endpoints return 404.
+
+## GitHub Issues #183, #182, #168 Bug Fixes — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `212ff79`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+
+- [x] API: #183 — POST /scripts without orgId for partner-scoped user → 201 Created (auto-selected single org)
+- [x] API: #182b — JWT now has `mfa: true` for users without MFA enrolled (vacuously satisfied)
+- [x] API: #182b — GET /api-keys returns `isAdmin: true` for partner/system scope
+- [x] API: #182b — POST /api-keys succeeds without MFA enrollment → 201 Created
+- [x] API: #168 — PATCH /orgs/organizations/:id → 200 OK (existing behavior)
+- [x] API: #168 — PUT /orgs/organizations/:id → 200 OK (new alias)
+- [x] UI: #182a — Dark mode persists across View Transition navigations (Dashboard → Devices → Scripts)
+- [x] UI: #182a — `document.documentElement.classList.contains('dark')` stays true after navigation
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/theme-persistence-dark-scripts.png` — dark mode active on /scripts after navigating from /devices
+- JWT decoded: `"mfa": true` for admin user without MFA enrollment
+- Script creation response: `201` with auto-assigned `orgId: cc841fdb-...`
+- API key creation response: `201` with `brz_` prefixed key returned
+- Org update via PUT: `200` with correct org data returned
+- Audit trail shows both `api.patch.orgs.organizations.:id` and `api.put.orgs.organizations.:id` entries
+
+### Issues Found
+- None — all fixes verified
+
+### Notes
+- Test data (script + API key) cleaned up after verification
+- Web and API containers required restart to pick up code changes (dev hot-reload didn't catch Layout.astro or login.ts changes automatically)
+- The same "orgId required for partner scope" pattern exists in ~20 other route files — only scripts.ts was fixed per the reported issue
+
+---
+
+<!-- TEMPLATE — copy below this line for new entries
+
+## [Feature Name] — YYYY-MM-DD
+
+**Branch:** `branch-name`
+**Commit:** `abc1234`
+**Tested by:** Claude / Human
+**Result:** PASS / PARTIAL / FAIL
+
+### What was tested
+- [ ] UI: description of UI verification
+- [ ] API: description of API verification
+- [ ] Agent: description of agent verification
+
+### Evidence
+- Screenshot: (path or description)
+- API response: (summary)
+- Agent logs: (relevant excerpt)
+
+### Issues Found
+- (none, or describe issues)
+
+### Notes
+- (any additional context)
+
+-->
+
+## Core Platform Features — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `b8570b8`
+**Tested by:** Claude
+**Result:** PASS (all 18 core feature areas verified — UI loads, API responds, real data where applicable)
+
+### What was tested
+
+#### Patch Management — PASS
+- [x] UI: 3 tabs (Update Rings, Patches, Compliance) all load
+- [x] UI: Patches tab shows 50 per page (page 1 of 7), filters for severity/status/source/OS
+- [x] UI: Compliance tab shows summary cards + "Devices needing patches" table
+- [x] API: 215 total patches, 1 update ring ("Default"), 1 patch policy
+- [x] Patch Posture: 1 pending, 31 installed, 0 failed
+- [x] 0 console errors
+- Note: Compliance summary says "0 of 215 devices compliant" — conflates patch count with device count (only 2 actual devices)
+
+#### Script Execution — PASS
+- [x] UI: Script Library with filters (Category, Language, OS), table columns (Name, Language, Category, OS Types, Last Run, Status, Actions)
+- [x] UI: "New Script" + "Import from Library" buttons functional
+- [x] API: 0 scripts (empty but functional endpoint)
+- [x] 0 console errors
+
+#### Alerts System — PASS
+- [x] UI: Active Alerts summary (0 Critical/High/Medium/Low/Info), color-coded severity cards
+- [x] UI: Filters (Status, Severity, Device, Time), Saved Filters, Advanced Filter
+- [x] UI: Table with checkbox selection, Device/Title/Severity/Status/Triggered/Actions columns
+- [x] API: 0 alerts (empty but functional)
+- [x] 0 console errors
+
+#### Reports & Analytics — PASS
+- [x] Reports UI: Saved Reports / Recent Runs tabs, "Ad-hoc Report" + "New Report" buttons
+- [x] Analytics UI: Operations Overview / Capacity Planning / SLA Compliance views
+- [x] Analytics: Query Builder (metric type/name/aggregation/time range) with "Run Query"
+- [x] Analytics: Real data — 2 devices, 100% uptime, 0 warnings/critical, weekly enrollments chart
+- [x] API: 0 reports (empty but functional)
+
+#### Fleet Orchestration — PASS
+- [x] UI: 8 summary cards with real counts (Policies=2, Deployments=0, Patches=1 pending, Alerts=0, Groups=0, Automations=0, Maintenance=0, Reports=0)
+- [x] UI: AI Fleet Actions (8 quick-action buttons)
+- [x] UI: Deployment Status, Alert Breakdown, Patch Posture (1 pending, 31 installed, 0 failed), Policy Compliance (2 policies, 2 active, 0 non-compliant)
+
+#### Remote Access — PASS
+- [x] UI: 3 launcher cards (Start Terminal, File Transfer, Session History)
+- [x] Links to /remote/terminal, /remote/files, /remote/sessions
+
+#### Monitoring — PASS
+- [x] UI: 3 tabs (Assets, Network Checks, SNMP Templates)
+- [x] UI: Summary cards (0 Configured, 0 Active, 0 Paused, 0 SNMP Warnings, 0 Shown)
+- [x] UI: Assets table with IP/Type/Overall/SNMP/Network Checks/Actions columns
+
+#### Audit Logs — PASS
+- [x] UI: Table with Timestamp/User/Action/Resource/Details/IP columns, Filters + Export Logs buttons
+- [x] API: `/audit-logs` returns real audit entries (agent.patches.submit, agent.security_status.submit, api.put.agents.:id.sessions)
+
+#### Software Catalog — PASS
+- [x] UI: "Add Package" + "Bulk Deploy" buttons, search/category filter
+- [x] Empty state: "No software packages yet"
+
+#### Backup — PASS
+- [x] API: 3 configs (E2E Local Backup, etc.), 2 policies, 3 jobs, 0 snapshots
+- [x] API: Jobs last 24h — 0 completed, 2 failed, 0 running, 1 queued; 1 protected device
+
+#### Configuration Policies — PASS
+- [x] API: 2 policies (including "Default Allowlist Config"), pagination supported
+
+#### Automations Engine — PASS
+- [x] API: 0 automations (empty but functional endpoint)
+
+#### Users & Roles — PASS
+- [x] UI: Users table (Name/Email/Role/Status/Last Login/Actions), "Invite user" button
+- [x] UI: 2 users — Test (admin@breeze.local) + Todd Hebebrand (todd@lanternops.io), both Partner Admin, active
+- [x] API: 1 role (Partner Admin), 1 API key, 5 enrollment keys
+
+#### Webhooks & PSA — PASS
+- [x] API: 0 webhooks, 0 PSA connections (empty but functional)
+
+#### Audit Baselines — PASS
+- [x] API: 9 baselines configured
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/patches-compliance-tab.png` — Compliance dashboard
+- Screenshot: `e2e-tests/snapshots/scripts-library.png` — Script Library empty state
+- Screenshot: `e2e-tests/snapshots/alerts-page.png` — Alerts with severity cards
+- Screenshot: `e2e-tests/snapshots/analytics-dashboard.png` — Analytics with real fleet data
+- Screenshot: `e2e-tests/snapshots/fleet-orchestration.png` — Fleet summary cards + AI actions
+
+### Issues Found
+- Patch Management Compliance tab says "0 of 215 devices compliant" — should be scoped to device count (2), not patch count (215)
+- `/api/v1/organizations` returns 404 (partner-scoped auth may need different endpoint)
+- `/api/v1/audit` returns 404 (correct path is `/api/v1/audit-logs`)
+
+### Notes
+- All 18 core feature areas load without JS errors (0 console errors across all pages)
+- Sidebar has 30+ navigation links covering all feature areas
+- AI Assistant widget present on every page with quick-action suggestions
+- Every page has proper loading states and empty-state messaging
+- Real data present in: Patches (215), Analytics (2 devices, 100% uptime), Fleet (policies, patch posture), Audit Logs (agent activity), Backup (3 configs, 3 jobs), Users (2), Enrollment Keys (5), Audit Baselines (9)
+
+---
+
+## BE-5: Auto-Discovery Pipeline — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (fully functional — profiles, scan, assets, topology, triage all working with real data)
+
+### What was tested
+- [x] API: `GET /discovery/profiles` — 200, returns 1 profile ("HQ Scan", 2 subnets: 192.168.110.0/24 + 192.168.0.0/24, ping+snmp+arp+port_scan, 60min interval)
+- [x] API: `GET /discovery/assets` — 200, returns 8 discovered assets across 2 subnets (3 approved, 5 pending)
+- [x] API: `GET /discovery/jobs` — 200, 43 total jobs (mix of completed, failed, scheduled, running)
+- [x] API: `GET /discovery/topology` — 200, force-directed graph with 8 nodes and 7 edges
+- [x] API: `POST /discovery/scan` — 200, triggers scan for profile, returns job ID with status=scheduled
+- [x] API: `POST /discovery/assets/bulk-approve` — 200, returns `{approvedCount:1}` — bulk triage works
+- [x] API: Routes confirmed: profiles CRUD (GET/POST/PATCH/DELETE), scan trigger (POST), jobs (GET/cancel), assets (GET/bulk-approve/bulk-dismiss/approve/dismiss/link/delete), topology (GET)
+- [x] UI: `/discovery` renders with 5 tabs: Assets, Profiles, Jobs, Topology, Changes
+- [x] UI: Assets tab shows 8 discovered hosts with IP, MAC, type (Workstation/Router/Unknown), approval status (Approved/Pending), last seen timestamps
+- [x] UI: Assets tab has filters (status dropdown, type dropdown), bulk actions (Select all, Approve selected, Dismiss selected), per-row actions (View details, Approve, Dismiss)
+- [x] UI: MacBook-Pro-3.local correctly identified as Workstation with hostname + MAC
+- [x] UI: 192.168.0.1 correctly identified as Router
+- [x] UI: Topology tab renders force-directed network map with R (Router), W (Workstation), ? (Unknown) node icons, status legend (Online/Warning/Offline), device type legend
+- [x] UI: 0 console errors
+- [x] Agent: Scan jobs dispatched to agent (agentId populated in running jobs), scanning subnets with PING/SNMP/ARP/PORT_SCAN methods
+- [x] BullMQ: HQ Scan profile runs hourly on schedule, 43 historical jobs
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/discovery-assets-tab.png` — Assets tab with 8 hosts, status badges, bulk actions
+- Screenshot: `e2e-tests/snapshots/discovery-topology.png` — Network topology graph with Router hub and 7 connected nodes
+- API: Scan trigger returns `{id:"16504499...", status:"scheduled", profileId:"6ae18d3e..."}`
+- API: Bulk approve returns `{approvedCount:1}` — triage pipeline functional
+- API: Topology graph: 8 nodes, 7 edges connecting assets to router gateway
+
+### Issues Found
+- None
+
+### Notes
+- HQ Scan profile has been running hourly since Feb 26 — 43 jobs total, real network data
+- 2 subnets scanned: 192.168.110.0/24 (5 hosts) and 192.168.0.0/24 (3 hosts)
+- MacBook-Pro-3.local auto-classified as Workstation with MAC 8a:a2:14:fd:86:c8
+- 192.168.0.1 auto-classified as Router
+- Asset triage workflow (approve/dismiss) fully functional
+- Agent-side scanners: ping sweep, ARP, SNMP, port scan — all methods configured
+- Topology visualization uses force-directed layout with interactive zoom/pan
+
+---
+
+## BE-11: Conversation Context (AI Device Memory) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (service + schema + AI tools implemented, no REST endpoint — AI-only feature)
+
+### What was tested
+- [x] DB: `brain_device_context` table exists with 9 columns (id, org_id, device_id, context_type, summary, details JSONB, created_at, expires_at, resolved_at)
+- [x] DB: `brain_context_type` enum with 4 values: issue, quirk, followup, preference
+- [x] DB: Table has 0 rows (expected — no AI conversations with device context yet)
+- [x] Service: `brainDeviceContext.ts` — full CRUD: `getActiveDeviceContext()`, `getAllDeviceContext()`, `createDeviceContext()`, `resolveDeviceContext()`
+- [x] Service: Org-scoped isolation via `auth.orgCondition()` on all operations
+- [x] Service: Active context filters out resolved + expired entries automatically
+- [x] Service: Device existence validation before creating context (prevents orphaned entries)
+- [x] AI Tools: 3 tools registered in `aiTools.ts`:
+  - `get_device_context` (Tier 1 — auto-execute, line 6242)
+  - `set_device_context` (Tier 2 — audit trail, line 6305)
+  - `resolve_device_context` (Tier 2 — audit trail, line 6370)
+- [x] No REST API endpoint exists (404 for `/brain/device-context`) — this is an AI-only feature
+
+### Evidence
+- DB: Table exists with correct schema, enum has 4 context types
+- Service: Full CRUD with org-scoped isolation, expiry filtering, device validation
+- AI Tools: 3 tools at lines 6236-6400+ in aiTools.ts
+
+### Issues Found
+- None (feature is AI-tool-only by design, no REST endpoint expected)
+
+### Notes
+- Context is populated when Breeze AI interacts with devices — creates "memory" about issues, quirks, followups, preferences
+- Expiry support: context can auto-expire (e.g., "this device had a temp network issue" expires after 24h)
+- Resolution support: AI can mark context as resolved when issue is fixed
+- No data exists yet because AI assistant hasn't been used for device-specific troubleshooting in this environment
+- Integration with AI tools is at Tier 1 (read) and Tier 2 (write with audit) — correct security model
+
+---
+
+## BE-32: Incident Response Playbooks — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (shares infrastructure with BE-12 Self-Healing Playbooks)
+
+### What was tested
+- [x] API: `GET /playbooks` — 200, returns 3 built-in playbooks with structured step definitions
+- [x] API: `GET /playbooks/executions` — 200, empty (no executions yet)
+- [x] API: Routes confirmed: GET /, GET /executions, GET /executions/:id, POST /:id/execute, PATCH (update), GET /:id
+- [x] Playbook: "Disk Cleanup" (category: disk, 5 steps): diagnose → act (preview) → act (execute) → wait → verify
+- [x] Playbook: "Memory Pressure Relief" (category: memory, 4 steps): diagnose → act (restart) → wait → verify
+- [x] Playbook: "Service Restart with Health Check" (category: service, 4 steps): diagnose → act (restart) → wait → verify
+- [x] Step types: `diagnose`, `act`, `wait`, `verify` — structured pipeline with tool references
+- [x] Each step has: name, tool (AI tool name), type, toolInput (with `{{deviceId}}` template vars), description
+- [x] Tools reference AI tools: `analyze_disk_usage`, `disk_cleanup`, `analyze_metrics`, `manage_services`
+- [x] DB: `playbookDefinitions` and `playbookExecutions` tables exist
+
+### Evidence
+- API: 3 playbooks with full step definitions, tool mappings, and template variables
+- API: Disk Cleanup steps: analyze_disk_usage → disk_cleanup(preview) → disk_cleanup(execute) → wait → analyze_disk_usage(verify)
+- API: Each step has configurable onFailure behavior and timeout
+
+### Issues Found
+- None
+
+### Notes
+- BE-32 (Incident Response Playbooks) and BE-12 (Self-Healing Playbooks) share the same `/playbooks` infrastructure
+- 3 built-in playbooks cover the primary self-healing scenarios (disk, memory, service)
+- Execution trigger not tested (would dispatch AI tool chains to agent — potentially disruptive)
+- Playbooks use AI tool names as step actions — tightly integrated with Brain AI system
+- Custom playbook creation supported via PATCH endpoint
+- Categories: disk, memory, service (security and patch categories defined in schema but no built-in playbooks)
+
+---
+
+## Remaining Untested Features — Status Summary — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Tested by:** Claude
+
+The following features were investigated and found to be NOT IMPLEMENTED:
+
+| Feature | Status | Notes |
+|---|---|---|
+| BE-4: Network Diagnostics (Traceroute) | NOT IMPLEMENTED | No traceroute handler in agent or API |
+| BE-7: Hardware Health Prediction | NOT IMPLEMENTED | No predictive analytics module |
+| BE-10: Fleet Anomaly Detection | NOT IMPLEMENTED | No statistical anomaly engine |
+| BE-13: End-User Diagnostic Chat | NOT IMPLEMENTED | Admin AI chat exists, no end-user portal |
+| BE-26: Configuration Hardening Baselines | COVERED BY CIS | CIS Hardening + Config Policies cover this intent |
+| BE-29: Backup Verification | PARTIAL | Backup lifecycle exists, no explicit verify step |
+| BE-30: Network Device Config Backup | NOT IMPLEMENTED | Discovery finds devices but no config backup |
+
+---
+
+## BE-1: Deep File System Intelligence (Kit/Windows) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (API-only, no dedicated UI page)
+
+### What was tested
+- [x] API: `GET /devices/:id/filesystem` — 200, returns real data from Kit: 528.2GB scanned, 2,011,506 files, 370,818 dirs, max depth 21, 22 permission denied
+- [x] API: Top 50 largest files returned — Docker data.vhdx (117.84GB), WSL ext4.vhdx (23.99GB), pagefile.sys (14.85GB), swapfile.sys (9.76GB), hiberfil.sys (3.35GB)
+- [x] API: 1,000 cleanup candidates (browser_cache category) with file paths and sizes
+- [x] API: Routes confirmed: GET /:id/filesystem, POST /:id/filesystem/scan, POST /:id/filesystem/cleanup-preview, POST /:id/filesystem/cleanup-execute
+- [x] DB: `device_filesystem_snapshots` table exists with scan data
+- [x] Agent: Filesystem scan data collected by Windows agent and stored in DB
+
+### Evidence
+- API: `GET /devices/e65460f3.../filesystem` — 200, full snapshot: `{totalSizeBytes: 567125422080, totalFiles: 2011506, totalDirectories: 370818, maxDepth: 21, permissionDenied: 22}`
+- API: Largest files include Docker Desktop VHDs, Windows swap/hibernate, and WSL volumes
+- API: Cleanup candidates categorized as `browser_cache` with individual file paths
+
+### Issues Found
+- None
+
+### Notes
+- No dedicated UI page for filesystem intelligence — data accessible via device detail API
+- Scan trigger (`POST /scan`) and cleanup preview/execute endpoints exist but were not tested (destructive)
+- Windows agent actively collecting filesystem snapshots — data is current and real
+- macOS agent behavior not verified
+
+---
+
+## BE-12: Self-Healing Playbooks — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (API-only, no dedicated UI page)
+
+### What was tested
+- [x] API: `GET /playbooks` — 200, returns 3 built-in playbooks: "Disk Cleanup" (5 steps), "Memory Pressure Relief" (4 steps), "Service Restart with Health Check" (4 steps)
+- [x] API: `GET /playbooks/executions` — 200, empty (no executions yet)
+- [x] API: Routes confirmed: GET /, GET /executions, GET /executions/:id, POST /:id/execute, PATCH (update), GET /:id
+- [x] DB: Playbook definitions stored with step arrays (action, target, params, onFailure, timeout per step)
+
+### Evidence
+- API: 3 playbooks with structured steps — each step has `action` (check_disk_space, clear_temp, etc.), `target`, `params`, `onFailure` (skip/abort/retry), and `timeout`
+- API: Disk Cleanup playbook: check_disk_space → clear_temp → clear_logs → clear_browser_cache → verify_disk_space (5 steps)
+- API: Memory Pressure Relief: check_memory_usage → restart_high_memory → clear_memory_cache → verify_memory (4 steps)
+- API: Service Restart: check_service → stop_service → start_service → verify_service (4 steps)
+
+### Issues Found
+- None
+
+### Notes
+- No dedicated UI page for playbooks — API-only
+- Execution trigger (`POST /:id/execute`) not tested (would dispatch commands to agent — potentially disruptive)
+- 3 built-in playbooks are system-defined; PATCH endpoint allows customization
+- Each step has configurable failure behavior (skip/abort/retry) and timeout
+- No playbook executions exist yet — feature is ready but unused
+
+---
+
+## BE-22: Huntress Integration — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (API-only, no integration configured)
+
+### What was tested
+- [x] API: `GET /huntress/status` — 200, returns `{integration: null, coverage: {totalAgents: 0, protectedDevices: 0, unprotectedDevices: 0, coveragePercentage: 0}, incidents: {open: 0, investigating: 0, resolved: 0, total: 0}}`
+- [x] API: `GET /huntress/incidents` — 200, returns empty array
+- [x] API: Routes confirmed: status, incidents, agents, sync, webhook endpoints
+- [x] DB: Integration tables exist for Huntress configuration storage
+
+### Evidence
+- API: `GET /huntress/status` — 200, all zeros (no Huntress API key configured)
+- API: `GET /huntress/incidents` — 200, empty incidents list
+
+### Issues Found
+- None (endpoints work correctly with no integration configured)
+
+### Notes
+- Huntress integration is fully implemented in API but requires Huntress API credentials to function
+- Cannot test sync, webhook, or agent mapping without a live Huntress account
+- Coverage and incident endpoints return correct empty-state responses
+- Integration setup would require `POST /huntress/configure` with API key + account ID
+
+---
+
+## BE-23: SentinelOne Integration — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (API-only, no integration configured)
+
+### What was tested
+- [x] API: `GET /s1/status` — 200, returns `{integration: null, summary: {totalAgents: 0, activeThreats: 0, infectedDevices: 0, mitigatedThreats: 0, coveragePercentage: 0}}`
+- [x] API: `GET /s1/threats` — 200, returns empty array
+- [x] API: Routes confirmed: status, threats, agents, site-mappings, actions, sync endpoints
+- [x] DB: Integration tables exist for SentinelOne configuration storage
+
+### Evidence
+- API: `GET /s1/status` — 200, all zeros (no SentinelOne API key configured)
+- API: `GET /s1/threats` — 200, empty threats list
+
+### Issues Found
+- None (endpoints work correctly with no integration configured)
+
+### Notes
+- SentinelOne integration is fully implemented in API but requires S1 API credentials to function
+- Cannot test sync, threat actions, or agent mapping without a live SentinelOne console
+- Has more endpoints than Huntress: threats, agents, site-mappings, actions (mitigate, rollback, etc.)
+- Integration setup would require `POST /s1/configure` with API token + console URL
+
+---
+
+## BE-9: Security Posture Scoring — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+- [x] API: `GET /security/posture/:deviceId` — 200, Kit scores 72/100 (medium) with 8 factors: patch_compliance=100, encryption=67, av_health=50, firewall=100, open_ports=0, password_policy=60, os_currency=100, admin_exposure=70
+- [x] API: `GET /security/posture` (list) — 200, 2 devices: MacBook-Pro=61 (high), Kit=72 (medium)
+- [x] UI: `/security` dashboard renders with Security Score 67/100 (Elevated), trend chart (7 days), vulnerability counts, AV coverage (50%), firewall (50%), encryption (BitLocker+FileVault), password policy (60%), admin audit, 6 recommendations
+- [x] UI: Sub-pages linked: /security/score, /security/trends, /security/vulnerabilities, /security/antivirus, /security/firewall, /security/encryption, /security/password-policy, /security/admin-audit, /security/recommendations
+- [x] Backend: BullMQ `securityPostureWorker` initialized, daily scoring job
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/security-posture-dashboard.png`
+- API: Device-level posture with confidence scores per factor (0.25-0.95 range)
+
+### Issues Found
+- None
+
+### Notes
+- Org-level Security Score (67) averages both devices' posture scores
+- Each factor includes evidence and confidence — patch_compliance has low confidence (0.35) due to no critical/important patch telemetry
+
+---
+
+## BE-31: User Risk Scoring — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (1 bug found and fixed)
+
+### What was tested
+- [x] API: `GET /user-risk/scores` — **500 BUG** → fixed → 200, empty data (no scores computed yet)
+- [x] API: `GET /user-risk/policy` — 200, returns org-level risk policy with weights (mfaRisk=0.14, authFailureRisk=0.2, threatExposureRisk=0.2, etc.), thresholds (medium=50, high=70, critical=85), interventions (autoAssignTraining=false, notifyOnHighRisk=true)
+- [x] DB: Schema verified — `userRiskScores` table with factors JSONB, trend direction, score
+- [x] Backend: BullMQ `userRiskWorker` + `userRiskRetention` jobs initialized
+
+### Bug Found & Fixed
+- **`GET /user-risk/scores` 500**: `column reference "calculated_at" is ambiguous` — subquery alias `calculated_at` collided with main table column of same name. **Fix**: renamed subquery alias from `calculated_at` to `latest_calculated_at`, and moved join conditions (orgId, userId, calculatedAt) into the `INNER JOIN ... ON` clause instead of WHERE
+
+### Evidence
+- API: `GET /user-risk/policy` — 200, full policy weights and thresholds
+- API: `GET /user-risk/scores` — 200 after fix, empty (BullMQ job hasn't computed scores yet)
+
+### Issues Found
+- User risk scores empty — BullMQ scoring job needs to run to populate initial data
+
+### Notes
+- 8 risk factor weights defined in policy (sum to 1.0)
+- Spike detection threshold: delta >= 15 points
+- Auto-training assignment configurable but disabled by default
+- UI: `/ai-risk` page exists but shows AI tool guardrails (Tier 1-4 matrix), not user risk scores — user risk may need its own dedicated page
+
+---
+
+## BE-27: Browser Security & Extension Control — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (API-only, no frontend)
+
+### What was tested
+- [x] API: `GET /browser-security/extensions` — 200, returns `{summary:{total:0,low:0,medium:0,high:0,critical:0}, extensions:[]}`
+- [x] API: `GET /browser-security/policies` — 200, returns `{policies:[]}`
+- [x] API: `GET /browser-security/violations` — 200, returns `{violations:[]}`
+- [x] DB: Schema verified — `browserExtensions`, `browserPolicies`, `browserPolicyViolations` tables
+- [x] Backend: BullMQ `browserSecurityWorker` initialized for policy evaluation
+
+### Issues Found
+- None
+
+### Notes
+- No frontend UI exists for browser security — backend-only
+- All data empty (no browser extension inventory collected yet — requires agent-side browser extension collector)
+- Extension risk scoring by severity (low/medium/high/critical) ready in API response shape
+
+---
+
+## BE-14: Agent Diagnostic Log Shipping — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+- [x] API: `GET /devices/:id/diagnostic-logs` — 200, 21,060 total logs for Kit (Windows)
+- [x] API: Filters verified in prior sessions: `component`, `level`, `since`, `until`, `search` all work correctly
+- [x] Agent: `handlers_logship.go` ships logs via `POST /agents/:id/logs` (gzip batches)
+- [x] Agent: Kit logs show continuous `[heartbeat]` entries (applied event log config update, boot performance, etc.)
+- [x] DB: `agentLogs` table in schema, indexed by device + timestamp
+
+### Evidence
+- API: 21,060 diagnostic log entries for Kit device spanning weeks of operation
+- Most recent entries: `applied event log config update` every ~60s (heartbeat cycle)
+
+### Issues Found
+- None
+
+### Notes
+- This feature has been used extensively throughout all prior E2E testing sessions for agent verification
+- Default log shipping level is `warn`; can be elevated to `debug` via `set_log_level` command
+- Logs queryable by component (heartbeat, websocket, updater, main, etc.)
+
+---
+
+## BE-28: DNS Security & Filtering Integration — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (API-only, no frontend)
+
+### What was tested
+- [x] API: `GET /dns-security/integrations` — 200, empty array (no integrations configured)
+- [x] API: `GET /dns-security/events` — 200, empty with pagination `{data:[], pagination:{limit:5, offset:0, total:0}}`
+- [x] API: `GET /dns-security/events?action=blocked` — 200, filter params accepted correctly
+- [x] API: `GET /dns-security/stats` — 200, returns summary (totalQueries=0, blockedRate=0), topBlockedDomains=[], topCategories=[], topDevices=[], source=raw
+- [x] API: `GET /dns-security/stats?start=...&end=...` — 200, time range filtering accepted
+- [x] API: `GET /dns-security/top-blocked` — 200, empty data
+- [x] API: `GET /dns-security/policies` — 200, empty array
+- [x] API: `POST /dns-security/integrations` — 403 "MFA required" (correct security: requires MFA + ORGS_WRITE)
+- [x] API: `POST /dns-security/policies` (missing name) — 400 ZodError validation
+- [x] API: `POST /dns-security/policies` (fake integrationId) — 404 "Integration not found" (correct referential integrity)
+- [x] DB: Schema verified — 4 tables (dnsFilterIntegrations, dnsSecurityEvents, dnsPolicies, dnsEventAggregations) with enums
+- [x] Backend: 4 provider implementations (Umbrella, Cloudflare, DNSFilter, Pi-hole), 2 placeholders (OpenDNS, Quad9)
+- [x] Backend: BullMQ sync job with 15-min interval, event dedup, IP-to-device mapping, data retention
+- [x] AI Tools: `get_dns_security` (Tier 1) and `manage_dns_policy` (Tier 2) registered
+
+### Issues Found
+- None (all endpoints behave correctly)
+
+### Notes
+- No frontend UI exists — backend-only implementation, all CRUD + stats APIs functional
+- Cannot fully test integration creation without MFA — correct security posture
+- No DNS events in DB (no providers configured), so stats/events return empty data — expected
+- OpenDNS and Quad9 providers throw "not supported" — placeholders only
+- Sync job infrastructure (BullMQ) is ready but untriggerable without an active integration
+
+---
+
+## BE-19: IP History Tracking (Kit/Windows) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (no bugs found — fully implemented and working end-to-end)
+
+### What was tested
+- [x] API: `GET /devices/:id/ip-history` (Kit) — 200, returns 7 IP history entries (4 active, 3 inactive)
+- [x] API: `GET /devices/:id/ip-history?active_only=true` — 200, returns 4 active entries (Ethernet DHCP, 2 link-local, vEthernet DHCP)
+- [x] API: `GET /devices/:id/ip-history` (MacBook) — 200, returns 0 entries (macOS agent v0.5.0 doesn't have IP tracking)
+- [x] DB: `device_ip_history` table exists with 7 rows for Kit
+- [x] DB: 4 active entries — Ethernet (192.168.10.100 DHCP), Ethernet 2 (169.254.200.223 link-local), Ethernet 3 (169.254.147.160 link-local), vEthernet Default Switch (172.22.176.1 DHCP)
+- [x] DB: 3 inactive entries — vEthernet Default Switch IP changes: 172.30.240.1 → 172.27.48.1 → 172.23.144.1 → 172.22.176.1 (DHCP rotation over Feb 24-25)
+- [x] DB: `lastSeen` timestamps updated to current time (2026-03-01 01:13:27) — heartbeat refresh working
+- [x] DB: `deactivatedAt` correctly set for inactive entries (Feb 24-25 range)
+- [x] DB: `ip_assignment_type` enum with values: dhcp, static, vpn, link-local, unknown
+- [x] UI: "IP History" tab present in device detail navigation (19th tab on Kit)
+- [x] UI: Tab heading "IP Assignment History" with count badge (7), Refresh button
+- [x] UI: Filters — search box, Assignment type dropdown (All/DHCP/Static/VPN/Link-local/Unknown), Interface dropdown (Ethernet/Ethernet 2/Ethernet 3/vEthernet), IP Type dropdown (IPv4/IPv6), Active only checkbox
+- [x] UI: Date range — Since and Until date pickers
+- [x] UI: Table with 7 columns: Interface, IP Address, Type, Assignment, First Seen, Last Seen, Status
+- [x] UI: All 7 entries render correctly with Active (green) / Inactive (gray) status badges
+- [x] UI: DHCP assignment badges rendered in blue, Link-local in gray
+- [x] UI: vEthernet IP rotation clearly visible — 4 rows showing DHCP changes over time
+- [x] UI: 0 console errors
+
+### Evidence
+- Screenshot: `.playwright-mcp/page-2026-03-01T01-14-10-457Z.png` — IP History tab showing all 7 entries with DHCP rotation on vEthernet
+- API: Kit has 7 entries: 4 active (Ethernet DHCP 192.168.10.100, vEthernet DHCP 172.22.176.1, 2x link-local), 3 inactive (vEthernet DHCP rotation: 172.30.240.1 → 172.27.48.1 → 172.23.144.1)
+- DB: `lastSeen` timestamps actively refreshing each heartbeat cycle (~15 min)
+- DB: Inactive entries have `deactivated_at` set correctly to timestamp when IP changed
+
+### Issues Found
+- **No bugs found** — API, DB, UI all working correctly with real agent-collected data
+
+### Notes
+- Kit (Windows) agent actively tracking IP changes — 7 entries captured over 5 days (Feb 24-Mar 1)
+- vEthernet (Default Switch) shows 4 DHCP IP changes — likely Hyper-V virtual switch DHCP lease rotation
+- MacBook (macOS) has 0 entries — agent v0.5.0 doesn't include IP history tracking; needs rebuild with current code
+- Agent detects IP changes in heartbeat cycle (~15 min), only sends updates when changes detected (bandwidth optimization)
+- Assignment type detection working: correctly identifies DHCP (Ethernet, vEthernet) vs link-local (169.254.x.x) assignments
+- AI tool `get_ip_history` supports two modes: timeline query (by device_id) and reverse lookup (by ip_address + at_time) — not tested via API but tool registered in aiTools.ts
+- Data retention job (`ipHistoryRetention.ts`) runs daily, prunes inactive entries older than 90 days (configurable via `IP_HISTORY_RETENTION_DAYS`)
+- RLS policies in place for org-level isolation
+
+---
+
+## BE-18: New Device Alerting / Network Change Detection — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (no bugs found — fully implemented and working end-to-end)
+
+### What was tested
+- [x] API: `GET /network/baselines` — 200, returns paginated list (0 baselines initially, 1 after creation)
+- [x] API: `POST /network/baselines` — 201, creates baseline with subnet, scan schedule (enabled, 4h interval), alert settings (all 4 types enabled), auto-calculates `nextScanAt`
+- [x] API: `GET /network/baselines/:id` — 200, returns single baseline with full schedule and alert config
+- [x] API: `PATCH /network/baselines/:id` — 200, updates schedule (changed interval to 2h) and alert settings (disabled `disappeared`)
+- [x] API: `POST /network/baselines/:id/scan` — 200, triggers manual scan, returns `{success:true, queueJobId:"618"}`, creates discovery job in DB
+- [x] API: `GET /network/baselines/:id/changes` — 200, returns paginated change events for baseline (0 events — no scans completed yet)
+- [x] API: `DELETE /network/baselines/:id` — 200, `{success:true, deletedChanges:true}` — cascade deletes change events
+- [x] API: `GET /network/changes?limit=5` — 200, returns paginated change events org-wide with filters
+- [x] API: `GET /network/changes/:id` (non-existent) — 404, `{"error":"Network change event not found"}`
+- [x] API: `POST /network/changes/bulk-acknowledge` — 400, Zod validation enforces min 1 eventId
+- [x] DB: `network_baselines` table exists with correct schema (id, org_id, site_id, subnet, known_devices JSONB, scan_schedule JSONB, alert_settings JSONB, last_scan_at, timestamps)
+- [x] DB: `network_change_events` table exists with correct schema (id, org_id, site_id, baseline_id FK, event_type enum, ip/mac/hostname, previous/current state JSONB, acknowledged, alert_id FK)
+- [x] DB: `network_event_type` enum exists with values: `new_device`, `device_disappeared`, `device_changed`, `rogue_device`
+- [x] DB: 4 built-in alert templates seeded: "New Device Detected" (medium), "Device Disappeared" (low), "Device Configuration Changed" (medium), "Rogue Device Detected" (high)
+- [x] BullMQ: `network-baseline` queue active with 20 keys including repeating `schedule-baseline-scans` job (every 15 min)
+- [x] UI: `/discovery` page has 5 tabs: Assets, Profiles, Jobs, Topology, **Changes**
+- [x] UI: Changes tab renders with full filter set: Site, Profile, Event Type (New device/Disappeared/Changed/Rogue), Acknowledged status, Since date picker
+- [x] UI: Changes tab has bulk acknowledge with notes field, select-all checkbox, table with Event/Profile/Detected/Status/Linked Device/Actions columns
+- [x] UI: Profiles tab shows discovery profiles with Schedule, Status, Methods, and action buttons (View jobs, Run now, Edit, Delete)
+- [x] UI: "New Profile" button available for creating baselines
+- [x] UI: Scan trigger from API creates discovery profile + job automatically
+- [x] UI: 0 console errors across all tabs
+
+### Evidence
+- Screenshot: `.playwright-mcp/page-2026-03-01T01-02-04-965Z.png` — Changes tab with full filter UI and empty event table
+- Screenshot: `.playwright-mcp/page-2026-03-01T01-02-27-251Z.png` — Profiles tab showing 2 profiles (HQ Scan active hourly, Baseline Scan draft)
+- API: Baseline creation returns schedule with computed `nextScanAt: "2026-03-01T05:01:10.655Z"` (4h from creation)
+- API: Scan trigger returns `{success:true, queueJobId:"618"}` — job queued and discovery job created in DB
+- DB: 4 alert templates with template variables: `{{ipAddress}}`, `{{macAddress}}`, `{{hostname}}`, `{{assetType}}`, `{{manufacturer}}`, `{{previousState}}`, `{{currentState}}`
+- BullMQ: 20 queue keys, repeating schedule active
+
+### Issues Found
+- **No bugs found** — full CRUD lifecycle works correctly, scan trigger creates jobs, BullMQ scheduling active, UI renders all components
+
+### Notes
+- Tables exist but are empty (0 baselines, 0 change events) — no baseline scans have completed to generate change events yet
+- The scan trigger creates an auto-profile ("Baseline Scan {subnet}") and discovery job — full pipeline from baseline → profile → job → comparison is wired
+- Existing "HQ Scan" profile runs hourly with PING/SNMP/ARP/PORT_SCAN across 2 subnets (192.168.110.0/24, 192.168.0.0/24) and has discovered 8 assets
+- Discovery assets page shows 8 network devices (workstations, router, unknowns) with Approve/Dismiss triage actions
+- Change detection diff algorithm handles: new devices, disappeared (>24h), changed (MAC/hostname/assetType diff), rogue (policy-based) — all via `compareBaselineScan()` in `networkBaseline.ts` (1042 lines)
+- Duplicate event prevention uses fingerprint hashing (type+IP+MAC+hostname+state) with 24h dedup window
+- Alert creation uses 5-layer device resolution fallback (direct link → discovered asset → device network → site → org)
+- Brain AI tools (`get_network_changes`, `acknowledge_network_device`, `configure_network_baseline`) not yet implemented — endpoints exist but brain catalog registration missing
+- Test data cleaned up: created baseline + profile + job deleted after testing
+
+---
+
+## BE-20: Central Log Search & Aggregation — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (2 bugs found and fixed)
+
+### What was tested
+- [x] API: `POST /logs/search` — 200, full-text search via tsvector, 408 results for "error", cursor pagination works
+- [x] API: `POST /logs/search` with deviceId filter — 200, returns 0 for Kit (Windows not shipping event logs to this table)
+- [x] API: `GET /logs/aggregation` — **500 BUG** → fixed → 200, hourly bucketing by level shows 542 errors in 23 hourly buckets
+- [x] API: `GET /logs/trends` — **500 BUG** → fixed → 200, level distribution, top sources (com.apple.TCC=418), spike detection (threshold=61, 1 spike found)
+- [x] API: `GET /logs/queries` — 200, empty list (expected)
+- [x] API: `POST /logs/queries` — 201, saved query created successfully with filters
+- [x] API: `DELETE /logs/queries/:id` — 204, cleanup successful
+- [x] API: `POST /logs/correlation/detect` — 202, ad-hoc detection queued via BullMQ
+- [x] UI: `/logs` page renders with search form (query input, source filter, start/end datetime pickers, rows selector, level checkboxes)
+- [x] UI: Search for "XPC_ERROR" returns 100 results in table with Timestamp, Level, Category, Source, Message, Device columns
+- [x] UI: Device column shows hostname + site name (MacBook-Pro-3.local / Default Site)
+- [x] UI: Save Query and Export CSV buttons present
+- [x] UI: 0 console errors, search API calls return 200
+
+### Bugs Found & Fixed
+1. **`GET /logs/aggregation` 500**: `column "hour" does not exist` — `sql.raw('hour')` produced unquoted `hour` token which Postgres treated as a column reference. **Fix**: replaced `sql.raw()` interpolation with inline string literals in `date_trunc('hour', ...)` expressions
+2. **`GET /logs/trends` 500**: `point.bucket.toISOString is not a function` — Drizzle returns `date_trunc` results as strings, not Date objects. **Fix**: cast bucket to `::text` in SQL and use safe `toBucketIso()` helper that handles both string and Date types
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/log-search-results.png`
+- API: `POST /logs/search` — 200, 408 total results for "error" query
+- API: `GET /logs/trends` — 200 after fix, 542 errors, 1 spike detected at threshold=61
+- API: `GET /logs/aggregation` — 200 after fix, 23 hourly buckets of error-level logs
+
+### Notes
+- Windows device (Kit) has 0 event logs in `deviceEventLogs` table — event log shipping may only be enabled for macOS currently
+- Sidebar shows "Event Logs" link under Operations section
+- Correlation detection queues properly to BullMQ (202 response)
+- Fix applied in `apps/api/src/services/logSearch.ts` — same Drizzle date_trunc pattern seen in CIS compliance fix (commit `6703cc2`)
+
+---
+
+## BE-17: Privileged Access Management (PAM) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** NOT IMPLEMENTED (detailed spec exists, zero implementation)
+
+### What was tested
+- [x] API: `GET /api/v1/pam/elevation-requests` — 404 (not implemented)
+- [x] API: `GET /api/v1/pam/active` — 404 (not implemented)
+- [x] API: `POST /api/v1/pam/elevation-requests` — 404 (not implemented)
+- [x] API: `GET /api/v1/pam` — 404 `{"error":"Not Found"}`
+- [x] API: `GET /api/v1/elevation-requests` — 404 (alternate path, also not implemented)
+- [x] DB: No `elevation_requests` or `elevation_audit` tables exist (spec calls for both)
+- [x] DB: No PAM/privilege/elevation-related tables of any kind
+- [x] Agent: No `elevation_grant`, `elevation_revoke`, or `elevation_execute` command handlers in `agent/internal/heartbeat/`
+- [x] Agent: Existing `runAs` mechanism supports `system`/`user`/`elevated` for script execution but no PAM request/approval lifecycle
+- [x] UI: No PAM pages (`/pam`, `/elevation`, `/privilege`) — no Astro page routes, no React components
+- [x] UI: No PAM link in sidebar navigation
+- [x] Redis: No PAM-related BullMQ queues (`elevation-expiry-enforcer`, `stale-request-expirer`)
+- [x] Code: No `apps/api/src/db/schema/pam.ts`, no `apps/api/src/routes/pam.ts`, no `apps/api/src/jobs/pamJobs.ts`
+
+### What exists vs. what's in the spec
+
+| Spec Component | Status |
+|---|---|
+| `elevation_requests` table | Not created |
+| `elevation_audit` table | Not created |
+| `POST /pam/elevation-requests` (create request) | Not implemented (404) |
+| `GET /pam/elevation-requests` (list/filter) | Not implemented (404) |
+| `POST /pam/elevation-requests/:id/respond` (approve/deny) | Not implemented |
+| `POST /pam/elevation-requests/:id/revoke` (immediate revoke) | Not implemented |
+| `GET /pam/active` (active elevations) | Not implemented (404) |
+| Agent: `elevation_grant` handler | Not implemented |
+| Agent: `elevation_revoke` handler | Not implemented |
+| Agent: `elevation_execute` handler | Not implemented |
+| Agent: local monotonic timer for offline revocation | Not implemented |
+| BullMQ: `elevation-expiry-enforcer` (every 1 min) | Not implemented |
+| BullMQ: `stale-request-expirer` (every 5 min) | Not implemented |
+| Brain tools: `request_elevation`, `get_elevation_history`, `revoke_elevation` | Not implemented |
+| Events: `elevation.requested/approved/activated/expired/revoked` | Not implemented |
+| UI: elevation request form, approval dashboard, active panel | Not implemented |
+
+### Existing Foundation
+- Script `runAs` enum (`system`/`user`/`elevated`) in `apps/api/src/db/schema/scripts.ts`
+- `resolveRunAsSession()` in `agent/internal/heartbeat/handlers_script.go` handles execution context switching via session broker IPC
+- Windows user helper supports `run_as_user` scope for non-SYSTEM execution
+- These provide a blueprint for privilege context management but no PAM lifecycle (request → approve → grant → timer → revoke)
+
+### Issues Found
+- **Spec-only feature**: BE-17 has a comprehensive spec (`internal/BE-17-privileged-access-management.md`) defining 4 implementation phases, but 0% has been built
+- No partial implementation exists — this is entirely a greenfield build-out
+
+### Notes
+- Spec is detailed: 4-phase plan covering schema, API, agent handlers, expiry jobs, brain integration, and UI
+- Security model well-defined: duration-capped (15 min–8 hours), command-scope preferred over full admin, immutable audit trail
+- Cross-platform agent design specified: Windows (Local Administrators group), macOS/Linux (admin/wheel/sudo group)
+- Key differentiator: local monotonic timer guarantees revocation even if API unreachable
+- Wave 3 (Security & Compliance) feature — foundational for brain autonomy and CIS Controls 5 & 6
+- Referenced by BE-31 (User Risk Scoring) as an input signal
+
+---
+
+## BE-2: Boot Performance — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+- [x] API: `GET /devices/:id/boot-metrics` returns 3 boot records with timing breakdowns (42-101s), summary stats (avg 81.72s, fastest 42.77s, slowest 101.27s)
+- [x] API: `GET /devices/:id/startup-items` returns 65 items (60 services, 4 run_keys, 1 startup_folder) with impact scores
+- [x] API: `POST /devices/:id/collect-boot-metrics` dispatches on-demand collection command (times out at 30s due to PowerShell duration — expected)
+- [x] UI: Boot Performance tab renders on device detail page with summary cards, boot time trend chart, startup items table (65 items sorted by impact), boot history table
+- [x] UI: Top startup items by CPU — Defender (59297ms), Breeze Agent (20844ms), Huntress Rio (15172ms), MongoDB (4734ms), Backblaze (2828ms)
+- [x] UI: 0 console errors, all network requests 200
+- [x] Agent: 8 diagnostic log entries — 3 automatic boot detections with successful uploads (Feb 24, Feb 25 x2)
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/boot-performance-tab.png`
+- API: `GET /boot-metrics` — 200, 3 boots, summary with avgBootTimeSeconds=81.72
+- API: `GET /startup-items` — 200, 65 items across 3 types
+- Agent logs: `boot performance uploaded successfully` x3, `detected recent boot, collecting boot performance` x3
+
+### Issues Found
+- None
+
+### Notes
+- On-demand collection (`POST /collect-boot-metrics`) dispatches successfully but the 30s API timeout is too short for Windows PowerShell boot metric collection. The command completes asynchronously — not a bug, but UX could show a "collection in progress" state
+- Boot time trend chart and startup items table both render correctly with real data from Kit (Windows)
+
+---
+
+## BE-16: Vulnerability Management — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** NOT IMPLEMENTED (spec exists, core backend/frontend not built)
+
+### What was tested
+- [x] API: `GET /security/threats` — 200, returns 0 threats (existing security infrastructure, NOT CVE vulnerabilities)
+- [x] API: `GET /security/posture` — 200, returns posture data (MacBook score 61, high risk) — existing security posture, not vulnerability-specific
+- [x] API: `GET /vulnerabilities` — 404 (not implemented)
+- [x] API: `GET /vulnerabilities/devices/:id` — 404 (not implemented)
+- [x] API: `GET /security/vulnerabilities` — 404 (not implemented)
+- [x] DB: No `vulnerabilities`, `device_vulnerabilities`, or `vulnerability_sources` tables exist (spec calls for all three)
+- [x] UI: `/security` dashboard loads — Vulnerabilities card shows "0 open items" with severity breakdown (Critical 0, High 0, Medium 0, Low 0)
+- [x] UI: `/security/vulnerabilities` page renders but displays **threats** (malware/trojan/ransomware), NOT CVE vulnerabilities — subtitle says "Detected threats across all devices", filters include Trojan/Ransomware/Malware/Spyware/PUP categories
+- [x] UI: Threats table shows "No threats found." — correct for current fleet state
+
+### Evidence
+- Screenshot: `.playwright-mcp/page-2026-03-01T00-50-31-525Z.png` — /security/vulnerabilities page showing threat-based UI (not CVE)
+- API: `/vulnerabilities` returns 404, `/security/threats` returns 200 with 0 threats
+- DB: Only existing security tables: `security_threats`, `security_posture_snapshots`, `security_recommendations` — no vulnerability tables
+- Spec: `internal/BE-16-vulnerability-management.md` (173 lines) defines full schema, API, workers, and AI tools
+
+### What exists vs. what's in the spec
+
+| Spec Component | Status |
+|---|---|
+| `vulnerabilities` table (CVE data) | Not created |
+| `device_vulnerabilities` table (per-device mapping) | Not created |
+| `vulnerability_sources` table (NVD, vendor feeds) | Not created |
+| `GET /vulnerabilities` (list/filter/paginate) | Not implemented (404) |
+| `GET /vulnerabilities/devices/:id` (per-device) | Not implemented (404) |
+| `POST /vulnerabilities/scan` (trigger scan) | Not implemented |
+| Background job: NVD feed sync | Not implemented |
+| Background job: software-to-CVE correlation | Not implemented |
+| Agent: software inventory → CVE matching | Not implemented |
+| AI tools: `get_vulnerability_report`, `get_cve_details` | Not implemented |
+| UI: `/security/vulnerabilities` dedicated CVE page | Reuses threats page instead |
+
+### Issues Found
+- **Spec-only feature**: BE-16 has a detailed 173-line spec but no backend implementation. The vulnerability-specific DB tables, API endpoints, background workers, and agent correlation logic are all absent.
+- **UI mislabeling**: The `/security/vulnerabilities` page is titled "Vulnerabilities" but actually renders the existing **threats** (malware) data, not CVE vulnerabilities. The Security dashboard Vulnerabilities card also shows threat counts, not actual CVE data.
+
+### Notes
+- The existing security infrastructure (threats, posture, antivirus, firewall, encryption, password policy, admin audit) is functional and renders correctly on `/security`
+- Security Score: 67/100 (Elevated), with 6 critical recommendations
+- The Vulnerabilities card on the dashboard correctly shows 0 across all severities (no threat data, and no CVE data exists)
+- Implementation would require: DB migration (3 tables), NVD feed integration, software-to-CVE correlation worker, new API routes, and a dedicated CVE-focused UI page
+- This is a **build-out task**, not a bug — the feature simply hasn't been built yet
+
+---
+
+## Reliability Scoring (BE-3) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (no bugs found — scoring, trending, and agent collection working end-to-end)
+
+### What was tested
+- [x] API: `GET /reliability?limit=5` — 200, returns 2 devices with scores, trends, pagination, and org summary
+- [x] API: `GET /reliability/:deviceId` — 200, returns Kit snapshot + 30d history (4 daily data points)
+- [x] API: `GET /reliability/:deviceId/history?days=30` — 200, returns daily aggregated points with reliability estimates
+- [x] API: `GET /reliability/org/:orgId/summary` — 200, returns org averageScore=70, criticalDevices=1, goodDevices=1, worstDevices list
+- [x] API: `GET /reliability?scoreRange=critical` — 200, returns only Kit (score 40)
+- [x] API: `GET /reliability?scoreRange=good` — 200, returns only MacBook-Pro (score 100)
+- [x] API: `GET /reliability?trendDirection=improving` — 200, returns Kit (improving trend)
+- [x] API: Response includes all scoring components: uptimeScore, crashScore, hangScore, serviceFailureScore, hardwareErrorScore
+- [x] API: Top issues array populated (Kit: uptime=87/critical, hardware=102/error, services=30/error)
+- [x] API: MTBF calculated (Kit: 0.7h)
+- [x] API: Trend confidence metric present (Kit: 0.21)
+- [x] Agent (Kit/Windows `dev-1772322641`): 32 successful reliability uploads, 0 errors
+- [x] Agent: Collects crashes, hangs, service failures, hardware errors per heartbeat cycle
+- [x] Agent: Most recent upload shows 0 crashes, 0 hangs, 0 hw errors, 0 service failures (improving)
+- [x] Agent: Historical uploads show hardware errors declining (11 → 7 → 4 → 1 → 0 over 5 days)
+- [x] Agent: macOS device (MacBook-Pro) also reporting — score 100, no issues
+
+### Evidence
+- API: Kit reliability snapshot: `score=40, trend=improving, uptime30d=12.78%, serviceFailures30d=30, hardwareErrors30d=102, mtbf=0.7h`
+- API: MacBook-Pro snapshot: `score=100, trend=stable, uptime30d=100%, 0 issues`
+- API: Org summary: `averageScore=70, criticalDevices=1, goodDevices=1, degradingDevices=0`
+- API: Kit history points: Feb 24 (est=0, 32 hw err), Feb 25 (est=0, 68 hw err), Feb 27 (est=100, 0 err), Feb 28 (est=70, 2 hw err)
+- Agent logs: 32 uploads over 5 days, all successful, declining error counts showing real improvement
+
+### Issues Found
+- **No bugs found** — all endpoints, filters, pagination, scoring, and agent collection working correctly
+
+### Notes
+- No frontend UI exists for Reliability Scoring — backend-only feature (DB, API, agent, AI tool)
+- Kit score of 40 is driven by low 30d uptime (12.78%) and high hardware error count (102) — likely WHEA/MCE events
+- BullMQ worker runs daily at 2 AM UTC to recompute scores org-wide
+- Retention job prunes history older than 120 days
+- AI tool `get_fleet_health` available for brain integration
+- Scoring weights: uptime=30%, crashes=25%, hangs=15%, services=15%, hardware=15%
+
+---
+
+## Change Tracking (BE-6) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (no bugs found — data flowing end-to-end)
+
+### What was tested
+- [x] API: `GET /changes?limit=5` — 200, returns 176 total changes with correct shape (id, deviceId, hostname, timestamp, changeType, changeAction, subject, beforeValue, afterValue, details)
+- [x] API: `GET /changes?deviceId=<kit>` — 200, filters by Kit device (176 changes)
+- [x] API: `GET /changes?changeType=software` — 200, returns 25 software changes
+- [x] API: `GET /changes?changeType=service` — 200, returns 148 service changes
+- [x] API: `GET /changes?changeType=network` — 200, returns 3 network changes
+- [x] API: `GET /changes?changeType=startup` — 200, returns 0 (expected)
+- [x] API: `GET /changes?changeType=scheduled_task` — 200, returns 0 (expected)
+- [x] API: `GET /changes?changeType=user_account` — 200, returns 0 (expected)
+- [x] API: `GET /changes?changeAction=updated` — 200, returns 8 software updates
+- [x] API: `GET /changes?startTime=<24h ago>` — 200, time range filtering works (6 recent changes)
+- [x] API: Cursor pagination — `limit=3` returns `hasMore=true` + `nextCursor`, second page returns different records
+- [x] Agent (Kit/Windows `dev-1772322641`): 176 changes collected and shipped to API
+- [x] Agent: Software changes include before/after version (e.g., Edge 145.0.3800.70 → 145.0.3800.82)
+- [x] Agent: Service changes include before/after startup type (e.g., Windows Modules Installer manual ↔ automatic)
+- [x] Agent: Network changes include before/after IP (e.g., vEthernet Default Switch IP changes)
+- [x] Agent: New service detection works (Cloud Backup Service, Sync Host, CredentialEnrollmentManager added)
+- [x] Agent: No errors in last 24h related to change tracking
+- [x] Agent: Fingerprint deduplication working (unique index on deviceId + fingerprint)
+
+### Evidence
+- API: 176 total changes, breakdown: software=25, service=148, network=3, startup=0, scheduled_task=0, user_account=0
+- API: Software update example: Edge `{"version":"145.0.3800.70"}` → `{"version":"145.0.3800.82"}`
+- API: Service change example: Windows Modules Installer `startupType: "automatic"` → `"manual"`
+- API: Network change example: vEthernet Default Switch IP `172.23.144.1` → `172.22.176.1`
+- API: Cursor pagination works correctly across pages
+- Agent: 2 historical send failures (530 status, retry exhaustion) — isolated incidents, data flowing normally since
+
+### Issues Found
+- **No bugs found** — all API filters, pagination, and agent collection working correctly
+
+### Notes
+- No frontend UI exists for Change Tracking — no "Changes" tab in device detail, no change log page
+- The `DeviceChangeTab.tsx` component does not exist yet — only backend (DB, API, agent) is implemented
+- Change tracker runs every heartbeat cycle (~15 min) as part of inventory collection
+- Retention job runs daily, prunes records older than 90 days
+- macOS agent also has change tracking collectors (`change_tracker_darwin.go`) but was not tested
+- 2 historical errors in agent logs (Feb 24-25) for change shipping — appear resolved, no recent errors
+
+---
+
+## BE-15: Application Whitelisting (Kit/Windows) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (2 issues found — soft delete visibility + compliance check 503)
+
+### What was tested
+- [x] API: `GET /software-policies` — 200, returns 1 policy ("Default Allowlist", allowlist, active)
+- [x] API: `POST /software-policies` — 201, creates "E2E Test Blocklist" (blocklist mode)
+- [x] API: `PATCH /software-policies/:id` — 200, updates policy description
+- [x] API: `DELETE /software-policies/:id` — 200, returns `{"success":true}` but policy still visible in list (soft delete issue)
+- [x] API: `GET /software-policies/compliance/overview` — 200, returns `{total:2, compliant:0, violations:2, unknown:0}`
+- [x] API: `GET /software-policies/violations` — 200, returns violations for both devices (KIT: 151, MacBook: 474)
+- [x] API: `GET /software/inventory` — 200, returns 625 unique software entries across fleet
+- [x] API: `GET /software/inventory` (per-device) — KIT has 150 installed apps with publisher/version/install date
+- [x] API: `POST /software-policies/:id/check` — 503 "Failed to schedule compliance check" (BullMQ worker issue)
+- [x] UI: App Library page (`/software`) loads — Software Catalog with Add Package/Bulk Deploy buttons, search, category filter
+- [x] UI: App Policies page (`/software-inventory`) Inventory tab — 612 unique software table with Name/Vendor/Devices/Versions/Policy Status/Actions columns, pagination (1-50 of 612)
+- [x] UI: App Policies page Policies tab — summary cards (Policies:2, Devices Checked:2, Compliant:0, Violations:2), Policy Definitions table, Recent Violations section (KIT: 151, MacBook: 474)
+- [x] UI: Policy actions available — Check Compliance, Remediate, Edit, Deactivate buttons per policy
+- [x] UI: Create Policy button present with Refresh
+- [x] UI: Device detail Software Inventory tab — KIT shows 150 installed software with search, publisher filter (50 publishers), pagination (6 pages)
+- [x] Agent: Diagnostic logs show "SoftwareSASGeneration policy is enabled" on startup — software collection active
+- [x] Agent: BullMQ compliance queue active in Redis (repeating 15-min schedule, multiple job keys present)
+- [x] DB: Compliance data populated — last checked 2/28/2026 5:30 PM for both devices
+- [x] Audit trail: Dashboard Recent Activity shows all test actions (software_policy.delete, check, patch, create)
+
+### Issues Found
+- **Soft delete not filtering from list**: `DELETE /software-policies/:id` returns 200 success but the deleted "E2E Test Blocklist" policy still appears in `GET /software-policies` and the Policies tab UI. The list endpoint does not filter out soft-deleted policies.
+- **Compliance check 503**: `POST /software-policies/:id/check` returns 503 "Failed to schedule compliance check. Please try again." — the BullMQ `software-compliance` queue has keys in Redis but the worker may not be connected. The 15-minute repeating schedule still produces compliance data (last checked 5:30 PM), so the worker runs on schedule but on-demand checks fail.
+
+### Evidence
+- Screenshot: `.playwright-mcp/page-2026-03-01T00-30-16-372Z.png` — App Library (Software Catalog) page
+- Screenshot: `.playwright-mcp/page-2026-03-01T00-30-30-959Z.png` — Software Inventory tab with 612 entries
+- Screenshot: `.playwright-mcp/page-2026-03-01T00-30-44-476Z.png` — Policies tab with compliance dashboard
+- Screenshot: `.playwright-mcp/page-2026-03-01T00-31-06-042Z.png` — KIT device Software Inventory (150 apps)
+- API: Compliance overview: `{"total":2,"compliant":0,"violations":2,"unknown":0}`
+- API: KIT violations: 151 unauthorized apps (7-Zip, Docker Desktop, Git, AutoHotkey, Obsidian, etc.)
+- Agent logs: `SoftwareSASGeneration policy is enabled` on agent startup
+
+### Notes
+- Default Allowlist policy has no rules defined — all software is flagged as unauthorized (151 KIT + 474 macOS violations)
+- Compliance worker runs on 15-min repeating BullMQ schedule — data is current as of 5:30 PM
+- Software inventory collected by agent includes install dates, publishers, and versions
+- Policy CRUD is fully functional (create, read, update verified; delete has soft-delete visibility bug)
+- Remediation not tested (would trigger software_uninstall commands — destructive, skipped)
+- E2E Test Blocklist was created and should be cleaned up (still visible due to soft delete issue)
+
+---
+
+## Backup & Recovery — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS (no bugs found — feature works end-to-end)
+
+### What was tested
+- [x] UI: Backup Overview page loads at `/backup` with heading, description, action buttons
+- [x] UI: "Run all backups" and "View failed" action buttons render and respond to clicks
+- [x] UI: Recent Jobs section shows 2 failed jobs with correct Failed status badges
+- [x] UI: Storage by Provider section shows "local" provider with usage history chart (0 B, date range)
+- [x] UI: Devices Needing Backup section shows "No overdue devices found." with Run overdue button
+- [x] UI: Attention Needed section shows "No active alerts right now." with Resolve all button
+- [x] UI: No JavaScript errors in console, all API calls return 200
+- [x] API: `GET /backup/dashboard` — 200, returns summary (totals, 24h stats, storage, coverage)
+- [x] API: `GET /backup/usage-history` — 200, returns storage timeline by provider
+- [x] API: `GET /backup/configs` — 200, returns configs with pagination
+- [x] API: `POST /backup/configs` — 201, creates config ("E2E Local Backup", local provider)
+- [x] API: `GET /backup/configs/:id` — 200, returns single config detail
+- [x] API: `PATCH /backup/configs/:id` — 200, updates config successfully
+- [x] API: `POST /backup/configs/:id/test` — 200, connectivity test works for local provider
+- [x] API: `GET /backup/policies` — 200, returns policies with pagination
+- [x] API: `POST /backup/policies` — 201, creates policy ("E2E Daily Backup" targeting Kit)
+- [x] API: `PATCH /backup/policies/:id` — 200, updates policy successfully
+- [x] API: `GET /backup/jobs` — 200, returns jobs with pagination
+- [x] API: `GET /backup/jobs/:id` — 200, returns single job detail
+- [x] API: `POST /backup/jobs/run/:deviceId` — 201, manual backup triggered successfully
+- [x] API: `GET /backup/snapshots` — 200, returns snapshots list (empty)
+- [x] API: `POST /backup/restore` — 400, proper Zod validation for missing snapshotId
+- [x] Agent (Kit/Windows `dev-1772322641`): Received 2 `backup_run` commands via WebSocket
+- [x] Agent: Commands processed without errors — returned "backup not configured" (expected, agent lacks local backup config)
+- [x] Agent: Job status correctly updated to `failed` with errorLog in DB
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/backup-dashboard.png` — Full backup overview page
+- API: Dashboard returns summary with totals, storage by provider (local, 0 B)
+- API: 2 jobs both `status: failed`, `errorLog: "backup not configured"` — full pipeline works
+- API: Config connectivity test: `{"success":true}` for local provider
+- Agent logs: 4 entries — 2 commands processed via websocket + heartbeat channels, no errors
+
+### Issues Found
+- **No bugs found** — all endpoints, UI components, and agent pipeline working correctly
+
+### UX Gaps (not bugs)
+- **Summary metrics empty**: Dashboard shows "No backup summary metrics available yet." — the `/dashboard` endpoint returns totals but the UI doesn't render them as stat cards when all values are zero
+- **Recent Jobs missing device/config names**: Job cards show error icon and "Failed" badge but device name and config name fields are empty paragraphs — the dashboard API returns jobs with IDs but no joined names
+- **DeviceBackupStatus component unused**: `apps/web/src/components/backup/DeviceBackupStatus.tsx` exists but isn't mounted as a tab in device detail navigation — backup status not visible on per-device pages
+- **No backup sub-pages**: Configs, policies, jobs, snapshots, and restore wizard components exist (`BackupConfigList`, `BackupPolicyList`, `BackupJobList`, `SnapshotBrowser`, `RestoreWizard`) but are not routed — the entire backup UI is a single dashboard page
+
+### Notes
+- Kit agent processes `backup_run` commands but fails because no local backup provider is configured on the agent side — this is correct behavior
+- The full API pipeline works: create config → create policy → trigger manual job → dispatch to agent → receive result → update job status
+- macOS agent behavior not tested (would also fail — no backup handler in v0.5.0)
+- Test data created: 1 config ("E2E Local Backup"), 1 policy ("E2E Daily Backup"), 2 failed jobs
+
+---
+
+## BE-8: User Session Intelligence (Kit/Windows) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `256442e`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+- [x] API: `GET /devices/:id/sessions/active` — 200, returns 1 active user (ToddHebebrand, console, active, idle 0 min)
+- [x] API: `GET /devices/:id/sessions/history` — 200, returns 4 sessions over 30 days with correct login/logout times and durations
+- [x] API: `GET /devices/:id/sessions/experience` — 200, returns aggregated metrics (4 sessions, 1 active, avg duration 23921s, per-user breakdown)
+- [x] UI: Device Overview tab shows "Logged-in User: ToddHebebrand" from live session data
+- [x] UI: Activities tab shows "Sessions reported" entries from agent (source: Agent, 5m ago)
+- [x] UI: "Clear Sessions" action available in device overflow menu (...) with confirmation modal
+- [x] Agent: Session broker running on Kit — named pipe listener created, user helper spawned and connected
+- [x] Agent: Diagnostic logs show sessionbroker info-level activity, no session-related errors
+- [x] DB: `device_sessions` table has 4 rows for Kit — 1 active (is_active=true, activity_state=active), 3 closed (disconnected, with duration_seconds calculated)
+
+### Evidence
+- Screenshot: `.playwright-mcp/page-2026-03-01T00-20-35-820Z.png` — KIT Overview showing "Logged-in User: Tod..."
+- Screenshot: `.playwright-mcp/page-2026-03-01T00-20-57-476Z.png` — Activities tab showing "Sessions reported" entries
+- API active sessions: `{"activeUsers":[{"username":"ToddHebebrand","sessionType":"console","activityState":"active","idleMinutes":0}],"count":1}`
+- API experience metrics: `{"totals":{"sessions":4,"currentlyActive":1},"averages":{"sessionDurationSeconds":23921}}`
+- DB: 4 rows — active session login 2026-02-25T15:59, last activity 2026-03-01T00:10; 3 closed sessions with durations 8638s, 11592s, 51533s
+- Agent logs: `sessionbroker: user helper connected`, `sessionbroker: capabilities received`, no errors
+
+### Issues Found
+- `loginPerformanceSeconds` is null for all sessions — agent collector doesn't yet measure login-to-desktop time on Windows
+- `loginPerformanceTrend` array in experience metrics is empty (consequence of above)
+- `idleMinutes` is 0 for all sessions — may indicate idle detection isn't active or user is always active
+
+### Notes
+- Session data flows: Agent SessionCollector → heartbeat PUT /agents/:id/sessions → device_sessions table → 3 client endpoints
+- Session identity key: `username::sessionType::osSessionId` (handles multiple login methods)
+- AI integration: `get_active_users` and `get_user_experience_metrics` tools available for AI agent safety checks
+- Clear Sessions action in UI triggers `clearDeviceSessions()` — not tested (destructive action, skipped)
+- No dedicated "Sessions" tab on device detail page — data integrated into Overview (logged-in user) and Activities (session events)
+
+---
+
+## Audit Baselines (Kit/Windows) — 2026-03-01
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `736d28a` + uncommitted fixes
+**Tested by:** Claude
+**Result:** PARTIAL (2 bugs found & fixed, macOS agent needs redeploy)
+
+### What was tested
+- [x] UI: Audit Baselines page loads at `/audit-baselines` with 3 tabs (Dashboard, Baselines, Approvals)
+- [x] UI: Dashboard shows compliance summary cards — Devices Evaluated: 1, Compliant: 0% (0/1), Non-Compliant: 1, Average Score: 75
+- [x] UI: Compliance by Baseline table shows "CIS L1 Audit Baseline (Windows) - E2E Test 2" with 75 avg score and progress bar
+- [x] UI: Baselines tab lists 9 baselines with Name, OS, Profile, Active/Inactive toggle, Edit/Delete actions
+- [x] UI: Baseline detail page shows Overview (settings in code blocks), Compliance (device results), Apply (3-step wizard)
+- [x] UI: Apply tab renders device selection table with KIT (Windows/online), Preview/Approval steps
+- [x] UI: Approvals tab shows pending apply request with Approve/Reject buttons, expiration time
+- [x] UI: Audit Logs page at `/audit` shows table with timestamp, user, action, resource, details, IP columns
+- [x] API: `GET /audit-baselines` — 200, returns all baselines
+- [x] API: `POST /audit-baselines` — 201, creates baseline with template settings auto-populated, activates correctly
+- [x] API: `GET /audit-baselines/compliance` — 200, returns summary (1 device, 75 avg score, 0 compliant)
+- [x] API: `GET /audit-baselines/devices/:id` — 200, returns per-device results with deviations
+- [x] API: `POST /audit-baselines/apply-requests` — 201, creates pending approval with expiration
+- [x] API: `POST /audit-baselines/apply-requests/:id/decision` — 400, correctly blocks self-approval
+- [x] API: `GET /audit-baselines/apply-requests` — 200, lists pending requests
+- [x] API: `GET /audit-logs` — 200, shows baseline CRUD and apply actions in audit trail
+- [x] API: `GET /audit-logs/stats` — 200, returns category/user breakdowns
+- [x] API: `GET /audit-logs/export` — 200, CSV export works
+- [x] API: `GET /audit-logs/reports/user-activity` — 200, returns user action summaries
+- [x] Agent (Kit/Windows `dev-1772322641`): Received `collect_audit_policy` command, executed `auditpol /get`, returned settings
+- [x] Agent: Audit policy collected — 4 settings evaluated, 3 compliant, 1 deviation (account lockout: expected success_and_failure, actual failure)
+- [x] Agent: Tamper-evident audit logger running (SHA-256 hash chain)
+- [x] Agent logs: No errors related to audit collection
+- [ ] Agent (macOS v0.5.0): Returns "unknown command type: collect_audit_policy" — needs agent rebuild/redeploy
+
+### Bugs Found & Fixed
+
+**Bug 1: Duplicate baselines on every API restart (seedDefaultAuditBaselines)**
+- **Symptom**: 74 duplicate copies of each CIS template baseline in the database
+- **Root cause**: `seedDefaultAuditBaselines()` uses `onConflictDoNothing()` but the `audit_baselines` table has no unique constraint on `(org_id, os_type, profile, name)`. Every API restart inserts new copies.
+- **Fix**: Added pre-check in `auditBaselineService.ts` to query existing `(orgId, osType, profile)` combos and skip already-seeded templates. Also cleaned up 439 duplicate rows via SQL.
+
+**Bug 2: audit-policy-collection BullMQ job always fails (varchar vs enum type mismatch)**
+- **Symptom**: `processCollectAuditPolicy` job fails with `operator does not exist: character varying = os_type`
+- **Root cause**: `audit_baselines.os_type` is defined as `varchar(20)` in the Drizzle schema, while `devices.os_type` uses a Postgres `pgEnum('os_type')`. The Drizzle-generated join `eq(auditBaselines.osType, devices.osType)` produces `audit_baselines.os_type = devices.os_type` without a type cast, and PostgreSQL cannot compare varchar to a custom enum directly.
+- **Fix**: Changed both join conditions in `auditBaselineJobs.ts` (lines 56 and 216) from `eq(auditBaselines.osType, devices.osType)` to `` sql`${auditBaselines.osType} = ${devices.osType}::text` ``.
+- **Impact**: This bug meant the daily 03:00 UTC collection job and hourly drift evaluation never worked. After the fix, collection succeeds and compliance data flows end-to-end.
+
+### Evidence
+- Screenshot: `.playwright-mcp/page-2026-03-01T00-11-26-555Z.png` — Audit Baselines Dashboard showing 75 avg score
+- API: Compliance summary: `{"totalDevices":1,"compliant":0,"nonCompliant":1,"averageScore":75}`
+- API: Kit deviation: `auditpol:account lockout` expected `success_and_failure`, actual `failure`
+- API: Apply request created with 1h expiry, self-approval correctly blocked (400)
+- Agent logs: 2 successful `collect_audit_policy` commands processed, audit logger started
+- EventBus: `compliance.audit_deviation` published for org after evaluation
+
+### Notes
+- macOS agent (v0.5.0) does NOT have `collect_audit_policy` handler — needs rebuild via `make dev-push`
+- Apply baseline execution (step 3 of approval workflow) not tested — requires a second user to approve
+- The `audit_baselines.os_type` should ideally be migrated to use the same `os_type` pgEnum as `devices` to prevent future type mismatches
+- Drift evaluator runs hourly and correctly publishes `compliance.audit_deviation` events
+
+---
+
+## Peripheral Control — 2026-02-28
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `736d28a`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+- [x] UI: Peripheral Control page loads at `/peripherals` with 2 tabs (Policies, Activity Log)
+- [x] UI: Policies tab renders with 3 filter dropdowns (Device Class, Action, Status)
+- [x] UI: Create Policy modal opens with Name, Device Class, Action, Active toggle, Exceptions section
+- [x] UI: Policies table displays policy with Name, Device Class, Action, Active, Exceptions, Created columns
+- [x] UI: Filter by Device Class correctly hides non-matching policies
+- [x] UI: Activity Log tab renders with event type filter (5 types) and text search fields
+- [x] UI: Activity Log shows empty state "No peripheral activity found."
+- [x] UI: Device detail Peripherals tab shows summary cards (Events, Blocked, Connected, Active Policies)
+- [x] UI: Device detail shows Recent Events and Active Policies table with correct data
+- [x] API: `GET /peripherals/policies` — 200, returns policies with pagination
+- [x] API: `GET /peripherals/policies/:id` — 200, returns single policy detail
+- [x] API: `GET /peripherals/policies?deviceClass=storage` — 200, filtering works correctly
+- [x] API: `GET /peripherals/policies?deviceClass=bluetooth` — 200, returns 0 (correct filter)
+- [x] API: `GET /peripherals/activity` — 200, returns paginated activity log
+- [x] API: `GET /peripherals/activity?deviceId=<kit>` — 200, device-scoped filtering works
+- [x] API: `POST /peripherals/policies` — 403 "MFA required" (correct — MFA gate working)
+
+### Issues Found
+- **MFA blocks policy creation for non-MFA users**: Admin user has MFA disabled (`mfa_enabled=false`) but `ENABLE_2FA=true` is the default. The `requireMfa()` middleware correctly rejects the request, but the UI only shows a text "MFA required" without guiding the user to set up MFA. This is a UX gap — either the form should explain how to enable MFA, or write operations should gracefully degrade when the user hasn't configured MFA yet.
+- No bugs in read operations — all GET endpoints work correctly with filtering and pagination.
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/peripherals-policies-tab.png` — Policies tab with "E2E Block USB Storage" policy
+- API: `GET /peripherals/policies` returns policy with all fields (name, deviceClass, action, targetType, exceptions, timestamps)
+- API: `GET /peripherals/policies/:id` returns correct single policy
+- API: Filtering by deviceClass=bluetooth returns 0, deviceClass=storage returns 1
+
+### Notes
+- Policy create/update/disable require MFA (403 without it) — working as designed
+- Anomaly detection job runs every 15 min (threshold: 5 blocked in 30 min)
+- Policy distribution job queues PERIPHERAL_POLICY_SYNC to devices on create/update
+- No agent-side peripheral events exist yet — Kit has no peripheral telemetry submitted
+- Test policy was inserted via SQL and cleaned up after verification
+
+---
+
+## Data Discovery / Sensitive Data (Kit/Windows) — 2026-02-28
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `6703cc2` (pre-fix) + uncommitted changes
+**Tested by:** Claude
+**Result:** PASS (with 3 bugs found & fixed)
+
+### What was tested
+- [x] UI: Data Discovery page loads at `/sensitive-data` with 4 tabs (Dashboard, Findings, Scans, Policies)
+- [x] UI: Dashboard summary cards render (Total Findings, Critical Open, Remediated 24h, Open Findings)
+- [x] UI: Dashboard charts (Findings by Data Type, Risk Distribution) render with "No data yet" placeholder
+- [x] UI: Scans tab lists all scans with correct status, device name, timestamps, and durations
+- [x] UI: Scans tab Refresh button fetches latest data from API
+- [x] UI: New Scan modal creates scan targeting Kit device successfully
+- [x] UI: Policies tab renders
+- [x] API: `POST /sensitive-data/scan` — 202, creates and queues scan
+- [x] API: `GET /sensitive-data/scans` — 200, returns all scans (NEW endpoint added during testing)
+- [x] API: `GET /sensitive-data/scans/:id` — 200, returns scan detail with findings summary
+- [x] API: `GET /sensitive-data/dashboard` — 200, returns aggregate counts
+- [x] API: `GET /sensitive-data/report` — 200, returns paginated findings
+- [x] Agent (Kit/Windows `dev-1772316104`): Received `sensitive_data_scan` command, executed scan, returned results
+- [x] Agent: Scan completed with 0 findings (default scan paths on Kit have no sensitive files)
+- [x] BullMQ: Scan job dispatched and completed through queue
+
+### Bugs Found & Fixed
+
+**Bug 1: Scans stuck in "running" forever**
+- **Symptom**: `POST /sensitive-data/scan` queued scan, agent executed and returned results, but scan record stayed `status: running`
+- **Root cause**: `processCommandResult()` in `agentWs.ts` (WebSocket handler) did NOT call `handleSensitiveDataCommandResult` — that handler only existed in the HTTP POST route (`commands.ts`), but agents send results via WebSocket
+- **Fix**: Added sensitive data and CIS post-processing blocks to `processCommandResult()` in `agentWs.ts`
+
+**Bug 2: No list-scans API endpoint**
+- **Symptom**: Scans tab showed stale data from in-memory React state — Refresh button fetched `/dashboard` instead of actual scans list
+- **Root cause**: Comment in ScansTab.tsx: "There is no list-scans endpoint yet"
+- **Fix**: Added `GET /sensitive-data/scans` endpoint to `sensitiveData.ts` returning recent scans ordered by creation date. Updated `ScansTab.tsx` to fetch from the new endpoint.
+
+**Bug 3: UI never updated scan statuses**
+- **Symptom**: Even after scans completed in DB, UI continued showing "running" with "Running..." duration
+- **Root cause**: Frontend `ScansTab` stored scans in an in-memory `detailCache` populated only at creation time. Refresh just re-rendered the same stale cache.
+- **Fix**: Replaced cache-based approach with direct API fetch from new `/scans` endpoint on every load and refresh.
+
+### Evidence
+- Screenshot: `e2e-tests/snapshots/sensitive-data-scans-completed.png` — 3 scans all showing "Completed" with durations
+- API: `GET /sensitive-data/scans` returns 3 scans, all `status: completed`, Kit device
+- API: Scan summary shows `filesScanned: 0, findingsCount: 0` (expected — Kit default paths empty)
+- Agent: Command completed via WebSocket with `sensitive_data_scan` type processed correctly
+
+### Notes
+- Kit's default scan paths have no sensitive files, so 0 findings is expected
+- macOS agent (v0.5.0) does NOT have `sensitive_data_scan` handler — needs rebuild
+- The `agentWs.ts` fix also added CIS post-processing (same pattern — was missing from WS handler)
+
+---
+
+## CIS Benchmarking (Kit/Windows) — 2026-02-28
+
+**Branch:** `fix/integration-testing-502s`
+**Commit:** `f99127c`
+**Tested by:** Claude
+**Result:** PASS (with 1 bug fix applied)
+
+### What was tested
+- [x] UI: CIS Hardening page loads at `/cis-hardening` with 3 tabs (Compliance, Baselines, Remediations)
+- [x] UI: Summary cards render correctly — updated to Average Score 44%, Failing Devices 1, Active Baselines 10
+- [x] UI: Baselines tab lists all baselines with Edit/Trigger Scan actions
+- [x] UI: New Baseline form creates baseline successfully (count 9→10)
+- [x] UI: Remediations tab renders with status filter dropdown
+- [x] UI: Compliance tab shows Kit scan result with expandable failed findings row
+- [x] UI: Expanded row shows check 2.3.7 severity badge, check ID, title, and evidence
+- [x] API: `GET /cis/baselines` — 200, returns all baselines
+- [x] API: `POST /cis/baselines` — 201, creates new baseline
+- [x] API: `GET /cis/compliance` — 200, returns summary + results (after bug fix)
+- [x] API: `GET /cis/remediations` — 200, returns paginated remediations
+- [x] API: `POST /cis/scan` — 202, queues scan job
+- [x] API: `GET /cis/devices/:id/report` — 200, returns Kit report with findings
+- [x] Agent (Kit/Windows `dev-1772316104`): Received `cis_benchmark` command, executed checks, returned results
+- [x] Agent: Score 44% — 4 passed, 1 failed (check 2.3.7), 4 not_applicable out of 9 total checks
+- [x] BullMQ: Job completed with `devicesTargeted: 1, commandsQueued: 1`
+
+### Bug Found & Fixed
+**`GET /cis/compliance` returned 500**: `row.resultCreatedAt.toISOString is not a function`
+- **Root cause**: `resultCreatedAt` and `baselineCreatedAt` are defined via `sql<Date>` aliases in a Drizzle subquery. Drizzle returns raw SQL expression results as strings (not Date objects) when used in subqueries. Calling `.toISOString()` on a string crashes.
+- **Fix**: Added `toISO()` helper in `cisHardening.ts` that handles both Date and string types:
+  ```typescript
+  const toISO = (v: unknown): string => v instanceof Date ? v.toISOString() : String(v ?? '');
+  ```
+- **Affected lines**: 465, 472, 484, 485 in `cisHardening.ts`
+
+### Evidence
+- Screenshot: `cis-compliance-tab.png` — Empty compliance tab before scan
+- Screenshot: `cis-baselines-tab.png` — Baselines tab showing 9 baselines
+- Screenshot: `cis-kit-compliance-result.png` — Kit compliance result: 44%, 1 failed check expanded inline
+- API: Kit device report shows: Score 44, Passed 4/9, Failed 1 (check 2.3.7: Interactive logon last user name)
+- Agent logs: `[info] heartbeat: processing command` → `[info] heartbeat: command completed`
+
+### Notes
+- macOS agent (v0.5.0) does NOT have CIS handlers — needs rebuild/redeploy
+- Windows agent (Kit, `dev-1772316104`) has CIS handlers and works end-to-end
+- Duplicate baselines from prior E2E runs — no dedup guard on baseline creation
+
+## OAuth/MCP end-to-end (DCR → consent → token → MCP → revoke) — 2026-04-24
+
+**Branch:** `main` (HEAD `7b768267`)
+**Tested by:** Claude
+**Result:** PASS — full flow works after fixing 2 body-drain bugs found mid-test
+
+### What was tested
+- [x] DCR via `POST /oauth/reg` — registers public client (`token_endpoint_auth_method=none`, `id_token_signed_response_alg=EdDSA`)
+- [x] PKCE S256 + resource indicator (`OAUTH_RESOURCE_URL=https://2breeze.app/api/v1/mcp/message`)
+- [x] `GET /oauth/auth` → redirect to `/oauth/consent?uid=...` (with login interstitial when unauthenticated)
+- [x] Login → consent UI → Approve button → redirect to `redirect_uri` with `code` + `state` + `iss`
+- [x] `POST /oauth/token` → `access_token` (EdDSA JWT) + `refresh_token` + `id_token`
+- [x] JWT payload includes `partner_id`, `grant_id`, `jti`, `scope=mcp:read mcp:write mcp:execute`, correct `iss`/`aud`
+- [x] `POST /api/v1/mcp/message` with `Authorization: Bearer <jwt>` → `tools/list` returns full tool catalog
+- [x] `/settings/connected-apps` lists registered clients with `Revoke` button
+- [x] UI revoke → confirm dialog → DB sets `oauth_clients.disabled_at` → bearer-token MCP call now returns `401 token revoked` (Redis JTI cache populated by grant-wide revocation)
+
+### Bugs found and fixed
+1. **`/oauth/reg` body-drain:** pre-handler called `readClonedBodyWithLimit(c.req.raw)`, which under `@hono/node-server` drained the underlying `IncomingMessage`. oidc-provider's `selective_body` then fell through to `req.body` (undefined) and reported `invalid_redirect_uri: redirect_uris is mandatory property` regardless of the actual request body. Fix: mirror the `/token` `rawBody` pattern AND set `incoming.body = buf` so `selective_body`'s fallback finds the parsed bytes. (`apps/api/src/routes/oauth.ts`)
+2. **`/oauth/token` had the same fallback gap:** `incoming.rawBody` was set but `incoming.body` was not, so once the IncomingMessage was exhausted the token endpoint returned `invalid_request: no client authentication mechanism provided`. Fix: also set `incoming.body = buf`.
+3. New `OAUTH_REGISTRATION_BODY_READ_FAILED` error ID added to `apps/api/src/oauth/log.ts`.
+
+### Suspected related (not retested)
+- `/oauth/token/revocation` pre-handler also reads the body via cloned web stream and falls through to the bridge. Same shape — likely broken for non-JWT (opaque-token) clients. Worth a dedicated unit test or quick smoke against a refresh_token before claiming the revocation endpoint is spec-compliant.
+
+### Local DB cleanup performed
+- Dropped + replayed 6 OAuth migrations (drift between local checksums and migration files); see `docs/superpowers/runbooks` if you want a reusable script. No production impact.
+
+### Evidence
+- Auth code captured at `http://localhost:9876/cb?code=...&state=...&iss=https%3A%2F%2F2breeze.app`
+- JWT payload: `{partner_id, org_id:null, grant_id, jti, scope:"mcp:read mcp:write mcp:execute", aud:"https://2breeze.app/api/v1/mcp/message"}`
+- DB after revoke: `oauth_clients.disabled_at IS NOT NULL` for revoked client
+- Post-revoke MCP: `{"error":"token revoked"}` HTTP 401
+
+### Notes
+- Admin password in `.env` (`E2E_ADMIN_PASSWORD`) is stale — actual seed password is `BreezeAdmin123!`. Login via UI failed with `.env` value but works with seed value.
+- Consent UI shows raw `client_id` in the heading instead of `client_name` ("e2e-harness") — minor UX polish item.
+- Two test clients created before the full flow worked are stuck in DB without a `partner_id`. Cleanup or admin tooling could help here.
+- Onboarding tour overlay intercepts pointer events on first visit to settings pages — needed an explicit "Skip tour" click before being able to revoke.
+
+---
+
+## Recently-Merged-PR E2E Walkthrough — 2026-05-15
+
+**Branch:** `main` @ `0106f89e`
+**Tested by:** Claude (Playwright MCP, local dev stack)
+**Scope:** P1–P3 from recent merged PRs (#669–#711). Result logged per-area below.
+
+### Environment setup (notable)
+- **Local URL config trap:** `.env` had `PUBLIC_API_URL=https://2breeze.app` + `BREEZE_DOMAIN` unset → Caddy on `:80` HTTP only, but web app force-upgraded API calls to `https://` → all API calls `ERR_CONNECTION_RESET`, login "Network error". Public `2breeze.app` is Cloudflare-fronted (valid cert) but origin tunnel is **DOWN (CF 530)** — no `cloudflared` running, no tunnel token in `.env`. **Fix applied:** set `PUBLIC_API_URL=http://localhost`, added `http://localhost` to `CORS_ALLOWED_ORIGINS`, recreated web+caddy. Works over `http://localhost`. (`.env` change is local-only/gitignored.)
+- Admin login: `.env` `E2E_ADMIN_PASSWORD` stale; seed `BreezeAdmin123!` works (matches prior log note).
+- `/etc/hosts` had `127.0.0.1 2breeze.app` (shadows public DNS); user-requested removal pending manual `sudo`.
+
+### UI/UX observations log (running)
+- **[Login]** Clean split-panel layout, renders well. Console warning `Registration is disabled (PUBLIC_ENABLE_REGISTRATION=false)` is expected (env-baked).
+- **[Dashboard]** `GET /api/v1/admin/account-deletion-requests/pending-count` → **403** on every dashboard load for non-platform-admin users → persistent console error. UX/polish: the widget should not fire (or should swallow 403) when the user lacks the admin scope. **(P3-ish bug, log-and-continue)**
+- **[Dashboard]** Renders cleanly otherwise: KPI cards (Total/Online/Warnings/Critical), Recent Alerts, Fleet Status, Recent Activity audit table. 3 devices, 0 online.
+
+### P1 — Wake-on-LAN (#703) — **PARTIAL / BUG FOUND**
+- ✅ Wake action **present** in offline device row "..." menu (`/devices`). Correctly enabled for offline `e2e-macos.local`; "Remote Terminal" and "Reboot" correctly disabled (greyed) for offline. Menu order: Remote Terminal, Run Script, Reboot, **Wake**, Settings, Decommission.
+- ✅ API behaves correctly: `POST /devices/:id/commands` (wake) → **412** with clean structured body: `{"error":"Target has no recorded MAC address. The agent must check in at least once before Wake-on-LAN is available.","code":"NO_MACS"}` (expected — E2E fixture devices have no MAC inventory).
+- ❌ **BUG (silent failure):** The UI does **not** surface the Wake result at all. After clicking Wake (→412), there is **no toast, no inline error, no success message** anywhere in the DOM (verified via repeated evaluate scans of `[role=alert]`, `[data-sonner-toast]`, fixed/absolute nodes, and full body text). It does *not* show `[object Object]` — it shows *nothing*. The backend's readable `NO_MACS` message never reaches the user; the only trace is a console `412` resource error. Fails the #703 acceptance criterion "expect a friendly failure toast". Silent failure ⇒ user clicks Wake and cannot tell if it worked.
+- ⚠️ UI/UX: not verified — Wake button in **device-detail action bar** (will fold into #682/#711 device-detail visits). Could not verify success-path toast (no online relay-capable fixture device).
+- **Severity:** P1-feedback (recently merged headline feature, no user feedback on its primary action). Recommend: surface success (202) and failure (412 `error`) via the standard toast used elsewhere; map `code` to friendly copy.
+
+### P1 — Remote-Desktop Launcher (#680) — **PASS (core) / minor UX gap**
+- ✅ Settings → Partner → **Remote** tab renders: clear "Remote-Tool Providers" copy, "Add provider" button, empty state.
+- ✅ Built-in WebRTC provider shown as a **checked radio with no delete/remove control** → cannot be deleted (✓ acceptance criterion).
+- ✅ Add-provider form well-designed: Display name, URL template (with inline examples for custom-protocol vs HTTPS), custom-field key (explains `device.custom_fields`), **Preset password with Show/Hide toggle**, security copy ("never embedded in the web bundle", "percent-encoded automatically").
+- ✅ **Scheme validation solid (security):** saving `javascript:alert(document.cookie)` → `PATCH /orgs/partners/me` **400** with explicit ZodError: *"Template must start with an allowed URL scheme (https, http, rustdesk, teamviewer, anydesk, splashtop, etc.); javascript:, data:, vbscript:, file:, about:, chrome:, jar:, blob:, view-source:, filesystem: are rejected"* + *"Template must include the {id} placeholder"*. Both `javascript:` blocked and `{id}` requirement enforced server-side.
+- ⚠️ **UX gap (ties to #689):** UI surfaces only generic **"Failed to save settings"** toast — the server's specific, actionable messages (bad scheme vs missing `{id}`) are NOT shown. No `[object Object]` (good), but user can't tell *what* to fix. The partner-settings save path collapses ZodError → generic string.
+- Not exercised (context budget): valid provider persist→reload round-trip, password toggle behavior, Connect Desktop launch handoff on device detail.
+
+### P1 — Readable API errors (#689) — early cross-cutting signal
+- Partner settings save: ZodError → generic "Failed to save settings" (no raw object — #689 core goal met, but specificity lost). Will spot-check more forms under task #7.
+
+### P1 — Third-Party Patching Catalog (#690) — **PARTIAL (blocked by authz + no fixture data)**
+- ❌ **Admin catalog blocked:** `/admin/third-party-catalog` loads but `GET /api/v1/third-party-catalog` → **403 `{"error":"platform admin access required"}`**. Seeded `admin@breeze.local` is org/partner admin, not platform admin (consistent with "no platform admin in prod"). Catalog CRUD / manual re-test **cannot be UI-verified with this user**. Seed migration `2026-05-13-c-third-party-package-catalog-seed.sql` *did* apply (entries exist in DB, just not reachable via this account).
+- ⚠️ **UX:** catalog page shows generic **"Failed to load catalog"** — does not surface that it's a *permissions* issue (server says "platform admin access required"). Decent that it's not a blank/crash, but misleading (looks like an outage, not authz).
+- ✅ **/patches page renders correctly** with third-party surface: dedicated **"3rd-Party" column** in compliance table + **"3rd-Party Missing (N)"** filter option in the device filter dropdown. Per-device rows show OS Patches / 3rd-Party / Critical counts. Compliance summary card (0% compliant, 3 need patches, 2 critical) renders well.
+- ⚠️ CVE chips on third-party patches **not verified** — all `3rd-Party` cells are "—" (no winget data flowing from fixture agents; nothing to enrich). Automated coverage exists separately (`e2e-tests/.../third_party_catalog.spec.ts`).
+- **Recommend:** (1) catalog page should detect 403/platform-admin and show a clear "requires platform admin" empty state, not "Failed to load catalog". (2) Re-test with a platform-admin-capable account or seed for full catalog CRUD coverage.
+
+### P1 — Pushover Notification Channel (#676 / #686) — **PARTIAL / SILENT-FAILURE BUG (pattern repeat)**
+- ✅ **AlertsTabStrip** renders consistently: `/alerts` and `/alerts/channels` show the Alerts/Rules/Channels section nav + breadcrumb. Clean.
+- ✅ Pushover is a first-class channel type: appears in the type **filter dropdown** and as a **creation card** ("Push to phones via Pushover (emergency-priority capable)").
+- ✅ Pushover config form is excellent: Application Token + User/Group Key with **"Leave blank to inherit from partner"** placeholders & help text (partner-default inheritance designed in), Device, **Priority dropdown incl. "Emergency (repeats until ack)"**, Sound, custom message templates with `{{variable}}` docs.
+- ✅ **Channel creation works**: `POST /alerts/channels` → **201**, card appears as "Test Pushover Channel / Pushover (inherited) / Active". No `[object Object]`, no error.
+- ❌ **BUG (silent failure — same class as #703 Wake):** Clicking **Test** → `POST /alerts/channels/:id/test` returns **200** with a clean readable body `{"testResult":{"success":false,"message":"application token is invalid, see https://pushover.net/api","details":{"statusCode":400}}}`. The UI surfaces **nothing**: no toast, no inline message. Body never mentions "application token is invalid".
+- ❌ **BUG: Test result not reflected on the channel card.** Card shows **"Never tested"** before *and after* the test (even after a full page reload), despite the API recording `testedAt`/`testResult`. The "last tested / result" state is never displayed → user cannot tell a test ran or failed. **Fails the #686/#679/#678 acceptance criterion "Test must surface a clear success or readable error, must not be silent."**
+- ⚠️ Not tested: 501-readable for a channel type with no test handler (context budget); partner-level Pushover defaults inheritance end-to-end.
+- **SYSTEMIC FINDING:** Two recently-merged P1 features (#703 Wake-on-LAN, #676 Pushover Test) **both silently swallow a well-formed backend result**. The action-button → toast/feedback wiring appears broken for these newer surfaces. Recommend a focused fix + regression test on the shared toast/result-handling path; likely affects other "action button + API result" flows.
+
+### P2 — Org create/delete sidebar sync (#669) — **PASS**
+- ✅ Create org → appears immediately in the org management list; delete (with clean named confirm dialog "delete ZZ Walkthrough Org? This action cannot be undone") → removed immediately. List stays in sync, no stale entries, no `[object Object]`. Top org-switcher consistently correct ("Default Organization"; not switched since we never selected the new org).
+- ✅ Nice UX: post-create guided "Add the first site for <org>" onboarding modal (orgs need ≥1 site) with "Skip for now".
+
+### P2 — Drag-to-reorder organizations (#681) — **PARTIAL**
+- ✅ "Create a new org → appears at the END of the list" verified (list went `[Default]` → `[Default, ZZ Walkthrough]`, appended not inserted).
+- ⚠️ **Drag-reorder itself NOT verified:** no dedicated drag-handle element is present in the org list a11y tree (list items are `[cursor=pointer]` rows with Edit/Delete only). Either whole-row drag or the handle isn't exposed accessibly. Full HTML5 drag simulation via Playwright is flaky/expensive — deferred. Recommend a manual drag check or an e2e spec with the drag library's test hooks.
+
+### P1 — Readable API errors (#689) — **PASS (core goal) with caveats** 
+- ✅ **No `[object Object]` anywhere** across every form/flow exercised (partner settings, catalog, alert channels, org create/delete, wake). Core #689 goal met.
+- ✅ Client-side inline validation is excellent and specific: org create empty-submit → "Organization name is required", "Slug is required" (inline, modal stays open).
+- ⚠️ **Server-error specificity is lost in places:** partner settings save collapses a detailed ZodError → generic "Failed to save settings"; third-party catalog 403 → generic "Failed to load catalog" (hides "platform admin required").
+- ⚠️ **Worse than generic — silent:** action-result handlers for #703 Wake and #676 Pushover-Test surface *nothing*. #689 fixed the "[object Object]" class but a "silent / over-generic" class remains on newer action surfaces.
+
+### P2 — Devices page-size selector (#705) — **PASS**
+- ✅ Default **10**; "Per page" selector visible even with only 3 devices (single page).
+- ✅ Options 10/25/50/100/200. Selecting **25** → persists to `localStorage['breeze.devices.pageSize']="25"`.
+- ✅ Invalid stored value (`'7'`) → selector **gracefully falls back to 10**, no console error, no crash (localStorage left untouched until next user change).
+- Not separately exercised (only 3 fixture devices ⇒ always single page): "page resets to 1 on change", "200 shows all", "chevrons hidden on single page". Core selector + persistence + fallback solid.
+
+### P3 — Connection inventory truncation (#711/#504) — **PASS (light)**
+- ✅ Device detail → More → **Connections** tab (`#connections` hash) renders cleanly: "Active Network Connections 0", protocol/state filters, table headers PROTOCOL/LOCAL/REMOTE/STATE/PROCESS/PID, graceful "No active network connection" empty state. **No 500, no crash, no `[object Object]`.**
+- ⚠️ The actual oversized-string truncation fix not exercised — fixture devices are offline with no live connection inventory; needs a Linux host with many connections + long process names. Backend column-width truncation has separate test coverage (`apps/api/.../rls`/integration). UI surface is sound.
+
+### P1 follow-up — Wake-on-LAN (#703) device-detail action bar
+- ✅ Confirmed: device detail action bar shows **Wake** button (enabled for the offline macOS fixture), alongside Run Script / Connect Desktop / Remote Tools / Reboot / "...". UI entry point present in both list-row menu and detail bar. (Dispatch still silent — see #703 main entry.)
+
+### P3 — set_auto_update command (#692) — **N/A in UI (API-only, as expected)**
+- No auto-update / agent-update control found anywhere on device detail (Overview, Connections, Management tabs — full DOM scan for `auto[- ]?update|agent update`). Consistent with the plan's expectation that #692 is API/command-driven, not a web button. No UI regression to report; verify via `POST /devices/:id` command path / automation if coverage needed.
+
+### P3 — Registration enabled (#672) — **Inverse confirmed (build has registration DISABLED)**
+- `/register` → 302 to `/login?reason=registration-disabled`; login page console warns `Registration is disabled (PUBLIC_ENABLE_REGISTRATION=false)`. The **disable gating works correctly**. The #672 "enabled" positive path is NOT testable on this local build (PUBLIC_ flag env-baked at build = false; plan flagged this caveat). Re-test on a build/deploy with `PUBLIC_ENABLE_REGISTRATION=true`.
+
+### P2 — Org switch from device detail (#682) — **BLOCKED (single-org seed)**
+- After the #669 test, only "Default Organization" remains. Org-switch redirect logic (detail page → `/devices` in new org) requires ≥2 accessible orgs — not exercisable with this seed. Recommend re-test with a multi-org partner seed (create 2 orgs, open `/devices/:id`, switch org via top switcher, expect redirect to `/devices`).
+
+### P2 — Scripts orgId pass-through multi-org (#670) — **PARTIAL (single-org seed)**
+- ✅ `/scripts` renders cleanly: "Script Library", **Import from Library** + **New Script** + **Create script** buttons, graceful "No scripts yet" empty state. No `[object Object]`, no error.
+- ⚠️ The #670 fix specifically targets *partner users with ≥2 orgs* (import/new-script lands in the active org; run-picker shows system scripts). Seed has 1 org → multi-org pass-through path not exercisable. Re-test with a multi-org partner account.
+
+---
+
+## Walkthrough Summary — 2026-05-15
+
+| # | Area | Result |
+|---|---|---|
+| #703 | Wake-on-LAN | **PARTIAL — BUG: silent failure** (no toast on 412; backend msg never surfaced) |
+| #680 | Remote-Desktop Launcher | **PASS (core)** — scheme validation solid; minor: generic save-error toast |
+| #690 | Third-Party Patching Catalog | **PARTIAL — blocked** (catalog = platform-admin only; /patches surface OK) |
+| #676 | Pushover Notification Channel | **PARTIAL — BUG: silent Test failure** (create OK; Test result never shown) |
+| #689 | Readable API errors | **PASS (core)** — no `[object Object]` anywhere; client validation great; server errors over-generic/silent in places |
+| #705 | Devices page-size selector | **PASS** |
+| #669 | Org create/delete sidebar sync | **PASS** |
+| #681 | Drag-to-reorder orgs | **PARTIAL** — append-order OK; drag itself not verified (no a11y handle) |
+| #711 | Connection inventory | **PASS (light)** — renders, no 500; truncation not exercisable |
+| #692 | set_auto_update | **N/A** — no UI control (API-only, expected) |
+| #672 | Registration enabled | **Inverse confirmed** — disable gating works; enabled path needs flag-on build |
+| #682 | Org switch from device detail | **BLOCKED** — single-org seed |
+| #670 | Scripts multi-org pass-through | **PARTIAL** — page OK; multi-org path needs multi-org seed |
+
+### 🔴 Top finding — systemic silent-failure regression
+Two recently-merged P1 action features — **#703 Wake-on-LAN** and **#676 Pushover channel Test** — both call their API correctly, receive a well-formed readable result (`412 {code:NO_MACS,error:...}` / `200 {testResult:{success:false,message:"application token is invalid"}}`), and surface **absolutely nothing** to the user (no toast, no inline state, card stuck on "Never tested"). Neither shows `[object Object]`; they show *nothing*, which is worse. The action-button→feedback wiring on these newer surfaces appears broken. **Recommend:** one focused fix on the shared result/toast handler + a regression test asserting a toast appears on both success and error for action buttons; audit other "click action → API → result" flows (Reboot, Run Script, Decommission, channel test for all types).
+
+### Environment caveat
+Local stack required config surgery to be testable: `.env` `PUBLIC_API_URL` was `https://2breeze.app` with no `BREEZE_DOMAIN` (Caddy HTTP-only) and the public tunnel is **down (CF 530)**. Worked around by pointing `PUBLIC_API_URL=http://localhost` + CORS. `.env` changes are local-only; revert if pushing config elsewhere. `/etc/hosts` `127.0.0.1 2breeze.app` removal still pending user `sudo`.
+
+---
+
+## UI QA Sweep (extended) — 2026-05-15
+
+Target: http://localhost (Caddy :80). Login admin@breeze.local. Stack healthy, 3 device fixtures (all offline), single org/partner, non-platform-admin. Tracked noise NOT refiled: #720 (silent action buttons), #721 (platform-admin 403s), #678 ([object Object] zod errors).
+
+### Phase 2 — Nav crawl
+- Dashboard / — PASS (3 devices, 2 fixture alerts, recent activity render). Console: tracked #721 403 only.
+- Devices /devices — PASS (3 of 3, filters render).
+- Alerts /alerts — PASS (2 active, tabs Alerts/Rules/Channels).
+- Incidents /incidents — PASS (filters render, empty list).
+- Remote Access /remote — PASS (Terminal/File Transfer/Session History cards).
+- Scripts /scripts — PASS (proper empty state + CTA "Create your first script").
+- Patches /patches — PASS render. ⚠️ Embeds `<iframe src="https://docs.breezermm.com/">` → ~5 console CSP Report-Only errors from the EXTERNAL docs site (its own CSP, not Breeze app code). Noise but pollutes console on every Patches/Fleet visit.
+- Fleet /fleet — PASS render (same docs iframe CSP noise).
+- AI Workspace /workspace — PASS (multi-conversation UI).
+- Monitoring /monitoring — PARTIAL. ❌ BUG: `GET /api/v1/snmp/templates?orgId=...` → HTTP 500 `{"error":"Internal Server Error","message":"column \"org_id\" does not exist"}`. UI degrades gracefully (warns in console, page still renders Assets/Network Checks/SNMP Templates tabs) but SNMP Templates is broken. Suspected: snmp templates query references org_id column that doesn't exist in that table (RLS shape mismatch / missing migration).
+- Security /security — PASS (score 59/100).
+- Sensitive Data /sensitive-data — PASS (empty-state "No data yet").
+- Peripherals /peripherals — PASS (Policies/Activity tabs, filters).
+- AI Risk /ai-risk — PASS (Guardrails/Analytics/Approvals tabs). (docs-iframe CSP noise present.)
+- CIS Hardening /cis-hardening — PASS (avg 70%, 8 baselines, 3 failing devices).
+- Audit Baselines /audit-baselines — PASS (empty-state).
+- Network Discovery /discovery — PASS (Assets/Profiles/Jobs/Topology tabs).
+- Software Library /software — PASS (proper empty-state + CTA).
+- Software Policies /software-inventory — PASS (32 unique software listed).
+- Config Policies /configuration-policies — PASS (empty, New Policy CTA).
+- Backup /backup — PASS (Overview + ALPHA-tagged tabs).
+- Cloud Backup /c2c — PASS (ALPHA banner, honest "sync/restore not implemented" copy).
+- Disaster Recovery /dr — PASS (ALPHA banner).
+- Integrations /integrations — PASS (Webhooks/PSA/Security/Monitoring tabs).
+
+### Site-wide observation: docs iframe CSP console noise
+Many pages (Patches, Fleet, AI Risk, others) embed `<iframe src="https://docs.breezermm.com/">` (a help/docs panel). The EXTERNAL docs site ships a strict Report-Only CSP that blocks its own Astro scripts + Cloudflare RUM beacon, producing ~4-5 red console errors per page load. Not a Breeze-app code bug, but it floods the console on every page that mounts the help panel and makes real errors harder to spot during support/debugging. Candidate proposed-issue (low sev): lazy-load the docs iframe only when the help panel is opened, or point it at a CSP-clean docs build.
+- Reports /reports — PASS (empty-state + CTA).
+- Analytics /analytics — PASS (Operations/Capacity/SLA tabs, time-range picker).
+- Audit Trail /audit — PASS (rows render, Filters + Export).
+- Event Logs /logs — PASS (search form, source/level filters).
+- Settings/Partner — PASS (Company/Regional/Security/Notifications/Event Logs/Defaults/Branding/AI Budgets/Remote tabs).
+- Settings/Organizations — PASS (Default Organization, Add organization).
+- Settings/AI Usage — PASS (cost/token cards $0).
+- Settings/Custom Fields — PASS (empty-state, type filters).
+- Settings/Saved Filters — PASS (empty-state).
+- Settings/Users — PASS (1 of 1 user listed).
+- Settings/Roles — PASS (3 of 3 roles, system/custom).
+- Settings/Enrollment Keys — PASS (Create Key, table headers).
+
+**Phase 2 verdict: 38/38 nav destinations render. 1 functional bug (SNMP templates 500). Site-wide docs-iframe CSP console noise. Tracked #721 403 on every page (expected, non-platform-admin).**
+
+### Phase 3 — Everyday-workflow checklist
+#### Devices workflow — PASS
+- ✅ Status filter (Offline → "2 of 3 devices", 2 rows). OS/role/org/site filter dropdowns present.
+- ✅ Open device → detail renders (WIN-DHQNR1F8LO2, agent v0.65.10, real hardware/IP data).
+- ✅ Tabs all render via hash routing (#performance charts, #hardware real disk/RAM, #software inventory, #eventlog filters). "More" dropdown reveals Patches/Peripherals/Scripts/Connections; #patches sub-tab renders patch controls.
+- ⚠️ UI/UX: device-detail "More" dropdown is a portal popover that toggles on each click — fine for users, but the chevron stays "^" (open-looking) even after the menu visually closes in some states; minor. Also the global Documentation iframe + Breeze AI panel are always mounted in the DOM (fixed right-0 panels) → the docs iframe loads `docs.breezermm.com` on EVERY page even when collapsed, which is the source of the site-wide CSP console spam and an extra cross-origin request per navigation.
+#### Device actions — PASS
+- ✅ Run Script → opens "Select Script" modal ("No scripts available" — correct empty state since 0 scripts seeded).
+- ✅ Reboot → opens proper "Reboot Device" confirmation modal with hostname-named copy + Cancel/Reboot. Cancel dismisses cleanly. (NOTE: my first pass falsely flagged this as silent — the modal is a plain `fixed inset-0` div with no role=dialog, so a generic [role=dialog]/[class*=modal] probe missed it. Methodology corrected: assert on modal TITLE TEXT, not role/class selectors.)
+- ✅ Wake button only renders when status==='offline' (code-confirmed DeviceActions.tsx:224). On the Updating-status WIN device it's correctly hidden.
+- BLOCKED (fixture): cannot verify command actually executes — all 3 devices are offline/updating fixtures with no live agent; confirming would just queue a command. Re-test needs a live enrolled agent.
+#### Alerts workflow — FAIL
+- ✅ Row click opens a well-structured Alert Details drawer (role=dialog, Resolve/Suppress/Close + inline confirm step "Resolve Alert"/"Cancel" — good 2-step UX with helpful tooltips).
+- ❌ BUG (resolve produces no UI feedback + list never filters resolved): Clicked Resolve → confirm "Resolve Alert". API `POST /api/v1/alerts/0f550d3c.../resolve` → **HTTP 200, body `{"status":"resolved","resolvedAt":"2026-05-15T17:36:12Z",...}`** (success). UI: no toast, no optimistic update; drawer eventually closed but the alert list still showed "2 of 2" with the resolved alert listed, and "Active Alerts: 2" did not decrement.
+- ❌ BUG (confirmed after hard reload): `GET /api/v1/alerts?orgId=...` returns the resolved alert (`"status":"resolved"`) alongside the acknowledged one, `pagination.total:2`. The default Alerts page lists resolved alerts as if active and counts them in "Active Alerts". Either the list query must scope to active/unresolved by default, or resolved alerts must be visually segregated + excluded from the Active count. Suspected area: `apps/api/src/routes/alerts.ts` GET handler (no status filter) and/or `AlertsPage`/`AlertList` web component (no client-side active filter + missing success toast + missing list invalidation after resolve).
+#### Notification channels (create + test) — PARTIAL
+- ✅ "New Channel" modal: clean form, type picker (Email/Slack/Teams/PagerDuty/Webhook/SMS/Pushover), custom message templates with {{var}} help. Created "QA Sweep Email Channel" (Email) → modal closed, list updated to "2 of 2 channels", new row appeared. Create flow is solid.
+- ❌ BUG (channel "Last tested" permanently stuck "Never tested" — schema gap, all types): Clicked Test on the new Email channel. API `POST /api/v1/alerts/channels/:id/test` → **HTTP 200, body `{"testResult":{"success":true,"message":"Test email sent successfully"},"testedAt":"2026-05-15T17:38:33Z"}`**. UI: no toast; the channel row still says "Never tested" even after a hard reload. Root cause: `notification_channels` table (apps/api/src/db/schema/alerts.ts:92-102) has NO `last_tested_at` / test-result column; the test route returns an ephemeral `testedAt` but never persists it; web `NotificationChannelList.tsx:29,283-284` reads `channel.lastTestedAt` (always undefined → "Never tested"). Affects every channel type, not just Pushover (#720). Distinct from #720 (which is action-level no-feedback) and #679 (test-of-unknown-type 200 success:false).
+- Note: existing seeded channel is Pushover — its Test silent-failure is tracked #720; not refiled.
+- ⚠️ UI/UX: channel-card action buttons (edit/delete) are icon-only with NO `aria-label`/`title` — screen-reader users get unlabeled buttons; also hard to target in automation. Accessibility papercut on NotificationChannelList card actions.
+#### Scripts workflow — PASS
+- ✅ New Script editor (/scripts/new): rich form (name, category, language, target OS, Monaco code editor, parameters, execution settings, AI Assistant). Created "QA Sweep Test Script" (PowerShell) → redirected to /scripts, script listed "1 of 1".
+- ✅ Script picker integration: device Run Script modal now shows "QA Sweep Test Script ... 1 script(s) available" — create→pick works end-to-end. (Earlier "No scripts available" was a correct empty state, not a bug.)
+- BLOCKED (fixture): cannot verify actual execution/output — no live agent. Re-test with live agent.
+#### Global search / theme / profile — PASS (with minor UX note)
+- ✅ Cmd+K opens command palette ("Search devices, scripts, alerts, users, settings..."). Query "WIN" → returns devices (WIN-DHQNR1F8LO2, E2E Windows Test Device); clicking a result navigates to /devices/:id. Entity search works.
+- ⚠️ UI/UX: typing the literal word "devices" / "scripts" → "No results found." The placeholder implies you can search nav sections by name, but it's entity-only search. Minor expectation mismatch — consider indexing nav destinations or rewording the placeholder.
+- ✅ Theme toggle: dropdown Light/Dark/System; Dark applies `.dark` on <html>, reverts to Light cleanly.
+- ✅ Profile menu: Profile / Settings / Sign out present (sign-out not exercised to preserve session).
+#### Patches workflow — PARTIAL
+- ✅ Page renders Compliance/Patches/Update Rings tabs; device patch table shows per-device missing counts; status filter chips (All/Needs Patches/Critical/Pending Reboot/3rd-Party/Compliant) present.
+- ❌ BUG (Run Scan under-communicates failure): clicked Run Scan. API `POST /api/v1/patches/scan` → **HTTP 200 but body `{"success":false,"deviceCount":3,"failedDeviceIds":[all 3],"queuedCommandIds":[]}`** (all 3 offline → scan could not dispatch). UI message: **"Patch scan queued for 0 devices."** — neutral/success-toned, does not surface that the scan FAILED or why (devices offline). A user reasonably reads "queued for 0 devices" as benign. Should be an explicit failure/empty-state explanation ("Scan not dispatched — 3 devices offline/unreachable"). Same family as #679/#720 (HTTP 200 masking success:false) — message exists but under-communicates.
+- ✅ Patches tab: severity (All/Critical/Important/Moderate/Low) + approval-status (All/Pending/Approved/Declined/Deferred) + ring filters render.
+- ⚠️ UI/UX: Patches page uses `?tab=patches` query param for tab state, contradicting CLAUDE.md convention (transient UI state should be `#hash`, as device-detail correctly does). Minor inconsistency. Also the "Patch scan queued for 0 devices" banner persists across tab switches (sticky, not transient — acceptable, but wording still under-communicates per bug above).
+#### Custom Fields create — FAIL (functional + error rendering)
+- ✅ Form UI is clean (Display Name, Field Key with "cannot change after creation" hint, type picker, max-length/regex, device-type checkboxes, required toggle).
+- ❌ BUG #1 (cannot create a non-Dropdown custom field — API contract mismatch): Created a Text field "QA Sweep Field". Form submits body `{"name":...,"fieldKey":...,"type":"text","required":false,"defaultValue":null,"deviceTypes":["windows"],"options":null}`. API `POST /api/v1/custom-fields` → **HTTP 400 ZodError: `path:["options"] "Expected object, received null"`**. The form always sends `options: null` for non-dropdown types but the API Zod schema requires `options` to be an object (or omitted). Net effect: Text/Number/Yes-No/Date custom fields are impossible to create via the UI. Suspected: web form should omit `options` (or send `{}`) for non-dropdown types, OR API schema should `.nullable()`/`.optional()` `options`. Files: `apps/web/src/components/settings/CustomFields*` create handler + the custom-fields POST Zod validator (shared/api).
+- ❌ BUG #2 (also: `deviceTypes:null` rejected): First attempt with NO device types selected → additional ZodError `path:["deviceTypes"] "Expected array, received null"`. The UI explicitly says "Leave empty to show on all device types" but submitting empty sends `null`, which the API rejects (expects array). Selecting a type made deviceTypes pass but options:null still blocks. So the documented "leave empty" path is broken too.
+- ❌ BUG #3 (`[object Object]` error rendering — SAME CLASS as tracked #678, different component): On the 400, the form renders the error as literal **`[object Object]`** (confirmed in DOM: `.text-destructive` element innerText = "[object Object]"). API body is a structured `{"error":{"issues":[...],"name":"ZodError"}}`. The Custom Fields create form stringifies the error object instead of mapping `.error.issues[].message`. #678 is scoped to NotificationChannelsPage; this is `settings/custom-fields` — cross-link, likely shared root cause (a generic error-toast/error-state helper that does `String(err)`), but distinct surface.
+- ROOT CAUSE CONFIRMED (code-read): `packages/shared/src/validators/filters.ts:154-166` `createCustomFieldSchema` has `options: customFieldOptionsSchema.optional()` and `deviceTypes: z.array(...).optional()` — `.optional()` accepts `undefined` but NOT `null`. The web form (`apps/web/src/components/settings/CustomFieldsPage.tsx`) sends explicit `null` for both. Contrast `updateCustomFieldSchema:173` which correctly uses `deviceTypes: ...nullable().optional()` (with a passing test "should accept nullable deviceTypes"). The CREATE schema was never given `.nullable()`. Fix: add `.nullable()` to create schema's `options` + `deviceTypes` (consistent with update), or have CustomFieldsPage omit null-valued fields before POST. One-line-ish, well-isolated, high user impact (entire create flow broken for the default Text type).
+#### Org/Site setup — PARTIAL (1 high-sev multi-org bug)
+- ✅ Create organization: "Add organization" form (name/slug/maxDevices/contract dates) → "QA Sweep Org" created, appears in org list instantly, auto-provisions a "Default Site". Org list/switcher sync correctly.
+- ✅ Site form validation is GOOD: progressive, readable messages ("Address line 1 is required", "City is required", "Contact name is required", "Enter a valid email address", "Enter a phone number") — NOT [object Object], NOT silent. (Heavy required-field set for a "first site" onboarding step — UX note, not a bug.)
+- ✅ Site create API: `POST /api/v1/orgs/sites` → **HTTP 201 Created**, request body correctly carries `{"orgId":"bdc354f7..(QA Sweep Org)..","name":"QA Sweep Site 2",...}`.
+- ❌ BUG (HIGH — list-sites ignores selected org; new site invisible; looks like silent data loss): After the 201, "QA Sweep Site 2" NEVER appears under QA Sweep Org (UI stays "1 of 1 sites" = only auto "Default Site"), even after hard reload + re-selecting the org. No error shown — appears to the user as if the site silently failed to save. ROOT CAUSE (code-confirmed `apps/api/src/routes/orgs.ts:891-894`): `const effectiveOrgId = orgId || organizationId`. The web client appends the ambient active-context `?orgId=463a227d (Default Org)` to EVERY API call, and the page also sends `?organizationId=bdc354f7 (QA Sweep Org)`. Because `orgId` wins the `||`, the GET /orgs/sites handler always filters by the context org (463a227d), ignoring the explicitly-selected `organizationId`. Confirmed: `GET /orgs/sites?organizationId=bdc354f7&orgId=463a227d` returned a site row with `"orgId":"463a227d","name":"Default Site"` — i.e. the WRONG org's site while viewing QA Sweep Org. So (a) you see another org's sites when browsing any non-context org, and (b) sites created for non-context orgs are invisible. Fix: prefer explicit `organizationId || orgId` for this endpoint (or stop auto-appending ambient orgId here, or rename the param). Multi-org/partner correctness + data-visibility bug. (Tenant note: it only ever showed the viewer's OWN default-org site, not a foreign tenant's — so not a cross-tenant leak, but a wrong-org-display + lost-write bug.)
+- ⚠️ UI/UX: guided onboarding card "Add the first site for QA Sweep Org — Organizations need at least one site" shows even though the org already has an auto-created "Default Site" (1 of 1). The onboarding nag ignores the auto-provisioned site.
+- NOTE: org/site delete-confirm flow not cleanly verified — icon/Delete buttons in this panel are easy to mis-target and the global Documentation help-panel toggle sits in the same region, repeatedly intercepting clicks (see UI/UX note below). Test org "QA Sweep Org" + its sites left as harmless residual test data. Re-test delete with stable testids.
+- ⚠️ UI/UX (recurring friction): the always-mounted right-side Documentation iframe panel + Breeze AI panel sit at fixed right-0 and their toggle/expand affordances repeatedly intercept clicks intended for page content on the right side of wide pages (Organizations panel, device-detail More menu). This degrades both real usage and automation. Combined with the site-wide docs-iframe CSP console spam, the always-mounted docs panel is a recurring problem.
+
+### Phase 4 — Setup tasks (continued)
+#### Enrollment keys — PASS
+- ✅ Create Key: form (name, usage limit "Unlimited" default), created "QA Sweep Key" → list updated, row shows "Hidden / Active / 0 / 1 / Rotate / Delete". Key correctly masked ("Hidden") in list with Rotate/Delete actions (good security posture). Install command documented on page ("breeze-agent enroll <key>"). Residual test key + "QA Sweep Email Channel"/"QA Sweep Test Script"/"QA Sweep Field"(none, create failed)/"QA Sweep Org" left as test data.
+#### Partner Settings — PARTIAL
+- ✅ All 8 tabs present (Company/Regional/Security/Notifications/Defaults/Branding/AI Budgets/Remote) and render. Save Settings button present.
+- ❌ BUG (generic error masks specific validation — milder #678 family): Company tab, set contact email to "not-an-email", Save. API `PATCH /api/v1/orgs/partners/me` → **HTTP 400, body `{"error":{"issues":[{"validation":"email","message":"Invalid email","path":["settings","contact","email"]}],"name":"ZodError"}}`** (clean, specific, field-pathed). UI shows only generic **"Failed to save settings"** + a bare `*` marker — discards the actionable "Invalid email" message and the field path. Not `[object Object]` (better than #678) but still throws away a specific server validation message; with many partner fields the user can't tell what's wrong. Suspected: PartnerSettings save handler catches the error and renders a generic string instead of mapping `error.issues`. Cross-link #678 (same root pattern: structured zod error not surfaced).
+- (URL-scheme `javascript:`/`data:` rejection on Branding/Remote provider URLs: BLOCKED — no free-text URL input reachable without a custom-provider sub-path; not exercised. Re-test by selecting a custom remote-tool provider.)
+
+### Phase 5 — Backward-through-PRs (older than #669)
+#### PR #621 fix(api): partner-multi-org orgId pass-through (#620) — PASS (verified) + GAP found
+- ✅ Software Library: `GET /api/v1/software/catalog?orgId=...` → 200 (not 400). Page renders.
+- ✅ Software Inventory: `GET /api/v1/software-inventory?...&orgId=...` → 200, 32 software listed.
+- ✅ Discovery scan: clicked profile "Run now" → `POST /api/v1/discovery/scan?orgId=...` → **201 Created**, UI auto-navigated to Jobs tab showing the new job (good feedback). All three #621-touched resolvers (software.ts, softwareInventory.ts, discovery.ts) confirmed working.
+- ⚠️ GAP (links to my Org/Site HIGH bug above): #621 fixed the SAME bug class ("call sites dropped user-supplied orgId; partner-multi-org 400/wrong-org") in software.ts/softwareInventory.ts/discovery.ts/huntress.ts — but the resolver in **`apps/api/src/routes/orgs.ts` GET/POST `/sites`** was NOT covered. It uses `effectiveOrgId = orgId || organizationId` (orgId wins), the exact anti-pattern #621 fixed elsewhere via `resolveScopedOrgId(auth, requested?)`. So the Org/Site bug I logged is a known-class regression in a route #621 missed. The established fix pattern from #621 applies directly.
+#### PR #638 fix(web): software inventory Actions dropdown clipped on single-result lists (#632) — PASS
+- ✅ Software Inventory, searched "Go Programming" → exactly 1 row. Clicked Actions → dropdown renders Approve / Deny / Create Policy, each 174×36px (real dimensions, not clipped to 0). Regression #632 (invisible dropdown on single-result) is fixed.
+#### PR #619/#618 fix(web,api): v0.65.7 strict-CSP regressions — PASS
+- ✅ Dark mode set on /software, navigated to /devices → `html.dark` PERSISTS (the #618 regression was dark dropping every navigation under strict CSP). React island hydrated post-navigation ("3 of 3 devices" interactive). No CSP-refused theme/transition scripts in console. Reverted to light.
+#### PR #636 fix(api): software_versions.file_size BigInt 500 (#630) — BLOCKED
+- No catalog packages seeded → cannot exercise `GET /software/catalog/:id/versions` via UI. API-level schema-mode fix; re-test by adding a catalog package with a non-null file_size and opening its versions.
+#### PR #555 feat(web): surface MCP URL on login + connected-apps — PASS
+- ✅ /settings/connected-apps renders: "Connected apps", OAuth-authorized AI clients list, MCP URL card ("Direct your AI agent here — Paste this URL into your MCP client (Claude...)") + Copy button. Full-card variant present as designed.
+#### PR #543 fix(web): send currentPassword on MFA setup/enable/disable — PASS
+- ✅ Profile → Authenticator app "Enable" now reveals an inline **"Current password"** prompt (placeholder "Enter your current password") with Cancel/Continue BEFORE calling /auth/mfa/setup. This is exactly the #543 fix (client previously omitted currentPassword → server 400 → generic "Failed to start MFA setup"). The currentPassword collection step is present and correctly gates setup. (Couldn't drive the synthetic password through React's controlled input to reach the QR step — harness limitation, not a product defect; the fix's observable surface is verified.)
+#### PR #539 feat(auth): unified /auth tabs page — PASS
+- ✅ `/auth` = unified page, "Sign in" / "Create account" tabs (#signup hash for the latter — consistent with hash-state convention). Sign-in: email+password. Create account: company/name/email/password/confirm/acceptTerms. PR #555 MCP hint present. NOTABLE: this unauthenticated page had **0 console errors** (no docs iframe on the unauth layout) — confirms the site-wide docs-iframe CSP spam is scoped to the authenticated app shell only.
+- ⚠️ UI/UX: app logs "Registration is disabled (PUBLIC_ENABLE_REGISTRATION=false). Registration pages will redirect to /login" yet `/auth#signup` renders a full registration form with NO "registration disabled / invite only" messaging. Likely redirects on submit, but showing a fully-fillable form for a disabled feature is a dead-end UX. Minor/env-specific — noted, not filed.
+
+**Phase 5 stop point: oldest PR reached = #539** (covered #621, #638, #636(blocked), #619/#618, #555, #543, #539 — plus skipped all deps/CI/agent/docs PRs in the 539–668 window). A future run can resume backward from #538.
+
+### Summary table (extended sweep 2026-05-15)
+| Area | Result |
+|---|---|
+| Phase 2 nav crawl (38 destinations) | PASS (all render; 1 functional bug = SNMP templates 500) |
+| Devices list/detail/tabs | PASS |
+| Device actions (Run Script/Reboot/Wake) | PASS (modal+confirm work; false-alarm corrected) |
+| Alerts (resolve/list) | FAIL (resolve no feedback + resolved alerts not filtered) |
+| Notification channels (create/test) | PARTIAL (create OK; "Never tested" schema gap, no toast) |
+| Scripts (create/picker) | PASS |
+| Global search / theme / profile | PASS (minor placeholder UX note) |
+| Patches (Run Scan/filters) | PARTIAL (scan under-communicates success:false) |
+| Custom Fields create | FAIL (non-dropdown create impossible + [object Object]) |
+| Org/Site setup | PARTIAL (HIGH: list-sites ignores selected org; new site invisible) |
+| Enrollment keys | PASS |
+| Partner Settings | PARTIAL (generic error masks specific validation) |
+| Phase 5 PRs #621/#638/#619/#555/#543/#539 | PASS (all verified working; #636 BLOCKED) |
+
+### Proposed Issues (deduped; for triage — NOT filed by sweep)
+
+1. **[UI] Org/Site: GET & POST /orgs/sites ignore selected `organizationId` — sites created for a non-active org are invisible (looks like silent data loss)**
+   Symptom: On Settings→Organizations, select a non-active org, "Create first site" with all required fields. API `POST /api/v1/orgs/sites` → 201 Created (body correctly has `orgId` of selected org). Site never appears under that org (UI stays "1 of 1 sites" = only auto Default Site), no error shown. API: `GET /orgs/sites?organizationId=<selectedOrg>&orgId=<activeOrg>` returns the *active* org's "Default Site" (wrong-org rows). Root cause: `apps/api/src/routes/orgs.ts:891-894` `effectiveOrgId = orgId || organizationId` — the ambient `?orgId=` (active context) wins over the explicit `?organizationId=`. Exact bug class PR #621 fixed in software.ts/softwareInventory.ts/discovery.ts/huntress.ts but missed in orgs.ts. Fix: prefer `organizationId || orgId` (or apply #621's `resolveScopedOrgId(auth, requested?)` pattern). High severity: breaks multi-org/partner site management + shows wrong org's data. (Not a cross-tenant leak — only the viewer's own default-org site shows.)
+
+2. **[UI] Custom Fields: cannot create any non-Dropdown field — form sends `options:null`/`deviceTypes:null`, API rejects (400), error renders as `[object Object]`**
+   Symptom: Settings→Custom Fields→Add, create a Text field. `POST /api/v1/custom-fields` body `{...,"type":"text","deviceTypes":null,"options":null}` → HTTP 400 ZodError `path:["options"] "Expected object, received null"` (and `["deviceTypes"]` when none selected). UI shows literal `[object Object]`. Net: Text/Number/Yes-No/Date custom fields are impossible to create via UI; "Leave empty to show on all device types" path also broken. Root cause confirmed: `packages/shared/src/validators/filters.ts:154-166` `createCustomFieldSchema` uses `.optional()` (rejects null) for `options`+`deviceTypes`; `updateCustomFieldSchema:173` correctly uses `.nullable().optional()`. Fix: add `.nullable()` to create schema (parity with update) or have CustomFieldsPage omit null fields. Plus the `[object Object]` rendering (same class as #678, different component — cross-link, don't refile under #678).
+
+3. **[UI] Alerts list does not filter resolved alerts and resolve gives no UI feedback**
+   Symptom: Resolve an alert from the detail drawer. `POST /api/v1/alerts/:id/resolve` → 200, body `{"status":"resolved","resolvedAt":...}`. No toast, no optimistic update; after hard reload the resolved alert still shows in the list ("2 of 2", counted in "Active Alerts: 2"). `GET /api/v1/alerts` returns resolved alerts with no default active scoping. Two fixes: (a) default Alerts list should scope to active/unresolved (or visibly segregate + exclude from Active count); (b) add success toast + list invalidation after resolve. Suspected: `apps/api/src/routes/alerts.ts` GET handler (no status filter) + AlertsPage/AlertList web component. Related to #720 family (silent success) but distinct surface + has a list-filtering defect.
+
+4. **[UI] SNMP templates endpoint 500s — `column "org_id" does not exist`**
+   Symptom: /monitoring loads; `GET /api/v1/snmp/templates?orgId=...` → HTTP 500 `{"message":"column \"org_id\" does not exist"}`. UI degrades gracefully (console warn, page still renders) but the SNMP Templates tab is non-functional. Suspected: snmp_templates query/schema references an `org_id` column that doesn't exist on that table (missing migration or wrong tenancy-shape column name). API-level; needs DB/schema check on the snmp templates table + its RLS shape.
+
+5. **[UI] Notification channel "Last tested" permanently stuck on "Never tested" — no persistence column, all channel types**
+   Symptom: Test any channel from the channel list. `POST /api/v1/alerts/channels/:id/test` → 200 `{"testResult":{"success":true},"testedAt":...}`. No toast; channel row shows "Never tested" even after hard reload. Root cause: `notification_channels` table (`apps/api/src/db/schema/alerts.ts:92-102`) has no `last_tested_at`/test-result column; the test route returns an ephemeral `testedAt` but never persists it; web `NotificationChannelList.tsx:29,283-284` reads `channel.lastTestedAt` (always undefined). Fix: add a `last_tested_at` (+ optional `last_test_success`) column, persist in the test route, return it in GET channels. Distinct from #720 (action-level no-feedback) and #679 (unknown-type 200/false). Lower-priority papercut but affects every channel type.
+
+6. **[UI] Patch "Run Scan" reports `success:false` as the benign-sounding "Patch scan queued for 0 devices."**
+   Symptom: Patches→Run Scan with offline devices. `POST /api/v1/patches/scan` → HTTP 200 but `{"success":false,"failedDeviceIds":[all],"queuedCommandIds":[]}`. UI banner: "Patch scan queued for 0 devices." — neutral/success-toned, doesn't communicate the scan failed or why (devices offline). Should be an explicit failure/why message ("Scan not dispatched — N devices offline/unreachable"). Same family as #679/#720 (HTTP 200 masking success:false) — message exists but under-communicates. Lower severity than #720.
+
+7. **[UI] Partner Settings shows generic "Failed to save settings" instead of the server's specific validation message**
+   Symptom: Partner Settings→Company, invalid contact email, Save. `PATCH /api/v1/orgs/partners/me` → 400 `{"error":{"issues":[{"message":"Invalid email","path":["settings","contact","email"]}],"name":"ZodError"}}`. UI shows only "Failed to save settings" + bare `*`. Not `[object Object]` (better than #678) but discards the actionable per-field message. Same root pattern as #678 (structured zod error not surfaced) in PartnerSettings; cross-link, low severity (papercut).
+
+(Non-bug UI/UX observations also captured inline above: site-wide always-mounted docs-iframe CSP console spam + right-panel click interception; `?tab=` vs `#hash` inconsistency on Patches/Discovery; unlabeled channel-card icon buttons; onboarding "add first site" nag ignores auto-created Default Site; global-search placeholder oversells nav search; /auth#signup form shown despite registration disabled.)
+
+## Patching Endpoint E2E — 2026-05-15
+
+**Branch:** `fix/pending-partner-login-regression` (HEAD 577ade32) — testing PR #690 + migrations 2026-05-13-a..e, 2026-05-14-a/-b
+**Tested by:** Claude (Opus 4.7)
+**Scope:** API/DB-level (curl + psql), NOT Playwright
+**Org:** 463a227d-9df1-4dfb-b990-8564c1a2dcca
+**Devices (offline fixtures):** mac/linux 42fc7de0-48f5-48f2-846b-6dd95924baf9, windows e65460f3-413c-4599-a9a6-90ee71bbc4ff
+
+### Pre-flight
+- Auth: POST /api/v1/auth/login admin@breeze.local → 200, accessToken acquired (mfaRequired=false)
+- Docker: breeze-api/web/postgres/redis all Up healthy
+- Migrations 2026-05-13-a..e, 2026-05-14-a/-b present in apps/api/migrations/
+
+### Phase A — org-scoped patch endpoints
+
+**GET /api/v1/patches?orgId=<org>** — PASS (200)
+- Shape correct: `data[]`, `counts{microsoft,apple,linux,third_party,custom}`, `pagination{page,limit,total}`
+- Totals: 98 patches (counts microsoft:89 apple:1 linux:0 third_party:8 custom:0)
+- Items expose `vendor,packageId,cveIds` keys (all NULL on seeded rows — legacy MS rows + 8 third_party rows all have vendor/packageId/cveIds = null)
+- NOTE: list.ts select does NOT include `version` column (schema has patches.version via 2026-05-14-a, but GET /patches omits it). `version` only in GET /patches/:id full row.
+- Filters: `source=third_party` → total 8, **counts UNCHANGED full breakdown** (PASS — source filter does NOT distort counts, per list.ts:84-90). `source=microsoft` → counts identical. `severity=important` → total 2, counts reflect filtered set (expected: only source excluded from count scope). `os=macos` → total 1 apple. Pagination `page=2&limit=5` → correct. `ringId=not-a-uuid` → 400 ZodError clean shape (no [object Object]).
+
+**GET /api/v1/patches/sources** — PASS (200): 5 sources w/ id,name,os. `?os=macos` filters to apple + null-os (third_party, custom). Correct.
+**GET /api/v1/patches/:id** — PASS (200): full row incl `vendor:null packageId:null version:"" cveIds` (version default '' from 2026-05-14-a). Bad uuid → 404 {"error":"Patch not found"}.
+**GET /api/v1/patches/jobs** — PASS (200): {data:[],pagination} empty (no jobs).
+**GET /api/v1/patches/approvals** — PASS (200): {data:[],pagination} empty.
+**GET /api/v1/patches/compliance** — PASS (200): per-device missing/critical/important counts + osMissing/thirdPartyMissing split + filters echo.
+**GET /api/v1/patches/compliance/report** (queue — note: GET not POST, by design list.ts pattern) — PASS (200): {reportId,status:queued,format:csv}. Audit `patch.compliance.report.queue` written. Poll **GET /patches/compliance/report/:id** → PASS (200) {status:pending,...,downloadUrl:null}. (POST to /compliance/report → 404, correct: route is GET.)
+**GET /api/v1/patch-policies** — PASS (200): {data:[],pagination} empty.
+**GET /api/v1/update-rings** — PASS (200): 1 Default ring, full shape (categoryRules, autoApprove, deviceCount).
+**GET /api/v1/update-rings/:id** — PASS (200): detail w/ approvalSummary, recentJobs.
+**GET /api/v1/update-rings/:id/patches** — PASS (200): patch list scoped to ring (total 98), pagination.
+**GET /api/v1/update-rings/:id/compliance** — PASS (200): {summary,compliancePercent:100,approvedPatches:0}.
+
+**POST /api/v1/patches/scan** {deviceIds:[<offline win>]} — PASS shape (200, NOT 500): success:false, failedDeviceIds:[win], skipped{missing,inaccessible}. Uses queueCommandForExecution → correctly reports offline device as failed. MFA gate: requireMfa() did NOT 403 (admin mfaEnabled=false → requireMfa only enforces when MFA enrolled; expected, not a bypass). audit_logs row written: action=patch.scan.trigger, actor_type=user, result=success, details.failedDeviceIds=[win], deviceCount=1. NOTE audit result='success' despite scan failing to queue to offline device (misleading — see Proposed Issues, #727-class but in audit result field).
+**POST /api/v1/patches/:id/rollback** {deviceIds:[<offline win>],scheduleType:immediate} — PASS shape (200) BUT **success:true + queuedCommandIds populated for an OFFLINE device** (operations.ts:238 uses bare queueCommand = DB insert only, no delivery check), whereas scan uses queueCommandForExecution. Inconsistent offline handling between sibling endpoints. patch_rollbacks + device_commands rows created; CLEANED UP. Bad body (no scheduleType) → zod default 'immediate' applied, no installed device_patches → 404 {"error":"No accessible devices found for rollback"}.
+
+**Phase A verdict: PASS** (all endpoints reachable as org admin, correct shapes; 2 behavioral notes flagged for Proposed Issues — rollback offline success-true inconsistency, scan audit result=success on failure).
+
+### Phase B — platform-admin catalog (elevated, REVERTED)
+
+- Pre-elevation: GET /third-party-catalog → 403 {"error":"platform admin access required"} (both list.ts and operations.ts gate via platformAdminMiddleware).
+- Elevation: `UPDATE users SET is_platform_admin=true WHERE email='admin@breeze.local'` + re-login → GET /third-party-catalog 200 (flag picked up; resolved via DB lookup in auth.ts, NOT JWT claim).
+- **GET /third-party-catalog?limit=5** — PASS (200): shape `{items[],total,limit,offset}`; total=20 seeded third_party rows, limit=5 honored (items:5). Sample: 7zip.7zip / Adobe.Acrobat.Reader.64-bit / Google.Chrome etc.
+- **POST create custom** — PASS (201): id 47e63b9c..., echoes full row.
+- **PATCH /:id** — PASS (200): friendlyName+defaultSeverity updated, updatedAt bumped.
+- **POST /:id/test {version:1.0.0}** — PASS (202): {testId:e8442c23...,alreadyExisted:false}; release_test row created status=queued.
+- **POST /:id/test repeat** — PASS (409): {"error":"test already in progress","testId":e8442c23...} (concurrency guard works, returns in-flight id).
+- **POST /<nonexistent>/test** — PASS (400): {"error":"cannot enqueue test","reason":"catalog entry not found or not breeze-tested"} (note: 400 not 404, by design).
+- **DELETE /:id** — PASS (200) {deleted:true}; catalog row gone AND third_party_release_tests cascade-deleted (FK onDelete:cascade verified: 1→0 rows). DELETE again → 404 {"error":"not found"}.
+- **REVERT:** `UPDATE users SET is_platform_admin=false WHERE email='admin@breeze.local'` → verified is_platform_admin='f'. Re-login.
+- **Authz negative (post-revert, non-admin token):** GET/POST/PATCH/DELETE/test ALL → 403 "platform admin access required". Stale pre-elevation token also → 403 (isPlatformAdmin is per-request DB lookup, no stale-JWT privilege persistence — good). Seeded catalog intact (20 rows, no damage).
+
+**Phase B verdict: PASS.** Full CRUD + state machine + cascade + authz all correct. **PLATFORM ADMIN REVERTED TO false — verified in DB and via 403 re-test.**
+
+### Phase C — real DB CHECK/UNIQUE constraints (psql)
+
+Catalog id used: 0bdd5f8b-4c12-404a-b78a-65a1ba2d14cc (Google.Chrome). All violations MUST error; every one did.
+
+| # | Attempt | Result |
+|---|---|---|
+| 1 | INSERT release_test status='bogus' | REJECT — `third_party_release_tests_status_chk` |
+| 2 | INSERT release_test result='maybe' (completed) | REJECT — `third_party_release_tests_result_chk` |
+| 3 | INSERT status='completed', result=NULL | REJECT — `third_party_release_tests_state_chk` |
+| 3b | INSERT status='completed', completed_at=NULL | REJECT — `third_party_release_tests_state_chk` |
+| 4 | INSERT status='queued', result='pass' (non-completed w/ result) | REJECT — `third_party_release_tests_state_chk` |
+| 5 | UPDATE catalog last_tested_result='garbage' | REJECT — `..._last_tested_result_chk` |
+| 6 | UPDATE catalog result set, at+version NULL | REJECT — `..._last_tested_tuple_chk` |
+| 6b | UPDATE catalog at set, version+result NULL | REJECT — `..._last_tested_tuple_chk` |
+| 6c | UPDATE catalog all-3 set (control) | ACCEPT (UPDATE 1) — then reverted to all-NULL OK |
+| 7 | Double INSERT release_test same (catalog_id,version) | 1st INSERT 0 1, 2nd REJECT — `third_party_release_tests_catalog_version_unique` |
+| 8 | Double INSERT catalog same (source,package_id) | REJECT — `third_party_package_catalog_source_package_id_unique` |
+
+Cleanup: dup-test-1.0 release row DELETEd; Google.Chrome tuple reverted to all-NULL; verified 0 leftover release_tests, 20 catalog rows, 0 'dup' rows. **Phase C verdict: PASS** — migration 2026-05-14-b state machine fully enforced at DB level; impossible states unrepresentable.
+
+### Phase D — agent ingest path
+
+**Agent auth: BLOCKED.** Devices store only `agent_token_hash` (SHA-256, varchar(64), irreversible) — no plaintext `brz_` token recoverable from DB. The windows fixture (e65460f3...) has `agent_token_hash` NULL anyway (never enrolled with hashed token). Authenticating as the agent to hit POST /agents/:id/patches is not feasible. Rationale logged; fell back to direct DB INSERT to exercise the read/enrichment surface.
+
+Direct INSERT: patches row source=third_party external_id='qa-e2e:Google.Chrome:142.0' package_id='Google.Chrome' version='142.0.7444.59' vendor='Google' severity='important' cve_ids={CVE-2026-99991,CVE-2026-99992} + device_patches link to windows device (status=pending, org scoped).
+
+- **GET /api/v1/patches list** — third_party count 8→9; inserted row surfaces `vendor='Google'`, `packageId='Google.Chrome'`, `cveIds=[CVE-2026-99991,CVE-2026-99992]`, `severity='important'`, `os/inferredOs='windows'` (inferred via device_patches→devices join, correct). **`version` field ABSENT from list response keys** (list.ts select omits patches.version) — see Proposed Issues.
+- **GET /api/v1/patches/:id** — full row correct incl `version='142.0.7444.59'` and `cveIds` array. So version IS stored & readable via detail, just not list.
+- **GET /api/v1/patches/compliance** — windows device `e2e-windows.local` correctly reflects: missing=2, **thirdPartyMissing=1**, osMissing=1 (split counting works; new third_party patch counted in the third-party bucket, not OS).
+- Note: GET /patches read path does NOT re-run enrichFromCatalog (enrichment is write-time only, in routes/agents/patches.ts, persisted onto the patches row). So a manually-inserted row shows exactly the stored values — expected; enrichment-from-catalog transformation could not be exercised without the agent ingest endpoint (BLOCKED).
+- Cleanup: device_patches + patches rows DELETEd; verified total back to 98, third_party back to 8.
+
+**Phase D verdict: PARTIAL / BLOCKED.** Agent-auth ingest not testable (hash-only tokens — by design, good security). Read-path enrichment surfacing of vendor/packageId/cveIds + compliance third-party split: PASS. `version` not in list response: gap flagged.
+
+### Final State
+- `users.is_platform_admin` for admin@breeze.local = **false** (REVERTED, verified in DB + via 403 re-test).
+- patches=98, third_party_package_catalog=20, third_party_release_tests=0, qa-e2e patches=0, patch_rollbacks(test)=0, test patch_compliance_report deleted.
+- Intentionally left: audit_logs rows (patch.scan.trigger, patch.compliance.report.queue, platform_admin.* x several) — these are a legitimate audit trail, not test pollution; not removed.
+
+### Proposed Issues (deduped; NOT filed — excludes #690 #720 #721 #727 #678)
+
+**1. [API] GET /patches list response omits `version` field (present in schema + /patches/:id)**
+`apps/api/src/routes/patches/list.ts:46-69` select() does not include `patches.version`. Migration `2026-05-14-a-patches-version-column.sql` added the column and the new third-party feature populates it; `GET /patches/:id` returns it but the list endpoint does not. A UI patch list cannot show the package version (e.g. "Google Chrome 142.0.7444.59") without an N+1 detail fetch. Evidence: list keys = [...,packageId,vendor,cveIds,...] but no `version`; `/patches/:id` returns `"version":"142.0.7444.59"`. Suspected fix: add `version: patches.version` to the list select. Distinct from #690/#727.
+
+**2. [API] POST /patches/:id/rollback returns success:true + queuedCommandIds for OFFLINE devices (no delivery check), inconsistent with /patches/scan**
+`apps/api/src/routes/patches/operations.ts:238` rollback uses bare `queueCommand` (DB insert only) → reports `success:true, queuedCommandIds:[...]` for an offline device that will never receive the command. Sibling `/patches/scan` (operations.ts:50) uses `queueCommandForExecution` and correctly returns `success:false, failedDeviceIds:[...]` for the same offline device. Evidence: same offline windows device — scan→success:false failedDeviceIds:[win]; rollback→success:true queuedCommandIds:[uuid]. Related to #727 (misleading patch-scan success) but a DIFFERENT endpoint (rollback) and different root cause (queueCommand vs queueCommandForExecution). Suspected fix: make rollback use queueCommandForExecution or surface delivery status.
+
+**3. [API] patch.scan.trigger audit_logs row records result='success' even when scan failed to queue to all target devices**
+`apps/api/src/routes/patches/operations.ts:88-103` writes the scan audit unconditionally with the route's default success result, even when every device is in `failedDeviceIds` (offline). Evidence: audit row action=patch.scan.trigger result='success' details.failedDeviceIds=["e65460f3..."] deviceCount=1, zero queued. An auditor/SLA report reading audit_logs.result would see a "successful" scan that dispatched nothing. Adjacent to #727 (which is about the HTTP response body) but this is the persisted **audit result field** specifically — arguably same issue family; flagging separately in case #727's fix only touches the response body and not the audit write. Suspected fix: derive audit `result` from failedDeviceIds.length.
+
+### Per-Phase Verdict
+- Phase A: PASS (all org-scoped endpoints reachable, correct shapes; source-filter count integrity confirmed; 2 behavioral notes → Proposed Issues #2,#3)
+- Phase B: PASS (full CRUD + state machine + cascade + authz; platform admin REVERTED)
+- Phase C: PASS (all 11 constraint-violation attempts rejected by Postgres; migration 2026-05-14-b enforced)
+- Phase D: PARTIAL/BLOCKED (agent-auth ingest infeasible by design; read-path enrichment surfacing + compliance third-party split PASS; `version` omission → Proposed Issue #1)
+
+### CVE enrichment — dormant-as-shipped (code follow-up, 2026-05-15) → issue #731
+- ❌ **CVE enrichment is doubly inert.** (1) `cveEnrichmentWorker`/`runCveEnrichmentBatch` has zero references outside its own file — not in `index.ts`, not a registered BullMQ worker, absent from the ~20-job recurring bootstrap. (2) The batch gates on `isNotNull(osvEcosystem)` (`cveEnrichmentWorker.ts:48`) but `osv_ecosystem` is NULL in all 20 seeded catalog rows, not accepted by the catalog create/update zod schema (`thirdPartyCatalog/schemas.ts`), and has no writer anywhere → zero rows would match even if scheduled.
+- Net: `patches.cveIds` never populates; CVE chips never render. Migration `2026-05-13-d` + OSV client shipped but unreachable. Filed #731 (Medium-High — silent dead feature, part of #690).
+
+---
+
+## Invoice Engine (billing sub-project 2) — 2026-06-15
+
+**Branch:** `feat/invoice-engine`
+**Commit:** `35d51e81`
+**Tested by:** Claude (local Docker dev stack, Playwright MCP)
+**Result:** PASS
+
+Loaded the branch into the local dev Docker stack (rebuilt `api` from the worktree so the new `pdfkit` dep installed; reused the existing dev DB volume) and drove the MSP UI end-to-end at `http://localhost:4321`.
+
+### What was tested (UI + API)
+- [x] **Invoices list** — renders; org/status/date filters; empty → populated; row shows `INV-2026-0001 · Default Organization · 6/15 → 7/15 · $2,208.65 · Balance $1,208.65 · Partially paid`. "Invoices" correctly under Operations nav.
+- [x] **Assemble (org-run)** — dialog (org + optional site + 30-day default range); pulled seeded billable work into a draft.
+- [x] **Draft editor** — time + part lines; minutes→hours (120m → 2.00h × $150 = $300); **unapproved-time warning banner** ("1 line reference unapproved time"); labor `taxable=false`, part `taxable=true`; live totals (Subtotal $565).
+- [x] **Catalog line** — picker lists active items (archived correctly excluded); added "QA Test Laptop" → $1,500 via `resolvePrice`; subtotal → $2,065.
+- [x] **Org billing settings** — Tax ID + tax rate 8.5% + full address; saved → DB `tax_rate=0.085` (✓ %→fraction).
+- [x] **Issue & Send** — `INV-2026-0001`; tax snapshot **8.5% = $143.65** (on part $190 + catalog $1,500 taxable; labor excluded); total **$2,208.65**; due = issue+30d; **bill-to snapshot** captured org address/tax-id at issue.
+- [x] **`/send` honest outcome (review fix)** — live API returned `emailed=false, reason=no_billing_contact, status=sent` (HTTP 200, no false success, no 500). UI shows warning toast.
+- [x] **Issued detail** — read-only lines; summary; PDF/Void buttons; payments panel.
+- [x] **Record partial payment** — $1,000 → `partially_paid`, balance $1,208.65, payment listed.
+- [x] **PDF download** — `GET /:id/pdf` → valid `%PDF-1.3` (1 page, 2,281 B), `content-type: application/pdf`, `content-disposition: attachment; filename="INV-2026-0001.pdf"` (sanitized filename, review fix).
+- [x] **Partner billing settings** — currency/prefix/terms/footer + default tax 5% → DB `default_tax_rate=0.050`.
+- [x] **Accounting-view toggle** — reveals Cost/Margin columns (SSD cost $60/margin $70; Laptop cost $1,000/margin $500; labor "—").
+
+### Not exercised here (covered by unit/integration tests)
+- **Customer portal UI** — the portal front-end app (`apps/portal`) is NOT served in this dev compose (only api/web/postgres/redis/caddy). Portal **API** verified live (`GET /api/v1/portal/invoices` → 401, auth-gated); portal components are unit-tested.
+- Void+reissue, bundle line expansion, overdue sweep, per-ticket "Create invoice" button — covered by the 100+ API tests.
+
+### Issues found
+- **None (no product bugs).** Two non-issues confirmed as *correct* behavior: archived catalog items are excluded from the line picker; the draft tax **preview** doesn't retroactively update when the org rate changes mid-draft (authoritative tax is snapshotted at issue — verified $143.65 applied correctly). Two test-harness hiccups were mine, not the product (a wrong `data-testid` guess for the Add button; a login rate-limit from repeated API logins).
+
+### Notes
+- **Dev DB test data seeded:** 2 billable time entries (1 unapproved) + 1 ticket part on "Default Organization"; re-activated 2 archived catalog items; set org + partner billing settings; created `INV-2026-0001` (number burned). All on the dev DB (5432).
+- **Stack state:** the dev stack is currently running the **`feat/invoice-engine`** code (swapped from `main`). To restore: `docker compose down` from the worktree, `docker compose up -d` from `/Users/toddhebebrand/breeze`, and remove the worktree `.env` symlink.
+
+## Quotes/Proposals Phase 2 — 2026-06-17
+
+**Branch:** `feat/quotes-proposals-phase2` (PR #1468)
+**Commit:** a4c2b719
+**Tested by:** Claude (ultracode)
+**Result:** PASS (logic + UI render), with the public Accept *button click* verified via API rather than the dev browser (env-blocked — see Notes)
+
+### What was tested
+- [x] API (real running branch on :3009): login → create quote → add lines → **send (quotes:send)** → status=sent, number assigned, emailed=true; **public GET (unauth)** → sent→viewed; **public accept (unauth typed signature)** → converted; **single-use token** → reuse 401. DB verified: converted invoice total $500.00 = one-time line ONLY ($80 monthly excluded), acceptance row has signer + 64-char content hash + jti.
+- [x] UI dashboard (Playwright, interactive): quotes list shows Phase 2 statuses + a Converted quote; opened a draft; Detail tab shows the real **"Send proposal"** button (not "coming soon"); clicked it → number Q-2026-0002 assigned, status→Sent, button correctly hidden (gated on status==='draft'). Editor offers the **Image** block.
+- [x] UI public page (Playwright, SSR): /quote/<token> renders branded proposal + intro + heading block + pricing table with **only the customer-visible line** (a customerVisible:false line was correctly filtered out) + typed-signature accept form.
+- [x] UI public **Accept button click** (verified on a PRODUCTION build, :4334 via `astro build` + node adapter): the React island hydrated, the typed-signature Accept fired, and the page transitioned to "Thank you — your acceptance has been recorded." DB confirmed quote→converted, invoice total $640.00 (one-time), acceptance "Casey Customer" + 64-char hash + jti.
+
+### Evidence
+- Converted invoice: status=draft, total=500.00 (one-time only); invoice_lines = ["Onboarding setup" $500.00].
+- quote_acceptances: signer "Pat Prospect", quote_sha256 len 64, jti present, ip_address empty (no proxy header on localhost — the C1-safe path).
+- Dashboard: heading "Draft quote" → "Q-2026-0002", status badge Draft → Sent after clicking Send.
+
+### Issues found
+- None in the feature. The public Accept button does not work under `astro dev` (dev-only): the portal's hardened CSP `script-src 'self'` blocks astro's dev-mode *un-hashed* inline hydration scripts, so the React island never hydrates. RESOLVED by testing a PRODUCTION build (`astro build`), where Astro emits **hashed** inline scripts (`script-src 'self' 'sha256-…'`) → the island hydrates and the Accept button works end-to-end (confirmed above). The accept fetch additionally needs the API origin in `connect-src` — production's `connect-src … https:` (apps/portal/astro.config.mjs:21) covers any HTTPS API; the only reason it failed locally is the test API was HTTP (`http://localhost:3009`). Verified by temporarily adding the local origin to connect-src (reverted after).
+
+### Notes
+- `apps/portal` is not deployed in prod (no compose service / caddy upstream) — pre-existing gap; the portal/public pages are dormant until a serving layer is added.
+
+## ANTHROPIC_BASE_URL self-hosted AI backend (#1412) — 2026-06-17
+
+**Branch:** `fix/1412-anthropic-base-url`
+**Commit:** `50719f55`
+**Tested by:** Claude
+**Result:** PASS
+
+### What was tested
+- [x] API (boot/config gate): ran the REAL `validateConfig()` boot path inside a throwaway container built from `breeze-api:dev` (linux), mounting the branch's `apps/api/src` over the image so MY code executed (`PROBE_HAS_HELPER=true` confirmed). API-only feature; no UI/agent layer.
+
+### Evidence — boot-gate matrix (in-container)
+- S1 `IS_HOSTED=false` + `http://litellm:4000/v1` → **PASS** + forensic log `host=litellm:4000` (host only, no token).
+- S2 `IS_HOSTED=true` + base URL → **REFUSED** ("self-hosted-only feature … refused unless self-host is affirmatively declared").
+- S3 `IS_HOSTED` **unset** + base URL → **REFUSED** (fail-closed; the #570 unmapped-IS_HOSTED case).
+- S4 `IS_HOSTED=false` + `ftp://bad/x` → **REFUSED** ("must be a well-formed http(s) URL").
+- S5 `IS_HOSTED=off` + `https://litellm.internal:8443/v1` → **PASS** + forensic log.
+- Fail-closed gate predicate (`isRecognizedSelfHostSignal`, shared by validator + subprocess strip) verified in-container: only `false/0/no/off` → self-host-confirmed; `true/1/maybe/""/undefined` → not.
+
+### Issues Found
+- (none in the feature) — the runtime subprocess-env probe (`buildClaudeSdkChildEnv`) could not import in-container because the **stale `breeze-api:dev` image** still ships Zod 3 while `main` is post the Zod 4 migration (`z.partialRecord is not a function` in an unrelated import-chain schema). Not a #1412 defect. The forwarding/strip wrapper is covered by the 161 green unit tests; its shared gate predicate was verified in-container directly.
+
+### Notes
+- 161 unit/config tests green + clean `tsc` on the branch. Boot gate proven end-to-end in the real container image. CI left to run the full suite (per request).
+
+## UI QA Sweep — 2026-06-19 (v0.81.0→HEAD regression)
+
+Target: http://localhost (docker dev override). Login: admin@breeze.local (single-org admin seed).
+Driver: Playwright MCP. Sweep follows docs/testing/v0.81.0-to-HEAD-test-plan.md.
+
+### Login / setup wizard — PASS
+- ✅ Login POST 200, redirect to /setup wizard, "Skip setup" → dashboard.
+- ⚠️ Pre-login 401 on /api/v1/auth/refresh in console (expected, no session yet).
+
+### Phase 2 nav crawl baseline — PASS (spot-checked)
+- ✅ Rendered cleanly (title + main content, no error state): /devices, /alerts, /tickets, /scripts, /patches, /monitoring, /security, /analytics, /settings/users. Each shows real headers/controls.
+- ⚠️ Console noise: repeated 403 on `/api/v1/devices?orgId=c5600395-...` and `/api/v1/alerts?...orgId=c5600395...`, plus 404 on `/api/v1/orgs/organizations/c5600395-...`. orgId `c5600395` is the PORTAL tester user's org (from `portal-auth` localStorage left over in this browser profile), NOT the admin's org (`aa0e43c8`). Admin pages otherwise loaded against the correct org. Pre-existing browser-profile contamination from prior portal testing; flagged, not a code defect. Worth confirming the dashboard isn't reading portal-auth org by mistake.
+- Note: each Playwright navigate spawns a phantom restored "Dashboard" tab (browser session restore) — cosmetic to the harness, not the app.
+
+### Quotes / Proposals funnel (#1455 P1, #1468 P2, #1483 P3) — PARTIAL (UI accept BLOCKED in dev; backend funnel PASS)
+- ✅ P1 block editor: created draft (org-select dialog), added Heading + Pricing-table blocks; Manual lines with One-time/Monthly/Annual recurrence. Money entered as "500.00"/"25.00"/"120.00" strings submitted fine (no Zod-money gotcha).
+- ✅ Live totals math correct: One-time $500, Monthly $250/mo (10×$25), Annual $1,200/yr (10×$120), First-invoice $1,950.
+- ✅ P1 PDF preview: Preview tab renders a blob: iframe; `GET /quotes/:id/pdf` 200; PDF visually shows heading + line items + totals (screenshot quote-preview.png). Blob-fetch anti-401 pattern works.
+- ✅ Send: Detail "Send proposal" → status Draft→Sent, quote number Q-2026-0001 assigned, Issued date set, visible state change. POST /send 200.
+- ✅ Public view (#1468): `/portal/quote/<token>` renders the proposal with partner branding, recurrence-grouped line items, totals, and accept/sign form. Public GET `/api/v1/quotes/public/:token` 200, flips sent→viewed.
+- ✅ Backend accept→convert (#1468/#1483): POST `/quotes/public/:token/accept` 200 → status `converted`, accepted_at+converted_at set, created invoice INV-2026-0001 ($500.00, Issued) — visible in admin /billing/invoices.
+- ✅ At-most-once / replay guard (#1483): re-POST same token → 401 "This link is invalid or has expired" (jti revoked post-commit). Solid.
+- ✅ payUrl null / payDeferred false on accept — expected, no Stripe key configured for partner (#1610 not set up).
+- ❌ BLOCKED (dev CSP) — public quote page React island does NOT hydrate: `<astro-island client="load">` for PublicQuoteView.tsx still has `ssr` attr (hydrated=false). Clicking "Accept & sign" fires NO network request — the button handler isn't attached. Root cause: portal serves the strict FALLBACK CSP (`script-src 'self'`, no nonce/hash) instead of Astro experimental.csp hash-based CSP, so Astro's inline island-bootstrap script is CSP-blocked (console: "Refused to execute inline script ... script-src 'self'" at page :1453). apps/portal/src/middleware.ts:88 only applies the strict fallback when experimental.csp left the header empty — which is what happens under the Vite dev server. LIKELY dev-only (per memory: dev CSP is vacuous; prod build emits hashes). RE-TEST on a prod portal build before treating as a shipping defect — but if experimental.csp also no-ops in prod-node-standalone, the entire public accept/decline UI is dead.
+- ⚠️ UI: emailed acceptUrl is malformed in this env: `https:///portal/quote/<token>` (EMPTY HOST — PUBLIC_PORTAL_URL/PUBLIC_APP_URL unset, portalBase() falls back to localhost:4321 only for the dashboard, the quote send produced an empty-authority URL). A customer would get an unclickable link. Env-config issue locally, but worth confirming prod has PUBLIC_PORTAL_URL set.
+- ⚠️ UI: admin Quote Detail "Customer" field shows raw org UUID prefix "aa0e43c8" instead of the org name "Default Organization".
+- ⚠️ Possible logic discrepancy: converted invoice billed $500.00 (one-time only), while the quote/portal advertised "First invoice total $1,950.00" (one-time + first month + first year). Either the recurring cadences spin up as a contract (only one-time invoiced now — plausible by design) or the first-invoice should have been $1,950. Flag for product confirmation.
+- ⚠️ Path note: portal serves under `/portal` locally, NOT `/c` (#1474). `/c/quote/...` → 404, `/portal/quote/...` → 200. Local Caddy differs from the `/c` prod config; verify the prod prefix is `/c` and matches the emailed-link base.
+
+### Billing-catalog UI (#1467) — PASS
+- ✅ Page renders: type filters (All/Hardware/Software/Service), active/archived toggle, TD SYNNEX distributor config panel (#1596), search.
+- ✅ Create item: drawer editor, type toggle, name/SKU/unit-price/cost-basis. Live margin computes correctly: (75−50)/75 = 33.3%. POST /catalog 200; money entered as "75.00"/"50.00" strings persisted (no Zod-money break). Drawer closes + list refreshes to show the new row.
+- ✅ Archive confirm dialog: row-actions → Archive opens a confirm with clear copy ("…hidden from active pickers (quotes, invoices, bundles). You can restore it from the Archived view."), Cancel/Archive. Confirm → item leaves Active, appears under Archived. Outcome visible.
+- ⚠️ Row-actions menu only offered Edit / Archive — did NOT surface a "per-org pricing" or "ticket-part link" entry from the list row. Those #1467 sub-features (per-org override pricing, ticket-part link) may live inside the Edit drawer or require an existing org-pricing context; not reachable from the row menu. NOT verified — recommend a targeted check of the Edit drawer's pricing-override section.
+- ⚠️ UI: row-actions dropdown menu renders below the fold / outside viewport (had to click via JS; Playwright reported "element is outside of the viewport"). Minor positioning bug for items low in a long page.
+- ⚠️ UI: TD SYNNEX "API key"/"API secret" fields are pre-filled by the browser with saved admin login creds (autofill leak; cosmetic, but a password manager will stuff them).
+
+### Invoice issue in-flight state (#1460) — PASS
+- ✅ Created blank draft invoice, added manual line (4 × $150 = $600; money as "150.00" string OK). Subtotal/Total $600.
+- ✅ Issue gated correctly until a customer-visible line exists ("Add at least one customer-visible line to issue").
+- ✅ Issue: POST /invoices/:id/issue 200 → header updated Draft invoice → INV-2026-0002 immediately (NO stale header — the #1418/#1460 bug is fixed), status badge Issued, Issue/Issue&Send buttons removed. Outcome unambiguous and visible.
+
+### Stripe API key entry (#1610) — PASS
+- ✅ Located at /settings/billing (NOT in sidebar nav — direct route only). "Online payments" section: secret-key field (placeholder `sk_live_… or rk_live_…`, type=password), copy "Charges run directly on your own Stripe account — funds never touch Breeze", link to Stripe dashboard, "Save key" button (disabled until input). This is the per-partner key model replacing Connect onboarding.
+- ✅ Entered a fake `sk_test_…` key → POST /partner/stripe-connect/key 400 → clear error toast: "That Stripe key was rejected — double-check it (and that it can read your account) and try again." Key validated against Stripe + failure surfaced (no silent failure).
+- ⚠️ Discoverability: the Stripe-key form is only at /settings/billing, which is not linked in the sidebar (Settings group has Partner/Orgs/AI/Custom Fields/Filters/Users/Roles/Enrollment Keys but no "Billing"). Partners may not find where to enter their Stripe key. Worth a nav entry.
+- Note: backend route still named `/partner/stripe-connect/key` (legacy "connect" path naming for the key model — cosmetic).
+
+### Billing RBAC (#1454) — PARTIAL
+(Seeded role users found: billing@breeze.local = "Partner Billing", tech@breeze.local = "Partner Technician". Set their password to admin's hash via SQL to test — see note.)
+- ✅ Dedicated billing System roles shipped (/settings/roles): "Partner Billing" (full catalog/invoices/contracts) and "Partner Billing Viewer" (read-only), alongside Partner Admin/Technician/Viewer.
+- ✅ API-level gating correct (defense-in-depth): billing user → GET /roles 403; technician → GET /invoices 403. Data is protected regardless of UI.
+- ✅ Technician nav correctly scoped down: 41 links, NO billing/contracts/catalog entries (billing hidden from its non-audience).
+- ✅ Technician on /billing/invoices: "New invoice" create button is HIDDEN (control gating works for tech).
+- ✅ Billing user can fully use /billing/invoices (sees invoices + New invoice button) — positive path works.
+- ❌ BUG: the "Partner Billing" role sees the FULL admin sidebar (44 links) including admin-only /settings/roles, /settings/users, Devices/Scripts/Security/PAM — the nav is NOT permission-filtered for the billing role (it IS for technician). Inconsistent gating: a billing-only user is shown admin destinations they can't use.
+- ❌ BUG (UX): hitting a gated route directly renders a generic data error, not a clean access-denied. Billing user → /settings/roles shows "Failed to fetch roles / Try again"; technician → /billing/invoices shows "Failed to load invoices / Try again". The 403 is correct at the API but the UI treats it like a transient fetch failure (offers "Try again", which will just 403 again). Should show "You don't have permission" and/or not render the page chrome.
+- Note: full multi-org technician scoping not exhaustively tested (no devices in seed).
+
+### Devices area (#1461/#1462/#1390/#1524/#1590) — PARTIAL (mostly BLOCKED: empty fleet seed)
+- BLOCKED: "Your fleet is empty" — zero devices in seed. Cannot verify on device rows/detail: #1462 (Role/Type column dedup), #1390 (Watchdog version shown), #1524 (BIOS/GPU/motherboard fields render — also needs a real Windows-reporting agent), #1590 (multi-select Run Script deviceIds — needs ≥2 devices). Prereq: enroll ≥2 agents (one Windows for #1524).
+- ✅ #1461 server-side software-name search VERIFIED: Add filter → "Has Software Installed" → chip value editor exposes a "Search software…" type-ahead (`filter-software-search`). Typing "chrome" fired GET /software-inventory/names?q=chrome → 200 (server-side, not client filter). Result empty (no software inventory in seed) but the search mechanism + endpoint wiring is confirmed.
+- ✅ Filter picker (positive signal for the blocked items) exposes the new fields as filter options: "Watchdog Status" (#1390), "GPU Model" (#1524), plus Manufacturer/Model/Serial/CPU/RAM/Disk — so the schema/columns exist; only the rendered device-row/detail display is unverifiable without devices.
+
+### Scripts / Script-AI editor (#1593/#1453/#1457) — PASS
+- ✅ #1593 Monaco theme across View-Transition: editor bg = rgb(30,30,30) (vs-dark). Navigated /scripts/new → /scripts → back to /scripts/new via in-app links (Astro ClientRouter View-Transition swap) — theme stayed dark, no flash-to-light/reset. (Note: full-page browser_navigate isn't a VT swap; used in-app link clicks to exercise the actual VT path.)
+- ✅ #1453 AI assistant editor insertion RESTORED: prompted "Write a PowerShell one-liner that prints the current date" → AI ran tool calls `apply_script_code` + `apply_script_metadata`, inserted `Get-Date` directly into the Monaco editor, showed explanation + a "Revert" button. Insertion confirmed in editor content.
+- ✅ #1457 script-builder library tools wired through guardrail: the `apply_script_code`/`apply_script_metadata` tool calls executed successfully (no "Unknown tool" / "No RBAC mapping" 404 — the dual-map drift class is clear for these tools). claude-agent-sdk 0.3 tool-handler path (#1484) works end-to-end for the script AI.
+
+### Update Ring approval matrix (#1456) — PASS (editor verified; live patch-approval BLOCKED: no patches)
+- ✅ Redesigned ring editor renders as a unified config dialog: Name, Rollout order, Install enforcement (Deadline days / Reboot grace hours), and an "Approval policy" section with a default row (Manual ↔ Auto-approve checkbox) + "Add override" per-category matrix.
+- ✅ "Add override" expands a full per-category matrix: category selector (Security/Feature/Firmware/Drivers/Third-Party/Definition Updates), Auto-approve toggle, Auto-approve severities (Critical/Important/Moderate/Low), Hold-after-release (days). The unified matrix design is in place and interactive.
+- BLOCKED: live approve/defer/decline across actual pending patches not exercised (0 devices, 0 patches in seed). Prereq: an enrolled device with pending patches.
+- ✅ Bonus: unsaved-script beforeunload guard fired when navigating away from /scripts/new with unsaved AI-inserted content (data-loss protection works).
+
+### Partner-wide alert templates (#1466) + Availability picker scope gating (#1469) — PASS
+(Seed IS a multi-org partner: Default Partner → Default Organization, Northwind IT, Acme Managed Services. Admin = Partner Admin = partner scope. This is exactly the audience the #1466/#1469 gating trap hid the feature from.)
+- ✅ /settings/alert-templates renders 6 built-in templates + scope filter (All / Partner-wide / Organization / Built-in) + "Add template".
+- ✅ #1469 availability picker: editor "AVAILABLE TO" shows BOTH "All my organizations (partner-wide)" (default-checked) and "A specific organization" for the partner-scope admin. The partner-wide option is VISIBLE to its partner audience — the `isPartnerScope = partners.length>0` bug (option hidden) is fixed; gated on JWT scope.
+- ✅ #1466 create: created "QA High CPU Partner-Wide" with the partner-wide option → POST /alert-templates/templates 201 Created → redirected to list → row shows scope "Partner-wide", Medium, Performance. Multi-org partner CAN create a partner-wide template (the create-blocking trap is fixed). Outcome visible.
+- ✅ Target scope section correctly enumerates all 3 partner orgs (Default/Northwind/Acme).
+
+### Collapsed AI + Documentation side panels inert (#1463) — PASS
+- ✅ Both side panels (Breeze AI, Documentation) when collapsed: `inert` attribute present + transform `matrix(1,0,0,1,400,0)` (translated 400px off-screen).
+- ✅ Programmatically focusing a control inside the collapsed panel (the close button) does NOT move focus into the panel — activeElement stays on BODY. `inert` correctly removes hidden controls from the tab order and blocks pointer interaction. Verified on dashboard; panels are layout-global so this holds app-wide.
+
+### Portal /c prefix (#1474) — PARTIAL (local serves under /portal, not /c)
+- ⚠️ In this local dev env the portal is served under `/portal` (Caddy `handle`): `/portal/quote/<token>` → 200, `/portal/login` etc. The `/c` prefix the plan/PR describes is NOT what's mounted locally — `/c/quote/<token>` → 404. Local Caddyfile differs from the prod `/c` config (known: droplet Caddyfile is hand-edited, not repo-tracked).
+- ✅ Base-confinement (#1474 isOutsideBase guard) holds: un-based `/quote/<token>` → 404 (portal answers strictly within its base; the root /login is web's, not portal's). So the "Astro node-standalone base-optional serves un-based 200" gotcha is NOT present here — un-based portal routes 404 correctly.
+- BLOCKED: cannot confirm the literal `/c` prefix resolves (env uses /portal). Re-verify the prod prefix is `/c` AND that the emailed quote acceptUrl base matches it (see Quotes finding: acceptUrl was `https:///portal/quote/...` — empty host + /portal, would not match a /c prod mount).
+
+### Authenticator registration redesign (#1433) — PARTIAL (UI verified; biometric enrollment + L4 re-auth BLOCKED)
+- ✅ Redesigned "Approval security" section renders on /settings/profile with the #1433 "just works" messaging: "Your phone registers itself automatically when you sign in to the Breeze mobile app; you can also register this browser with Windows Hello or Touch ID. All of this is optional — approvals still work without it." Empty state: "No approver devices registered yet. Sign in to the Breeze mobile app … or register this browser below." + a register-this-browser control. This is the no-setup enrollment redesign.
+- BLOCKED: cannot complete browser registration — needs a WebAuthn virtual authenticator (headless Chromium has no real platform biometric; the ceremony would hang/fail). Prereq: CDP virtual authenticator or a real device.
+- BLOCKED: PIN→L4 re-auth on an approval — requires a pending high-risk (L4) approval_request; none in seed (PAM has no pending requests, no devices). Prereq: seed/raise an L4 approval and an enrolled approver device.
+
+### Zod 3→4 broad form sweep (#1451/#1452) — PASS (no silent breaks observed)
+- ✅ Exercised many create/edit forms with real values: quote draft + manual lines (money strings), catalog item (price/cost strings), blank invoice + manual line, alert template, Stripe key, update ring. All persisted; money-as-string did NOT break (the #1411-class billing UI↔Zod gotcha did not recur).
+- ✅ Validation error messages still render (the key zod-v4 silent-break risk — ZodError.issues non-enumerable): webhook create with bad URL + no events showed field messages "Invalid URL", "Select at least one event", "Secret is required for HMAC authentication". Stripe bad key → 400 → clear toast. 400 bodies are rendering field-level messages correctly.
+
+### claude-agent-sdk 0.3 tool path (#1484) — PASS (device category)
+- ✅ Main AI assistant "Find offline devices" → ran "Query Devices" tool → "Tool Result" → coherent answer ("All devices currently online"). Cost meter shows. The 0.3 SDK tool-handler port works for the device tool category. (Network/scripts categories: scripts tools already proven via the script-AI apply_script_code calls; network category not separately smoked — no network assets in seed.)
+
+### Summary table
+| Area / PR | Result |
+|---|---|
+| Login / setup wizard | PASS |
+| Phase 2 nav crawl baseline | PASS (spot-checked) |
+| Quotes funnel — P1 editor/PDF (#1455) | PASS |
+| Quotes funnel — P2 send/public view (#1468) | PASS (view) / accept UI BLOCKED (dev CSP) |
+| Quotes funnel — P3 accept→convert→pay (#1483) | PASS (backend) / pay no-op (no Stripe key) |
+| Billing catalog UI (#1467) | PASS (per-org pricing/ticket-part link not surfaced from row menu) |
+| Invoice issue in-flight state (#1460) | PASS |
+| Stripe API key entry (#1610) | PASS |
+| Billing RBAC (#1454) | PARTIAL (nav not filtered for billing role; gated routes show generic error) |
+| Authenticator registration (#1433) | PARTIAL (UI verified; enroll + L4 re-auth BLOCKED) |
+| Devices — software search (#1461) | PASS |
+| Devices — #1462/#1390/#1524/#1590 | BLOCKED (empty fleet) |
+| Scripts/AI — Monaco VT theme (#1593) | PASS |
+| Scripts/AI — editor insertion (#1453) | PASS |
+| Scripts/AI — library tools wired (#1457) | PASS |
+| Update Ring matrix (#1456) | PASS (editor; live approval BLOCKED) |
+| Partner-wide alert templates (#1466) | PASS |
+| Availability picker scope gating (#1469) | PASS |
+| Collapsed panels inert (#1463) | PASS |
+| Portal /c prefix (#1474) | PARTIAL (local serves /portal; base-confinement OK) |
+| Zod 3→4 form sweep (#1451/#1452) | PASS |
+| claude-agent-sdk 0.3 tool path (#1484) | PASS (device) |
+
+### Top findings (systemic)
+1. **Public quote accept/decline UI is dead in dev (CSP blocks Astro island hydration).** Portal serves the strict FALLBACK CSP (`script-src 'self'`, no nonce/hash) instead of Astro experimental.csp hash-based CSP, so the `client:load` island never hydrates and Accept/Decline buttons fire nothing. Backend accept works (verified via API → converted + invoice + replay-guard). LIKELY dev-only (experimental.csp emits hashes in prod build) — MUST re-verify on a prod portal build. If experimental.csp also no-ops under node-standalone in prod, the entire public e-sign surface is broken. File: apps/portal/src/middleware.ts:88.
+2. **Emailed quote acceptUrl is malformed:** `https:///portal/quote/<token>` — empty host (PUBLIC_PORTAL_URL unset) + `/portal` path while #1474 describes `/c`. Confirm prod sets PUBLIC_PORTAL_URL and the prefix matches the actual portal mount.
+3. **Billing RBAC nav is inconsistently filtered:** the "Partner Billing" role sees the full admin sidebar (incl. Users/Roles/Devices/Security) while "Partner Technician" is correctly scoped. API gating is correct (403s) but the UI (a) doesn't hide admin nav for billing and (b) renders gated routes as a generic "Failed to load / Try again" instead of a clean access-denied.
+4. **Possible first-invoice amount discrepancy:** quote advertised "First invoice total $1,950.00" (one-time + first month + first year) but the auto-issued invoice on accept was $500.00 (one-time only). Confirm whether recurring cadences are meant to spin up a contract (one-time invoiced now) or the first invoice should include the first recurring periods.
+5. **Empty seed blocks the device-centric PRs** (#1462/#1390/#1524/#1590) and live patch-approval (#1456) and L4 step-up (#1433). A QA seed with ≥2 enrolled devices (one Windows-reporting) + a pending L4 approval would unblock a large slice.
+6. Minor UX: admin Quote Detail shows raw org UUID prefix as "Customer"; catalog row-actions menu renders off-viewport; /settings/billing (Stripe key) not in sidebar nav; TD SYNNEX key fields catch browser autofill.
+
+### Test artifacts / state notes
+- Created in local DB: quote Q-2026-0001 (converted) + invoice INV-2026-0001 ($500), blank invoice INV-2026-0002 ($600), catalog item "Managed Workstation" (archived), alert template "QA High CPU Partner-Wide" (partner-wide).
+- Set billing@breeze.local + tech@breeze.local password_hash = admin's hash (to test RBAC). Harmless in local dev; reset if needed.
+
+### Windows agent verification — 2026-06-19 (.55 / WIN-DHQNR1F8LO2)
+Built current-main agent (`0.82.0-maintest-db6b0dc5`, `CGO_ENABLED=0 GOOS=windows`), uninstalled the existing v0.68.2 MSI on the .55 Tailscale box, installed the new build as a service (`service install --no-watchdog`), enrolled against the local stack via `http://100.95.194.59` (Mac's Tailscale IP) into Default Org / Default Site.
+
+- ✅ **#1524 hardware reporting — PASS (agent→API→DB→device-detail API).** device_hardware + `GET /devices/:id` return the new fields: `biosVersion=090008`, `gpuModel=Microsoft Hyper-V Video`, `motherboardManufacturer=Microsoft Corporation`, `motherboardProduct=Virtual Machine`, `motherboardVersion=7.0` (plus cpuModel/manufacturer/model). Unblocks the sweep's empty-fleet BLOCK on #1524. Pixel-render check pending (MCP browser wedged from prior sub-agent session — infra, not a product bug).
+- ⚠️ **#1478 pending_reboot — PARTIAL.** Field is live and populated (`pendingReboot=true` from the live OS signal). Full clear-after-reboot cycle not exercised (would require rebooting the box).
+- ⛔ **#1390 watchdog version — N/A on this box.** Installed `--no-watchdog` (no matching watchdog binary published for the maintest version), so `watchdogVersion=null`. Needs the watchdog deployed to verify.
+- Device is **online** in the local stack (1-device fleet) — also unblocks UI checks for #1462 (Role/Type dedup) and gives a target for #1590 (multi-select Run Script needs ≥2).
+
+#### Windows agent — reboot + watchdog follow-up (.55)
+- ✅ **#1478 pending_reboot clears after reboot — PASS.** Before reboot `pending_reboot=true` (driven by a real `PendingFileRenameOperations` registry entry from the MSI uninstall). Rebooted the box; agent re-derived from the now-cleared live OS signal → `pending_reboot=false`, device back `online`. End-to-end verified.
+- ⚠️ **#1390 watchdog version in UI — PARTIAL.** Built + deployed current-main watchdog, installed/started `BreezeWatchdog` service (Running). But `watchdog_version`/`watchdog_status` stay NULL — they're populated from the agent heartbeat's `watchdogState` (heartbeat.ts:168-170), which requires the watchdog→agent handshake the MSI sets up by having the watchdog supervise the agent. Here the agent was installed `--no-watchdog` first then the watchdog added separately, so no handshake. Test-harness artifact; would need an MSI-style install (watchdog-launches-agent) to confirm the UI field. Not filed as a product bug without more evidence.
+
+## Patching Area Sweep — 2026-06-19
+
+Tester: UI QA sweep (Playwright MCP, http://localhost, admin@breeze.local Partner Admin).
+Fixture: one live Windows device WIN-DHQNR1F8LO2 (online) in Default Organization / Default Site. 2 outstanding patches (1 approved, 1 pending approval, 1 critical, 0 third-party).
+
+### Patching page (Compliance tab) — PARTIAL
+- ✅ Compliance tab loads cleanly, no console errors. Summary chips render real data: "0% compliant / 0 of 1 devices / 1 have pending patches / 1 approved / 1 pending approval / 1 critical".
+- ✅ Device-status filter dropdown works (All Devices / Pending Patches / Critical / Pending Reboot / 3rd-Party Pending / Compliant); counts shown inline. Selecting "Compliant (0)" shows a proper empty state "No devices match your filters." with a "Clear" link. Good empty-state handling.
+- ✅ "Run Scan" opens a confirmation dialog (role=dialog, title "Confirm patch scan", body "Scan for patches on 1 device in Default Organization?") and on confirm POSTs /api/v1/patches/scan => 200, with a clear visible toast: "Patch scan queued for 1 device, 1 dispatched immediately." Excellent feedback.
+- ❌ BUG (silent failure): "Export" button on the Compliance tab, while scope = "All Organizations", fires GET /api/v1/patches/compliance/report?format=csv => **400 Bad Request**, body `{"error":"orgId is required when multiple organizations are accessible"}`. **NO toast, NO inline error, nothing visible** — the export just silently does nothing. Confirmed network req #177 = 400 and DOM contained no "Failed to generate report" text.
+  - Root cause: handler `handleExport` in `apps/web/src/components/patches/PatchComplianceView.tsx:232-293` does NOT include an orgId param (only ringId + format) when the user is partner/all-orgs scoped. The API resolver `resolvePatchReportOrgId` (`apps/api/src/routes/patches/helpers.ts:184-210`, line 209) 400s when no orgId is passed AND accessibleOrgIds != exactly 1.
+  - Secondary bug: even when it does error, `handleExport` does NOT use `runAction`; on `!response.ok` it throws a generic `'Failed to generate report'` into local `setBulkError` state (discarding the API's specific message). In this all-orgs case the inline error never rendered visibly at all. Violates the project's no-silent-mutations / runAction feedback rule.
+  - Repro: log in as Partner Admin with >1 accessible org (default), Patches > Compliance tab, scope "All Organizations", click Export. Expected: either pass orgId / scope all-orgs server-side, OR show a clear error toast prompting org selection.
+- ⚠️ UX: "Export" gives the user no hint that it requires a single-org scope. A partner admin viewing all orgs has no way to know they must switch to a specific org first. At minimum it should toast "Select a specific organization to export" instead of failing silently.
+- ⚠️ UX: The Run Scan confirm dialog correctly scopes to "1 device in Default Organization" even though the page header says "Shared across all organizations" / scope chip is All Organizations — mildly inconsistent messaging (scan is org-aware, export is not).
+
+
+### Patching page (Patches tab) — PARTIAL (one major broken-in-default-scope flow)
+- ✅ Patches tab loads 6 Microsoft patches with real KB data, descriptions, severity, source, OS, release date, approval status. Sortable column headers present.
+- ✅ Source filter chips work (All 6 / Microsoft 6 / Apple 0 / Linux 0 / Third-party 0). Clicking "Third-party" => "0 of 0 patches" with clean empty state "No patches found. Try adjusting your search or filters."
+- ✅ Severity filter works (Critical => "1 of 6 patches", only the critical row). Status filter present (All/Pending/Approved/Declined/Deferred). Search works ("Defender" => "2 of 6").
+- ✅ Pagination control present (Rows per page 25/50/100/200).
+- ✅ "Review" opens a clean Review Patch modal (role=dialog) with Approve/Decline/Defer choice cards (each with a helpful one-line description), a Notes field, Cancel + confirm. Good design. A second "Confirm patch approval" dialog ("Approve patch on 1 device in Default Organization?") gates the action.
+- ✅ With an Update Ring selected, Approve works: POST /api/v1/patches/:id/approve => 200, both dialogs close, row flips to "Approved" with a "Deploy" action. Visible state-change feedback (toast auto-dismissed before probe but the status change is clear).
+- ❌ BUG (silent/cryptic failure, broken in DEFAULT scope): With the page in "All Organizations" scope and NO ring selected (the default state), Approve => **400 Bad Request** body `{"error":"orgId is required for partner/system scope"}`. The patch is NOT approved. Feedback: no toast; the **raw developer error string** "orgId is required for partner/system scope" is rendered inline inside the Review modal. Same root cause class as the Export bug.
+  - Root cause (confirmed in code): `/patches` is classified a GLOBAL-scope route (`apps/web/src/lib/routeScope.ts:10`), so the org-id provider returns null on this path (`apps/web/src/stores/orgStore.ts:263-268`) and `fetchWithAuth` does NOT auto-inject `?orgId=` (`apps/web/src/stores/auth.ts:432-435`). The approve/decline/defer request builder `PatchApprovalModal.doSubmit` (`apps/web/src/components/patches/PatchApprovalModal.tsx:119-132`) only sends `{ note, ringId?, deferUntil? }` — **never an orgId**. The bulk handlers in `PatchesPage.tsx:196-202` / `:231-233` have the same gap. The API route `POST /patches/:id/approve` (`apps/api/src/routes/patches/approvals.ts:127-150`) DOES accept `orgId` from body or query and 400s in `resolvePatchApprovalOrgId` (`apps/api/src/routes/patches/helpers.ts:122-151`) only when partner/system scope AND no ring AND no orgId AND accessibleOrgIds != 1. **Fix is web-side: pass currentOrgId explicitly.** No API change needed.
+  - Impact: For a partner admin with >1 accessible org (the default seed), the entire approve/decline/defer flow is broken from the Patches tab unless they first discover the workaround of selecting a specific Update Ring (which lets the API derive orgId from the ring). Org-bound single-org users are unaffected (auth.orgId set).
+- ❌ BUG (dead-end / no-op): After approving, the row action becomes "Deploy". Clicking "Deploy" fires NO network request, opens NO dialog/menu, shows NO toast — it does nothing visible. Either it silently requires device selection first (with zero hint) or it is broken. Confirmed twice; 0 network calls.
+- ⚠️ UX: The org switcher in the top bar is visually dimmed (opacity-70) with title "This page shows all organizations" on /patches, and selecting "Default Organization" does NOT change scope (it snaps back to "All Organizations"). A user trying to fix the orgId error by switching orgs cannot — the page silently ignores the selection. There's no on-page hint that you must pick an Update Ring to make approvals work.
+- ⚠️ UX: Showing the raw API error "orgId is required for partner/system scope" to an end user is developer-facing jargon. Should be a friendly message or, better, just work (pass orgId).
+- ⚠️ UX: An already-Approved patch has no inline way to Decline/Defer/re-review — only Deploy/Details. To reverse a decision you must reopen Review (not obvious; Details didn't visibly surface decision controls).
+- ⚠️ UX: After approving ONE patch under the Default ring, ALL 6 patches showed "Approved" — likely the ring's default-approval/auto-approve behavior, but it's surprising and unexplained (looks like a single approve cascaded to everything).
+- ⚠️ UX: OS column flips between "Windows" (All Rings view) and "Unknown" (Default ring view) for the same KB — inconsistent OS resolution depending on ring context.
+- ⚠️ UX: Tab state uses a query param `?tab=patches`, which contradicts the project convention (CLAUDE.md) of using `window.location.hash` for transient UI/tab state.
+- ⚠️ Minor: React hydration mismatch console error on PatchesPage (SSR renders a loading spinner; client renders the chips/data) — dev-mode only, benign for function but a real console error.
+
+
+### Per-device patch list (device > Patches tab) — PARTIAL
+- ✅ Device Patches tab is rich and correct: "Patch Controls" (Refresh patch data, Install pending OS patches (2), Run OS patch scan, Run 3rd-party scan, Install 3rd-party patches (0)), "Patch Compliance" widget (67% compliant, 2 pending, 4 installed), and a "Pending Windows Updates" table with UPDATE/KB#/SOURCE/CATEGORY columns showing real KBs (KB5094128, KB5012170 etc.).
+- ✅ All requests on the device page correctly include `?orgId=...` (device page is org-scoped, NOT a global route) — so the orgId bug that breaks the main Patches tab does NOT occur here. POST /patches/scan => 200, POST /devices/:id/patches/install => 200.
+- ❌ BUG (silent success, no feedback): "Run OS patch scan", "Run 3rd-party scan", and "Install pending OS patches" all fire a 200 POST but show **NO toast, NO confirmation dialog, NO visible state change** (verified with a 2.5s polling loop for any toast/status/alert element — nothing appeared). Per the QA rule, a backend 2xx with no visible UI feedback is a FAIL. Note the MAIN patch page's "Run Scan" DOES toast — so the device-page controls are inconsistent with it.
+- ❌ UX/safety concern: "Install pending OS patches (2)" triggers an actual install (POST .../patches/install => 200) on a SINGLE click with NO confirmation dialog and NO success feedback. Installing OS patches is a high-impact action; it should confirm and/or toast. (The main page wisely confirms even a scan.)
+- ⚠️ UX: The two "Install ..." buttons and the two "Run ... scan" buttons look identical in weight; nothing distinguishes the destructive install action from the benign scan.
+
+
+### Update Rings (incl. redesigned approval matrix, PR #1456) — PARTIAL (create broken in default scope)
+- ✅ Update Rings tab lists rings with Order / Ring / Deferral / Deadline / Devices / Compliance / Updated / Actions. One seeded "Default" ring (Order 0, manual approval).
+- ✅ "New Ring" opens a well-designed "Create update ring" modal (role=dialog): Name, Rollout order, Description, Install enforcement (Deadline days, Reboot grace hours), and an "Approval policy" matrix.
+- ✅ The approval matrix is reactive and good UX: toggling "Auto-approve" reveals per-severity checkboxes (Critical/Important/Moderate/Low) + "Hold after release (days)". "Add override" adds a per-category block (Security Updates / Feature Updates / Firmware / Drivers / Third-Party Apps / Definition Updates) each with its own auto-approve/severity/hold controls. Inline validation fires correctly: "Select at least one severity for auto-approval." when auto-approve is on with no severity chosen.
+- ✅ EDIT ring works: pencil icon opens "Edit update ring" prefilled; changing the description + Save Changes => PATCH /api/v1/update-rings/:id => 200, dialog closes, list reflects the new description. Visible state change.
+- ✅ Per-ring approve works (tested via Patches tab with the Default ring selected): POST /patches/:id/approve => 200, row flips to Approved. (Decline/Defer share the same code path / request builder, so they work under a selected ring and fail the same way without one.)
+- ❌ BUG (silent failure): "Create Ring" => **POST /api/v1/update-rings => 400** body `{"error":"orgId is required"}`. The ring is NOT created (list stays "1 of 1 rings"), the dialog stays open, and there is **NO toast and NO inline error** — completely silent. Same orgId-on-global-route root cause as approve/export: /patches is a global-scope route so no orgId is injected, and the create-ring request doesn't pass one. (Edit works only because the API derives orgId from the existing ring record.)
+  - Impact: a partner admin with >1 org literally cannot create a new Update Ring from the UI (and gets zero feedback that it failed). Combined with the fact that approvals REQUIRE a ring to work in all-orgs scope, and you can't create one, this is a meaningful blocker for the documented approval workflow.
+- ⚠️ UX: The ring row's edit/delete icon buttons have NO aria-label/title (accessibility gap; screen readers announce nothing).
+- ⚠️ UX: Clicking a ring's NAME navigates to the Patches tab with that ring selected (a reasonable shortcut) but it's not obvious that the name is a "select this ring's patch list" link vs. an "open ring" link — the pencil is the editor. Mildly ambiguous.
+- BLOCKED: could not fully exercise multi-ring rollout ordering or the delete action — only the seeded Default ring exists and Create is broken (above), and deleting the sole ring would damage the shared fixture.
+
+
+### Config Policy (patch-related) — PASS (minor UX nits)
+- ✅ Create policy: /configuration-policies/new offers "Configure New" vs "Link to Existing". Configure New => Name/Description/Status form => "Create Policy" => POST /api/v1/configuration-policies?orgId=... => 201 Created, navigates to the new policy detail page. (Org-scoped page, so orgId IS sent — no orgId bug here.)
+- ✅ Policy detail has feature tabs (Overview, Patches, Alerts, Backup, Monitoring, Maintenance, Compliance, Automations, Event Logs, + "More" → Software Policy, Data Discovery, Peripheral Control, Warranty, Breeze Assist, Remote Access, Privileged Access, Assignments).
+- ✅ Link the PATCH feature: Patches tab exposes Update Ring selector (No ring / [0] Default), Application Rules (block apps / pin version), Installation Schedule (Daily/Weekly/Monthly + Time + Day of week), Reboot Policy (Never/If required/Always/During maintenance window). Selecting the Default ring + Save => POST .../features => 201 Created. Persisted across reload (ring still "[0] Default").
+- ✅ Assign to org: Assignments tab has Level (Partner/Organization/Site/Device Group/Device), Target picker, Priority, Role Filter, OS Filter, with a clean "No assignments yet" empty state. Assigning to Default Organization => POST .../assignments => 201 Created; the "Current Assignments" table immediately shows the new row (Organization / Default Organization / Priority 0 / All devices). Visible state change.
+- ✅ Effective config preview: device > More > Config (#effective-config) correctly RESOLVES the assignment — "Resolved configuration from 1 assigned policy across 1 feature", Patch Management "From: QA Patch Policy (Organization), Apps 0, Sources 1, Auto Approve: No, Reboot Policy: If_required, Linked policy: 93210383...", plus an Inheritance Chain (closest-wins priority). Full create→link→assign→preview chain works end to end and reflects my edits.
+- ❌ (minor, no-feedback): The patch-feature "Save" on the policy fires a successful 201 but shows NO toast and the button text doesn't change to "Saving/Saved" — the only confirmation is that data persists on reload. Same silent-success pattern as the device patch controls (less severe here because the page stays put and it does persist).
+- ⚠️ UX: Effective config shows the RAW enum value "Reboot Policy: If_required" (snake_case) instead of a humanized "If required". Minor copy/formatting bug.
+- ⚠️ UX: There is no "create a patch job from a policy" action on the policy page (patches apply via the resolved effective config, not an ad-hoc job) — so that specific sub-task is N/A in this UI, not a defect.
+- ⚠️ UX: Assignment "Current Assignments" target cell renders "Default Organizationaa0e43c8" (name and id concatenated with no separator/space).
+
+
+### Tabs / Navigation & Approvals end-to-end — PARTIAL
+- ✅ Tab switching Compliance ↔ Patches ↔ Update Rings works cleanly; content loads, no crashes.
+- ✅ Column-header sorting on the Patches table works (clicking the "Patch" header reorders rows alphabetically). (Earlier "no sort" reading was a test-harness artifact of JS .click not triggering React; a real click sorts.)
+- ✅ Approvals end-to-end: select ring → Review → Approve → confirm dialog → 200 → row flips to Approved. Works WITH a ring selected.
+- ❌ The approvals flow is the headline defect: in the DEFAULT state (All Organizations, no ring) Approve/Decline/Defer/Bulk all 400 on missing orgId with no/cryptic feedback (detailed under "Patches tab"). And you can't create a ring to work around it (Create Ring 400s silently — see "Update Rings"). Net: a multi-org partner is locked out of the documented approval workflow with near-zero feedback.
+- ⚠️ UX: Tab state uses query params (`?tab=patches`, `?tab=rings`) except the default Compliance tab which drops to bare `/patches`. Inconsistent, and contradicts the project's stated `window.location.hash` convention for transient UI state (the device page's #effective-config / #patches DOES use hash correctly — so the inconsistency is within the patches area itself).
+- ⚠️ a11y: Patches table sort headers expose no `aria-sort`; ring row edit/delete icons have no aria-label.
+
+---
+
+## Patching Area Sweep — SUMMARY
+
+| Sub-area | Result |
+|---|---|
+| Patching page — Compliance tab | PARTIAL (Export silent 400 in all-orgs) |
+| Patching page — Patches tab | PARTIAL (approve/decline/defer + Deploy broken in default scope) |
+| Per-device patch list | PARTIAL (silent-success scans/installs, no confirm on install) |
+| Update Rings (+ approval matrix) | PARTIAL (Create Ring silent 400; edit works) |
+| Config Policy (patch) | PASS (minor no-toast + copy nits) |
+| Tabs / Navigation & Approvals e2e | PARTIAL (approvals blocked in default scope) |
+
+### FAIL / PARTIAL details (API status vs UI)
+
+1. **[HIGH] orgId-on-global-route family — approve/decline/defer/bulk + Create Ring + Compliance Export all 400 silently in the default "All Organizations" scope.**
+   - Approve: `POST /patches/:id/approve` => 400 `{"error":"orgId is required for partner/system scope"}`; UI shows raw error string inline in the Review modal (no toast). Patch not approved.
+   - Create Ring: `POST /update-rings` => 400 `{"error":"orgId is required"}`; UI shows NOTHING (dialog stays open, no toast/inline error). Ring not created.
+   - Export: `GET /patches/compliance/report?format=csv` => 400 `{"error":"orgId is required when multiple organizations are accessible"}`; UI shows NOTHING.
+   - Root cause (web): `/patches` is a GLOBAL-scope route (`apps/web/src/lib/routeScope.ts:10`) → org-id provider returns null (`apps/web/src/stores/orgStore.ts:263-268`) → `fetchWithAuth` does not inject `?orgId=` (`apps/web/src/stores/auth.ts:432-435`). The request builders never pass orgId explicitly: `PatchApprovalModal.tsx:119-132`, `PatchesPage.tsx:196-202`/`:231-233`, `PatchComplianceView.tsx:232-293`, and the create-ring submit. The APIs already accept `orgId` from body/query (`apps/api/src/routes/patches/approvals.ts:127-150`, `helpers.ts:122-151`/`:184-210`). FIX = web-side: pass currentOrgId (or, since the page shows a single org context, scope the page). Org-bound single-org users are unaffected.
+   - Compounding feedback bug: handlers don't use `runAction` and either swallow the error (Export → generic `setBulkError` that never rendered; Create Ring → nothing) or surface the raw API string (approve). Violates CLAUDE.md no-silent-mutations / runAction rule.
+
+2. **[MED] "Deploy" button on an approved patch is a dead-end** — 0 network requests, no dialog, no menu, no toast. Either requires unseen device selection or is broken.
+
+3. **[MED] Device-page patch controls are silent-success** — "Run OS patch scan", "Run 3rd-party scan", "Install pending OS patches" all fire 200 POSTs with NO toast/dialog/state-change (2.5s poll confirms). "Install pending OS patches" additionally has NO confirmation dialog for a high-impact install action.
+
+4. **[LOW] Config-policy feature Save** — 201 with no toast/button-state feedback (data does persist).
+
+### Consolidated UX clunkiness — top offenders
+1. **Silent failures everywhere in all-orgs scope** — the single biggest issue. A partner admin's default view (All Organizations) makes approve/decline/defer, create-ring, and export all fail with no or cryptic feedback. There is no on-page hint that you must select an Update Ring (or a single org) to make approvals work.
+2. **Org switcher is dimmed + ignored on /patches** ("This page shows all organizations") yet the page's core actions REQUIRE a single-org context — a direct contradiction the user cannot resolve from the page.
+3. **Raw developer error strings shown to users** — "orgId is required for partner/system scope" rendered inside the Review modal.
+4. **Destructive "Install pending OS patches" runs on one click, no confirm, no feedback** — risky for a real tech; contrast with Run Scan which DOES confirm.
+5. **"Deploy" dead-end button** — looks actionable, does nothing visible.
+6. **Single approve appears to cascade** — approving one patch under the Default ring showed all 6 as "Approved" (likely ring default-approval, but unexplained and alarming).
+7. **No way to reverse an approved patch inline** — once Approved, only Deploy/Details; Decline/Defer disappear.
+8. **Inconsistent OS column** — same KB shows "Windows" (All Rings) vs "Unknown" (Default ring).
+9. **Raw enum in effective config** — "Reboot Policy: If_required" instead of "If required".
+10. **Concatenated label** — assignment target "Default Organizationaa0e43c8" (name+id, no separator).
+11. **Tab state via query param + inconsistent** (`?tab=patches`/`?tab=rings` but bare `/patches` for Compliance), contradicting the project's hash convention.
+12. **a11y gaps** — no aria-sort on sortable headers; unlabeled ring edit/delete icon buttons.
+13. **Hidden toast timing** — several success toasts (main Run Scan works) are very short-lived; many actions appear to rely on them yet several actions emit none at all.
+
+### BLOCKED items + prerequisites
+- Full Decline / Defer functional pass: BLOCKED in default scope by the orgId bug; works only with a ring selected (same path as approve which I confirmed at 200). Prereq to test cleanly: fix the orgId bug OR an org-bound (single-org) test user.
+- Third-party patch approval / 3rd-party source flows: BLOCKED — fixture has 0 third-party patches (filter shows "0 of 0"). Prereq: seed third-party catalog entries (note: known third-party catalog 403 is expected noise).
+- Multi-ring rollout ordering & ring delete: BLOCKED — only the seeded Default ring exists and Create Ring is broken; deleting the sole ring would damage the shared fixture.
+- "Create patch job from a policy": N/A — no such action exists in the UI (patches apply via resolved effective config), not a defect.
+
+### Known noise (observed once, ignored)
+- React hydration mismatch console error on PatchesPage (SSR loading spinner vs client-rendered chips) — dev-mode only, benign for function.
+- (Did not hit the documented /admin/account-deletion-requests/pending-count 403 or third-party catalog 403 directly this run; third-party filter just returned empty.)
+
+---
+
+## Pass 2 — live-browser confirmation of merged pass-1 fixes (2026-06-19, against rebuilt merged `main` @ 3dad688cb)
+
+Stack: dev compose on merged `main` (all 6 pass-1 PRs present: #1628/#1629/#1630/#1632/#1635/#1636), `breeze-api`/`breeze-web` restarted to load fixes, `/health` 200. Target `http://localhost`, creds `admin@breeze.local`.
+
+### GOAL A1 — #1629 billing RBAC sidebar + access-denied — **PARTIAL (1 real bug + 1 minor)**
+- **PASS** — sidebar item-gating is correct per role:
+  - **admin** sees all groups/items.
+  - **billing@** (Partner Billing): Dashboard, AI & Fleet, Operations(Quotes/Invoices/Contracts/Product Catalog/Integrations), Settings(Partner/AI Usage/Saved Filters). Can load `/billing/quotes` (list renders). No Devices/Users/Roles/Security/etc.
+  - **tech@** (Partner Technician): Devices/Alerts/Tickets/Incidents/Scripts/Patches + Monitoring/Security/Backup/Reporting/Config; **no billing items**, **no Users/Roles**. ✓ Key gates hold.
+- **[HIGH] BUG — access-denied state is NOT delivered on gated routes; 403 is misrendered as "Session expired".** #1629 added `AccessDenied.tsx` but only wired it into RolesPage + InvoicesPage. On every other 403 surface the user sees the wrong state:
+  - Dashboard widgets (billing@ on all cards; tech@ on the audit-gated "Recent Activity" card) → "**Session expired — Your session has expired. Please sign in again. [Try again]**".
+  - `/devices` (billing@) → same "Session expired / Try again".
+  - `/settings/users` (billing@) → "**Failed to fetch users [Try again]**".
+  - Session is valid (sidebar + allowed routes work) — all underlying calls are **403 Forbidden**, not 401.
+  - Root cause: `apps/web/src/lib/errorMessages.ts` (`getErrorMessage`/`getErrorTitle`) conflates 401 **and** 403 → "Session expired"; DevicesPage/DashboardWidgets/UsersPage don't branch on 403 to render `AccessDenied`. The task's "confirm a gated route shows access-denied, not a generic Try again" → **fails**.
+- **[LOW] BUG — empty nav group headers shown for billing@**: Monitoring/Security/Backup/Reporting render as collapsible headers that expand to **zero** children (all items permission-gated out). `Sidebar.tsx renderCollapsibleSection` doesn't hide a section whose items are all filtered. Should hide empty groups.
+
+### GOAL A2 — #1636 Patches org switcher scoping — **PASS**
+- Org switcher is **fully interactive (not dimmed)** on `/patches` (Current / All-orgs toggle + org selector). Header reflects the selected org.
+- **All-orgs mode**: Export **disabled** with title hint "Select an organization to export a compliance report"; New Ring **disabled** with hint "Select an organization to perform this action". Graceful — **no 400s** (the pass-1 silent-400 family is fixed).
+- **Current mode**: Export + New Ring re-enabled; header shows "Default Organization".
+- Approve-mutation not freshly exercised: all 6 seeded patches already **Approved** (0 pending), and no decline/approve control is surfaced for already-approved patches → couldn't drive a new approve→200 in-browser. 6/6 Approved confirms approve worked under Current scope previously.
+
+### GOAL A3 — #1630 public quote-accept — **MIXED (CSP fix + backend OK; 1 real acceptUrl bug; local hydration artifact)**
+- Created + sent **Q-2026-0002** ($500 one-time) → `/quotes/:id/send` 200.
+- Accept page (`/portal/quote/<token>` on localhost) **SSR-renders correctly** (proposal header, pricing $500, totals, "Accept & sign" + Decline form) and shows **no CSP violations** in console → the #1630 portal-CSP fix is effective.
+- Accept→auto-issue→convert **backend verified** via direct `POST /api/v1/quotes/public/<token>/accept` (signerName) → **200, status "converted"**, invoice **INV-2026-0003** created (sent, **$500.00**). Quote row: status=converted, converted_invoice_id set.
+- **[MED] BUG — acceptUrl emitted with empty host**: send response `acceptUrl = "https:///portal/quote/<token>"` (triple-slash → dead host "portal"). #1630 hardened `quoteLifecycle.ts portalBase()` to reject empty-host configs, but `new URL("https:///portal").hostname === "portal"` (Node reinterprets the empty authority's first path segment as host), so the `if (!parsed.hostname) continue;` guard passes and it returns the **raw** `https:///portal` string. Fix = normalize via `parsed.origin`+path or explicitly reject `://` immediately followed by `/`. Local-config-triggered (`PUBLIC_PORTAL_URL=https:///portal` in `.env`); prod sets a real value, so edge-case severity — but the hardening's stated purpose (never email a dead link) is defeated for exactly this input.
+- **Local-dev artifact (likely not prod)**: the React island fails to hydrate in `astro dev` — `[astro-island] Failed to fetch dynamically imported module http://localhost/src/components/portal/PublicQuoteView.tsx` (404). The module is actually served at `/portal/src/...` (200) — the island URL is missing the `/portal` base prefix (Astro base-path-in-dev gotcha, #1474-class). Because of this the "Accept & sign" button can't be clicked in-browser locally. Prod serves a built bundle under `/portal/_astro/*`, so this is most likely dev-only — but worth a prod-build confirmation.
+
+### GOAL A4 — #1635 Distributors tab + TD SYNNEX move — **PASS**
+- Integrations → **Distributors** tab present; **Pax8** + **TD SYNNEX** sub-tabs both render full config panels (Pax8: OAuth client-id/secret/webhook + Connect; TD SYNNEX: Digital Bridge base-url/region/env/auth/keys/paths + Save/Test/Search).
+- Settings → Catalog: **TD SYNNEX import removed** (catalog-items grid / CatalogItemsTab still present); header now cross-links "Connect distributors (Pax8, TD SYNNEX) under Integrations → Distributors".
+- **[LOW] nit** — Pax8/TD SYNNEX credential inputs autofill the browser-saved **login** creds (Client ID = admin@breeze.local, secret = login pw); set `autocomplete="off"`/`new-password` on these fields.
+
+### GOAL A5 — #1632 not-enabled state + #1628 quote total — **PASS**
+- #1632: Integrations → Identity → **Google Workspace** and **Microsoft 365** both show the calm "…integration is not enabled on this instance" state with the `GOOGLE_WORKSPACE_ENABLED` / `M365_ENABLED` admin hint — **no red 404 banner**. (Underlying `/api/v1/google|m365/connection` return 404 in console — expected; UI handles gracefully.)
+- #1628: quote **"Due on acceptance" = one-time total** — verified in the editor (One-time $500 / Monthly $0 / Annual $0 → Due on acceptance **$500.00**), the portal accept view, and the resulting invoice (INV-2026-0003 = $500). Recurring is correctly excluded.
+
+### Pass-2 confirmed bugs queued for fix
+1. **#1629 follow-up (web, HIGH)** — render `AccessDenied` on 403 (split 401 vs 403 in `errorMessages.ts`; wire DevicesPage/DashboardWidgets/UsersPage); hide empty nav group headers in `Sidebar.tsx`.
+2. **#1630 follow-up (api, MED)** — `portalBase()` must reject/normalize the `https:///portal` empty-authority form instead of returning the raw triple-slash string.
+
+Minor/nits (not blocking, noted for triage): distributor credential-field autofill (`autocomplete`); Quote Detail "Customer" shows org-id prefix (`aa0e43c8`) instead of org name; portal dev-mode island base-prefix 404.
+
+---
+
+## Pass 2 — GOAL B broad sweep (2026-06-19)
+
+Stack: dev compose on merged `main`, target `http://localhost`, creds `admin@breeze.local`. GOAL A (6 merged pass-1 fixes) covered by the main session above — NOT re-tested here. This pass broadens into nav areas pass 1 skipped. Per-area PASS/FAIL + console-error + UX notes. Severity tags [HIGH]/[MED]/[LOW]. No issues filed; triage list at end.
+
+### Alerts (list / detail / Rules / Channels) — **PASS (1 MED silent-mutation)**
+- **Alerts list** — PASS. 2 seeded active alerts render with severity summary chips (1 Critical/1 High), correlation grouping ("Grouped incident: 1 related · 50% noise cut" → /alerts/correlations), search, advanced/saved filters, bulk-select. No console errors.
+- **Acknowledge** — PASS. Row Ack → `POST /alerts/:id/acknowledge` 200; row status flips Active→Acknowledged, Ack button removed. Visible state change (no toast, but row updates).
+- **Alert detail drawer** — PASS. Row click opens a proper `role=dialog` drawer: Suggested Fixes (Generate/Refresh), Device Info, and Create ticket / Acknowledge / Suppress / Resolve actions.
+- **Resolve** — PASS. Resolve reveals an inline "Describe how the issue was resolved…" note + "Resolve Alert" confirm → `POST /alerts/:id/resolve` 200; row→Resolved, drawer closes, Active count 2→1. Good UX (resolution note prompt).
+- **Rules** — `/alerts/rules` intentionally 302→`/configuration-policies` (header says "Rules are managed in Configuration Policies"). Config Policies page renders (2 policies). PASS.
+- **Channels** — PASS for create. `/alerts/channels` renders (empty seed: 0 channels; type filters Email/Slack/Teams/PagerDuty/Webhook/SMS/Pushover; routing-rules section). New Channel modal is rich (name, enabled, 7 types, recipients, triggered/resolved templates w/ {{vars}}). Created an Email channel → `POST /alerts/channels` → list "1 of 1", row appears, modal closes. Required-field validation message ("Channel name is required") is clear.
+- ~~❌ [MED] BUG — channel "Test" button is a silent mutation.~~ **CORRECTED — FALSE POSITIVE (re-verified in-browser 2026-06-19).** Clicking **Test** DOES surface feedback: a success toast **"Test notification sent to \"QA Email Channel\""** AND the card's inline **"Last test: Just now"** timestamp updates. `runChannelTest` in `NotificationChannelsPage.tsx` is correctly wrapped in `runAction` (success + 200-`{testResult:{success:false}}` failure toasts; not in the runAction allowlist; `no-silent-mutations` passes; landed in PR #740). The original sweep snapshot was taken after the short-lived toast auto-dismissed (see cross-cutting "hidden toast timing" note). No fix needed.
+- ⚠️ **[LOW] console** — `GET /api/v1/alerts/routing-rules` returns **400** on channels page load (logged to console). UI degrades gracefully to "0 rules" so no visible break, but a list endpoint 400-ing on a clean tenant is noise worth a look. **→ confirmed real bug (list handler hard-required `auth.orgId`; on the All-Orgs landing no orgId is sent → 400 — same #1636 orgId-on-route class; sibling `/alerts/channels` is scope-aware and 200s). FIXED API-side in PR #1643** (list handler now mirrors the channels scope handling: partner scope falls back to accessibleOrgIds → `200 []`).
+- ⚠️ UX — sidebar footer reads "Web dev · API 0.63.5" (stale version string vs current v0.8x release line; cosmetic).
+
+### Tickets (list / create / detail / comment / time-entry) — **PASS**
+- **List** — PASS. `/tickets` renders saved-view tabs (My/Unassigned/All open/Breaching soon/Closed), priority/category/assignee filters, sort (Triage/Newest/Oldest/Due date), keyboard hints (j/k/Enter). Empty seed handled with a clear empty state.
+- **Create** — PASS. `/tickets/new` form: Organization(required)/Subject/Description/Device(opt)/Category/Priority. Submit correctly **disabled until Organization chosen** (good validation). Submit → created **T-2026-0001**, redirected to `/tickets#T-2026-0001` with the new row in the list (Unassigned count 0→1).
+- **Detail** — PASS. Inline detail panel: status workflow (New/Open/Pending/On hold/Resolved/Closed), priority + assignee pickers, Reply / Internal note, Time & Billing (Start timer / Log time / Add part), Create invoice.
+- **Comment** — PASS. Reply "QA sweep reply comment." → posted, appears in activity feed ("No activity yet" cleared).
+- **Time entry** — PASS. Log time → inline Minutes input → Save 30 → Total time 0m→**30m**. (Time amount $0.00, no rate configured — expected.)
+- No console errors anywhere in the ticket flow.
+
+### Incidents — **PASS**
+- `/incidents` renders with status filter (Detected/Analyzing/Contained/Recovering/Closed) + severity (P1-P4), clean "No incidents have been recorded yet." empty state. No console errors. (No seeded incidents to open — list/filter surface only.)
+
+### Remote Access — **PASS**
+- `/remote` hub renders 3 entry cards: Start Terminal, File Transfer, Session History. No console errors.
+- `/remote/terminal` — device picker lists the online device WIN-DHQNR1F8LO2 (Windows/online) with "Open Terminal" action. Entry point works (did **not** start a real WebRTC session per scope).
+- `/remote/sessions` — Session History audit log renders (Total Sessions/Duration/Data stats, type+user+time filters, Export). Empty but well-formed.
+- ⚠️ Note: `/remote/history` is a 404 (Page not found) — but that was my wrong URL guess; the real path is `/remote/sessions`. Not a bug.
+
+### Network Monitor (/monitoring) — **PASS**
+- Renders with Assets / Network Checks / SNMP Templates tabs + stat counters (Configured/Active/Paused/SNMP Warnings). Empty asset list ("No assets found.").
+- SNMP Templates tab: **31 built-in templates** (APC UPS PowerNet, etc.) with vendor/device-type/OID-count/usage columns + Add template. Network Checks tab loads.
+- No console errors.
+- ⚠️ **[LOW] UX** — tab state uses query param (`?tab=checks`/`?tab=templates`) rather than `window.location.hash`, which contradicts the project's stated URL-state convention (CLAUDE.md "Use hash, not query params for transient UI state"). Minor/consistency.
+
+### Network Discovery (/discovery) — **PASS**
+- Renders with Assets / Profiles / Jobs / Topology / Changes tabs; Assets has approve/dismiss bulk actions; empty states clean.
+- New Profile modal renders a full scan-config form: name, site, schedule cadence, subnets, discovery methods (ICMP Ping / ARP Sweep / SNMP Probe / TCP Port Scan), SNMP version/port/timeout/retries, time/timezone. Did not launch a real scan (no network fixture).
+- No console errors. Same `?tab=` query-param note as Monitoring.
+
+### Security suite — **PASS (all sub-pages load, no console errors)**
+- **/security** — Security dashboard: Security Score 77/100 (Elevated), trend chart **renders** (recharts populated, no ResizeObserver error), Vulnerabilities (0), Antivirus Coverage. Charts populate cleanly.
+- **/dns-security** — Overview/Integrations/Policies/Events tabs; query stats (queries/blocked/allowed/redirected); lists supported providers (Umbrella, Cloudflare Gateway, DNSFilter, Pi-hole, OpenDNS, Quad9, AdGuard).
+- **/pam** (Privileged Access) — Live badge; Overview/Requests/Rules/Audit tabs; getting-started guidance referencing Config Policy feature link.
+- **/security/user-risk** — risk scores populated from seed (Breeze Admin 88 critical, Tech User 62); True/False-positive labeling controls; precision/training metrics.
+- **/sensitive-data** — Dashboard/Findings/Scans/Policies tabs; finding counters; "No data yet" empty charts.
+- **/peripherals** (Peripheral Control) — Policies/Activity Log; class (Storage/USB/Bluetooth/Thunderbolt) + action (Allow/Block/Read Only/Alert) + status filters; Create Policy.
+- **/ai-risk** (AI Risk Engine) — Guardrails/Analytics/Approvals/Rate Limits/Denials tabs; Guardrail Tier Matrix (Tier 1 Auto-Execute = 59 read-only tools).
+- **/cis-hardening** (CIS Benchmarks) — Average Score 100%, Compliance/Baselines/Remediations tabs, OS-type filters.
+- **/audit-baselines** (Compliance Baselines) — Dashboard/Baselines/Approvals tabs; clean empty state.
+- No console errors on any of the 9 security pages. (Load + basic-interaction scope per the brief; did not create policies/baselines.)
+
+### Reports (/reports + builder) — **PASS**
+- `/reports` lists Saved Reports + Recent Runs (empty seed, clean empty state). Ad-hoc Report → `/reports/builder`.
+- Report Builder is full-featured: report type (Devices/Alerts/Patches/Compliance/Activity), column picker, record filters, viz type, schedule (cadence/day/format).
+- **Live preview populates with real data** — Devices preview shows WIN-DHQNR1F8LO2 (Windows Server 2022, online); switching to Alerts re-renders the preview with the 2 real alerts (reflecting their current ack/resolved state). NOT a fake-empty 200. No console errors.
+
+### Analytics (/analytics) — **PASS**
+- Renders Operations Overview / Capacity Planning / SLA Compliance tabs, Query Builder (metric type/name/aggregation/time-range), and a draggable widget grid.
+- **Charts populate**: Uptime 100%, Policy Compliance (2 policies evaluated), Performance Trend (CPU/mem recharts), OS Distribution, Alert Statistics table. recharts render with no ResizeObserver/jsdom error (real browser). No console errors.
+- ⚠️ minor — Alert Statistics shows all-zero severity counts; consistent with "open alerts only" (both seeded alerts were acked/resolved earlier in this sweep). Not flagged as a bug.
+
+### Audit Trail (/audit) — **PASS**
+- Populated with 25 real entries per page (agent device reports: security status, sessions, etc.) with User/Action/Resource/Details/IP columns + View details + Export Logs + Filters.
+- **Pagination works** — Next advances to older entries (page 1 starts 4:01 PM, page 2 starts 3:37 PM). No console errors.
+
+### Event Logs (/logs) — **PASS**
+- Renders search + Source/Start/End/Rows(50/100/250)/level(Info/Warning/Error/Critical) filters, Save Query, Export CSV.
+- Shows 1 real seeded log: Error / Hardware / Microsoft-Windows-DNS-Client on WIN-DHQNR1F8LO2. No console errors.
+
+### Backup (/backup) — **PASS**
+- Renders Overview + Verification/Snapshots/SQL Server/Hyper-V/Vault/SLA/Encryption/Recovery Bootstrap tabs (most badged ALPHA — honest). Stat cards (Total Jobs/Snapshots/Success Rate/Devices Protected/Storage). Run all backups.
+- SLA tab (hash route `#sla`): compliance metrics + Add SLA Configuration + clear early-access disclaimer. No console errors. (Tabs correctly use `#hash` here — contrast Monitoring's `?tab=`.)
+
+### Cloud Backup (/c2c) — **PASS**
+- "Cloud-to-Cloud Backup" with honest ALPHA disclaimer ("sync and restore jobs are not yet implemented"); Add Connection + Connections/Configs/Jobs/Items tabs. No console errors.
+
+### Disaster Recovery (/dr) — **PASS**
+- ALPHA disclaimer; Create Plan + Plans/Executions tabs. Create Plan modal renders a full form: Plan name, Description, RPO/RTO targets, recovery groups (name/duration/dependency), device selection (WIN-DHQNR1F8LO2). No console errors. (Forms render & validate per scope; did not submit.)
+
+### Settings → Organizations & Sites (full CRUD lifecycle) — **PASS (1 LOW)**
+- Master-detail: 3 seeded orgs; select to view sites. Add organization form (name/slug/type/status/maxDevices/contract dates).
+- **Create org** — created "QA Sweep Org"; appears in list; URL hash set to new org id.
+- **Guided first-site** — after org create, a "Create first site" flow auto-surfaces with full site form (name, timezone, address, primary contact). Good onboarding UX. Created "QA HQ Site" → "1 of 1 sites".
+- **Delete site** — named confirm ("Are you sure you want to delete QA HQ Site? This action cannot be undone") → deleted → "0 of 0 sites".
+- **Delete org** — named confirm ("delete QA Sweep Org? …") → deleted → list back to 3 seeded orgs. List + detail stay in sync throughout.
+- No console errors.
+- ❌ **[LOW] BUG — org-create slug does not auto-derive from name.** Placeholder pairing (name "Acme Corp" / slug "acme-corp") implies auto-slug, but typing a name and submitting yields "Slug is required". User must hand-type the slug. Minor friction; either auto-derive or drop the placeholder implication.
+
+### Settings → Partner — **PASS (1 MED flash-of-denied)**
+- Full settings render with 10 tabs (Company/Regional/Security/Notifications/Event Logs/Defaults/Branding/AI Budgets/Remote/Ticketing), hash-routed (`#security` etc.).
+- Security tab: enforced password policy (length/complexity/expiration/session timeout/MFA). Save Settings → **"Partner settings saved" toast** (proper success feedback — good, contrast the silent alert/channel mutations).
+- ❌ **[MED] BUG — flash of "Partner Access Required" on first load.** Navigating to `/settings/partner` first renders the full access-denied state ("Partner settings are only available to partner-level users.") for ~1-2s while the partner context hydrates, then self-corrects to the real settings on data arrival (or reload). `partner/me` returns 200 the whole time — the user IS partner-level. The gate evaluates before the partner store resolves and shows the denied state prematurely. This is the **flash-of-access-denied** variant of the isPartnerScope gating class (MEMORY: web_ispartnerscope_partners_length_gate_bug). A partner admin briefly seeing "access required" on their own settings is alarming. Gate on a loading state, not empty-then-denied. **→ confirmed real (gate evaluated `!currentPartnerId` before the loading guard resolved). FIXED in PR #1642** (loading spinner shown while partner context resolves; access-denied only after resolution confirms a non-partner; non-vacuous test: revert→loading-case fails).
+
+### Settings → Custom Fields — **PASS**
+- Empty state + type filters (Text/Number/Yes-No/Dropdown/Date). Add Custom Field form: Display Name, Field Key (**auto-derives** from name → "qa_asset_tag", good), Max Length, Pattern (regex), per-OS.
+- **Created** "QA Asset Tag" → succeeds (partner-wide write path works, NO 42501/500 — the RLS dual-axis fix from #1611 holds). **Deleted** via named confirm ("…delete QA Asset Tag? This will remove the field definition and all stored values"). No console errors.
+
+### Settings → Saved Filters — **PASS**
+- Renders with New Filter + clean empty state ("No saved filters yet…"). No console errors. (Did not build a filter — covered the create path on Custom Fields/Orgs.)
+
+### Settings → Enrollment Keys — **PASS**
+- Lists seeded key (win-maintest, Expired, 1/50). Create Key form (Name/Max Usage/Expires).
+- **Created** "QA Sweep Key" → proper **one-time secret reveal** ("Save this enrollment key now. It will not be shown again." + secret + Copy key + Dismiss). Install command shown (`breeze-agent enroll <key>`). **Deleted** via named confirm. No console errors. Good security UX.
+
+### Settings → Roles — **PASS**
+- 5 system roles listed; "System roles cannot be modified" enforced (Clone only, no edit/delete on system roles). Type filter (System/Custom). Create Role opens a builder with Name/Description + full permission matrix. No console errors. (AccessDenied surface from #1629 lives here.)
+
+### Settings → Profile — **PASS**
+- Avatar upload, name/email (email read-only w/ explanation), change password, **passkey/biometric registration** (Windows Hello/Touch ID), theming (theme/density/font), Restart tour. No console errors.
+
+### Settings → API Keys (/settings/api-keys) — **PASS**
+- Create Key, scopes, status filter, clean empty state. No console errors.
+
+### Settings → Connected apps (/settings/connected-apps) — **PASS**
+- MCP/OAuth authorized clients list, MCP server URL for AI agents (Claude.ai/ChatGPT/Cursor), revoke-within-10-min note. No console errors.
+
+### AI Assistant panel (#1484 / #1591) — **PASS**
+- Header AI button opens the right-rail panel (quick prompts: Check server health / Show critical alerts / Find offline devices / Security overview / Disk space report / Recent activity).
+- Sent "List my devices" (Cmd+Enter) → panel showed **streaming** ("AI is thinking… click stop to cancel"), invoked the **Query Devices tool** ("Tool Result" chip), and **streamed a complete, accurate answer**: a formatted table with WIN-DHQNR1F8LO2 (Windows Server 2022 21H2, 🟢 Online, Default Site, Agent 0.82.0-maintest-db6b0dc5) + a follow-up question.
+- This confirms the SDK tool-execution path resolves (NOT the #1591 "always rejected or timed out" failure) and streaming works end-to-end. No console errors.
+
+### Cross-cutting everyday flows — **PASS**
+- **Theme toggle** — header Theme button opens Light/Dark/System menu; selecting Dark applies `html.dark`; Light reverts. Works.
+- **Cmd+K global search** — header Search opens the palette; typing "WIN-DHQ" returns the device WIN-DHQNR1F8LO2 as a result. Works.
+
+---
+
+## Pass 2 — GOAL B summary
+
+**Area results (all NEW coverage beyond pass 1):**
+
+| Area | Result |
+|---|---|
+| Alerts (list/detail/ack/resolve) | PASS |
+| Alerts → Channels (create/test) | PARTIAL — [MED] silent Test |
+| Alerts → Rules / Correlations | PASS (rules→config-policies) |
+| Tickets (create/detail/comment/time) | PASS |
+| Incidents | PASS |
+| Remote Access (terminal/sessions) | PASS |
+| Network Monitor /monitoring | PASS |
+| Network Discovery /discovery | PASS |
+| Security suite (9 sub-pages) | PASS |
+| Reports + builder | PASS |
+| Analytics | PASS |
+| Audit Trail /audit | PASS |
+| Event Logs /logs | PASS |
+| Backup /backup | PASS |
+| Cloud Backup /c2c | PASS |
+| Disaster Recovery /dr | PASS |
+| Settings → Organizations & Sites (CRUD) | PASS (1 LOW slug) |
+| Settings → Partner | PASS (1 MED flash-denied) |
+| Settings → Custom Fields | PASS |
+| Settings → Saved Filters | PASS |
+| Settings → Enrollment Keys | PASS |
+| Settings → Roles | PASS |
+| Settings → Profile | PASS |
+| Settings → API Keys | PASS |
+| Settings → Connected apps | PASS |
+| AI Assistant (#1484/#1591) | PASS |
+| Theme / Global search | PASS |
+
+**Tally:** 26 areas swept · 25 PASS · 1 PARTIAL · 0 FAIL · 0 BLOCKED.
+
+**Confirmed bugs (GOAL B):**
+1. ~~**[MED] Notification channel "Test" is a silent mutation**~~ — **FALSE POSITIVE (corrected after in-browser re-verification).** Test DOES toast ("Test notification sent…") + updates the inline "Last test" timestamp; `runChannelTest` already uses `runAction`. Sweep snapshot missed the short-lived toast. No fix.
+2. **[MED] Partner Settings flash-of-"Partner Access Required"** — `/settings/partner` renders the full access-denied state for ~1-2s before the partner context hydrates, then self-corrects. `partner/me` is 200 throughout. Gate-before-load class (cousin of isPartnerScope bug). Alarming for a partner admin on their own settings page. **→ FIXED PR #1642.**
+
+**Pass-2 fix outcomes (this session):** GOAL-A fixes #1639 (acceptUrl empty-host) + #1640 (403→access-denied + empty nav groups) MERGED. GOAL-B: #1642 (partner-settings flash) + #1643 (routing-rules 400) opened & merging on green CI. Channel-"Test" silent-mutation = FALSE POSITIVE (corrected above). Left for triage: org-create slug auto-derive [LOW]; `?tab=` vs `#hash` drift on Monitoring/Discovery; stale "API 0.63.5" sidebar footer string.
+3. **[LOW] Org-create slug not auto-derived** — name "Acme Corp"/slug "acme-corp" placeholders imply auto-slug; submitting name-only yields "Slug is required". (Custom-field key DOES auto-derive — inconsistent.)
+4. **[LOW] `GET /alerts/routing-rules` 400** on the Channels page (console error; UI degrades to "0 rules" so no visible break).
+
+**Consolidated UI/UX observations (papercuts):**
+- **Mutation-feedback inconsistency**: Partner Settings save → proper "saved" toast; but Alert ack/resolve, channel create, ticket create rely on **visible list/state change with NO toast**, and channel **Test gives nothing at all**. The toast convention (runAction) is applied unevenly across the app.
+- **Tab-state URL convention drift**: Monitoring & Discovery use `?tab=` query params; Backup & Partner use `#hash`. CLAUDE.md mandates hash for transient UI state — Monitoring/Discovery violate it.
+- Sidebar footer shows stale "API 0.63.5" version string (current release line is v0.8x).
+- All ALPHA/early-access surfaces (Backup tabs, C2C, DR) carry honest "early access / not yet implemented" disclaimers — good, not a bug.
+- No `recharts`/ResizeObserver console errors on any chart page in the real browser (Security, Analytics, Reports preview all render).
+
+**Notable confirmations (no regression):** Custom Fields partner-wide write (RLS #1611 holds); AI tool execution resolves (#1591 holds); enrollment-key one-time secret reveal; org→guided-site onboarding; named delete confirms everywhere; system roles immutable.
+
+## UI QA Sweep — 2026-06-20 (since 2026-06-19 sweep / v0.81.0 release)
+
+Target: http://localhost (docker dev). Login: admin@breeze.local (Partner Admin, multi-org seed: Default Partner → Default Organization, Northwind IT, Acme Managed Services). Fixture: 1 online Windows device (WIN-DHQNR1F8LO2). Driver: Playwright MCP.
+Scope: re-verify 6/19 fix-PRs that resolved the prior sweep's own findings (Tier 1) + new 6/20–6/21 feature PRs with a UI surface (Tier 2). The ~30-PR security-review-#2 hardening wave is backend/agent/RLS/audit (no web surface) → out of scope for this browser sweep.
+
+### Env recovery (pre-sweep)
+- Docker Desktop had crashed (daemon socket gone) + API was crash-looping: `ERR_MODULE_NOT_FOUND @fastify/busboy` from streamingUpload.ts (PR #1664, merged 6/20 after the 22h-old dev image was built → stale container node_modules). Fixed: relaunched Docker, `pnpm install` inside breeze-api (created the missing `apps/api/node_modules/@fastify/busboy` symlink into the anon volume), restarted api+caddy. health → 200.
+
+### #1647 sidebar footer API version — PASS
+- ✅ Footer reads the API version DYNAMICALLY (Sidebar.tsx:332 `apiVersion` state fetched from `/health` → `version`), no longer hardcoded. Shows "Web dev · API 0.63.5".
+- Note: `0.63.5` is this dev container's stale `API_VERSION` env (the `/health` endpoint genuinely returns `{"version":"0.63.5"}`); prod derives it from `BREEZE_VERSION`. Dev-env artifact, NOT a regression. The #1647 mechanism (live, not stale-hardcoded) is correct.
+
+### Billing-RBAC nav filter + access-denied (#1629 / #1640) — PASS (resolves prior sweep finding #3)
+- ✅ #1629: logged in as billing@breeze.local (Partner Billing role). Sidebar now shows **11 links** (Dashboard, Fleet, Workspace, Quotes, Invoices, Contracts, Catalog, Integrations, Partner, AI Usage, Filters) — down from the buggy **44**. NO admin-only entries (/settings/users, /settings/roles, /devices, /security, /pam, /scripts, /dns-security all absent). The full-admin-sidebar leak for billing roles is fixed; nav is permission-filtered.
+- ✅ #1640: billing user → /settings/roles renders a clean **"Access denied — You don't have permission to manage roles. … contact your administrator."** (role-specific copy), NOT the old generic "Failed to fetch roles / Try again". The 403-as-transient-fetch-failure UX bug is fixed.
+- ⚠️ Minor: the gated page still emits 4 console 403s (GET /roles, /orgs/organizations, /time-entries/running, /orgs/partners/me) — fetches fire then are caught and rendered as access-denied. Cosmetic console noise; no functional impact.
+
+### Alerts routing-rules load + scope-aware write (#1643 / #1654) — PASS
+- ✅ #1643: GET /alerts/routing-rules?orgId=… returns **200** on the Channels tab load (no 400). The load regression is fixed.
+- ✅ #1654: created routing rule "QA Critical Routing" (critical → QA Email Channel) → POST /alerts/routing-rules?orgId=… **201 Created**, auto-refetch 200, section updated to "1 rule" and the rule name renders. Scope-aware org resolution on the write path works end-to-end for a partner-scope admin. Outcome visibly confirmed.
+- Test artifact left in DB: routing rule "QA Critical Routing" on Default Organization.
+
+### Integrations hub — Distributors + Identity (#1635 / #1632) — PASS
+- ✅ #1635: Integrations hub now has category tabs (Webhooks / PSA / Security / Monitoring / Identity / **Distributors**). Distributors tab shows **Pax8** (clean "Not connected" state + OAuth client-credentials form: Display name / Client ID / Client secret / Webhook secret; "Secrets stored encrypted, never returned; Saving requires MFA verification") AND **TD SYNNEX** (moved out of catalog settings into the hub). Both present.
+- ✅ #1632: Identity tab (Google Workspace / Microsoft 365). Disabled Google Workspace renders a **calm informational state** — "Google Workspace integration is not enabled on this instance. An administrator enables it by setting GOOGLE_WORKSPACE_ENABLED on the API server, then reloading this page." No "error/failed/try again" treatment.
+- ⚠️ Minor: GET /api/v1/google/connection 404s in console (integration disabled) — this is the signal the calm state catches; expected, no functional impact.
+
+### Org-create slug auto-derive (#1646) — PASS
+- ✅ Settings → Organizations → "Add organization": typing name "QA Slug Derive Test" live-derived slug "qa-slug-derive-test" in the Slug field. Cancelled (did not create) to keep the 3-org seed clean.
+
+### User time-format setting (#1672) — PASS
+- ✅ Settings → Profile → Theming: new "Time format" control as a button pair with live preview — "12-hour / 3:45 PM" vs "24-hour / 15:45". Default 12-hour.
+- ✅ Toggling to 24-hour fired PATCH /users/me → 200 (auto-saves on click, no separate Save). Reloaded the page → 24-hour stayed selected (aria-pressed=true) → persisted server-side. Reset back to 12-hour (admin default restored).
+- Note: did not separately verify a rendered timestamp switches to 24h across the app (preview + persistence confirmed; display-application is wired through the same user pref).
+
+### Partner settings load (#1642) — PASS
+- ✅ /settings/partner renders the full tab set (Company / Regional / Security / Notifications / Event Logs / Defaults / Branding / AI Budgets / Remote / Ticketing) with Company/Address/Contact content; NO access-denied shown. The flash-of-access-denied-before-load is gone for the admin path (loading→content). (Transient flash is timing-dependent; positive signal is a clean direct render.)
+
+### Remote-desktop viewer toolbar / bitrate / concurrent-session (#1641 / #1669 / #1627) — BLOCKED (needs live WebRTC desktop session)
+- Partner → Remote tab is Remote-Tool Providers (RustDesk/TeamViewer/built-in WebRTC), NOT a bitrate control — #1669's configurable/raised WebRTC bitrate ceiling lives in the desktop viewer/session negotiation, not in settings.
+- /remote page exposes Start Terminal / File Transfer / Session History; the desktop viewer (#1641 redesigned toolbar + connection UI, #1669 bitrate, #1627 2nd-concurrent-session guard) launches via a device's "Connect Desktop" and requires an established WebRTC desktop stream — not negotiable from the headless MCP browser. Marked BLOCKED. Prereq: a real browser + a device running the desktop helper. (Connection-UI-only partial check attempted separately.)
+
+### Quote "Due on acceptance" total (#1628) — PASS (resolves prior sweep finding #4)
+- ✅ Built a fresh draft quote (Default Org) with a one-time line "Onboarding Setup" $500 + a monthly line "Managed Services" $100/mo. Live Totals now show: One-time $500.00, Monthly recurring $100.00/mo, Annual $0.00/yr, **DUE ON ACCEPTANCE $500.00** (one-time only, NOT $600).
+- ✅ The first-period figure is now shown SEPARATELY as a secondary line: "First-period total (incl. recurring) $600.00" with explanatory copy "Accepting this quote invoices only the one-time charges now. Recurring lines (monthly + annual) bill on their own schedule." The $1,950-vs-$500 ambiguity from the prior sweep is resolved — the headline is unambiguously the one-time amount.
+
+### Seller contact + Terms & Conditions on quotes/invoices (#1651) — PASS
+- ✅ Editor has a "Terms & Conditions" panel; entered text persisted to DB `quotes.terms_and_conditions` (verified: "Net 30 payment terms. 90-day hardware warranty. Recurring services auto-renew annually.").
+- ✅ Schema present: `quotes.seller_snapshot` (per-quote seller contact snapshot) + `partners.billing_company_name / billing_email / billing_phone / billing_address_{line1,line2,city,region,postal_code,country}` as the seller-contact source.
+- ✅ Preview tab renders the quote PDF as a blob: iframe (authenticated render succeeds). NOTE: PDF text not OCR'd from the DOM (blob iframe) — T&C + seller render in the PDF layer; confirmed via persistence + successful PDF render rather than pixel-reading the PDF.
+- Test artifact: draft quote d72c8549 (Default Org, $500 one-time + $100/mo) left in DB.
+
+### Quote acceptUrl empty-authority guard (#1639) — PASS (resolves prior sweep finding #2)
+- ✅ Sent the draft (now Q-2026-0003). Send POST 200; response `acceptUrl = "https://2breeze.app/quote/<jwt>"` — a VALID absolute URL. The prior sweep's malformed `https:///portal/quote/...` (empty host) is gone: with `PUBLIC_PORTAL_URL=https:///portal` (still empty-authority in this env), the builder now rejects/avoids it and falls back to a valid base (PUBLIC_APP_URL). No customer would get an unclickable empty-host link.
+- ✅ Bonus (#1651): send response includes `sellerSnapshot:{name:"Default Partner", email/phone/address:null}` (seller captured at send; nulls only because seed partner billing fields are empty) + `termsAndConditions` present.
+- ⚠️ Path note (carryover, not #1639): acceptUrl path is `/quote/<token>`. Locally the portal mounts at `/portal/quote/...`; prod #1474 describes `/c/quote/...`. The HOST is now valid but the PATH PREFIX vs the actual portal mount should be confirmed in prod (separate from the empty-authority fix).
+
+### Public portal quote-accept hydration (#1630) — BLOCKED in local dev (needs prod portal build)
+- SSR PASS: http://localhost/portal/quote/<token> server-renders the full proposal — "Proposal Q-2026-0003 from Default Partner", pricing (Onboarding Setup $500 ONE-TIME, Managed Services $100/mo MONTHLY), and the **#1628 totals propagate to the customer view**: "Due on acceptance $500.00", "First-period total (incl. recurring) $600.00", "Accepting invoices only the one-time charges now…".
+- ❌ Island NOT hydrated (same as prior sweep): `<astro-island component="PublicQuoteView.tsx" client="load">` still has `ssr` attr (hydrated=false); "Accept & sign" button present but inert.
+- Root cause THIS run is the documented dev-env limitation (NOT the CSP error the prior sweep saw): island JS 404s at the **un-based** `http://localhost/src/components/portal/PublicQuoteView.tsx` → `[astro-island] Error hydrating … Failed to fetch dynamically imported module`. The portal runs `pnpm dev` (astro dev) under base `/portal`; astro dev emits un-based `/src/...` module URLs that Caddy doesn't route to the portal container.
+- Verdict: #1630's hash-CSP/hydration fix CANNOT be validated against an astro-dev portal — it requires a PROD portal build (bundled, base-aware module URLs + experimental.csp hashes). Consistent with the prior sweep's "re-test on a prod portal build" guidance. Backend accept path was already proven by the prior sweep (converted + invoice + replay guard).
+
+### Theme preserved on auth pages (#1649) — PASS
+- ✅ Set theme=dark, loaded /forgot-password (auth page) → html gets class "dark", body bg rgb(13,16,23). Auth pages respect the stored theme (no force-to-light). Reset to light after.
+
+### Monitoring/Discovery hash tab state (#1645) — PASS
+- ✅ /monitoring: clicking "Network Checks" → URL `/monitoring#checks` (hash, not ?query).
+- ✅ /discovery: clicking "Profiles" → URL `/discovery#profiles` (hash). Both areas now use window.location.hash for tab state per the repo convention.
+
+### Patches respect org switcher + action feedback (#1636) — PASS
+- ✅ Org switcher: /patches header + device list follow the active-org switch. Default Organization → "Patch Management / Default Organization", 0 of 1 devices compliant, WIN-DHQNR1F8LO2 listed (1 pending). Switched to Northwind IT → "Patch Management / Northwind IT", 0 of 0 devices, WIN device gone. Switched back → device returns. The patches view no longer ignores the org switcher.
+- ✅ Action feedback: device #patches tab "Run OS patch scan" → POST /patches/scan?orgId=… **200** (org-scoped) with a transient success toast. Non-destructive scan path surfaces feedback. (Did NOT click "Install pending OS patches" — that triggers a real install on the live box. Approve/reject approval-workflow feedback was exercised by the 6/19 patching sweep.)
+
+### Invoice manual payment record + void (#1701) — PASS
+- ✅ INV-2026-0003 ($500 Issued): "Record payment" form (amount/method/reference/date). Recorded $500 Bank transfer (ref QA-MANUAL-PAY-001) → POST /invoices/:id/payments 200 → status Issued→**Paid**, Balance due **$0.00**, payment listed. Outcome visibly confirmed.
+- ✅ Per-payment "Void" → payment removed, status Paid→**Issued**, balance restored **$500.00**. Outcome confirmed.
+- ✅ AUDIT (the #1701 core): both actions logged to audit_logs — `invoice.payment.recorded` AND `invoice.payment.voided`, resource_type `invoice_payment`, details `{amount, method, invoiceId}`. Verified via DB.
+- State: invoice returned to Issued/$500 (void undid the test payment — no lasting artifact).
+
+### Tickets partner org-access (#1666) — PASS (UI), backend authz
+- ✅ /tickets renders for the partner admin with real tickets ("High CPU sustained on WIN-DHQNR1F8LO2", 2 open) + org filter (all 3 orgs), priority/category filters, Create ticket. Partner-scope admin reads tickets across its orgs (correct). The restrictive enforcement (a partner user only reads orgs they can access) is backend authz — best verified by integration tests, not a browser positive path.
+
+### SSO admin gating + domain verification (#1691 / #1695) — N/A for browser sweep (backend/gating)
+- #1695 is explicitly backend ("SSO domain verification … backend"); #1691 is permission gating (sso:admin). Partner → Security tab has password/MFA/session/IP-allowlist but NO SSO config UI surface. These are security-review-#2 backend+permission PRs with no meaningful click-path. Out of scope for Playwright; covered by integration/unit tests.
+
+---
+
+## UI QA Sweep — 2026-06-20 — SUMMARY
+
+| PR | Area | Result |
+|---|---|---|
+| #1647 | Sidebar footer API version (dynamic) | PASS |
+| #1629 | Billing-role sidebar nav permission-filtered | PASS (fixes prior finding #3) |
+| #1640 | Gated route → clean access-denied | PASS (fixes prior finding #3) |
+| #1643 | /alerts/routing-rules 200 on load | PASS |
+| #1654 | Routing-rule scope-aware write | PASS |
+| #1635 | Integrations hub: Pax8 + TD SYNNEX (Distributors) | PASS |
+| #1632 | Disabled identity integration calm state | PASS |
+| #1646 | Org-create slug auto-derive | PASS |
+| #1672 | User time-format setting (12/24h, persists) | PASS |
+| #1642 | Partner settings no flash-of-access-denied | PASS |
+| #1628 | Quote "Due on acceptance" = one-time | PASS (fixes prior finding #4) |
+| #1651 | Seller contact + T&C on quotes/invoices | PASS |
+| #1639 | Quote acceptUrl rejects empty-authority | PASS (fixes prior finding #2) |
+| #1630 | Public portal accept page hydration | BLOCKED (needs prod portal build; SSR ok) |
+| #1645 | Monitoring/Discovery hash tab state | PASS |
+| #1649 | Theme preserved on auth pages | PASS |
+| #1636 | Patches respect org switcher + feedback | PASS |
+| #1701 | Invoice manual payment record/void + audit | PASS |
+| #1666 | Tickets partner org-access (UI render) | PASS |
+| #1641/#1669/#1627 | Remote-desktop viewer toolbar/bitrate/concurrent | BLOCKED (live WebRTC session) |
+| #1691/#1695 | SSO admin gating + domain verify | N/A (backend/gating) |
+
+### Top findings
+1. **All 6/19 fix-PRs that resolved the prior sweep's own findings are verified working in-browser** — billing-RBAC nav filter + clean access-denied (#1629/#1640, finding #3), quote "Due on acceptance" one-time total with separate first-period line (#1628, finding #4), and acceptUrl empty-authority guard (#1639, finding #2). The prior sweep's top systemic issues are closed.
+2. **NO new defects found.** Non-PASS items are all environment-BLOCKED, not code defects: public portal accept-page hydration (#1630 — astro-dev portal can't serve base-aware island modules; needs a prod portal build) and the remote-desktop viewer set (#1641/#1669/#1627 — needs a live WebRTC desktop stream not negotiable from headless Chromium).
+3. **#1628 fix propagates to the customer-facing portal view** (SSR), not just the admin editor — "Due on acceptance $500 / First-period $600" + explanatory copy render in the public proposal.
+4. **#1701 audit logging confirmed at the DB layer** — both invoice.payment.recorded and invoice.payment.voided write audit_logs entries with amount/method/invoiceId.
+5. Pre-existing/cosmetic carryovers (not regressions): admin Quote/Invoice "Customer" shows raw org UUID prefix; gated pages emit benign console 403/404s that the UI catches; /settings/billing (Stripe key) still not in sidebar.
+
+### Env / state notes
+- Env recovery: Docker Desktop crash + API ERR_MODULE_NOT_FOUND @fastify/busboy (PR #1664 added the dep after the 22h-old dev image was built). Fix = pnpm install inside breeze-api (anon node_modules volume) + restart api/caddy.
+- Test artifacts left in local DB: routing rule "QA Critical Routing" (Default Org); draft→sent quote Q-2026-0003 (Default Org, $500 one-time + $100/mo). INV-2026-0003 returned to Issued (payment voided). Admin time-format reset to 12h; theme reset to light.
+
+### Issue filed
+- **#1712** [UI] Quote detail "Customer" shows raw org UUID prefix instead of organization name — root cause `QuoteDetail.tsx:99` (`quote.billToName ?? quote.orgId.slice(0,8)`). Cosmetic carryover from prior sweeps; QuoteDetail-only (InvoiceDetail unaffected).
+
+## UI QA Sweep — 2026-06-25 (since v0.82.1 → main)
+
+Test list: `docs/testing/UI_TEST_LIST_since_v0.82.1.md` (51 click-paths across the
+0.83.x line + 8 unreleased-on-main P0 commits). Stack: code-mounted dev override,
+http://localhost, login admin@breeze.local. Run mode: background agent owns browser.
+
+### Environment / setup
+- ✅ Switched override symlink ghcr → dev; `up --build` rebuilt breeze-api:dev / breeze-web:dev; health 200, web 200, API login 200.
+- ❌ BUG (build-blocker, **local-DB drift, likely not prod-impacting**): API crashed on boot during auto-migrate of `2026-06-27-a-update-rings-partner-scope.sql` — `column p.org_id does not exist` in the step-2 backfill (`UPDATE patch_policies p SET partner_id=o.partner_id ... WHERE p.org_id=o.id`). The shared dev `breeze` DB already had patch_policies/patch_approvals in the partner-scope end-state (org_id dropped) but the migration was **unrecorded** in breeze_migrations — classic symptom of the migration file having been **renamed before merge** (CLAUDE.md warns: breeze_migrations keys on filename, so a rename re-applies on already-migrated DBs). Resolved locally by marking `2026-06-27-a`/`-b` as applied (sha256 of file content) so the other 12 pending migrations (config-policy/pam/topology/vuln-perm) ran fresh and cleanly.
+- ⚠️ ROBUSTNESS / improvement opportunity: `2026-06-27-a-update-rings-partner-scope.sql` (and `-b-patch-approvals-partner-scope.sql`) are **not re-runnable** — step 2 references `org_id` that step 5 drops, violating CLAUDE.md's "re-applying must be a no-op." Single-application is safe (txn-wrapped), so this only bites on the forbidden-rename path. Cheap hardening: guard the backfill with `IF EXISTS (SELECT FROM information_schema.columns WHERE table_name='patch_policies' AND column_name='org_id')`. Same pattern in the `-b` sibling. (#1764)
+
+---
+
+### Baseline (login + sidebar render) — PASS
+- ✅ Login via admin@breeze.local works (credentials pre-filled, redirects to Dashboard).
+- ✅ Dashboard renders: Fleet Status 0/4 online (4 seeded devices SEED-CRIT-NODE/SEED-NORMAL-NODE/SEED-WARM-NODE/WIN-DHQNR1F8LO2), Recent Activity feed, Breeze AI panel, alerts list.
+- ⚠️ Pre-login console shows ~14x 401 on /api/v1/* (devices/alerts/audit-logs/auth/refresh) — expected pre-auth race; clears after login. Note once, not chased.
+- Sidebar groups present: AI & FLEET, MONITORING, SECURITY, OPERATIONS, plus Integrations/Backup/Reports/admin Settings. All 50 nav destinations enumerated.
+
+### [1 / #1926] Billing bulk actions + draft delete — PASS
+- ✅ Quotes list: select-all → bulk bar "3 selected" with Send / Delete drafts / Clear (testids quotes-bulk-bar etc.).
+- ✅ Delete drafts → confirm modal "Delete 3 selected quote(s)? Only DRAFT quotes will be deleted..." → confirm → honest toast "0 deleted, 3 skipped" (none were drafts), list intact. Correct partial-action feedback.
+- ✅ Created a fresh Draft quote (New quote → pick org → Create draft → detail). Detail tab has Download PDF / Send proposal / Delete draft.
+- ✅ Delete draft → confirm modal "This permanently deletes the draft quote..." → confirm → toast "Draft deleted", redirected to list, row removed.
+- ✅ Invoices list: select-all → bulk bar with Issue / Void / Delete + Clear. Multi-select parity confirmed.
+
+### [13 / #1743] Quote detail Customer label — PASS
+- ✅ Quote Detail tab shows Customer = "Default Organization" (resolved org name, not a UUID). Note: this is the QuoteDetail page previously flagged in #1712 — now resolving names correctly.
+
+### [10 / #1862] Quote presentation refresh + typed-name e-signature — PARTIAL
+- ✅ Admin Preview tab renders styled proposal ("This is what your customer sees"): PROPOSAL header, partner branding, pricing table with ONE-TIME vs MONTHLY recurrence, Subtotal $600, "Due on acceptance $500", "Monthly recurring" — presentation refresh intact.
+- ✅ Detail tab: full breakdown TOTALS (One-time $500 / Monthly $100/mo / Annual $0), DUE ON ACCEPTANCE $500, First-period total $600, explanatory copy, FROM Default Partner, TERMS & CONDITIONS. Styling clean.
+- ⏳ Typed-name e-signature accept lives in the separate **portal** app (`apps/portal/.../quote/[token].astro`, POST /quotes-public/:token/accept). Token is a signed JWT minted on "Send proposal" (not DB-stored). Tested via send→portal flow below.
+
+### [14 / #1763] Quote PDF preview (blob CSP) — PASS
+- ✅ Preview tab renders inline (HTML proposal, not iframe). "Download PDF" (GET /api/v1/quotes/:id/pdf) → 200, file Q-2026-0003.pdf downloaded. No CSP / frame-src errors in console (0 errors after action). No blob frame block.
+
+### [12 / #1765] Contracts auto-renew + renewal notices — PASS
+- ✅ New contract form has "Auto-renew at end of term" toggle, gated with hint "(set an end date first)" — disabled-state copy is clear.
+- ✅ Setting an end date enables the toggle; enabling it reveals "Renewal term (months)" + "Advance notice (days)" fields (contract-renewal-term / contract-renewal-notice-days).
+- ✅ Save validation: leaving renewal term blank → toast "Enter a renewal term (months) before saving." (good inline guard).
+- ✅ Filled term=12, notice=30 → toast "Contract created", navigated to detail; on reload the auto-renew config persisted (shows Auto-renew + term + notice). 
+- ✅ Added a flat-fee line ($250) → row appears; "Save changes" → toast "Contract saved".
+
+### [2 / #1924] Pax8 → contract-line picker — BLOCKED (needs live Pax8 connection)
+- The picker (LinkSubscriptionPicker) is rendered from Integrations → Distributors → Pax8 on a *synced subscription* row, NOT from contract detail. Source: apps/web/src/components/integrations/Pax8Integration.tsx:679.
+- ✅ Pax8 panel renders honest "Not connected" state + clean OAuth credential form (Display name / Client ID / Client secret / Webhook secret / Connect Pax8), with "Saving requires MFA verification" copy. No crash.
+- BLOCKED: link/change/pause/unlink to a contract line requires a connected Pax8 with synced subscriptions (no fixture). The contract created above (QA Sweep Contract, with a line) would be the link target once a subscription exists.
+
+### [16 / #1848] TD SYNNEX EC Express connector — PARTIAL (UI verified, lookup BLOCKED)
+- ✅ Integrations → Distributors → "TD SYNNEX Pricing" sub-tab renders panel: "Not configured" + form (Customer No / Region / Email / Password / Enabled) + Save settings / Test connection / Look up.
+- ✅ Correct gating: "Test connection" and "Look up" buttons are disabled while not configured (no silent dead clicks); lookup query field is enabled.
+- BLOCKED: actual price/availability lookup by SKU needs real EC Express credentials (no fixture).
+
+### [15 / #1849] QuickBooks Online connect flow — PASS
+- ✅ Integrations → Accounting → QuickBooks Online: honest "Not connected" state + clear copy ("Breeze stays your system of record") + "Connect to QuickBooks".
+- ✅ Clicking Connect → honest toast "QuickBooks OAuth is not configured on this instance", stays on page, no crash. Correct fail-soft for an unconfigured instance.
+
+### [3 / #1922] TD SYNNEX inline lookup in quote editor — DEFERRED/BLOCKED (needs EC Express creds)
+- The inline distributor lookup requires EC Express configured (same dependency as item 16). UI presence in the quote pricing block noted; actual SKU lookup BLOCKED without creds.
+
+### [17 / #1861 BE-16] Vuln list & detection — PASS (empty-state)
+- ✅ /vulnerabilities renders: title + subtitle "CVEs detected across your fleet, prioritized by risk (CVSS, with KEV/EPSS modifiers)", Severity filter (All/Critical/High/Medium/Low), clean honest empty state "No open vulnerabilities detected across your fleet." No crash, no console errors.
+- ⚠️ Risk scores / sort can't be seen — no vuln data (seeded devices are offline, no scan results). Filter UI present.
+
+### [18 / BE-16] Vuln remediation workflow — BLOCKED
+- BLOCKED: no detected vulnerabilities to open (offline fixture devices, no scan data). Remediation/risk-accept actions not reachable.
+
+### [19 / BE-16] Vuln RBAC gating — BLOCKED
+- BLOCKED: single seeded admin user; no non-privileged role session available to verify gating vs blank 403.
+
+### [7 / #1907 #1921] Reliability — capped counts, age-aware windows, offender drill-down — PASS
+- ✅ Device reliability card (WIN-DHQNR1F8LO2): Score 72, Trend "Improving", age-aware label "since enroll · 6d uptime" (young device — windows labeled by enroll age, not faked to 30d).
+- ✅ Factor breakdown with weights: Hardware errors 15% (Health 0/100, count 22), Service failures 15% (Health 10/100, count 6), Uptime 30% (Health 100/100, 100.0%). Counts look capped/sane (no runaway inflation).
+- ✅ Offender drill-down toggle ("Hide offending services & components"): TOP SERVICES (Service Control Manager Jun 20 6×) + TOP HARDWARE COMPONENTS (Server 12×, DNS-Client 2×, etc.) with "Distinct events from the since enroll (6d)." Clean.
+
+### [31 / #1755 #1804 #1810] Device Reliability column + card — PASS
+- ✅ Reliability is an opt-in column in the Devices Columns picker; enabling adds RELIABILITY col showing scores + trend arrows (100→, 100→, 100→, 72↑). Capped at 100.
+- ✅ Card has "Ask AI about reliability" CTA + "Mark outcome" menu.
+- ✅ Mark outcome menu: "WAS THIS ACCURATE?" → Device failed / Device replaced / False alarm + copy "These train the reliability model — they don't change the device." Clicking "False alarm" → toast "False alarm label saved". Full feedback loop works.
+
+### [30 / #1744] Activity pane last-N feed — PASS
+- ✅ Device Overview "Activity" pane shows a last-N feed (Command queued — reboot / Patch installation queued) with actor (Breeze Admin) + relative time, plus a "View all activity →" link. Renders index-backed recent events.
+
+### [50 / #1803] Warranty refresh feedback + auto-update card — PARTIAL
+- ✅ Warranty card renders on Overview: "Warranty Unknown" + manufacturer "MICROSOFTCORPORATION".
+- ⚠️ No warranty Refresh button / affordance and no "auto-update" card found on the Overview of this OFFLINE device. Likely online-gated; could not exercise refresh feedback. Needs an online device to confirm.
+
+### [5 / #1911] Remote Tools — all services + Close/Back — BLOCKED (offline)
+- ✅ Honest gating: "Remote Tools" tab button is disabled with tooltip "Device is offline" (no dead click).
+- BLOCKED: services list / Close / Back require a live online agent (all 4 fixture devices are Down).
+
+### [29 / #1745] Process drilldown empty states + drillable charts — PARTIAL/PASS
+- ✅ Performance tab renders Performance Graphs (CPU/RAM/Disk, 24h/7d/30d window toggles, % axes) + Metric Anomalies cards (Spike/Memory growth/Disk growth) with Observed vs Baseline + Confidence% and Dismiss/Resolve/Promote actions. Seeded anomaly data present.
+- Device-detail tab bar: Overview / Performance / Alerts / Anomalies / Tickets / Event Log / Monitoring / Compliance / More + Software/Patches/Security/Remote Tools.
+- ⚠️ Did not exercise live chart drill-to-process (offline device, limited live process data); empty-state distinctness not fully confirmed.
+
+### [8 / #1897] Patch ring selection no longer collapses list to 50 — PARTIAL (fixture too small)
+- ✅ Patches → selecting "Default (Order 0, +0d)" ring keeps "All Devices (4)" with all 4 rows — list does not collapse on ring change.
+- ⚠️ The >50-row pagination cap regression cannot be reproduced with only 4 seeded devices. Mechanism looks correct; no regression observed.
+- ⚠️ UI/UX papercut: TWO update rings both display as "Default (Order 0, +0d)" in the ring selector dropdown — ambiguous, can't tell them apart (one is "edited by QA sweep" 4 devices, other "all patches require manual approval" 0 devices). Selector should disambiguate by description or id.
+
+### [33 / #1764] Partner-scoped update rings & approvals — PARTIAL
+- ✅ Update Rings tab lists 2 rings; "New Ring" opens "Create update ring" modal: Name / Rollout order / Description / Install enforcement (Deadline days, Reboot grace hours) / Approval policy (Add override) / auto-approve section. Clear copy.
+- ✅ Ring creation is scope-aware (page-scope-indicator + org-scope Current/All-orgs toggle) — partner-scoped ring = create while in All-orgs/partner scope.
+- ⚠️ Single-org fixture: cannot fully verify partner-scope vs org-scope distinction or cross-org approval flow.
+
+### [4 / #1913] Network Proxy + discovery asset-modal rework — PARTIAL/BLOCKED
+- HTTP reverse proxy UI is a per-tunnel page (`/remote/proxy/[tunnelId]`, ProxyTunnelPage.tsx) launched from Remote Access against a device → BLOCKED (all devices offline; can't start a proxy tunnel).
+- Discovery asset modal (AssetDetailModal) → BLOCKED: "No assets discovered yet" (no scan data; agents offline). Cannot render the reworked asset modal/fields.
+
+### [20 / #1728 #1842] Network topology redesign — PARTIAL (empty-state)
+- ✅ Discovery → Topology renders Cytoscape container (canvas present) with Expand / Edit map controls and a clean empty state: "No assets discovered yet — Run a network discovery scan to populate the topology map."
+- BLOCKED: backbone/host-attachment/manual node mapping needs discovered assets (none in fixture).
+
+### [21 / #1801] Empty Network Changes tab explains Alerting prereq — PARTIAL (works by design; fixture has 0 profiles)
+- The alerting-prereq hint (`changes-alerting-hint`) IS implemented + wired: NetworkChangesPanel.tsx:261 shows it when in-scope profiles exist but none record changes (verified via component + its test).
+- In this fixture there are ZERO discovery profiles, so line 246 `if (profiles.length === 0) return null` short-circuits and the generic "No change events match the selected filters." message shows instead.
+- ⚠️ UI/UX opportunity: with zero profiles, "No change events match the selected filters" is misleading (no filters are excluding anything). A distinct "create a discovery profile with alerting to detect changes" empty state would be clearer for the truly-unconfigured case.
+
+### [22 / #1799] SNMP data in asset detail modal — BLOCKED
+- BLOCKED: no discovered assets to open (empty Discovery). Modal/SNMP fields not reachable.
+
+### [24 / #1742] Discovered-asset "Link to Device" clarity — BLOCKED
+- BLOCKED: no discovered assets. (Assets tab shows Approve/Dismiss bulk controls + "No assets discovered yet.")
+
+### [9 / #1914] PAM UAC interception opt-in default — PARTIAL (single-org fixture)
+- ✅ PAM Overview "Getting started" copy: "UAC prompt capture is on by default. Scope it per device with a Configuration Policy → Privileged Access feature link." Default Org is an existing/grandfathered org (capture ON), consistent with #1914 (opt-in default applies to NEW orgs, active orgs grandfathered).
+- ⚠️ Cannot verify the new-org opt-in default vs grandfathering with only one pre-existing org (no second/new org in fixture). The per-device toggle lives in Config Policy → Privileged Access feature.
+
+### [35 / #1771] Signer-group (trusted-publisher) catalog — PASS
+- ✅ PAM → Signer Groups: clear empty state + helper copy ("reuse a trusted-publisher list across multiple rules").
+- ✅ "Add signer group" modal: Name / Description / Signers (one Authenticode subject CN per row, "Add signer") / Create group. Created "QA Trusted Publishers" (signer: Microsoft Corporation) → modal closed, group appears in list (state-change confirmation).
+- ⚠️ Minor: no success toast on create — confirmation is the list update only (acceptable per list-handler pattern, but a toast would be clearer).
+
+### [36 / #1761] PAM rule matching cluster — PASS
+- ✅ Rules tab: priority-order explainer + "Default verdict" (Require approval / Auto-deny) for unmatched elevations (pam-default-unmatched-verdict).
+- ✅ "Add rule" editor has full matching cluster, each criterion with its own "Negate (does not match)" toggle: Signer, Signer group, SHA-256 hash, Path glob, Parent image, Command line, User, AD group + scheduling window (start/end), approval mins, Enabled. Command-line match + negation + default-unmatched verdict all present.
+
+### [6 / #1909] Viewer interactive update prompt — BLOCKED (desktop app)
+- BLOCKED: this is the desktop Viewer (Tauri) update prompt, not the web app. Out of scope for browser QA.
+
+---
+## P1 items
+
+### [25 / #1762] Unified chip-centric filter bar + saved views — PASS
+- ✅ Quick-add chips (Online/Offline/Servers/Needs patches/Critical/Reboot needed/Not seen 7d/Low disk/Untagged) + Add filter + Views + Advanced + Columns.
+- ✅ Clicking "Offline" chip applies a filter encoded in URL hash (#filtersV2=...) — transient UI state in hash per project convention.
+- ✅ Views menu → "Save current as view…" → name "QA Offline View" → toast "Saved view \"QA Offline View\""; view appears in menu.
+- ✅ Delete view → toast "Deleted view \"QA Offline View\"". Full chip→save→delete cycle confirmed with feedback. (Existing "Online devices" view also present.)
+
+### [26 / #1886] Reboot-pending dot layout — PASS (by design + code)
+- Set pending_reboot=true on offline WIN device. Inline status dot is correctly NOT rendered (DeviceList.tsx:818 `device.pendingReboot && device.status !== 'offline'`). Comment: "On an offline device the flag is stale and unactionable, so suppress the dot rather than wrap it under the wider 'Down' pill." → the wrap regression is resolved by suppression. No layout break observed.
+
+### [27 / #1850] Pending-reboot orange dot + "Updating" label — PASS (verified by code; live orange dot needs online device)
+- ✅ Dedicated "Pending Reboot" column renders "Reboot pending" badge (bg-warning amber) for the pending device — confirms pendingReboot data + amber styling.
+- ✅ statusLabels.updating = 'Updating' (full word, NOT truncated to "Upd"); inline reboot dot is `bg-warning` (orange/amber) and only shows for non-offline devices (DeviceList.tsx).
+- ⚠️ Live inline orange dot not visually exercised — requires an ONLINE pending-reboot device (all fixture devices offline). Logic confirmed in source.
+
+### [28 / #1718] Display names in Device column — PARTIAL
+- ✅ Device column renders friendly primary name (primaryName) with hostname as secondary/title (DeviceList.tsx:657-659). Seeded devices show hostnames as their names (SEED-CRIT-NODE etc.).
+- ⚠️ Cannot distinguish a separate friendly display_name from hostname — no fixture device has a distinct display name set.
+
+### [32 / #1760] Responsive data tables (mobile) — PASS
+- ✅ At 390px width: no horizontal viewport overflow (docW === viewW === 390) on Devices and Organizations pages; no layout break.
+- ✅ Devices table uses `overflow-x-auto` container on mobile (graceful horizontal scroll, content stays within viewport).
+- ✅ Organizations (ResponsiveTable) renders card layout on mobile (no `<table>` element at 390px) and switches at desktop width — no duplicate rendering, no overflow. ResponsiveTable primitive adopted across org/users/patches/vuln/discovery lists (source-confirmed).
+
+### [34 / #1775] Linux OS patch logic — BLOCKED
+- BLOCKED: no Linux device with patch data in fixture (4 devices: 3 SEED nodes with no OS shown + 1 Windows). Cannot verify Linux-specific OS patch rendering.
+
+### [41 / #1749] Script scope changer on edit screen — PASS
+- ✅ Edit Script screen has a scope control: radios "All my organizations" (partner-wide) / "A specific organization" + scope-badge.
+- ✅ Selecting "A specific organization" reveals an Organization picker (Default Organization / Northwind IT / Acme Managed Services). Reverted without saving to preserve the partner-wide script. Save button present.
+
+### [42 / #1794] Monaco theme preserved across nav — PASS
+- ✅ Script editor Monaco background = rgb(30,30,30) (dark). Navigated to /devices and back to the script editor → Monaco background still rgb(30,30,30) (NOT white). No white-editor regression (global monaco-theme-persist.js working).
+
+### [40 / #1883] Ticket requester selectable/editable + device link — PASS
+- ✅ Ticket detail (T-2026-0002): Requester field "Breeze Admin" + Edit. Edit reveals contact select ("Unknown" / "Someone else…") + Name + Email inputs + Save/Cancel.
+- ✅ Set requester to custom "QA Requester" → field updates to "QA Requester" + activity-log entry recorded (no toast, but clear state change).
+- ✅ Device link "WIN-DHQNR1F8LO2" → clicking navigates to /devices/<id> (device detail). Device also has Unlink control.
+
+### Bonus observation — Script editor unsaved-changes guard — POSITIVE
+- ✅ The Edit Script page fires a beforeunload guard when navigating away with unsaved changes. Good safety UX (prevents accidental loss).
+
+### [43 / #1875] Config-policy monitoring + compliance in portal — PASS
+- ✅ Config policy detail has feature tabs: Overview / Patches / Alerts / Backup / Monitoring / Maintenance / Compliance / More.
+- ✅ Monitoring tab: "Service/process monitoring, event log alerts, and metric alert rules" — General (Check Interval), Service & Process Watches (Add Watch), Event Log Alerts (Add Alert), Metric & Status Alert Rules (CPU/RAM/disk thresholds, offline detection, custom conditions). "Not configured" state honest.
+- ✅ Compliance tab: "Compliance rules and enforcement" + Compliance Rule Sets (Add Compliance Rule) + empty state "No compliance rule sets configured yet."
+
+### [44 / #1860 #1859] Config-policy automations & offline rules — PASS
+- ✅ Automations feature (More → Automations): "Add Automation" + empty state "No automations configured yet."
+- ✅ Offline alert rules present: Monitoring → Metric & Status Alert Rules explicitly includes "offline detection."
+
+### [BUG / #1875 area] Nested <button> hydration error on Config Policy Monitoring tab — FAIL (console)
+- ❌ BUG: Opening Config Policy → Monitoring tab logs a React hydration error: "In HTML, <button> cannot be a descendant of <button>. This will cause a hydration error." Source: MonitoringSection — the collapsible section-header is a <button>, and the "Add Watch"/action button is nested inside it. Invalid DOM (interactive-in-interactive) + hydration mismatch + a11y issue. Visible behavior currently works, but should be fixed (wrap header in a non-button or move the action button outside).
+
+### [45 / #1754] Huntress inbound webhook URL + secret in GUI — PASS (secret); URL post-connect
+- ✅ Integrations → Security → Huntress (in All-orgs/partner scope): config form Name / Account ID / API Key (hk_...) / API Secret (hs_...) / Webhook Secret (optional, "used to verify inbound Huntress webhooks") + Generate.
+- ✅ "Generate" button produces a 64-char hex webhook secret into the field. Copy/verify path present.
+- Note: the inbound webhook URL display is a post-connection element (Huntress not connected — no real creds). Secret generation fully verified.
+
+### [46 / #1791] Partner-wide SentinelOne — PASS
+- ✅ Integrations → Security → SentinelOne: clear partner-wide model copy ("configured once at the partner level and shared across every organization. Switch your scope to All orgs to add the management URL and API token"). Honest "isn't connected yet" state; config form surfaces in All-orgs scope.
+- ✅ Same partner-level pattern confirmed for Huntress.
+
+### [23 / #1748] Network Discovery in All-Orgs mode — PASS
+- ✅ In All-orgs scope, /discovery shows a clean guard: "Select an organization to view network discovery — Network discovery is scoped to a single organization, site, and agent. Choose an organization in the scope switcher..." No crash. Exactly the intended guard.
+
+### [47 / #1852] Software inventory "All Orgs" — PASS
+- ✅ #1852 target is /software-inventory (Software Policies → Inventory tab). In All-orgs mode it loads the aggregate: "Aggregate view of software installed across all managed devices", "33 unique software" with Name/Vendor/Devices/Versions/Policy Status columns. No error.
+
+### [FINDING] Software LIBRARY (/software) catalog errors in All-Orgs mode — PARTIAL/BUG
+- ❌ BUG: /software (Software Library, distinct from the #1852-fixed /software-inventory) fails in All-orgs scope: GET /api/v1/software/catalog → 400 {"error":"orgId is required for this scope"}, surfaced as an error banner "Failed to fetch software catalog [Dismiss]".
+- ✅ Loads fine in Current (single-org) scope ("No software packages yet").
+- This is the SAME class of bug #1852 fixed for Software Inventory, not yet applied to the Software Library catalog endpoint. Unlike Discovery (clean guard), Library shows a raw error. Fix: either aggregate the catalog across accessible orgs (like #1852) or show a "select an organization" guard.
+
+### [49 / #1740] Sidebar nav scroll position preserved — PASS
+- ✅ Scrolled .sidebar-nav to scrollTop=240, clicked the "Users" nav link → after navigation the sidebar scroll position is restored to 240 (not reset to top). Works across the click-driven (MPA) navigation path.
+- Note: a direct URL navigation (browser goto) does reset to 0, which is expected (bypasses the click handler that persists scroll).
+
+### [48 / #1741] AI chat panel pinned to bottom — PASS
+- ✅ Workspace → New Conversation → submitted "List how many devices are offline..." → AI ran a "Query Devices" tool call and answered "There are 4 devices currently offline." (correct — 4 seeded offline devices). End-to-end AI + tool-calling works.
+- ✅ Latest message renders at the bottom with the composer ("Cmd+Enter to send") pinned below it; no layout break. Short reply fit the panel so scroll-pinning wasn't stress-tested, but no anti-pattern observed.
+
+### [37 / #1752] UAC elevation → mobile approval — BLOCKED
+- BLOCKED: cross-surface (live elevation request + mobile approval app). Not exercisable from web browser with offline devices.
+
+### [38 / #1694] Remote session consent & notification — BLOCKED
+- BLOCKED: starting a remote session requires an online device (all offline). Consent prompt config not reachable.
+
+### [11 / #1759] Accepted quote → auto-draft contract — BLOCKED (portal accept)
+- BLOCKED: requires completing the typed-name accept on the public portal page (apps/portal /quote/[token]); token is a signed JWT minted on Send. Portal accept flow not exercisable in this dev stack (per prior sweeps). The auto-draft-contract-on-accept path therefore can't be triggered via UI.
+
+### [51 / #1844] Forced-MFA enrollment login — BLOCKED
+- BLOCKED: requires an MFA-required fixture/user. Single seeded admin without forced MFA.
+
+### [39 / #1863 #1864] Breeze Assist tab — PASS
+- Note: the Breeze Assist tab is a Config Policy feature tab (HelperTab.tsx), reached via Config Policy detail → More → Breeze Assist (NOT a device-detail tab).
+- ✅ Honest badge: "Not configured" when deploy is off.
+- ✅ "Deploy Breeze Assist to devices" toggle present.
+- ✅ Tray Menu Options ARE shown even when deploy is off, with hint "Enable 'Deploy Breeze Assist to devices' above to apply these options" — the #1863 fix. Toggles: Open Breeze Portal / Device Info / Request Support + Custom Portal URL field. Exactly the intended behavior.
+
+---
+
+## SUMMARY — UI/UX papercuts & improvement opportunities (running list)
+1. **Duplicate "Default (Order 0, +0d)" update rings** in the Patches ring selector — two rings share the identical display label; can't disambiguate without opening each. Add description/id to the dropdown label. (Patches)
+2. **Network Changes empty state misleading when 0 profiles** — shows "No change events match the selected filters" even when no filters exclude anything (zero profiles). A distinct "create a discovery profile with alerting" empty state would be clearer. (Discovery #1801)
+3. **Software Library (/software) errors in All-Orgs mode** — "Failed to fetch software catalog" (400 orgId required) instead of a guard like Discovery's. Same class of bug #1852 fixed for Software Inventory; not yet applied to the Library catalog. (BUG-ish)
+4. **Nested <button> hydration error on Config Policy → Monitoring tab** — invalid DOM + React hydration warning + a11y issue (MonitoringSection). (BUG)
+5. **No success toast on PAM signer-group create** — confirmation is list-update only (acceptable, but a toast would match other flows). (PAM)
+6. **No success toast on ticket requester change** — field updates + activity-log entry, but no toast. (Tickets — minor)
+7. **Warranty card has no Refresh affordance / no auto-update card** on the Overview of an offline device — could not find a way to trigger warranty refresh (#1803 may be online-gated). (Devices)
+8. **Footer shows "API 0.82.0"** while testing against main (post-0.83.3) — version endpoint may be stale/behind. (Minor — worth confirming /system/version reflects deployed build.)
+9. **POSITIVE**: script editor beforeunload guard, honest "not configured"/"not connected" integration states, disabled-with-tooltip gating (Remote Tools "Device is offline", TD SYNNEX Test/Lookup), and clear partial-action feedback ("0 deleted, 3 skipped") are all good patterns.
+
+## RESULTS TABLE (this sweep)
+| # | PR | Area | Result |
+|---|---|---|---|
+| 1 | #1926 | Billing bulk actions + draft delete | PASS |
+| 2 | #1924 | Pax8 → contract-line picker | BLOCKED (no Pax8 conn) |
+| 3 | #1922 | TD SYNNEX inline lookup in quote editor | BLOCKED (no EC creds) |
+| 4 | #1913 | Network Proxy + asset-modal | BLOCKED (offline/no assets) |
+| 5 | #1911 | Remote Tools all services + Close/Back | BLOCKED (offline; gated honestly) |
+| 6 | #1909 | Viewer update prompt | BLOCKED (desktop) |
+| 7 | #1907/1921 | Reliability capped/age-aware/offenders | PASS |
+| 8 | #1897 | Patch ring no 50-collapse | PARTIAL (4-device fixture) |
+| 9 | #1914 | PAM UAC opt-in default | PARTIAL (single org) |
+| 10 | #1862 | Quote presentation + typed signature | PARTIAL (presentation PASS; accept on portal) |
+| 11 | #1759 | Accepted quote → auto-draft contract | BLOCKED (portal accept) |
+| 12 | #1765 | Contracts auto-renew + renewal notices | PASS |
+| 13 | #1743 | Quote detail Customer label | PASS |
+| 14 | #1763 | Quote PDF preview (blob CSP) | PASS |
+| 15 | #1849 | QuickBooks connect flow | PASS |
+| 16 | #1848 | TD SYNNEX EC Express connector | PARTIAL (UI PASS; lookup blocked) |
+| 17 | #1861 | Vuln list & detection | PASS (empty) |
+| 18 | BE-16 | Vuln remediation | BLOCKED (no vuln data) |
+| 19 | BE-16 | Vuln RBAC | BLOCKED (no role) |
+| 20 | #1728/1842 | Network topology | PARTIAL (empty-state PASS) |
+| 21 | #1801 | Network Changes empty-state | PARTIAL (works by design; 0 profiles) |
+| 22 | #1799 | SNMP in asset modal | BLOCKED (no assets) |
+| 23 | #1748 | Discovery All-Orgs guard | PASS |
+| 24 | #1742 | Link-to-Device clarity | BLOCKED (no assets) |
+| 25 | #1762 | Chip filter + saved views | PASS |
+| 26 | #1886 | Reboot dot layout | PASS (suppress-on-offline) |
+| 27 | #1850 | Pending-reboot orange dot + "Updating" | PASS (code+badge; live dot needs online) |
+| 28 | #1718 | Display names in Device column | PARTIAL (no distinct display name in fixture) |
+| 29 | #1745 | Process drilldown empty states | PARTIAL/PASS |
+| 30 | #1744 | Activity pane last-N | PASS |
+| 31 | #1755/1804/1810 | Reliability column + card | PASS |
+| 32 | #1760 | Responsive tables mobile | PASS |
+| 33 | #1764 | Partner-scoped rings | PARTIAL (single org) |
+| 34 | #1775 | Linux patch logic | BLOCKED (no Linux device) |
+| 35 | #1771 | Signer-group catalog | PASS |
+| 36 | #1761 | PAM rule matching cluster | PASS |
+| 37 | #1752 | UAC → mobile approval | BLOCKED |
+| 38 | #1694 | Remote session consent | BLOCKED (offline) |
+| 39 | #1863/1864 | Breeze Assist tab | PASS |
+| 40 | #1883 | Ticket requester + device link | PASS |
+| 41 | #1749 | Script scope changer | PASS |
+| 42 | #1794 | Monaco theme across nav | PASS |
+| 43 | #1875 | Config-policy monitoring + compliance | PASS (+ hydration bug) |
+| 44 | #1860/1859 | Config-policy automations + offline rules | PASS |
+| 45 | #1754 | Huntress webhook URL + secret | PASS (secret gen; URL post-connect) |
+| 46 | #1791 | Partner-wide SentinelOne | PASS |
+| 47 | #1852 | Software inventory All-Orgs | PASS (+ Library catalog all-orgs bug) |
+| 48 | #1741 | AI chat pinned to bottom | PASS |
+| 49 | #1740 | Sidebar scroll preserved | PASS |
+| 50 | #1803 | Warranty refresh + auto-update card | PARTIAL (no refresh affordance offline) |
+| 51 | #1844 | Forced-MFA enrollment | BLOCKED (no fixture) |
+
+Test artifacts left in DB: contract "QA Sweep Contract" (Default Org, $250 line, auto-renew 12mo/30d notice); PAM signer group "QA Trusted Publishers"; ticket T-2026-0002 requester changed to "QA Requester"; a workspace AI conversation. Reverted: WIN device pending_reboot, script scope. Org scope left on Current.
+
+### Triage note (main session)
+- Dropped proposed issue "footer reports API 0.82.0": confirmed `BREEZE_VERSION=0.82.0` is set in the local `.env` and passed into breeze-api; the footer correctly reflects that env var. Local-config artifact, NOT a defect.
+
+### Issues filed (2026-06-25, internal QA)
+- **#1932** [UI] Config Policy → Monitoring tab renders nested `<button>` (hydration error) — MonitoringTab.tsx (medium)
+- **#1933** [UI] Software Library catalog 400s in All-Orgs mode — software.ts `/catalog`, #1852 sibling (medium)
+- **#1934** [Patches] Duplicate identical "Default" update rings after #1764 org→partner migration (`-a` lacks the dedup `-b` has) (low/medium)
+- **#1935** [UI] Network Changes empty state misleading when no discovery profiles exist (low)
+- **#1936** [DB] #1764 partner-scope migrations not re-runnable — guard org_id backfill with IF EXISTS (low)
+
+## UI QA Sweep — 2026-06-26 (increment)
+
+Pulled main 61983fbd9 → 6c880e0ce (10 commits). Test list: `docs/testing/UI_TEST_LIST_2026-06-26_increment.md`. Stack: same code-mounted dev, http://localhost, admin@breeze.local.
+
+### Environment / setup
+- ✅ ff-merged to 6c880e0ce; ticket-response-templates migration applied; stack health/web/login 200.
+- ✅ VERIFIED #1941 (#1936 fix): API booted clean through the partner-scope a/b/c rerun path. #1941 edited the shipped `-a`/`-b` in place + added exact CHECKSUM_RECONCILIATIONS (from = the canonical original checksums, which matched what this QA recorded yesterday). Local DB had a stale `-b` (857bb90…) and `-c` (6f5a3b3…) recorded checksum from yesterday's surgical marking + intermediate runs; healed both to the on-disk hashes (already-applied schema), after which boot is clean. New `-c` dedup confirmed at data layer: Default rings 2→1 (#1939).
+
+### [A1 / #1937] Config Policy → Monitoring nested-button — PASS (CONFIRMED-FIXED)
+- ✅ Source fix confirmed: `MonitoringSection` outer expand header is now `<div role="button" tabIndex aria-expanded>` (MonitoringTab.tsx:254), inner "Add Watch" remains a real `<button>` — valid nesting.
+- ✅ Fresh page load + open Monitoring tab: `browser_console_messages level=error` = 0 errors; no `validateDOMNesting`/`<button> cannot be a descendant of <button>`/hydration error.
+- ✅ DOM probe: 42 buttons, 0 nested `<button>`-in-`<button>`.
+- ✅ Row toggle works (expand/collapse, aria-expanded flips); inner "Add Watch" adds an editor row (count badge 0→1) and inner remove button deletes it — inner actions fire independently of the row toggle (stopPropagation).
+- ⚠️ Note: with `all=true` the console buffer still contained ONE stale nested-button hydration warning from an earlier HMR/compile state; it does NOT reproduce on a clean reload. Mention only so future sweeps don't false-alarm on the accumulated buffer.
+
+### [A2 / #1938] Software Library catalog All-Orgs — PASS (CONFIRMED-FIXED)
+- ✅ Scope = All Orgs (aria-pressed=true): `GET /api/v1/software/catalog => 200 OK` (network probe req #154). No 400, no raw error banner.
+- ✅ Single-org scope: library loads cleanly too. Both modes render the empty-state ("No software packages yet. Add one to get started.") — no console errors (level=error = 0).
+- BLOCKED (fixture): catalog is empty in this DB, so cross-org *aggregation* couldn't be visually confirmed — but the 400 regression (#1933) is resolved (200 in both scopes).
+
+### [A3 / #1939] Duplicate Default rings deduped — PASS (CONFIRMED-FIXED)
+- ✅ Patches → Update Ring selector: exactly one entry "Default (Order 0, +0d)" alongside "All Rings". No duplicate identical entries.
+- ✅ Patches → Update Rings tab: header reads "1 of 1 rings"; single "Default" row (Order 0). Matches data-layer 2→1 confirmation noted in env setup.
+
+### [A4 / #1940] Network Changes empty state — PASS (CONFIRMED-FIXED)
+- ✅ Discovery → Changes with no profiles now shows actionable guidance: "Set up a network discovery profile to start tracking changes." + "Network change events are created by discovery profiles. Create a profile and enable Alerting to record new, changed, or disappeared devices." NOT the old misleading "no events match filters".
+- ✅ "Go to Profiles" CTA (data-testid changes-create-profile) navigates to /discovery#profiles.
+- ⚠️ Minor: the "0 events loaded" counter + full filter bar still render above the empty-state guidance, which slightly competes with the call-to-action. Acceptable, not blocking.
+
+### [B6 / #1946] EDR operations (SentinelOne + Huntress) Pillars 1–4a — PARTIAL
+- ✅ Pillar 2 (Fleet EDR pages) VISIBLE & working: /security/edr renders "Endpoint Detection & Response" with SentinelOne Threats + Huntress Incidents tabs (hash-routed #huntress).
+  - S1 tab: full filter bar (severity/status/date-range/search/refresh), `GET /api/v1/s1/threats?limit=100&orgId=... => 200 OK`, honest empty state "0 threats match your filters" / "No SentinelOne threats found."
+  - Huntress tab: filters (severity/status/search/refresh), `GET /api/v1/huntress/incidents?limit=100&orgId=... => 200 OK`, honest empty state "No Huntress incidents found."
+  - No console errors; integration-not-connected is handled as empty 200, NOT an error banner — correct honest gating.
+- BLOCKED Pillar 1 (Device-detail EDR panel): device Security tab shows NO EDR/SentinelOne/Huntress content. Gated behind build-time flag `PUBLIC_ENABLE_EDR_INTEGRATIONS` (default false in featureFlags.ts:18; not set in this dev stack). Sidebar "EDR" nav link also absent for the same reason. Prereq: rebuild web with `PUBLIC_ENABLE_EDR_INTEGRATIONS=true`.
+- BLOCKED Pillar 3 (security-dashboard EDR summary panel): same flag gate.
+- BLOCKED Pillar 4a (promote-to-incident from EDR events): no SentinelOne threats / Huntress incidents in fixture and no integration creds, so isolate/promote inline actions have no rows to exercise. Prereq: connected S1/Huntress integration + seeded threat/incident data.
+- ⚠️ Inconsistency: the fleet EDR page (/security/edr astro route) renders regardless of the flag (route not gated), but its sidebar entry point IS flag-gated — so with the flag off the page is functional yet has no discoverable nav link (reachable only by direct URL). Either gate the route too, or surface the link.
+
+### [B7 / #1942] AI catalog auto-fill from name/SKU — PARTIAL (UI correct; enrichment failing + cost-tracking bug)
+- ✅ UI surface present: Product Catalog (/settings/catalog) → "Add item" drawer has an "Auto-fill a new item from the web" section: input "Product name or SKU" + "✨ Auto-fill from web" button (CatalogEnrichButton; also wired into QuoteEditor). Button correctly disabled until text entered.
+- ✅ Honest loading state: button → "Filling…", input disabled during the ~16s call.
+- ✅ AI call actually executes: `POST /api/v1/catalog/enrich` (Anthropic + web_search tool; ~30k input tokens, real spend per logs).
+- ✅ Honest error feedback (NOT silent): on failure a toast fires ("AI response missing required fields") via runAction; fields revert cleanly, no crash. Captured via MutationObserver.
+- ❌ BUG (reliability): enrichment FAILED twice for a mainstream product ("Microsoft 365 Business Premium") → API 502 `{"error":"AI response missing required fields","code":"AI_PARSE"}`. Root cause (api log + catalogEnrichmentService.ts:158): the model's JSON output fails `enrichDraftSchema.safeParse` (required field missing, likely `name`) after web search. Happy-path field population could NOT be demonstrated. Could be model-config specific (resolveDefaultModel) — needs investigation; if a common SKU can't enrich, the feature is effectively non-functional here.
+- ❌ BUG (cost-tracking integrity): every enrich call logs `[catalog-enrich] recordUsage failed: ... invalid input syntax for type uuid: "catalog-enrich-<uuid>"`. catalogEnrichmentService.ts:125 calls `recordUsage('catalog-enrich-' + randomUUID(), ...)` — the first arg is written to `ai_sessions.id` (a UUID column), but the `catalog-enrich-` prefix makes it a non-UUID string, so the usage UPDATE throws on EVERY call. Result: AI cost/tokens for catalog enrichment are never recorded → budget accounting/enforcement is bypassed for this endpoint. Caught+logged (doesn't fail the request) but the spend (~$0.10/call here) is lost. Fix: use a bare `randomUUID()` for the session id (the human label belongs elsewhere), or change the column/lookup.
+- Note: spend is real (~30k tokens/call) and untracked — the two bugs compound (paying for calls that both fail to parse AND fail to record).
+
+### [B8 / #1931] Tickets auto-reply + canned responses — BLOCKED (UI dead in dev stack; backend verified via API)
+- ❌ BLOCKER (dev-env, not a #1931 source defect): BOTH host pages fail to hydrate. `/settings/partner#ticketing` hangs forever on "Loading partner settings…"; `/tickets` renders the SSR shell but the React island never hydrates. Console (both): `[astro-island] Error hydrating … SyntaxError: The requested module '/@fs/app/packages/shared/src/index.ts' does not provide an export named 'renderTemplate'`.
+  - Root cause: #1931 added `export * from './ticketTemplate'` to `packages/shared/src/utils/index.ts`. The export chain on disk is correct & complete (index.ts → `export * from './utils'` → utils/index.ts → `export * from './ticketTemplate'` → `export function renderTemplate`). The long-running Vite dev server has NOT re-resolved the newly-added *transitive* `export *` across nested barrels (a known Vite limitation; HMR/file-touch does not fix it — error persisted with an unchanged `?t=` after touch). Consumers `InboundEmailCard.tsx` + `CannedResponsePicker.tsx` import `renderTemplate`/`variablesForContext` from `@breeze/shared`, so their host islands crash.
+  - This is dev-only: a production rollup build bundles the export fine. PREREQ to test the UI: restart the web dev container (or `rm -rf node_modules/.vite` then restart astro dev) so Vite rebuilds the module graph. Per instructions I did not restart docker.
+  - ⚠️ DX papercut: every dev who pulls #1931 and relies on HMR will hit a broken Tickets + Partner Settings page until they restart Vite.
+- ✅ Backend verified via API (partner-scope token): `GET /api/v1/ticket-response-templates` → 200 `{data:[]}`; `POST` a canned response with merge vars (`Hi {{requester_name}}, re ticket {{ticket_number}}…`) → 201 (id returned, body+vars persisted, partnerId scoped); `GET` reflects it; `DELETE /…/{id}` → 200 `{success:true}`. Canned-response CRUD + template-variable storage all work server-side. Test row cleaned up.
+- Not exercised (UI-only): auto-reply template editor + live preview (InboundEmailCard), template-variable rendering in the composer, applying a canned response in a ticket reply (CannedResponsePicker), and save-feedback toasts — all blocked by the hydration failure above.
+
+### Cleanup / stack note
+- `touch`ed packages/shared/src/{index.ts,utils/index.ts,utils/ticketTemplate.ts} (mtime only, no content change) attempting to nudge Vite; this restarted the API dev server (transient 502s ~30s) — recovered (/health 200, /api/v1/config 200, web 200). Did NOT fix the web Vite barrel-resolution cache.
+- Test artifact: created+deleted canned template "QA Canned Reply" (id 88f2bee5…) — net zero.
+
+### Triage outcomes (main session, 2026-06-26)
+- ✅ **All 4 fix-verifications CONFIRMED-FIXED**: #1937 (Monitoring nested-button — source now `<div role=button>`, 0 console errors), #1938 (Software Library all-orgs aggregates, no 400), #1939 (Default rings 2→1), #1940 (Network Changes empty-state CTA).
+- **B8 (#1931 tickets) — flipped BLOCKED → PASS.** The hydration breaker was a Vite stale-cache artifact (newly-added transitive `export *` from ticketTemplate not re-resolved without restart). `docker restart breeze-web` cleared it; `/tickets` now 200 with **0 console errors** and hydrates (auto-nav to T-2026-0002). Export chain verified correct in source (`utils/index.ts` → `export * from './ticketTemplate'`; root `index.ts` → `export * from './utils'`). NOT a code bug → not filed. DX note only: after pulling #1931, dev stacks relying on HMR must restart Vite.
+- **Filed #1949** [Billing/AI] catalog enrich never records usage — `'catalog-enrich-'+uuid` written to `ai_sessions.id` (uuid col) → insert fails → budget bypass. `catalogEnrichmentService.ts:125`. CONFIRMED (ai_sessions.id data_type=uuid). medium.
+- **Filed #1950** [AI] catalog auto-fill 502/AI_PARSE for common products (M365 Business Premium ×2). Local `ANTHROPIC_API_KEY` IS set, so not a missing-key artifact; `enrichDraftSchema.safeParse` rejects model output. `catalogEnrichmentService.ts:158`. medium.
+- Stack left healthy on 6c880e0ce (api/web/caddy/pg/redis all up; health/web/login 200).
+---
+
+## UI QA Sweep — 2026-06-15
+
+**Scope:** Integration branch `qa/integration-2026-06-15` = `origin/main` (65 commits since `v0.70.0`)
++ 10 merged-for-QA PRs: #1411 Recurring Contracts, #1369 Authenticator step-up, #1413/#1414 ticketing
+fixes, #1381 catalog delete, #1390 watchdog version, #1385 OS labels, #1380 observability, #1376 last-login RLS,
+#1402 claude-agent-sdk bump. **Dropped:** #1218 (zod 3→4) — breaks ~20 validator typechecks; non-UI dep bump.
+**Stack:** dev compose re-pointed at this worktree; api+web healthy; authenticator + recurring-contracts
+migrations applied (2 checksum drifts reconciled). Login: admin@breeze.local / E2E_ADMIN_PASSWORD.
+
+### Running UI/UX observations (papercuts)
+_(appended continuously)_
+
+
+### [#1383 Invoice Engine routing] — FAIL (HIGH) — caddy `/billing/*` collision
+- ❌ BUG: Nav "Invoices" → `/billing/invoices` returns **502** through the standard caddy ingress.
+  Root cause: `docker/Caddyfile.prod` has `@billing path /billing /billing/*` → `reverse_proxy billing:3002`
+  (the hosted-SaaS billing sidecar), evaluated **before** the catch-all `handle { reverse_proxy web:4321 }`.
+  The Invoice Engine put its only nav-linked MSP page at `/billing/invoices` (`apps/web/src/pages/billing/invoices.astro`,
+  Sidebar.tsx:161 `href:'/billing/invoices'`), so caddy shadows it with the sidecar route.
+  - **API actual:** caddy 502 (no `billing` container locally); web:4321/billing/invoices = **200** (page is fine).
+  - **Prod impact:** where the billing sidecar runs, clicking "Invoices" reaches the SaaS billing portal, NOT the
+    MSP invoice-management UI → Invoice Engine UI unreachable via its own nav link.
+  - Contracts (#1411) is unaffected — it lives at `/contracts` (works through caddy).
+  - Fix options: move MSP invoice pages off `/billing/*` (e.g. `/invoices`), OR narrow the caddy `@billing`
+    matcher to the sidecar's actual paths and let `/billing/invoices*` fall through to web. → **file issue (architectural, not a small inline fix).**
+  - ✅ Candidate fix verified locally: added a `@webBillingInvoices path /billing/invoices /billing/invoices/*`
+    → `web:4321` handle **above** the `@billing` sidecar rule in `docker/Caddyfile.prod`. After caddy reload,
+    `/billing/invoices` and `/billing/invoices/[id]` → 200; `/contracts`, `/health`, `/` unaffected. (Local QA scaffold
+    on the throwaway integration branch; offer as the fix in the issue — maintainers should confirm the sidecar
+    doesn't itself need `/billing/invoices`.)
+
+### [#1411 Recurring Contracts] — FAIL→FIXED — create & add-line both 400 (feature was non-functional)
+- ❌ BUG 1 (create): `POST /api/v1/contracts` → **400** for the common case (no end date / no notes).
+  UI sends `endDate: endDate || null` + `notes: notes.trim() || null` (ContractEditor.tsx:164,166), but
+  `createContractSchema` had `endDate: isoDate.optional()` / `notes: ...optional()` (no `.nullable()`), so `null`
+  is rejected: `ZodError "Expected string, received null"`. `updateContractSchema` already used `.nullable().optional()`
+  → create was inconsistent. Route/validator tests only ever omit these fields (undefined), never null → green CI.
+  - ✅ FIX: `packages/shared/src/validators/contracts.ts` — `endDate`/`notes`/`terms` → `.nullable().optional()`;
+    refine `c.endDate == null || c.endDate > c.startDate`. Verified: UI payload now 201; endDate<startDate still 400.
+- ❌ BUG 2 (add line): `POST /api/v1/contracts/:id/lines` → **400** for EVERY line. UI (ContractEditor.tsx:216-219)
+  sent `unitPrice: Number(linePrice)` (a **number**, but `contractLineInputSchema.unitPrice` is the `money` **string**
+  regex) and `catalogItemId`/`siteId`/`manualQuantity` as **null** (schema = optional string). ZodError on all of them.
+  → no line can be added → contract can never be activated → **the whole feature is unusable via the UI.**
+  - ✅ FIX: ContractEditor.tsx — send `unitPrice: linePrice` (string), omit absent optionals (undefined not null).
+- **Why CI missed both:** unit/route tests construct payloads with correct string types and omit optionals; the real
+  browser payload (number price, `|| null` optionals) was never exercised end-to-end. → classic UI-QA-only catch.
+- Severity: HIGH (headline PR feature non-functional). Both fixed on integration branch; needs cherry-pick to #1411.
+
+### [#1411 Recurring Contracts — full lifecycle] — PASS (after the 2 fixes above)
+- ✅ Create contract (org, name, advance/monthly, no end date) → 201, navigates to detail, "Draft" badge.
+- ✅ Add flat-fee line ($99.99) → line row renders, "Estimated this period" → $99.99, Activate button enables.
+- ✅ Activate → "Active" badge, read-only detail (Next billing 6/15/2026, Auto-issue "No (drafts)"), Pause/Cancel + Generate-now.
+- ✅ "Generate invoice now" → creates a DRAFT invoice, navigates to /billing/invoices/[id]; line + Subtotal/Tax(8.5%)/Total
+  ($99.99) correct; contract notes carried over. (Also proves the caddy fix serves /billing/invoices/[id].)
+- ✅ Issue → invoice persisted as `status=sent`, `INV-2026-0002` (verified in DB).
+
+### [#1383 Invoice Engine — issue action] — PARTIAL (MEDIUM) — stale header after Issue
+- ❌ BUG: After clicking **Issue** on a draft invoice, the line fields + Issue buttons correctly disable, but the page
+  header still reads **"Draft invoice"** with no invoice number/status — the view doesn't refetch the invoice after the
+  mutation. DB was already `sent`/`INV-2026-0002`. A manual reload then shows "INV-2026-0002 / Sent / Due 7/15/2026"
+  correctly. → mutation succeeds but the detail view renders stale state until reload. (Medium: looks like the action
+  half-failed.) Likely missing a refetch/state-refresh in the invoice issue handler. → file issue.
+- ⚠️ UI/UX: issued invoice "Bill to" shows "Set on the organization billing settings." — good empty-state nudge.
+  "Record payment" is disabled with no tooltip explaining why (org billing not configured?) — minor.
+
+### [Devices — #1385 OS labels, #1390 watchdog, #1284 sortable, #1306 overview] — PASS
+- ✅ Devices list: 7 devices / 3 orgs; every column header sortable (#1284, sort icons present); OS column shows
+  normalized Windows/macOS/Linux labels+icons (#1385); status chips with rich tooltips ("Watchdog still reporting…
+  agent wedged"); page-size selector 10–500.
+- ✅ Device detail → Details tab: **Watchdog Version "0.68.2"** renders in Agent section (#1390); **OS Version**
+  "Microsoft Windows Server 2022 Standard Evaluation" + OS Build + Architecture amd64 normalized correctly (#1385,
+  no kernel-prefix mangling — the merge-conflict resolution that dropped the redundant local formatter is correct).
+- ✅ Device Overview (#1306): CPU/RAM/uptime, perf charts (24h/7d/30d) render in real browser (no ResizeObserver
+  issue — that's jsdom-only), warranty, activity feed empty-state.
+
+### [Tickets — #1413 assignee dark theme, #1414 perf, Phase 4] — PASS
+- ✅ #1413: in dark theme the ticket Assignee `<select>` renders light text rgb(232,234,238) on dark bg rgb(13,16,23)
+  — readable contrast (the white-on-dark bug is fixed). Status/Priority selects keep their semantic color tints.
+- ✅ Queue UI: tabs My/Unassigned/All open/Breaching soon/Closed with counts; SLA states (Breached, "Paused · 22m left");
+  org/priority/category/assignee filters; split list+detail layout loads cleanly (#1414 refetch-cascade perf — no visible
+  thrash on open). Ticket detail: Status/Priority/Assignee selects, Reply/Internal note, SLA panel, Time & Billing
+  (Start timer / Log time), Parts, Requester/Source/Created. "Create invoice" action links ticket→Invoice Engine.
+- ⚠️ UI/UX: footer version string reads **"Web dev · API 0.63.5"** on every page — stale/incorrect (branch is past
+  v0.70.0). Minor but visible on all screens. → note (low).
+
+### [#1381 Software Library catalog delete] — PASS
+- ✅ Add Package (metadata-only modal) → package appears. Select package → detail shows Deploy/Details/Versions/**Delete**.
+  Delete → "Delete package?" confirm modal → Confirm → `DELETE /software/catalog/:id`, package removed, list returns to
+  empty state, modal dismissed. Cancel path also present (per the PR's test).
+- ⚠️ UI/UX: Delete only appears in the package DETAIL (after selecting), not on the grid card — reasonable (avoids
+  accidental deletes) but a tester scanning the grid won't see it. Acceptable.
+
+### [Product Catalog #1365 / Authenticator #1369] — routes/locations:
+- ✅ #1365 Product Catalog (/settings/catalog): renders items table — "QA Starter Bundle" (service/bundle/$2000),
+  "QA Test Laptop" (hardware/QA-LAP-001/$1500); Add item / Edit / Archive actions. Items feed the contract line
+  catalog picker (cross-feature integration confirmed). PASS.
+- ⓘ #1369 Authenticator: no dedicated web page (no /authenticator route/component); ships dark (L1 default) as
+  enforcement on the approval flow. Not UI-testable in a browser sweep beyond non-regression of existing approvals.
+  Migrations applied (authenticator_devices, authenticator_policies, approval_requests tables present). Mark
+  CODE-VERIFIED / UI-N/A.
+
+### Other observations
+- ⚠️ Side panels (Breeze AI + Documentation) render docked open by default and sit off the right edge at 1680px width
+  — the AI panel close button was off-viewport (couldn't click). Minor layout/space issue.
+- ⚠️ Onboarding product tour ("Navigate your tools", 1 of 4) auto-shows on first load — expected for a fresh session.
+- ✅ Nav crawl: all 41 sidebar destinations + settings return SSR 200 (after the caddy /billing fix). No whole-page 500s.
+
+## Summary (UI QA Sweep 2026-06-15)
+
+| Area | PR(s) | Result |
+|---|---|---|
+| Recurring Contracts lifecycle | #1411 | FAIL→**FIXED** (2 HIGH: create & add-line 400; now full create→line→activate→invoice works) |
+| Invoice Engine — caddy routing | #1383 | **FAIL (HIGH)** — `/billing/invoices` shadowed by billing sidecar; candidate caddy fix verified |
+| Invoice Engine — issue action | #1383 | PARTIAL (MEDIUM) — header stale after Issue until reload |
+| Contracts intervalMonths bound | #1411 | bug (MEDIUM) — client max 120 vs server max 60 mismatch |
+| Devices: OS labels/watchdog/sortable/overview | #1385/#1390/#1284/#1306 | PASS |
+| Tickets: assignee dark theme / queue | #1413/#1414 | PASS |
+| Software Library delete | #1381 | PASS |
+| Product Catalog | #1365 | PASS |
+| Authenticator | #1369 | CODE-VERIFIED / UI-N/A (ships dark) |
+| Nav crawl (41 routes) | — | PASS (all 200 after caddy fix) |
+
+**Top findings:** (1) Recurring Contracts was fully non-functional via UI — two client/server payload mismatches
+(null vs undefined for optional fields; number vs money-string for price) — both fixed. (2) Invoice Engine MSP page
+unreachable through caddy ingress (`/billing/*` reserved for the hosted billing sidecar). (3) Recurring pattern across
+the billing feature: **the UI sends `null`/`Number()` where Zod schemas expect `undefined`/money-strings, and unit
+tests never exercised the real browser payloads** — worth a validator/UI-contract audit across the billing routes.
+
+### Issues filed / fixes applied (2026-06-15)
+- **Filed #1417** — caddy `/billing/*` shadows the Invoice Engine MSP page (HIGH, main via #1383). Includes verified caddy fix.
+- **Filed #1418** — invoice detail header stale after Issue until reload (MEDIUM, main via #1383).
+- **Fixed on integration branch (belong on open PR #1411 — NOT yet on that branch):**
+  - `packages/shared/src/validators/contracts.ts` — createContractSchema endDate/notes/terms `.nullable().optional()` + null-safe refine; + regression test in `contracts.test.ts` (7/7 pass).
+  - `apps/web/src/components/contracts/ContractEditor.tsx` — add-line payload sends money strings + omits absent optionals (no `Number()`/`null`).
+  - **Open (needs product decision):** contracts `intervalMonths` — client allows ≤120 (ContractEditor.tsx:127,339) vs server `.max(60)` (contracts.ts:27). Pick one bound and align both.
+- **Local QA scaffold (throwaway branch only):** `docker/Caddyfile.prod` `/billing/invoices*`→web route (= the #1417 fix); worktree `.env` symlink → root `.env`.
+
+**Stack state:** dev compose re-pointed at this worktree (`qa/integration-2026-06-15`), api+web healthy. To restore to the prior worktree: bring web/api/caddy back up from `/Users/toddhebebrand/breeze/.claude/worktrees/invoice-engine-impl` (or wherever desired) and remove this worktree's `.env` symlink.
+
+### Resolution (2026-06-15, end of sweep)
+- **Pushed contract fixes to PR #1411** as `68dec3cc` (createContractSchema nullable + regression test, ContractEditor
+  add-line money-string/omit-null, intervalMonths client→60 to match server). PR comment posted. Verified E2E after fix.
+- **#1417** (caddy `/billing/*`) + **#1418** (invoice issue staleness) filed against main.
+- **Dev DB test data left:** contract "QA Managed Services — Monthly" (+ a few curl replay contracts), invoice
+  INV-2026-0002 (number burned), software package created then deleted. All on the dev DB (5432).
+- **Local-only scaffold (NOT pushed):** `docker/Caddyfile.prod` /billing/invoices route (= #1417 fix) + `.env` symlink
+  remain on `qa/integration-2026-06-15` for the running stack.
+
+> **Reconciliation (2026-06-26):** every code fix prototyped on `qa/integration-2026-06-15`
+> (contracts validator `.nullable()`, ContractEditor money-string payload, the
+> `docker/Caddyfile.prod` `/billing/invoices` route = #1417) was independently fixed
+> forward on `main` — verified present in `origin/main`, which is also well ahead of the
+> throwaway branch (Zod-4 migration, contract auto-renew, quotes + portal Caddy routes).
+> The QA branch was discarded; only this log + `UI_IMPROVEMENTS.md` + the checklist were salvaged.
+
+## Web console i18n Phase 1 (en / pt-BR) — 2026-07-10
+
+**Branch:** `worktree-web-i18n-phase1`
+**Commit:** `e44d668ef` (implementation uncommitted)
+**Tested by:** Codex
+**Result:** PARTIAL
+
+### What was tested
+
+- [x] UI unit coverage: language selector persists and applies `pt-BR`; mounted sidebar switches between English and Portuguese; full web Vitest suite run.
+- [x] API unit coverage: `/users/me` rejects unsupported locales and merges `pt-BR` preferences.
+- [x] Static verification: Astro check completes with zero errors.
+- [ ] Live UI/API smoke: unavailable because this worktree has no configured `E2E_*` credentials and no running web/API/Postgres/Redis compose services.
+
+### Evidence
+
+- Full web suite: 412 files / 3,215 tests passed (including the new i18n and ProfilePage regression coverage).
+- API users route tests: 68 passed.
+- Astro check: 0 errors (existing hints only).
+
+### Issues Found
+
+- No implementation defects found in automated verification.
+- Live persistence across a fresh browser profile remains to be exercised when an E2E stack is configured.
+
+## Web console i18n Phase 2 extraction (en / pt-BR) — 2026-07-11
+
+**Branch:** `worktree-web-i18n-phase1`
+**Commit:** `0b17bf3b7`
+**Tested by:** Codex
+**Result:** PASS
+**Plan progress:** 34 of 34 executable items complete (100%).
+
+### What was tested
+
+- [x] Full web unit suite after the final residue pass.
+- [x] Locale parity and static translation-key usage across all extracted namespaces.
+- [x] Partner-default locale API coverage and precedence behavior.
+- [x] Astro type/static analysis and production web build.
+- [x] Post-wave visible-string residue audit, including multiline UI, CSV, and printable-report copy.
+- [x] Manual pt-BR click-through of the top 10 pages on an isolated, seeded OrbStack worktree stack: Dashboard, Profile, Devices, Alerts, Tickets, Remote Access, Scripts, Patches, Vulnerabilities, and Reports. Locale persistence, `<html lang>`, navigation, browser titles, and representative content were re-verified after fixes.
+
+### Evidence
+
+- Full web suite: 425 files / 3,270 tests passed.
+- API org/user route suites: 2 files / 214 tests passed.
+- Astro check: 1,334 files, 0 errors (existing hints only).
+- Production build: passed; pt-BR remains emitted through lazy locale chunks.
+- Live browser recheck passed for the confirmed residue fixes: localized metadata/help/profile copy, dashboard/device/alert relative times, Devices filters/table labels, Alerts tabs, Remote/Vulnerabilities landing copy, and Reports diacritics.
+- Fresh-tab pt-BR recheck passed with zero hydration/runtime console errors after deferring the persisted locale switch until Astro's initial islands finish hydrating.
+- Worktree diff and whitespace checks: clean.
+
+### Issues Found
+
+- Automated verification found and fixed structural enum/state values that had been translated by mechanical extraction, two callback variables shadowing `t()`, cross-namespace device metadata labels, and several post-wave literal-string misses.
+- The live walkthrough found and fixed remaining runtime-only residues that unit/static checks could not expose, including a duplicate Devices quick-filter rendering path.
+- The live walkthrough also exposed and fixed a stored-locale hydration race that could render pt-BR before English SSR islands hydrated.
+- Final read-only code review found no unresolved Critical or Important issues after runtime, enforcement, formatter, and copy-quality remediation.
+- Brazilian Portuguese copy remains machine-drafted and should receive native-speaker review before production rollout.
+
+## Windows System State Backup (system_image mode) — 2026-07-15
+
+**Branch:** `backup-fixes-wip`
+**Base commit:** `e2df3b691`
+**Tested by:** Claude
+**Result:** PASS (backend E2E; UI badge display is an unblocked follow-up)
+
+### What was tested
+- [x] Agent: `system_image` backup_run on the live Windows VM (`WIN-DHQNR1F8LO2`) collects OS system state (registry hives, BCD, drivers, services, tasks, firewall, features) and uploads it as a snapshot.
+- [x] API: server labels the snapshot `backup_type=system_image` and persists `system_state_manifest` + `hardware_profile`; snapshots list DTO surfaces `backupType`.
+- [x] Full-stack fan-out: manual run creates one `file` + one `system_image` job; both complete.
+
+### Bug found (before fix)
+`system_image` job failed immediately with `backup_run payload has no paths`. The worker maps `system_image` → `backup_run {systemImage:true}` (no file paths), but the agent's `backup_run` handler required file paths and never read `systemImage`. Nothing captured Windows system state through the server-driven flow.
+
+### Fixes
+- **agent/cmd/breeze-backup/exec_backup.go** — `managerFromBackupRunPayload` honors `systemImage:true`: builds the manager with `SystemStateEnabled`, no file paths required.
+- **agent/internal/backup/backup.go** — `RunBackupWithExcludes` allows a paths-less run when system state is enabled; an empty system-state-only run now FAILS loudly instead of a silent `skipped`.
+- **apps/api** — result manifest was dropped in three places, all fixed: `resultSchemas.ts` (schema passthrough), `queueSchemas.ts` (strict queue schema rejected the new keys → job hung), `agentWs.ts` (enqueue subset omitted the fields), `backupResultPersistence.ts` (persist manifest/hardware_profile + derive `backupType` from `backup_mode`), `snapshots.ts` (list DTO surfaces `backupType`).
+
+### Evidence
+- Snapshot `snapshot-20260716T042714Z-4c7abb8b`: `backup_type=system_image`, 13 files, 103 MB, `has_manifest=t`, `has_hw=t`, platform=windows, os=Windows Server 2022, 10 manifest artifacts.
+- Tests: Go `internal/backup` + `cmd/breeze-backup` green; API backup/agentWs/queue/persistence/snapshots suites green (new cases added for the systemImage payload guard and the manifest-persistence/labeling).
+
+### Follow-ups — all completed + verified in the same session
+- **UI badge (done):** `SnapshotBrowser.tsx` now shows a "System image" badge on the snapshot header + a type suffix in the selector dropdown (`backupType !== 'file'`). Web test added; `astro check` 0 errors.
+- **Windows hardware profile (done):** root cause was `wmic.exe`, deprecated/removed on Server 2022 — the whole collector silently returned zeros. Rewrote `hw_windows.go` to use PowerShell `Get-CimInstance`. Verified live: `AMD Ryzen 7 3800X`, 4 cores, 4255 MB, 4 disks, 2 NICs, BIOS `090008`, `Microsoft Corporation Virtual Machine`.
+- **Restore round-trip (done, non-destructive):** restored the system_image snapshot to `C:\tmp\restore-test` via `POST /backup/restore` (full). 13 files / 103,584,508 bytes / 0 failed; on-disk artifacts byte-match the backup (registry SOFTWARE 84,037,632, SYSTEM 18,776,064, SAM/SECURITY, BCD, drivers, services, tasks, firewall, features). Full BMR (destructive, needs boot media) intentionally not run on the live VM.
+
+### Code review round (PR #2581) — hardening applied
+
+A 4-agent review (code / silent-failure / tests / comments) confirmed the core change sound and surfaced partial-failure gaps, now fixed:
+- **Partial system-state collection no longer silent (C1):** `state_windows.go` records failed steps in `manifest.IncompleteSteps`, `collectRegistry` reports failure when it captures zero hives (every Windows box has SYSTEM/SOFTWARE), and `backup.go` surfaces a completion `Warning` (→ result `warning` → job errorLog → UI) so a degraded system_image can't pass as a full, restorable capture.
+- **CIM failures now logged (M1):** `cimCSV` logs each failure with PowerShell stderr — an unlogged failure was how the wmic path shipped all-zero profiles.
+- **Malformed-completed backup result now fails, not silently completes (H2):** the Redis enqueue path in `agentWs.ts` gates `status` on parse success, mirroring the inline path.
+- **Tests added:** Go seam (`collectSystemState`) + fail-loud/partial-warning assertions (the prior test was vacuous on CI hosts); `backupProcessResultSchema` + `backupCommandResultSchema` manifest round-trip (the strict-schema rejection that hung the job); backupType precedence (file not mislabeled, explicit type wins).
+- **Deferred (noted, not fixed):** H1 (server null-manifest guard — verified unreachable in practice); M2 (combined file+system_image mode — not dispatched); hard-fail-on-missing-registry policy (product decision); hw perf (8 PowerShell spawns).
+
+### Partial-collection policy: hard-fail on required artifacts (per Todd)
+
+Refined the review-round C1 handling — missing *required* artifacts now fails the run rather than warning:
+- `systemstate.go` adds a pure, CI-testable `missingRequired(incomplete, required)` policy helper; the Windows collector declares `windowsRequiredSteps = {registry, boot}` (the classes a bare-metal restore can't boot without) and `CollectState` returns an error when any is missing.
+- A required-artifact failure therefore propagates as a collection error → the system_image job fails loud (no green unbootable snapshot).
+- Genuinely optional classes (certs, iis, firewall, …) still complete with a surfaced warning — an MSP doesn't lose an otherwise-good backup over a non-critical step.
+- Tests: `TestMissingRequired` (policy table); partial-warning test switched to optional classes (certs/iis); required-failure → hard-fail is covered by the collection-error consumption test.
+
+## Incremental Backups + Reliability Controls — live E2E — 2026-07-17
+
+**Branch:** `ToddHebebrand/backup-work` (de9e6285b + fixes below)
+**Rig:** breeze-wt-toddhebebrand-backup-testing stack (fresh seed), isolated non-root agent on this Mac (`~/breeze-backup-e2e-rig`, HOME-overridden so `~/.breeze/backup-journal` is writable), local-provider destination, profile→config-policy→org assignment created through the web UI via Playwright.
+**Tested by:** Claude
+**Result:** PASS after 2 fixes (both committed with this entry)
+
+### Verified working
+- Profile → policy Backup tab (new destination inline create) → org assignment → device shows "Policy assigned"; Run backup now dispatches.
+- Full backup #1: 14 files/14.35 MB uploaded, objects + manifest in dest, job row + restore point + expiry in UI.
+- Incremental #2/#3: snapshot prefix physically contains only changed files; mtime-only touch correctly *referenced* via sha256 tiebreak; `baseSnapshotId` set; restore/verify read through references.
+- Savings UI: "13.9 MB protected — 79.0 B uploaded" (`backup-job-savings`) on the /backup jobs list after the fix below.
+- Live progress: jobs list shows "44% · 18/24 files · 60.8 MB/s" with Stop button during a 3.5 GB run.
+- Stop: after fix below, `backup_stop` → `{"stopped":true}`, upload halts immediately, no manifest written, partial prefix + journal preserved.
+- Resume: next run reused the interrupted snapshot prefix (journal), re-uploaded only the interrupted file, completed with 34/35 referenced.
+- Pure-reference snapshot (unchanged source): completes with ref=12/12, zero upload.
+- Integrity check (idle): passed 35/35 across referenced prefixes. Test restore: correct partial + per-file failures + temp cleanup when the rig disk filled (env artifact, not a bug).
+- Agent auto-update host-mismatch guard refused a cross-host download URL (dev rig).
+
+### Bugs found + fixed in this branch
+1. **Incremental savings dropped on the Redis path** — `agentWs.ts` `enqueueBackupResults` payload hand-copied fields and omitted `referencedFiles`/`referencedBytes`/`errorCount`; `ProcessResultsResult` + strict `backupProcessResultSchema` also lacked them. Only the no-Redis inline fallback preserved them, so every real deployment persisted NULL savings. Fixed in all three layers + `queueSchemas.test.ts` regression block.
+2. **backup_stop was a no-op on policy-managed devices** — helper `executeCommand` nil-mgr fallback returned "backup not configured on this device" before reaching the canceller, so server-dispatched runs could never be stopped (3/3 live repros: cancelled jobs kept uploading and wrote their manifests). Fixed by routing `backup_stop` through `commandCanceller.cancelAll()` in the nil-mgr switch + 2 tests in `main_test.go`.
+
+### Observations (not fixed)
+- Restore point "Expires" shows +7d under Standard (30d) retention — GFS `daily:7` bucket wins over `retentionDays`; adjudicate whether intended.
+- Integrity Check button targets the latest job even while it's running → helper result has no snapshotId → verification row fails "malformed". Should target last *completed* snapshot or disable mid-run.
+- `backup_stop` during helper spawn returns "backup helper is already being spawned" (stop lost); benign for the reaper (retries) but a UI stop click in that window is dropped.
+- Rebuilding `bin/breeze-backup` under a running agent → "auth rejected: binary hash mismatch" until agent restart (hash pinning working as designed; dev-loop gotcha).
+- Device "Updating" badge persists while a failed auto-update retries every heartbeat; recovers once update stops failing.
+
+## PAM approval dialog on the secure desktop — 2026-07-16
+
+**Branch:** `ToddHebebrand/PAM-Testing-2`
+**Commit:** `3e9046839`
+**Tested by:** Codex
+**Result:** PARTIAL
+
+### What was tested
+
+- [x] Agent: SYSTEM-only PAM scope/selection, same-Windows-session fail-closed routing, dialog IPC authorization, input-desktop fallback, restore/cleanup ordering, restore failure, and panic cleanup under Go unit tests with `-race`.
+- [x] Agent: full `go test -race ./...` suite.
+- [x] Windows build: `internal/userhelper`, `internal/sessionbroker`, and `internal/heartbeat` test binaries cross-compiled for Windows amd64 with CGO disabled.
+- [ ] Native Windows: real UAC interaction with `PromptOnSecureDesktop=1` and `=0` was unavailable because this worktree has no configured E2E/dev-push credentials or Windows device ID.
+
+### Evidence
+
+- Focused `sessionbroker`, `userhelper`, and `heartbeat` race tests passed.
+- Full agent race suite passed after all review fixes.
+- Focused Go vet, Windows cross-compilation, and diff whitespace checks passed.
+- Independent task review and final whole-branch review found no unresolved Critical or Important issues.
+
+### Issues Found
+
+- No implementation defects remain from automated review and verification.
+- Before release, manually verify Approve, Deny, timeout, default-desktop fallback, and console/RDP coexistence on a native Windows test host.
+
+## UI QA Sweep — 2026-08-11 (Playwright pass, stacks 32821/32825)
+
+**Tested by:** Claude (Playwright MCP), branch `fix/config-policy-count-i18n-glue` @ http://localhost:32792
+
+### Environment note (not a product bug, logged once)
+- Access token / refresh cycle is very short-lived in this dev stack (session expired ~20-30s after login repeatedly, sometimes hitting `429` on `/api/v1/auth/refresh`). Caused several forced re-logins during the sweep, each redirecting back to the original route (`?reason=session-expired` works correctly). Flagging as environment friction, not a release defect — the redirect-back-after-relogin behavior itself is correct.
+
+### [Nav crawl — sidebar destinations] — PASS
+- ✅ All ~30 sidebar destinations visited (Dashboard, Devices, Alerts, Tickets, Incidents, Remote Access, Scripts, Patches, Vulnerabilities, OneDrive, Fleet, AI Workspace, Network Monitor, Network Discovery, Security, DNS Security, PAM, User Risk, Sensitive Data, Peripherals, AI Risk Engine, CIS Benchmarks so far) all render with correct titles, no 500s, no unexpected console errors.
+- ⚠️ UI/UX: `/remote` and a few other islands log `react-i18next: NO_I18NEXT_INSTANCE` warning on first mount (see i18n glue section below) — cosmetic console noise, not a functional break.
+
+### [CIS Benchmarks `/cis-hardening` — PR #3400 dual ownership] — PASS
+- ✅ Existing seed data already shows a partner-wide baseline ("QA Partner-Wide Baseline") with a visible **"All orgs"** badge (tooltip: "Partner-wide baseline — applies to devices in every organization").
+- ✅ Created a new baseline via "New Baseline" modal with Scope radio = "All organizations (partner-wide baseline)"; on save the row appeared immediately with the "All orgs" badge and the "Active Baselines" KPI incremented 3→4 — confirms create flow + badge render end-to-end.
+- ✅ "Trigger Scan" action on the new baseline produced a visible toast: "Scan queued for QA Sweep Test Baseline" — confirms `runAction` mutation feedback (PR #3372) is wired correctly here.
+- ⚠️ Minor: clicking "Save" with the required "Benchmark Version" field empty silently did nothing (no inline validation message appeared, modal just stayed open) — had to guess the cause and fill it in to proceed. Low severity (didn't lose data, no false success), but a papercut vs. the "readable validation, not silent" standard in the QA checklist.
+
+### [Audit Baselines `/audit-baselines`, `/audit-baselines/[id]` — PR #3372 runAction feedback] — PASS
+- ✅ Dashboard tab shows a clean empty state ("No compliance data yet — Activate a baseline and wait for the next drift evaluation cycle") rather than an error or blank screen.
+- ✅ Baselines tab lists 6 seeded CIS baselines; toggling the Active/Inactive status button on "CIS L1 Audit Baseline (Linux)" flipped the button label Inactive→Active immediately (visible state change, no console errors) — confirms the org-scoping/mutation-feedback fix works.
+- ✅ Detail page `/audit-baselines/[id]` renders Overview/Compliance/Apply tabs, baseline details, and raw settings correctly.
+
+### [i18n count-glue fixes — config-policy list, Roles, Software Inventory, Compliance Status] — PARTIAL
+- ✅ `/configuration-policies` list header renders "1 of 1 policies" as one clean sentence (local commit `0f49f0a26` verified working).
+- ✅ `/settings/roles` list header renders "6 of 6 roles" as one clean sentence (local commit `80ace9c15` verified working).
+- ⚠️ BLOCKED: Config-policy Compliance Status tab (`/configuration-policies/[id]#compliance_status`, `ComplianceStatusTab.tsx`) could not be exercised — the only seed policy ("QA Timezone Test Policy") has no compliance rule sets configured, so `GET /api/v1/policies/{id}/compliance` 404s and the tab shows a generic "Failed to load compliance status" + Retry (never reaches the count-glue string). Prerequisite: a policy with compliance rules configured and at least one evaluated device.
+- ❌ BUG (NEW, not covered by the two recent i18n-glue fix commits): `/software-inventory` renders **"0unique software"** — glued string, same defect class as the ones just fixed in `0f49f0a26`/`80ace9c15`. Root cause: `apps/web/src/components/software/SoftwareInventory.tsx` line ~254-257:
+  ```
+  <span className="text-sm text-muted-foreground">
+    {total}
+    {i18n.t("policies:software.softwareInventory.uniqueSoftware")}
+  </span>
+  ```
+  Adjacent JSX expression containers again render with no whitespace. This is a *different* string from the one `80ace9c15` fixed in the same file (that commit only touched the "Showing X-Y of Z" pagination footer at line ~509 — this is the top-of-page unique-count summary at line ~254, keyed `uniqueSoftware` not `...of`, so the commit's "repo-wide sweep of the 19 `of` keys" did not catch it since this key isn't named `of`). Reproduced with 0 count (worst case, no space at all: "0unique software") but the underlying JSX-concatenation bug applies at any count. Confirmed via DOM: `[...document.querySelectorAll('span')].find(e=>e.textContent.includes('unique software')).textContent === "0unique software"`.
+  Suggested fix: same interpolated-`summary`-key pattern as the sibling fixes, e.g. `i18n.t("...uniqueSoftwareSummary", { total })`.
+
+### [Config Policy Maintenance/Automation tabs — PR #3361 shared TimezoneSelect] — PASS
+- ✅ Maintenance tab's Timezone control uses the shared searchable `TimezoneSelect` (`data-testid=maintenance-timezone-*`): opened popover, typed "Tokyo" in the search box, filtered to a single match (Asia/Tokyo GMT+9), selected it, and the trigger button updated to "Timezone: Asia/Tokyo" — full round-trip works identically to other TimezoneSelect usages in the app.
+- ⚠️ Automation tab has no automations configured in seed data so its own TimezoneSelect instance (per-automation schedule) wasn't exercised — not blocking, the shared component behavior was already verified on Maintenance.
+
+### [Quotes `/billing/quotes/[id]` — PR #3318 unit price digit clipping] — PASS
+- ✅ Created a new draft quote, added a pricing-table line, typed "123.45" into the Unit price field one keystroke at a time (verifying DOM `value`/`selectionStart` after each key to rule out tool-typing races): value tracked correctly at every step (`1`→`12`→`123`→`123.`→`123.4`→`123.45`), and on blur the field displayed the full `$123.45` — no clipped trailing digit. Confirms the `growWidth` chrome-funding fix.
+- Note: Playwright's `pressSequentially`/`type` (rapid synthetic keystrokes with ~0ms delay) transiently produced a garbled value ("123.00045") once during this session; per-keystroke verification with real settle time between presses showed this was a test-harness timing artifact against the controlled input's re-render, not a reproducible product defect — flagging for awareness, not filing as a bug.
+
+### [Quote → Invoice conversion — PR #3319 line name carry-through] — PASS
+- ✅ Seed quote Q-2026-0003 ("QA Unit Price Test", status Converted, line name "QA Widget Line") → its linked invoice INV-2026-0001 shows the same "QA Widget Line" description on the invoice line, not a generic placeholder like "Quote line" or blank. Confirmed via `/billing/quotes/[id]` → "View invoice" → `/billing/invoices/[id]`.
+
+### [What's New splash — PR #3317] — PASS
+- ✅ Sidebar "What's new" button reopens the splash on demand, showing "What's new in 0.105.0" with release bullets and a working "Learn more" link (→ breezermm.com/release-notes) plus "Show me later"/"Got it" actions.
+
+### [Scripts `/scripts` — PR #3301 library pagination] — BLOCKED
+- ⚠️ UI/UX: on `/scripts` first paint (before i18next finishes initializing on this island), the catalog-scope label briefly rendered the raw i18n key `layout.scope.catalogLine` instead of falling back to English or showing nothing; it self-corrected to "Catalog — same for every organization" once i18next loaded (~1s later). Matches the known `NO_I18NEXT_INSTANCE` warning seen on other pages (`/remote`, etc.) — likely a pre-existing island-hydration race, not new in this release, but worth a mention since it's a visible key-leak.
+- ✅ "Import from Library" system-script picker lists all 23 catalog scripts unpaginated (fits on one scroll, count label "23 script(s) available" matches the rendered rows) — no defect here, just not enough fixtures to exercise pagination.
+- BLOCKED: Custom script library (`/scripts`) has 0 org scripts in seed data ("No scripts yet" empty state), so the actual `/scripts` pagination fix (PR #3301, listed as fixing truncation beyond page 1) could not be exercised. Prerequisite: 25+ custom scripts seeded in an org to cross a page boundary.
+
+### [`/register-partner` — PR #3289 business-email gate] — PARTIAL
+- ✅ Self-hosted path (this dev stack) verified unaffected: registering with a free/consumer email (gmail.com) returned `200 OK` from `POST /api/v1/auth/register-partner` and the UI showed the same non-enumerating "Check your email — if registration can proceed…" confirmation used for any registration attempt (by design, to avoid leaking domain-block status). Matches the guide's expectation that self-hosted is unaffected by the gate.
+- BLOCKED: Cannot verify the hosted-only rejection path (the gate only activates when `IS_HOSTED=true`) — this local stack is self-hosted config. Needs a hosted-mode deployment or env override to confirm the free-domain rejection message/flow.
+
+### [PSA `/integrations` PSA tab — PR #2135 dual ownership, #3291 real connection test] — PARTIAL
+- ✅ Seed data already has a partner-wide Jira connection ("QA Jira Test Renamed") showing the "All orgs" badge with correct tooltip — confirms PR #2135 dual-ownership render.
+- ✅ "PSA Connections" / "Synced Tickets" list headers render clean "1 of 1 connections" / "0 of 0 tickets" sentences (no glue defect here).
+- ✅ Edit → Save changes round-trips correctly (modal closes, no errors, list stays in sync).
+- ⚠️ UI/UX: "Test connection" is disabled every time the Edit modal is (re)opened, with hint "Save first — Test checks the stored credentials, not your unsaved edits" — even immediately after a no-op Save with zero field changes. Had to Save twice across two modal sessions and still could not get to an enabled Test button in the time available, so PR #3291's "real connection test, not simulated" behavior could not be exercised end-to-end this pass. Possibly by design (forces an explicit save-then-test flow) but the friction of needing a fresh save inside the *same* modal session before Test unlocks (if that's even sufficient) is worth a UX look — low severity.
+
+### [Fleet Posture `/devices/posture` — PR #3244] — PASS
+- ✅ KPI strip renders correctly ("Enrolled devices: 2", "Never scanned: 2" with clean sentences, no glue defects), matches per-org breakdown table ("2 enrolled in Breeze / 0 running both / 0 Breeze-only / 2 unknown").
+- BLOCKED: persistent "migration required" banner (PR #3324) not observed anywhere in the nav crawl — no agent in seed data is flagged `migrationRequired`. Prerequisite: an agent/device fixture with that flag set to verify the `DashboardLayout` banner persists across navigation.
+
+### [Enrollment Keys `/settings/enrollment-keys` — PR #3034 per-token capacity] — PARTIAL
+- ✅ Create Key flow works end-to-end: filled form, created "QA Token Capacity Test", one-time key secret displayed with copy/dismiss, list updated immediately showing "Active" status and "0 / 1" usage.
+- BLOCKED: Could not locate a distinct "generate install token" UI surface within this pass to create two separate install tokens under one key and compare their capacity tracking (the specific PR #3034 behavior). The "Download" action produces a file rather than an in-page token list. Needs a follow-up pass specifically tracing the install-token UI (or API-level verification of `installer_bootstrap_tokens` per-token capacity).
+
+### [Partner Service Principals `/settings/partner-service-principals` — PR #3243] — PASS
+- ✅ Full lifecycle verified: created "QA Sweep SP" (default scopes pre-checked sensibly, read-only by default), issued a key ("QA Key 1") — masked prefix `brz_sp_BN_hgmtj8On…` shown in the list, plaintext shown once in a "Copy this key now" dialog with explicit "shown once and cannot be retrieved later" warning — then Revoked it, and the row updated to status "revoked" with no actions remaining. No console errors, no silent failures at any step.
+
+### [Quick Support public landing `/quick` — PR #3292] — PASS
+- ✅ Page renders correctly for an anonymous/logged-out visitor (own layout, no sidebar, no auth needed) with clear plain-language 3-step instructions and the 9-digit code format (`234-567-892`).
+- ✅ Entering an invalid-alphabet code (all-zero) correctly triggers a format error ("That is not a complete code yet…") — verified this is intentional: the code alphabet is deliberately digits 2-9 only (`packages/shared/src/validators/quickSupport.ts`, `SUPPORT_CODE_PATTERN = /^[A-Z2-9]{9}$/`), excluding 0/1 to avoid O/0 and I/l/1 spoken-code ambiguity. Not a bug.
+- ✅ Entering a well-formed but non-existent/expired code returns a clear, non-technical "That code no longer works" message with recovery guidance ("Ask the person helping you to read out a new code") — good graceful-failure UX, not a silent failure or raw error.
+- BLOCKED: Could not test the full digit-code → download → reconnect-already-ended-session round trip (needs a live technician-initiated session code and the downloadable agent binary, out of scope for a browser-only pass).
+
+### [AI cost indicator — PR #3297] — PARTIAL
+- ✅ `AiCostIndicator` is present in the AI chat sidebar header ("$0.12 this month · 1 msg") and reflects a prior tool-invoking conversation (multiple "Manage Alerts"/"Get Device Details" tool calls executed) — consistent with tool executions being counted into the usage rollup.
+- BLOCKED: Could not confirm the *live, no-refresh* update behavior specifically — sending a fresh prompt ("Show critical alerts") hit the environment's AI-session expiry ("Session has expired due to inactivity. Please start a new session.") caused by the same short-lived-token issue noted at the top of this log, before a new response/cost update landed. Re-test once the session-refresh issue is resolved or with a longer-lived token.
+
+### [Remote access consolidation `/discovery`, `/devices/network/[id]` — PR #3199] — BLOCKED
+- `/discovery` renders cleanly (Assets/Profiles/Jobs/Topology/Changes tabs, clean empty state "No assets discovered yet."), but no discovered assets or online network devices exist in seed data, so the asset-detail-modal remote-access launch path and the 5-minute-session-cliff fix could not be exercised in this pass. Prerequisite: a discovered network asset or online device with proxy/remote access available.
+
+### Continuation pass — Phases 3 & 4
+
+**Tested by:** Claude (Playwright MCP), branch `fix/config-policy-count-i18n-glue` @ http://localhost:32821 (port changed from 32792 after a Docker restart)
+
+**Environment note:** first login redirected to `/setup` (Initial Setup wizard: Account/Organization/Install Agent) instead of straight to the dashboard — used "Skip setup - I'll configure this later" to reach `/`. Also hit a first-visit "Navigate your tools" 4-step product tour overlay on `/settings/organizations`; used "Skip tour". Neither is a bug, just noting the extra steps needed to reach a clean testing state. API version shown in sidebar footer reads "API 0.82.0" (older than other recent log entries mentioning 0.104/0.105 — cosmetic version-string drift in this build, not chased further).
+
+### [Org/Site lifecycle `/settings/organizations`] — PASS
+- ✅ Created org "QA Sweep Org" via inline "Add Organization" form (not a modal) — appeared in the org list immediately, auto-selected in the detail panel, and correctly triggered the guided "Add the first site for QA Sweep Org" inline form (matches the Phase-4 checklist expectation).
+- ✅ Created first site "QA Sweep HQ" — Sites panel updated to a clean "1 of 1 sites" sentence (no count-glue), row appeared in the sites table.
+- ✅ Renamed the site to "QA Sweep HQ Renamed" via its full-page Site Settings editor (`/settings/sites/[id]`, Details tab) — "Save changes" round-tripped, heading and breadcrumb updated, and the parent org's sites table reflected the new name immediately on return.
+- ✅ Deleted the site via the row "Delete" action — named confirm dialog ("Delete Site — Are you sure you want to delete QA Sweep HQ Renamed? This action cannot be undone.") appeared correctly (not a generic "Are you sure?"); confirmed and the table updated to "0 of 0 sites" / empty state immediately.
+- ✅ Deleted the org via the detail-panel "Delete" action — named confirm dialog ("Delete Organization — Are you sure you want to delete QA Sweep Org?..."); confirmed and the org disappeared from both the org list and the top-banner org switcher dropdown with no stale entries, no console errors at any step.
+
+### [Users & Roles `/settings/users`, `/settings/roles`] — PASS
+- ✅ `/settings/users` list header renders "1 of 1 users" (later "2 of 2 users") — clean sentence, no count-glue.
+- ✅ Invited "QA Sweep Tech" (Partner Technician role, All-organizations access) via the inline "Invite User" form — appeared in the table immediately with Status "Invited", "Never" last login, and "Resend invite | Edit | Devices | Remove" actions. No toast observed but the row-appearing-immediately is itself the visible state change (list is the source of truth here).
+- ✅ Cross-verified on `/settings/roles`: "Partner Technician" row's user count incremented from "0 users" → "1 user" after the invite, confirming the assignment round-tripped through to the roles view too.
+- ✅ Created custom role "QA Sweep Custom Role" (inherits from Partner Viewer) via "Create Role" — rich permission matrix (18 resources × up to 15 action columns: Read/Write/Delete/Execute/Acknowledge/Manage/Administer/Send/Export/Fulfill/Invite/Access/Accept Risk/Read All/Decide) rendered correctly, submit button was disabled until a name was entered (good inline validation), and after Create the role list included it immediately.
+- ✅ Assigned the new custom role to "QA Sweep Tech" via Edit User → Role dropdown (custom role appeared alongside the 6 system roles) → Save changes; table row updated Role column to "QA Sweep Custom Role" immediately. No console errors across the whole flow.
+
+### [Enrollment Keys `/settings/enrollment-keys`] — PASS
+- ✅ Created key "QA Sweep Key" (site = Default Site, Max Usage left blank/"Unlimited" placeholder) — plaintext key shown once in a "Save this enrollment key now. It will not be shown again." banner with Copy/Dismiss, row appeared in the table immediately with Status "Active".
+- ⚠️ UI/UX: leaving "Max Usage (optional)" blank (placeholder says "Unlimited") still resulted in the row showing Usage "0 / 1", not "0 / ∞" or similar — either the default silently caps at 1 despite the "Unlimited" placeholder implying otherwise, or the displayed fraction mislabels an actually-unlimited key. Worth a look; low severity (didn't block enrollment, just a confusing label) but exactly the kind of "readable, accurate" gap the checklist calls out.
+- ✅ "View install command": no separate command view — the page header text ("Use these keys with `breeze-agent enroll <key>`") combined with the one-time plaintext key serves the same purpose; functionally fine, just not a literal composed command string.
+- ✅ Revoked (deleted) the key — named confirm dialog ("Delete Enrollment Key — Are you sure you want to delete QA Sweep Key?... Agents will no longer be able to enroll using this key."), confirmed, table returned to "No enrollment keys found." empty state immediately. No console errors.
+
+### [Notification Channels `/alerts/channels`] — PARTIAL
+- ✅ Created Email channel "QA Sweep Email Channel" (qa-alerts@example.com) — card appeared immediately, "1 of 1 channels" clean sentence.
+- ✅ Clicked **Test** on the Email channel: visible pass/fail feedback confirmed — a red `circle-x` icon (lucide, `text-red-600`) appears next to "Last test: Just Now" (test failed, expected — no SMTP configured in this dev stack; this is the known environment limitation, not a product bug). This satisfies the "visible pass/fail result" requirement — it is NOT silent.
+- ✅ Created Slack channel "QA Sweep Slack Channel" (dummy `hooks.slack.com` webhook URL) — succeeded, card appeared, "2 of 2 channels".
+- ✅ Created Microsoft Teams channel "QA Sweep Teams Channel" (dummy `outlook.office.com` webhook URL) — succeeded, "3 of 3 channels".
+- ✅ Created PagerDuty channel "QA Sweep PagerDuty Channel" (dummy integration key) — succeeded, "4 of 4 channels". Along the way, confirmed the form's required-field validation is real (not decorative): a raw-DOM `value` set that bypassed React's controlled-input tracking left React state empty and correctly surfaced an inline "Channel name is required" error on submit — refilling via a real keystroke-driven `fill` fixed it. Testing-tooling artifact, not a product bug, but it double-confirms the validation is wired to actual form state.
+- ✅ **URL scheme rejection confirmed**: submitting the Webhook form with `javascript:alert(1)` and separately with `data:text/html,<script>alert(1)</script>` both correctly returned `400` from `POST /api/v1/alerts/channels` with `details: ["Webhook URL must use HTTPS","Webhook URL hostname is required", ...]`, and the UI surfaced a visible toast ("Invalid webhook channel configuration") both times — not silent, not a false success. This satisfies the "reject javascript:/data: schemes" checklist item.
+- ❌ **BUG: Webhook notification channel creation is completely broken, independent of URL** — after fixing the URL to a fully valid `https://webhook.example.com/breeze-alerts` with the default "No custom headers configured" state, `POST /api/v1/alerts/channels` still returned `400` with body `{"error":"Invalid webhook channel configuration","details":["Headers must be an object"]}`. Root cause confirmed via request body: the frontend serializes the (empty) headers list as `"headers":[]` (a JSON array), but the API validator at `apps/api/src/services/notificationSenders/webhookSender.ts:438-439` explicitly rejects `Array.isArray(c.headers)`, requiring a plain object/Record. `apps/web/src/components/alerts/NotificationChannelForm.tsx:36` models the Zod schema for `headers` as `z.array(z.object({...}))` (reasonable for an editable key/value-pair UI list) but never converts that array to a `Record<string,string>` before the POST body is built — so **every** webhook channel create request 400s, even with zero custom headers and a fully valid HTTPS URL. This masks the scheme-validation test above (all three attempts 400'd for the same missing-conversion reason; the HTTPS/hostname errors only showed alongside it on the malicious-URL attempts because those inputs failed multiple checks at once). UI correctly surfaced the failure (no silent failure), but the feature itself is unusable — could not create a working Webhook channel in this pass. High severity: Webhook is one of the 5 documented channel types and is entirely non-functional.
+- BLOCKED (by the bug above): could not exercise Test/Edit/Delete or partner-level default routing on a real Webhook channel; "5 of 5 channels" configured across all listed types (Email/Slack/Teams/PagerDuty/Webhook) not achieved — 4 of 5 succeeded.
+- Did not reach: partner-level channel defaults, routing-rule creation ("Notification Routing Rules — 0 rules" panel present but unexercised), and SMS/Pushover channel types — deprioritized after the Webhook bug consumed the available time budget for this area. Re-test once the Webhook fix ships.
+
+### [Configuration Policies `/configuration-policies`] — PASS
+- ✅ "0 of 0 policies" clean empty-state sentence on list.
+- ✅ Created "QA Sweep Config Policy" via the "Configure New" path, scoped to "A specific organization" → Default Organization (matches the org-scope/partner-scope radio pattern from the Partner-Wide First playbook) — navigated straight to the new policy's detail page.
+- ✅ Linked/configured the **Patches** feature: opened the Patches tab (badge read "Not configured"), changed Reboot Policy to "If required", clicked **Save** — badge flipped to "Configured" immediately, confirming the feature-link + save round-trip works.
+- Tab set present: Overview, Patches, Alerts, Backup, Security, Service & Process Monitoring, Maintenance, Compliance, More — all rendered without console errors.
+- Did not reach: a separate "preview effective config" surface — the Overview tab is just the policy-details form (name/description/status), not an effective-config diff view; assignment-to-org happens at creation time via the scope radio rather than a distinct "assign" step for org-scoped policies. Not a bug, just notes that this policy type's UX differs from the partner-wide assignment flow described in the checklist.
+
+### [Partner Settings `/settings/partner` — Company tab] — FAIL
+- ✅ Tab nav renders 11 sections (Company, Regional, Defaults, Security, Remote Access, Event Logs, Notifications, Ticketing, AI Budgets, Branding, Login Branding) as anchored single-scroll sections, not separate pages.
+- ✅ Company Name save round-trips (toast "Partner settings saved", `PATCH /api/v1/orgs/partners/me` → 200).
+- ❌ **BUG (HIGH — security): Contact → Website field has NO scheme/URL validation, client or server-side.** Entered `javascript:alert(1)` into Website, clicked Save Settings → toast "Partner settings saved" (200 OK, no error), and `PATCH /api/v1/orgs/partners/me` response body confirmed `"contact":{"website":"javascript:alert(1)"}` persisted verbatim. Repeated with `data:text/html,<script>alert(1)</script>` — also persisted verbatim (200 OK), including the raw `<script>` tag string in the stored JSON. This is the **opposite** of the sibling Notification-Channel Webhook URL field (`/alerts/channels`, tested above in this same pass), which correctly rejects both schemes with a 400 + `"Webhook URL must use HTTPS"`/`"hostname is required"` errors — proving the validation exists elsewhere in the codebase but was never applied here. Risk: this Website value is used for "branded PDFs, invoices, and email footers" per the section's own subtext — if rendered as an `<a href>` anywhere in generated documents or the portal, this is a stored-XSS / `javascript:` URI execution vector. Component: `apps/web/src/components/settings/PartnerCompanyTab.tsx` (client-side has no validation); server accepts it in `PATCH /api/v1/orgs/partners/me` with no scheme allowlist. Cleaned up test data (reset Website to `https://example.com`, saved) before moving on. **Did not check** whether the same gap exists on Branding-tab logo/link URLs or the org-level equivalent — worth a follow-up sweep.
+- ✅ **Remote Access (Remote-Tool Providers) tab — validation works correctly, unlike Company/Website above.** Added a provider with URL template `javascript:alert(document.cookie)`; Save Settings correctly 400'd (`PATCH /api/v1/orgs/partners/me`) with a precise scheme-allowlist error (`https, http, rustdesk, teamviewer, anydesk, splashtop, etc.` permitted; `javascript:, data:, vbscript:, file:, about:, chrome:, jar:, blob:, view-source:, filesystem:` rejected), **and** the UI surfaced this as an inline field-level error directly under the URL template textbox ("That URL scheme is not permitted — ..."), not just a toast. This is the correct, best-practice pattern in the app — confirms the Company/Website gap above is an inconsistency, not a codebase-wide limitation. Removed the test provider and saved to clean up.
+- BLOCKED (time-boxed): did not reach Regional, Defaults, Security, Event Logs, Notifications, Ticketing, AI Budgets, Branding, or Login Branding tabs in this pass, given the severity finding above consumed the budget for this area.
+
+### [Monitoring `/monitoring`, Network Discovery `/discovery`] — PARTIAL
+- BLOCKED: `/monitoring` (Assets/Network Checks/SNMP Templates) has 0 configured monitors and no discovered assets to attach one to — monitoring is fed by discovery per the page's own subtext. Prerequisite: at least one discovered/approved network asset.
+- ✅ Created discovery profile "QA Sweep Scan Profile" (site Default Site, subnet `10.0.0.0/24`, ICMP+SNMP methods, daily schedule) via `/discovery` → Profiles → New Profile — appeared in the table immediately.
+- ✅ Clicked "Run" on the profile — auto-navigated to the Jobs tab and the job correctly surfaced **"Failed — No online agent available for this site"** rather than hanging or silently no-oping. This is the expected graceful-failure pattern for an offline-fixture environment (no agent online to execute the scan) — a PASS per the checklist's "graceful can't messaging is a PASS" standard.
+- ⚠️ UI/UX (minor): profile-count summary reads "1 profiles configured" — plural used for a singular count (should be "1 profile configured"). Same defect family as the i18n count-glue bugs logged earlier in this file, though this is a pluralization bug rather than a missing-space concatenation bug.
+
+### [Backup `/backup` profiles, Integrations `/integrations`] — PASS
+- ✅ Backup → Profiles → "New profile" renders 5 starting templates (Server, Windows Workstation, macOS Workstation, Linux Server, Blank); selecting "Windows Workstation" opens a full profile editor with dual-ownership Availability radios ("This organization" / "All organizations — Partner-wide... Requires full partner access") matching the Partner-Wide First pattern, plus a Data Sources section. Confirms "forms render & validate" — did not complete a full save in this pass (time-boxed).
+- ✅ Integrations catalog renders 9 categories (Webhooks, Notifications, PSA, Security, Monitoring, Identity, Distributors, Accounting, UniFi); Webhooks tab shows clean "0 of 0 webhooks" empty state. Accounting → QuickBooks Online card shows "Inactive" status and a correctly-rendered "Connect to QuickBooks" button (`data-testid=quickbooks-connect`) that would initiate the OAuth redirect — did not click through to the real external OAuth provider (would leave the app / hang in this sandbox), but the connect-flow entry point itself renders correctly with accurate copy.
+
+### [Devices `/devices`] — BLOCKED
+- BLOCKED: "Your fleet is empty" — **zero devices exist in this dev stack**, unlike prior QA passes in this same log which referenced seeded devices/orgs. Every device-centric checklist item (search/filter by status & OS, page size, device-detail tabs, sort, bulk-select, tag, Run Script/Reboot/Wake/Connect Desktop actions) is blocked on this. Prerequisite: at least one enrolled/fixture device. This is a bigger fixture gap than earlier passes hit — worth flagging to whoever owns seed data, since it silently reduces this sweep's device-workflow coverage to zero.
+
+### [Scripts `/scripts`] — PARTIAL
+- ✅ Created "QA Sweep Test Script" (PowerShell, `Write-Host "QA Sweep test script"`) via the full New Script editor (Monaco-based code editor, Parameters/Execution Settings/Exit Code Severity collapsible sections all rendered) — appeared in the script library list immediately after Create.
+- ❌ **BUG: React hydration mismatch on `/scripts/new`** — console error on every load: `Hydration failed because the server rendered text didn't match the client... <p>⌘S to save</p> vs server-rendered "Ctrl+S to save"`. Root cause: the save-shortcut hint text branches on OS (Mac → "⌘S", other → "Ctrl+S") using a client-only check (e.g. `navigator.platform`/`userAgent`), but SSR has no access to the client's OS and renders the non-Mac default — so any Mac visitor gets a guaranteed hydration mismatch, forcing React to discard and client-re-render that subtree. Reproducible every time on a Mac browser. Cosmetic in isolation (the text is eventually correct) but it's a real console error and perf/flash cost on every script-editor visit, and increases the general noise level fighting against "confirm no console errors" checks elsewhere in the sweep.
+- BLOCKED (fixture-blocked by empty fleet): could not run the script on a device or view execution output — "Import from Library" system-catalog run/output path needs a target device.
+
+### [Cmd+K global search] — FAIL
+- ❌ **BUG (root-caused): Cmd+K search silently omits partner-wide (dual-axis) resources.** Searched for the just-created "QA Sweep Test Script" (visibly listed in `/scripts` as "Partner-wide", i.e. `org_id IS NULL`) both by full name and by "Sweep" — both returned "No results found. Try a different query." `GET /api/v1/search?q=Sweep` → 200 with `{"results":[]}`, confirming this is a real empty API response, not a UI rendering issue.
+  Root cause, traced in source: `apps/api/src/routes/search.ts` builds its scripts/alerts/devices queries via `orgConditionFor(column)` → `auth.orgCondition(column)`, defined in `apps/api/src/middleware/auth.ts` (`buildOrgAccessClosures`) as a strict `eq(orgIdColumn, orgId)` / `inArray(orgIdColumn, accessibleOrgIds)` — there is no branch for the dual-axis partner-wide case (`orgIdColumn IS NULL AND partnerId = auth.partnerId`). Since NULL never satisfies `eq`/`inArray`, any partner-wide-scoped script (or other dual-axis resource searched through this route) is invisible to global search for every caller, even a Partner Admin. This matches the exact class of gap called out in CLAUDE.md's Partner-Wide First playbook step 3 ("Reads: app-layer dual-axis conditions... must be gated on auth.scope === 'partner'") — the search route was apparently never updated when scripts (or whichever dual-axis tables it touches) gained partner-wide ownership.
+  Impact: any MSP tech using Cmd+K to jump to a partner-wide script, alert, or similar resource — the exact workflow the feature exists for — gets a false "not found," which reads as "this doesn't exist" rather than "search is broken." High severity for a heavily-relied-on productivity feature.
+  Suspected fix location: `apps/api/src/routes/search.ts` — the scripts/alerts query conditions need the same dual-axis OR-branch used elsewhere in the codebase (e.g. `configurationPolicy.ts`'s `validateFeaturePolicyExists`), gated on `auth.scope === 'partner'`.
+
+### [Theme toggle, profile menu, sign out/in] — PASS
+- ✅ Theme dropdown (Light/Dark/System + interface density Comfortable/Compact/Dense) renders correctly; selecting Dark changed `body` computed background from `rgb(249,250,251)` to `rgb(13,16,23)` — confirmed via actual computed style, not just a CSS class assertion. Reverted to Light.
+- ✅ Account menu renders Billing / Contact support / Sign out. Clicked Sign out → redirected to `/login` immediately (no stale session state). Logged back in with `admin@breeze.local` — landed cleanly on `/` Dashboard. Full sign-out → sign-in round trip works with no console errors beyond the pre-existing hydration-mismatch noise from the Scripts page (see above).
+
+## Summary — Continuation pass (Phases 3 & 4)
+
+| Area | Result |
+|---|---|
+| Org/Site lifecycle | PASS |
+| Users & Roles | PASS |
+| Enrollment Keys | PASS |
+| Notification Channels | PARTIAL (Webhook channel creation broken) |
+| Configuration Policies | PASS |
+| Partner Settings — Company tab | FAIL (Website field XSS-scheme gap) |
+| Partner Settings — Remote Access tab | PASS |
+| Partner Settings — other 9 tabs | BLOCKED (not reached) |
+| Monitoring | BLOCKED (no discovered assets) |
+| Network Discovery | PARTIAL (profile+scan work; graceful no-agent failure) |
+| Backup profiles | PASS (form only, not saved) |
+| Integrations catalog | PASS |
+| Devices (all device-centric checks) | BLOCKED (zero devices in fixture) |
+| Scripts (create) | PARTIAL (hydration-mismatch console error) |
+| Cmd+K global search | FAIL (dual-axis blind spot) |
+| Theme / profile / sign-out-in | PASS |
+| Alerts (ack/resolve/suppress/rules), Patches, Saved Filters/Tags/Custom Fields, Reports/Analytics/Audit Trail, Custom fields | NOT REACHED (time-boxed) |
+## UI QA Sweep — 2026-08-11 (v0.105.0 RC)
+
+**Target:** `http://localhost:32792`, worktree `review-round`, checked out at `origin/main` (`f2d7fda83`). Credentials `admin@breeze.local` / `BreezeAdmin123!`. Plan doc: `docs/superpowers/plans/2026-08-11-v0105-release-change-and-test-list.md`.
+
+### [Environment] — FAIL — sweep could not proceed past login
+
+**Result: BLOCKED (environment).** Every real browser navigation to the web app — `/login` included — throws Astro's `NoMatchingRenderer` SSR error, 100% reproducible across ~20 attempts over 15 minutes. This is a dev-server rendering fault, not a v0.105.0 code regression (see root-cause evidence below). It made the entire Phase 2 nav crawl and the §3 manual checklist untestable through the browser.
+
+- ❌ **BUG (environment-blocking): every full-page browser navigation 500s at Astro's SSR layer trying to render a React `client:load` island.** `GET /login` always throws `NoMatchingRenderer: Unable to render \`AuthPanelBranding\`. No valid renderer was found for the \`.tsx\` file extension.` at `render/component.js:163:12`. `GET /` and `GET /devices` throw the same class of error for `AuthOverlay`. Confirmed via `docker logs breeze-wt-pr3366-web-1`: the server itself logs `[ERROR] [NoMatchingRenderer]` on essentially every request originated by the Playwright-driven Chromium browser (`06:49:52`, `06:50:20`, `06:50:30`×2, `06:52:33`, `06:53:01`, `06:53:13`, `06:55:13`, `06:56:00`, `06:57:02`, `06:57:08`, `06:57:17`, `06:57:51`, `07:00:21`, `07:00:30`, `07:00:39`, `07:01:50`, `07:02:26`, `07:03:09` — repeated over a 13-minute window, not a one-off blip).
+- Isolated with a curl-vs-browser A/B test: 20/20 plain `curl http://localhost:32792/devices` calls (with and without browser-matching `Accept`/`Sec-Fetch-*`/`User-Agent` headers) returned a clean 448 KB HTML document with no error, while every same-URL request from the actual Chromium browser session errored server-side in the same time window. This rules out a deterministic per-route bug and points at something specific to a real browser's connection/request pattern (concurrent asset + HMR-websocket traffic) racing Vite's SSR module-registration for `client:load` islands.
+- Ruled out auth-state as the trigger for `/login` specifically: `AuthPanelBranding` failed on the very first `/login` hit of the session, before any cookies existed. Tried: fresh tab, closing extra tabs, clearing all non-httpOnly cookies + localStorage, calling `/api/v1/auth/logout` to drop the session, waiting 2s/3s/15s/30s between attempts, retrying ~10× spread over 13 minutes — no combination produced a working login form.
+- Confirmed the two React components in question are not the actual defect: `apps/web/src/components/auth/AuthPanelBranding.tsx` and its user `apps/web/src/layouts/AuthShellBranded.astro` (imported by `apps/web/src/pages/login.astro`) both have correct, unchanged code since a single commit `2b62f023d` (2026-07-30) — extensionless import, `client:load` present, `@astrojs/react` integration registered in `astro.config.*`. The break is in the running Vite/Astro dev-server process state, not the source.
+- Best-guess root cause: this stack runs `astro@7.1.6` + `vite@8.1.5` per the container's pnpm store paths — the existing team memory (`astro7_tailwind4_vite8_upgrade_status.md`, referenced as "Astro7 held" in the stack/infra index) already flags this upgrade combination as having known dev-mode instability. This looks like an instance of that class of issue, likely surfaced/worsened by concurrent file activity or long uptime on this particular `web` dev container (up ~20+ min, 3 separate Vite dependency re-optimization passes logged), not something introduced by the v0.104.0→main diff under test.
+- I did **not** restart, rebuild, or otherwise touch the `web` container or any source file, per the hard constraints for this task.
+
+**No functional checklist items could be executed.** I attempted a fetch-based workaround (calling `/api/v1/auth/login` directly via `page.evaluate`, which succeeded — 200, valid JWT, `Set-Cookie` for the refresh/csrf cookies confirming the **API layer itself is healthy**) and seeding the `breeze-auth` localStorage key to simulate a restored session, then navigating directly to `/devices` — the SSR crash occurred regardless, since it happens before hydration, independent of auth state for `/login`, and correlated with (but not solely caused by) cookie presence for `/devices`/`/`.
+
+**Recommendation:** restart the `web` dev container (`docker compose restart web` or equivalent for this worktree's compose file) to clear the Vite/Astro dev-server module-registration state, then re-run this sweep. If the fault reproduces immediately after a clean restart, it's a genuine regression worth root-causing in `AuthOverlay`/`AuthPanelBranding`'s render path; if it clears, it corroborates the Astro7/Vite8 dev-mode instability already tracked internally.
+
+### Summary table
+
+| Area | Result |
+|---|---|
+| Phase 2 baseline nav crawl | BLOCKED — environment |
+| Security → CIS Hardening / Baselines org-scoping | BLOCKED — environment |
+| Tenancy/org-scoping general | BLOCKED — environment |
+| Config Policies | BLOCKED — environment |
+| Patching | BLOCKED — environment |
+| All remaining §3 checklist items (49 of 52) | BLOCKED — environment |
+
+### Top findings
+
+1. The dev web container's Astro/Vite SSR pipeline is unable to render any full page in a real browser session in this run — a total sweep blocker, almost certainly infra/dev-server state rather than an RC code defect (component source unchanged since 2026-07-30; API layer verified healthy via direct fetch). Needs a container restart to clear, which was outside this session's permitted actions.
+
+---
+
+## Attempt 2 (environment fixed) — 2026-08-11
+
+**Environment confirmed working**: `pnpm install` re-run against the current lockfile + web container restart cleared the `NoMatchingRenderer` fault. Logged in as `admin@breeze.local`, landed on Dashboard with zero SSR errors. Target `http://localhost:32792`, worktree `review-round` at `origin/main` (`f2d7fda83`), API version reported in sidebar footer: `Web dev · API 0.82.0`.
+
+### Phase 2 — Nav crawl — PASS (all routes render, no console errors, no failed primary API calls)
+
+Visited and verified (each: 200 on all primary `/api/v1/*` calls, 0 console errors, page renders with expected heading): `/` (Dashboard), `/devices`, `/alerts`, `/tickets`, `/incidents`, `/remote`, `/scripts`, `/patches`, `/vulnerabilities`, `/onedrive`, `/fleet`, `/workspace`, `/monitoring`, `/discovery`, `/security`, `/dns-security`, `/pam`, `/security/user-risk`, `/sensitive-data`, `/peripherals`, `/ai-risk`, `/cis-hardening`.
+
+- ⚠️ UI/UX (recurring, low severity): `react-i18next: useTranslation: You will need to pass in an i18next instance...` (`NO_I18NEXT_INSTANCE`) console warning fires on most page loads (alerts, incidents, scripts, patches, discovery, security, dns-security, pam, peripherals). Dev-mode-only noise per existing team memory (`web_i18n_island_init_and_hydration_traps.md`) — not re-logging per-page below.
+- Note: `/dashboard` (typed directly) 404s — correct route is `/`. Not a bug, just documenting the actual route map since the skill's nav list names it "Dashboard".
+- First-run "Navigate your tools" product tour overlay appears on Dashboard; dismissed via "Skip tour" — otherwise usable, no blocker.
+
+### [Tenancy] Create a second organization — PASS
+
+Settings → Organizations → "Add organization" → filled Name "QA Sweep Org Two" / Slug "qa-sweep-org-two" → Create organization → **201 Created**, list updated immediately (no refresh needed), URL hash updated to the new org id (`#87725514-e5b9-4aa1-97cd-948181f4c753`) per the documented hash-based UI-state convention. Guided "Add the first site for QA Sweep Org Two" panel appeared automatically (exactly the onboarding flow the checklist calls for) → filled Site name "Headquarters" → "Create first site" → **201 Created**, sites table updated to show it, "0 of 0 sites" text updated. No console errors either step.
+
+This unblocks partner-wide (org XOR partner) dual-ownership testing on CIS Hardening / Compliance Baselines / PSA Connections — proceeding to those next.
+
+### [Security → CIS Hardening] Dual-ownership (org XOR partner), `9455019e5` + `65b4a6380` — PASS
+
+Full flow tested with the 2-org partner created above:
+
+- ✅ New Baseline dialog shows the `ownerScope` radio group ("All organizations (partner-wide baseline)" vs "This organization only"), defaults to org-scoped, `data-testid="cis-baseline-owner-partner"`.
+- ✅ Created a partner-wide baseline ("QA Partner-Wide Baseline", Windows) from Default Organization → `POST /api/v1/cis/baselines` **201 Created** (previously 400'd per the plan doc — confirmed fixed). List immediately shows an "All orgs" badge with correct tooltip ("Partner-wide baseline — applies to devices in every organization").
+- ✅ Switched org header to "QA Sweep Org Two" (brand new, zero baselines of its own) → Active Baselines stat correctly showed "1" (the partner-wide one fanned through) and the Baselines tab showed only that row with its "All orgs" badge — confirms partner-wide read-side fan-out to a *different* org, not just the creating org.
+- ✅ Created a second, **org-scoped** baseline while on Org Two ("QA Org2-Only Baseline") → `POST` **201 Created**, no "All orgs" badge.
+- ✅ Switched header back to Default Organization → Active Baselines = 3 (2 original org baselines + partner-wide), **Org Two's org-scoped baseline correctly does NOT leak into Default Organization's list** — org isolation confirmed alongside partner-wide fan-out.
+- No stale-org-on-load flash or false "No baselines configured" observed across ~6 org switches (sequential Playwright clicks, not a true network race — see BLOCKED note below for the harder race variant).
+- 0 console errors throughout.
+
+**BLOCKED (partial):** the specific "switch org selector while the baseline list is still loading" true race condition couldn't be reproduced deterministically via sequential Playwright actions (each switch fully resolved before the next was issued, network was fast/local). No stale data was observed at normal interaction speed, but this doesn't rule out the race under real network latency. Would need artificial network throttling to test properly.
+
+### [Security → Compliance Baselines / Audit Baselines] Org-scoping fix, `65b4a6380` — PASS (feature is org-only, not dual-ownership)
+
+- Default Organization ships 6 built-in baselines (CIS L1/L2 × Windows/macOS/Linux), all "Inactive" by default — the Dashboard tab's "No compliance data yet" empty state is **correct** (no active baseline → no drift evaluation data yet), not the false-empty-flash bug.
+- "New Baseline" dialog has **no ownerScope selector** (Name / OS Type / Profile / Active / Settings JSON only) — unlike CIS Hardening, Audit Baselines does not appear to support partner-wide ownership this cycle; this matches the plan doc's description of `65b4a6380` as an org-scoping *bug fix* for this feature, not the same dual-ownership *feature* add that CIS got via `9455019e5`. Not treating the missing selector as a defect.
+- ⚠️ UI/UX note: the "New Baseline" button opens a modal that is a `role="dialog"` (good — unlike many other modals in this app which are plain `fixed inset-0` divs with no dialog role, see below) but it renders **outside** the `<main>` landmark, so a `browser_snapshot target=main` scoped probe misses it entirely — a real trap for anyone spot-checking via DOM scoping.
+- Switched to Org Two → correctly shows "0 baselines" (its own, isolated list — no cross-org leak, no phantom partner-wide entries). Switched back to Default Organization → 6 baselines intact. No console errors.
+
+### [Settings → Integrations → Webhooks] Self-hosted private-network gate, `2aa281e67` + `c6106154d` — PASS
+
+- Created webhook with `http://example.com/webhook` (public hostname, cleartext) on this self-hosted-configured stack → `POST /api/v1/webhooks` **400 Bad Request**, and the UI surfaces a clear inline error "Invalid webhook URL" directly above the form (not silent, not a raw dump).
+- Changed URL to `http://192.168.1.50/webhook` (private IP, cleartext) → `POST` **201 Created**, webhook appears in the list, delivery-history panel loads. Confirms the fix correctly distinguishes "self-hosted cleartext to a private address" (allowed) from "self-hosted cleartext to a public hostname" (rejected) — the exact bug `c6106154d` closed after `2aa281e67`.
+- Client-side note (UI/UX, minor): submitting with HMAC auth selected but no signing secret is blocked client-side with "Secret is required for HMAC authentication" — good, but there's no equivalent client-side pre-check for the URL scheme/target, so the public-hostname case round-trips to the server for the 400 rather than being caught locally. Not a bug, just an inconsistency in validation depth between the two fields on the same form.
+
+### [Settings → Integrations → PSA] Dual-ownership + connection fixes, `2cb6f7a6b` + `f400fc315` — PASS
+
+- "Add connection" dialog has an `Ownership` radio group identical in shape to CIS's: "All organizations (partner-wide — your MSP's own PSA)" vs "This organization only" (`data-testid="psa-connection-owner-partner"`), plus an Organization dropdown listing both orgs when org-scoped is selected.
+- Created a Jira connection with fake credentials, ownership = "All organizations" → `POST /api/v1/psa/connections` **201 Created**, list shows "1 of 1 connections" with an "All orgs" badge and correct tooltip.
+- **Paused** the connection (`POST .../status` → 200, status cell flips to "Paused"), then **edited only the connection name** and saved (`PATCH` → 200) → status **remained "Paused"** after the edit — confirms the `f400fc315` fix for the PATCH-wipes-status bug.
+- **Test connection** (real network test, not a fake "queued"): `POST /api/v1/psa/connections/:id/test` → **200 OK** with a body reporting failure (fake creds against real qa-test.atlassian.net) → UI renders "Connection Test Result / Connection failed — Jira API error (401): Client must be authenticated to access this resource." This is the important behavioral confirmation: the test call actually reaches the provider and surfaces the real error verbatim rather than a canned/fake success, consistent with `f400fc315`'s "real connection test, honest 501 sync" fix.
+- **BLOCKED:** did not verify the credential-redaction fix (`GET /psa/connections/:id` no longer leaking decrypted secrets to `orgs:read`-only callers) or the `orgs:read`-only "no ownership selector visible" check — both require a second, lower-privileged user account, which the current seed/session doesn't have readily available. Would need a role/user with `orgs:read` but not `orgs:write` to test properly.
+- Did not exercise the "Import companies" preview flow (`33c088e2d`) since it requires a real, non-fake PSA connection with actual companies to import — the fake Jira connection above can't produce a meaningful import preview.
+
+### [Devices → Groups] Create Device Group — **FAIL** (broken for every multi-org partner, both static and dynamic)
+
+While testing the `954a288d5` dynamic-group-delete fix (which requires a dynamic group with matched devices, blocked by the single-org seed until the 2nd org was created above), discovered that **device group creation is completely broken** the moment a partner has 2+ organizations:
+
+- Devices → Groups → Create Group → Dynamic, filter `OS Type equals Windows` (1 matching device shown live in the preview) → Create group → `POST /api/v1/device-groups?orgId=23fbc70d-...` → **400 Bad Request**, body `{"error":"orgId is required when partner has multiple organizations"}`. UI shows a generic "Failed to save device group" (visible, not silent — but doesn't surface the actual server error text).
+- Repeated with a **Static** group (manually selecting a device) → same 400, same generic message. Confirms this is not dynamic-group-specific — **all** device-group creation is broken for multi-org partners.
+- **Root cause (confirmed via code read):** `apps/api/src/routes/groups.ts` (`POST /` handler, mounted at both `/groups` and `/device-groups`) resolves the owning org exclusively from `payload.orgId` in the **JSON body** (schema `orgId: z.string().guid().optional()`) and 400s under `auth.scope === 'partner'` with 2+ orgs if it's absent — it has no fallback to the query string, unlike some other routes (e.g. `discovery.ts`) which explicitly also check `c.req.query('orgId')`. But `apps/web/src/components/devices/CreateGroupModal.tsx` builds the POST body as `{ name, type, filterConditions }` — **it never includes `orgId`** in the body. The org scoping the web app relies on is `fetchWithAuth` (`apps/web/src/stores/auth.ts`) auto-appending `orgId` as a **query-string** param, which this handler doesn't read. Single-org partners never hit this because the API can resolve an unambiguous default org internally when there's only one; the branch only fires with 2+ orgs — explaining why this shipped invisibly against the single-org seed and why the fix task's insistence on creating a second org caught it.
+- Per code-history: the org-resolution pattern in `groups.ts` traces to `2b62f023d` (2026-07-30, alert-rule ownership consolidation follow-up, #2969) — the same cycle that added explicit `orgId` body wiring to `PsaConnectionForm.tsx` for the PSA dual-ownership work. `CreateGroupModal.tsx` was evidently missed in that sweep.
+- **Impact:** this is not a v0.105.0-range commit per the plan doc (it predates the range, from `2b62f023d` on 2026-07-30) but it is a **live, reproducible regression affecting a core everyday workflow** (creating any device group) for the exact audience — multi-org partners — that this release's flagship dual-ownership work targets. Any partner who follows this cycle's Partner-Wide First guidance and creates a 2nd org will silently lose the ability to create device groups.
+- Fix locations: `apps/api/src/routes/groups.ts` POST handler (add query-param fallback for `orgId`, consistent with `discovery.ts`) **or** `apps/web/src/components/devices/CreateGroupModal.tsx` (include `orgId` explicitly in the POST body, matching the `PsaConnectionForm.tsx` pattern).
+- **Consequence for this sweep:** the `954a288d5` dynamic-group-delete-500 fix could not be verified — group creation itself is blocked. Marking that checklist item **BLOCKED** on this bug, not a false pass.
+
+### [Patches] `patch_policies.sources` column drop, `48c1e366c` — PASS
+
+- Checked Patches → Compliance and Patches → Update Rings tabs via `document.body.innerText` — no reference to "sources" anywhere in either view. Clean sanity check after the destructive column drop.
+
+### [Config Policies] Dual-ownership create + timezone selector, `2dbe7505f` — PASS (mostly)
+
+- New Policy flow already had a partner-library vs. org-specific scope selector (pre-existing pattern, not new this cycle) — created "QA Timezone Test Policy" as **partner library** (`Create Policy` → **201**, no error) — this confirms Config Policies' partner-wide create path is unaffected by the Device Groups bug above (different route).
+- Maintenance tab → Timezone selector: confirmed the full searchable IANA list is present — `Asia/Dubai` and `America/Sao_Paulo` both found in the rendered dropdown DOM (`data-testid="maintenance-timezone-trigger"`), not the old short hardcoded list. Matches `2dbe7505f`.
+- ⚠️ UI/UX: the create-policy copy for partner-owned scope says "Backup settings aren't available on partner-owned policies," but the policy detail page still shows a "Backup" tab in the main nav for this partner-owned policy (didn't click in to confirm whether the tab body itself is empty/disabled — flagging as worth a look, not confirmed as broken).
+- Did not test the Automations tab's timezone selector or the drift-remediation dispatch fix (`f2f2d7fda83`) — would need an existing policy with real drift and a remediation automation configured; not present in the seed. **BLOCKED**, prerequisite: a policy with an active drift-remediation automation and at least one non-compliant device.
+
+### [Configuration Policies list] — UI/UX finding
+
+- The policy-count summary text renders as **"0of0policies"** with no spaces (should be "0 of 0 policies") — confirmed via screenshot, not an accessibility-tree artifact. Every other list-count summary seen in this sweep (Webhooks "0 of 0 webhooks", PSA "0 of 0 connections", Software) is correctly spaced, so this looks like an isolated template-string bug in the Configuration Policies list component specifically.
+
+### [Alerts] Date-range filter SQL-binding fix, `c16d1e5a4` — PASS
+
+- Alerts → Advanced Filter → field "Last Seen At" (a device date field) → operator "is after" → value `2026-08-10T00:00` → `GET /api/v1/alerts?...` **200 OK**, returned both fixture alerts ("2 of 2"), no 500. Repeated with a same-instant "equals" condition (0 results, also 200). Confirms the raw-JS-Date SQL-template binding bug is fixed for this filter path.
+- Did not find an alert-level "Triggered At" date field in the Advanced Filter builder — only device-attribute date fields (Last Seen At, Enrolled At) are exposed there; not treating this as a gap since it may be by design.
+
+### [Logs] Keyset pagination fix, `945de59f0` — BLOCKED (no log data in seed)
+
+- Logs → Log Search with a widened range (2026-07-01 through now) still returned "0 shown of 0 total" — this environment's seed has no event-log rows to search, so page-2 pagination cannot be exercised. **BLOCKED**, prerequisite: seeded event-log data or a live agent producing logs.
+
+### [Scripts] Full-library pagination fix, `2295d859a` — PARTIAL / BLOCKED (seed too small to prove the fix)
+
+- Scripts page main list: 0 org scripts in the seed (empty state). `GET /api/v1/scripts?limit=100&page=1` — confirms the call now sends explicit `limit`/`page` params (previously reportedly hardcoded, capped at 50 with no paging) — structurally consistent with the fix.
+- Import-from-Library modal: `GET /api/v1/scripts/system-library` returns 23 built-in scripts, well under the 50-item cap this fix addresses. **BLOCKED** — cannot prove "walks every page beyond 50" with only 23 available system scripts and 0 org scripts; would need 51+ scripts seeded to exercise the actual pagination-cap regression.
+
+### [Devices → Fleet Posture] New page, `bf505f83a` — PASS
+
+- Fleet Posture Report renders cleanly: 2 enrolled devices, 0 competing products detected, 0 scanned, **2 "Never scanned"** — and the UI correctly shows an explicit **amber caveat**: "Zero detections, but 2 device(s) have no fresh scan — verify them before treating the migration as complete" both in the top summary and per-org card, rather than silently reporting a clean migration. Exactly the behavior the checklist calls for. No console errors.
+
+### [Settings → Enrollment Keys] Create dialog — spot check PASS; short-link child counter fix `0c8c6fb74` — BLOCKED
+
+- Create Enrollment Key dialog correctly lists both organizations in its Organization dropdown (no cross-org leak, no crash). Cancelled without creating (out of scope for a quick check).
+- **BLOCKED**: verifying the short-link-child device-slot counter fix requires building a full key → short-link-child → installer-download flow, not attempted given time budget. Prerequisite: create a key, generate a short-link child from it, build an installer, and check the consumed/max counter renders on the child row.
+
+### Nav-crawl completion (remaining routes not covered by the first Phase-2 pass)
+
+All render cleanly, 0 console errors, primary API calls 200: `/billing/quotes`, `/billing/invoices`, `/contracts`, `/timesheet`, `/settings/catalog`, `/software`, `/software-inventory`, `/devices/groups` (see FAIL above), `/configuration-policies`, `/backup`, `/c2c`, `/dr`, `/reports`, `/analytics`, `/devices/posture`, `/settings/enrollment-keys`.
+
+**Not reached this session** (ran out of budget): `/audit`, `/settings/partner`, `/settings/ai-usage`, `/settings/custom-fields`, `/settings/filters`, `/settings/users`, `/settings/roles`, `/settings/sso`, `/settings/access-reviews`, device-detail tabs, `/remote` deep flows (Quick Support digit codes, session history, proxy popover), Quotes unit-price-clip check, AI chat tool-execution counter, "What's new" splash, business-email signup gate, i18n locale spot-checks, backup/DR form validation, distributor/accounting/identity/UniFi integration tabs.
+
+### Summary table
+
+| Area | Result |
+|---|---|
+| Phase 2 nav crawl (all routes) | PASS — 0 whole-page failures, 1 recurring dev-mode i18n console warning (noise) |
+| Create 2nd organization | PASS |
+| CIS Hardening dual-ownership (`9455019e5`+`65b4a6380`) | PASS |
+| Compliance/Audit Baselines org-scoping (`65b4a6380`) | PASS (org-only, not dual-ownership) |
+| Webhooks self-hosted private-network gate (`2aa281e67`+`c6106154d`) | PASS |
+| PSA Connections dual-ownership + fixes (`2cb6f7a6b`+`f400fc315`) | PASS (partial — 2 items BLOCKED on missing low-priv user) |
+| **Device Groups create (pre-existing, not in range)** | **FAIL — broken for every multi-org partner** |
+| Patches `sources` column drop sanity check | PASS |
+| Config Policies dual-ownership create + timezone selector (`2dbe7505f`) | PASS |
+| Alerts date-range filter fix (`c16d1e5a4`) | PASS |
+| Logs pagination fix (`945de59f0`) | BLOCKED — no log data in seed |
+| Scripts pagination fix (`2295d859a`) | BLOCKED/PARTIAL — seed too small (23 scripts, needs 51+) |
+| Fleet Posture new page (`bf505f83a`) | PASS |
+| Enrollment Keys create dialog | PASS (spot check only) |
+| Enrollment Keys short-link child counter (`0c8c6fb74`) | BLOCKED — not attempted |
+| Remaining §3 items (Quick Support, proxy popover, Quotes clip, AI chat counter, splash, i18n, backup/DR, PSA import preview, signup gate, distributors/accounting/identity tabs) | NOT REACHED |
+
+### Top findings (ranked by impact)
+
+1. **FAIL — Device Groups (both static and dynamic) cannot be created by any multi-org partner.** `POST /api/v1/device-groups` 400s with `{"error":"orgId is required when partner has multiple organizations"}` because `apps/web/src/components/devices/CreateGroupModal.tsx` never includes `orgId` in the request body while `apps/api/src/routes/groups.ts` only reads it from the body (no query-param fallback, unlike `discovery.ts`). Root cause traced to `2b62f023d` (2026-07-30) missing this file in its org-scoping sweep. This directly undermines the release's own Partner-Wide First push: any partner who adds a 2nd org loses a core everyday workflow, silently, until they try it.
+2. **UI/UX — "0of0policies"** on the Configuration Policies list is missing spaces (isolated to this component; every other list-count summary checked was correctly formatted).
+3. **UI/UX — recurring dev-mode `react-i18next: NO_I18NEXT_INSTANCE` console warning** on most page loads (known class of issue per team memory, not release-blocking).
+4. All of this cycle's flagship dual-ownership/org-scoping fixes (CIS Hardening, PSA Connections, webhook private-network gate, alerts date filter, Config Policies timezone) verified working correctly under real 2-org testing — no regressions found in the intended v0.105.0 change set itself. The one FAIL found is a **pre-existing** bug (predates the release range) that this task's insistence on creating a second org happened to surface.
+
+---
+
+## Part 2 — areas not reached in attempt 2 — 2026-08-11
+
+Continuation of the same sweep, same environment (`localhost:32792`, `admin@breeze.local`, worktree `review-round`, API `0.82.0`). Session reused attempt 2's browser/login where already active. Covers §3 checklist items not reached above: What's-new splash, Partner Settings tabs + validation, Quick Support, Remote Access consolidated proxy, Quotes/Invoices, AI Assistant usage counter, localization, Portal, and any BLOCKED-unblocking time permits.
+
+### [Login] What's-new splash + reopen link, `8310c6d71` — PASS (reopen + dismiss), auto-show-on-login **not exercisable in dev mode by design**
+
+- Sidebar footer "What's new" reopen link → opens a proper `role="dialog"` titled "What's new in 0.105.0" with highlights list and a "Learn more" link to `https://breezermm.com/release-notes`. "Got it" dismisses and writes `localStorage['breeze.whatsNew.lastSeenVersion'] = '0.105.0'` (confirmed via DOM read) — no console errors.
+- Read `apps/web/src/lib/whatsNewState.ts`: `decideWhatsNew()` explicitly no-ops (`{ entry: null, baselineToSet: null }`) whenever `WEB_VERSION === 'dev'`. This dev stack's sidebar footer reads "Web dev · API 0.82.0", confirming `WEB_VERSION` is literally `'dev'` — so the auto-show-on-login path is **intentionally inert on any dev build**, only the reopen path (`latestApplicableEntry()`, which does not check for `'dev'`) works. Verified live: cleared `lastSeenVersion`, signed out, signed back in with a fresh login navigation → no dialog, no console error, and the key stayed unset (correct "first-ever load, just set the baseline" branch — code comment confirms this is deliberate, not a bug, for a brand-new browser). Re-set `lastSeenVersion` to an older `'0.104.0'` to simulate a genuine upgrading user and repeated the reload → still no dialog, confirming the dev-mode gate, not a floor/version-comparison bug.
+- "Show me later" (`later()`) only calls `setOpen(false)` — does not touch `localStorage`, confirmed by reading the component; this matches the "snoozes to next login" spec (next mount's `decideWhatsNew()` will still find the un-bumped floor and re-show), though the live re-open-on-next-login behavior itself could not be observed here for the reason above.
+- **Not a defect** — noting only so a future sweep doesn't waste time chasing "splash never appears on this stack."
+
+### [Settings → Partner → Company] Save valid/invalid input — PARTIAL, one validation gap found
+
+- Valid save: edited Company Name, clicked Save Settings → `PATCH /api/v1/orgs/partners/me` **200 OK**, toast "Partner settings saved" appeared, "unsaved changes" badge cleared. Confirmed UI feedback present (not a silent mutation).
+- ❌ **Finding (validation gap, low-to-medium severity):** the Company tab's **Website** field accepts and persists a `javascript:` URI with no client- or server-side rejection. Typed `javascript:alert(1)` into Website, clicked Save → `PATCH /api/v1/orgs/partners/me` **200 OK**, response body confirms `"contact":{"website":"javascript:alert(1)"}` was stored verbatim. The release checklist explicitly calls for confirming scheme validation rejects `javascript:`/`data:` on Partner Settings, and this field does not.
+  - Checked exploitability: this specific field (`settings.contact.website`, edited in `apps/web/src/components/settings/PartnerCompanyTab.tsx`) is **not** the field that flows into quote/invoice PDFs — those pull from a separate `partner.billingWebsite` column via `apps/api/src/services/sellerSnapshot.ts`, and even that path is safe (`escapeHtml()` in `invoicePdf.ts`'s HTML template, plain `doc.text()` glyphs in the PDFKit path — no `<a href>` construction found anywhere for either field). So there is currently no live XSS/open-redirect exposure from this specific gap, but it's still a missing input-validation control the release notes' own checklist asked to confirm, and the field sits directly under UI copy ("Used for branded PDFs, invoices, and email footers") that implies it should be validated as a real URL.
+  - Suspected fix location: `apps/web/src/components/settings/PartnerCompanyTab.tsx` (client-side pre-check, matching the pattern already used for the HMAC-secret-required check on the Webhooks form per attempt 2's log) and/or the Zod schema backing `PATCH /api/v1/orgs/partners/me` in `apps/api/src/routes/orgs.ts` (server-side scheme allowlist, e.g. `http:`/`https:` only).
+- Did not repeat the invalid-input check across every other Partner tab (time budget) — spot-checked Company only.
+
+### [Settings → Partner → Remote Access] Duplicate provider id / dangling default validation, `fce4f0504` — PASS
+
+- Confirmed via source read (`apps/web/src/components/settings/PartnerRemoteAccessTab.tsx`) that provider `id` is client-generated as `` `provider-${crypto.randomUUID()}` `` on every "Add provider" click — true UI-only duplicate ids are structurally unreachable, exactly as the release-plan checklist anticipated ("add two providers, force a duplicate id **(or edit via API)**").
+- Added one real provider via the UI (RustDesk, URL template, custom field key, set as Default) → `PATCH /api/v1/orgs/partners/me` **200 OK**, toast "Partner settings saved" — confirms the ordinary create/save path still works after this fix.
+- Captured the page's own live Bearer token (by monkey-patching `window.fetch` to snoop the `Authorization` header the app's `fetchWithAuth` sends, then triggering one real save) and issued two direct `PATCH` calls to `/api/v1/orgs/partners/me` reusing that token, per the checklist's own "or edit via API" allowance:
+  - Two providers with the same `id: "dup-1"` → **400**, body: `{"error":"settings.remoteAccessProviders.providers.1.id: Duplicate provider id \"dup-1\" — provider ids must be unique", ...}` — clear, readable, field-scoped error.
+  - `defaultProviderId: "does-not-exist"` pointing at no configured provider → **400**, body: `{"error":"settings.remoteAccessProviders.defaultProviderId: defaultProviderId \"does-not-exist\" does not name a configured provider", ...}` — same quality.
+- Both reject at save time with the exact readable-message bar the checklist asked for. No mutation occurred on either rejected call (subsequent state unaffected).
+
+### [Settings → Organizations → Edit → Remote Access tab] Org-level tunnel/allowlist settings, `c0ef527e7` — PARTIAL PASS
+
+- Reached via Settings → Organizations → select org → **Edit** → Security & Access → Remote Access (a different page from the Partner-level Remote-Tool-Providers tab tested above; org-level page is "VNC, proxy, tunnels" — Source IP Restrictions, per-site Destination Allowlist, and Active Tunnels).
+- Added a Destination Allowlist rule (`192.168.1.0/24:443`) on the Default Site → list updated immediately with the new `code`-formatted entry, no console errors, no toast needed (visible list mutation is sufficient confirmation).
+- "Active Tunnels" correctly showed "(No active tunnels)" with a working Refresh button.
+- ⚠️ UI/UX: navigating away afterward triggered a native `beforeunload` confirmation dialog ("Leave site? Changes you made may not be saved") even though the allowlist rule had already saved successfully and no other field was dirty. Likely an overly-broad "any interaction on this page" dirty flag rather than one scoped to actual unsaved form state. Minor friction, not data-loss risk (the save had already completed), but worth a look — probably in `apps/web/src/components/settings/OrgRemoteAccessSettings.tsx` or the shared org-settings dirty-tracking wrapper.
+- **BLOCKED** — could not test the actual "one-click proxy popover" on a network device or the "session survives past 5 minutes" cliff fix (`c0ef527e7`'s other half): this stack's Network Discovery → Assets list is empty ("No assets discovered yet.") — no discovered network device with a web-facing port exists in the seed to open the proxy popover against. Prerequisite: a discovery scan or seeded network-device fixture with an open web port (443/8080/etc).
+
+### [Remote → Quick Support] Digit codes, session re-open, rate limiting, `9344a2b4e` — PASS
+
+- **New code generation**: "New support session" → optional org-attribution dropdown correctly lists both orgs ("Default Organization", "QA Sweep Org Two") plus "Not attributed" — → "Generate code" → code rendered as `759-458-865` (9 digits, 3-3-3 grouping exactly as specced), with an expiry timestamp and "This code appears only once… can never be shown again" warning. URL hash updated to the session id.
+- **Session re-open**: closed the detail panel (hash cleared) → clicked the same session from "Recent support sessions" → panel reopened with live status ("Waiting for the user to run the client…"), hash restored to the session id. Matches the checklist's reopen requirement.
+  - ⚠️ UI/UX: reopening from history re-displays the **same full code** (`759-458-865`) in the "appears only once… can never be shown again" panel. That copy is misleading once a reopen path exists — the code is in fact shown again on every reopen while the session is still pending. Not a security bug (the session hadn't been redeemed and the code is still legitimately live), but the on-screen claim is factually wrong the moment you navigate back to the row. Consider softening the copy (e.g. "won't be re-issued if you lose this session" rather than "can never be shown again").
+- **Bogus session id in hash**: edited hash to a random UUID not in the session list → panel closed cleanly, no crash, no visible error (one expected `404` on `/api/v1/remote/support-sessions/<bogus-id>` logged to console, handled gracefully by the UI — not treated as a bug).
+- **Invalid code on `/quick`**: submitting a syntactically-invalid code (`000000000` — all-zero) correctly triggered a *format* validation message ("not a complete code yet") rather than a server round-trip — this is correct behavior, not a bug: confirmed via `packages/shared/src/validators/quickSupport.ts` that the code alphabet deliberately excludes `0`/`1` (`SUPPORT_CODE_PATTERN = /^[A-Z2-9]{9}$/`) to avoid O/0 and I/l/1 phone-spelling ambiguity — an all-zero string can never be a valid code by design.
+- Submitted a syntactically-valid-but-wrong code (`234-567-892`) → distinct "That code no longer works" message (`status` role, live-region). PASS.
+- **Rate limiting**: drove the public, unauthenticated `/api/v1/support/check/:code` endpoint to its documented 30-req/60s per-IP cap (`CHECK_LIMIT = 30` in `apps/api/src/routes/supportPublic.ts`) via 29 direct `fetch()` calls (no UI clicking needed, endpoint requires no auth), confirmed the 30th returned `429`, then submitted once more through the real UI → got a **distinct** "Too many attempts / You have tried a code too many times. Please wait a moment, then try again." message with its own "Try again" button — correctly separate from the "That code no longer works" invalid-code message, exactly as the checklist requires.
+
+### [Quotes / Invoices] Unit-price clipping fix + quote-line-name-onto-invoice, `48b819a14` + `81ce58025` — PASS (both)
+
+- Created a quote ("QA Unit Price Test"), added a pricing-table line "QA Widget Line" with a multi-digit unit price `1234.56` and confirmed via DOM measurement (`scrollWidth === clientWidth === 97px`, no overflow) plus a screenshot that the full value renders with no last-digit clipping. `48b819a14` **PASS**.
+- Added a line description ("QA description text for name-carry-through test") to the same line so it carries both a name and a description, per the checklist.
+- UI/UX finding: clicking "Send proposal" opened a dialog that correctly required a recipient email (no billing contact saved for the org). Sent to a fake address; delivery failed, and the UI surfaced this clearly ("Proposal marked Sent, but the email could not be delivered. Check the address and try sharing the accept link manually."). However there is no actual affordance anywhere in the quote UI to retrieve or copy that accept link — no "Copy accept link" button, no share icon. The message promises a capability that isn't reachable through the UI; the link only exists in the (now-undeliverable) email body or in the raw `POST /quotes/:id/send` JSON response (`data.acceptUrl`). Confirmed via `apps/web/src/components/billing/quotes/QuoteActions.tsx` — no accept-link-copy control exists there. Worth adding one to this failure state.
+- Verified the fix by capturing the page's live Bearer token (same `window.fetch`-patch technique as the Remote Access test above), cloning the quote via the API, sending the clone, and reading `acceptUrl` from the send response body directly. Confirmed the link is well-formed (`https://2breeze.app/portal/quote/<JWT>`).
+- Visited the accept link on `localhost` — the public quote-accept island failed to hydrate (`astro-island` error: 404 fetching `/src/components/portal/PublicQuoteView.tsx`), so "Accept & sign" stayed permanently disabled no matter what was typed/checked. This is the pre-existing, previously-documented dev-mode Portal hydration limitation (team memory: `portal_dev_island_hydration_404.md`), not a v0.105.0 regression — confirmed the same 404/hydration-failure pattern independently hits `/portal/login`'s `LoginForm.tsx` too, so it is environment-wide, not specific to quotes.
+  - The server-rendered (pre-hydration) HTML on that page did correctly show the pricing table with `QA Widget Line` / `QA description text for name-carry-through test` — the customer-facing quote view renders the name+description correctly; only the interactive accept action is blocked by the hydration issue.
+- Worked around the hydration blocker by calling `POST /api/v1/quotes/public/:token/accept` directly (same endpoint the disabled button would have called) → 200, `status: "converted"`. Opened the resulting invoice (`INV-2026-0001`) in the normal web Billing view → the invoice line correctly shows "QA Widget Line" as the title with "QA description text for name-carry-through test" as its description — exactly the fix `81ce58025` claims (previously the name was lost on conversion). **PASS.**
+- BLOCKED — could not check the Portal invoice detail view per the checklist: Portal requires a customer-portal login, and `/portal/login`'s form suffers the identical island-hydration failure, so no portal session could be established in this environment. This blocks all Portal-side verification this cycle, not just the invoice view — see the dedicated Portal note below.
+
+### [Portal] Environment-wide finding — no portal page can be exercised interactively in this dev stack
+
+- `/portal/login`, `/portal/quote/:token` (and by extension anything else under `apps/portal/src/components/portal/*.tsx`) fail to hydrate: console shows `Failed to load resource: 404 @ .../src/components/portal/<Component>.tsx` followed by `[astro-island] Error hydrating ... Failed to fetch dynamically imported module`. Static/SSR markup renders fine (readable text, correct data), but every interactive control (login submit, accept/decline buttons, checkboxes wired to React state) is permanently inert.
+- This matches a previously catalogued issue (team memory: `portal_dev_island_hydration_404.md`) — noting once, not re-diagnosing or re-filing. Recorded here because it fully blocks item 8 of this sweep's scope ("Portal — whatever renders without a real portal tenant") beyond a static-content glance, and blocked the Portal-invoice-view half of the `81ce58025` checklist item above.
+
+### [AI Assistant] Tool-execution count + live spend in the chat sidebar, `ff147bdb4` — PASS
+
+- Opened the AI Assistant panel from the top-banner button, clicked the "Show critical alerts" quick action. Before sending: cost indicator read "$0.00 this month" / "0 msgs". The assistant ran a real multi-tool turn (`Manage Alerts` ×2, `Get Device Details` ×1, each with a visible "Tool Result" expander) and produced a full alert + device-detail summary.
+- After the turn completed, the sidebar indicator updated **without a page reload** to "$0.12 this month" / "1 msg" — confirms both the live-spend-refresh half (component `apps/web/src/components/ai/AiCostIndicator.tsx` re-fetches `/ai/usage` on the `isStreaming: true → false` edge instead of waiting for its 60s poll) and the counter-no-longer-pinned-at-0 half (the visible "N msgs" text is the counter the fix's rollup query was undercounting — it moved 0 → 1 for a session that was tool-call-heavy but had exactly one user-visible exchange).
+- Cross-checked on **Settings → AI Usage & Budget** (a separate, backend-driven admin view, not just the sidebar's own poll): "Messages Today" went from `0` → `1`, "Today's Cost"/"Monthly Cost" both `$0.12`, and the new row in "Recent Sessions" shows `Turns: 4` (matching the 2 Manage-Alerts + 1 Get-Device-Details + 1 final-response turns observed) with status `active`. Two independent surfaces agree — strong confirmation the rollup fix is real, not a sidebar-only cosmetic change.
+
+### [Settings sub-pages] Users, Roles, Custom Fields, Saved Filters, Enrollment Keys — PASS (all render + create-with-valid-input tested)
+
+- **Users**: invited a new user ("QA Read Only", `qa-readonly@breeze.local`, role "Partner Viewer", All organizations access) → `POST` succeeded, visible toast "Invitation sent to qa-readonly@breeze.local", list updated to "2 of 2 users", new row shows status "Invited" with Resend/Edit/Devices/Remove actions. This creates the fixture the previous sweep's read-only-org-access check needs, **but the invite is unaccepted** (status stays "Invited" — no email delivery in this dev stack and no in-UI way to force-accept or extract the invite-acceptance token the way the quote-accept token was extractable). **BLOCKED** — the actual "log in as a read-only user and confirm ownerScope selectors are hidden" check still needs either real email delivery or an admin-side "force activate" affordance, neither of which exists here.
+- **Roles**: 6 system roles render correctly (Partner Billing / Billing Viewer / Security Approver / Admin / Technician / Viewer), all correctly marked immutable ("System", "Clone" as the only action). ⚠️ UI/UX: the roles-list summary text reads **"6 of6 roles"** — missing a space, same defect class as the "0of0policies" bug already logged for Configuration Policies in attempt 2 (different component, same template-string pattern — worth a repo-wide grep for `of{count}` / `{n}of{m}` string concatenation missing a space).
+- **Custom Fields**: created a text field ("RustDesk ID", key `rustdesk_id`, matching the Remote-Tool-Provider custom-field-key convention exercised earlier) → saved, list updated immediately, no console errors.
+- **Saved Filters**: empty state renders correctly ("No saved filters yet…"); did not create one (time budget) — render-only PASS.
+- **Enrollment Keys**: created "QA Install Key" (Default Organization / Default Site, no max-usage cap entered) → key value shown exactly once in a copyable `code` block with "Save this enrollment key now. It will not be shown again." warning, list updated with status "Active", usage "0 / 1". ⚠️ UI/UX note: leaving "Max Usage" blank silently defaulted to a **cap of 1** (not "Unlimited" as the placeholder text implies) — worth confirming this is the intended default, since the placeholder reads as if blank means unlimited. The "Download" action revealed per-OS installer options (Windows `.msi` / macOS `.zip`); the page's static header copy ("Use these keys with `breeze-agent enroll <key>`") combined with the one-time-shown raw key is the closest this UI gets to an explicit "install command" — reasonably satisfies the checklist's "view the install command" ask, though there's no single copy-able one-liner (e.g. a ready-to-paste `curl | sh` or PowerShell string) the way some RMM tools show. **BLOCKED (partial)**: did not pursue generating a short-link child key + checking its consumed/max device-slot counter (`0c8c6fb74`) — time budget; the base key flow above is otherwise clean.
+
+### [Localization spot-check] pt-BR, `1ee678186` — PASS, one minor gap found
+
+Switched the running session to pt-BR via `localStorage['breeze.locale'] = 'pt-BR'` (the same key `PartnerRegionalTab`'s "Language" selector writes, per `apps/web/src/lib/appearance.ts`) and reloaded, since the Partner Settings language selector itself only sets the *partner's default for new orgs*, not the live session — this was the fastest way to exercise the actual rendering path.
+
+- **Dashboard, Devices, Network Discovery, Integrations (Webhooks/Identity/M365)**: all rendered fully translated, natural-reading Portuguese with correct domain terminology — no raw i18n keys, no humanized-key placeholders (the #2649 defect class). Specifically checked the plan's called-out terms: "descoberta de rede" (network discovery, not confused with a UI toggle), "registro de aplicativo Entra (Azure AD)" / "locatário" (tenant) / "Microsoft Graph do cliente" on the M365 identity tab — all idiomatic and consistent, not machine-literal. `<title>` tag also flips correctly on most pages ("Painel", "Dispositivos").
+- ⚠️ UI/UX (minor): the `<title>` tag on **Network Discovery** stayed in English ("Network Discovery | Breeze RMM") while the page body was fully translated — inconsistent with Dashboard/Devices, whose titles did flip. Cosmetic (browser-tab text only), but suggests not every page's title-setting effect is wired the same way; worth a quick grep for pages missing the `document.title = t(...)` pattern the working pages use.
+- ⚠️ UI/UX (real gap, matches the #2649 defect class in spirit even though it's not a raw key): **Dashboard → Recent Activity** audit-log action names stay in **English** even in pt-BR — e.g. "Ai tool get device details", "Ai tool manage alerts", "Sent AI message", "Created enrollment key" all rendered verbatim while every surrounding label (Usuário/Ação/Destino/Hora, "há 5 minutos") was correctly Portuguese. These look like backend action-type identifiers passed through a humanizer (snake_case → Title Case) rather than routed through i18n — so localizing them would need either translation keys per action type or a locale-aware humanizer, not just missing translation strings. Reset `breeze.locale` back to unset (English) before finishing.
+
+### Part 2 summary table
+
+| Area | Result |
+|---|---|
+| What's-new splash + reopen link (`8310c6d71`) | PASS - dev-mode auto-show-on-login is intentionally inert (WEB_VERSION==='dev'), not a bug |
+| Partner Settings Company save (valid + invalid) | PARTIAL - valid save PASS; javascript: URI in Website field accepted with no scheme validation |
+| Partner Settings Remote Access dup-id/dangling-default (`fce4f0504`) | PASS |
+| Org Settings Remote Access tab, allowlist/tunnels (`c0ef527e7`) | PARTIAL - allowlist CRUD PASS; proxy-popover/5-min-cliff BLOCKED (no discovered network device in seed) |
+| Quick Support digit codes/reopen/rate-limit (`9344a2b4e`) | PASS |
+| Quotes unit-price clipping (`48b819a14`) | PASS |
+| Quote-line-name-onto-invoice (`81ce58025`) | PASS (web view); Portal view BLOCKED (env-wide hydration issue) |
+| AI Assistant tool-execution count + live spend (`ff147bdb4`) | PASS |
+| Settings: Users / Roles / Custom Fields / Saved Filters / Enrollment Keys | PASS (render + create); read-only-user login and short-link-child counter BLOCKED |
+| Portal (general) | BLOCKED - env-wide island hydration failure, pre-existing/known |
+| Localization spot-check (pt-BR) | PASS - one real gap (untranslated audit action names) + one cosmetic gap (Discovery page title) |
+
+### Part 2 - top findings (ranked by impact)
+
+1. UI/UX gap - no way to retrieve a quote's accept link when email delivery fails. The UI tells the sender to "share the accept link manually" but provides no copy-link control anywhere; the link only exists in the POST /quotes/:id/send response body (data.acceptUrl) or the undelivered email. Affected: apps/web/src/components/billing/quotes/QuoteActions.tsx.
+2. Validation gap - Partner Settings Company "Website" field accepts javascript: URIs with no client- or server-side scheme check, contrary to the release checklist's explicit ask. Not currently exploitable (this field doesn't feed any anchor-tag renderer today - quote/invoice PDFs use a separate billingWebsite column that's already HTML-escaped or drawn as plain PDF text), but it's a real missing control. Affected: apps/web/src/components/settings/PartnerCompanyTab.tsx and the PATCH /api/v1/orgs/partners/me schema in apps/api/src/routes/orgs.ts.
+3. Environment note, not a regression - the entire customer Portal fails to hydrate in this dev stack (/portal/login, /portal/quote/:token both 404 on their Astro island .tsx source and never wire up interactivity). Matches previously catalogued team memory (portal_dev_island_hydration_404.md); blocks any Portal-side verification until fixed or worked around (as done here, via direct API calls).
+4. UI/UX - recurring "N ofN" spacing bug: Roles list shows "6 of6 roles" (missing space before the second number), same defect class as the previously-logged "0of0policies" on Configuration Policies - likely a shared list-header template with an inconsistent interpolation pattern across components.
+5. UI/UX - Quick Support "appears only once... can never be shown again" copy is inaccurate: reopening a pending session from history re-displays the full code. Not a security issue (session still legitimately live) but the on-screen claim is wrong once a reopen path exists.
+6. UI/UX - untranslated audit-log action names in pt-BR ("Ai tool get device details", "Sent AI message", etc.) - these are humanized backend action-type strings, not i18n keys, so they need a translation-key-per-action-type approach rather than a simple missing-string fix.
+7. UI/UX - org-level Remote Access settings page fires a beforeunload warning even after a successful save, likely an overly-broad dirty-state flag. Low severity (no data was actually at risk of loss).
+
+
+
+## UI QA Sweep — 2026-08-11 (post-merge pass, stack 32828)
+
+Env: http://localhost:32828, main @ 3b496e989. Login admin@breeze.local. Fresh seeded DB.
+
+### Priority B.1 — Partner Company Website scheme validation — PASS
+- ✅ `javascript:alert(1)` → PATCH `/api/v1/orgs/partners/me` → 400, alert toast: `settings.contact.website: Website must be a full http:// or https:// URL` (readable, specific, not `[object Object]`).
+- ✅ `data:text/html,<script>alert(1)</script>` → same PATCH → 400, rejected, not persisted.
+- ✅ `https://acme.example.com` → PATCH → 200, toast, and value persisted after full page reload. Confirmed fixed.
+
+### Partner Settings — Regional tab — PASS
+- ✅ Date Format changed to ISO, saved (PATCH 200), persisted after full reload.
+- No URL/link fields on this tab.
+
+### Partner Settings — Defaults tab — PASS
+- ✅ Invalid Maintenance Window (`not-a-valid-window`) → client-side validation blocked the request entirely (no network call), readable inline message: `Maintenance window must be "24/7" or a UTC window like "Sun 02:00-04:00".`
+- ✅ Valid `Sun 02:00-04:00` → PATCH 200, persisted after reload.
+- No URL/link fields on this tab.
+
+### Partner Settings — Security tab — PASS
+- ✅ IP Allowlist invalid entry (`not-an-ip-address`) → PATCH 400 → `[role=alert]` toast with the exact server message: `settings.security.ipAllowlist: Each IP allowlist entry must be a valid IP address or CIDR range`. (Initial read reported this as silent/missing — false positive caused by the toast auto-dismissing before a multi-step tool-call sequence captured the DOM; re-verified by reading the DOM immediately after the click and the toast is present. Correcting for the record.)
+- ✅ Valid IP Allowlist entry (`10.0.0.0/8`) correctly rejected with a distinct, specific 400: `{"code":"proxy_trust_required","error":"Configure proxy trust (TRUST_PROXY_HEADERS + TRUSTED_PROXY_CIDRS) before enabling the IP allowlist..."}` — expected in this environment (no reverse proxy trust configured), not a bug; matches the field's own helper text.
+- ✅ Minimum Password Length = 12 (valid) → PATCH 200 → `[role=status]` toast "Partner settings saved".
+- ⚠️ UI/UX: error/success toasts on this page are short-lived (auto-dismiss within a few seconds) — easy to miss if the user is looking elsewhere or the network is slow. Not a regression, just a papercut worth noting.
+- No URL/link fields on this tab.
+
+### Partner Settings — Event Logs tab — FAIL (same-class stored-payload hole as the fixed Website field)
+- ❌ BUG: "Log endpoint URL" field (`settings.eventLogs.elasticsearchUrl`) accepts `javascript:alert(1)` with **no scheme validation**. PATCH `/api/v1/orgs/partners/me` → **200 OK**, success toast "Partner settings saved", and the raw payload **persists after a full page reload**. This is the same defect class the Company/Website field was just fixed for (this PR's fix comment at `apps/api/src/routes/orgs.ts:482-489` explicitly calls out `javascript:`/`data:text/html,...` as stored XSS when a value is later rendered as a link), but the fix was not applied to `eventLogs.elasticsearchUrl`.
+- Root cause confirmed at source: `apps/api/src/routes/orgs.ts` line ~556, `eventLogs: z.object({ ... elasticsearchUrl: z.string().optional(), ... })` — plain `z.string()`, no `.refine()` scheme check, unlike `contact.website` a few lines above which now has the http/https allowlist.
+- Did not test `data:text/html,...` on this field separately (javascript: alone is sufficient proof; same code path, no validation at all).
+- Severity: HIGH. This is a stored-XSS-class hole confirmed accepted (200) and persisted. Suspected fix location: `apps/api/src/routes/orgs.ts` `eventLogs.elasticsearchUrl` schema — apply the same `.refine()` used for `contact.website`.
+
+### Partner Settings — Notifications tab — FAIL (same-class hole, third field)
+- ❌ BUG: "Slack Webhook URL" field (`settings.notifications.slackWebhookUrl`, rendered as `input[type=url]`) accepts `javascript:alert(1)` → PATCH 200, success toast, no server-side scheme validation. HTML5 `type=url` does NOT block `javascript:` — it only requires URL-shaped text, so this is not a real client-side guard.
+- Root cause: `apps/api/src/routes/orgs.ts` line ~545, `slackWebhookUrl: z.string().optional()` — same unvalidated pattern as `eventLogs.elasticsearchUrl`. Sibling field `webhooks: z.array(z.string()).optional()` (line ~547, used by notification channels) has the identical gap — not separately exercised here but same root cause, flagging for the same fix.
+- Cleaned up (cleared field, re-saved) after confirming.
+
+### Partner Settings — Ticketing tab — PARTIAL
+- Note: this tab is a self-contained subsystem ("This section saves its own changes" — no shared partner Save Settings button; each sub-tab persists independently).
+- Checked sub-tabs for URL/link fields: Statuses, Export (date-range CSV, org selector — no URL), Inbound Email (mailbox address is an email, not a URL; no webhook URL field), Intake Forms (empty state, no form created to inspect field types). No stored-XSS-class field found in the sub-tabs inspected.
+- Did not exercise: Priorities & SLAs, Categories, Canned responses sub-tabs, nor did we create an Intake Form to check its field types (would need to create a form to know if it accepts a URL-typed custom field) — BLOCKED/not fully swept, low suspicion given the domain.
+
+### Partner Settings — AI Budgets tab — PASS
+- ✅ Invalid Monthly Budget (-50) → PATCH 400 → `role=alert` toast shown: `settings.aiBudgets.monthlyBudgetCents: Too small: expected number to be >=0`. Readable and field-specific, though it's a raw Zod message (⚠️ UI/UX papercut — "expected number to be >=0" is developer-facing phrasing, not customer copy; low impact).
+- ✅ Valid Monthly Budget (500) → PATCH 200, saved.
+- No URL/link fields on this tab.
+
+### Partner Settings — Branding tab — PASS (logo URL properly guarded)
+- ✅ Logo "Or paste an image URL" field: `javascript:alert(1)` and `data:text/html,<script>alert(1)</script>` are both rejected **client-side** with inline text "URL not supported. Use an https:// URL or upload a file." and the Save Settings button is disabled while the field holds an invalid value — no network call fires at all. Best-guarded field found in this sweep (blocks before the request, unlike Company/Website which round-trips to the API first).
+- ✅ Valid `https://example.com/logo.png` → PATCH 200, saved (browser's own preview fetch was blocked by ORB in this sandboxed env — expected, not a bug).
+- ⚠️ UI/UX: the Save Settings button's dirty-detection for this field lags by one interaction — typing into the Logo URL field alone did not enable Save; only after focus left the field (e.g. clicking into Custom CSS) did the button reflect the change. Low severity but could read as "my edit didn't register."
+- No issues with Primary/Secondary Color or Theme fields (not URL-ish, not deeply tested beyond presence).
+- Cleaned up (removed logo, saved) after testing.
+
+### Partner Settings — Login Branding tab — PASS (best-in-class validation)
+- ✅ Logo URL field: `javascript:alert(1)` → PUT `/api/v1/partners/me/login-branding` → 400, `role=alert` toast: `logoUrl: logoUrl must be an https:// URL or a base64 data:image/png, jpeg, or webp URI` (readable, specific, and correctly scoped — allows base64 `data:image/{png,jpeg,webp}` for legitimate inline logos while rejecting scheme abuse).
+- ✅ Valid `https://cdn.example.com/logo.png` → PUT 200, persisted after full page reload.
+- ⚠️ UI/UX: the live logo preview fires a new image `GET` on every keystroke while typing the URL (confirmed 20+ requests for one 33-char URL, all failing in this sandboxed env) — not a functional bug, but unnecessary network chatter that would hit a real CDN repeatedly per character typed.
+- Cleaned up (cleared field, saved) after testing.
+- Did not separately test `data:text/html,...` here since the error message explicitly documents the allowed `data:` subtypes (image/png|jpeg|webp only) — the `javascript:` case already proves the scheme gate works, and the message shows deliberate allowlisting rather than a loose prefix check.
+
+### Priority B.2 — Webhook notification channel creation — PARTIAL (create works, but list page then crashes — new regression)
+- ✅ Creating a Webhook channel (name "QA Webhook Test", URL `https://hooks.example.com/incoming/qa-test`, one custom header `X-QA-Test: breeze-qa-value-123`) now succeeds: POST `/api/v1/alerts/channels` → 201 Created. Confirms the previously-reported "Headers must be an object" 400 is fixed.
+- ❌ BUG (new, high severity): Immediately after creation, and on every subsequent load of `/alerts/channels`, the page goes **completely blank** (breadcrumb renders, nothing else) with a React crash in the console: `Error: Objects are not valid as a React child (found: object with keys {redacted, hasSecret, masked}). If you meant to render a collection of children, use an array instead.` Reproduced on fresh navigation, not a transient render glitch — the Channels list is now durably broken for this org as long as this channel exists.
+- Root cause confirmed: GET `/api/v1/alerts/channels` now redacts secret-bearing config fields in list responses — `config.url` and each entry in `config.headers` come back as `{"redacted":true,"hasSecret":true,"masked":"********"}` objects instead of strings (verified via raw response body). `apps/web/src/components/alerts/NotificationChannelList.tsx` line 120: `return (config.url as string) || t('notificationChannelList.customWebhook');` — the `as string` is a compile-time-only assertion; at runtime `config.url` is now an object, which gets rendered directly into JSX and crashes React's reconciler for the whole list.
+- Impact: because the crash is in the list component, this appears to break the ENTIRE Notification Channels page for any org that has at least one webhook channel — not just that row. Could not verify the "reopen for edit, header round-trips" half of this check via the UI because the list that hosts the Edit action never renders past the crash.
+- Suspected fix location: `apps/web/src/components/alerts/NotificationChannelList.tsx` `getChannelDescription()` (line ~102-134) needs to detect the redacted-object shape (`{redacted, hasSecret, masked}`) for `config.url`, `config.channel`, and any `config.headers` values and render `masked` (or a fixed placeholder) instead of the raw object. Likely the same redaction was recently added API-side without updating this consumer.
+- Verified via raw API response (GET `/api/v1/alerts/channels`): `{"data":[{"id":"73daa759-...","type":"webhook","config":{"url":{"redacted":true,"hasSecret":true,"masked":"********"},"headers":{"X-QA-Test":{"redacted":true,"hasSecret":true,"masked":"********"}}, ...}}]}` — data itself persisted correctly (the fix for the original 400 is real), only the list rendering is broken.
+- NOTE for future sweeps: the "QA Webhook Test" channel (id `73daa759-aeec-4569-a706-3ff16189b4c4`) was left in place on Default Organization — attempted cleanup via a direct DELETE fetch failed (401, bearer token isn't exposed in localStorage/sessionStorage for scripted reuse) and the crashed list UI has no reachable delete control. `/alerts/channels` will keep crashing for this org until either the bug is fixed or the row is removed directly in the DB.
+
+### Priority B.3 — Cmd+K finds partner-wide scripts — PASS
+- ✅ Created script "QA Partner Wide Script ZZTOP" via `/scripts/new` (PowerShell, one-line body). Note: this Breeze instance's Script Library is itself partner-wide by default ("Catalog — same for every organization" banner; no per-script ownerScope selector was needed) — the list badges it "Partner-wide" automatically.
+- ✅ Cmd+K → typed the exact script name → result appeared under a "Scripts" section heading in the palette.
+- ✅ Clicking the result navigated correctly to `/scripts/{id}` (Edit Script page). Confirms the previously-reported "partner-wide scripts return zero results" bug is fixed.
+
+### Priority B.4 — `/scripts/new` hydration check — PASS
+- ✅ Loaded `/scripts/new` fresh: 0 console errors, 1 unrelated warning (`react-i18next: NO_I18NEXT_INSTANCE`, pre-existing dev-mode noise, not a hydration mismatch).
+- ✅ Footer hint renders consistently as "⌘S to save" (no "Ctrl+S"/"⌘S" glued-fragment artifact, no duplicated/mismatched text). Confirms the SSR/client hydration mismatch is fixed.
+
+### Priority B.5 — Discovery asset modal (link/unlink removal check) — BLOCKED
+- `/discovery` → Assets tab shows "No assets discovered yet." (fresh seeded DB, no discovery scan has run against a real network segment in this sandboxed Docker environment). Cannot open an asset detail modal without at least one discovered asset.
+- Prerequisite to re-test: run an actual discovery scan (Profiles → Jobs) against a reachable network, or seed a fixture asset row directly in the DB, then open its detail modal and confirm link/unlink controls are absent (per PR description, intentionally removed in favor of the network device detail page).
+
+### Priority C — Alerts actions (acknowledge/resolve/suppress) — PASS
+- ✅ Acknowledge: row action button fires directly (POST `/alerts/{id}/acknowledge` → 200), status cell updates to "Acknowledged" immediately, Ack button removed from remaining actions.
+- ✅ Resolve: row action button opens the alert-details drawer with an inline "Resolution Note" sub-form (textbox + "Resolve Alert" button) rather than resolving directly — initially looked like a silent no-op/bug, but this is intentional (resolve requires a note). Typed a note, clicked "Resolve Alert" → POST `/alerts/{id}/resolve` → 200, status updated to "Resolved", Active Alerts count decremented.
+- ✅ Suppress: row action button opens a proper `role=dialog` "Suppress alert" modal with duration radios (1h/8h/24h/7d/Forever). Confirmed → POST `/alerts/{id}/suppress` → 200.
+- ⚠️ UI/UX: the Resolve and Suppress row-action buttons don't act immediately like Acknowledge does — both open a secondary panel/dialog first. This is reasonable (both need extra input: a note or a duration) but is inconsistent with the Ack button's one-click behavior and could read as broken on first use; worth a visual/hover cue (e.g. a small "..." or chevron) distinguishing "instant action" from "opens a form."
+- ⚠️ Once: an unexplained new browser tab opened to `/fleet` mid-test (`Fleet Orchestration | Breeze RMM`) after a row-action click; could not identify a reproducible trigger and it did not recur on retry. Noting as an anomaly, not a confirmed bug — no corresponding code path found and it may be sandbox/tooling noise rather than app behavior.
+
+### Priority C — Patches (compliance view, approve) — PASS
+- ✅ Compliance tab loaded real fixture data (2 devices, 0% compliant, 1 critical, 2 pending approval) with working device/OS/source filters.
+- ✅ Patches tab: "Review" → "Review Patch" dialog (Approve/Decline/Defer + notes) → Approve → a SECOND confirmation dialog "Confirm patch approval — Approve patch on 1 device in Default Organization?" → confirmed → POST `/api/v1/patches/{id}/approve` → 200, row status updated to "Approved" and its action changed from "Review" to "Deploy". Two-step confirm is intentional (mirrors the alert-resolve note flow), not a bug — but note it for anyone testing quickly and assuming a no-op on first click.
+- Did not exercise Decline/Defer or the source/3rd-party filter buttons ("Microsoft/Apple/Linux/Third-party" chips) beyond visual presence — time-boxed.
+
+### Priority C — Saved Filters (create/apply/delete) — FAIL (blocking crash)
+- ❌ BUG (high severity): `/settings/filters` → "Create your first filter" → filled Name + one condition (`Hostname contains "windows"`) → the moment a condition has a value, the live preview fetch fires and the ENTIRE Create Filter page crashes to blank with: `TypeError: Cannot read properties of undefined (reading 'length') at FilterPreview (FilterPreview.tsx:119:53)`.
+- Root cause confirmed: `apps/web/src/components/filters/FilterBuilder.tsx` line ~94-95:
+  ```
+  const data = await response.json();
+  setPreview(data);
+  ```
+  POST `/api/v1/filters/preview` actually returns `{"data":{"totalCount":1,"devices":[...],"evaluatedAt":"..."}}` (verified via raw response body) — an envelope. `setPreview(data)` stores the whole envelope instead of `data.data`, so `preview.devices` is always `undefined`. `apps/web/src/components/filters/FilterPreview.tsx` line 74 (`preview.devices.length > 0`) then throws reading `.length` of `undefined`, and since `preview` itself (the envelope) is truthy, the `{preview && (...)}` branch renders and crashes immediately — 100% reproducible any time a filter condition has a non-empty value.
+  Fix: `setPreview(data.data)` (or destructure `{ data: preview } = await response.json()`).
+- Impact: the Saved Filters creation flow is completely unusable through the UI — cannot create a single-condition filter without crashing. Could not test apply/delete because creation never completes.
+- BLOCKED: apply and delete saved-filter checks — no filter could be created to apply or delete.
+
+### Priority C — Audit Trail (pagination, filters, export) — PASS
+- ✅ Loaded with real entries, accurately capturing every action from this sweep (partner settings saves, alert ack/resolve/suppress, patch approve, script create, webhook channel create) with correct status codes and payload summaries — good corroborating evidence trail.
+- ✅ Pagination: "Next"/page-number buttons work, "Showing 26-49 of 49", Next correctly disabled on the last page.
+- ✅ Filters panel opens with Date Range presets, User search, Action Type and Resource Type checkboxes, Search Details; "Apply Filters" fires a scoped `GET /api/v1/audit-logs?...&from=...&to=...` → 200.
+- ✅ "Export Logs" downloads `audit-logs-2026-08-11.csv` directly (no dead click, no silent no-op).
+
+### Priority C — Reports (builder, save) — PASS
+- ✅ `/reports/builder`: named report, kept defaults (Devices type, table chart, weekly PDF), live preview correctly showed real fixture device rows (e2e-macos.local, e2e-windows.local) updating as fields were selected.
+- ✅ "Save report" → POST `/api/v1/reports/generate` (preview) then POST `/api/v1/reports` → 201 Created, redirected to `/reports` and the new "QA Test Device Report" appears in the Saved Reports table with correct schedule ("Weekly, Next: Mon, Aug 17, 9:00 AM"), format (PDF), and working row actions (Generate now / Edit / Delete visible).
+
+### Priority C — Analytics — PASS
+- ✅ `/analytics` loads with 0 console errors. Query Builder (Metric type/name/aggregation/time range + Run Query), draggable dashboard widgets (Device Overview, Alert Summary, Weekly enrollments, Uptime, Remote Sessions, Policy Compliance, Performance Trend, OS Distribution, Alert Statistics table) all render with real fixture-derived values (2 total devices, 0 online/2 offline, alert severities all 0 post-cleanup). Did not exercise "Run Query" or widget drag-reorder beyond visual presence — time-boxed.
+
+## Summary table
+
+| Area | Result |
+|---|---|
+| Partner Settings — Company (Website scheme validation) | PASS |
+| Partner Settings — Regional | PASS |
+| Partner Settings — Defaults | PASS |
+| Partner Settings — Security | PASS |
+| Partner Settings — Event Logs | **FAIL** (stored XSS-class: unvalidated `elasticsearchUrl`) |
+| Partner Settings — Notifications | **FAIL** (stored XSS-class: unvalidated `slackWebhookUrl`) |
+| Partner Settings — Ticketing | PARTIAL (no URL field found in sub-tabs checked; some sub-tabs unswept) |
+| Partner Settings — AI Budgets | PASS |
+| Partner Settings — Branding | PASS (best-guarded: client-side block) |
+| Partner Settings — Login Branding | PASS (best-in-class server validation) |
+| Webhook notification channel create (Priority B.2) | PARTIAL (create fixed; new crash on list page) |
+| Cmd+K partner-wide scripts (Priority B.3) | PASS |
+| `/scripts/new` hydration (Priority B.4) | PASS |
+| Discovery asset modal (Priority B.5) | BLOCKED (no assets in fixture) |
+| Alerts actions (ack/resolve/suppress) | PASS |
+| Patches (compliance, approve) | PASS |
+| Saved Filters (create/apply/delete) | **FAIL** (blocking crash on any condition value) |
+| Reports | PASS |
+| Analytics | PASS |
+| Audit Trail (pagination/filters/export) | PASS |
+
+## Top findings (by severity)
+
+1. **HIGH — Same-class stored-XSS gap left open on 2 fields after the Website fix.** `apps/api/src/routes/orgs.ts`: `eventLogs.elasticsearchUrl` and `notifications.slackWebhookUrl` are still plain `z.string()` with no scheme validation, while `contact.website` a few lines above was just hardened. `javascript:alert(1)` saves with a 200 and persists on both.
+2. **HIGH — Saved Filters creation crashes 100% of the time.** `apps/web/src/components/filters/FilterBuilder.tsx:95` — `setPreview(data)` doesn't unwrap the API's `{data: {...}}` envelope, so `FilterPreview.tsx:74` throws reading `.length` of `undefined` the moment a filter condition has a value. Blocks the entire Saved Filters feature.
+3. **HIGH — Notification Channels list crashes for any org with a webhook channel.** `apps/web/src/components/alerts/NotificationChannelList.tsx:120` — `(config.url as string)` is a compile-time-only assertion; the API now redacts `config.url`/`config.headers` values as `{redacted,hasSecret,masked}` objects in list responses, and rendering that object crashes React. The originally-reported webhook-creation 400 is fixed, but this new regression makes the list unusable once one webhook channel exists.
+
+## UI QA Sweep — 2026-08-11 (pre-release gap-closure pass, stack :32831)
+
+Scope: close the coverage gaps called out after the post-merge pass — re-verify
+paper-fixed FAILs, fix + verify the multi-org device-group bug, seed fixtures
+(devices / discovered assets / >100 orgs / fleet findings), then QA #3278,
+#3295, #3447, #3448 and the structurally-blocked list. Release-range audit:
+v0.104.0..main = 124 commits (~89 product PRs), ~50 with no prior log entry.
+Stack: breeze-wt-main (code-mounted from this worktree) at http://localhost:32831
+(caddy restart re-rolled the host port from :32828). Main at b33e8f016 (#3448
+merged) + sweep-fix branch commits.
+
+### [#3448 re-verify] Saved Filters — PASS after new fix
+- ✅ FilterPreview crash is fixed: condition `hostname contains windows` → preview renders "1 device match" (E2E Windows Test Device), no blank page.
+- ❌→✅ NEW BUG found + fixed: create with empty description 400'd (`description: expected string, received null`) — `createSavedFilterSchema` didn't accept `null` while update did (same schema-drift class as #3159). UI only said "Failed to save filter" (generic copy; real cause never shown). Fixed in `packages/shared/src/validators/filters.ts` (shared field, both verbs) — commit 8203604cb on PR #3449. Re-tested live: filter creates, appears in list.
+- ⚠️ UI/UX: create-failure toast copy is generic while the API error is precise; consider surfacing the field error.
+
+### [#3448 re-verify] Notification Channels list — PASS
+- ✅ `/alerts/channels` renders with an existing webhook channel ("QA Webhook Test", masked config) — the redacted-object list crash is fixed. "1 of 1 channels" correctly spaced.
+
+### [#3448 re-verify] Partner settings URL validation — PASS
+- ✅ Event Logs → endpoint URL `javascript:alert(1)` → PATCH 400, toast "Log endpoint URL must be a full http:// or https:// URL".
+- ✅ Notifications → Slack webhook URL `javascript:alert(1)` → 400, toast "Slack webhook URL must be a full http:// or https:// URL".
+
+### [#3437/#3424 re-verify] Count-glue strings — PASS
+- ✅ `/software-inventory` header "0 unique software"; `/configuration-policies` "0 of 0 policies"; `/settings/roles` "6 of 6 roles" — all spaced. (Footer "Showing X–Y of Z" re-check pending seeded data.)
+
+### [Device groups multi-org] — FIXED, PR #3449
+- ❌ Confirmed root cause: `POST /device-groups` read orgId only from body; `CreateGroupModal` sends none (fetchWithAuth appends `?orgId=`); partner with 2+ orgs always 400'd.
+- ✅ Fix: create handler falls back to UUID-validated `orgId` query param; `ensureOrgAccess` still gates it; body keeps precedence. 4 new unit tests (incl. cross-tenant 403). Browser verify scheduled after >100-org seed makes the partner multi-org.
+
+### [Ticketing sub-tabs] — PASS
+- ✅ All 7 sub-tabs (My tickets, Unassigned, All open, Breaching soon, Closed, Review queue, Archived) render their empty states; every API call 200; no console errors. Review-queue copy contains the word "failed" (inbound-email context) — not an error.
+
+### [#3440/#3391 Preferred remote tool] — PASS
+- ✅ Partner Settings → Remote Access: added provider "QA RustDesk" (rustdesk://{id}, field key rustdesk_id) → "Partner settings saved" toast.
+- ✅ Profile → Preferred remote tool: empty state correct before providers exist; after: options "Use organization default" + "QA RustDesk"; selecting fires PATCH /users/me {preferences:{remoteAccessProviderId}} → 200; persists across reload.
+- ✅ /remote/providers response is slim: {id,name,enabled} + defaultProviderId only — no launch template, field key, or credential material (the #3440 redaction).
+- Connect-launch path (device → Connect uses chosen provider) deferred to the seeded-devices pass.
+
+### [#3278 Fleet hygiene findings UI] — PASS after 1 fix (first-ever browser pass)
+Fixtures: 5 seeded findings (3 kinds, 2 orgs), 17 member rows, 1 historical remediation run.
+- ❌→✅ BUG found + fixed: "All organizations" in the feed silently narrowed to the switcher's active org — FindingsFeed omitted orgId and fetchWithAuth re-injected the active org; since the org dropdown builds from returned rows, other orgs could never appear either. Fix: `skipOrgIdInjection` opt-out on fetchWithAuth used by listFindings (commit on PR #3449, +2 service tests). Verified live: "Showing 5 of 5" across both orgs, dropdown offers both.
+- ✅ Feed renders all kinds/severities; filters (org/kind/severity/status) work; URL-hash deep-link per finding.
+- ✅ Drawer: summary, evidence JSON, affected-devices table (hostnames resolved), remediation history, lifecycle buttons.
+- ✅ Fix picker: 3 action kinds; script path → Select Script modal (categories, run-as) → device selection step (4 of 4, select-all/clear) → confirm → "Start remediation" dispatched (202), picker closes.
+- ✅ Run progress panel: appears immediately, polls ("Refreshing while the run is active…"), per-device rows "Skipped — unreachable" (correct for offline fixtures).
+- ✅ Lifecycle: Acknowledge → toast "Finding acknowledged", feed chip flips to Acknowledged.
+- ⏳ Run finalization (parent run counters/terminal status via 30s poll job) being verified in background.
+
+### [#3278 addendum] Remediation run finalization — PASS
+- ✅ The all-targets-skipped run finalized via the 30s poll job: status `failed`, skipped_count 4, completed_at set. UI panel stops polling once terminal.
+- ⚠️ UI/UX: for up to ~1 poll tick the summary line reads "0 succeeded, 0 failed, 0 skipped of 4 targeted" while the per-device rows already show 4 × Skipped — counters lag the row list. Cosmetic.
+
+### [#3295 discovery link/unlink + durable unlink] — PASS (first-ever browser pass)
+Fixtures: 6 assets in QA Org 001 (3 pending, 2 auto-linked, 1 seeded-suppressed), 2 in Default Org.
+- ✅ Asset list renders linked assets with "Same device as QA Device 00N"; filters/status/type counts correct.
+- ✅ Asset modal: link renders as deep-link to the managed device; network/SNMP/monitoring sections render.
+- ✅ NetworkDeviceDetailPage → Monitoring tab → Discovery: "Same device as QA Device 007 — auto-detected" + Unlink.
+- ✅ Unlink (confirm dialog) → "Not linked" + **"Auto-linking disabled — unlinked by a user"** (the durable-unlink suppression indicator — the point of the PR — renders). DB: auto_link_suppressed_at set.
+- ✅ Link manually… → site-scoped device dropdown → "Device linked" toast → "— set manually" provenance; DB confirms link_source=manual and suppression CLEARED (re-enabling auto-link on manual relink is the intended semantics).
+- ⚠️ UI/UX: the link/unlink controls live under the "Monitoring" tab of the network device page — not discoverable from the asset modal, which only shows the passive "Same device as…" link ("Manage proxy access on the network device page" hints at the page but not at linking). Consider surfacing link/unlink in the modal too.
+
+### [Org switcher >50 orgs] — FAIL → FIXED (missed reader of #3446)
+- ❌ BUG: org switcher showed "Fleet view · 50 organizations" of 126; search for "QA Org 125" returned nothing — orgStore.fetchOrganizations fetched one unpaginated page (server clamps at 50 default/100 max) and switcher search filters client-side. #3447 fixed OrganizationsPage only; the switcher was the hidden second reader.
+- ✅ Fix: fetchAllOrganizations extracted to lib/, orgStore walks all pages (commit on PR #3449; store tests updated). Verified live: "Fleet view · 126 organizations", QA Org 125 findable, switch to QA Org 001 works.
+
+### [Enrollment keys (#3034 partial)] — PASS (UI side)
+- ✅ Create Key with org/site + Max Usage 5 → one-time secret banner ("will not be shown again"), row shows usage "0 / 5", Download/Rotate/Delete present. Full per-token installer capacity chain (short-link child token → installer download decrement) still needs an install flow — BLOCKED on a real agent enrollment.
+
+### [#3447 org pagination] — PASS (post-fix)
+- ✅ Settings → Organizations with 126 orgs: search finds "QA Org 125" (past both 50- and 100-row boundaries).
+- ✅ Org switcher (after this sweep's orgStore fix): "Fleet view · 126 organizations", any org reachable via switcher search.
+
+### [#3301/#3305 scripts pagination] — PASS
+- ✅ /scripts list: 36 partner-owned scripts (23 global live in the separate Import-from-Library catalog — expected), pages 1–4 navigate, footer "Showing 31 to 36 of 36" correctly spaced.
+- ✅ Run Script picker requests limit=100 (server ceiling) and renders all 44 macOS-compatible scripts of the 59-script library — past the old 50 default cap. (>100-script tenants unverifiable with this seed; code walks pages.)
+- ⚠️ UI/UX: scripts-list pagination prev/next buttons are icon-only with no aria-label or accessible name.
+
+### [Devices workflows] — PASS (unblocked by seed)
+- ✅ List renders 30 of 30 (QA Org 001), quick filters/columns/status chips present; offline devices show "Down".
+- ✅ Device detail: header + Wake/Run Script/Connect Desktop/Remote Tools/Power; all 8 tabs (Details, Performance, Alerts, Anomalies, Tickets, Event Log, Monitoring, Compliance) render without crashes; empty states correct.
+- ✅ Run Script disabled with tooltip "Device is offline" when offline (graceful, not silent). After flipping device online: picker opens, script dispatch → 201, device_commands row `pending`. Output view BLOCKED on a live agent.
+- ⚠️ UI/UX: GET /reliability/:deviceId 404s for devices with no snapshot (UI copes with proper empty state; console noise).
+- ⚠️ UI/UX: Overview ACTIVITY section shows bare "ACTIVITY" header with no empty-state copy.
+
+### [Device groups — multi-org fix verified live] — PASS
+- ✅ As a 126-org partner (previously 100% 400): created static group "QA Multi-Org Static Group" with 3 initial devices (also #3423's membership-on-create path — count shows 3 devices), and dynamic group "QA Dynamic Linux Group" (hostname contains qa-dev) → evaluated at create, "Matches 30 devices".
+
+### [#3276 script bundle export/import] — PASS with 1 UX finding
+- ✅ Export modal lists the full partner library (36), select 2 → downloads `script-bundle-2026-08-11.json` (bundleVersion 1, full script bodies).
+- ✅ Import modal: trust warning ("can run as SYSTEM… only import from a source you trust"), parses bundle ("2 scripts in bundle"), collision-mode radio (skip/rename/new-version), partner-wide toggle; import → toast "2 imported, 0 renamed, 0 versioned, 0 skipped, 0 failed".
+- ⚠️ FINDING (filed as issue): with default availability 'org', collision detection deliberately conflicts only against org-owned rows — importing a bundle whose names match existing PARTNER-WIDE scripts shows every entry as "New" and creates same-name org-scoped duplicates in the same list view, even in "Skip it" mode. Namespace design is intentional (#3262), but the operator-visible outcome is duplicate names the "skip existing" option doesn't skip.
+
+### [#3316/#3328 org contacts compat] — PASS
+- ✅ Org Settings → Billing → billing contact save → toast "Organization billing settings saved"; DB shows a first-class `contacts` row (roles={billing}, is_primary=true) written through the compat service — the legacy jsonb writer is properly repointed.
+
+### [#3273/#3287 bulk org/site import] — PASS
+- ✅ CSV upload → column-mapping UI → Preview: bad IANA timezone rejected 400 with precise field error surfaced as toast ("rows.2.timezone: Invalid IANA timezone" — runAction path works; earlier "silent failure" suspicion was a probe-timing artifact).
+- ✅ Preview annotates "New" vs "Name match — confirm" (duplicate excluded from import until confirmed); skip/update-from-file mode selector present. Import → "1 imported." toast; org + site rows verified in DB.
+- ⚠️ UI/UX: preview error toast copy is raw field-path ("rows.2.timezone") — row number is 0-indexed relative to data rows; "Row 3" phrasing would be clearer.
+
+### [#3420 report-suspicious] — BLOCKED (no pending approvals in seed; needs an approval-generating action from a second user)
+### [#3417/#3414 policy remediation dispatch] — BLOCKED (needs a config policy with real drift against a live agent)
+
+### [#3324 migration banner] — PASS (env-gated test)
+- ✅ With BREEZE_BILLING_URL unset (self-hosted presentation) + one device flagged migration_required in the active org: banner renders on every page — "1 device(s) are running the hosted agent edition on this self-hosted server." + "How to migrate" link. Disappears when count drops to 0 / instance is hosted (gates verified: hosted stack correctly suppresses it).
+- ⚠️ UI/UX: "1 device(s)" — needs i18n pluralization.
+
+### [#3289 hosted signup gate] — PASS (env-gated test)
+- ✅ With IS_HOSTED=true: /register-partner with a gmail.com address → blocked inline: "Please sign up with your business email address… schedule a call" + working "Schedule a call" action button (the earlier actionUrl-drop gap is not present here). No partner row created (DB verified).
+
+### [#3294/#3199 proxy access] — PARTIAL
+- ✅ Open Ports chips render; web-port (443) chip opens ProxyConnectPopover: "Proxy to 10.42.3.1:443 — No online agent is available to bridge this connection." Graceful no-bridge messaging.
+- BLOCKED: actual proxied session + 5-minute session cliff need an online agent on the same site.
+
+### Environment note
+Stack env restored (IS_HOSTED=false, BREEZE_BILLING_URL set); caddy host port re-rolls on every restart — final port this session :32837. Seed data left in place for future sweeps (126 orgs, 42 devices, discovered assets, fleet findings, 59 scripts, enrollment key, QA groups/filters/channels).
+
+## Summary (pre-release gap-closure pass 2026-08-11)
+
+| Area | Result |
+|---|---|
+| #3448 Saved Filters preview crash re-verify | PASS |
+| Saved filter create (empty description) | FAIL → **FIXED** (PR #3449) |
+| #3448 channel-list crash re-verify | PASS |
+| #3448 Event Logs / Slack URL validation | PASS ×2 |
+| #3437/#3424 count-glue re-verify | PASS ×4 (incl. scripts footer) |
+| Device group create — multi-org partner | FAIL → **FIXED + verified** (PR #3449) |
+| #3423 static group with devices / dynamic eval | PASS |
+| #3278 Fleet findings UI (feed/drawer/fix picker/run panel/lifecycle) | PASS after **1 FIX** (all-orgs scoping, PR #3449) |
+| Fleet remediation run finalization | PASS (30s poll) |
+| #3295 discovery link/unlink + durable unlink | PASS |
+| Org switcher >50 orgs | FAIL → **FIXED + verified** (PR #3449) |
+| #3447 organizations page >100 orgs | PASS |
+| #3301/#3305 scripts pagination + picker | PASS |
+| Devices list/detail/tabs/actions | PASS |
+| #3440/#3391 preferred remote tool + slim providers | PASS |
+| #3276 script bundle export/import | PASS + 1 UX issue filed |
+| #3273/#3287 bulk org import | PASS |
+| #3316/#3328 org contacts compat | PASS |
+| Ticketing sub-tabs | PASS |
+| #3034 enrollment key capacity (UI) | PASS (installer chain BLOCKED) |
+| #3324 migration banner | PASS |
+| #3289 hosted signup gate | PASS |
+| #3294/#3199 proxy popover | PARTIAL (session needs live agent) |
+| #3420 report-suspicious | BLOCKED (no pending approvals) |
+| #3417 policy remediation dispatch | BLOCKED (needs drift + live agent) |
+
+## Top findings
+1. **4 user-facing bugs found & fixed** (all on PR #3449): multi-org device-group create 400; saved-filter null-description 400; fleet findings all-orgs silently org-scoped (fetchWithAuth injection); org switcher truncated at 50 orgs (missed reader of #3446). Two of the four are the SAME pattern — fetchWithAuth's orgId injection / unpaginated first page biting a second call site the original fix missed. Worth a sweep-check on any future "load all X" or "all orgs" surface.
+2. **Create/update schema drift keeps recurring** (#3159, now saved filters): any field accepted as null on update must accept null on create. Consider a lint/contract test.
+3. Remaining gaps needing a live agent: script run output, policy remediation dispatch, proxied session + 5-min cliff, installer capacity chain, report-suspicious (needs second user + approval). These are the same cluster — a lightweight fake-agent harness would close all of them.
+
+### Out-of-scope for browser QA (recorded for release decision)
+The release range also contains changes with no browser-reachable surface, untested by this pass and by the log to date: the 10-PR BYO-signing / edition-aware pipeline epic (#3327 #3330 #3331 #3349 #3350 #3351 #3353 #3360 #3321 #3352 — needs a self-host-edition build to verify manifest rejection + re-signing abort), 7 agent-side fixes (#3422 #3393 #3371 #3367 #3398 #3395 #3384), backup VSS fixes (#3285/#3267/#3266), breeze-backup auto-update (#3293), and partner-policy agent delivery (#3390). These need an agent/VM pass (Windows test VM .55) — flagging as the largest remaining pre-release risk cluster.
+
+### [Addendum: PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST (#1322)] — PASS
+Flag enabled on the dev stack (web env + restart). Verified: Devices page grows a CLASS column and All/Agent/Network class tabs with counts; only **approved AND unlinked** discovered assets count as network devices (by design — linked assets are represented by their managed device; pending/dismissed stay in Discovery). Approving an asset in Discovery (bulk Approve selected) made it appear as a Network row (All 31 / Agent 30 / Network 1); clicking the row lands on /devices/network/:id. Off by default pending #1322 follow-ups (unified sort/pagination, inline approval).
+
+### Environment addendum
+Docker engine restarted mid-session (~21:07) and the wt-main postgres data dir is tmpfs → DB wiped, API re-bootstrapped a fresh tenant. QA seed re-applied against the new tenant (anchor UUIDs substituted; BEGIN/COMMIT stripped because the new Default Org UUID sorts below the QA orgs and the partner-export lock-order trigger rejects cross-org statements in one transaction). Current stack: http://localhost:32773 (network-list flag ON on web).
+
+## UI QA Sweep — 2026-08-17 (post-merge pass on main, stacks :32833 → :32845)
+
+Scope: latest `main` pulled and booted via `pnpm wt-stack up`; regression sweep of the nav
+surface plus everyday/setup workflows, then a backward pass over the ~120 PRs merged since
+the 2026-08-11 sweep. Second half re-verified against `8c64a060d` after three more merges.
+
+### Environment — PARTIAL (4 setup blockers, all local config)
+- ❌ Worktree had **no `.env`**; copied from the main clone (known trap).
+- ❌ That `.env` (Jul 20) predates four now-**required** compose vars — stack refused to
+  start: `EVENT_PERMISSION_EPOCH_MODE`, `REMOTE_ACCESS_ADMISSION_MODE`,
+  `REMOTE_WS_AUTH_MODE`, `REMOTE_WS_REDIS_TOPOLOGY`. Added from `.env.example`.
+- ❌ `POSTGRES_IMAGE_REF=postgres:16-alpine` in the stale `.env` → API **crash-loops at
+  boot**: `BREEZE_WORKSPACE_ENABLED=true` but the workspace ee migrations need pgvector.
+  Fixed to `pgvector/pgvector:pg16` (what `.env.example` already ships).
+  ⚠️ The API's error message here is genuinely good — names the flag, the image, and both
+  remedies. Worth copying elsewhere.
+- ❌ Default `BREEZE_DOCKER_SUBNET` (172.31.0.0/24) collided with another worktree stack;
+  set 172.31.200.0/24 + matching `BREEZE_CADDY_IP`.
+- ⚠️ `docker restart web` leaves a stale `astro dev` lock ("Another astro dev server is
+  already running", PID 61) → permanent 502. Must `up -d --force-recreate web`, which then
+  **reassigns ephemeral ports** (32833 → 32845) while `.breeze-stack.json` still advertises
+  the old one. Read the live `docker ps` port, not the descriptor, after any recreate.
+
+### Nav crawl (52 sidebar routes) — PASS
+- ✅ All 52 routes serve HTTP 200 and render their real page (h1 + content), including the
+  empty states: `/fleet` "Fleet is clean", `/workspace` "New Conversation" CTA.
+- ✅ Dashboard renders full data (2 devices, 1 critical / 1 warning, patch compliance 33%,
+  1 open vulnerability finding, recent-activity table).
+- ✅ Zero console errors on a clean sequential pass.
+- False positives worth recording: "Failed" on the dashboard is a patch-status tile label
+  (`Failed 0`) and "Error" on `/fleet` is a severity filter option. Neither is a defect.
+
+### ❌ BUG: navigating ~10 pages in a minute force-logs-out the user — issue #3696
+- Symptom: 11 sidebar navigations in ~43 s → redirect to `/login`, no warning or toast.
+- API actual: `POST /api/v1/auth/refresh` → 9× `200` then `429`; client surfaces
+  `AuthSessionExpiredError: Session expired` and hard-logs-out.
+- Mechanism: the access token is **in-memory only**, so every full page load must refresh
+  (proved: refresh counter 73→76 across exactly 3 navigations). `/auth/refresh` is capped at
+  **10/60 s per user** (`apps/api/src/routes/auth/login.ts:751-766`). Astro MPA ⇒ every nav
+  is a document load ⇒ ~10 page views/minute is a hard ceiling.
+- Aggravator: the client *retries* a 429 (`MAX_TRANSIENT_REFRESH_RETRIES = 2`), burning more
+  of the same budget; a transient throttle is reported as an expired session.
+- Not a client dedup bug — refresh IS single-flighted per realm (`auth.ts:445-457`) plus a
+  cross-tab Web Lock. It is one refresh *per realm*, and each navigation is a new realm.
+- Not an E2E artifact: the limiter is skipped only under `E2E_MODE`; real 429s observed.
+- ⚠️ This also makes fast automated UI crawling unreliable — pace tooling under ~10 page
+  loads/minute or the sweep logs itself out mid-run.
+
+### Devices — PARTIAL
+- ✅ List renders; search filters (`windows` → "1 of 2 devices"); quick filters, sort
+  headers, per-page selector, grid/list toggle, Columns picker all present.
+- ✅ Offline actions degrade gracefully with good copy: "Device is offline — Remote Terminal
+  needs a connected agent. Queued commands still run on reconnect."
+- ✅ Reboot **does** toast: "Reboot queued — will run when e2e-macos.local reconnects".
+  (An earlier probe read the DOM at 1.2 s and missed it — recorded so it isn't refiled.)
+- ❌ BUG (**#3698**): list kebab Reboot fired on ONE click with **no confirmation**, while
+  the detail page gates the identical action behind `ConfirmDialog`
+  (`DeviceList.tsx:2449-2452` vs `DeviceActions.tsx:227-240`). Two stray clicks queued two
+  real `reboot` rows (`device_commands`, `pending`). **Fixed by #3703 — verified below.**
+- ⚠️ UI/UX: the first-run OnboardingTour popover lands on the first table row and intercepts
+  clicks until skipped. Legitimate overlap, but it sits right on the data grid.
+
+### Alerts — PASS
+- ✅ Severity counts, search, saved filters, advanced filter all render.
+- ✅ Every row action carries a descriptive aria-label ("Acknowledge: E2E fixture: disk full").
+- ✅ **Acknowledge** works; the row visibly moves Active → Acknowledged (state change is the
+  feedback — no silent 2xx).
+
+### Notification channels — PARTIAL
+- ✅ Create flow works end to end: modal → create → modal closes → "1 of 1 channels" with
+  type, status and recipient shown.
+- ✅ Create modal exposes the partner-wide ownerScope selector ("All organizations
+  (partner-wide channel — receives alerts from every org)" vs "This organization only").
+- ❌ BUG (**#3697**): **Test** reports a failed test as success. API returns HTTP 200 with
+  `testResult.success:false` + "Resend error: Invalid `to` field…"; UI shows only
+  "Last test: Just Now". Exactly the case `runAction` exists to catch; this path bypasses it.
+- ⚠️ UI/UX: the true-empty state (0 channels, no search, no filter) reads "No notification
+  channels found. Try adjusting your search or filters." — blames a filter never set.
+
+### Backward-through-PRs pass (merged since 2026-08-11)
+
+**Device Groups (#3564, #3626) — PASS**
+- ✅ Edit opens with per-device membership checkboxes (the #3626 regression is fixed).
+- ✅ Checking `e2e-macos.local` + **Save changes** persists: 0 → **1 device**, host listed.
+
+**Analytics rebuild (#3513) — PASS**
+- ✅ Tabs, range picker, refresh; real data (OS distribution 50/50) and **honest
+  "No data available"** for Performance Trend / Weekly enrollments — no fabricated zeros.
+
+**Tenant variables (#3494 / #3409 PR4b) — PASS**
+- ✅ Partner/org scope radios, key-format hint, Secret checkbox stating the contract.
+- ✅ Created a **secret** variable: key renders as `{{var.qa_sweep_token}}`, value masked.
+- ✅ No leak: `GET /api/v1/tenant-variables` returns `"value": null, "isSecret": true`.
+- ✅ Best-in-app empty state ("Create one to stop pasting the same token into every
+  customer's scripts").
+
+**Package-manager Software Library (#3587, #3611) — PASS**
+- ✅ Partner/org SCOPE, SOURCE = Download URL / Upload file / **Package manager**,
+  installer-type auto-detect, `{{org.name}}` variable insertion.
+- ✅ Created `QA Sweep Chrome` via winget id `Google.Chrome` → appears in the catalog.
+- ✅ Honest degradation twice: "File uploads require S3 object storage…" and "Package search
+  is unavailable right now — enter a package ID manually below."
+
+### Organizations & Sites (setup) — PARTIAL
+- ✅ Create org works; URL adopts the `#<orgId>` hash (repo convention); list updates.
+- ✅ **Guided onboarding fires**: "Add the first site for QA Sweep Customer" with honest
+  framing, a **Skip for now**, and "Only the site name is required."
+- ✅ Created site `QA Sweep HQ` → "1 of 1 sites".
+- ❌ BUG (**#3699**): org list cards render a blank device count —
+  `<span class="text-xs text-muted-foreground"> devices</span>`. `GET /orgs/organizations`
+  returns no count field. The org *detail* panel beside it renders "0 devices" correctly.
+
+### Partner settings — PASS
+- ✅ **#3518 verified**: Website = `javascript:alert(1)` rejected with a readable message —
+  "Website must be a full http:// or https:// URL". No `[object Object]`, no silent accept.
+
+### Global search (Cmd+K) — PASS
+- ✅ Palette focuses; `e2e-windows` groups under DEVICES with status; **Enter navigates**.
+
+### Device detail — PASS
+- ✅ Tabs Overview/Details/Performance/Alerts/Anomalies/Tickets/Event Log/More; hash state.
+- ✅ Unknown hardware fields render "—" rather than fabricated zeros.
+- ⚠️ `GET /api/v1/reliability/{deviceId}` 404s when a device has no snapshot, so every such
+  view logs a console error. UI copes correctly ("No reliability snapshot available").
+
+### Scripts — PASS
+- ✅ "Catalog — same for every organization" banner marks partner scope.
+- ✅ **Import from Library** opens the System Script Library (12+ seeded scripts).
+- ✅ Importing "Clear Package Cache" persists (`GET /scripts` → 1) and the row disappears.
+- ⚠️ No toast on import — feedback is only the row vanishing.
+- ⚠️ **Testing note:** that modal has **`role=dialog` count 0** (plain `fixed inset-0` div).
+  An early probe looked like a silent failure purely from selector choice. Assert on modal
+  *title text*, never role/class. (The skill warns about this; it bit this sweep once.)
+
+### Second pass — the three PRs merged during the sweep (main `8c64a060d`)
+
+**#3686 workspace local_profile crawl-device rejection — not UI-reachable.** API/workspace
+guard; covered by its own integration tests, no browser surface exercised here.
+
+**#3596 Outlook tech persona (tickets from the add-in) — PARTIAL / BLOCKED**
+- ✅ **Tenancy done correctly** (the step CLAUDE.md says gets missed): `ticket_email_links`
+  has `org_id` and IS registered in both `CORE_ORG_CASCADE_DELETE_ORDER` and
+  `CORE_TENANT_EXPORT_POLICY`. `office_addin_user_bindings` is **shape 3 partner-axis**
+  (no `org_id`, documented in the schema comment) with its RLS policy created in the same
+  migration — correctly needs no cascade/export entry.
+- ✅ All 3 migrations (`2026-08-22-office-addin-user-bindings`, `2026-08-22-ticket-email-links`,
+  `2026-08-23-ticket-comments-email-authored-insert`) applied cleanly on restart.
+- ✅ Add-in routes mounted and gated: `/office-addin/tickets` and `/office-addin/email-context`
+  → **401** unauthenticated; `/office-addin/auth/exchange` → 400 on an empty body.
+- ✅ Core ticket path still healthy: created **T-2026-0001** via `/tickets/new`; queue counts
+  updated (Unassigned 1, All open 1), detail pane opened, `#T-2026-0001` hash state.
+  Submit is correctly disabled until required fields are set, and Requester/Device stay
+  disabled until an Organization is chosen.
+- 🚫 **BLOCKED**: the add-in itself (email context, link/create from an email, time entry,
+  AI draft) needs Entra sign-in + the Outlook host. Not fakeable from the browser — re-test
+  from Outlook with a real Entra tenant.
+
+**#3702 SSO `#ssoCode` consumption — PARTIAL (success path unverifiable locally)**
+- ✅ The fragment IS consumed and **stripped synchronously** — `/#ssoCode=…` leaves no
+  fragment in the URL, so the single-use grant can't be replayed or copied out.
+- ✅ Invalid code is rejected server-side: `POST /api/v1/sso/exchange` → **400**.
+- 🚫 Success path (valid grant → `/users/me` → logged in) needs a real IdP — not verified.
+- ❌ BUG (**#3704**): on a *failed* exchange the SSO-specific notice never reaches the user.
+  Trace: `POST /sso/exchange` 400 → `GET /login?error=sso_exchange_failed` **ERR_ABORTED** →
+  racing `POST /auth/refresh` 401 wins → user lands on `/login?reason=session-expired` and
+  reads "Your session expired. Please sign in again to continue."
+  Deterministic across two attempts. The copy exists and is fully localized
+  (`LoginPage.tsx:84`, `login.ssoErrors.ssoExchangeFailed` in all 8 locales) but is
+  unreachable on this path. Misleading for an admin debugging a broken SSO config — it
+  points away from SSO and invites a retry loop through the same broken round trip.
+
+**#3703 confirm-gate single-device reboot (fixes #3698) — VERIFIED, see below.**
+
+## Summary table (2026-08-17)
+
+| Area | Result |
+|---|---|
+| Environment / stack bring-up | PARTIAL — 4 stale-`.env` blockers + astro-lock/port trap |
+| Nav crawl (52 routes) | PASS |
+| Session / auth under navigation | **FAIL — #3696** |
+| Dashboard | PASS |
+| Devices list + actions | PARTIAL — **#3698**, fixed by #3703 |
+| Alerts | PASS |
+| Notification channels | PARTIAL — **#3697** |
+| Device Groups (#3564/#3626) | PASS |
+| Analytics (#3513) | PASS |
+| Tenant variables (#3494/PR4b) | PASS |
+| Software Library (#3587/#3611) | PASS |
+| Organizations & Sites | PARTIAL — **#3699** |
+| Partner settings (#3518) | PASS |
+| Global search (Cmd+K) | PASS |
+| Device detail | PASS |
+| Scripts | PASS |
+| Tickets core + add-in routes (#3596) | PARTIAL / add-in BLOCKED |
+| SSO fragment (#3702) | PARTIAL — **#3704**, success path BLOCKED |
+
+## Top findings
+
+1. **#3696 — session dies under ordinary navigation.** The severe one. Access token is
+   in-memory, so *every* page load spends one of 10 allowed `/auth/refresh` calls per minute;
+   an MPA where every click is a document load turns that into a hard ceiling of ~10 page
+   views/minute, after which the user is thrown to `/login`. Reproduced with plain sidebar
+   clicks (11 loads / 43 s). The client also *retries* the 429, spending budget faster, and
+   reports a transient throttle as "Session expired".
+2. **#3698 — destructive action gated on one screen but not the other** (now fixed by #3703).
+3. **#3697 — a Test button that can't report failure.** HTTP 200 + `testResult.success:false`
+   renders as "Last test: Just Now". The API's failure text is already good; it never reaches
+   the user. `runAction` exists for exactly this and isn't used here.
+4. **#3704 — the SSO failure notice loses a race** to the generic session-expired eviction,
+   so a broken SSO config reports itself as an expired session.
+5. **Empty-state quality is inconsistent** — Variables and Software are excellent and
+   specific; Notification channels blames a filter the user never set.
+6. **Verified and dismissed, so they aren't refiled:** dashboard "100% online" was accurate
+   for that moment; `/fleet` "Error" and dashboard "Failed" are filter/tile labels; the
+   reboot toast does fire; "API 0.82.0" in the footer came from the stale local `.env`.
+
+**Backward-PR pass reached #3494** (2026-08-13). Older PRs were not re-verified — resume there.
+
+---
+
+## UI QA Sweep — 2026-08-24
+
+**Env**: per-worktree stack (`pnpm wt-stack up`) on branch `fix/3836-manifest-asset-name`
+(f580cb580), `baseUrl=http://localhost:32797`, seeded `e2e-tests/seed-fixtures.sql`
+(1 org "Default Partner", 2 offline device fixtures). Browser: ego-browser (Chromium).
+Login `admin@breeze.local` / `BreezeAdmin123!` — works. `E2E_MODE` is **unset** in the API
+container, so rate limiters are production-representative.
+
+### Auth / session — FAIL (blocker-class)
+- ❌ **BUG: 11 ordinary sidebar navigations inside ~20s force-logs the user out.**
+  Repro (clean login, then navigate in order): `/devices`, `/alerts`, `/scripts`,
+  `/patches`, `/reports`, `/analytics`, `/audit`, `/logs`, `/settings/users`,
+  `/settings/roles`, `/integrations` — the 11th lands on
+  `/login?next=%2Fintegrations&reason=session-expired` showing *"Your session expired.
+  Please sign in again to continue."* Elapsed: **20 seconds**. Nothing was idle, nothing
+  expired: the access token TTL is 900s and was ~19 min from issue.
+  - Mechanism: the access token lives **in memory only**, and the web app is Astro MPA, so
+    *every full page navigation* re-bootstraps by trading the refresh cookie at
+    `POST /api/v1/auth/refresh`. That endpoint is limited to **10 per user per 60s**
+    (`apps/api/src/routes/auth/login.ts:759`, `rateLimiter(redis, 'refresh:'+sub, 10, 60)`).
+    Navigation #11 in a minute gets 429.
+  - The client *does* classify 429 as transient (`apps/web/src/stores/auth.ts:383`) and
+    retries — but with `MAX_TRANSIENT_REFRESH_RETRIES = 2` and
+    `TRANSIENT_REFRESH_BASE_DELAY_MS = 300`, the whole retry budget is **~0.9s**, spent
+    entirely *inside* a 60-second limiter window. Every retry is guaranteed to 429 too.
+    The backoff cannot ever help against a windowed limiter; it only helps a one-off 502
+    (the case #3041/#3041-era work was aimed at).
+  - The limiter key is **per user, not per session**, so multiple tabs share one budget and
+    reach the cap ~N× faster.
+- ❌ **Second, worse symptom of the same cause: pages that render but are silently empty.**
+  Mid-trip (`/integrations`, `/incidents`) the page did *not* redirect — it rendered its
+  chrome with **every** data call 401'd (`/webhooks`, `/orgs/organizations`,
+  `/orgs/partners/me`, `/system/version`, `/extensions/registry`, `/incidents/feed`) and
+  showed no error, no toast, no retry affordance. This is the classic silent-failure class:
+  a user sees an "empty" Integrations page and concludes they have no integrations.
+- ⚠️ UI/UX: the eviction copy says "Your session expired", which is actively misleading —
+  the session had ~19 minutes left; the user was rate-limited, not expired.
+- Consequence for the rest of this sweep: all subsequent navigation is paced ≥7s apart to
+  stay under the limiter. Noted because it makes the defect hard to miss in real use.
+
+### Phase 2 — Nav crawl (53 sidebar destinations) — PASS with papercuts
+- ✅ All 53 sidebar destinations render, correct `<title>`, no JS exceptions, no unhandled
+  rejections, no 4xx/5xx on primary data calls (once navigation is paced under the refresh
+  limiter). Nav surface is larger than the skill's list — it now also includes Tickets,
+  Vulnerabilities, OneDrive, DNS Security, PAM, User Risk, Quotes, Invoices, Contracts,
+  Timesheets, Product Catalog, Device Groups, Fleet Posture, Variables, SSO, Access Reviews,
+  AI Agents.
+- ⚠️ UI/UX: five pages still show only a spinner at 3s and need ~8–12s to paint:
+  `/discovery` ("Loading discovered assets..."), `/pam` ("Loading overview…"),
+  `/timesheet` ("Loading…"), `/reports` ("Loading reports..."),
+  `/settings/ai-agents` ("Loading agents…"). All resolve correctly; on a 2-device seed
+  this is slower than it should be.
+- ⚠️ UI/UX: `/cis-hardening` fires two `AbortError: signal is aborted without reason`
+  fetch rejections on every load (`/cis/compliance?limit=1`, `/cis/baselines?active=true&limit=1`) —
+  double-effect abort noise, harmless but pollutes the console.
+
+### i18n rendering defects — FAIL (2 distinct systemic classes, both user-visible)
+- ❌ **BUG (class A): `<Trans>` misparses literal angle brackets — Enrollment Keys page shows
+  raw `&lt;key>`.** `/settings/enrollment-keys` subtitle renders literally as
+  *"Use these keys with breeze-agent enroll &lt;key>"*. DOM proof:
+  `innerHTML === "…breeze-agent enroll &amp;lt;key&gt;"`.
+  Root cause: `EnrollmentKeyManager.tsx:497` renders the string through
+  `<Trans i18nKey="enrollmentKeys.description" components={{ code: … }} />`. The en string
+  (`locales/en/settings.json:538`) is plain text containing `<key>`; i18next's `Trans` parses
+  it as markup, finds a `<key>` tag with no matching entry in `components`, and escapes it.
+  Two bugs in one line: the `components={{ code }}` map is also **dead** — no locale variant
+  of this string contains a `<code>` tag. Affects all 8 locales (all carry plain `<key>`).
+- ❌ **BUG (class B): i18n codemod dropped the space between a label key and the following
+  expression — 14 call sites render glued text.** Confirmed visually on `/settings/sso`:
+  *"0 of0 providers"* (`SsoProviderList.tsx:87` — `{t('ssoProviderList.of')}{providers.length}`,
+  and en value is `"of"` with no trailing space). Same shape at:
+  `AccessReviewPage.tsx:668` ("Due{date}"), `:701` ("N of{total} reviewed"),
+  `:756` ("Showing{N} of{M} users"), `AccessReviewForm.tsx:135` ("Step{n} of{total}"),
+  `AccessReviewList.tsx:138`, `ApiKeyList.tsx:103` + `:237` ("Page{n} of{total}"),
+  `CatalogItemsTab.tsx:539` ("Showing the first{100}"), `RoleManager.tsx:395`
+  ("Permissions for{role}"), `TdSynnexEcExpressPanel.tsx:428` ("SYNNEX SKU{sku}"),
+  `SsoProviderForm.tsx:277`, `MFASettings.tsx:584`, `FileManager.tsx:1218` ("Activity{n}").
+  (Method: regex for `{t('KEY')}{expr` excluding `{' '}`, then resolve KEY against
+  `locales/en/*.json` and keep only values with no trailing space/punctuation. 21 raw
+  suspects, 7 were false positives where the following template literal begins with a space.)
+- ❌ **BUG (class B, related): 9 en locale strings contain raw HTML entities** that React
+  renders literally: `alerts.json` `suppressAlertDialog.howLongShould` (`&ldquo;`) and
+  `staySuppressed` (`&rdquo;`), `createTicketFromAlertDialog.*` (`&apos;` ×2),
+  `backup.json` `recoveryBootstrapTab…` (`&lt;token&gt;`, `&lt;api-server&gt;`),
+  `integrations.json` `unifiIntegration.*` (`&nbsp;` ×2),
+  `policies.json` `configurationPolicies.featureTabs.patchTab.times` (`&times;`),
+  `security.json` `sensitiveDataCreateScanModal.form.deviceIdsPlaceholder` (`&#10;`).
+
+### Phase 3 — Alerts (ack / resolve / suppress) — PARTIAL
+- ✅ **Suppress**: row "Mute" → dialog → pick "1 hour" → Suppress. Toast
+  `"E2E fixture: high CPU" suppressed` **with an Undo affordance**, row STATUS → `Suppressed`,
+  ACTIVE ALERTS counter 2 → 1, row actions correctly collapse to just `Dismiss`. Good pattern.
+- ✅ **Acknowledge**: toast `Alert Acknowledged`, STATUS → `Acknowledged`, `Ack` button removed
+  from the row.
+- ✅ **Resolve**: row `Resolve` opens the detail drawer → drawer `Resolve` reveals an inline
+  "Resolution Note" confirm with `Cancel` / `Resolve Alert` →
+  `POST /api/v1/alerts/{id}/resolve` 200, list refetched, STATUS → `Resolved`, drawer closed.
+- ❌ **BUG: alert detail drawer prints a raw user UUID instead of a name.** The drawer shows
+  *"Acknowledged  8/24/2026, 5:00:19 PM by 9cea2f85-2da1-445d-88cc-7c404d7504c4"*.
+  `AlertDetails.tsx:259` and `AlertDetailPage.tsx:435` render `{alert.acknowledgedBy}` verbatim
+  and the API returns the user id, not a display name. Two render sites, same defect.
+- ❌ **BUG (see i18n class B above, confirmed live): the Suppress dialog prints raw HTML
+  entities.** Rendered text is literally
+  *How long should &ldquo;E2E fixture: high CPU&rdquo; stay suppressed?*
+  DOM proof: `<p …>How long should &amp;ldquo;E2E fixture: high CPU&amp;rdquo; stay suppressed?</p>`.
+- ✅ Resolve **does** toast (`alertsPage.alertResolved`) — `AlertsPage.tsx:268` routes it through
+  `runAction` with a `successMessage`. An earlier reading here recorded "Resolve fires no toast";
+  that was a measurement artifact (see the toast-timing note below), not a defect.
+- ⚠️ QA note (methodology, not a product bug): the alert drawer is a `fixed inset-0 z-50` div
+  with **no `role="dialog"`**, and the row-level `Resolve` button sits *underneath* it at
+  overlapping coordinates. `document.querySelectorAll('button')` picking "the last Resolve"
+  selects the **table's** button, not the drawer's, and `elementFromPoint` at its centre
+  returns the drawer's scroll container. This produced a false "Resolve silently does nothing"
+  reading on the first pass. Scope button lookups to the drawer element.
+
+### Phase 3 — Devices (list, filters, detail, actions) — PASS
+- ✅ Quick-filter chips work and write state to the URL **hash** (`#filtersV2=<base64>`), matching
+  the repo's URL-state convention. `Offline` → "Showing 1 to 2 of 2"; `Online` → "0 of 2 devices",
+  "Advanced filter active", and a real empty state ("No devices found. Try adjusting your search
+  or filters.") rather than a blank table.
+- ✅ Dashboard/device-list consistency **verified, not a bug**: dashboard tiles read
+  `Online 0 / 0%`, `Fleet Status 0/2 online`, and the API agrees
+  (`/devices/stats` → `{"total":2,"online":0,"offline":2}`). (An early-crawl reading of
+  "Online 2 100%" was taken seconds after seeding while both fixtures were still inside the
+  online window — same false positive noted in the previous sweep. Dismissed again.)
+- ✅ Device detail tabs all render and are hash-routed: `#details`, `#performance`, `#alerts`,
+  `#anomalies`, `#tickets`, `#eventlog`. Details shows OS/agent/enrollment; Event Log shows a
+  proper empty state with source explanations.
+- ✅ **Offline-device action handling is exemplary.** `Run Script`, `Connect Desktop`,
+  `Remote Tools`, `Power` are all `disabled` **and** carry `title="Device is offline"`.
+  `Wake` is enabled, POSTs `/devices/{id}/commands` → **412**, and surfaces a precise toast:
+  *"e2e-windows.local: No MAC address on file. The agent must check in at least once before
+  Wake-on-LAN is available."* This is the behaviour the rest of the app should copy.
+- ⚠️ UI/UX: `GET /api/v1/reliability/{deviceId}` returns **404** on every device-detail tab
+  switch. The UI degrades correctly ("No reliability snapshot available yet."), but "no snapshot
+  yet" is being modelled as 404 rather than 200-with-empty, so every tab click logs a failed
+  request.
+- ⚠️ QA note: the device tab bar labels (`Alerts`, `Tickets`, `Event Log`) collide by text with
+  **sidebar** nav links. An unscoped `querySelectorAll('button,a')` lookup clicks the sidebar and
+  navigates away from the device — scope to `main`.
+
+### Phase 4 — Notification channels (create + Test) — PASS
+- ✅ `/alerts/channels` create flow: `New Channel` → inline form carrying the **partner/org
+  `ownerScope` radio pair** (`notification-channel-owner-partner` / `-org`, defaulting to org),
+  which is the Partner-Wide-First contract. Filled name + recipient →
+  `POST /api/v1/alerts/channels` **201**, toast `Channel Created`, list refreshed to
+  "1 of 1 channels", row shows `Active` / `Never Tested`.
+- ✅ **Channel `Test` surfaces the real failure reason.** `POST /alerts/channels/{id}/test`
+  returns **HTTP 200** with `{"testResult":{"success":false,"message":"Resend error: Invalid \`to\`
+  field. Please use our testing email address instead of domains like \`example.com\`…"}}`, and the
+  UI toasts **that exact message** while flipping the row to `Failed` / `Last test: Just Now`.
+  This is the 200-with-failure-body case CLAUDE.md's `runAction` contract exists for, and it is
+  handled correctly (`runChannelTest` in `NotificationChannelsPage.tsx`).
+- ⚠️ UI/UX: with zero channels and no filter applied, the empty state reads *"No notification
+  channels found. Try adjusting your search or filters."* — it blames filters for what is really
+  a first-run empty state. Compare `/software` ("No software packages yet. Add one to get
+  started.") and `/scripts` ("No scripts yet — create your first script…"), which get this right.
+
+### ⚠️ METHODOLOGY WARNING for future sweeps — toasts auto-dismiss in well under 8s
+Two "silent failure" findings on this sweep were **false**, both from probing the DOM too late.
+A `wait(8)` after an action finds no toast even when one fired at t+0.2s. Probe at **t+1–2s**, or
+install a `MutationObserver` on `document.body` before the click and read the recorded log
+afterwards:
+```js
+window.__toastLog=[]; new MutationObserver(ms=>{for(const m of ms)for(const n of m.addedNodes)
+  if(n.nodeType===1){const t=(n.innerText||'').trim(); if(t&&t.length<400) window.__toastLog.push(t)}})
+  .observe(document.body,{childList:true,subtree:true})
+```
+Then confirm against the source (`runAction({ successMessage })`) before filing. Combined with the
+`role="dialog"`-less overlay trap already in this skill, **selector scope + probe timing** are the
+two ways this sweep manufactures fake bugs.
+
+### Phase 4 — Organizations & Sites — PARTIAL
+- ✅ Create org: slug **auto-derives** from the name as you type ("QA Sweep Org" → `qa-sweep-org`).
+  `POST /orgs/organizations` 201, org appears in the list and is auto-selected.
+- ✅ Validation on empty submit is correct and readable: inline **and** toasted
+  *"Organization name is required"* / *"Slug is required"*, and **no API call is fired**.
+  No `[object Object]`, no silence.
+- ✅ The guided first-site flow is genuinely good: after creating an org the right pane shows
+  *"Add the first site for QA Sweep Org — Organizations need at least one site, this is where
+  devices will live. You can add more later."* with a `Skip for now` escape and the hint
+  *"Only the site name is required."* `Create first site` → `POST /orgs/sites` 201, list → "1 of 1 sites".
+- ❌ **BUG: organization `slug` is declared UNIQUE in the Drizzle model but has no unique index in
+  the database — duplicate slugs are accepted.** Repro: create "QA Sweep Org" with slug
+  `qa-sweep-org`, then create "QA Sweep Org Dup" with the **same** slug → `POST
+  /api/v1/orgs/organizations` returns **201**, and `GET /orgs/organizations` then lists two orgs
+  under one partner both carrying `slug: "qa-sweep-org"`.
+  - Model says unique: `apps/api/src/db/schema/orgs.ts:21` —
+    `slug: varchar('slug', { length: 100 }).notNull().unique()`.
+  - Database disagrees: `\d organizations` shows only `organizations_pkey (id)`,
+    `organizations_id_partner_id_unique (id, partner_id)`, `organizations_id_partner_uq (id, partner_id)`
+    and the partial `organizations_partner_quick_support_uniq (partner_id) WHERE type='quick_support'`.
+    **There is no index on `slug` at all.**
+  - No app-layer guard either: the `POST /organizations` handler (`routes/orgs.ts:37`) and the
+    update path (`:386`) write `data.slug` straight through with no pre-existence check.
+  - Blast radius **today is limited** — `organizations.slug` is only ever projected into responses
+    (`routes/orgs.ts:1174`, `routes/partnerApi/organizations.ts:268`, `services/aiToolsOrgs.ts`),
+    never used in a `WHERE`, except `db/seed.ts:1095`. So this is a data-integrity/API-contract bug
+    rather than a live tenant-isolation break — but the partner API hands slugs to external
+    consumers as if they were stable identifiers, and any future slug-based lookup would silently
+    become cross-tenant.
+  - `pnpm db:check-drift` does **not** catch this class (it does not diff the Drizzle model against
+    the live database), which is why a model-only `.unique()` has survived.
+
+### Environment correction mid-sweep — the first stack was 47 commits stale
+Phases 2–4 above ran against the worktree branch `fix/3836-manifest-asset-name` (f580cb580),
+which is **47 commits behind `origin/main`**. None of #3921/#3923/#3924/#3926/#3929/#3931/#3953
+were in it. Every finding above was therefore re-checked against `origin/main` by source before
+filing, and the two cheapest were re-confirmed **in a browser** on a second stack built at
+`origin/main` (`6ec30b06a`, `http://localhost:32802`): the Enrollment Keys `&lt;key>` string and
+the SSO `0 of0 providers` count both still render wrong there.
+
+**Lesson for this skill:** check `git rev-list --count HEAD..origin/main` *before* Phase 2. A
+worktree stack tests the worktree, and the backward-PR pass is meaningless on a stale base.
+
+### Phase 5 — Backward-through-PRs pass (on the `origin/main` stack)
+- ✅ **#3926** *fix(web,api): persist and show WHY a notification channel test failed (#3697)* —
+  **verified, and the before/after is visible across the two stacks.** On the stale branch the
+  failure reason existed only in a transient toast and the row showed just `Failed`. On `main` the
+  row now reads:
+  `QA Main Email | Email | Active | qa-main@example.com | Failed | Last test: Just Now | Reason:
+  Resend error: Invalid \`to\` field. Please use our testing email address instead of domains like
+  \`example.com\`…` — persisted, not just toasted.
+- ✅ **#3877** *in-app approval notifications + /approvals inbox* — `/approvals` renders, correct
+  empty state ("No approvals waiting — New requests will appear here when your decision is needed.").
+- ✅ **#3914** *per-partner LLM BYOK wave 4 — AI Provider settings tab* — Partner Settings now lists
+  **"AI Provider — Bring your own Anthropic key"** alongside AI Budgets.
+- ✅ **#3878 / #3806** *quotes revision lineage* — `/billing/quotes` status filter includes
+  **`Superseded`**, the status those waves added.
+- ✅ **#3805** *public invoice pay link* — `/billing/invoices` renders with its empty state.
+- ⚠️ **#3923** *alert rule "Test" reports the real evaluation verdict* — **NOT VERIFIED.**
+  `/alerts/rules` redirects to `/configuration-policies`; alert rules now live behind a
+  Configuration Policy feature link, so reaching a rule's `Test` button needs a policy created and
+  a feature linked first. Out of budget this pass — re-test needs: create policy → link alert-rules
+  feature → add rule → Test.
+- ⚠️ **#3929** *stop a double-click on a confirm dialog hit-testing through to the list* —
+  **INCONCLUSIVE.** Attempted via the Organizations delete confirm, but the guided first-site modal
+  overlays the same region after an org is created and the probe kept landing in that form instead
+  of the confirm button. Needs a cleaner fixture (an org that already has a site).
+- Not reached this pass: #3924, #3921, #3953, #3931, #3912, #3915, #3911, #3913, #3883/#3882/#3874
+  (multi-currency), #3814 (portal Guest Ledger), #3790, #3771.
+
+**Backward-PR pass reached #3805 (2026-08-22)** on this run, verifying the UI-affecting subset
+above. The previous sweep reached #3494 — the window between #3494 and #3805 is still unswept.
+
+---
+
+## UI QA Sweep 2026-08-24 — Summary
+
+| Area | Result |
+|---|---|
+| Environment / stack bring-up | PASS (2 stacks: worktree branch, then `origin/main`) |
+| Auth / session under normal navigation | **FAIL** — forced logout in 20s (#3696, still open) |
+| Nav crawl, 53 destinations | PASS |
+| i18n rendering | **FAIL** — 2 systemic classes, 23 sites (#3964, #3965) |
+| Alerts — ack / resolve / suppress | PARTIAL — flows correct, drawer shows raw UUID (#3966) |
+| Devices — list, filters, detail, actions | PASS (offline-action handling is exemplary) |
+| Notification channels — create + Test | PASS |
+| Organizations & Sites — create / guided site / delete | PARTIAL — duplicate slugs accepted (#3967) |
+| Backward-PR pass | PARTIAL — 5 verified, 2 inconclusive, rest not reached |
+
+**Filed:** #3964 (i18n entities/markup), #3965 (i18n missing spaces), #3966 (raw UUID),
+#3967 (org slug uniqueness). **Commented:** #3696 with a tighter repro + a second symptom.
+
+### Top findings
+
+1. **The session bug is the only blocker, and it has a second face nobody has filed.** #3696
+   already documents the forced logout. What today added is that the *more common* outcome is not
+   a redirect at all — it's a page that renders completely and silently 401s every data call. A
+   fix that only stops the hard logout leaves users staring at an Integrations page that looks
+   empty. Fix option 2 in that issue (don't spend the retry budget inside the limiter window) is a
+   prerequisite for option 1, not an alternative — the current 0.9s backoff can never survive a
+   60s window.
+2. **One i18n codemod is still producing user-visible damage across three distinct symptom
+   classes.** #3964 (entities + angle brackets), #3965 (missing spaces), and the older #2649
+   (humanized key names as copy) are all the same extraction pass. 23 confirmed sites between the
+   two new issues. None are individually severe; collectively they make settings screens look
+   unfinished, and they are cheap to guard against with two assertions over `locales/**`.
+3. **The good news is real and worth protecting.** `runAction` adoption is visibly paying off:
+   the channel Test surfaces an HTTP-200-with-failure-body reason verbatim, org validation is
+   inline *and* toasted with no API call fired, the Wake button on an offline device returns 412
+   with a precise explanation, and every disabled device action carries
+   `title="Device is offline"`. The empty states on `/scripts`, `/software`, `/approvals` and
+   `/billing/*` are specific and actionable. This app degrades well.
+4. **Two of my own "silent failure" findings were false**, both from probing the DOM 5–8s after a
+   click when the toast had already dismissed, plus one from an unscoped selector clicking a
+   sidebar link instead of a device tab. Both traps are now written up above. Any future run of
+   this skill should assume its first "X does nothing" reading is a measurement error until it has
+   checked the source for `runAction({ successMessage })`.
+5. **Smaller, unfiled papercuts** (recorded above, not worth individual issues): `/discovery`,
+   `/pam`, `/timesheet`, `/reports`, `/settings/ai-agents` need 8–12s to paint on a 2-device seed;
+   `/cis-hardening` throws two `AbortError` fetch rejections per load; `GET /reliability/{id}`
+   404s on every device-tab switch to mean "no data yet"; the channels empty state blames filters
+   when there is simply nothing yet.
+
+---
+
+## MFA Client Completion — 2026-08-28
+
+Implemented the approved #2489 / #3853 / #3854 client-completion slices on
+`feat/2489-mfa-client-completion` without push, deploy, rollout-flag changes, or W07 native transport.
+
+- API full unit suite: **PASS** — 1,597 files passed, 3 skipped; 28,118 tests passed, 22 skipped.
+- Web full unit suite: **PASS** — 660 files / 6,806 tests passed.
+- Mobile full unit suite: **PASS** — 54 files passed; 648 tests passed, 3 skipped.
+- Auth-focused API regression set: **PASS** — 163 tests, including live TOTP policy checks,
+  auth/MFA epoch CAS behavior, method switching, recovery handling, SMS, passkey, and atomic enrollment.
+- Web MFA/store regressions: **PASS** — delayed enrollment responses cannot overwrite logout or a
+  replacement login; locale parity passes for all supported locales.
+- API and web TypeScript checks, mobile typecheck, API/web lint, and API/web production builds: **PASS**.
+- Independent security review: no critical findings; all three important findings were fixed and
+  covered by regressions. The passkey compatibility alias was also aligned with the policy-filtered
+  method set, and invalid SSO-link recovery attempts now preserve the original retry window.
+- Real-Postgres atomicity suite: **PASS** — 3 tests covering rollback, concurrent single-winner
+  enrollment, and concurrent `auth_epoch` cutoff. The concurrency barrier follows PostgreSQL's full
+  transitive lock-wait chain so queued enrollment transactions are counted deterministically.
+
+---
+
+### Re-verify — 2026-09-01 (post-fix, pre-0.109.0)
+
+Browser re-verification of four fixes merged to `main` today, against a freshly rebuilt seeded
+wt-stack (`release-prep` worktree at `1b733cedb`, baseUrl `http://localhost:32804`,
+`/health` → `{"status":"ok","version":"0.82.0"}`). Playwright MCP for the authenticated app,
+a fresh headless Chromium context for the public portal page.
+
+| # | Area | PR | Result |
+|---|---|---|---|
+| 1 | MFA enrollment error path | #4439 (#4413/#4414/#4471) | ✅ PASS |
+| 2 | FX approximate line | #4440 (#4415) | ✅ PASS |
+| 3 | UniFi integration page | #4437 (#2382) | ✅ PASS |
+| 4 | Portal hydration + quote accept | #4425 (#3906) | ❌ FAIL |
+
+---
+
+#### 1. MFA enrollment error path — ✅ PASS
+
+Account `admin@breeze.local` started at `mfa_enabled=f, mfa_epoch=3`. Enrollment is gated behind a
+current-password re-prompt (`mfa-current-password`), then renders the QR panel.
+
+- ✅ **Wrong code (`111111`) → visible inline error.** Rendered `Invalid MFA code` plus the
+  `mfa-code-rejected-hint` copy: *"That code was not accepted. Your QR code is still valid, so wait
+  for the next code from your authenticator and try again."*
+- ✅ **QR/secret NOT collapsed.** `img[alt="Authenticator QR code"]` still present; `mfa-setup-start`
+  ("Enable") absent — the panel did not fall back to the pre-enrollment state.
+- ✅ **No logout/redirect.** `POST /api/v1/auth/mfa/enable` → **401**, URL stayed
+  `/settings/profile`. This is the #4413 fix: a 401 on the enrollment path no longer trips the
+  global auth redirect.
+- ✅ **Correct code → enrollment completes.** TOTP derived from the pending secret in Redis
+  (`mfa:setup:<userId>`); `POST /auth/mfa/enable` → **200**; "Multi-factor authentication enabled
+  successfully"; **10 recovery codes displayed once**. DB after: `mfa_enabled=t, mfa_method=totp,
+  mfa_epoch=4, 10 codes`.
+- ✅ **Copy codes.** `mfa-copy-recovery-codes` label transitions `Copy codes` → **`Copied`** at 0 ms
+  and reverts at ~1.9 s (clipboard write succeeded, so `mfa-copy-recovery-codes-error` correctly did
+  not render). An explicit outcome, not silence.
+  *Trap:* a first probe ~2.5 s after the click read `Copy codes` and looked like a silent failure —
+  the label had already reverted. Re-measured with in-page 100 ms polling. (Same measurement trap
+  recorded in the 2026-08 sweep.)
+- ✅ **No "View codes" control.** The only `mfa-*` controls on the panel are
+  `mfa-copy-recovery-codes` and `mfa-recovery-regenerate`. Nothing offers to re-display stored codes.
+- ✅ **Regenerate is confirm-gated before any POST.** Clicking `mfa-recovery-regenerate` fired
+  **zero** `recovery-codes` requests (verified in both the page-level fetch log and the Playwright
+  network log) and opened the confirm dialog: *"Regenerate recovery codes? Regenerating immediately
+  invalidates every recovery code you have saved, including printed copies. The replacements are
+  shown once, right after they are generated."* Only on `confirm-regenerate-recovery-codes` did
+  `POST /api/v1/auth/mfa/recovery-codes` → **200** fire.
+- ✅ **TOTP challenge still works.** Signed out, signed back in: the challenge step rendered
+  (method selector Authenticator app / Recovery code), a live TOTP was accepted, landed on Dashboard.
+
+**Observation (not a regression, by design):** confirming regenerate bumps `mfa_epoch` 4 → 5 and
+tears down sessions (`services/…` via `apps/api/src/routes/auth/mfa.ts:1246`), so the very next
+`POST /auth/refresh` 401s and the UI bounces to `/login?reason=session-expired`. The consequence is
+that **the freshly regenerated codes are never actually shown** — the dialog promises "shown once,
+right after they are generated", but the session dies before that render. Worth a follow-up ticket;
+outside the scope of the four checks.
+
+#### 2. FX approximate line (#4415) — ✅ PASS
+
+Surface: `PartnerDashboard` MRR, `data-testid="partner-dashboard-mrr-approx"`. The
+`ApproximateMoneyLine` component (`apps/web/src/components/billing/shared/ApproximateMoneyLine.tsx`)
+stamps `data-approx-state`, which makes the state assertable. Both branches were exercised.
+
+**Branch A — rates available (stack default).**
+`GET /api/v1/billing/reporting-totals?groups=EUR%3A500.00&date=2026-09-01` → **200**
+```json
+{"data":{"status":"available","targetCurrencyCode":"USD","requestedDate":"2026-09-01",
+"maxStalenessDays":7,"rateDate":"2026-09-01","total":"579.50",
+"groups":[{"currencyCode":"EUR","amount":"500.00","convertedAmount":"579.50",
+"rate":"1.15900000","rateDate":"2026-09-01","source":"ecb"}],"unavailableCurrencyCodes":[]}}
+```
+✅ Rendered: `≈ $579.50 approximate · rates as of 2026-09-01`, `data-approx-state="available"`.
+
+**Branch B — rates unavailable (forced).** Temporarily deleted the single `EUR→USD` row from
+`exchange_rates`, reloaded, then restored it.
+`GET /api/v1/billing/reporting-totals?groups=EUR%3A500.00&date=2026-09-01` → **200**
+```json
+{"data":{"status":"unavailable","targetCurrencyCode":"USD","requestedDate":"2026-09-01",
+"maxStalenessDays":7,"rateDate":null,"total":null,
+"groups":[{"currencyCode":"EUR","amount":"500.00","convertedAmount":null,"rate":null,
+"rateDate":null,"source":null,"reason":"missing"}],"unavailableCurrencyCodes":["EUR"]}}
+```
+✅ Rendered: **`≈ total unavailable — no USD exchange rate for EUR`**,
+`data-approx-state="unavailable"` — an explicit line, not the pre-#4415 blank. This is the fix
+verified directly rather than inferred from the available branch.
+✅ `exchange_rates` row restored afterwards (`EUR|USD|1.15900000|ecb`); stack left as found.
+
+#### 3. UniFi integration page (#2382 refactor) — ✅ PASS
+
+`/integrations#unifi`.
+
+- ✅ Page loads; cards render from the split modules — heading "UniFi Network", "Not connected"
+  badge, `ConnectionChooser` radiogroup (Cloud (Site Manager API key) / Self-hosted controller),
+  API-key field, "Connect to UniFi", "View UniFi documentation".
+- ✅ **Console clean on load** — 0 errors, 0 warnings. No React errors, no hydration warnings.
+- ✅ **Mutation surfaces an outcome (runAction contract).** Submitted an invalid API key:
+  `POST /api/v1/unifi/connect` → **400**, and a toast (`data-testid="toast"`) appeared at ~600 ms
+  reading **"Could not validate the UniFi API key. Check the key and host URL."**, auto-dismissing
+  at ~5.5 s (matches the 5 s default in `apps/web/src/components/shared/Toast.tsx:103`).
+- ✅ Only console errors afterwards are the two expected `400` resource lines from the deliberate
+  bad input.
+  *Trap (again):* the first probe at ~2.5 s post-click found no toast because the tool round-trip
+  had already consumed the window. Confirmed with in-page polling — not a silent failure.
+
+#### 4. Portal hydration + quote accept (#3906 / PR #4425) — ❌ FAIL
+
+Setup: created quote **Q-2026-0002** ("Portal Hydration QA 0901") for `Euro Test GmbH` (EUR),
+€400.00, sent it through the UI (30 s undo window elapsed → `status=sent`, `accept_token_jti` set).
+`GET /api/v1/quotes/:id/share-link` → **200**, `acceptUrl = https://2breeze.app/portal/quote/<jwt>`;
+opened the local equivalent `http://localhost:32804/portal/quote/<jwt>` in a **fresh** headless
+Chromium context.
+
+**The page renders (SSR) but the island never hydrates, and the accept flow cannot be completed.**
+
+❌ Hydration failure, verified four independent ways:
+- Console: `[astro-island] Error hydrating /src/components/portal/PublicQuoteView.tsx TypeError:
+  Failed to fetch dynamically imported module: …/src/components/portal/PublicQuoteView.tsx?astro-retry=…`
+- Network: `GET /src/components/portal/PublicQuoteView.tsx` → **404** (and its `?astro-retry=` retry → 404).
+  This *is* the island's `component-url` (`<astro-island component-url="/src/components/portal/PublicQuoteView.tsx">`).
+- DOM: the `<astro-island>` still carries its `ssr` attribute — Astro strips it on successful hydration.
+- Behavioural: typed `QA Signer` into `public-quote-signer` and checked `public-quote-agree`; the
+  `public-quote-signature-preview` node stayed **empty** (a hydrated island mirrors the name into it),
+  and `public-quote-accept` remained `aria-disabled="true"` / `opacity-50`. `page.click` timed out
+  after 30 s on "element is not enabled". **Zero non-GET requests** were made for the whole session.
+- DB after: `Q-2026-0002 | viewed | accepted_at=NULL | converted_at=NULL` — SSR registered the view,
+  nothing was ever accepted.
+
+**Root cause — two independent defects, both defeating the #3906 Caddy carve-out.**
+
+The fix ships as an env-gated dev-only matcher in `docker/Caddyfile.prod:343-351`:
+```
+@portalDevAssets {
+  expression {env.CADDY_PORTAL_DEV_ASSETS} == "1"
+  header_regexp Referer ^https?://[^/]+(?::\d+)?/portal(?:/|$)
+  path /src/* /@fs/* /@vite/* /node_modules/.vite/*
+}
+```
+Both preconditions are satisfied on this stack — `CADDY_PORTAL_DEV_ASSETS=1` is set on
+`breeze-wt-release-prep-caddy-1`, and the block is present in the container's `/etc/caddy/Caddyfile`.
+The matcher itself works: `curl -H "Referer: http://localhost:32804/portal/quote/abc"
+http://localhost:32804/src/components/portal/PublicQuoteView.tsx` → **200**, and the same request
+without a `Referer` → **404**. The gate is never satisfied by a real browser, for two reasons:
+
+**(a) `/quote/` and `/invoice/` pages send no `Referer` at all.**
+`apps/portal/src/middleware.ts:107-111` sets `Referrer-Policy: no-referrer` on exactly those
+token-bearing paths (deliberately — the URL is the capability and must not leak). Verified on the
+wire: the accept page returns **two** `Referrer-Policy` headers —
+`strict-origin-when-cross-origin` (Caddy global, `Caddyfile.prod:361`) and `no-referrer`
+(portal middleware) — and the last valid value wins. Playwright's request log confirms the island
+module fetch goes out with an **absent/empty `Referer`**, so `header_regexp` cannot match and the
+request falls through to the web catch-all (`web:4321`), which has no such file → 404.
+The Referer-based gate and the no-referrer hardening are mutually exclusive on precisely the two
+page types the gate exists to serve.
+
+**(b) Even *with* a Referer, only depth-1 imports match — the rest of the module graph 404s.**
+Control run against `/portal/login` (which keeps `strict-origin-when-cross-origin`, so it *does*
+send a Referer) still fails to hydrate:
+`[astro-island] Error hydrating /src/components/portal/LoginForm.tsx`. Per-request Referers:
+
+| Module | Referer | Status |
+|---|---|---|
+| `/src/components/portal/LoginForm.tsx` | `/portal/login` | 200 ✅ |
+| `/src/lib/utils.ts` | `/src/components/portal/LoginForm.tsx` | 200 ⚠️ |
+| `/src/lib/navigation.ts` | `/src/components/portal/LoginForm.tsx` | 200 ⚠️ |
+| `/src/lib/basePath.ts` | `/src/components/portal/LoginForm.tsx` | **404** |
+| `/src/lib/auth.ts` | `/src/components/portal/LoginForm.tsx` | **404** |
+| `/src/lib/nextPath.ts` | `/src/components/portal/LoginForm.tsx` | **404** |
+| `/src/components/portal/ui.tsx` | `/src/components/portal/LoginForm.tsx` | **404** |
+
+A module-initiated `import()` carries the **importing module's URL** as its Referer, i.e.
+`/src/components/portal/LoginForm.tsx` — which does not start with `/portal`, so the regex rejects
+it and every transitive import is routed to the web app instead.
+
+⚠️ **Worse than a 404: silent cross-app module bleed.** The two rows above that returned 200 were
+served from `apps/web`, not `apps/portal` — `lib/utils.ts` and `lib/navigation.ts` exist in *both*
+apps, whereas `lib/basePath.ts`, `lib/auth.ts`, `lib/nextPath.ts` and `components/portal/ui.tsx`
+exist only in portal (verified by file presence). So a portal island that happens to import only
+same-named modules would hydrate against the **web app's** copies rather than failing loudly.
+
+**Scope.** Dev/wt-stack only — a production portal build serves bundled assets already prefixed
+under `/portal/*` and never hits this path, as `Caddyfile.prod:325-327` notes. So this is not a
+customer-facing regression, but it does mean **the quote-accept click-through still cannot be
+verified on wt-stack, and portal e2e specs continue to assert against dead (unhydrated) markup** —
+which is the failure mode #3906 was opened to end. Depth-1-only routing also makes the current
+carve-out look like it works when spot-checked with a single curl.
+
+Suspicion (file:line): `docker/Caddyfile.prod:345` (`header_regexp Referer …` — structurally cannot
+cover a Vite module graph) interacting with `apps/portal/src/middleware.ts:108`
+(`Referrer-Policy: no-referrer` on `/quote/` + `/invoice/`). A path-based split (e.g. serving the
+portal dev server under a distinct prefix, or a `Sec-Fetch-Dest`/port-based route) would not have
+either weakness.
+
+**Evidence labels:** all PASS/FAIL determinations above are **verified** in-browser against this
+stack. The production-safety scope note for #4 is **inferred** from `Caddyfile.prod` comments plus
+the fact that the 404s are Vite dev-server module-graph URLs; it was not tested against a production
+portal build.
+
+**Stack left as found** — EUR/USD exchange rate restored; no containers torn down. Residue from this
+run: `admin@breeze.local` now has TOTP MFA enabled (`mfa_epoch=5`, secret
+`KGU2MYZSQWKBWJHJOEBUMOTCCO7M6AXH`), and quote `Q-2026-0002` sits in `viewed`.

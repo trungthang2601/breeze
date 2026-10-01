@@ -1,0 +1,1373 @@
+---
+title: API Overview
+description: "REST API reference for Breeze RMM: authentication, devices, organizations, alerts, scripts, automations, patching, and role-based permissions."
+sidebar:
+  order: 1
+  label: API Overview
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Base URL
+
+```
+https://breeze.yourdomain.com/api/v1
+```
+
+## Authentication
+
+All API requests (except enrollment, health, SSO, and portal) require a JWT bearer token:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  https://breeze.yourdomain.com/api/v1/devices
+```
+
+Tenancy-mutating writes made with a JWT are additionally gated by MFA — the
+session must have completed an MFA challenge, which makes user JWTs a poor fit
+for unattended scripts.
+
+<Aside type="caution" title="X-API-Key is not general-purpose auth">
+  Organization API keys (`brz_…`, sent via the `X-API-Key` header) do **not**
+  authenticate the general REST API. `curl -H "X-API-Key: brz_..." …/devices`
+  returns `401`. A `brz_` key authenticates exactly three surfaces:
+
+  - `POST /mcp/*` — the [MCP server](/features/mcp-server/) for AI integrations
+  - `POST /dev/push` — the development push endpoint
+  - `GET`/`PATCH /devices/:id/custom-fields` — device custom-field values
+    (these accept either a JWT or a `brz_` key)
+
+  Everything else rejects `X-API-Key` with a `brz_` key and requires a JWT.
+</Aside>
+
+For **machine-to-machine integrations** (exports, migration scripts, unattended
+provisioning), use the [Partner API](#partner-api-service-principals) with a
+**partner service-principal key** (`brz_sp_…`) — a distinct credential class,
+also sent via `X-API-Key`, that is not MFA-gated because no human is involved:
+
+```bash
+curl -H "X-API-Key: brz_sp_..." \
+  https://breeze.yourdomain.com/api/v1/partner-api/devices
+```
+
+### Login
+
+```bash
+curl -X POST https://breeze.yourdomain.com/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "admin@example.com", "password": "..."}'
+
+# Response:
+# { "accessToken": "eyJ...", "refreshToken": "..." }
+```
+
+### Refresh Token
+
+```bash
+curl -X POST https://breeze.yourdomain.com/api/v1/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refreshToken": "..."}'
+```
+
+---
+
+## Devices
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/devices` | List devices (paginated, filterable; supports keyset cursor) |
+| `GET` | `/devices/:id` | Get device details |
+| `POST` | `/devices/provision` | Pre-create a device row before any agent has enrolled. Returns a single-use enrollment payload. |
+| `POST` | `/devices/:id/move-org` | Relocate a device to a different organization within the same partner. Requires an interactive user session (API keys are refused), an MFA-assured session, and — when two-factor authentication is enabled — a single-use step-up grant for operation `device_move_org` (`POST /auth/mfa/step-up`) bound to the exact device, destination and currency acknowledgement; otherwise `403 STEP_UP_REQUIRED`. See [Moving a Device to Another Organization](/features/devices/#moving-a-device-to-another-organization). |
+| `POST` | `/devices/:id/commands` | Send command to device. Rejects a duplicate `refresh_inventory` with `409 ALREADY_PENDING`. |
+| `POST` | `/devices/bulk/commands` | Send the same command to many devices. Returns `commands`, `skipped`, and `failed` arrays. |
+| `GET` | `/devices/:id/billing` | Which contract line, if any, bills this device. Requires **partner or system scope** plus both `devices:read` and `contracts:read`. Returns the covering contract and line with how it matched (organization-wide, site, role, or group), or a reason the device is not billable. A device-group evaluation failure is reported as an error rather than as "not covered". |
+| `DELETE` | `/devices/:id` | Decommission device |
+
+`GET /devices` supports a cursor-based paging mode in addition to the legacy `page`/`limit` shape. Pass `cursor`, `sort` (`hostname` / `lastSeen` / `enrolled`), `sortDir`, `limit` (max 1000), and optional filters like `orgIds`, `siteIds`, `groupIds`, `includeDecommissioned`, and `includeTotal`. The response carries `{ devices, nextCursor, limit, total? }`; pass `nextCursor` back as `cursor` to fetch the next page. The list payload also exposes `mainAgentSilentSince` and `watchdogStatus` per device so callers can render the **Agent silent (watchdog OK)** badge described in [Agent Watchdog](/features/watchdog/).
+
+## Partners & Organizations
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/orgs/` | List orgs in scope |
+| `GET` | `/orgs/partners` | List all partners (system scope) |
+| `POST` | `/orgs/partners` | Create partner |
+| `GET` | `/orgs/partners/:id` | Get partner details |
+| `PATCH` | `/orgs/partners/:id` | Update partner |
+| `DELETE` | `/orgs/partners/:id` | Delete partner |
+| `GET` | `/orgs/partners/me` | Get current partner |
+| `PATCH` | `/orgs/partners/me` | Update partner settings |
+| `GET` | `/orgs/organizations` | List organizations |
+| `POST` | `/orgs/organizations` | Create organization |
+| `GET` | `/orgs/organizations/:id` | Get organization |
+| `PATCH` | `/orgs/organizations/:id` | Update organization |
+| `DELETE` | `/orgs/organizations/:id` | Delete organization |
+
+## Sites
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/orgs/sites` | List sites |
+| `POST` | `/orgs/sites` | Create site |
+| `GET` | `/orgs/sites/:id` | Get site details |
+| `PATCH` | `/orgs/sites/:id` | Update site |
+| `DELETE` | `/orgs/sites/:id` | Delete site |
+
+## Device Groups
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/groups` | List groups |
+| `GET` | `/groups/:id` | Get group details |
+| `POST` | `/groups` | Create group (static or dynamic) |
+| `PATCH` | `/groups/:id` | Update group |
+| `DELETE` | `/groups/:id` | Delete group |
+| `GET` | `/groups/:id/devices` | List devices in group |
+| `POST` | `/groups/:id/devices` | Add devices to group |
+| `DELETE` | `/groups/:id/devices/:deviceId` | Remove device from group |
+| `POST` | `/groups/:id/preview` | Preview dynamic group membership |
+| `POST` | `/groups/:id/devices/:deviceId/pin` | Pin device to dynamic group |
+| `DELETE` | `/groups/:id/devices/:deviceId/pin` | Unpin device |
+| `GET` | `/groups/:id/membership-log` | Group membership change log |
+
+## Tags
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/tags` | List all tags |
+| `GET` | `/tags/devices` | List device tags |
+
+## Users
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/users/me` | Get current user profile |
+| `PATCH` | `/users/me` | Update current user profile |
+| `GET` | `/users` | List users |
+| `GET` | `/users/roles` | List users with roles |
+| `GET` | `/users/:id` | Get user |
+| `POST` | `/users/invite` | Invite user |
+| `POST` | `/users/resend-invite` | Resend invitation |
+| `PATCH` | `/users/:id` | Update user |
+| `DELETE` | `/users/:id` | Delete user |
+| `POST` | `/users/:id/role` | Assign user role |
+
+## Roles & Permissions
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/roles` | List roles |
+| `POST` | `/roles` | Create role |
+| `GET` | `/roles/:id` | Get role |
+| `PATCH` | `/roles/:id` | Update role |
+| `DELETE` | `/roles/:id` | Delete role |
+| `POST` | `/roles/:id/clone` | Clone role |
+| `GET` | `/roles/:id/users` | List users with role |
+| `GET` | `/roles/:id/effective-permissions` | Get effective permissions |
+| `GET` | `/roles/permissions/available` | List available permissions |
+
+## Access Reviews
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/access-reviews` | List access reviews |
+| `POST` | `/access-reviews` | Create access review |
+| `GET` | `/access-reviews/:id` | Get review details |
+| `PATCH` | `/access-reviews/:id/items/:itemId` | Update review item |
+| `POST` | `/access-reviews/:id/complete` | Complete review |
+
+## API Keys
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api-keys` | List API keys |
+| `POST` | `/api-keys` | Create API key |
+| `GET` | `/api-keys/:id` | Get API key |
+| `PATCH` | `/api-keys/:id` | Update API key |
+| `DELETE` | `/api-keys/:id` | Revoke API key |
+| `POST` | `/api-keys/:id/rotate` | Rotate API key |
+
+## Partner API (Service Principals)
+
+Machine-to-machine surface authenticated with a **partner service principal**
+key (`X-API-Key: brz_sp_…`), not a user JWT. Reads are cursor-paginated
+exports; the provisioning writes let migration scripts and integrations
+create tenancy unattended — no MFA challenge is involved because no human is.
+Each route requires the listed scope on the principal.
+
+| Method | Path | Scope | Description |
+|---|---|---|---|
+| `GET` | `/partner-api/organizations` | `organizations:read` | Export organizations |
+| `GET` | `/partner-api/sites` | `sites:read` | Export sites |
+| `GET` | `/partner-api/devices` | `devices:read` | Export devices |
+| `GET` | `/partner-api/device-inventory` | `inventory:read` | Export device inventory |
+| `GET` | `/partner-api/device-software` | `inventory:read` | Export installed software |
+| `GET` | `/partner-api/device-relationships` | `inventory:read` | Export topology/relationship edges |
+| `GET` | `/partner-api/configuration-policies` | `configuration:read` | Export configuration policies |
+| `GET` | `/partner-api/configuration-assignments` | `configuration:read` | Export policy assignments |
+| `GET` | `/partner-api/scripts` | `scripts:read` | Export scripts |
+| `GET` | `/partner-api/automations` | `configuration:read` | Export automations |
+| `GET` | `/partner-api/backup-configurations` | `backup-configuration:read` | Export backup configuration |
+| `GET` | `/partner-api/custom-fields` | `custom-fields:read` | Export custom field definitions |
+| `GET` | `/partner-api/custom-field-values` | `custom-fields:read` | Export custom field values |
+| `POST` | `/partner-api/organizations` | `organizations:write` | Create an organization under the principal's partner. Enforces the partner's `maxOrganizations` cap (409 when reached). Body: `name`, `slug`, `type?`, `status?` (`active`/`trial`). |
+| `POST` | `/partner-api/sites` | `sites:write` | Create a site. `orgId` must be in the principal's accessible organizations (403 otherwise). Body: `orgId`, `name`, `timezone?`, `address?`, `contact?`. |
+| `POST` | `/partner-api/enrollment-keys` | `enrollment-keys:write` | Create an enrollment key. Body: `orgId`, `name`, `siteId?`, `maxUsage?`, `issueEnrollmentSecret?`, and `ttlMinutes` **or** `expiresAt` (never both). The raw key is returned once in the 201 body. `issueEnrollmentSecret: true` additionally mints a per-key `enrollmentSecret`, returned once; omitted, the key enrolls with the global `AGENT_ENROLLMENT_SECRET`. Supports `X-Idempotency-Key`. |
+| `POST` | `/partner-api/contracts` | `contracts:write` | Create a draft contract. `orgId` must be in the principal's accessible organizations. |
+| `GET` | `/partner-api/contracts/:id` | `contracts:write` | Read one contract and its lines. |
+| `PATCH` | `/partner-api/contracts/:id` | `contracts:write` | Update header fields. Schedule fields (`billingTiming`, `intervalMonths`, `startDate`) are draft-only. |
+| `POST` | `/partner-api/contracts/:id/lines` | `contracts:write` | Add a line. Same field rules as the human editor. |
+| `PATCH` | `/partner-api/contracts/:id/lines/:lineId` | `contracts:write` | Patch a line, including `manualQuantity`. |
+| `DELETE` | `/partner-api/contracts/:id/lines/:lineId` | `contracts:write` | Remove a line. This is contract contents, not tenancy deletion. |
+
+Tenancy provisioning is deliberately **create-only**: there are no `DELETE` routes
+for organizations, sites, or enrollment keys, and organization deletion remains
+a human, MFA-gated action on the main API. Contract line `DELETE` is contents
+only. `partnerId` never appears in any write body — it always comes
+from the authenticated principal. Writes share the principal's hourly rate
+limit but are additionally capped by a tighter per-principal write budget
+(120/hour), and every write is attributed to the service principal in the
+audit log.
+
+Minting enrollment keys is held to a tighter standard again. The principal must
+carry **both** an expiry and a source-CIDR allowlist — a principal without them
+is refused with `403 partner_provisioning_principal_restrictions_required`,
+because an unrestricted key that can mint enrollment keys is an unrestricted key
+that can enroll devices. Mints are capped at **10 per hour per principal** and
+**100 per hour per partner**, separately from the general write budget. When
+neither `ttlMinutes` nor `expiresAt` is supplied the key gets the same default
+lifetime as one created in the UI (30 days unless
+`ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` says otherwise), clamped by
+`PARTNER_API_ENROLLMENT_KEY_MAX_TTL_MINUTES` and by the organization's own cap.
+
+## Alerts
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/alerts` | List alerts |
+| `GET` | `/alerts/summary` | Alert summary counts |
+| `GET` | `/alerts/:id` | Get alert details |
+| `POST` | `/alerts/:id/acknowledge` | Acknowledge alert. Valid only from `active`; returns `409` if the alert left that status first (another user, or the auto-resolve sweep, got there first) |
+| `POST` | `/alerts/:id/resolve` | Resolve alert. Returns `409` if the alert already reached a terminal status |
+| `POST` | `/alerts/:id/suppress` | Suppress alert. Returns `409` if the alert already reached a terminal status |
+| `POST` | `/alerts/:id/dismiss` | Permanently dismiss an alert. Terminal and valid from any status (including `resolved`); dismissed alerts are hidden from `GET /alerts` unless you filter to `status=dismissed`. Returns `409` if the alert was already dismissed — including when a concurrent caller dismissed it first, in which case `dismissedAt`/`dismissedBy` name that caller, not this one |
+| `POST` | `/alerts/bulk` | Bulk state change for up to 100 alerts — `action` is one of `acknowledge`, `resolve`, `suppress`, or `dismiss` |
+
+### Alert Rules
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/alerts/rules` | List alert rules |
+| `GET` | `/alerts/rules/:id` | Get alert rule |
+| `POST` | `/alerts/rules` | Create alert rule |
+| `PATCH` | `/alerts/rules/:id` | Update alert rule |
+| `DELETE` | `/alerts/rules/:id` | Delete alert rule |
+| `POST` | `/alerts/rules/:id/test` | Test alert rule |
+
+### Notification Channels
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/alerts/channels` | List notification channels |
+| `POST` | `/alerts/channels` | Create channel (email, Slack, Teams, webhook, PagerDuty, SMS) |
+| `PATCH` | `/alerts/channels/:id` | Update channel |
+| `DELETE` | `/alerts/channels/:id` | Delete channel |
+| `POST` | `/alerts/channels/:id/test` | Test channel |
+
+### Alert Policies
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/alerts/policies` | List alert policies |
+| `POST` | `/alerts/policies` | Create policy |
+| `PATCH` | `/alerts/policies/:id` | Update policy |
+| `DELETE` | `/alerts/policies/:id` | Delete policy |
+
+## Alert Templates & Correlation
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/alert-templates/templates` | List templates |
+| `GET` | `/alert-templates/templates/built-in` | List built-in templates |
+| `POST` | `/alert-templates/templates` | Create template |
+| `PATCH` | `/alert-templates/templates/:id` | Update template |
+| `DELETE` | `/alert-templates/templates/:id` | Delete template |
+| `GET` | `/alert-templates/correlations` | List correlation rules |
+| `GET` | `/alert-templates/correlations/groups` | Get correlation groups |
+| `POST` | `/alert-templates/correlations/analyze` | Analyze correlations |
+
+## Scripts
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/scripts` | List scripts |
+| `GET` | `/scripts/system-library` | List system library scripts |
+| `POST` | `/scripts/import/:id` | Import script from library |
+| `GET` | `/scripts/:id` | Get script |
+| `POST` | `/scripts` | Create script |
+| `PUT` | `/scripts/:id` | Update script |
+| `DELETE` | `/scripts/:id` | Delete script |
+| `POST` | `/scripts/:id/execute` | Execute on device(s) |
+| `GET` | `/scripts/:id/executions` | List executions |
+| `GET` | `/scripts/executions/:id` | Get execution details |
+| `POST` | `/scripts/executions/:id/cancel` | Cancel execution |
+
+## Script Library
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/script-library/categories` | List categories |
+| `POST` | `/script-library/categories` | Create category |
+| `GET` | `/script-library/categories/:id` | Get category |
+| `PATCH` | `/script-library/categories/:id` | Update category |
+| `DELETE` | `/script-library/categories/:id` | Delete category |
+| `GET` | `/script-library/tags` | List script tags |
+| `POST` | `/script-library/tags` | Create tag |
+| `DELETE` | `/script-library/tags/:id` | Delete tag |
+| `GET` | `/script-library/scripts/:id/versions` | List script versions |
+| `POST` | `/script-library/scripts/:id/versions` | Create new version |
+| `POST` | `/script-library/scripts/:id/rollback/:versionId` | Rollback to version |
+| `GET` | `/script-library/templates` | List templates |
+| `POST` | `/script-library/from-template/:templateId` | Create script from template |
+| `GET` | `/script-library/scripts/:id/usage-stats` | Script usage statistics |
+
+## Automations
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/automations` | List automations |
+| `GET` | `/automations/runs/:runId` | Get automation run |
+| `GET` | `/automations/:id` | Get automation |
+| `POST` | `/automations` | Create automation |
+| `PATCH` | `/automations/:id` | Update automation |
+| `DELETE` | `/automations/:id` | Delete automation |
+| `POST` | `/automations/:id/trigger` | Trigger automation |
+| `POST` | `/automations/:id/run` | Run automation immediately |
+| `GET` | `/automations/:id/runs` | List runs for automation |
+
+## Patching
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/patches` | List patches |
+| `POST` | `/patches/scan` | Trigger patch scan |
+| `GET` | `/patches/sources` | List patch sources |
+| `GET` | `/patches/approvals` | List pending approvals |
+| `POST` | `/patches/bulk-approve` | Bulk approve patches |
+| `GET` | `/patches/jobs` | List patch jobs |
+| `GET` | `/patches/compliance` | Compliance overview |
+| `GET` | `/patches/compliance/report` | List compliance reports |
+| `GET` | `/patches/compliance/report/:id` | Get compliance report |
+| `GET` | `/patches/compliance/report/:id/download` | Download report |
+| `POST` | `/patches/:id/rollback` | Rollback a patch |
+| `POST` | `/patches/:id/approve` | Approve patch |
+| `POST` | `/patches/:id/decline` | Decline patch |
+| `POST` | `/patches/:id/defer` | Defer patch |
+| `GET` | `/patches/:id` | Get patch details |
+
+`GET /patches` accepts `?source=` (`microsoft`, `apple`, `linux`, `third_party`, `custom`) and returns `source` on every patch. Third-party patches also carry `version`, `vendor`, and a `cveIds` array populated by OSV.dev enrichment.
+
+### Third-Party Package Catalog
+
+Platform-admin scope. Backs the third-party application patching catalog and AI smoke tests — see [Patch Management](/features/patch-management/#third-party-application-patching).
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/third-party-catalog` | List catalog entries (`?vendor=&breezeTested=&search=`) |
+| `POST` | `/third-party-catalog` | Create a catalog entry |
+| `GET` | `/third-party-catalog/:id` | Get a catalog entry |
+| `PATCH` | `/third-party-catalog/:id` | Update a catalog entry |
+| `DELETE` | `/third-party-catalog/:id` | Delete a catalog entry |
+| `POST` | `/third-party-catalog/:id/test` | Queue a smoke test (`{ "version": "..." }`) |
+
+### Patch Policies
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/patch-policies` | List patch policies |
+| `POST` | `/patch-policies` | Create policy |
+| `GET` | `/patch-policies/:id` | Get policy |
+| `PATCH` | `/patch-policies/:id` | Update policy |
+| `DELETE` | `/patch-policies/:id` | Delete policy |
+
+## Security
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/security/status` | Org security status overview |
+| `GET` | `/security/status/:deviceId` | Device security status |
+| `GET` | `/security/threats` | List threats across org |
+| `GET` | `/security/threats/:deviceId` | List threats for device |
+| `POST` | `/security/threats/:id/quarantine` | Quarantine threat |
+| `POST` | `/security/threats/:id/remove` | Remove threat |
+| `POST` | `/security/threats/:id/restore` | Restore quarantined file |
+| `POST` | `/security/scan/:deviceId` | Trigger security scan |
+| `GET` | `/security/scans/:deviceId` | List scan history |
+| `GET` | `/security/policies` | List security policies |
+| `POST` | `/security/policies` | Create security policy |
+| `PUT` | `/security/policies/:id` | Update security policy |
+| `GET` | `/security/dashboard` | Security dashboard data |
+| `GET` | `/security/score-breakdown` | Security score breakdown |
+| `GET` | `/security/posture` | Org security posture |
+| `GET` | `/security/posture/:deviceId` | Device security posture |
+| `GET` | `/security/trends` | Security trends over time |
+| `GET` | `/security/firewall` | Firewall status across org |
+| `GET` | `/security/encryption` | Encryption status across org |
+| `GET` | `/security/password-policy` | Password policy compliance |
+| `GET` | `/security/admin-audit` | Admin action audit |
+| `GET` | `/security/recommendations` | Security recommendations |
+| `POST` | `/security/recommendations/:id/complete` | Mark recommendation complete |
+| `POST` | `/security/recommendations/:id/dismiss` | Dismiss recommendation |
+
+### Vulnerabilities
+
+The vulnerabilities dashboard is a fleet-wide, fix-first queue. The `/software` endpoints power the default **By software** view (findings grouped by the update that clears them); `/` powers the **By CVE** view. Bulk and `/remediate` endpoints let you triage across every affected device at once.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/vulnerabilities` | List open findings, one row per CVE (By CVE view) |
+| `GET` | `/vulnerabilities/software` | List findings grouped by remediation unit (By software view) |
+| `GET` | `/vulnerabilities/software/:groupKey` | Devices and findings within one software group |
+| `GET` | `/vulnerabilities/stats` | Priority stat-card counts (Critical open, KEV exposure, Patch ready, Accepted expiring soon) |
+| `GET` | `/vulnerabilities/:cveId/devices` | Devices affected by a specific CVE |
+| `POST` | `/vulnerabilities/remediate` | Schedule the fixing patch across affected devices (requires `devices:execute` + MFA) |
+| `POST` | `/vulnerabilities/bulk/accept-risk` | Accept risk across a group of findings |
+| `POST` | `/vulnerabilities/bulk/mitigate` | Record a mitigation across a group of findings |
+| `POST` | `/vulnerabilities/tickets` | Open a ticket for a finding and link it; a multi-org selection yields one ticket per organization |
+| `POST` | `/vulnerabilities/:id/accept-risk` | Accept risk on a single finding (requires `vulnerabilities:accept_risk`) |
+| `POST` | `/vulnerabilities/:id/mitigate` | Mitigate a single finding (requires `devices:write`) |
+| `POST` | `/vulnerabilities/:id/reopen` | Return an accepted or mitigated finding to open |
+
+### Incident Response
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/incidents/feed` | Unified tracked-incident + EDR-finding feed (see below) |
+
+`GET /incidents/feed` merges native tracked incidents (`kind: "tracked"`, `source: "breeze"`) with not-yet-promoted Huntress and SentinelOne findings (`kind: "finding"`, `source: "huntress"` or `"s1"`) into a single feed, ordered by severity rank (p1 first) then detection time (most recent first).
+
+Query params (all optional): `orgId`, `kind` (`tracked` | `finding`), `source` (`breeze` | `huntress` | `s1`), `page` (default `1`), `limit` (integer, `1`-`100`, default `25`).
+
+Response:
+
+```json
+{
+  "data": [
+    {
+      "kind": "tracked",
+      "source": "breeze",
+      "sourceId": "…",
+      "title": "Ransomware detected on WIN-ACCT-04",
+      "severity": "p1",
+      "edrStatus": null,
+      "status": "detected",
+      "deviceId": "…",
+      "detectedAt": "2026-06-30T18:04:11Z",
+      "trackedIncidentId": "…",
+      "linkOut": null
+    }
+  ],
+  "pagination": { "page": 1, "limit": 25, "total": 3 }
+}
+```
+
+`severity` is `p1`-`p4`. `trackedIncidentId` is `null` unless a finding has already been promoted to a tracked incident; `linkOut` carries a link to the EDR console for finding rows when the provider exposes one. Raw EDR finding rows additionally require `devices:read` -- a caller with only `alerts:read` sees native tracked incidents only.
+
+## Privileged Access Management (PAM)
+
+Just-in-time elevation: UAC-intercept and technician JIT-admin requests, approvals, and the executable/signer rules that auto-decide them. Full request/response shapes and the elevation flow live in [PAM API](/reference/pam-api/); this section covers the endpoint surface and rule-matching fields.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/pam/elevation-requests` | List and filter elevation requests |
+| `GET` | `/pam/active` | List currently-active (unexpired, approved) elevations |
+| `POST` | `/pam/elevation-requests/:id/respond` | Approve or deny a pending request |
+| `POST` | `/pam/elevation-requests/:id/revoke` | Revoke an active elevation before it expires |
+| `GET` | `/pam/rules` | List executable/signer auto-decision rules |
+| `POST` | `/pam/rules` | Create a rule |
+| `POST` | `/pam/rules/preview` | Preview which recent requests a draft rule would have matched |
+| `PATCH` | `/pam/rules/:id` | Update a rule |
+| `DELETE` | `/pam/rules/:id` | Delete a rule |
+| `GET` | `/pam/signer-groups` | List reusable code-signer groups |
+| `POST` | `/pam/signer-groups` | Create a signer group |
+| `PATCH` | `/pam/signer-groups/:id` | Update a signer group |
+| `DELETE` | `/pam/signer-groups/:id` | Delete a signer group |
+| `GET` | `/pam/config` | Get the org's default unmatched-request verdict |
+| `PUT` | `/pam/config` | Set the org's default unmatched-request verdict |
+
+### Rule matching fields
+
+A rule matches an elevation candidate on one or more of these fields (`POST`/`PATCH /pam/rules`); at least one is required:
+
+| Field | Type | Notes |
+|---|---|---|
+| `matchSigner` | string | Code-signer name (executable rule). Mutually exclusive with `matchSignerGroupId` |
+| `matchSignerThumbprint` | string | SHA-256 Authenticode signer certificate thumbprint -- 64 hex characters (`/^[0-9a-fA-F]{64}$/`), stored lowercased. Pins the rule to one exact code-signing certificate. Mutually exclusive with `matchSignerGroupId` |
+| `matchSignerGroupId` | uuid \| null | Reference a reusable [signer group](/reference/pam-api/#signer-groups) instead of `matchSigner`/`matchSignerThumbprint` |
+| `matchHash` | string | SHA-256 file hash, 64 hex characters |
+| `matchPathGlob` | string | Executable path glob |
+| `matchParentImage` | string | Parent process image path |
+| `matchCommandLine` | string | Command-line substring/glob |
+| `matchUser` | string | Subject username |
+| `matchAdGroup` | string | Subject AD group |
+
+`matchSignerGroupId` cannot be combined with `matchSigner` or `matchSignerThumbprint` on the same rule -- a rule pins to a group or to a direct signer identity, not both; the API rejects the combination with a 400.
+
+## Software Inventory
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/software/catalog` | List software catalog |
+| `POST` | `/software/catalog` | Add to catalog |
+| `GET` | `/software/catalog/search` | Search catalog |
+| `GET` | `/software/catalog/:id/versions` | List versions |
+| `POST` | `/software/catalog/:id/versions` | Add version |
+| `GET` | `/software/catalog/:id` | Get software details |
+| `PATCH` | `/software/catalog/:id` | Update software |
+| `DELETE` | `/software/catalog/:id` | Remove from catalog |
+| `GET` | `/software/deployments` | List deployments |
+| `POST` | `/software/deployments` | Create deployment |
+| `GET` | `/software/deployments/:id` | Get deployment |
+| `POST` | `/software/deployments/:id/cancel` | Cancel deployment |
+| `GET` | `/software/deployments/:id/results` | Get results |
+| `GET` | `/software/inventory` | Full software inventory |
+| `GET` | `/software/inventory/:deviceId` | Device software |
+| `POST` | `/software/inventory/:deviceId/:softwareId/uninstall` | Uninstall software |
+
+## Monitors
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/monitors` | List monitors |
+| `POST` | `/monitors` | Create monitor |
+| `GET` | `/monitors/dashboard` | Monitor dashboard |
+| `GET` | `/monitors/:id` | Get monitor |
+| `PATCH` | `/monitors/:id` | Update monitor |
+| `DELETE` | `/monitors/:id` | Delete monitor |
+| `POST` | `/monitors/:id/check` | Run check now |
+| `POST` | `/monitors/:id/test` | Test monitor config |
+| `GET` | `/monitors/:id/results` | Check result history |
+| `GET` | `/monitors/alerts` | List monitor alerts |
+| `GET` | `/monitors/:monitorId/alerts` | Monitor-specific alerts |
+| `PATCH` | `/monitors/alerts/:id` | Update monitor alert |
+| `DELETE` | `/monitors/alerts/:id` | Delete monitor alert |
+
+## Network Discovery
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/discovery/profiles` | List scan profiles |
+| `POST` | `/discovery/profiles` | Create profile |
+| `GET` | `/discovery/profiles/:id` | Get profile |
+| `PATCH` | `/discovery/profiles/:id` | Update profile |
+| `DELETE` | `/discovery/profiles/:id` | Delete profile |
+| `POST` | `/discovery/scan` | Start discovery scan |
+| `GET` | `/discovery/jobs` | List scan jobs |
+| `GET` | `/discovery/jobs/:id` | Get job status |
+| `POST` | `/discovery/jobs/:id/cancel` | Cancel scan |
+| `GET` | `/discovery/assets` | List discovered assets |
+| `POST` | `/discovery/assets/:id/link` | Link asset to device |
+| `POST` | `/discovery/assets/:id/ignore` | Ignore asset |
+| `DELETE` | `/discovery/assets/:id` | Delete asset |
+| `POST` | `/discovery/assets/:id/enable-monitoring` | Enable monitoring |
+| `POST` | `/discovery/assets/:id/disable-monitoring` | Disable monitoring |
+| `GET` | `/discovery/assets/:id/monitoring` | Get monitoring config |
+| `PATCH` | `/discovery/assets/:id/monitoring` | Update monitoring config |
+| `GET` | `/discovery/topology` | Network topology map (classic view) |
+
+## Site Map (Network Topology)
+
+Endpoints for the next-generation, per-site logical topology map (site coverage, shared configuration templates, on-demand diagnostics). All are scoped under `/topology/sites/:siteId/...` unless noted.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/topology/sites/:siteId/graph` | Get the site's graph (overview/logical/physical) |
+| `GET` | `/topology/sites/:siteId/nodes` | Search/list graph nodes |
+| `GET` | `/topology/sites/:siteId/nodes/:nodeId` | Get a node |
+| `GET` | `/topology/sites/:siteId/relationships/:relationshipId` | Get a connection |
+| `GET` | `/topology/sites/:siteId/relationships/:relationshipId/evidence` | Get connection evidence |
+| `GET` | `/topology/sites/:siteId/health` | Get node/relationship health |
+| `PATCH` | `/topology/sites/:siteId/layouts/:view` | Save node layout positions |
+| `POST` | `/topology/sites/:siteId/manual-nodes` | Add a manual placeholder node |
+| `PATCH` | `/topology/sites/:siteId/manual-nodes/:nodeId` | Update a manual node |
+| `DELETE` | `/topology/sites/:siteId/manual-nodes/:nodeId` | Remove a manual node |
+| `POST` | `/topology/sites/:siteId/manual-relationships` | Draw a manual connection |
+| `DELETE` | `/topology/sites/:siteId/manual-relationships/:relationshipId` | Remove a manual connection |
+| `GET` | `/topology/sites/:siteId/settings` | Read resolved site configuration |
+| `PATCH` | `/topology/sites/:siteId/settings` | Override site configuration |
+| `GET` | `/topology/sites/:siteId/targets` | List diagnostic targets |
+| `POST` | `/topology/sites/:siteId/targets` | Add diagnostic target |
+| `PATCH` | `/topology/sites/:siteId/targets/:id` | Update diagnostic target |
+| `DELETE` | `/topology/sites/:siteId/targets/:id` | Remove diagnostic target |
+| `GET` | `/topology/sites/:siteId/policies` | List monitoring policies |
+| `POST` | `/topology/sites/:siteId/policies` | Add monitoring policy |
+| `PATCH` | `/topology/sites/:siteId/policies/:id` | Update monitoring policy |
+| `DELETE` | `/topology/sites/:siteId/policies/:id` | Remove monitoring policy |
+| `GET` | `/topology/sites/:siteId/collectors` | List agents eligible to run a diagnostic |
+| `POST` | `/topology/sites/:siteId/diagnostic-runs` | Start an on-demand diagnostic run |
+| `GET` | `/topology/sites/:siteId/diagnostic-runs/:runId` | Get diagnostic run status/results |
+| `POST` | `/topology/sites/:siteId/diagnostic-runs/:runId/cancel` | Cancel a diagnostic run |
+| `GET` | `/topology/sites/:siteId/template-options` | List template versions eligible for this site |
+| `GET` | `/topology/templates` | List configuration templates |
+| `POST` | `/topology/templates` | Create a template |
+| `PATCH` | `/topology/templates/:templateId` | Update a template |
+| `GET` | `/topology/templates/:templateId/versions` | List template versions |
+| `POST` | `/topology/templates/:templateId/versions` | Create a draft version |
+| `POST` | `/topology/templates/:templateId/versions/:versionId/publish` | Publish a draft version |
+| `POST` | `/topology/template-applications/preview` | Preview a template apply across sites |
+| `POST` | `/topology/template-applications` | Apply a previewed template change |
+| `GET` | `/topology/template-applications/:operationId` | Get template apply status |
+
+## SNMP
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/snmp/devices` | List SNMP devices |
+| `POST` | `/snmp/devices` | Add SNMP device |
+| `GET` | `/snmp/devices/:id` | Get device |
+| `PATCH` | `/snmp/devices/:id` | Update device |
+| `DELETE` | `/snmp/devices/:id` | Delete device |
+| `POST` | `/snmp/devices/:id/poll` | Poll device now |
+| `POST` | `/snmp/devices/:id/test` | Test SNMP connectivity |
+| `GET` | `/snmp/templates` | List SNMP templates |
+| `POST` | `/snmp/templates` | Create template |
+| `GET` | `/snmp/templates/:id` | Get template |
+| `PATCH` | `/snmp/templates/:id` | Update template |
+| `DELETE` | `/snmp/templates/:id` | Delete template |
+| `GET` | `/snmp/oids/browse` | Browse OID tree |
+| `POST` | `/snmp/oids/validate` | Validate OIDs |
+| `GET` | `/snmp/metrics/:deviceId` | Get device metrics |
+| `GET` | `/snmp/metrics/:deviceId/history` | Metrics history |
+| `GET` | `/snmp/metrics/:deviceId/:oid` | Get specific OID metric |
+| `GET` | `/snmp/thresholds/:deviceId` | List thresholds |
+| `POST` | `/snmp/thresholds` | Create threshold |
+| `PATCH` | `/snmp/thresholds/:id` | Update threshold |
+| `DELETE` | `/snmp/thresholds/:id` | Delete threshold |
+| `GET` | `/snmp/dashboard` | SNMP dashboard |
+
+## Remote Access
+
+| Method | Path | Description |
+|---|---|---|
+| `DELETE` | `/remote/sessions/stale` | Clean stale sessions |
+| `GET` | `/remote/sessions` | List active sessions |
+| `POST` | `/remote/sessions` | Create remote session |
+| `GET` | `/remote/sessions/history` | Session history |
+| `GET` | `/remote/sessions/:id` | Get session |
+| `POST` | `/remote/sessions/:id/ws-ticket` | Get WebSocket ticket |
+| `POST` | `/remote/sessions/:id/desktop-connect-code` | Get desktop connect code |
+| `GET` | `/remote/ice-servers` | Get ICE/TURN server config |
+| `POST` | `/remote/sessions/:id/offer` | WebRTC SDP offer |
+| `POST` | `/remote/sessions/:id/ice` | ICE candidate exchange |
+| `POST` | `/remote/sessions/:id/end` | End session |
+
+### Network Proxy
+
+Reach a discovered LAN device's web UI through a bridge agent. The proxy page first mints a one-time ticket, then all browser traffic flows through the reverse-proxy route (authenticated by a signed, path-scoped cookie — no bearer token on the proxied requests).
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/tunnels/:id/http-ticket` | Mint a one-time HTTP-proxy ticket (5-min TTL) for a tunnel session |
+| `ALL` | `/tunnel-http/:tunnelId/*` | Authenticated HTTP reverse proxy to the target device's web UI |
+
+## System Tools
+
+Device-scoped management commands exposed as REST endpoints.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/system-tools/devices/:deviceId/processes` | List processes |
+| `GET` | `/system-tools/devices/:deviceId/processes/:pid` | Get process details |
+| `POST` | `/system-tools/devices/:deviceId/processes/:pid/kill` | Kill process |
+| `GET` | `/system-tools/devices/:deviceId/services` | List services |
+| `GET` | `/system-tools/devices/:deviceId/services/:name` | Get service |
+| `POST` | `/system-tools/devices/:deviceId/services/:name/start` | Start service |
+| `POST` | `/system-tools/devices/:deviceId/services/:name/stop` | Stop service |
+| `POST` | `/system-tools/devices/:deviceId/services/:name/restart` | Restart service |
+| `GET` | `/system-tools/devices/:deviceId/registry/keys` | List registry keys |
+| `GET` | `/system-tools/devices/:deviceId/registry/values` | List registry values |
+| `GET` | `/system-tools/devices/:deviceId/registry/value` | Get registry value |
+| `PUT` | `/system-tools/devices/:deviceId/registry/value` | Set registry value |
+| `DELETE` | `/system-tools/devices/:deviceId/registry/value` | Delete registry value |
+| `POST` | `/system-tools/devices/:deviceId/registry/key` | Create registry key |
+| `DELETE` | `/system-tools/devices/:deviceId/registry/key` | Delete registry key |
+| `GET` | `/system-tools/devices/:deviceId/eventlogs` | List event logs |
+| `GET` | `/system-tools/devices/:deviceId/eventlogs/:name` | Get event log |
+| `GET` | `/system-tools/devices/:deviceId/eventlogs/:name/events` | Query events |
+| `GET` | `/system-tools/devices/:deviceId/eventlogs/:name/events/:recordId` | Get event |
+| `GET` | `/system-tools/devices/:deviceId/tasks` | List scheduled tasks |
+| `GET` | `/system-tools/devices/:deviceId/tasks/:path` | Get task |
+| `GET` | `/system-tools/devices/:deviceId/tasks/:path/history` | Task history |
+| `POST` | `/system-tools/devices/:deviceId/tasks/:path/run` | Run task |
+| `POST` | `/system-tools/devices/:deviceId/tasks/:path/enable` | Enable task |
+| `POST` | `/system-tools/devices/:deviceId/tasks/:path/disable` | Disable task |
+| `GET` | `/system-tools/devices/:deviceId/files` | List/read files |
+| `GET` | `/system-tools/devices/:deviceId/files/download` | Download file |
+| `POST` | `/system-tools/devices/:deviceId/files/upload` | Upload file |
+
+## Maintenance Windows
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/maintenance/windows` | List maintenance windows |
+| `POST` | `/maintenance/windows` | Create window |
+| `GET` | `/maintenance/windows/:id` | Get window |
+| `PATCH` | `/maintenance/windows/:id` | Update window |
+| `DELETE` | `/maintenance/windows/:id` | Delete window |
+| `POST` | `/maintenance/windows/:id/cancel` | Cancel window |
+| `GET` | `/maintenance/windows/:id/occurrences` | List occurrences |
+| `GET` | `/maintenance/occurrences` | List all occurrences |
+| `GET` | `/maintenance/occurrences/:id` | Get occurrence |
+| `POST` | `/maintenance/occurrences/:id/start` | Start manually |
+| `POST` | `/maintenance/occurrences/:id/end` | End manually |
+| `GET` | `/maintenance/active` | List currently active windows |
+
+## Policy Management
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/policies` | List policies |
+| `GET` | `/policies/compliance/stats` | Compliance statistics |
+| `GET` | `/policies/compliance/summary` | Compliance summary |
+| `GET` | `/policies/compliance/device/:deviceId` | Per-device compliance across every assigned policy |
+| `GET` | `/policies/:id` | Get policy |
+| `POST` | `/policies` | Create policy |
+| `PUT` | `/policies/:id` | Replace policy |
+| `PATCH` | `/policies/:id` | Update policy |
+| `DELETE` | `/policies/:id` | Delete policy |
+| `POST` | `/policies/:id/deactivate` | Deactivate policy |
+| `GET` | `/policies/:id/compliance` | Policy compliance details |
+
+## Deployments
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/deployments` | List deployments |
+| `POST` | `/deployments` | Create deployment |
+| `GET` | `/deployments/:id` | Get deployment |
+| `PATCH` | `/deployments/:id` | Update deployment |
+| `DELETE` | `/deployments/:id` | Delete deployment |
+| `POST` | `/deployments/:id/initialize` | Initialize deployment |
+| `POST` | `/deployments/:id/start` | Start deployment |
+| `POST` | `/deployments/:id/pause` | Pause deployment |
+| `POST` | `/deployments/:id/resume` | Resume deployment |
+| `POST` | `/deployments/:id/cancel` | Cancel deployment |
+| `GET` | `/deployments/:id/devices` | List deployment devices |
+| `POST` | `/deployments/:id/devices/:deviceId/retry` | Retry failed device |
+
+## Reports
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/reports` | List report definitions |
+| `GET` | `/reports/:id` | Get report definition |
+| `POST` | `/reports` | Create report definition |
+| `PUT` | `/reports/:id` | Update report |
+| `DELETE` | `/reports/:id` | Delete report |
+| `POST` | `/reports/:id/generate` | Generate report |
+| `POST` | `/reports/generate` | Generate ad-hoc report |
+| `GET` | `/reports/runs` | List report runs |
+| `GET` | `/reports/runs/:id` | Get report run |
+| `GET` | `/reports/data/device-inventory` | Device inventory data |
+| `GET` | `/reports/data/software-inventory` | Software inventory data |
+| `GET` | `/reports/data/alerts-summary` | Alerts summary data |
+| `GET` | `/reports/data/compliance` | Compliance data |
+| `GET` | `/reports/data/metrics` | Metrics data |
+
+Saved reports schedule via `schedule` (`daily` / `weekly` / `monthly`) plus a `config.schedule` object (`time`, `day`, `date`) that pins the exact run time, and `config.emailRecipients` (up to 50 addresses) that emails the generated file -- a branded PDF attachment for `pdf`-format reports, CSV for `csv`/`excel` -- on every scheduled run. Both are validated and persisted on create and update.
+
+## Analytics
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/analytics/query` | Run analytics query |
+| `GET` | `/analytics/dashboards` | List dashboards |
+| `POST` | `/analytics/dashboards` | Create dashboard |
+| `GET` | `/analytics/dashboards/:id` | Get dashboard |
+| `PATCH` | `/analytics/dashboards/:id` | Update dashboard |
+| `DELETE` | `/analytics/dashboards/:id` | Delete dashboard |
+| `POST` | `/analytics/dashboards/:id/widgets` | Add widget |
+| `PATCH` | `/analytics/widgets/:id` | Update widget |
+| `DELETE` | `/analytics/widgets/:id` | Delete widget |
+| `GET` | `/analytics/capacity` | Capacity planning data |
+| `GET` | `/analytics/sla` | SLA compliance overview |
+| `POST` | `/analytics/sla` | Create SLA |
+| `GET` | `/analytics/sla/:id/compliance` | SLA compliance details |
+| `GET` | `/analytics/executive-summary` | Executive summary |
+| `GET` | `/analytics/os-distribution` | OS distribution |
+
+## Audit Logs
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/audit-logs` | List audit events |
+| `GET` | `/audit-logs/logs` | List audit logs (paginated) |
+| `GET` | `/audit-logs/logs/:id` | Get log entry |
+| `GET` | `/audit-logs/search` | Search audit logs |
+| `GET` | `/audit-logs/export` | Export as CSV/JSON |
+| `POST` | `/audit-logs/export` | Export with filters |
+| `GET` | `/audit-logs/reports/user-activity` | User activity report |
+| `GET` | `/audit-logs/reports/security-events` | Security events report |
+| `GET` | `/audit-logs/reports/compliance` | Compliance report |
+| `GET` | `/audit-logs/stats` | Audit statistics |
+
+## Notifications
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/notifications` | List notifications |
+| `GET` | `/notifications/unread-count` | Unread count |
+| `PATCH` | `/notifications/:id` | Mark as read |
+| `DELETE` | `/notifications/:id` | Delete notification |
+| `DELETE` | `/notifications` | Clear all notifications |
+
+## Webhooks
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/webhooks` | List webhooks |
+| `POST` | `/webhooks` | Create webhook |
+| `GET` | `/webhooks/:id` | Get webhook |
+| `PATCH` | `/webhooks/:id` | Update webhook |
+| `DELETE` | `/webhooks/:id` | Delete webhook |
+| `GET` | `/webhooks/:id/deliveries` | Delivery log |
+| `POST` | `/webhooks/:id/test` | Test webhook |
+| `POST` | `/webhooks/:id/retry/:deliveryId` | Retry delivery |
+
+### Inbound: QuickBooks Online
+
+`POST /api/v1/webhooks/quickbooks` is an **inbound** endpoint Intuit calls, not one you call. It takes no user token: every request is verified against the app's `intuit-signature` HMAC and is IP rate-limited. A valid notification only wakes the reconcile sweep for the affected company — the sweep, not the webhook, is the authoritative path, so a missed delivery costs latency and nothing else.
+
+| Response | When |
+|---|---|
+| `202` | Accepted and enqueued |
+| `400` | Body could not be parsed |
+| `401` | Missing or invalid Intuit signature |
+| `429` | Rate limited |
+| `503` | `QBO_WEBHOOK_VERIFIER_TOKEN` is not configured, or the notification could not be enqueued. Intuit retries |
+
+## Plugins
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/plugins/catalog` | List available plugins |
+| `GET` | `/plugins/catalog/:slug` | Get plugin details |
+| `GET` | `/plugins/installations` | List installations |
+| `POST` | `/plugins/installations` | Install plugin |
+| `GET` | `/plugins/installations/:id` | Get installation |
+| `PATCH` | `/plugins/installations/:id` | Update config |
+| `DELETE` | `/plugins/installations/:id` | Uninstall |
+| `POST` | `/plugins/installations/:id/enable` | Enable |
+| `POST` | `/plugins/installations/:id/disable` | Disable |
+| `GET` | `/plugins/installations/:id/logs` | Plugin logs |
+
+## Custom Fields
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/custom-fields` | List custom fields |
+| `GET` | `/custom-fields/:id` | Get field |
+| `POST` | `/custom-fields` | Create field |
+| `PATCH` | `/custom-fields/:id` | Update field |
+| `DELETE` | `/custom-fields/:id` | Delete field |
+
+## Saved Filters
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/filters/preview` | Preview filter results |
+| `GET` | `/filters` | List saved filters |
+| `POST` | `/filters` | Create filter |
+| `GET` | `/filters/:id` | Get filter |
+| `PATCH` | `/filters/:id` | Update filter |
+| `DELETE` | `/filters/:id` | Delete filter |
+| `POST` | `/filters/:id/preview` | Preview saved filter |
+
+## Catalog & Billing
+
+Selected catalog and billing operations. Resource CRUD follows the standard REST pattern under `/catalog`, `/invoices`, `/quotes`, and `/contracts`; the endpoints below are the bulk and assist operations most useful to integrators.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/catalog/enrich` | AI-draft a catalog item's fields from a product name or SKU (returns a draft to review; writes nothing) |
+| `POST` | `/invoices/bulk-issue` | Issue multiple draft invoices |
+| `POST` | `/invoices/bulk-void` | Void multiple invoices (with a shared reason) |
+| `POST` | `/invoices/bulk-delete` | Delete multiple draft invoices |
+| `POST` | `/quotes/bulk-send` | Send multiple draft quotes |
+| `POST` | `/quotes/bulk-delete` | Delete multiple draft quotes |
+| `GET` | `/quotes/:id` | Get quote detail, blocks, lines, branding, and any staged Pax8 order summary (`pax8OrderId`, `pax8OrderLineCount`) |
+| `POST` | `/invoices/:id/resend` | Re-email an issued invoice without restamping its number, dates, or sent timestamp |
+| `GET` | `/invoices/:id/public-link` | Return the invoice's durable customer view-and-pay link |
+| `POST` | `/invoices/:id/reset-link` | Revoke every customer link issued for the invoice and mint a new one |
+| `POST` | `/invoices/:id/currency` | Change a **draft** invoice's currency. Requires `clearLines` or `reprice` when monetary lines exist; never converts at an exchange rate |
+| `POST` | `/quotes/:id/currency` | Change a **draft** quote's currency (same rules as above) |
+| `POST` | `/contracts/:id/currency` | Change a **draft** contract's currency (same rules as above) |
+| `POST` | `/contracts/bulk-cancel` | Cancel multiple contracts |
+| `POST` | `/contracts/bulk-delete` | Delete multiple draft contracts |
+| `POST` | `/contracts/:id/lines` | Add a contract line |
+| `PATCH` | `/contracts/:id/lines/:lineId` | Edit a line in place. The line **type** is immutable — remove and re-add to change it |
+| `DELETE` | `/contracts/:id/lines/:lineId` | Remove a line. Returns `404 LINE_NOT_FOUND` when the line does not exist (it used to answer `200` and do nothing) |
+| `GET` | `/contracts/:id/periods/:periodId/outcome` | What a billing period actually billed: snapshot device total, uncovered total (with a per-role breakdown), flagged total, and billed overage total. `404 PERIOD_NOT_FOUND` |
+| `GET` | `/invoices/:id/lines/:lineId/devices` | Per-device evidence for one generated invoice line — hostname, role, and whether the device counted as included, overage, or flagged. Cursor-paginated (`limit` default 100, max 500). Lines from invoices generated before this shipped return `recorded: false`. `404 INVOICE_LINE_NOT_FOUND` |
+
+Bulk endpoints accept a list of IDs and return per-item results, so partial success is possible.
+
+### Contract line validation and errors
+
+Line writes validate their inputs rather than failing at the database. `unitPrice` and `manualQuantity` are money strings (up to 10 digits, at most 2 decimal places), `sortOrder` is a non-negative 32-bit integer, and `catalogItemId` must be a UUID — a violation is a `400`, not a `500`.
+
+| Code | Status | Meaning |
+|---|---|---|
+| `LINE_NOT_FOUND` | 404 | No such line on this contract |
+| `INVALID_LINE_PATCH` | 400 | The patch body has nothing usable in it |
+| `SITE_NOT_IN_ORG` | 400 | The site belongs to a different organization |
+| `GROUP_NOT_IN_ORG` | 400 | The device group belongs to a different organization |
+| `CATALOG_ITEM_NOT_FOUND` | 400 | No such catalog item |
+| `NO_PRICE_FOR_CURRENCY` / `PRICE_NOT_REPRESENTABLE` | 409 | The catalog item has no usable price in the contract's currency |
+| `SITE_DELETED` / `GROUP_DELETED` | 409 | Raised at **invoice generation**, not at line-write time: the line points at a site or group that no longer exists. Generation writes nothing until the line is re-scoped or removed |
+
+Invoice lines generated from a contract are ordered deterministically by `(sortOrder, createdAt, id)`, so a regenerated invoice lists its lines in the same order every time.
+
+`PATCH /quotes/:id/lines/:lineId` validates strictly: an unrecognised key is a `400` rather than a silently ignored no-op. Device-set fields on a quote line (roles, group, site, included quantity, overage mode and price) are patchable; the device-set type itself is not — remove the line and add it again.
+
+### Distributor Integrations
+
+Pax8 integration and ordering routes require partner or system scope plus `billing:manage`. An organization-scoped token is refused even when it can access the target organization. Partner-scoped callers use the partner from their token. System-scoped callers supply `partnerId` only on routes that accept it and require it for system scope. Company map and subscription link/unlink routes instead derive the partner from their tenant-scoped `integrationId`. Every mutation is MFA-gated and audited.
+
+| Method | Path | MFA | Description |
+|---|---|---|---|
+| `GET` | `/pax8/integration` | No | Get the active integration and credential-presence/sync-status fields |
+| `POST` | `/pax8/integration` | Yes | Create or update the integration; queues an initial sync when active |
+| `POST` | `/pax8/integration/test` | Yes | Test the active integration; returns `{ success, data? | error? }` |
+| `POST` | `/pax8/sync` | Yes | Queue a company, subscription, and product sync; returns `{ queued, jobId, integrationId }` |
+| `GET` | `/pax8/companies` | No | List company mappings and non-PII ordering-readiness flags |
+| `POST` | `/pax8/companies/map` | Yes | Map, unmap, or ignore a Pax8 company |
+| `GET` | `/pax8/subscriptions` | No | List subscription observations, contract-line linkage, and Breeze billing quantities |
+| `POST` | `/pax8/subscriptions/link` | Yes | Link or re-point a subscription snapshot to a manual contract line |
+| `DELETE` | `/pax8/subscriptions/link` | Yes | Unlink a subscription snapshot (idempotent) |
+| `GET` | `/pax8/products` | No | List up to 200 active catalog items mapped to Pax8 products |
+| `GET` | `/pax8/products/:productId/provision-details` | No | Read live Pax8 provisioning-field metadata for a product |
+| `GET` | `/pax8/products/:productId/dependencies` | No | Read live Pax8 commitment/dependency rules for a product |
+| `GET` | `/pax8/orders` | No | List orders; optional `orgId` returns that organization's history |
+| `GET` | `/pax8/orders/:id` | No | Get `{ order, lines }` for an accessible order |
+| `POST` | `/pax8/orders` | Yes | Create or reuse the organization's mutable direct order |
+| `POST` | `/pax8/orders/:id/lines` | Yes | Stage a new subscription, quantity change, or cancellation on a mutable direct order |
+| `PATCH` | `/pax8/orders/:id/lines/:lineId` | Yes | Update commitment/provisioning values on a mutable new-subscription line, including a quote-staged line |
+| `DELETE` | `/pax8/orders/:id/lines/:lineId` | Yes | Remove a line from a mutable direct order |
+| `POST` | `/pax8/orders/:id/preflight` | Yes | Mock-validate new-subscription lines with Pax8; returns the raw Pax8 body on `422` |
+| `POST` | `/pax8/orders/:id/submit` | Yes | Claim and execute the order once; returns per-line outcomes |
+| `POST` | `/pax8/orders/:id/reconcile` | Yes | Read Pax8 state to classify uncertain writes; never issues a Pax8 write |
+| `GET` | `/pax8/drift?integrationId=:id` | No | List known Pax8 quantity observations that differ from linked Breeze manual quantities |
+
+#### Company mapping and subscription quantities
+
+`GET /pax8/companies` returns `{ data, integrationId }`. Each row includes the mapping fields plus these readiness booleans:
+
+```json
+{
+  "statusActive": true,
+  "primaryAdminReady": true,
+  "primaryBillingReady": true,
+  "primaryTechnicalReady": true,
+  "orderReady": true
+}
+```
+
+`orderReady` is true only when the company is Active and the synchronized metadata contains primary Admin, Billing, and Technical contacts. Contact PII is not returned. `POST /pax8/companies/map` accepts:
+
+```json
+{
+  "integrationId": "11111111-1111-4111-8111-111111111111",
+  "pax8CompanyId": "pax8-company-id",
+  "orgId": "22222222-2222-4222-8222-222222222222",
+  "ignored": false
+}
+```
+
+Set `orgId` to `null` to unmap it. A direct order requires exactly one non-ignored, order-ready mapping. Quote acceptance can stage an order without a mapping; preflight and submit resolve and validate the mapping later.
+
+`GET /pax8/subscriptions` supports `integrationId`, `orgId`, `unmappedOnly`, and `limit` (1–500, default 100). Important quantity and linkage fields are:
+
+| Field | Meaning |
+|---|---|
+| `breezeQuantity` | The linked manual contract line's billing quantity, or `null` when not linked/available |
+| `quantity` | Pax8's latest reported quantity string; inspect `quantityKnown` before using it |
+| `quantityKnown` | `false` when Pax8 did not provide credible quantity evidence; an unknown value is not zero |
+| `contractLineId` | The linked Breeze contract line, when present |
+| `syncEnabled` | Whether scheduled sync records quantity observations for this link; it does not authorize overwriting billing quantity |
+| `lastObservedQuantity`, `lastObservedAt` | Last recorded known Pax8 observation for a sync-enabled link |
+| `activeCommitmentId`, `activeCommitmentAmbiguous` | Evidence used to select the commitment that governs quantity and cancellation actions |
+
+<Aside type="caution" title="Breaking quantity-sync behavior">
+  `sync_enabled` Pax8 links no longer copy `quantity` into `contract_lines.manual_quantity`. The Breeze order ledger and linked manual quantity are billing truth; Pax8's reported quantity is observation-only because it does not reliably match what Pax8 invoices. Use the drift endpoint to surface disagreements rather than silently applying them.
+</Aside>
+
+`GET /pax8/drift` requires `integrationId` and returns `{ data }`, where each row contains `contractLineId`, `orgId`, `pax8SubscriptionId`, `productName`, `breezeQuantity`, and `pax8Quantity`. Results are limited to sync-enabled links on manual contract lines whose Pax8 quantity is known and differs from Breeze. The endpoint performs no Pax8 call and no write.
+
+#### Product metadata
+
+`GET /pax8/products` returns local, active mappings as `{ data: [{ pax8ProductId, catalogItemId, catalogName, catalogSku, catalogDescription, productName, vendorSkuId, billingFrequency, commitmentTermMonths }] }`. It does not call Pax8. Provisioning details and dependencies do call the configured Pax8 API.
+
+`GET /pax8/products/:productId/provision-details`:
+
+```json
+{
+  "data": [{
+    "key": "msDomain",
+    "label": "Microsoft domain",
+    "description": null,
+    "valueType": "Input",
+    "possibleValues": null
+  }]
+}
+```
+
+`GET /pax8/products/:productId/dependencies`:
+
+```json
+{
+  "data": {
+    "commitments": [{
+      "id": "commitment-id",
+      "term": "Annual",
+      "allowForQuantityIncrease": true,
+      "allowForQuantityDecrease": false,
+      "allowForEarlyCancellation": false,
+      "cancellationFeeApplied": false
+    }]
+  }
+}
+```
+
+Provision fields may have `valueType` `Input`, `Single-Value`, or `Multi-Value`. Their submitted representation is `{ "key": "...", "values": ["..."] }`. Pax8 does not expose reliable requiredness metadata, so clients should not invent required fields; preflight is authoritative.
+
+#### Order authoring
+
+`POST /pax8/orders` accepts `{ "orgId": "<uuid>" }` and returns the order in `{ data }` with `201`. If that organization already has a mutable direct order, the same order is returned. Quote-originated orders are created by quote acceptance, not this endpoint.
+
+Order status is one of `draft`, `awaiting_details`, `ready`, `submitting`, `completed`, `partially_failed`, `failed`, or `cancelled`. Each line has a `submitState` of `pending`, `in_flight`, `succeeded`, `failed`, or `needs_reconcile`. `GET /pax8/orders?orgId=<uuid>` returns the organization's complete, newest-first history (up to 100); without `orgId`, it returns the accessible non-terminal partner queue. `GET /pax8/orders/:id` returns `{ data: { order, lines } }`.
+
+Stage lines on a mutable **direct** order with `POST /pax8/orders/:id/lines`. The body is strict—unknown fields are rejected—and depends on `action`. Public callers cannot add lines to a quote-staged order.
+
+New subscription—`pax8ProductId`, `catalogItemId`, `billingTerm`, and a quantity greater than zero are required:
+
+```json
+{
+  "action": "new_subscription",
+  "pax8ProductId": "product-id",
+  "catalogItemId": "33333333-3333-4333-8333-333333333333",
+  "billingTerm": "Monthly",
+  "commitmentTermId": "commitment-id",
+  "quantity": "12",
+  "provisioningDetails": [{ "key": "msDomain", "values": ["example"] }]
+}
+```
+
+The `pax8ProductId` and `catalogItemId` must be the exact active tuple returned by `GET /pax8/products`; both the Pax8 integration and catalog item must still be active when the line is staged and again when it is submitted. Do not mix a Pax8 product ID with a different catalog item. A direct new-subscription request cannot supply `contractLineId`.
+
+Existing subscription quantity—`targetSubscriptionId` and a quantity of zero or greater are required:
+
+```json
+{
+  "action": "change_quantity",
+  "targetSubscriptionId": "subscription-id",
+  "quantity": "15"
+}
+```
+
+Cancellation—`targetSubscriptionId` is required. Cancellation is immediate, not scheduled:
+
+```json
+{
+  "action": "cancel",
+  "targetSubscriptionId": "subscription-id"
+}
+```
+
+For immediate cancellation, omit `cancelDate` as shown. If a caller includes it, use the current UTC calendar date (`YYYY-MM-DD`); future-dated cancellation is unsupported and rejected with `422` so Breeze cannot set the billing quantity to zero before Pax8 cancellation takes effect.
+
+For `change_quantity` and `cancel`, do **not** send `contractLineId`. The strict public schema rejects caller-controlled linkage. Breeze derives exactly one linked manual contract line from `targetSubscriptionId`, uses its manual quantity as billing truth, and fails closed if the link or quantity is missing or changes during authorization.
+
+Valid billing terms are `Monthly`, `Annual`, `2-Year`, `3-Year`, `One-Time`, `Trial`, and `Activation`. Quantity changes and cancellations are rejected with `422` when the active commitment cannot be determined or does not allow that action. A target subscription must belong to the order's organization. Only one change or cancellation may target a given subscription in an order.
+
+The line-create response is `{ data: <line> }` with `201`. `PATCH /pax8/orders/:id/lines/:lineId` accepts at least one of `commitmentTermId` (string or `null`) and `provisioningDetails`; it applies only to a mutable `new_subscription` line and deliberately preserves its quote/catalog/contract linkage. Public add and delete operations are direct-order-only. Quote-staged lines are immutable in membership: clients cannot add or delete them, and may only complete their commitment/provisioning values through this PATCH. Deleting a mutable direct-order line returns `{ "removed": true }`.
+
+#### Preflight, submit, and reconciliation
+
+`POST /pax8/orders/:id/preflight` sends a Pax8 mock order for the order's `new_subscription` lines. An order containing only quantity changes/cancellations returns `{ "ok": true }` without a mock call because those actions were dependency-checked while staged. Success is `{ "ok": true }`; validation failure is HTTP `422` with Pax8's raw JSON or text body so clients can associate `details[]` with the relevant line.
+
+`POST /pax8/orders/:id/submit` claims the order and its pending lines before making any external write. A concurrent submit loses the claim with `409`. The response is HTTP `200` even when some work needs attention:
+
+```json
+{
+  "orderId": "55555555-5555-4555-8555-555555555555",
+  "status": "partially_failed",
+  "lines": [{
+    "lineId": "66666666-6666-4666-8666-666666666666",
+    "submitState": "needs_reconcile",
+    "error": "Pax8 outcome was uncertain"
+  }]
+}
+```
+
+Treat the returned `status` and every line's `submitState` as the result—not HTTP `200` alone. Successful linked actions update only manual contract-line quantities; cancellation records `0`. A definitive Pax8 rejection becomes `failed`. A timeout, transport error, or server response whose write outcome is uncertain becomes `needs_reconcile`.
+
+<Aside type="caution">
+  Never blindly retry `submit` for an `in_flight` or `needs_reconcile` line. Pax8 does not accept an idempotency key, so a retry could duplicate a purchase or mutation.
+</Aside>
+
+Call `POST /pax8/orders/:id/reconcile` instead. It performs read-only Pax8 order/subscription lookups and returns `{ "resolved": <number>, "stillUnknown": <number> }`. It never repeats the write. When `stillUnknown` is nonzero, leave the order for manual investigation.
+
+#### Quote-staged orders
+
+Accepting a Pax8-backed quote stages its order transactionally without sending anything to Pax8. The authenticated `GET /quotes/:id` response persists discoverability across reloads:
+
+```json
+{
+  "data": {
+    "quote": { "id": "...", "status": "converted" },
+    "blocks": [],
+    "lines": [],
+    "branding": {},
+    "pax8OrderId": "55555555-5555-4555-8555-555555555555",
+    "pax8OrderLineCount": 2
+  }
+}
+```
+
+`pax8OrderId` is `null` and `pax8OrderLineCount` is `0` when no Pax8-backed order was staged. Use the ID with `GET /pax8/orders/:id`, then complete provisioning and submit through the normal endpoints.
+
+## Tickets
+
+Core ticket CRUD follows the standard REST pattern under `/tickets`; the endpoints below cover soft-delete, restore, and bulk actions.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/tickets?deleted=only` | List soft-deleted tickets (the Archived queue). Requires `tickets:manage`. |
+| `DELETE` | `/tickets/:id` | Soft-delete a ticket. Requires `tickets:manage`. Reversible; by-id operations on a deleted ticket return `404`. |
+| `POST` | `/tickets/:id/restore` | Restore a soft-deleted ticket. Requires `tickets:manage`. |
+| `POST` | `/tickets/bulk` | Bulk `assign` / status change / `delete` across up to 100 ticket IDs. The `delete` action requires `tickets:manage`; `assign` and status changes require `tickets:write`. Returns per-ticket `updated`/`skipped`/`failed` counts. |
+| `POST` | `/tickets/:id/attachments` | Upload one file (`multipart/form-data`, field `file`) and get back a **pending** attachment. Requires `tickets:write`. |
+| `GET` | `/tickets/:id/attachments/:attachmentId/content` | Stream an attachment's bytes. Requires `tickets:read`. |
+| `DELETE` | `/tickets/:id/attachments/:attachmentId` | Delete an attachment and its bytes. `tickets:write` for your own pending upload or your own comment's file; `tickets:manage` for anyone else's. |
+
+### Comment attachments
+
+Attaching a photo or PDF to a ticket comment is a **two-step** flow:
+
+1. `POST /tickets/:id/attachments` with a `multipart/form-data` body carrying exactly one file under the field name `file`. The response is attachment metadata with `commentId: null` — a *pending* upload that belongs to the uploader and nothing else.
+2. `POST /tickets/:id/comments` with `attachmentIds: ["<id>", …]`. The comment and the claim happen in one transaction, so a rejected attachment rolls the comment back rather than posting a comment with missing files. `content` may be empty when `attachmentIds` is non-empty.
+
+A pending upload that is never claimed is deleted automatically after 24 hours.
+
+**Limits**
+
+| Limit | Value |
+|---|---|
+| Maximum file size | 10 MiB |
+| Attachments per comment | 5 |
+| Pending (unclaimed) uploads per user | 20 |
+| Upload rate | 30 per minute per user |
+| Accepted types | `image/jpeg`, `image/png`, `image/webp`, `application/pdf` |
+
+The client's `Content-Type` is **ignored**. The file's type is determined by sniffing its magic bytes, and anything that does not sniff to one of the four accepted types is rejected with `415 UNSUPPORTED_ATTACHMENT_TYPE`. Other error codes: `413 ATTACHMENT_TOO_LARGE`, `429 TOO_MANY_PENDING`, `409 ATTACHMENT_NOT_CLAIMABLE`, `409 TICKET_DELETED`, `503 STORAGE_UNAVAILABLE`.
+
+Bytes are always served through the authenticated `…/content` route — there is no public URL and no presigned link — with `X-Content-Type-Options: nosniff`, an `ETag` (so `If-None-Match` gets a `304`) and `Cache-Control: private, max-age=300`. Customers see attachments on **public** comments only, through `GET /portal/tickets/:id/attachments/:attachmentId/content`.
+
+**Storage on self-hosted installs.** When an object-storage bucket is configured (`S3_BUCKET` and its credentials), attachment bytes go to the bucket under `ticket-attachments/<attachmentId>`. When it is not — the default self-hosted setup — the bytes are stored inline in Postgres instead, and every route behaves identically. The choice is made once, per attachment, at upload time: rows written before you configure a bucket keep serving from the database. Plan database sizing accordingly, or configure a bucket before enabling attachments for a large fleet.
+
+## Ticketing
+
+Canned reply templates are partner-scoped. Management operations require `partner` scope and MFA.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/ticket-response-templates` | List canned response templates |
+| `POST` | `/ticket-response-templates` | Create a canned response template |
+| `PATCH` | `/ticket-response-templates/:id` | Update a canned response template |
+| `DELETE` | `/ticket-response-templates/:id` | Delete a canned response template |
+
+## PSA Integrations
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/psa/connections` | List PSA connections |
+| `POST` | `/psa/connections` | Create connection |
+| `GET` | `/psa/connections/:id` | Get connection |
+| `PATCH` | `/psa/connections/:id` | Update connection |
+| `DELETE` | `/psa/connections/:id` | Delete connection |
+| `POST` | `/psa/connections/:id/test` | Test connection |
+| `POST` | `/psa/connections/:id/sync` | Trigger sync |
+| `GET` | `/psa/connections/:id/status` | Sync status |
+| `GET` | `/psa/tickets` | List tickets |
+| `GET` | `/psa/connections/:id/tickets` | Tickets for connection |
+
+## SSO
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/sso/presets` | JWT | List SSO presets |
+| `GET` | `/sso/providers` | JWT | List SSO providers |
+| `GET` | `/sso/providers/:id` | JWT | Get provider |
+| `POST` | `/sso/providers` | JWT | Create provider |
+| `PATCH` | `/sso/providers/:id` | JWT | Update provider |
+| `DELETE` | `/sso/providers/:id` | JWT | Delete provider |
+| `GET` | `/sso/login/:orgId` | None | Initiate SSO login |
+| `GET` | `/sso/callback` | None | SSO callback |
+| `POST` | `/sso/exchange` | None | Token exchange |
+| `GET` | `/sso/check/:orgId` | None | Check SSO availability |
+
+## Enrollment Keys
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/enrollment-keys` | List enrollment keys |
+| `POST` | `/enrollment-keys` | Create enrollment key |
+| `DELETE` | `/enrollment-keys/:id` | Delete enrollment key |
+| `POST` | `/enrollment-keys/:id/rotate` | Rotate key |
+| `GET` | `/enrollment-keys/:id` | Get key details |
+
+## Agent Management
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/agents/enroll` | Enrollment secret | Enroll new device |
+| `GET` | `/agents/download/:os/:arch` | None | Download agent binary. Optional `?version=` serves that exact registered release instead of the promoted one (used for pinned/pilot versions); an unregistered version returns 404. |
+| `GET` | `/agents/install.sh` | None | One-line install script |
+
+### Agent Versions
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/agent-versions/latest` | Get latest agent version |
+| `GET` | `/agent-versions/:version/download` | Download specific version |
+| `GET` | `/agent-versions` | List all versions |
+
+## AI Assistant
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/ai/sessions` | Create chat session |
+| `GET` | `/ai/sessions` | List sessions |
+| `GET` | `/ai/sessions/search` | Search sessions |
+| `GET` | `/ai/sessions/:id` | Get session |
+| `DELETE` | `/ai/sessions/:id` | Delete session |
+| `POST` | `/ai/sessions/:id/messages` | Send message (streaming) |
+| `POST` | `/ai/sessions/:id/interrupt` | Interrupt response |
+| `POST` | `/ai/sessions/:id/approve/:executionId` | Approve tool execution |
+| `GET` | `/ai/usage` | AI usage stats |
+| `GET` | `/ai/budget` | AI budget info |
+| `GET` | `/ai/admin/sessions` | Admin: list all sessions |
+| `GET` | `/ai/admin/security-events` | Admin: security events |
+
+## MCP Server
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/mcp/sse` | API key | SSE transport for MCP |
+| `POST` | `/mcp/message` | API key | Send MCP message |
+
+Over the transport, the server speaks JSON-RPC 2.0. Alongside `tools/*` and `resources/*`, it advertises an `instructions` string on `initialize` and a **prompts** capability with five guided MSP workflows, exposed via the `prompts/list` and `prompts/get` methods. See [MCP Server → Guided prompts](/features/mcp-server/#guided-prompts).
+
+## Mobile API
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/mobile/notifications/register` | Register push token |
+| `POST` | `/mobile/notifications/unregister` | Unregister push token |
+| `GET` | `/mobile/devices` | List devices (mobile-optimized) |
+| `GET` | `/mobile/devices/:id/settings` | Device settings |
+| `GET` | `/mobile/devices/:id` | Device details |
+| `GET` | `/mobile/alerts/inbox` | Alert inbox |
+| `POST` | `/mobile/alerts/:id/acknowledge` | Acknowledge alert. Same `409`-on-conflict contract as `POST /alerts/:id/acknowledge` |
+| `POST` | `/mobile/alerts/:id/resolve` | Resolve alert. Same `409`-on-conflict contract as `POST /alerts/:id/resolve` |
+| `POST` | `/mobile/devices/:id/actions` | Send device action |
+| `GET` | `/mobile/summary` | Dashboard summary |
+
+## Client Portal
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/portal/branding/:domain` | None | Get portal branding |
+| `GET` | `/portal/branding` | None | Default branding |
+| `POST` | `/portal/auth/login` | None | Portal login |
+| `POST` | `/portal/auth/forgot-password` | None | Forgot password |
+| `POST` | `/portal/auth/reset-password` | None | Reset password |
+| `POST` | `/portal/auth/logout` | Portal session | Logout |
+| `GET` | `/portal/devices` | Portal session | List devices |
+| `GET` | `/portal/tickets` | Portal session | List tickets |
+| `POST` | `/portal/tickets` | Portal session | Create ticket |
+| `GET` | `/portal/tickets/:id` | Portal session | Get ticket |
+| `POST` | `/portal/tickets/:id/comments` | Portal session | Add comment |
+| `GET` | `/portal/assets` | Portal session | List assets |
+| `POST` | `/portal/assets/:id/checkout` | Portal session | Check out asset |
+| `POST` | `/portal/assets/:id/checkin` | Portal session | Check in asset |
+| `GET` | `/portal/profile` | Portal session | Get profile |
+| `PATCH` | `/portal/profile` | Portal session | Update profile |
+| `POST` | `/portal/profile/password` | Portal session | Change password |
+
+## Partner Dashboard
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/partner/dashboard` | Partner dashboard data |
+
+## Other Route Groups
+
+A few mounted route groups are documented on their feature pages rather than repeated here:
+
+| Prefix | Purpose |
+|---|---|
+| `/backup` | Device backup, restore, boot-media, and SLA endpoints. See [Backup Overview](/backup/overview/). |
+| `/ai/agents`, `/ai/agents/schedules`, `/ai/operator` | Autonomous scheduled AI agents (triage, sweeps, reports) — distinct from the interactive `/ai` chat assistant above. See [AI Agents](/features/ai-agents/). |
+| `/s1`, `/huntress` | SentinelOne and Huntress EDR integration endpoints (credentials, mappings, webhooks, sync). See [EDR Integrations](/features/edr-integrations/). |
+| `/m365`, `/onedrive`, `/office-addin` | Microsoft 365 tenant connection, Graph sync, OneDrive helper, and Office add-in endpoints. See [Identity Integrations (M365)](/features/identity-integrations/) and [OneDrive Helper](/features/onedrive-helper/). |
+
+## Search
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/search` | Global search across devices, users, orgs, scripts, alerts |
+
+---
+
+## Pagination
+
+List endpoints support cursor-based pagination:
+
+```bash
+curl "https://breeze.yourdomain.com/api/v1/devices?limit=50&cursor=eyJ..."
+```
+
+`GET /devices` accepts a `limit` of up to **1000** per page (default **500**) so partners can pull large fleets in fewer round trips; other list endpoints use their own, generally smaller, defaults and caps. The dashboard's devices list has its own per-page selector (10–200).
+
+Response:
+
+```json
+{
+  "data": [...],
+  "pagination": {
+    "nextCursor": "eyJ...",
+    "limit": 500
+  }
+}
+```
+
+## Error Format
+
+All errors follow a consistent format:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Invalid email address",
+    "details": [...]
+  }
+}
+```
+
+<Aside>
+  Enable the interactive Swagger UI by setting `ENABLE_API_DOCS_UI=true` in your environment (on by default outside production).
+</Aside>

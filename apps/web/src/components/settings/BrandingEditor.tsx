@@ -1,0 +1,741 @@
+import { type ChangeEvent, type DragEvent, useCallback, useEffect, useState } from 'react';
+import { FileCode, Globe, Image, Mail, Palette, RefreshCcw, Save } from 'lucide-react';
+import { fetchWithAuth } from '../../stores/auth';
+import { sanitizeImageSrc } from '../../lib/safeImageSrc';
+import { resolveUiColorToken, sanitizeHexColor } from '@/lib/utils';
+import { navigateTo } from '@/lib/navigation';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+
+type BrandingEditorProps = {
+  organizationId?: string;
+  onDirty?: () => void;
+  onSave?: () => void;
+};
+
+type StatusMessage = {
+  type: 'success' | 'error';
+  message: string;
+};
+
+type UploadTarget = 'logoLight' | 'logoDark' | 'favicon';
+
+type BrandingData = {
+  organizationName: string;
+  portalName: string;
+  portalUrl: string;
+  supportEmail: string;
+  primaryColor: string;
+  secondaryColor: string;
+  customCss: string;
+  logoLightUrl: string;
+  logoDarkUrl: string;
+  faviconUrl: string;
+};
+
+type SavedBranding = {
+  primaryColor: string;
+  secondaryColor: string;
+  customCss: string;
+  logoLightUrl: string;
+  logoDarkUrl: string;
+  faviconUrl: string;
+  logoLightName: string;
+  logoDarkName: string;
+  faviconName: string;
+};
+
+const defaultBranding: BrandingData = {
+  organizationName: '',
+  portalName: 'Breeze Portal',
+  portalUrl: '',
+  supportEmail: '',
+  primaryColor: '#2563eb',
+  secondaryColor: '#f97316',
+  customCss:
+    '/* Example: .portal-card { border-radius: 18px; } */\n.portal-header {\n  letter-spacing: 0.04em;\n}',
+  logoLightUrl: '',
+  logoDarkUrl: '',
+  faviconUrl: ''
+};
+
+const getInitials = (value: string) =>
+  value
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map(part => part[0]?.toUpperCase() ?? '')
+    .join('');
+
+const isValidHex = (value: string) => /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value);
+
+const normalizeHex = (value: string) => {
+  if (!isValidHex(value)) {
+    return null;
+  }
+
+  const hex = value.slice(1);
+  if (hex.length === 3) {
+    return `#${hex
+      .split('')
+      .map(char => char + char)
+      .join('')}`;
+  }
+
+  return value;
+};
+
+type UploadDropzoneProps = {
+  title: string;
+  description: string;
+  helper?: string;
+  preview: string;
+  fileName: string;
+  placeholder: string;
+  previewClassName?: string;
+  previewSizeClassName?: string;
+  accept?: string;
+  onFileSelect: (file: File) => void;
+};
+
+function UploadDropzone({
+  title,
+  description,
+  helper,
+  preview,
+  fileName,
+  placeholder,
+  previewClassName,
+  previewSizeClassName = 'h-16 w-16',
+  accept = 'image/*',
+  onFileSelect
+}: UploadDropzoneProps) {
+  const { t } = useTranslation('settings');
+  const [isDragging, setIsDragging] = useState(false);
+  const safePreview = sanitizeImageSrc(preview);
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragging(false);
+    const file = event.dataTransfer.files?.[0];
+    if (!file) {
+      return;
+    }
+    onFileSelect(file);
+  };
+
+  const handleChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    onFileSelect(file);
+    event.target.value = '';
+  };
+
+  return (
+    <div
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      className={`rounded-lg border border-dashed p-4 transition ${
+        isDragging ? 'border-primary bg-primary/5' : 'bg-muted/40'
+      }`}
+    >
+      <div className="flex flex-wrap items-center gap-4">
+        <div
+          className={`flex items-center justify-center rounded-md border ${previewSizeClassName} ${previewClassName ?? 'bg-background'}`}
+        >
+          {safePreview ? (
+            <img src={safePreview} alt={t('brandingEditor.imagePreview', { title })} className="h-full w-full rounded-md object-contain" />
+          ) : (
+            <span className="text-xs font-medium text-muted-foreground">{placeholder}</span>
+          )}
+        </div>
+        <div className="space-y-1">
+          <p className="text-sm font-medium">{title}</p>
+          <p className="text-xs text-muted-foreground">{description}</p>
+          {fileName ? <p className="text-xs text-muted-foreground">{t('brandingEditor.selectedFile', { fileName })}</p> : null}
+        </div>
+        <label className="ml-auto inline-flex cursor-pointer items-center gap-2 rounded-md border bg-background px-3 py-2 text-sm font-medium transition hover:bg-muted">
+          <input type="file" accept={accept} className="hidden" onChange={handleChange} />
+          {t('common:actions.upload')}
+        </label>
+      </div>
+      {helper ? <p className="mt-3 text-xs text-muted-foreground">{helper}</p> : null}
+    </div>
+  );
+}
+
+export default function BrandingEditor({ organizationId, onDirty, onSave }: BrandingEditorProps) {
+  const { t } = useTranslation('settings');
+  const [branding, setBranding] = useState<BrandingData>(defaultBranding);
+  const [loading, setLoading] = useState(true);
+  const [logoLightPreview, setLogoLightPreview] = useState('');
+  const [logoDarkPreview, setLogoDarkPreview] = useState('');
+  const [faviconPreview, setFaviconPreview] = useState('');
+  const [logoLightName, setLogoLightName] = useState('');
+  const [logoDarkName, setLogoDarkName] = useState('');
+  const [faviconName, setFaviconName] = useState('');
+  const [logoLightFile, setLogoLightFile] = useState<File | null>(null);
+  const [logoDarkFile, setLogoDarkFile] = useState<File | null>(null);
+  const [faviconFile, setFaviconFile] = useState<File | null>(null);
+  const [primaryColor, setPrimaryColor] = useState(defaultBranding.primaryColor);
+  const [secondaryColor, setSecondaryColor] = useState(defaultBranding.secondaryColor);
+  const [customCss, setCustomCss] = useState(defaultBranding.customCss);
+  const [statusMessage, setStatusMessage] = useState<StatusMessage | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [hasChanges, setHasChanges] = useState(false);
+  const [savedBranding, setSavedBranding] = useState<SavedBranding>({
+    primaryColor: defaultBranding.primaryColor,
+    secondaryColor: defaultBranding.secondaryColor,
+    customCss: defaultBranding.customCss,
+    logoLightUrl: '',
+    logoDarkUrl: '',
+    faviconUrl: '',
+    logoLightName: '',
+    logoDarkName: '',
+    faviconName: ''
+  });
+
+  const fetchBranding = useCallback(async () => {
+    if (!organizationId) {
+      setLoading(false);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const response = await fetchWithAuth(`/orgs/organizations/${organizationId}/branding`);
+      if (!response.ok) {
+        if (response.status === 401) {
+          void navigateTo('/login', { replace: true });
+          return;
+        }
+        if (response.status === 404) {
+          // No branding set yet, use defaults
+          setLoading(false);
+          return;
+        }
+        throw new Error(t('brandingEditor.fetchFailed'));
+      }
+      const data = await response.json();
+      const brandingData = { ...defaultBranding, ...data };
+      setBranding(brandingData);
+      setPrimaryColor(brandingData.primaryColor);
+      setSecondaryColor(brandingData.secondaryColor);
+      setCustomCss(brandingData.customCss);
+      setLogoLightPreview(brandingData.logoLightUrl || '');
+      setLogoDarkPreview(brandingData.logoDarkUrl || '');
+      setFaviconPreview(brandingData.faviconUrl || '');
+      setSavedBranding({
+        primaryColor: brandingData.primaryColor,
+        secondaryColor: brandingData.secondaryColor,
+        customCss: brandingData.customCss,
+        logoLightUrl: brandingData.logoLightUrl || '',
+        logoDarkUrl: brandingData.logoDarkUrl || '',
+        faviconUrl: brandingData.faviconUrl || '',
+        logoLightName: '',
+        logoDarkName: '',
+        faviconName: ''
+      });
+    } catch (error) {
+      setStatusMessage({
+        type: 'error',
+        message: error instanceof Error ? error.message : t('brandingEditor.loadFailed')
+      });
+    } finally {
+      setLoading(false);
+    }
+  }, [organizationId, t]);
+
+  useEffect(() => {
+    fetchBranding();
+  }, [fetchBranding]);
+
+  useEffect(() => {
+    if (!logoLightPreview || !logoLightPreview.startsWith('blob:')) {
+      return;
+    }
+    return () => URL.revokeObjectURL(logoLightPreview);
+  }, [logoLightPreview]);
+
+  useEffect(() => {
+    if (!logoDarkPreview || !logoDarkPreview.startsWith('blob:')) {
+      return;
+    }
+    return () => URL.revokeObjectURL(logoDarkPreview);
+  }, [logoDarkPreview]);
+
+  useEffect(() => {
+    if (!faviconPreview || !faviconPreview.startsWith('blob:')) {
+      return;
+    }
+    return () => URL.revokeObjectURL(faviconPreview);
+  }, [faviconPreview]);
+
+  const markDirty = () => {
+    setHasChanges(true);
+    setStatusMessage(null);
+    onDirty?.();
+  };
+
+  const handleFileSelect = (target: UploadTarget, file: File) => {
+    const previewUrl = URL.createObjectURL(file);
+
+    if (target === 'logoLight') {
+      setLogoLightPreview(previewUrl);
+      setLogoLightName(file.name);
+      setLogoLightFile(file);
+    } else if (target === 'logoDark') {
+      setLogoDarkPreview(previewUrl);
+      setLogoDarkName(file.name);
+      setLogoDarkFile(file);
+    } else {
+      setFaviconPreview(previewUrl);
+      setFaviconName(file.name);
+      setFaviconFile(file);
+    }
+
+    markDirty();
+  };
+
+  const handleSave = async () => {
+    if (!organizationId) {
+      setStatusMessage({ type: 'error', message: t('brandingEditor.noOrganization') });
+      return;
+    }
+
+    setIsSaving(true);
+    setStatusMessage(null);
+
+    try {
+      // First, save the branding settings (colors, CSS)
+      const brandingPayload = {
+        primaryColor,
+        secondaryColor,
+        customCss
+      };
+
+      const response = await fetchWithAuth(`/orgs/organizations/${organizationId}/branding`, {
+        method: 'PUT',
+        body: JSON.stringify(brandingPayload)
+      });
+
+      if (!response.ok) {
+        throw new Error(t('brandingEditor.saveFailed'));
+      }
+
+      // Handle file uploads if any files were selected
+      if (logoLightFile || logoDarkFile || faviconFile) {
+        const formData = new FormData();
+        if (logoLightFile) {
+          formData.append('logoLight', logoLightFile);
+        }
+        if (logoDarkFile) {
+          formData.append('logoDark', logoDarkFile);
+        }
+        if (faviconFile) {
+          formData.append('favicon', faviconFile);
+        }
+
+        const uploadResponse = await fetchWithAuth(`/orgs/organizations/${organizationId}/branding/upload`, {
+          method: 'POST',
+          body: formData,
+          headers: {} // Let browser set content-type for FormData
+        });
+
+        if (!uploadResponse.ok) {
+          throw new Error(t('brandingEditor.uploadFailed'));
+        }
+      }
+
+      setSavedBranding({
+        primaryColor,
+        secondaryColor,
+        customCss,
+        logoLightUrl: logoLightPreview,
+        logoDarkUrl: logoDarkPreview,
+        faviconUrl: faviconPreview,
+        logoLightName,
+        logoDarkName,
+        faviconName
+      });
+      setLogoLightFile(null);
+      setLogoDarkFile(null);
+      setFaviconFile(null);
+      setHasChanges(false);
+      setStatusMessage({ type: 'success', message: t('brandingEditor.saved') });
+      onSave?.();
+    } catch (error) {
+      setStatusMessage({
+        type: 'error',
+        message: error instanceof Error ? error.message : t('brandingEditor.saveError')
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleReset = () => {
+    setLogoLightPreview(savedBranding.logoLightUrl);
+    setLogoDarkPreview(savedBranding.logoDarkUrl);
+    setFaviconPreview(savedBranding.faviconUrl);
+    setLogoLightName(savedBranding.logoLightName);
+    setLogoDarkName(savedBranding.logoDarkName);
+    setFaviconName(savedBranding.faviconName);
+    setLogoLightFile(null);
+    setLogoDarkFile(null);
+    setFaviconFile(null);
+    setPrimaryColor(savedBranding.primaryColor);
+    setSecondaryColor(savedBranding.secondaryColor);
+    setCustomCss(savedBranding.customCss);
+    setHasChanges(false);
+    setStatusMessage({ type: 'success', message: t('brandingEditor.resetSuccess') });
+    onSave?.();
+  };
+
+  const resolvedPrimary = sanitizeHexColor(primaryColor, defaultBranding.primaryColor);
+  const resolvedSecondary = sanitizeHexColor(secondaryColor, defaultBranding.secondaryColor);
+  const primarySwatch = normalizeHex(resolvedPrimary) ?? defaultBranding.primaryColor;
+  const secondarySwatch = normalizeHex(resolvedSecondary) ?? defaultBranding.secondaryColor;
+  const primaryToken = resolveUiColorToken(resolvedPrimary, defaultBranding.primaryColor);
+  const secondaryToken = resolveUiColorToken(resolvedSecondary, defaultBranding.secondaryColor);
+  const initials = getInitials(branding.organizationName || 'Breeze');
+  const safeLogoLightPreview = sanitizeImageSrc(logoLightPreview);
+  const safeLogoDarkPreview = sanitizeImageSrc(logoDarkPreview);
+  const safeFaviconPreview = sanitizeImageSrc(faviconPreview);
+
+  if (loading) {
+    return (
+      <section className="space-y-6 rounded-lg border bg-card p-6 shadow-xs">
+        <div className="flex items-center justify-center py-12">
+          <div className="text-center">
+            <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
+            <p className="mt-4 text-sm text-muted-foreground">{t('brandingEditor.loading')}</p>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="space-y-6 rounded-lg border bg-card p-6 shadow-xs">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-semibold">{t('brandingEditor.title')}</h2>
+          <p className="text-sm text-muted-foreground">
+            {t('brandingEditor.description', { name: branding.organizationName })}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleReset}
+            disabled={!hasChanges}
+            className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <RefreshCcw className="h-4 w-4" />
+            {t('brandingEditor.reset')}
+          </button>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={isSaving}
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-70"
+          >
+            <Save className="h-4 w-4" />
+            {isSaving ? t('common:states.saving') : t('brandingEditor.save')}
+          </button>
+        </div>
+      </div>
+
+      {statusMessage ? (
+        <div
+          className={`rounded-md border px-4 py-2 text-sm ${
+            statusMessage.type === 'error'
+              ? 'border-destructive/40 bg-destructive/10 text-destructive'
+              : 'border-emerald-200 bg-emerald-50 text-emerald-900'
+          }`}
+        >
+          {statusMessage.message}
+        </div>
+      ) : null}
+
+      <div className="grid gap-6 lg:grid-cols-[1.1fr_1fr]">
+        <div className="space-y-6">
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Image className="h-4 w-4" />
+              {t('brandingEditor.logos')}
+            </div>
+            <div className="grid gap-4 lg:grid-cols-2">
+              <UploadDropzone
+                title={t('brandingEditor.lightLogo')}
+                description={t('brandingEditor.lightLogoDescription')}
+                helper={t('brandingEditor.logoHelp')}
+                preview={logoLightPreview}
+                fileName={logoLightName}
+                placeholder={initials}
+                onFileSelect={file => handleFileSelect('logoLight', file)}
+              />
+              <UploadDropzone
+                title={t('brandingEditor.darkLogo')}
+                description={t('brandingEditor.darkLogoDescription')}
+                helper={t('brandingEditor.logoHelp')}
+                preview={logoDarkPreview}
+                fileName={logoDarkName}
+                placeholder={initials}
+                previewClassName="bg-slate-950 text-white"
+                onFileSelect={file => handleFileSelect('logoDark', file)}
+              />
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Image className="h-4 w-4" />
+              {t('brandingEditor.favicon')}
+            </div>
+            <UploadDropzone
+              title={t('brandingEditor.browserIcon')}
+              description={t('brandingEditor.browserIconDescription')}
+              helper={t('brandingEditor.browserIconHelp')}
+              preview={faviconPreview}
+              fileName={faviconName}
+              placeholder="ICO"
+              previewSizeClassName="h-10 w-10"
+              accept="image/png,image/svg+xml,image/x-icon"
+              onFileSelect={file => handleFileSelect('favicon', file)}
+            />
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2 rounded-lg border bg-muted/40 p-4">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Palette className="h-4 w-4" />
+                {t('brandingEditor.primaryColor')}
+              </div>
+              <div className="flex items-center gap-3">
+                <input
+                  type="color"
+                  value={primarySwatch}
+                  onChange={event => {
+                    setPrimaryColor(event.target.value);
+                    markDirty();
+                  }}
+                  className="h-10 w-12 cursor-pointer rounded-md border bg-background"
+                />
+                <input
+                  type="text"
+                  value={primaryColor}
+                  onChange={event => {
+                    setPrimaryColor(event.target.value);
+                    markDirty();
+                  }}
+                  className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2 rounded-lg border bg-muted/40 p-4">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Palette className="h-4 w-4" />
+                {t('brandingEditor.secondaryColor')}
+              </div>
+              <div className="flex items-center gap-3">
+                <input
+                  type="color"
+                  value={secondarySwatch}
+                  onChange={event => {
+                    setSecondaryColor(event.target.value);
+                    markDirty();
+                  }}
+                  className="h-10 w-12 cursor-pointer rounded-md border bg-background"
+                />
+                <input
+                  type="text"
+                  value={secondaryColor}
+                  onChange={event => {
+                    setSecondaryColor(event.target.value);
+                    markDirty();
+                  }}
+                  className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-2 rounded-lg border bg-muted/40 p-4">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <FileCode className="h-4 w-4" />
+              {t('brandingEditor.customCss')}
+            </div>
+            <textarea
+              value={customCss}
+              onChange={event => {
+                setCustomCss(event.target.value);
+                markDirty();
+              }}
+              rows={7}
+              className="w-full rounded-md border bg-background px-3 py-2 text-xs font-mono"
+            />
+            <p className="text-xs text-muted-foreground">
+              {t('brandingEditor.customCssHelp')}
+            </p>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Globe className="h-4 w-4" />
+            {t('brandingEditor.livePreview')}
+          </div>
+
+          <div className="space-y-4 rounded-lg border bg-muted/30 p-4">
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                <Mail className="h-4 w-4" />
+                {t('brandingEditor.emailPreview')}
+              </div>
+              <div className="overflow-hidden rounded-lg border bg-background">
+                <div
+                  className={`flex items-center justify-between px-4 py-3 ${primaryToken.bgClass} ${primaryToken.textOnClass}`}
+                >
+                  <div className="flex items-center gap-2">
+                    {safeLogoLightPreview ? (
+                      <img
+                        src={safeLogoLightPreview}
+                        alt={t('brandingEditor.lightLogoPreview')}
+                        className="h-8 w-8 rounded-full bg-white/20 object-cover"
+                      />
+                    ) : (
+                      <div className="flex h-8 w-8 items-center justify-center rounded-full border border-white/30 bg-white/20 text-xs font-semibold uppercase">
+                        {initials}
+                      </div>
+                    )}
+                    <div>
+                      <p className="text-sm font-semibold">{branding.organizationName}</p>
+                      <p className="text-xs opacity-80">{t('brandingEditor.weeklySummary')}</p>
+                    </div>
+                  </div>
+                  <span className="text-xs font-semibold uppercase tracking-wide">Breeze</span>
+                </div>
+                <div className="space-y-3 p-4 text-sm">
+                  <p>{t('brandingEditor.helloPreview')}</p>
+                  <p className="text-muted-foreground">
+                    {t('brandingEditor.emailBodyPreview')}
+                  </p>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      className={`rounded-md px-3 py-2 text-xs font-semibold ${secondaryToken.bgClass} ${secondaryToken.textOnClass}`}
+                    >
+                      {t('brandingEditor.viewDashboard')}
+                    </button>
+                    <span className="text-xs text-muted-foreground">
+                      {t('brandingEditor.questions', { email: branding.supportEmail })}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                <Globe className="h-4 w-4" />
+                {t('brandingEditor.portalPreview')}
+              </div>
+              <div className="space-y-4 rounded-lg border bg-background p-4">
+                <div
+                  className={`flex flex-wrap items-center justify-between gap-3 rounded-md border px-3 py-2 ${primaryToken.borderClass}`}
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-8 w-8 items-center justify-center rounded-md border bg-muted text-xs font-semibold">
+                      {safeFaviconPreview ? (
+                        <img
+                          src={safeFaviconPreview}
+                          alt={t('brandingEditor.faviconPreview')}
+                          className="h-6 w-6 rounded-sm object-contain"
+                        />
+                      ) : (
+                        initials[0] ?? 'B'
+                      )}
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {safeLogoLightPreview ? (
+                        <img
+                          src={safeLogoLightPreview}
+                          alt={t('brandingEditor.portalLogoPreview')}
+                          className="h-8 w-8 rounded-md object-cover"
+                        />
+                      ) : (
+                        <div className="flex h-8 w-8 items-center justify-center rounded-md border bg-muted text-xs font-semibold">
+                          {initials}
+                        </div>
+                      )}
+                      <div>
+                        <p className="text-sm font-semibold">{branding.portalName}</p>
+                        <p className="text-xs text-muted-foreground">{branding.portalUrl}</p>
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`rounded-md px-3 py-2 text-xs font-semibold ${secondaryToken.bgClass} ${secondaryToken.textOnClass}`}
+                  >
+                    {t('brandingEditor.newRequest')}
+                  </button>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className={`rounded-md border p-3 ${secondaryToken.borderClass}`}>
+                    <p className="text-xs text-muted-foreground">{t('brandingEditor.openRequests')}</p>
+                    <p className="text-xl font-semibold">12</p>
+                  </div>
+                  <div className="rounded-md border p-3">
+                    <p className="text-xs text-muted-foreground">{t('brandingEditor.csatScore')}</p>
+                    <p className="text-xl font-semibold">94%</p>
+                  </div>
+                </div>
+
+                <div className="rounded-md border border-slate-800 bg-slate-950 p-3 text-slate-100">
+                  <div className="flex items-center gap-3">
+                    {safeLogoDarkPreview ? (
+                      <img
+                        src={safeLogoDarkPreview}
+                        alt={t('brandingEditor.darkLogoPreview')}
+                        className="h-7 w-7 rounded-md object-cover"
+                      />
+                    ) : (
+                      <div className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-700 bg-slate-900 text-xs font-semibold">
+                        {initials}
+                      </div>
+                    )}
+                    <div>
+                      <p className="text-xs font-semibold">{t('brandingEditor.darkHeader')}</p>
+                      <p className="chart-legend-xs text-slate-400">{t('brandingEditor.darkAssetsPreview')}</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}

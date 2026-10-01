@@ -1,0 +1,221 @@
+import { and, eq, inArray, isNull, sql, type SQL } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { oauthClients, oauthClientPartnerGrants, oauthGrants, oauthRefreshTokens } from '../db/schema';
+import { revokeGrantsDurablyInCurrentDbContext } from './grantStatus';
+import { writeOAuthRevocationMarkerDurably } from './revocationRetry';
+import { ERROR_IDS, logOauthError } from './log';
+
+// Grant-marker TTL must outlive the longest access JWT minted under a grant.
+// Kept in sync with `ACCESS_TOKEN_TTL_SECONDS` in oauth/provider.ts (1800s
+// since #2363 — a shorter marker here would leave already-minted access JWTs
+// alive after the marker expired). We define it locally (rather than
+// importing provider) so this module stays off the
+// provider → adapter → revocationService import chain — adapter deliberately
+// avoids importing provider to prevent a require cycle. Exported so
+// provider.test.ts can assert the constants never drift
+// (GRANT_REVOCATION_TTL_SECONDS >= ACCESS_TOKEN_TTL_SECONDS).
+export const GRANT_REVOCATION_TTL_SECONDS = 1800;
+
+/**
+ * Explicit revocation scope for a shared OAuth (DCR) client. A single
+ * `client_id` is shared across every partner that installs the app, so
+ * "revoke this client" is ambiguous without a scope:
+ *
+ *   - `global`  — registration-management DELETE of the client itself.
+ *                 Revokes EVERY family and disables the client row.
+ *   - `partner` — one partner disconnects the shared app for their tenant.
+ *                 Revokes only that partner's families and removes only their
+ *                 join row; other partners keep working.
+ *   - `user`    — one user revokes one client (self-service / admin lifecycle).
+ */
+export type OAuthRevocationScope =
+  | { kind: 'global' }
+  | { kind: 'partner'; partnerId: string }
+  | { kind: 'user'; userId: string; partnerId?: string };
+
+export interface RevokeClientFamiliesResult {
+  grants: number;
+  refreshTokens: number;
+}
+
+/**
+ * Central grant-family revocation.
+ *
+ * Grant discovery is authoritative from `oauth_grants` — refresh-token rows
+ * are supplemental (they drive per-token jti markers only). This closes the
+ * code-only-grant gap (MCP-OAUTH-07): an auth-code access token minted without
+ * a refresh token still has an `oauth_grants` row, so it is discovered and
+ * revoked here even though no refresh row exists.
+ *
+ * Ordering is FAIL CLOSED (design §3):
+ *   1. resolve affected grants + active refresh rows;
+ *   2. write grant-wide + token jti Redis markers — THROW on any failure so
+ *      the caller can surface a 503 and NOT proceed (never hide/disable an app
+ *      whose in-flight access JWTs we could not mark revoked);
+ *   3. stamp `oauth_grants.revoked_at/by/reason` + refresh `revoked_at`;
+ *   4. partner scope: delete only that partner's join row;
+ *   5. global scope only: set `oauth_clients.disabled_at` LAST, after every
+ *      family is revoked.
+ *
+ * Steps 3-5 all run inside the single transaction that
+ * `withSystemDbAccessContext` already holds, so they are atomic together
+ * without opening a nested transaction (nesting inside a held context would
+ * pin a second pooled connection idle-in-transaction — #1105).
+ *
+ * Idempotent: a repeat call finds no active families (revoked_at filter), so
+ * it writes no markers, mutates no grant/refresh rows, and the global-scope
+ * client disable is guarded by `disabled_at IS NULL`.
+ *
+ * Runs in an explicit system DB context (callers may be inside a request).
+ */
+export async function revokeClientFamilies(
+  clientId: string,
+  scope: OAuthRevocationScope,
+  opts: { revokedByUserId?: string; reason?: string } = {},
+): Promise<RevokeClientFamiliesResult> {
+  const outcome = await runOutsideDbContext(() =>
+    withSystemDbAccessContext(() => revokeClientFamiliesInSystemContext(clientId, scope, opts)),
+  );
+  if (outcome.retryQueued) {
+    throw new Error('OAuth revocation cache unavailable; durable retry queued');
+  }
+  return outcome.result;
+}
+
+function grantScopeCondition(clientId: string, scope: OAuthRevocationScope): SQL[] {
+  const conds: SQL[] = [eq(oauthGrants.clientId, clientId), isNull(oauthGrants.revokedAt)];
+  if (scope.kind === 'partner') {
+    conds.push(eq(oauthGrants.partnerId, scope.partnerId));
+  } else if (scope.kind === 'user') {
+    conds.push(eq(oauthGrants.accountId, scope.userId));
+    if (scope.partnerId) conds.push(eq(oauthGrants.partnerId, scope.partnerId));
+  }
+  return conds;
+}
+
+function refreshScopeCondition(clientId: string, scope: OAuthRevocationScope): SQL[] {
+  const conds: SQL[] = [eq(oauthRefreshTokens.clientId, clientId), isNull(oauthRefreshTokens.revokedAt)];
+  if (scope.kind === 'partner') {
+    conds.push(eq(oauthRefreshTokens.partnerId, scope.partnerId));
+  } else if (scope.kind === 'user') {
+    conds.push(eq(oauthRefreshTokens.userId, scope.userId));
+    if (scope.partnerId) conds.push(eq(oauthRefreshTokens.partnerId, scope.partnerId));
+  }
+  return conds;
+}
+
+async function revokeClientFamiliesInSystemContext(
+  clientId: string,
+  scope: OAuthRevocationScope,
+  opts: { revokedByUserId?: string; reason?: string },
+): Promise<{ result: RevokeClientFamiliesResult; retryQueued: boolean }> {
+  // 1. Authoritative discovery: grants first (source of truth), refresh rows
+  //    supplemental (jti markers only).
+  const grants = await db
+    .select({ id: oauthGrants.id, accountId: oauthGrants.accountId })
+    .from(oauthGrants)
+    .where(and(...grantScopeCondition(clientId, scope)));
+
+  const refreshRows = await db
+    .select({
+      id: oauthRefreshTokens.id,
+      userId: oauthRefreshTokens.userId,
+      expiresAt: oauthRefreshTokens.expiresAt,
+    })
+    .from(oauthRefreshTokens)
+    .where(and(...refreshScopeCondition(clientId, scope)));
+
+  let retryQueued = false;
+
+  // 2. Attempt every Redis marker. Failures become durable work in this same
+  // transaction; the public fail-closed error is raised only after commit.
+  for (const grant of grants) {
+    const result = await writeOAuthRevocationMarkerDurably(db, {
+      userId: grant.accountId,
+      markerType: 'grant',
+      markerId: grant.id,
+      expiresAt: new Date(Date.now() + GRANT_REVOCATION_TTL_SECONDS * 1000),
+    });
+    if (result.status === 'retry_queued') {
+      retryQueued = true;
+      logOauthError({
+        errorId: ERROR_IDS.OAUTH_REVOCATION_CACHE_WRITE_FAILED,
+        message: 'revocation-service grant marker queued for retry',
+        context: { clientId, markerType: 'grant', scope: scope.kind, errorCode: result.errorCode },
+      });
+    }
+  }
+
+  for (const row of refreshRows) {
+    // Key the jti marker on the token ROW id, never on payload.jti — Task 3
+    // removes jti from the refresh payload but the row id (its digest) remains
+    // the authoritative token identifier.
+    const ttl = Math.max(Math.ceil((new Date(row.expiresAt).getTime() - Date.now()) / 1000), 1);
+    const result = await writeOAuthRevocationMarkerDurably(db, {
+      userId: row.userId,
+      markerType: 'jti',
+      markerId: row.id,
+      expiresAt: new Date(Date.now() + ttl * 1000),
+    });
+    if (result.status === 'retry_queued') {
+      retryQueued = true;
+      logOauthError({
+        errorId: ERROR_IDS.OAUTH_REVOCATION_CACHE_WRITE_FAILED,
+        message: 'revocation-service refresh-token marker queued for retry',
+        context: { clientId, markerType: 'jti', scope: scope.kind, errorCode: result.errorCode },
+      });
+    }
+  }
+
+  // 3-5. DB mutations run inside the held system-context transaction, so they
+  //      are atomic without a nested transaction.
+  const now = new Date();
+  const grantIds = grants.map((g) => g.id);
+  const refreshIds = refreshRows.map((r) => r.id);
+
+  // Consumes every live authorization code for these Grants, then stamps
+  // revoked_at — see revokeGrantsDurablyInCurrentDbContext for why that order.
+  // The explicit refresh rows are revoked separately below because a partner
+  // disconnect revokes only the ids its scope query selected.
+  await revokeGrantsDurablyInCurrentDbContext({
+    grantIds,
+    reason: opts.reason ?? null,
+    revokedByUserId: opts.revokedByUserId ?? null,
+    now,
+  });
+
+  if (refreshIds.length > 0) {
+    await db
+      .update(oauthRefreshTokens)
+      .set({ revokedAt: now })
+      .where(inArray(oauthRefreshTokens.id, refreshIds));
+  }
+
+  // 4. Partner disconnect removes only this partner's join row; the shared
+  //    client and every other partner's grants are untouched.
+  if (scope.kind === 'partner') {
+    await db
+      .delete(oauthClientPartnerGrants)
+      .where(
+        and(
+          eq(oauthClientPartnerGrants.clientId, clientId),
+          eq(oauthClientPartnerGrants.partnerId, scope.partnerId),
+        ),
+      );
+  }
+
+  // 5. Global registration-management deletion disables the shared client
+  //    LAST, only after every family has been revoked. Guarded on
+  //    `disabled_at IS NULL` so a repeat call is a true no-op.
+  if (scope.kind === 'global') {
+    await db
+      .update(oauthClients)
+      .set({ disabledAt: now })
+      .where(and(eq(oauthClients.id, clientId), isNull(oauthClients.disabledAt)));
+  }
+
+  return {
+    result: { grants: grants.length, refreshTokens: refreshRows.length },
+    retryQueued,
+  };
+}

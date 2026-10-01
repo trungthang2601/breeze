@@ -1,0 +1,6 @@
+---
+// Communication (Slack/Teams/Discord) config now lives on the /integrations hub
+// Notifications tab. Keep this route as a permanent alias so existing bookmarks /
+// in-app links land there instead of an orphaned standalone page.
+return Astro.redirect('/integrations#notifications', 301);
+---

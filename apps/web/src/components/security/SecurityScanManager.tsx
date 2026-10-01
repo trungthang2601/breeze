@@ -1,0 +1,635 @@
+import { useTranslation } from "react-i18next";
+import "@/lib/i18n";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity,
+  CheckCircle2,
+  HardDrive,
+  Loader2,
+  Play,
+  Timer,
+} from "lucide-react";
+import { fetchWithAuth } from "@/stores/auth";
+import { formatDateTime } from "@/lib/dateTimeFormat";
+import { friendlyFetchError } from "@/lib/utils";
+import { errorKindOf, throwIfNotOk, type LoadErrorKind } from "@/lib/httpError";
+import { runAction } from "@/lib/runAction";
+import { showToast } from "../shared/Toast";
+import AccessDenied from "../shared/AccessDenied";
+import ProgressBar, {
+  ProgressItemList,
+  type ProgressItem,
+} from "../shared/ProgressBar";
+type DeviceStatus = {
+  deviceId: string;
+  deviceName: string;
+  os: "windows" | "macos" | "linux";
+  status: "protected" | "at_risk" | "unprotected" | "offline";
+};
+type ScanRecord = {
+  id: string;
+  deviceId: string;
+  deviceName: string;
+  scanType: "quick" | "full" | "custom";
+  status: "queued" | "running" | "completed" | "failed";
+  startedAt: string | null;
+  finishedAt: string | null;
+  threatsFound: number;
+  durationSeconds: number | null;
+};
+export default function SecurityScanManager() {
+  const { t } = useTranslation("security");
+  const [selectionMode, setSelectionMode] = useState<"single" | "multi">(
+    "multi",
+  );
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [scanType, setScanType] = useState<"quick" | "full" | "custom">(
+    "quick",
+  );
+  const [customPath, setCustomPath] = useState("");
+  const [devices, setDevices] = useState<DeviceStatus[]>([]);
+  const [scans, setScans] = useState<ScanRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [runningScan, setRunningScan] = useState(false);
+  const [scanProgress, setScanProgress] = useState<{
+    completed: number;
+    failed: number;
+    total: number;
+    items: Map<string, "running" | "success" | "failed">;
+  }>({ completed: 0, failed: 0, total: 0, items: new Map() });
+  const [error, setError] = useState<string>();
+  const [errorKind, setErrorKind] = useState<LoadErrorKind>("none");
+  // Distinguishes "this fleet has no scan history" from "we could not read it",
+  // and how much of it we could not read (partial reads are the dangerous case:
+  // the table looks complete).
+  const [scanLoad, setScanLoad] = useState({ failed: 0, total: 0 });
+  const abortRef = useRef<AbortController | null>(null);
+  const selectedDevices = useMemo(
+    () => devices.filter((device) => selectedIds.has(device.deviceId)),
+    [devices, selectedIds],
+  );
+  const activeScans = useMemo(
+    () =>
+      scans
+        .filter((scan) => scan.status === "queued" || scan.status === "running")
+        .slice(0, 10),
+    [scans],
+  );
+  const scanHistory = useMemo(
+    () =>
+      scans
+        .filter(
+          (scan) => scan.status === "completed" || scan.status === "failed",
+        )
+        .slice(0, 25),
+    [scans],
+  );
+  const fetchScansForDevice = useCallback(
+    async (deviceId: string, signal: AbortSignal): Promise<ScanRecord[]> => {
+      const response = await fetchWithAuth(
+        `/security/scans/${deviceId}?limit=10`,
+        { signal },
+      );
+      // Was `if (!response.ok) return []`, which silently turned a failed
+      // per-device scan fetch into "this device has no scan history". Throw so
+      // the settled-result handling below can distinguish a real empty list from
+      // a device whose scans we could not read. (#2472)
+      throwIfNotOk(response);
+      const payload = await response.json();
+      return Array.isArray(payload.data) ? payload.data : [];
+    },
+    [],
+  );
+  const fetchData = useCallback(async () => {
+    setError(undefined);
+    setErrorKind("none");
+    setScanLoad({ failed: 0, total: 0 });
+    setLoading(true);
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      const statusRes = await fetchWithAuth("/security/status?limit=100", {
+        signal: controller.signal,
+      });
+      // HttpError (not a bare Error) so a 403 survives the throw and the render
+      // can tell "you may not see this" from "this broke, try again" (#2472).
+      throwIfNotOk(statusRes);
+      const statusPayload = await statusRes.json();
+      const nextDevices: DeviceStatus[] = Array.isArray(statusPayload.data)
+        ? statusPayload.data.map((item: any) => ({
+            deviceId: item.deviceId,
+            deviceName: item.deviceName,
+            os: item.os,
+            status: item.status,
+          }))
+        : [];
+      setDevices(nextDevices);
+      const scanResults = await Promise.allSettled(
+        nextDevices
+          .slice(0, 25)
+          .map((device) =>
+            fetchScansForDevice(device.deviceId, controller.signal),
+          ),
+      );
+      // This run has been superseded by a newer fetchData; its per-device fetches
+      // were aborted, so everything below would be noise attributed to the wrong
+      // run. `Promise.allSettled` never rejects, so the outer AbortError guard
+      // cannot catch this for us.
+      if (controller.signal.aborted) return;
+      // A rejected per-device fetch is NOT "this device has no scans" — but an
+      // ABORTED one is not a failure either, it is just a superseded request.
+      // Count only genuine failures. (#2472)
+      const rejected = scanResults.filter(
+        (r): r is PromiseRejectedResult =>
+          r.status === "rejected" &&
+          !(r.reason instanceof DOMException && r.reason.name === "AbortError"),
+      );
+      if (rejected.length > 0) {
+        console.error(
+          `[SecurityScanManager] ${rejected.length}/${scanResults.length} scan-history fetches failed:`,
+          rejected[0].reason,
+        );
+      }
+      // Surfaced whatever the row count is. Showing only the devices we could read
+      // — with no note that others were unreadable — is a scan-history table that
+      // looks complete and silently isn't.
+      setScanLoad({ failed: rejected.length, total: scanResults.length });
+      const nextScans = scanResults.flatMap((result) =>
+        result.status === "fulfilled" ? result.value : [],
+      );
+      const deduped = new Map<string, ScanRecord>();
+      nextScans.forEach((scan) => deduped.set(scan.id, scan));
+      setScans(
+        Array.from(deduped.values()).sort((a, b) => {
+          const aTime = a.startedAt ? new Date(a.startedAt).getTime() : 0;
+          const bTime = b.startedAt ? new Date(b.startedAt).getTime() : 0;
+          return bTime - aTime;
+        }),
+      );
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      console.error("[SecurityScanManager] fetch error:", err);
+      const kind = errorKindOf(err);
+      setErrorKind(kind);
+      // 'denied' renders AccessDenied, which supplies its own copy.
+      if (kind === "other") setError(friendlyFetchError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [fetchScansForDevice]);
+  useEffect(() => {
+    fetchData();
+    return () => abortRef.current?.abort();
+  }, [fetchData]);
+  const handleSelectDevice = (id: string) => {
+    setSelectedIds((prev) => {
+      if (selectionMode === "single") return new Set([id]);
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const handleSelectMode = (mode: "single" | "multi") => {
+    setSelectionMode(mode);
+    if (mode === "single" && selectedIds.size > 1) {
+      const first = selectedIds.values().next().value as string | undefined;
+      setSelectedIds(first ? new Set([first]) : new Set());
+    }
+  };
+  const startScan = async () => {
+    if (selectedDevices.length === 0) return;
+    setRunningScan(true);
+    setError(undefined);
+    const total = selectedDevices.length;
+    const itemMap = new Map<string, "running" | "success" | "failed">();
+    selectedDevices.forEach((d) => itemMap.set(d.deviceId, "running"));
+    setScanProgress({
+      completed: 0,
+      failed: 0,
+      total,
+      items: new Map(itemMap),
+    });
+    let completedCount = 0;
+    let failedCount = 0;
+    try {
+      const body = {
+        scanType,
+        ...(scanType === "custom" && customPath.trim()
+          ? { paths: [customPath.trim()] }
+          : {}),
+      };
+      // Aggregate handler with inline per-device feedback (the progress list
+      // below shows each device's outcome): each request still goes through
+      // runAction so a failure isn't silently swallowed, but the summary
+      // banner (allScanRequestsFailed / someScanRequestsFailed) and the
+      // per-device ProgressItemList remain the primary feedback surface — a
+      // single aggregate success toast fires once rather than once per device.
+      await Promise.all(
+        selectedDevices.map(async (device) => {
+          try {
+            await runAction({
+              request: () =>
+                fetchWithAuth(`/security/scan/${device.deviceId}`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(body),
+                }),
+              errorFallback: t("securitySecurityScanManager.scanRequestFailed"),
+            });
+            completedCount++;
+            itemMap.set(device.deviceId, "success");
+          } catch {
+            failedCount++;
+            itemMap.set(device.deviceId, "failed");
+          }
+          setScanProgress({
+            completed: completedCount,
+            failed: failedCount,
+            total,
+            items: new Map(itemMap),
+          });
+        }),
+      );
+      if (completedCount > 0) {
+        showToast({
+          message: t("securitySecurityScanManager.scansQueuedCount", {
+            count: completedCount,
+          }),
+          type: "success",
+        });
+      }
+      if (failedCount > 0 && completedCount === 0) {
+        setError(
+          t("securitySecurityScanManager.allScanRequestsFailed", {
+            count: failedCount,
+          }),
+        );
+      } else if (failedCount > 0) {
+        setError(
+          t("securitySecurityScanManager.someScanRequestsFailed", {
+            failed: failedCount,
+            total,
+          }),
+        );
+      }
+      await fetchData();
+    } catch (err) {
+      setError(friendlyFetchError(err));
+    } finally {
+      setRunningScan(false);
+    }
+  };
+  const formatDuration = (durationSeconds: number | null): string => {
+    if (!durationSeconds || durationSeconds <= 0) return "-";
+    if (durationSeconds < 60) return `${durationSeconds}s`;
+    const minutes = Math.floor(durationSeconds / 60);
+    const seconds = durationSeconds % 60;
+    return `${minutes}m ${seconds}s`;
+  };
+  const formatTimestamp = (value: string | null): string => {
+    if (!value) return "-";
+    return formatDateTime(value, { fallback: "-" });
+  };
+  const managerHeader = (
+    <div className="flex flex-col gap-2">
+      <h2 className="text-lg font-semibold">
+        {t("securitySecurityScanManager.securityScanManager")}
+      </h2>
+      <p className="text-sm text-muted-foreground">
+        {t("securitySecurityScanManager.startScansWatchProgressAndReviewScan")}
+      </p>
+    </div>
+  );
+  const scanHistoryFailed = scanLoad.failed > 0;
+  // The device list is the spine of this panel — without it there is nothing to
+  // scan and no history to show. A 403 is terminal, so stop here rather than
+  // rendering an empty device picker that implies the fleet has no devices.
+  // (#2472)
+  if (errorKind === "denied") {
+    return (
+      <div className="space-y-6">
+        {managerHeader}
+        <AccessDenied testId="security-scan-manager-denied" />
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-6">
+      {managerHeader}
+
+      {error && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      {/* Partial reads are the dangerous case: the history table below renders only
+          the devices we COULD read, which looks complete and silently isn't. Say so
+          regardless of how many rows came back. (#2472) */}
+      {scanHistoryFailed && (
+        <div
+          className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-400"
+          data-testid="scan-history-partial-failure"
+          role="status"
+        >
+          {t("securitySecurityScanManager.scanHistoryPartiallyUnavailable", {
+            failed: scanLoad.failed,
+            total: scanLoad.total,
+          })}
+        </div>
+      )}
+
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div className="space-y-1">
+            <h3 className="text-base font-semibold">
+              {t("securitySecurityScanManager.startAScan")}
+            </h3>
+            <p className="text-sm text-muted-foreground">
+              {t("securitySecurityScanManager.devicesSelected", {
+                count: selectedDevices.length,
+              })}
+            </p>
+          </div>
+          <div className="inline-flex rounded-md border bg-muted/30 p-1 text-sm">
+            <button
+              type="button"
+              onClick={() => handleSelectMode("single")}
+              className={`rounded-md px-3 py-1 ${selectionMode === "single" ? "bg-background shadow-xs" : "text-muted-foreground"}`}
+            >
+              {t("securitySecurityScanManager.singleSelect")}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSelectMode("multi")}
+              className={`rounded-md px-3 py-1 ${selectionMode === "multi" ? "bg-background shadow-xs" : "text-muted-foreground"}`}
+            >
+              {t("securitySecurityScanManager.multiSelect")}
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-4 lg:grid-cols-3">
+          <div className="rounded-md border bg-muted/20 p-4">
+            <p className="text-xs uppercase text-muted-foreground">
+              {t("securitySecurityScanManager.devices")}
+            </p>
+            {loading ? (
+              <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t("securitySecurityScanManager.loadingDevices")}
+              </div>
+            ) : (
+              <div className="mt-3 space-y-2">
+                {devices.map((device) => (
+                  <label
+                    key={device.deviceId}
+                    className="flex cursor-pointer items-center justify-between rounded-md border bg-background px-3 py-2 text-sm"
+                  >
+                    <div>
+                      <p className="font-medium">{device.deviceName}</p>
+                      <p className="text-xs capitalize text-muted-foreground">
+                        {device.os} - {device.status.replace("_", " ")}
+                      </p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(device.deviceId)}
+                      onChange={() => handleSelectDevice(device.deviceId)}
+                      className="h-4 w-4 rounded border-border"
+                    />
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-md border bg-muted/20 p-4 lg:col-span-2">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <label className="text-xs uppercase text-muted-foreground">
+                  {t("securitySecurityScanManager.scanType")}
+                </label>
+                <select
+                  value={scanType}
+                  onChange={(event) =>
+                    setScanType(
+                      event.target.value as "quick" | "full" | "custom",
+                    )
+                  }
+                  className="mt-2 h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                >
+                  <option value="quick">
+                    {t("securitySecurityScanManager.quickScan")}
+                  </option>
+                  <option value="full">
+                    {t("securitySecurityScanManager.fullScan")}
+                  </option>
+                  <option value="custom">
+                    {t("securitySecurityScanManager.customScan")}
+                  </option>
+                </select>
+              </div>
+              {scanType === "custom" && (
+                <div>
+                  <label className="text-xs uppercase text-muted-foreground">
+                    {t("securitySecurityScanManager.customPath")}
+                  </label>
+                  <input
+                    type="text"
+                    value={customPath}
+                    onChange={(event) => setCustomPath(event.target.value)}
+                    placeholder={t("securitySecurityScanManager.cData")}
+                    className="mt-2 h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={startScan}
+                disabled={selectedDevices.length === 0 || runningScan}
+                className="inline-flex items-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {runningScan ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Play className="h-4 w-4" />
+                )}
+                {t("securitySecurityScanManager.startScan")}
+              </button>
+              <div className="text-sm text-muted-foreground">
+                {t(
+                  "securitySecurityScanManager.scansAreQueuedImmediatelyOnSelectedDevices",
+                )}
+              </div>
+            </div>
+
+            {/* Scan submission progress */}
+            {runningScan && scanProgress.total > 1 && (
+              <div className="mt-4 rounded-md border bg-background p-4 space-y-3">
+                <ProgressBar
+                  current={scanProgress.completed + scanProgress.failed}
+                  total={scanProgress.total}
+                  label={`Submitting scans to ${scanProgress.total} devices...`}
+                  variant={scanProgress.failed > 0 ? "warning" : "default"}
+                />
+                <ProgressItemList
+                  items={Array.from(scanProgress.items.entries()).map(
+                    ([deviceId, status]): ProgressItem => {
+                      const device = devices.find(
+                        (d) => d.deviceId === deviceId,
+                      );
+                      return {
+                        id: deviceId,
+                        label: device?.deviceName ?? deviceId,
+                        status:
+                          status === "running"
+                            ? "running"
+                            : status === "success"
+                              ? "success"
+                              : "failed",
+                      };
+                    },
+                  )}
+                  maxVisible={6}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <div className="flex items-center justify-between">
+            <h3 className="text-base font-semibold">
+              {t("securitySecurityScanManager.activeScans")}
+            </h3>
+            <Activity className="h-5 w-5 text-muted-foreground" />
+          </div>
+          <div className="mt-4 space-y-4">
+            {activeScans.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                {/* "No active scans" is only true if we actually read them. */}
+                {scanHistoryFailed
+                  ? t("securitySecurityScanManager.scanHistoryUnavailable")
+                  : t("securitySecurityScanManager.noActiveScans")}
+              </p>
+            ) : (
+              activeScans.map((scan) => (
+                <div
+                  key={scan.id}
+                  className="rounded-md border bg-muted/30 p-4"
+                >
+                  <div className="flex items-center justify-between text-sm font-medium">
+                    <span>{scan.deviceName}</span>
+                    <span className="capitalize">
+                      {t("securitySecurityScanManager.scanTypeLabel", {
+                        type: scan.scanType,
+                      })}
+                    </span>
+                  </div>
+                  <div className="mt-2 text-xs text-muted-foreground">
+                    {t("securitySecurityScanManager.started", {
+                      time: formatTimestamp(scan.startedAt),
+                    })}
+                  </div>
+                  <div className="mt-2 text-xs text-muted-foreground capitalize">
+                    {t("securitySecurityScanManager.status", {
+                      status: scan.status,
+                    })}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <div className="flex items-center justify-between">
+            <h3 className="text-base font-semibold">
+              {t("securitySecurityScanManager.scanHistory")}
+            </h3>
+            <HardDrive className="h-5 w-5 text-muted-foreground" />
+          </div>
+          <div className="mt-4 overflow-x-auto rounded-md border">
+            <table className="min-w-full divide-y">
+              <thead className="bg-muted/40">
+                <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  <th className="px-4 py-3">
+                    {t("securitySecurityScanManager.device")}
+                  </th>
+                  <th className="px-4 py-3">
+                    {t("securitySecurityScanManager.type")}
+                  </th>
+                  <th className="px-4 py-3">
+                    {t("securitySecurityScanManager.status2")}
+                  </th>
+                  <th className="px-4 py-3">
+                    {t("securitySecurityScanManager.startedColumn")}
+                  </th>
+                  <th className="px-4 py-3">
+                    {t("securitySecurityScanManager.duration")}
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {scanHistory.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={5}
+                      className="px-4 py-6 text-center text-sm text-muted-foreground"
+                    >
+                      {/* Empty vs unreadable are different facts — say which. */}
+                      {scanHistoryFailed
+                        ? t("securitySecurityScanManager.scanHistoryUnavailable")
+                        : t("securitySecurityScanManager.noScanHistoryYet")}
+                    </td>
+                  </tr>
+                ) : (
+                  scanHistory.map((scan) => (
+                    <tr key={scan.id} className="text-sm">
+                      <td className="px-4 py-3 font-medium">
+                        {scan.deviceName}
+                      </td>
+                      <td className="px-4 py-3 capitalize text-muted-foreground">
+                        {scan.scanType}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-xs font-semibold ${scan.status === "completed" ? "bg-emerald-500/10 text-emerald-700" : "bg-red-500/10 text-red-700"}`}
+                        >
+                          <CheckCircle2 className="h-3 w-3" />
+                          {scan.status === "completed"
+                            ? `Clean${scan.threatsFound > 0 ? ` (${scan.threatsFound})` : ""}`
+                            : t("securitySecurityScanManager.failed")}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-muted-foreground">
+                        {formatTimestamp(scan.startedAt)}
+                      </td>
+                      <td className="px-4 py-3 text-muted-foreground">
+                        {formatDuration(scan.durationSeconds)}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+            <Timer className="h-4 w-4" />
+            {t(
+              "securitySecurityScanManager.historyShowsTheLatestCompletedAndFailed",
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

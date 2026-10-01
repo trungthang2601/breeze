@@ -1,0 +1,1679 @@
+/**
+ * AI Chat Routes
+ *
+ * REST + SSE endpoints for the AI chat sidebar.
+ * Uses streaming input mode via StreamingSessionManager for persistent sessions.
+ */
+
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { streamSSE } from 'hono/streaming';
+import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
+import { aiScriptAuthoringEnabled } from '../config/env';
+import { loadScriptProposalReviewerDisagreements } from '../services/scriptProposals/metrics';
+import {
+  createSession,
+  getSession,
+  listSessions,
+  closeSession,
+  getSessionMessages,
+  handleApproval,
+  isIntentBackedExecution,
+  searchSessions,
+  listM365Connections,
+  resolveDefaultModel,
+  sanitizeErrorForClient,
+} from '../services/aiAgent';
+import { runPreFlightChecks, abortActivePlan, settleBlockedTurnForNewMessage } from '../services/aiAgentSdk';
+import { sanitizeThrownToolError } from '../services/aiToolErrors';
+import { redactPersistedToolInput } from '../services/aiToolOutput';
+import { streamingSessionManager } from '../services/streamingSessionManager';
+import { drainPendingRunResults } from '../services/workspace/chatRunBridge';
+import {
+  calculateCatalogCostCents,
+  calculateCostCents,
+  getUsageSummary,
+  updateBudget,
+  getSessionHistory,
+  recordUsage,
+  type CatalogPricingSnapshot,
+} from '../services/aiCostTracker';
+import { createTicket, changeTicketStatus, TicketServiceError } from '../services/ticketService';
+import { createTimeEntry, TimeEntryServiceError } from '../services/timeEntryService';
+import { writeRouteAudit } from '../services/auditEvents';
+import { assertNotLocked } from '../services/effectiveSettings';
+import { normalizeAlertThresholds, evaluateAiBudgetThresholds } from '../services/aiBudgetAlerts';
+import { db } from '../db';
+import { aiSessions, aiMessages, aiToolExecutions, auditLogs, organizations, devices, actionIntents, scriptProposals, scriptExecutions, aiScriptLaneState } from '../db/schema';
+import { eq, and, desc, gte, lte, count, avg, sql as drizzleSql } from 'drizzle-orm';
+import { REVEAL_WINDOW_DAYS } from '../services/actionIntents/resultSecrets';
+import { PERMISSIONS } from '../services/permissions';
+import {
+  createAiSessionSchema as sharedCreateAiSessionSchema,
+  sendAiMessageSchema,
+  approveToolSchema,
+  approvePlanSchema,
+  pauseAiSchema,
+  aiSessionQuerySchema
+} from '@breeze/shared/validators/ai';
+import { aiActionPlans } from '../db/schema';
+import { captureException } from '../services/sentry';
+import { getConfig } from '../config/validate';
+import { OpenAICompatibleProvider } from '../services/llm/openaiCompatibleProvider';
+import { OpenAISessionManager } from '../services/llm/openaiSessionManager';
+import {
+  draftTicketFromTranscript,
+  ThinTranscriptError,
+  TicketDraftFailedError,
+} from '../services/aiTicketDraft';
+import { getAnthropicClientForPartner, LlmUnavailableError, resolveWireModel } from '../services/llm/llmConfigResolver';
+import { createTicketFromChatSchema, type AiTicketDraft } from '@breeze/shared';
+import { deviceInSiteScope } from './tickets/siteScope';
+import { timeActorFrom } from './timeEntries/timeEntries';
+import {
+  isAiBudgetLockTimeout,
+  markAiBudgetReservationIndeterminate,
+  releaseUnusedAiBudgetReservation,
+  reserveAiBudget,
+  type ReserveAiBudgetResult,
+} from '../services/aiBudgetReservations';
+
+// Provider check that tolerates an unvalidated config: route unit tests never
+// call validateConfig(), and getConfig() throws in that state. Without a
+// validated config, behave as the default anthropic path. Production always
+// validates at boot, so this never masks a misconfiguration there.
+export function isOpenAICompatibleProvider(): boolean {
+  try {
+    return getConfig().MCP_LLM_PROVIDER === 'openai-compatible';
+  } catch {
+    return false;
+  }
+}
+
+// Lazy singleton for the openai-compatible path.
+// Only constructed on first use when MCP_LLM_PROVIDER=openai-compatible.
+let _openaiSessionManager: OpenAISessionManager | null = null;
+function getOpenAISessionManager(): OpenAISessionManager {
+  if (!_openaiSessionManager) {
+    const cfg = getConfig();
+    if (!cfg.MCP_LLM_BASE_URL) {
+      // Should be caught at startup by the superRefine cross-field validation,
+      // but guard here in case getConfig() is called before validateConfig().
+      throw new Error('MCP_LLM_BASE_URL is required when MCP_LLM_PROVIDER is openai-compatible');
+    }
+    if (
+      cfg.MCP_LLM_PROVIDER === 'openai-compatible' &&
+      cfg.MCP_LLM_PRICE_INPUT_PER_M_USD === 0 &&
+      cfg.MCP_LLM_PRICE_OUTPUT_PER_M_USD === 0
+    ) {
+      console.warn(
+        'MCP_LLM_PROVIDER=openai-compatible but both MCP_LLM_PRICE_*_PER_M_USD are 0: cost tracking and budget enforcement are no-ops on this path.'
+      );
+    }
+    const provider = new OpenAICompatibleProvider({
+      baseUrl: cfg.MCP_LLM_BASE_URL,
+      apiKey: cfg.MCP_LLM_API_KEY!,
+      priceInputPerMUsd: cfg.MCP_LLM_PRICE_INPUT_PER_M_USD,
+      priceOutputPerMUsd: cfg.MCP_LLM_PRICE_OUTPUT_PER_M_USD,
+    });
+    _openaiSessionManager = new OpenAISessionManager(provider);
+  }
+  return _openaiSessionManager;
+}
+
+const createAiSessionSchema = sharedCreateAiSessionSchema.extend({
+  orgId: z.string().guid().optional(),
+  delegantM365ConnectionId: z.string().guid().optional(),
+  // Bind the session to a specific device (a "task on this computer"). The
+  // device is org-validated in createSession.
+  deviceId: z.string().guid().optional(),
+  // Let the caller pick the approval posture (e.g. plan-first for open-ended
+  // device tasks). Defaults to the column default (per_step) when omitted.
+  approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional()
+});
+
+/**
+ * Derive a short title from the user's first message.
+ * Truncates at a word boundary to ≤80 chars and adds ellipsis if needed.
+ */
+function generateSessionTitle(content: string): string {
+  // Strip excess whitespace
+  const cleaned = content.replace(/\s+/g, ' ').trim();
+  if (cleaned.length <= 80) return cleaned;
+
+  // Truncate at word boundary
+  const truncated = cleaned.slice(0, 80);
+  const lastSpace = truncated.lastIndexOf(' ');
+  return (lastSpace > 20 ? truncated.slice(0, lastSpace) : truncated) + '…';
+}
+
+type AiTurnBudgetDispatch = { reservationId: string; maxBudgetUsd?: number };
+
+function budgetDispatchFrom(result: ReserveAiBudgetResult): AiTurnBudgetDispatch | null {
+  if (result.kind === 'denied') return null;
+  return {
+    reservationId: result.reservationId,
+    ...(result.kind === 'reserved'
+      ? { maxBudgetUsd: result.reservedCostCents / 100 }
+      : {}),
+  };
+}
+
+async function releaseUnusedTurn(orgId: string, dispatch: AiTurnBudgetDispatch): Promise<void> {
+  await releaseUnusedAiBudgetReservation({ orgId, reservationId: dispatch.reservationId });
+}
+
+export const aiRoutes = new Hono();
+const requireAiRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
+// Org-level AI config (budget) and cross-owner moderation (flag/unflag) stay
+// organizations:write actions.
+const requireAiWrite = requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action);
+// #6396: opening and driving your OWN chat session is a dedicated capability
+// (ai_sessions:use) held by Org Admin, Org Technician and Partner Technician — NOT
+// organizations:write, which no seeded org-scope role holds. Tool calls inside
+// the session are re-checked against TOOL_PERMISSIONS (route parity), so this
+// gate opens the conversation without widening what the role can do. Own-session
+// READS use it too: seeded org roles hold neither organizations:read nor :write.
+const requireAiUse = requirePermission(PERMISSIONS.AI_SESSIONS_USE.resource, PERMISSIONS.AI_SESSIONS_USE.action);
+// SR5-09: reading OTHER users' AI sessions (the admin audit dashboard) is a
+// dedicated, higher-trust capability — NOT organizations:read, which every
+// technician/viewer holds and which for ordinary AI routes only ever returns the
+// caller's OWN sessions. Gated on ai_sessions:read_all (Org Admin + Partner Admin).
+const requireAiSessionsReadAll = requirePermission(
+  PERMISSIONS.AI_SESSIONS_READ_ALL.resource,
+  PERMISSIONS.AI_SESSIONS_READ_ALL.action,
+);
+const requireTicketsWrite = requirePermission(PERMISSIONS.TICKETS_WRITE.resource, PERMISSIONS.TICKETS_WRITE.action);
+
+aiRoutes.use('*', authMiddleware);
+
+// ============================================
+// Session CRUD
+// ============================================
+
+// POST /sessions - Create a new AI chat session
+aiRoutes.post(
+  '/sessions',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  zValidator('json', createAiSessionSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const body = c.req.valid('json');
+
+    try {
+      const session = await createSession(auth, body);
+      writeRouteAudit(c, {
+        orgId: session.orgId,
+        action: 'ai.session.create',
+        resourceType: 'ai_session',
+        resourceId: session.id,
+        resourceName: body.title
+      });
+      return c.json(session, 201);
+    } catch (err) {
+      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
+      const message = err instanceof Error ? err.message : 'Failed to create session';
+      if (message === 'Organization context required') return c.json({ error: message }, 400);
+      if (message === 'Invalid M365 connection') return c.json({ error: message }, 400);
+      if (message === 'Invalid device') return c.json({ error: message }, 400);
+      if (message === 'Access denied to this organization') return c.json({ error: message }, 403);
+      // Anything past the four exact-match branches above is an unexpected fault
+      // whose message may be raw driver text (#2603) — genericize it.
+      return c.json({ error: sanitizeThrownToolError('create_ai_session', err) }, 500);
+    }
+  }
+);
+
+// GET /sessions - List user's sessions
+aiRoutes.get(
+  '/sessions',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  zValidator('query', aiSessionQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+
+    const sessions = await listSessions(auth, {
+      status: query.status,
+      page: (query.page ? parseInt(query.page, 10) : 1) || 1,
+      limit: (query.limit ? parseInt(query.limit, 10) : 20) || 20
+    });
+
+    return c.json({ data: sessions });
+  }
+);
+
+// GET /m365-connections - List the caller's active M365 customer connections.
+// Returns ONLY id, customerLabel, customerDisplayName — never delegant pointer fields.
+aiRoutes.get(
+  '/m365-connections',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  async (c) => {
+    const auth = c.get('auth');
+    const rows = await listM365Connections(auth);
+    return c.json({ data: rows });
+  }
+);
+
+// GET /sessions/search - Search past conversations
+// NOTE: Must be registered BEFORE /sessions/:id to prevent `:id` from matching "search"
+aiRoutes.get(
+  '/sessions/search',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.query('q');
+
+    if (!query || query.length < 2) {
+      return c.json({ error: 'Search query must be at least 2 characters' }, 400);
+    }
+
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '20', 10) || 20, 50);
+    const results = await searchSessions(auth, query, { limit });
+    return c.json({ data: results });
+  }
+);
+
+// GET /sessions/:id - Get session with messages
+aiRoutes.get(
+  '/sessions/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+
+    const result = await getSessionMessages(sessionId, auth);
+    if (!result) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    return c.json(result);
+  }
+);
+
+// DELETE /sessions/:id - Close a session
+aiRoutes.delete(
+  '/sessions/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+
+    const closed = await closeSession(sessionId, auth);
+    if (!closed) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    const manager =
+      isOpenAICompatibleProvider()
+        ? getOpenAISessionManager()
+        : streamingSessionManager;
+    manager.remove(sessionId);
+
+    writeRouteAudit(c, {
+      orgId: closed.orgId,
+      action: 'ai.session.close',
+      resourceType: 'ai_session',
+      resourceId: sessionId
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+// PATCH /sessions/:id - Update session title
+aiRoutes.patch(
+  '/sessions/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  zValidator('json', z.object({ title: z.string().min(1).max(255) })),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+    const { title } = c.req.valid('json');
+
+    const session = await getSession(sessionId, auth);
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    await db.update(aiSessions)
+      .set({ title, updatedAt: new Date() })
+      .where(eq(aiSessions.id, sessionId));
+
+    return c.json({ success: true, title });
+  }
+);
+
+// POST /sessions/:id/flag - Flag a conversation
+aiRoutes.post(
+  '/sessions/:id/flag',
+  requireScope('organization', 'partner', 'system'),
+  requireAiWrite,
+  requireMfa(),
+  zValidator('json', z.object({ reason: z.string().max(1000).optional() }).optional()),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+
+    // Flagging is a moderation action (paired with the admin-only unflag below),
+    // not an owner-only read — keep its existing org-scoped behavior.
+    const session = await getSession(sessionId, auth, { allowAnyOwnerInOrg: true });
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    const body = c.req.valid('json') ?? {};
+
+    await db
+      .update(aiSessions)
+      .set({
+        flaggedAt: new Date(),
+        flaggedBy: auth.user?.id ?? null,
+        flagReason: body.reason ?? null,
+      })
+      .where(eq(aiSessions.id, sessionId));
+
+    writeRouteAudit(c, {
+      orgId: session.orgId,
+      action: 'ai.session.flag',
+      resourceType: 'ai_session',
+      resourceId: sessionId,
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+// DELETE /sessions/:id/flag - Unflag a conversation (admin only)
+aiRoutes.delete(
+  '/sessions/:id/flag',
+  requireScope('partner', 'system'),
+  requireAiWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+
+    // Admin-only unflag (requireScope partner/system): moderators clear another
+    // user's flag, so this is deliberately org-scoped, not owner-bound.
+    const session = await getSession(sessionId, auth, { allowAnyOwnerInOrg: true });
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    await db
+      .update(aiSessions)
+      .set({
+        flaggedAt: null,
+        flaggedBy: null,
+        flagReason: null,
+      })
+      .where(eq(aiSessions.id, sessionId));
+
+    writeRouteAudit(c, {
+      orgId: session.orgId,
+      action: 'ai.session.unflag',
+      resourceType: 'ai_session',
+      resourceId: sessionId,
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+// POST /sessions/:id/ticket-draft - Draft a support ticket from an AI conversation
+aiRoutes.post(
+  '/sessions/:id/ticket-draft',
+  requireScope('organization', 'partner', 'system'),
+  requireTicketsWrite,
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+
+    const loaded = await getSessionMessages(sessionId, auth);
+    if (!loaded) return c.json({ error: 'Session not found' }, 404);
+    const { session, messages } = loaded;
+
+    const elapsedMinutes = Math.max(0, Math.round((Date.now() - new Date(session.createdAt).getTime()) / 60000));
+    const model = session.model ?? resolveDefaultModel();
+    const [org] = await db
+      .select({ name: organizations.name, partnerId: organizations.partnerId })
+      .from(organizations)
+      .where(eq(organizations.id, session.orgId))
+      .limit(1);
+    if (!org) return c.json({ error: 'ai_unavailable' }, 503);
+
+    let draft;
+    let billingSource: 'platform' | 'partner_key' = 'platform';
+    let catalogPricing: CatalogPricingSnapshot | undefined;
+    let reservationId: string | undefined;
+    try {
+      const { client, resolved } = await getAnthropicClientForPartner(org.partnerId ?? null, {
+        surface: 'one_shot_ticket_draft',
+        orgId: session.orgId,
+      });
+      billingSource = resolved.source === 'partner' ? 'partner_key' : 'platform';
+      // The session's model translated to what the resolved endpoint speaks —
+      // a catalog endpoint 404s on the platform-logical id. Throws
+      // LlmUnavailableError (handled below as a 503) when the pinned revision
+      // has no verified mapping for this session's model.
+      const wire = resolveWireModel(resolved, model);
+      catalogPricing = wire.catalogPricing;
+      // S8: no stable request identity reaches this surface — the client sends
+      // no message/draft id — so the key is random per dispatch. The unique
+      // (org_id, idempotency_key) index is therefore a structural guarantee
+      // that two dispatches never share a reservation row, NOT a replay guard.
+      // The one caller with a real identity uses it: `ai-agent-run:${run.id}`
+      // in services/aiAgents/runLoop.ts. Give this one a stable key only when
+      // the request schema starts carrying a client-generated id.
+      let reservation;
+      try {
+        reservation = await reserveAiBudget({
+          orgId: session.orgId,
+          idempotencyKey: `ticket-draft:${sessionId}:${crypto.randomUUID()}`,
+          billingSource,
+          sessionId,
+        });
+      } catch (err) {
+        // Same fail-fast answer as the other admission sites: contention on the
+        // org row is a 503 the client can retry, not a 500.
+        if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
+        throw err;
+      }
+      if (reservation.kind === 'denied') return c.json({ error: reservation.message }, 429);
+      reservationId = reservation.reservationId;
+      draft = await draftTicketFromTranscript({
+        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        contextSnapshot: session.contextSnapshot,
+        elapsedMinutes,
+        model: wire.model,
+        partnerId: org.partnerId ?? null,
+        orgId: session.orgId,
+        client,
+        ...(reservation.kind === 'reserved'
+          ? {
+            budgetCents: reservation.reservedCostCents,
+            calculateCostCents: catalogPricing
+              ? (inputTokens, outputTokens) => calculateCatalogCostCents(catalogPricing!, inputTokens, outputTokens)
+              : (inputTokens, outputTokens) => calculateCostCents(model, inputTokens, outputTokens),
+          }
+          : {}),
+      });
+    } catch (err) {
+      if (reservationId) {
+        try {
+          if (err instanceof ThinTranscriptError
+            || (err instanceof TicketDraftFailedError
+              && !err.providerOutcomeUnknown && err.inputTokens === 0 && err.outputTokens === 0)) {
+            await releaseUnusedAiBudgetReservation({ orgId: session.orgId, reservationId });
+          } else if (err instanceof TicketDraftFailedError && !err.providerOutcomeUnknown) {
+            await recordUsage(
+              sessionId,
+              session.orgId,
+              model,
+              err.inputTokens,
+              err.outputTokens,
+              false,
+              billingSource,
+              catalogPricing,
+              reservationId,
+            );
+          } else {
+            await markAiBudgetReservationIndeterminate({ orgId: session.orgId, reservationId });
+          }
+        } catch (budgetError) {
+          captureException(budgetError);
+        }
+      }
+      if (err instanceof ThinTranscriptError) return c.json({ error: err.message }, 422);
+      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
+      console.error('[AI] Ticket draft failed:', err);
+      captureException(err);
+      return c.json({ error: 'Could not draft a ticket from this conversation' }, 502);
+    }
+
+    // Best-effort cost accounting; never fails the request.
+    try {
+      await recordUsage(
+        sessionId,
+        session.orgId,
+        model,
+        draft.inputTokens,
+        draft.outputTokens,
+        false,
+        billingSource,
+        // Catalog traffic meters from the revision snapshot, never Anthropic
+        // list rates.
+        catalogPricing,
+        reservationId,
+      );
+    } catch (err) {
+      captureException(err);
+      if (reservationId) {
+        await markAiBudgetReservationIndeterminate({ orgId: session.orgId, reservationId }).catch(captureException);
+      }
+    }
+
+    let deviceHostname: string | null = null;
+    if (session.deviceId) {
+      const [dev] = await db
+        .select({ hostname: devices.hostname })
+        .from(devices)
+        .where(eq(devices.id, session.deviceId))
+        .limit(1);
+      deviceHostname = dev?.hostname ?? null;
+    }
+
+    const payload: AiTicketDraft = {
+      subject: draft.subject,
+      problemSummary: draft.problemSummary,
+      resolutionSummary: draft.resolutionSummary,
+      suggestedStatus: draft.wasFixed ? 'resolved' : 'open',
+      suggestedTimeMinutes: draft.suggestedTimeMinutes,
+      elapsedMinutes,
+      orgId: session.orgId,
+      orgName: org?.name ?? null,
+      deviceId: session.deviceId ?? null,
+      deviceHostname,
+    };
+    return c.json({ data: payload });
+  }
+);
+
+aiRoutes.post(
+  '/sessions/:id/ticket',
+  requireScope('organization', 'partner', 'system'),
+  requireTicketsWrite,
+  zValidator('json', createTicketFromChatSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+    const body = c.req.valid('json');
+
+    const session = await getSession(sessionId, auth);
+    if (!session) return c.json({ error: 'Session not found' }, 404);
+
+    // deviceId comes from the session; drop it if a site-restricted caller can't reach the device.
+    let deviceId: string | undefined = session.deviceId ?? undefined;
+    if (deviceId && !(await deviceInSiteScope(auth, deviceId))) deviceId = undefined;
+
+    const actor = { userId: auth.user.id, name: auth.user.name, email: auth.user.email };
+
+    let ticket;
+    try {
+      ticket = await createTicket(
+        { source: 'ai', orgId: session.orgId, subject: body.subject, description: body.description, deviceId, priority: body.priority },
+        actor,
+      );
+    } catch (err) {
+      if (err instanceof TicketServiceError) return c.json({ error: err.message }, err.status ?? 400);
+      throw err;
+    }
+
+    let resolved = false;
+    if (body.status === 'resolved') {
+      try {
+        await changeTicketStatus(ticket.id, { status: 'resolved' }, { resolutionNote: body.resolutionNote }, actor);
+        resolved = true;
+      } catch (err) {
+        console.error(`[AI] Ticket ${ticket.id} created but resolve failed:`, err);
+        captureException(err);
+      }
+    }
+
+    let timeLogged = false;
+    let timeLogError: string | undefined;
+    if (body.timeMinutes > 0 && (auth.scope === 'partner' || auth.scope === 'system')) {
+      try {
+        const endedAt = new Date();
+        const startedAt = new Date(endedAt.getTime() - body.timeMinutes * 60_000);
+        await createTimeEntry(
+          { ticketId: ticket.id, startedAt, endedAt, description: 'Logged from AI conversation', ...(body.billable !== undefined ? { isBillable: body.billable } : {}) },
+          timeActorFrom(c),
+        );
+        timeLogged = true;
+      } catch (err) {
+        console.error(`[AI] Ticket ${ticket.id} created but time entry failed:`, err);
+        timeLogError = err instanceof TimeEntryServiceError
+          ? err.message
+          : 'The time entry could not be logged. Please log it on the ticket.';
+      }
+    }
+
+    writeRouteAudit(c, { orgId: session.orgId, action: 'ai.session.create_ticket', resourceType: 'ticket', resourceId: ticket.id });
+    return c.json({ data: ticket, resolved, timeLogged, ...(timeLogError ? { timeLogError } : {}) }, 201);
+  }
+);
+
+// ============================================
+// Message Sending (SSE Stream via Streaming Sessions)
+// ============================================
+
+// POST /sessions/:id/messages - Send a message and stream the response
+aiRoutes.post(
+  '/sessions/:id/messages',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  zValidator('json', sendAiMessageSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+    const body = c.req.valid('json');
+
+    // Pre-flight checks (rate limits, budget, session status, input sanitization)
+    const preflight = await runPreFlightChecks(sessionId, body.content, auth, body.pageContext, c);
+    if (!preflight.ok) {
+      const err = preflight.error;
+      if (err === 'ai_unavailable') return c.json({ error: 'ai_unavailable' }, 503);
+      if (preflight.status === 503) return c.json({ error: err }, 503);
+      if (err === 'Session not found') return c.json({ error: err }, 404);
+      if (err.includes('rate limit') || err.includes('Rate limit')) return c.json({ error: err }, 429);
+      if (err.includes('budget') || err.includes('Budget')) return c.json({ error: err }, 402);
+      if (err.includes('expired')) return c.json({ error: err }, 410);
+      return c.json({ error: err }, 400);
+    }
+
+    const { session: dbSession, sanitizedContent, systemPrompt, resolved } = preflight;
+
+    // ---- OpenAI-compatible path (chat-only, no tool-calling) ----
+    const useOpenAICompatibleProvider = isOpenAICompatibleProvider();
+    if (useOpenAICompatibleProvider && resolved.source === 'partner') {
+      return c.json({ error: 'ai_unavailable' }, 503);
+    }
+    if (useOpenAICompatibleProvider) {
+      const billingSource = resolved.source === 'partner' ? 'partner_key' : 'platform';
+      // S8: no stable request identity reaches this surface — the client sends
+      // no message/draft id — so the key is random per dispatch. The unique
+      // (org_id, idempotency_key) index is therefore a structural guarantee
+      // that two dispatches never share a reservation row, NOT a replay guard.
+      // The one caller with a real identity uses it: `ai-agent-run:${run.id}`
+      // in services/aiAgents/runLoop.ts. Give this one a stable key only when
+      // the request schema starts carrying a client-generated id.
+      let reservation;
+      try {
+        reservation = await reserveAiBudget({
+          orgId: dbSession.orgId,
+          billingSource,
+          sessionId,
+          idempotencyKey: `chat:${sessionId}:${crypto.randomUUID()}`,
+        });
+      } catch (err) {
+        if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
+        throw err;
+      }
+      if (reservation.kind === 'denied') {
+        return c.json({ error: reservation.message }, 402);
+      }
+      const budgetDispatch = budgetDispatchFrom(reservation)!;
+      const openaiManager = getOpenAISessionManager();
+      const openaiSession = openaiManager.getOrCreate(sessionId, dbSession.orgId, auth, c);
+
+      if (!openaiManager.tryTransitionToProcessing(openaiSession)) {
+        await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
+        return c.json({ error: 'A message is already being processed for this session' }, 409);
+      }
+
+      writeRouteAudit(c, {
+        orgId: dbSession.orgId,
+        action: 'ai.message.send',
+        resourceType: 'ai_session',
+        resourceId: sessionId,
+        details: { contentLength: body.content.length },
+      });
+
+      try {
+        await db.insert(aiMessages).values({
+          sessionId,
+          role: 'user',
+          content: sanitizedContent,
+        });
+      } catch (err) {
+        console.error('[AI/OpenAI] Failed to save user message to DB:', err);
+        openaiSession.state = 'idle';
+        await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
+        return c.json({ error: 'Failed to save message' }, 500);
+      }
+
+      if (!dbSession.title) {
+        const title = generateSessionTitle(sanitizedContent);
+        try {
+          await db.update(aiSessions).set({ title }).where(eq(aiSessions.id, sessionId));
+          openaiSession.eventBus.publish({ type: 'title_updated', title });
+        } catch (err) {
+          console.error('[AI/OpenAI] Failed to auto-set session title:', err);
+        }
+      }
+
+      openaiManager.startTurn(
+        openaiSession,
+        dbSession.model,
+        systemPrompt,
+        sanitizedContent,
+        budgetDispatch,
+      );
+
+      const subscriptionId = crypto.randomUUID();
+      return streamSSE(c, async (stream) => {
+        const events = openaiSession.eventBus.subscribe(subscriptionId);
+        try {
+          for await (const event of events) {
+            await stream.writeSSE({ event: event.type, data: JSON.stringify(event) });
+            if (event.type === 'done') break;
+          }
+        } catch (err) {
+          // Never stream a raw error to the browser (#2603). Uses the stream
+          // sanitizer (not the tool one) so user-actionable conditions — rate
+          // limit, budget, approval timeout — survive, while driver text does
+          // not. sanitizeErrorForClient is now detector-gated.
+          console.error('[AI/OpenAI] Stream error:', err);
+          const message = sanitizeErrorForClient(err);
+          await stream.writeSSE({
+            event: 'error',
+            data: JSON.stringify({ type: 'error', message }),
+          });
+        } finally {
+          openaiSession.eventBus.unsubscribe(subscriptionId);
+        }
+      });
+    }
+    // ---- End OpenAI-compatible path ----
+
+    // A Claude SDK query's maxBudgetUsd is immutable after creation. Finish any
+    // approval-only prior turn, then rotate the idle query so this turn is
+    // created with the exact durable reservation ceiling.
+    const priorSession = streamingSessionManager.get(sessionId);
+    if (priorSession?.state === 'processing') {
+      // #3089: when the in-flight turn is blocked ONLY on pending tool
+      // approvals, the assistant used to go mute — the user's message bounced
+      // with a 409 while the model sat waiting up to 5 minutes per approval.
+      // Settle those waits instead: the blocked tool calls return promptly
+      // with an approval-pending result (tier-3 intents stay pending and are
+      // executed by the durable release worker once decided), the model
+      // concludes the turn, and this message then proceeds normally. If the
+      // session is busy for any other reason (model actively working), or the
+      // turn doesn't conclude in time, fall back to a 409 as before.
+      const settle = await settleBlockedTurnForNewMessage(priorSession);
+      if (settle !== 'concluded') {
+        return c.json({
+          error: settle === 'not_blocked_on_approvals'
+            ? 'A message is already being processed for this session'
+            : 'The assistant is wrapping up the previous turn — please try again in a moment',
+        }, 409);
+      }
+    }
+    if (streamingSessionManager.get(sessionId)) {
+      streamingSessionManager.remove(sessionId);
+    }
+
+    const billingSource = resolved.source === 'partner' ? 'partner_key' : 'platform';
+    // S8: no stable request identity reaches this surface — the client sends
+    // no message/draft id — so the key is random per dispatch. The unique
+    // (org_id, idempotency_key) index is therefore a structural guarantee
+    // that two dispatches never share a reservation row, NOT a replay guard.
+    // The one caller with a real identity uses it: `ai-agent-run:${run.id}`
+    // in services/aiAgents/runLoop.ts. Give this one a stable key only when
+    // the request schema starts carrying a client-generated id.
+    let reservation;
+    try {
+      reservation = await reserveAiBudget({
+        orgId: dbSession.orgId,
+        billingSource,
+        sessionId,
+        idempotencyKey: `chat:${sessionId}:${crypto.randomUUID()}`,
+      });
+    } catch (err) {
+      if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
+      throw err;
+    }
+    if (reservation.kind === 'denied') {
+      return c.json({ error: reservation.message }, 402);
+    }
+    const budgetDispatch = budgetDispatchFrom(reservation)!;
+
+    let activeSession;
+    try {
+      activeSession = await streamingSessionManager.getOrCreate(
+        sessionId,
+        {
+          orgId: dbSession.orgId,
+          sdkSessionId: dbSession.sdkSessionId,
+          model: dbSession.model,
+          maxTurns: dbSession.maxTurns,
+          turnCount: dbSession.turnCount,
+          systemPrompt: dbSession.systemPrompt,
+          // Device-bound sessions narrow tool execution to the device's org
+          // (ai_sessions.org_id), not the login org (#3087).
+          deviceId: dbSession.deviceId,
+        },
+        auth,
+        c,
+        systemPrompt,
+        budgetDispatch.maxBudgetUsd,
+        resolved,
+        undefined,
+        undefined,
+        { budgetReservationId: budgetDispatch.reservationId },
+      );
+    } catch (err) {
+      await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
+      throw err;
+    }
+
+    if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetDispatch.reservationId)) {
+      await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
+      return c.json({ error: 'A message is already being processed for this session' }, 409);
+    }
+
+    writeRouteAudit(c, {
+      orgId: dbSession.orgId,
+      action: 'ai.message.send',
+      resourceType: 'ai_session',
+      resourceId: sessionId,
+      details: { contentLength: body.content.length }
+    });
+
+    try {
+      await db.insert(aiMessages).values({
+        sessionId,
+        role: 'user',
+        content: sanitizedContent,
+      });
+    } catch (err) {
+      console.error('[AI] Failed to save user message to DB:', err);
+      activeSession.state = 'idle';
+      await releaseUnusedTurn(dbSession.orgId, budgetDispatch);
+      return c.json({ error: 'Failed to save message' }, 500);
+    }
+
+    // Auto-generate title from first user message
+    if (!dbSession.title) {
+      const title = generateSessionTitle(sanitizedContent);
+      try {
+        await db.update(aiSessions)
+          .set({ title })
+          .where(eq(aiSessions.id, sessionId));
+        activeSession.eventBus.publish({ type: 'title_updated', title });
+      } catch (err) {
+        console.error('[AI] Failed to auto-set session title:', err);
+      }
+    }
+
+    // Execution plane (spec §5.5): an `analysis` run associated with this
+    // session may have finished between turns (chat-initiated launch is
+    // currently disabled, #6086, but a preconfigured agent's run can still
+    // report back to a session this way). Its summary is prepended HERE
+    // rather than pushed when it arrived — pushing then would start a turn
+    // with no SSE subscriber, so the assistant's reply would never reach the
+    // browser.
+    const pendingRunResults = drainPendingRunResults(activeSession);
+    activeSession.inputController.pushMessage(
+      pendingRunResults ? `${pendingRunResults}\n\n${sanitizedContent}` : sanitizedContent,
+    );
+    streamingSessionManager.startTurnTimeout(activeSession);
+
+    const subscriptionId = crypto.randomUUID();
+
+    return streamSSE(c, async (stream) => {
+      const events = activeSession.eventBus.subscribe(subscriptionId);
+
+      try {
+        for await (const event of events) {
+          await stream.writeSSE({
+            event: event.type,
+            data: JSON.stringify(event),
+          });
+          if (event.type === 'done') break;
+        }
+      } catch (err) {
+        // Never stream a raw error to the browser (#2603). See the OpenAI
+        // branch above for why this uses the stream sanitizer.
+        console.error('[AI] Stream error:', err);
+        const message = sanitizeErrorForClient(err);
+        await stream.writeSSE({
+          event: 'error',
+          data: JSON.stringify({
+            type: 'error',
+            message,
+          }),
+        });
+      } finally {
+        activeSession.eventBus.unsubscribe(subscriptionId);
+      }
+    });
+  }
+);
+
+// ============================================
+// Interrupt
+// ============================================
+
+// POST /sessions/:id/interrupt - Interrupt the current AI response
+aiRoutes.post(
+  '/sessions/:id/interrupt',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+
+    const session = await getSession(sessionId, auth);
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    let result: { interrupted: boolean; reason?: string };
+    try {
+      const manager =
+        isOpenAICompatibleProvider()
+          ? getOpenAISessionManager()
+          : streamingSessionManager;
+      result = await manager.interrupt(sessionId);
+    } catch (err) {
+      console.error('[AI] Interrupt failed:', err);
+      return c.json({ error: 'Failed to interrupt session' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: session.orgId,
+      action: 'ai.message.interrupt',
+      resourceType: 'ai_session',
+      resourceId: sessionId,
+      details: { interrupted: result.interrupted, reason: result.reason },
+    });
+
+    if (!result.interrupted) {
+      return c.json({ success: false, interrupted: false, reason: result.reason }, 409);
+    }
+
+    return c.json({ success: true, interrupted: true });
+  }
+);
+
+// ============================================
+// Tool Approval
+// ============================================
+
+// POST /sessions/:id/approve/:executionId - Approve or reject a tool execution
+aiRoutes.post(
+  '/sessions/:id/approve/:executionId',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  zValidator('json', approveToolSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const executionId = c.req.param('executionId')!;
+    const { approved } = c.req.valid('json');
+
+    // Fetch session first for orgId (auth.orgId is null for partner/system users)
+    const sessionId = c.req.param('id')!;
+    const approvalSession = await getSession(sessionId, auth);
+    if (!approvalSession) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    const success = await handleApproval(executionId, approved, auth, sessionId);
+    if (!success) {
+      // CRITICAL-3 (whole-branch review): a Tier-3 intent-backed execution
+      // NEVER reports success here — its real decision lives on
+      // action_intents.status, decided via the /approvals surface (mobile
+      // push or the Approvals queue), not this self-approve endpoint. Give
+      // the web chat client an honest "still pending" response instead of a
+      // generic "not found" so it can render a waiting state rather than
+      // silently timing out.
+      if (await isIntentBackedExecution(executionId)) {
+        return c.json({
+          success: false,
+          pending: true,
+          via: 'intent',
+          message: 'This action needs approval in the Approvals area or the Breeze mobile app.',
+        });
+      }
+      return c.json({ error: 'Execution not found or already processed' }, 404);
+    }
+
+    writeRouteAudit(c, {
+      orgId: approvalSession.orgId,
+      action: 'ai.tool_approval.update',
+      resourceType: 'ai_execution',
+      resourceId: executionId,
+      details: { approved }
+    });
+
+    return c.json({ success: true, approved });
+  }
+);
+
+// ============================================
+// Pause AI (auto_approve → per_step fallback)
+// ============================================
+
+aiRoutes.post(
+  '/sessions/:id/pause',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  zValidator('json', pauseAiSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+    const { paused } = c.req.valid('json');
+
+    const session = await getSession(sessionId, auth);
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    if (isOpenAICompatibleProvider()) {
+      return c.json(
+        {
+          error: 'This operation is not supported when using the OpenAI-compatible provider.',
+          code: 'NOT_SUPPORTED_ON_PROVIDER',
+        },
+        501,
+      );
+    }
+
+    const activeSession = streamingSessionManager.get(sessionId);
+    if (!activeSession) {
+      return c.json({ error: 'Session not active in memory' }, 404);
+    }
+
+    activeSession.isPaused = paused;
+
+    // If pausing while a plan is active, abort it
+    if (paused && activeSession.activePlanId) {
+      await abortActivePlan(activeSession);
+    }
+
+    const effectiveMode = paused ? 'per_step' : activeSession.approvalMode;
+    activeSession.eventBus.publish({ type: 'approval_mode_changed', mode: effectiveMode });
+
+    writeRouteAudit(c, {
+      orgId: session.orgId,
+      action: 'ai.session.pause',
+      resourceType: 'ai_session',
+      resourceId: sessionId,
+      details: { paused, effectiveMode },
+    });
+
+    return c.json({ success: true, paused, effectiveMode });
+  }
+);
+
+// ============================================
+// Plan Approval
+// ============================================
+
+aiRoutes.post(
+  '/sessions/:id/approve-plan',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  zValidator('json', approvePlanSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+    const { approved } = c.req.valid('json');
+
+    const session = await getSession(sessionId, auth);
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    if (isOpenAICompatibleProvider()) {
+      return c.json(
+        {
+          error: 'This operation is not supported when using the OpenAI-compatible provider.',
+          code: 'NOT_SUPPORTED_ON_PROVIDER',
+        },
+        501,
+      );
+    }
+
+    const activeSession = streamingSessionManager.get(sessionId);
+    if (!activeSession) {
+      return c.json({ error: 'Session not active in memory' }, 404);
+    }
+
+    if (!activeSession.planApprovalResolver) {
+      return c.json({ error: 'No pending plan approval' }, 400);
+    }
+
+    // Resolve the in-memory promise
+    activeSession.planApprovalResolver(approved);
+    activeSession.planApprovalResolver = null;
+
+    // Update DB plan record
+    if (activeSession.activePlanId || !approved) {
+      try {
+        const planId = activeSession.activePlanId;
+        if (planId) {
+          await db.update(aiActionPlans)
+            .set({
+              status: approved ? 'approved' : 'rejected',
+              approvedBy: auth.user.id,
+              approvedAt: new Date(),
+            })
+            .where(eq(aiActionPlans.id, planId));
+        }
+      } catch (err) {
+        console.error('[AI] Failed to update plan status:', err);
+        captureException(err);
+        return c.json({ success: true, approved, warning: 'Plan processed but database record could not be updated.' });
+      }
+    }
+
+    writeRouteAudit(c, {
+      orgId: session.orgId,
+      action: 'ai.plan_approval.update',
+      resourceType: 'ai_action_plan',
+      resourceId: activeSession.activePlanId ?? sessionId,
+      details: { approved },
+    });
+
+    return c.json({ success: true, approved });
+  }
+);
+
+// ============================================
+// Plan Abort
+// ============================================
+
+aiRoutes.post(
+  '/sessions/:id/abort-plan',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id')!;
+
+    const session = await getSession(sessionId, auth);
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    if (isOpenAICompatibleProvider()) {
+      return c.json(
+        {
+          error: 'This operation is not supported when using the OpenAI-compatible provider.',
+          code: 'NOT_SUPPORTED_ON_PROVIDER',
+        },
+        501,
+      );
+    }
+
+    const activeSession = streamingSessionManager.get(sessionId);
+    if (!activeSession) {
+      return c.json({ error: 'Session not active in memory' }, 404);
+    }
+
+    const planId = activeSession.activePlanId;
+    if (!planId) {
+      return c.json({ error: 'No active plan to abort' }, 400);
+    }
+
+    const aborted = await abortActivePlan(activeSession);
+
+    writeRouteAudit(c, {
+      orgId: session.orgId,
+      action: 'ai.plan.abort',
+      resourceType: 'ai_action_plan',
+      resourceId: planId,
+    });
+
+    return c.json({ success: aborted });
+  }
+);
+
+// ============================================
+// Usage & Budget
+// ============================================
+
+// GET /usage - Get AI usage and budget for the org
+aiRoutes.get(
+  '/usage',
+  requireScope('organization', 'partner', 'system'),
+  requireAiUse,
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = c.req.query('orgId') || auth.orgId;
+
+    if (!orgId) {
+      // System/partner users without a specific org: no org to resolve an
+      // effective budget for, so budget stays null. #4388: alerts.fired must
+      // still be present (empty) so callers can read it unconditionally.
+      return c.json({
+        daily: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
+        monthly: { inputTokens: 0, outputTokens: 0, totalCostCents: 0, messageCount: 0 },
+        budget: null,
+        billedTo: 'platform' as const,
+        // #4388 W04: present (null) on every /ai/usage response, same
+        // rationale as `alerts.fired` above: callers read `usage.credits`
+        // unconditionally.
+        credits: null,
+        alerts: { fired: [] },
+      });
+    }
+
+    if (orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Access denied to this organization' }, 403);
+    }
+
+    // #4388 W04: the credit pool is PARTNER-wide, shared across every one of
+    // the MSP's customer orgs. An organization-scoped token belongs to one of
+    // those customers, so handing it that balance would leak a partner-level
+    // figure across the tenancy boundary (and let one customer watch another's
+    // spend drain it). Only partner- and system-scoped callers get it.
+    const includeCredits = auth.scope === 'partner' || auth.scope === 'system';
+    const usage = await getUsageSummary(orgId, { includeCredits });
+    return c.json(usage);
+  }
+);
+
+// PUT /budget - Update AI budget settings for the org
+aiRoutes.put(
+  '/budget',
+  requireScope('organization', 'partner', 'system'),
+  requireAiWrite,
+  requireMfa(),
+  zValidator('json', z.object({
+    enabled: z.boolean().optional(),
+    monthlyBudgetCents: z.number().int().min(0).nullable().optional(),
+    dailyBudgetCents: z.number().int().min(0).nullable().optional(),
+    maxTurnsPerSession: z.number().int().min(1).max(200).optional(),
+    messagesPerMinutePerUser: z.number().int().min(1).max(100).optional(),
+    messagesPerHourPerOrg: z.number().int().min(1).max(10000).optional(),
+    approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional(),
+    alertThresholdPercents: z.array(z.number().int().min(1).max(99)).max(5).nullable().optional(),
+  })),
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = c.req.query('orgId') || auth.orgId;
+    if (!orgId) return c.json({ error: 'Organization context required' }, 400);
+
+    if (orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Access denied to this organization' }, 403);
+    }
+
+    const body = c.req.valid('json');
+
+    // Normalise BEFORE the lock check: assertNotLocked compares with
+    // isDeepStrictEqual, which is array-order-sensitive, so checking the raw
+    // body would 403 a legitimate no-op resubmit of the same rungs sent in a
+    // different order.
+    const normalized = body.alertThresholdPercents == null
+      ? body
+      : { ...body, alertThresholdPercents: normalizeAlertThresholds(body.alertThresholdPercents) };
+
+    // Enforce partner locks on AI budget fields. Submitted values are passed so a
+    // field the partner enforces only 403s when the org actually changes it
+    // (issue #2752); re-sending the enforced value is an allowed no-op.
+    if (Object.keys(normalized).length > 0) {
+      await assertNotLocked(orgId, 'aiBudgets', normalized);
+    }
+
+    await updateBudget(orgId, normalized);
+
+    // A lowered cap or a new rung must fire now, not on the next turn (spec §4.2 #2).
+    // The evaluator wraps itself in runOutsideDbContext, so calling it from a
+    // request is safe; it never throws.
+    void evaluateAiBudgetThresholds(orgId);
+
+    writeRouteAudit(c, {
+      orgId,
+      action: 'ai.budget.update',
+      resourceType: 'ai_budget'
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+// GET /admin/sessions - Get session history for admin dashboard.
+// SR5-09: enumerates other users' sessions (id, userId, title, cost, flags), so
+// it requires ai_sessions:read_all — a stricter gate than the ordinary AI reads.
+// The returned rows are already a projected metadata DTO (getSessionHistory):
+// no systemPrompt, contextSnapshot, sdkSessionId, or raw tool input/output.
+aiRoutes.get(
+  '/admin/sessions',
+  requireScope('organization', 'partner', 'system'),
+  requireAiSessionsReadAll,
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = c.req.query('orgId') || auth.orgId;
+
+    if (!orgId) {
+      return c.json({ data: [] });
+    }
+
+    if (orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Access denied to this organization' }, 403);
+    }
+
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 100);
+    const offset = parseInt(c.req.query('offset') ?? '0', 10) || 0;
+    const flagged = c.req.query('flagged') === 'true' ? true : undefined;
+
+    const sessions = await getSessionHistory(orgId, { limit, offset, flagged });
+    return c.json({ data: sessions });
+  }
+);
+
+// GET /admin/security-events - Get AI security and tool audit events
+aiRoutes.get(
+  '/admin/security-events',
+  requireScope('organization', 'partner', 'system'),
+  requireAiSessionsReadAll,
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = c.req.query('orgId') || auth.orgId;
+
+    if (!orgId) {
+      return c.json({ data: [] });
+    }
+
+    if (orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Access denied to this organization' }, 403);
+    }
+
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '50', 10) || 50, 100);
+    const sinceParam = c.req.query('since');
+    const actionFilter = c.req.query('action');
+
+    const since = sinceParam
+      ? new Date(sinceParam)
+      : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // Default: last 7 days
+
+    const conditions = [
+      eq(auditLogs.orgId, orgId),
+      gte(auditLogs.timestamp, since),
+      drizzleSql`(${auditLogs.action} LIKE 'ai.security.%' OR ${auditLogs.action} LIKE 'ai.tool.%')`,
+    ];
+
+    if (actionFilter) {
+      conditions.push(eq(auditLogs.action, actionFilter));
+    }
+
+    const events = await db
+      .select({
+        id: auditLogs.id,
+        timestamp: auditLogs.timestamp,
+        actorType: auditLogs.actorType,
+        actorEmail: auditLogs.actorEmail,
+        action: auditLogs.action,
+        resourceType: auditLogs.resourceType,
+        resourceId: auditLogs.resourceId,
+        result: auditLogs.result,
+        errorMessage: auditLogs.errorMessage,
+        details: auditLogs.details,
+      })
+      .from(auditLogs)
+      .where(and(...conditions))
+      .orderBy(desc(auditLogs.timestamp))
+      .limit(limit);
+
+    return c.json({ data: events });
+  }
+);
+
+// GET /admin/tool-executions - Get tool execution analytics for AI risk dashboard
+aiRoutes.get(
+  '/admin/tool-executions',
+  requireScope('organization', 'partner', 'system'),
+  requireAiSessionsReadAll,
+  async (c) => {
+    const auth = c.get('auth');
+    const orgId = c.req.query('orgId') || auth.orgId;
+
+    if (!orgId) {
+      // Partner/system users without a specific org — return empty analytics
+      return c.json({
+        summary: { total: 0, byStatus: {}, byTool: [] },
+        timeSeries: [],
+        executions: [],
+      });
+    }
+
+    if (orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Access denied to this organization' }, 403);
+    }
+
+    const limit = Math.min(parseInt(c.req.query('limit') ?? '100', 10) || 100, 200);
+    const sinceParam = c.req.query('since');
+    const untilParam = c.req.query('until');
+    const statusFilter = c.req.query('status');
+    const toolNameFilter = c.req.query('toolName');
+
+    const since = sinceParam
+      ? new Date(sinceParam)
+      : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const until = untilParam ? new Date(untilParam) : new Date();
+
+    if (isNaN(since.getTime())) {
+      return c.json({ error: `Invalid 'since' date: ${sinceParam}` }, 400);
+    }
+    if (isNaN(until.getTime())) {
+      return c.json({ error: `Invalid 'until' date: ${untilParam}` }, 400);
+    }
+
+    // Base conditions: org-scoped via session join + date range
+    const baseConditions = [
+      eq(aiSessions.orgId, orgId),
+      gte(aiToolExecutions.createdAt, since),
+      lte(aiToolExecutions.createdAt, until),
+    ];
+    if (statusFilter) {
+      baseConditions.push(drizzleSql`${aiToolExecutions.status} = ${statusFilter}`);
+    }
+    if (toolNameFilter) {
+      baseConditions.push(eq(aiToolExecutions.toolName, toolNameFilter));
+    }
+
+    // 1. Status counts
+    const statusCounts = await db
+      .select({
+        status: aiToolExecutions.status,
+        count: count(),
+      })
+      .from(aiToolExecutions)
+      .innerJoin(aiSessions, eq(aiToolExecutions.sessionId, aiSessions.id))
+      .where(and(...baseConditions))
+      .groupBy(aiToolExecutions.status);
+
+    const byStatus: Record<string, number> = {};
+    let total = 0;
+    for (const row of statusCounts) {
+      byStatus[row.status] = Number(row.count);
+      total += Number(row.count);
+    }
+
+    // 2. Per-tool stats
+    const toolStats = await db
+      .select({
+        toolName: aiToolExecutions.toolName,
+        count: count(),
+        avgDurationMs: avg(aiToolExecutions.durationMs),
+        completedCount: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'completed')`,
+      })
+      .from(aiToolExecutions)
+      .innerJoin(aiSessions, eq(aiToolExecutions.sessionId, aiSessions.id))
+      .where(and(...baseConditions))
+      .groupBy(aiToolExecutions.toolName)
+      .orderBy(drizzleSql`COUNT(*) DESC`);
+
+    const byTool = toolStats.map((row) => ({
+      toolName: row.toolName,
+      count: Number(row.count),
+      avgDurationMs: row.avgDurationMs ? Math.round(Number(row.avgDurationMs)) : null,
+      successRate: Number(row.count) > 0 ? Number(row.completedCount) / Number(row.count) : 0,
+    }));
+
+    // 3. Daily time series
+    const timeSeries = await db
+      .select({
+        date: drizzleSql<string>`DATE(${aiToolExecutions.createdAt})::text`,
+        completed: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'completed')`,
+        failed: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'failed')`,
+        rejected: drizzleSql<number>`COUNT(*) FILTER (WHERE ${aiToolExecutions.status} = 'rejected')`,
+      })
+      .from(aiToolExecutions)
+      .innerJoin(aiSessions, eq(aiToolExecutions.sessionId, aiSessions.id))
+      .where(and(...baseConditions))
+      .groupBy(drizzleSql`DATE(${aiToolExecutions.createdAt})`)
+      .orderBy(drizzleSql`DATE(${aiToolExecutions.createdAt}) ASC`);
+
+    // 4. Raw executions list (leftJoin: only reset-password rows have an
+    // intent with a revealable secret; everything else derives NULL state)
+    const executions = await db
+      .select({
+        id: aiToolExecutions.id,
+        sessionId: aiToolExecutions.sessionId,
+        toolName: aiToolExecutions.toolName,
+        status: aiToolExecutions.status,
+        toolInput: aiToolExecutions.toolInput,
+        approvedBy: aiToolExecutions.approvedBy,
+        approvedAt: aiToolExecutions.approvedAt,
+        durationMs: aiToolExecutions.durationMs,
+        errorMessage: aiToolExecutions.errorMessage,
+        createdAt: aiToolExecutions.createdAt,
+        completedAt: aiToolExecutions.completedAt,
+        intentId: aiToolExecutions.intentId,
+        tempPasswordState: drizzleSql<'available' | 'revealed' | 'expired' | null>`CASE
+          WHEN ${actionIntents.id} IS NULL THEN NULL
+          WHEN ${actionIntents.result} ?| array['temporaryPasswordEnc', 'temporaryPassword'] THEN
+            CASE
+              WHEN ${actionIntents.executedAt} < now() - make_interval(days => ${REVEAL_WINDOW_DAYS}) THEN 'expired'
+              ELSE 'available'
+            END
+          WHEN ${actionIntents.result} ? 'temporaryPasswordRevealed' THEN 'revealed'
+          WHEN ${actionIntents.result} ? 'temporaryPasswordExpired' THEN 'expired'
+          ELSE NULL
+        END`,
+      })
+      .from(aiToolExecutions)
+      .innerJoin(aiSessions, eq(aiToolExecutions.sessionId, aiSessions.id))
+      .leftJoin(actionIntents, eq(aiToolExecutions.intentId, actionIntents.id))
+      .where(and(...baseConditions))
+      .orderBy(desc(aiToolExecutions.createdAt))
+      .limit(limit);
+
+    return c.json({
+      summary: { total, byStatus, byTool },
+      timeSeries: timeSeries.map((row) => ({
+        date: row.date,
+        completed: Number(row.completed),
+        failed: Number(row.failed),
+        rejected: Number(row.rejected),
+      })),
+      executions: executions.map((execution) => ({
+        ...execution,
+        toolInput: redactPersistedToolInput(execution.toolInput),
+      })),
+    });
+  }
+);
+
+// GET /admin/script-proposals-metrics - AI Risk Dashboard script-proposal panel (W05, #5612)
+aiRoutes.get(
+  '/admin/script-proposals-metrics',
+  requireScope('organization', 'partner', 'system'),
+  requireAiRead,
+  async (c) => {
+    // Same dark-when-off gate as every other AI script authoring surface
+    // (routes/ai/scriptProposals.ts) — without it, a deployment with the
+    // feature off gets a permanently-empty "Script Proposals" tab instead of
+    // the tab simply not answering.
+    if (!aiScriptAuthoringEnabled()) return c.json({ error: 'feature_disabled' }, 404);
+
+    const auth = c.get('auth');
+    const orgId = c.req.query('orgId') || auth.orgId;
+
+    if (!orgId) {
+      // Same shape as the populated branch below — ScriptProposalsPanel keys
+      // the unattended-run/lane-state cards on `!== undefined`, so a partial
+      // shape here would silently drop both cards for a partner/system-scope
+      // caller with no orgId instead of showing zero / not-configured.
+      return c.json({
+        scriptProposals: {
+          perDay: [], unattendedRuns: 0, laneState: null,
+          reviewerDisagreements: { humanRejectedAfterApprove: 0, humanApprovedAfterReject: 0 },
+        },
+      });
+    }
+    if (orgId !== auth.orgId && !auth.canAccessOrg(orgId)) {
+      return c.json({ error: 'Access denied to this organization' }, 403);
+    }
+
+    const sinceParam = c.req.query('since');
+    const untilParam = c.req.query('until');
+    const since = sinceParam ? new Date(sinceParam) : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const until = untilParam ? new Date(untilParam) : new Date();
+    if (isNaN(since.getTime())) return c.json({ error: `Invalid 'since' date: ${sinceParam}` }, 400);
+    if (isNaN(until.getTime())) return c.json({ error: `Invalid 'until' date: ${untilParam}` }, 400);
+
+    // 1. Proposals per day
+    const perDayRows = await db
+      .select({
+        date: drizzleSql<string>`DATE(${scriptProposals.createdAt})::text`,
+        count: drizzleSql<number>`COUNT(*)::int`,
+      })
+      .from(scriptProposals)
+      .where(and(eq(scriptProposals.orgId, orgId), gte(scriptProposals.createdAt, since), lte(scriptProposals.createdAt, until)))
+      .groupBy(drizzleSql`DATE(${scriptProposals.createdAt})`)
+      .orderBy(drizzleSql`DATE(${scriptProposals.createdAt}) ASC`);
+    const perDay = perDayRows.map((row) => ({ date: row.date, count: Number(row.count) }));
+
+    // 2. Reviewer disagreements — a human decision that goes against the
+    // latest completed model review. Extracted to services/scriptProposals/
+    // metrics.ts (raw SQL, DISTINCT ON) so a live-Postgres test can exercise
+    // it directly.
+    const reviewerDisagreements = await loadScriptProposalReviewerDisagreements(orgId, since, until);
+
+    // 3. Unattended runs in the window (W04, #5612)
+    const [unattendedCountRow] = await db
+      .select({ count: drizzleSql<number>`COUNT(*)::int` })
+      .from(scriptExecutions)
+      .where(
+        and(
+          eq(scriptExecutions.orgId, orgId),
+          eq(scriptExecutions.approvalMethod, 'unattended_reviewer_gated'),
+          gte(scriptExecutions.createdAt, since),
+          lte(scriptExecutions.createdAt, until),
+        ),
+      );
+    const unattendedRuns = Number(unattendedCountRow?.count ?? 0);
+
+    // 4. Lane state (W04) — one row per org, PK org_id; no row means the
+    // lane has never been evaluated for this org.
+    const [laneRow] = await db
+      .select({ state: aiScriptLaneState.state })
+      .from(aiScriptLaneState)
+      .where(eq(aiScriptLaneState.orgId, orgId))
+      .limit(1);
+    const laneState = laneRow?.state ?? null;
+
+    return c.json({
+      scriptProposals: {
+        perDay,
+        unattendedRuns,
+        laneState,
+        reviewerDisagreements,
+      },
+    });
+  }
+);

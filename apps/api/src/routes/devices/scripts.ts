@@ -1,0 +1,74 @@
+import { Hono } from 'hono';
+import { eq, desc, sql } from 'drizzle-orm';
+import { db } from '../../db';
+import { scriptExecutions, scripts } from '../../db/schema';
+import { authMiddleware, requirePermission, requireScope } from '../../middleware/auth';
+import { PERMISSIONS, type UserPermissions } from '../../services/permissions';
+import { getDeviceWithOrgCheck, canAccessDeviceSite } from './helpers';
+
+export const scriptsRoutes = new Hono();
+
+scriptsRoutes.use('*', authMiddleware);
+
+// GET /devices/:id/scripts - Get script execution history for a device
+scriptsRoutes.get(
+  '/:id/scripts',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.SCRIPTS_READ.resource, PERMISSIONS.SCRIPTS_READ.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const deviceId = c.req.param('id')!;
+
+    const device = await getDeviceWithOrgCheck(deviceId, auth);
+    if (!device) {
+      return c.json({ error: 'Device not found' }, 404);
+    }
+    if (!canAccessDeviceSite(device, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    const executions = await db
+      .select({
+        id: scriptExecutions.id,
+        scriptId: scriptExecutions.scriptId,
+        scriptName: scripts.name,
+        status: scriptExecutions.status,
+        exitCode: scriptExecutions.exitCode,
+        stdout: scriptExecutions.stdout,
+        stderr: scriptExecutions.stderr,
+        errorMessage: scriptExecutions.errorMessage,
+        // #5318 — the device Scripts tab now renders the same status labels as
+        // the scripts pages, which qualify a terminal status with the cancel
+        // outcome ("your stop request arrived too late" / "stop failed").
+        // Already exposed at this permission level by GET /scripts/executions/:id.
+        cancelState: scriptExecutions.cancelState,
+        // #4885 — the "Run again" action needs the runtime values the
+        // execution was submitted with. Already exposed at the same
+        // SCRIPTS_READ permission level by GET /scripts/:id/executions and
+        // GET /scripts/executions/:id, so this adds no new exposure — just
+        // parity for the device-scoped history list.
+        parameters: scriptExecutions.parameters,
+        // #4888 — the run context this execution actually used, so the device
+        // Scripts tab can show SYSTEM vs the logged-in user instead of leaving
+        // the operator to guess. NULL on rows written before the column.
+        runAs: scriptExecutions.runAs,
+        targetSessionId: scriptExecutions.targetSessionId,
+        aiInitiatorKind: scriptExecutions.aiInitiatorKind,
+        // Presence only. The ids themselves are an authorization decision, not a
+        // projection: an ai_sessions transcript is owner-bound (aiAgent.ts:229),
+        // and a device that moved tenants can hold a pointer into the source org.
+        // Disclosure happens in GET /devices/:id/ai-origin, per-row, on demand.
+        hasAiOrigin: sql<boolean>`(${scriptExecutions.aiSessionId} IS NOT NULL OR ${scriptExecutions.aiAgentRunId} IS NOT NULL)`,
+        startedAt: scriptExecutions.startedAt,
+        completedAt: scriptExecutions.completedAt,
+        createdAt: scriptExecutions.createdAt
+      })
+      .from(scriptExecutions)
+      .leftJoin(scripts, eq(scriptExecutions.scriptId, scripts.id))
+      .where(eq(scriptExecutions.deviceId, deviceId))
+      .orderBy(desc(scriptExecutions.createdAt))
+      .limit(50);
+
+    return c.json({ data: executions });
+  }
+);

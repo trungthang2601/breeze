@@ -1,0 +1,116 @@
+import { Hono } from 'hono';
+import type { Context, Next } from 'hono';
+import { HTTPException } from 'hono/http-exception';
+import { and, eq } from 'drizzle-orm';
+import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
+import { db } from '../db';
+import { oauthClients, oauthClientPartnerGrants } from '../db/schema';
+import { revokeClientFamilies } from '../oauth/revocationService';
+import { ERROR_IDS, logOauthError } from '../oauth/log';
+import { MCP_OAUTH_ENABLED } from '../config/env';
+import { PERMISSIONS } from '../services/permissions';
+import { canManagePartnerWidePolicies } from '../services/partnerWideAccess';
+
+export const connectedAppsRoutes = new Hono();
+
+const requireConnectedAppsRead = requirePermission(
+  PERMISSIONS.CONNECTED_APPS_READ.resource,
+  PERMISSIONS.CONNECTED_APPS_READ.action,
+);
+const requireConnectedAppsManage = requirePermission(
+  PERMISSIONS.CONNECTED_APPS_MANAGE.resource,
+  PERMISSIONS.CONNECTED_APPS_MANAGE.action,
+);
+
+async function requireFullPartnerConnectedAppAuthority(c: Context, next: Next) {
+  const auth = c.get('auth');
+  if (!auth.partnerId || !canManagePartnerWidePolicies(auth)) {
+    throw new HTTPException(403, {
+      message: 'Connected-app administration requires full partner organization access',
+    });
+  }
+  await next();
+}
+
+if (MCP_OAUTH_ENABLED) {
+  connectedAppsRoutes.use('*', authMiddleware);
+  connectedAppsRoutes.use('*', requireScope('partner'));
+  connectedAppsRoutes.use('*', requireFullPartnerConnectedAppAuthority);
+
+  connectedAppsRoutes.get('/', requireConnectedAppsRead, async (c) => {
+    const partnerId = c.get('auth').partnerId;
+    if (!partnerId) throw new HTTPException(403, { message: 'partner scope required' });
+
+    // Query (client, partner) pairs from the join table — a single DCR
+    // client_id is shared across all consenting partners, so the old
+    // `oauth_clients.partner_id = $partnerId` filter would only show the
+    // FIRST partner that consented and hide the app from everyone else.
+    const rows = await db.select({
+      clientId: oauthClients.id,
+      metadata: oauthClients.metadata,
+      createdAt: oauthClients.createdAt,
+      lastUsedAt: oauthClients.lastUsedAt,
+      disabledAt: oauthClients.disabledAt,
+    })
+      .from(oauthClients)
+      .innerJoin(
+        oauthClientPartnerGrants,
+        eq(oauthClientPartnerGrants.clientId, oauthClients.id),
+      )
+      .where(eq(oauthClientPartnerGrants.partnerId, partnerId));
+
+    return c.json({
+      clients: rows
+        .filter((r) => !r.disabledAt)
+        .map((r) => ({
+          client_id: r.clientId,
+          client_name: ((r.metadata as { client_name?: string } | null)?.client_name) ?? r.clientId,
+          created_at: r.createdAt,
+          last_used_at: r.lastUsedAt,
+        })),
+    });
+  });
+
+  connectedAppsRoutes.delete('/:clientId', requireConnectedAppsManage, requireMfa(), async (c) => {
+    const partnerId = c.get('auth').partnerId;
+    if (!partnerId) throw new HTTPException(403, { message: 'partner scope required' });
+    const clientId = c.req.param('clientId');
+    if (!clientId) throw new HTTPException(400, { message: 'client id required' });
+
+    // Look up the join row, not the client row. A DCR client is shared
+    // across partners; "is this app connected for me?" is answered by the
+    // (client, partner) join, not by `oauth_clients.partner_id` (which
+    // only points at the first consenting partner under the legacy schema).
+    const [row] = await db.select()
+      .from(oauthClientPartnerGrants)
+      .where(and(
+        eq(oauthClientPartnerGrants.clientId, clientId),
+        eq(oauthClientPartnerGrants.partnerId, partnerId),
+      ))
+      .limit(1);
+    if (!row) return c.body(null, 404);
+
+    // Partner disconnect of a shared DCR client. Grant discovery is
+    // authoritative from oauth_grants (partner scope), so code-only grants —
+    // auth-code access tokens minted without a refresh token — are revoked
+    // too (MCP-OAUTH-07). The service writes Redis markers BEFORE any DB
+    // mutation and throws on ANY failure (marker write or the later DB
+    // stamping); we surface both as a 503 so the user sees a hard error
+    // rather than a hidden-but-partially-revoked app. Only this partner's
+    // join row is removed; other partners on the same shared client keep
+    // working.
+    try {
+      await revokeClientFamilies(clientId, { kind: 'partner', partnerId });
+    } catch (err) {
+      logOauthError({
+        errorId: ERROR_IDS.OAUTH_REVOCATION_CACHE_WRITE_FAILED,
+        message: 'connected-app partner revocation failed',
+        err,
+        context: { clientId, partnerId },
+      });
+      throw new HTTPException(503, { message: 'revocation failed — the app may still have access; please retry' });
+    }
+
+    return c.body(null, 204);
+  });
+}

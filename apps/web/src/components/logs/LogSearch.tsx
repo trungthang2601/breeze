@@ -1,0 +1,406 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Download, Save, Search } from 'lucide-react';
+
+import { fetchWithAuth } from '../../stores/auth';
+import { formatDateTime } from '@/lib/dateTimeFormat';
+import { toCsv } from '@/lib/csvExport';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+type EventLogRow = {
+  log: {
+    id: string;
+    timestamp: string;
+    level: 'info' | 'warning' | 'error' | 'critical';
+    category: 'security' | 'hardware' | 'application' | 'system';
+    source: string;
+    eventId: string | null;
+    message: string;
+    deviceId: string;
+  };
+  device: {
+    id: string;
+    hostname: string;
+    displayName: string | null;
+    siteId: string;
+  } | null;
+  site: {
+    id: string;
+    name: string;
+  } | null;
+};
+
+type SearchResponse = {
+  results: EventLogRow[];
+  total: number | null;
+  totalMode?: 'exact' | 'estimated' | 'none';
+  limit: number;
+  offset: number;
+  hasMore?: boolean;
+  nextCursor?: string | null;
+};
+
+const LEVELS: EventLogRow['log']['level'][] = ['info', 'warning', 'error', 'critical'];
+
+function toDatetimeLocalInput(date: Date): string {
+  const offsetMs = date.getTimezoneOffset() * 60_000;
+  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
+}
+
+export default function LogSearch() {
+  const { t } = useTranslation('common');
+  const [query, setQuery] = useState('');
+  const [source, setSource] = useState('');
+  const [selectedLevels, setSelectedLevels] = useState<Array<EventLogRow['log']['level']>>([]);
+  const [limit, setLimit] = useState(100);
+  const [offset, setOffset] = useState(0);
+
+  const [startTime, setStartTime] = useState(() => toDatetimeLocalInput(new Date(Date.now() - (24 * 60 * 60 * 1000))));
+  const [endTime, setEndTime] = useState(() => toDatetimeLocalInput(new Date()));
+
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [results, setResults] = useState<EventLogRow[]>([]);
+  const [total, setTotal] = useState(0);
+
+  const currentPage = Math.floor(offset / limit) + 1;
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+
+  const canSearch = useMemo(() => {
+    const start = new Date(startTime);
+    const end = new Date(endTime);
+    return !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime()) && start <= end;
+  }, [startTime, endTime]);
+
+  const fetchLogs = useCallback(async (nextOffset = 0) => {
+    if (!canSearch) {
+      setError(t('longTail.logs.LogSearch.errors.invalidTimeRange'));
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const payload = {
+        query: query.trim() || undefined,
+        source: source.trim() || undefined,
+        level: selectedLevels.length > 0 ? selectedLevels : undefined,
+        timeRange: {
+          start: new Date(startTime).toISOString(),
+          end: new Date(endTime).toISOString(),
+        },
+        limit,
+        offset: nextOffset,
+        countMode: 'estimated' as const,
+        sortBy: 'timestamp' as const,
+        sortOrder: 'desc' as const,
+      };
+
+      const response = await fetchWithAuth('/logs/search', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(typeof body.error === 'string' ? body.error : t('longTail.logs.LogSearch.errors.searchFailed'));
+      }
+
+      const data: SearchResponse = await response.json();
+      setResults(Array.isArray(data.results) ? data.results : []);
+      setTotal(Number(data.total ?? 0));
+      setOffset(nextOffset);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('longTail.logs.LogSearch.errors.searchFailed'));
+    } finally {
+      setLoading(false);
+    }
+  }, [canSearch, query, source, selectedLevels, startTime, endTime, limit, t]);
+
+  useEffect(() => {
+    fetchLogs(0);
+  }, [fetchLogs]);
+
+  const toggleLevel = (level: EventLogRow['log']['level']) => {
+    setSelectedLevels((prev) => prev.includes(level)
+      ? prev.filter((value) => value !== level)
+      : [...prev, level]);
+  };
+
+  const saveQuery = async () => {
+    const name = window.prompt(t('longTail.logs.LogSearch.savePrompt'));
+    if (!name || !name.trim()) {
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+
+    try {
+      const response = await fetchWithAuth('/logs/queries', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: name.trim(),
+          isShared: false,
+          filters: {
+            query: query.trim() || undefined,
+            source: source.trim() || undefined,
+            level: selectedLevels.length > 0 ? selectedLevels : undefined,
+            timeRange: {
+              start: new Date(startTime).toISOString(),
+              end: new Date(endTime).toISOString(),
+            },
+            limit,
+            sortBy: 'timestamp',
+            sortOrder: 'desc',
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(typeof body.error === 'string' ? body.error : t('longTail.logs.LogSearch.errors.saveFailed'));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('longTail.logs.LogSearch.errors.saveFailed'));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const exportCsv = () => {
+    if (results.length === 0) {
+      setError(t('longTail.logs.LogSearch.errors.noRowsExport'));
+      return;
+    }
+
+    const header = [
+      'Timestamp',
+      'Level',
+      'Category',
+      'Source',
+      'Event ID',
+      'Message',
+      'Device',
+      'Site',
+    ];
+
+    const rows = results.map((row) => [
+      row.log.timestamp,
+      row.log.level,
+      row.log.category,
+      row.log.source,
+      row.log.eventId ?? '',
+      row.log.message,
+      row.device?.hostname ?? row.log.deviceId,
+      row.site?.name ?? '',
+    ]);
+
+    // Neutralize spreadsheet-formula injection from agent-supplied fields
+    // (message/source/category/hostname) before quoting (F7).
+    const csv = toCsv(header, rows);
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `fleet-logs-${new Date().toISOString().slice(0, 19)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <section className="space-y-4">
+      <div>
+        <h1 className="text-xl font-semibold tracking-tight">{t('longTail.logs.LogSearch.title')}</h1>
+        <p className="text-sm text-muted-foreground">{t('longTail.logs.LogSearch.description')}</p>
+      </div>
+      <div className="rounded-lg border bg-card p-4 shadow-xs">
+        <div className="grid gap-3 lg:grid-cols-6">
+          <div className="lg:col-span-2">
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('common:actions.search')}</label>
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={t('longTail.logs.LogSearch.searchPlaceholder')}
+              className="w-full rounded-md border px-3 py-2 text-sm"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.source')}</label>
+            <input
+              value={source}
+              onChange={(event) => setSource(event.target.value)}
+              placeholder={t('longTail.logs.LogSearch.sourcePlaceholder')}
+              className="w-full rounded-md border px-3 py-2 text-sm"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.start')}</label>
+            <input
+              type="datetime-local"
+              value={startTime}
+              onChange={(event) => setStartTime(event.target.value)}
+              className="w-full rounded-md border px-3 py-2 text-sm"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.end')}</label>
+            <input
+              type="datetime-local"
+              value={endTime}
+              onChange={(event) => setEndTime(event.target.value)}
+              className="w-full rounded-md border px-3 py-2 text-sm"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">{t('longTail.logs.LogSearch.rows')}</label>
+            <select
+              value={limit}
+              onChange={(event) => setLimit(Number(event.target.value))}
+              className="w-full rounded-md border px-3 py-2 text-sm"
+            >
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={250}>250</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          {LEVELS.map((level) => (
+            <label key={level} className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm">
+              <input
+                type="checkbox"
+                checked={selectedLevels.includes(level)}
+                onChange={() => toggleLevel(level)}
+              />
+              {t(/* i18n-dynamic */ `longTail.logs.LogSearch.levels.${level}`)}
+            </label>
+          ))}
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            onClick={() => fetchLogs(0)}
+            disabled={loading || !canSearch}
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+          >
+            <Search className="h-4 w-4" />
+            {t('longTail.logs.LogSearch.searchFleetLogs')}
+          </button>
+
+          <button
+            onClick={saveQuery}
+            disabled={saving || loading || !canSearch}
+            className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm disabled:opacity-50"
+          >
+            <Save className="h-4 w-4" />
+            {t('longTail.logs.LogSearch.saveQuery')}
+          </button>
+
+          <button
+            onClick={exportCsv}
+            disabled={results.length === 0}
+            className="inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm disabled:opacity-50"
+          >
+            <Download className="h-4 w-4" />
+            {t('longTail.logs.LogSearch.exportCsv')}
+          </button>
+        </div>
+
+        {error && (
+          <p className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </p>
+        )}
+      </div>
+
+      <div className="rounded-lg border bg-card shadow-xs">
+        <div className="flex items-center justify-between border-b px-4 py-3">
+          <h2 className="text-sm font-semibold">{t('longTail.logs.LogSearch.resultsTitle')}</h2>
+          <span className="text-xs text-muted-foreground">
+            {loading
+              ? t('longTail.logs.LogSearch.loading')
+              : t('longTail.logs.LogSearch.resultsCount', { shown: results.length, total })}
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/40">
+              <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                <th className="px-3 py-2">{t('longTail.logs.LogSearch.table.timestamp')}</th>
+                <th className="px-3 py-2">{t('longTail.logs.LogSearch.table.level')}</th>
+                <th className="px-3 py-2">{t('longTail.logs.LogSearch.table.category')}</th>
+                <th className="px-3 py-2">{t('longTail.logs.LogSearch.source')}</th>
+                <th className="px-3 py-2">{t('longTail.logs.LogSearch.table.message')}</th>
+                <th className="px-3 py-2">{t('common:labels.device')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {results.map((row) => (
+                <tr key={row.log.id} className="border-t align-top">
+                  <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">
+                    {formatDateTime(row.log.timestamp)}
+                  </td>
+                  <td className="px-3 py-2">
+                    <span className="rounded px-2 py-0.5 text-xs font-medium capitalize bg-muted">
+                      {row.log.level}
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 capitalize">{row.log.category}</td>
+                  <td className="px-3 py-2">{row.log.source}</td>
+                  <td className="max-w-[640px] px-3 py-2 text-xs leading-relaxed">{row.log.message}</td>
+                  <td className="px-3 py-2 text-xs">
+                    <div className="font-medium">{row.device?.hostname ?? row.log.deviceId}</div>
+                    <div className="text-muted-foreground">{row.site?.name ?? t('longTail.logs.LogSearch.unknownSite')}</div>
+                  </td>
+                </tr>
+              ))}
+
+              {results.length === 0 && !loading && (
+                <tr>
+                  <td colSpan={6} className="px-3 py-10 text-center text-sm text-muted-foreground">
+                    {t('longTail.logs.LogSearch.empty')}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="flex items-center justify-between border-t px-4 py-3 text-sm">
+          <span className="text-muted-foreground">{t('longTail.logs.LogSearch.pageCount', { page: currentPage, totalPages })}</span>
+          <div className="flex gap-2">
+            <button
+              onClick={() => fetchLogs(Math.max(0, offset - limit))}
+              disabled={loading || offset === 0}
+              className="rounded-md border px-3 py-1.5 disabled:opacity-50"
+            >
+              {t('longTail.logs.LogSearch.previous')}
+            </button>
+            <button
+              onClick={() => fetchLogs(offset + limit)}
+              disabled={loading || (offset + limit) >= total}
+              className="rounded-md border px-3 py-1.5 disabled:opacity-50"
+            >
+              {t('common:actions.next')}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}

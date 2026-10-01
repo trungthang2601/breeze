@@ -1,0 +1,955 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { writeRouteAudit } from '../services/auditEvents';
+import { Hono } from 'hono';
+
+const { queueDeliveryMock, validateWebhookUrlSafetyWithDnsMock } = vi.hoisted(() => ({
+  queueDeliveryMock: vi.fn(),
+  validateWebhookUrlSafetyWithDnsMock: vi.fn()
+}));
+
+const { permissionGate, mfaGate } = vi.hoisted(() => ({
+  permissionGate: { deny: false },
+  mfaGate: { deny: false }
+}));
+
+vi.mock('../workers/webhookDelivery', () => ({
+  getWebhookWorker: vi.fn(() => ({
+    queueDelivery: queueDeliveryMock
+  }))
+}));
+
+vi.mock('../services/auditEvents', () => ({
+  writeRouteAudit: vi.fn()
+}));
+
+vi.mock('../services/notificationSenders/webhookSender', () => ({
+  validateWebhookUrlSafetyWithDns: validateWebhookUrlSafetyWithDnsMock,
+  // Real implementation: strips userinfo/query/hash so masked responses keep
+  // scheme+host+path. Kept in sync with the production helper.
+  redactUrlForLogs: (rawUrl: string) => {
+    try {
+      const parsed = new URL(rawUrl);
+      parsed.username = '';
+      parsed.password = '';
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.toString().replace(/\/$/, '');
+    } catch {
+      return '[invalid-url]';
+    }
+  }
+}));
+
+vi.mock('../db', () => ({
+  runOutsideDbContext: vi.fn((fn) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  db: {
+    select: vi.fn(),
+    insert: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn()
+  }
+}));
+
+vi.mock('../db/schema', () => ({
+  webhooks: {
+    id: 'id',
+    orgId: 'orgId',
+    status: 'status',
+    createdAt: 'createdAt',
+    successCount: 'successCount',
+    failureCount: 'failureCount',
+    approvalGeneration: 'approvalGeneration'
+  },
+  webhookDeliveries: {
+    id: 'id',
+    webhookId: 'webhookId',
+    status: 'status',
+    deliveredAt: 'deliveredAt',
+    createdAt: 'createdAt'
+  }
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      scope: 'organization',
+      partnerId: null,
+      orgId: '11111111-1111-1111-1111-111111111111',
+      accessibleOrgIds: ['11111111-1111-1111-1111-111111111111'],
+      canAccessOrg: (orgId: string) => orgId === '11111111-1111-1111-1111-111111111111',
+      user: { id: 'user-123', email: 'test@example.com' }
+    });
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn(() => async (c: any, next: any) => {
+    if (permissionGate.deny) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    return next();
+  }),
+  requireMfa: vi.fn(() => async (c: any, next: any) => {
+    if (mfaGate.deny) {
+      return c.json({ error: 'MFA required' }, 403);
+    }
+    return next();
+  })
+}));
+
+import { db } from '../db';
+import { authMiddleware } from '../middleware/auth';
+import { webhookRoutes } from './webhooks';
+
+function mockSelectLimit(result: unknown) {
+  return {
+    from: vi.fn(() => ({
+      where: vi.fn(() => ({
+        limit: vi.fn(() => Promise.resolve(result))
+      }))
+    }))
+  };
+}
+
+function mockSelectWhere(result: unknown) {
+  return {
+    from: vi.fn(() => ({
+      where: vi.fn(() => Promise.resolve(result))
+    }))
+  };
+}
+
+function mockSelectOrderLimit(result: unknown) {
+  return {
+    from: vi.fn(() => ({
+      where: vi.fn(() => ({
+        orderBy: vi.fn(() => ({
+          limit: vi.fn(() => Promise.resolve(result))
+        }))
+      }))
+    }))
+  };
+}
+
+function mockSelectList(result: unknown) {
+  return {
+    from: vi.fn(() => ({
+      where: vi.fn(() => ({
+        orderBy: vi.fn(() => ({
+          limit: vi.fn(() => ({
+            offset: vi.fn(() => Promise.resolve(result))
+          }))
+        }))
+      }))
+    }))
+  };
+}
+
+// Stable UUIDs for test fixtures
+const WEBHOOK_ID_1 = '22222222-2222-2222-2222-222222222222';
+const WEBHOOK_ID_2 = '33333333-3333-3333-3333-333333333333';
+const DELIVERY_ID_1 = '44444444-4444-4444-4444-444444444444';
+
+describe('webhook routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    permissionGate.deny = false;
+    mfaGate.deny = false;
+    validateWebhookUrlSafetyWithDnsMock.mockResolvedValue([]);
+
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        scope: 'organization',
+        partnerId: null,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        accessibleOrgIds: ['11111111-1111-1111-1111-111111111111'],
+        canAccessOrg: (orgId: string) => orgId === '11111111-1111-1111-1111-111111111111',
+        user: { id: 'user-123', email: 'test@example.com' }
+      });
+      return next();
+    });
+
+    app = new Hono();
+    app.route('/webhooks', webhookRoutes);
+  });
+
+  it('creates a webhook with secret metadata', async () => {
+    vi.mocked(db.insert).mockReturnValueOnce({
+      values: vi.fn(() => ({
+        returning: vi.fn(() => Promise.resolve([{
+          id: WEBHOOK_ID_1,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: 'Device Alerts',
+          url: 'https://example.com/webhooks/device',
+          secret: 'secret-123',
+          events: ['device.created'],
+          headers: [{ key: 'X-Test', value: '1' }],
+          status: 'active',
+          createdBy: 'user-123',
+          createdAt: new Date('2026-02-07T13:00:00.000Z'),
+          updatedAt: new Date('2026-02-07T13:00:00.000Z'),
+          lastDeliveryAt: null
+        }]))
+      }))
+    } as any);
+
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Device Alerts',
+        url: 'https://example.com/webhooks/device',
+        secret: 'secret-123',
+        events: ['device.created'],
+        headers: [{ key: 'X-Test', value: '1' }]
+      })
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.id).toBe(WEBHOOK_ID_1);
+    expect(body.hasSecret).toBe(true);
+    expect(body.secret).toBeUndefined();
+  });
+
+  it('encrypts and redacts custom webhook headers', async () => {
+    vi.mocked(db.insert).mockReturnValueOnce({
+      values: vi.fn((values: any) => ({
+        returning: vi.fn(() => Promise.resolve([{
+          id: WEBHOOK_ID_1,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: 'Device Alerts',
+          url: 'https://example.com/webhooks/device',
+          secret: values.secret,
+          events: ['device.created'],
+          headers: values.headers,
+          status: 'active',
+          createdBy: 'user-123',
+          createdAt: new Date('2026-02-07T13:00:00.000Z'),
+          updatedAt: new Date('2026-02-07T13:00:00.000Z'),
+          lastDeliveryAt: null
+        }]))
+      }))
+    } as any);
+
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Device Alerts',
+        url: 'https://example.com/webhooks/device',
+        secret: 'secret-123',
+        events: ['device.created'],
+        headers: [{ key: 'Authorization', value: 'Bearer token-123' }]
+      })
+    });
+
+    expect(res.status).toBe(201);
+    const insertValues = vi.mocked(db.insert).mock.results[0]?.value.values.mock.calls[0][0];
+    expect(insertValues.headers[0].value).not.toBe('Bearer token-123');
+    expect(String(insertValues.headers[0].value)).toMatch(/^enc:v1:/);
+    const body = await res.json();
+    expect(JSON.stringify(body)).not.toContain('token-123');
+    expect(body.headers[0].value).toEqual({
+      redacted: true,
+      hasSecret: true,
+      masked: '********'
+    });
+  });
+
+  it('encrypts the delivery URL at rest and masks credentials in the response', async () => {
+    const credentialUrl = 'https://user:pass@example.com/hook?token=secret-token-xyz';
+
+    vi.mocked(db.insert).mockReturnValueOnce({
+      values: vi.fn((values: any) => ({
+        returning: vi.fn(() => Promise.resolve([{
+          id: WEBHOOK_ID_1,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: 'Cred Hook',
+          // Echo back what the handler actually persisted (encrypted form).
+          url: values.url,
+          secret: values.secret,
+          events: ['device.created'],
+          headers: [],
+          status: 'active',
+          createdBy: 'user-123',
+          createdAt: new Date('2026-02-07T13:00:00.000Z'),
+          updatedAt: new Date('2026-02-07T13:00:00.000Z'),
+          lastDeliveryAt: null
+        }]))
+      }))
+    } as any);
+
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Cred Hook',
+        url: credentialUrl,
+        secret: 'secret-123',
+        events: ['device.created']
+      })
+    });
+
+    expect(res.status).toBe(201);
+
+    // 1. Persisted URL is encrypted, not plaintext.
+    const insertValues = vi.mocked(db.insert).mock.results[0]?.value.values.mock.calls[0][0];
+    expect(insertValues.url).not.toBe(credentialUrl);
+    expect(String(insertValues.url)).toMatch(/^enc:v[123]:/);
+
+    // 2. API response masks the credential-bearing parts of the URL.
+    const body = await res.json();
+    expect(JSON.stringify(body)).not.toContain('secret-token-xyz');
+    expect(JSON.stringify(body)).not.toContain('user:pass');
+    expect(body.url).toBe('https://example.com/hook');
+  });
+
+  it('queues delivery by webhookId + generation only, never the decrypted URL (site-ceiling gate contract §7E)', async () => {
+    const { encryptSecret } = await import('../services/secretCrypto');
+    const encryptedUrl = encryptSecret('https://user:pass@example.com/deliver?token=abc') as string;
+    expect(encryptedUrl).toMatch(/^enc:v[123]:/);
+
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([
+      {
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Device Alerts',
+        url: encryptedUrl,
+        secret: null,
+        events: ['device.created'],
+        headers: [],
+        status: 'active',
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null,
+        retryPolicy: null,
+        approvalGeneration: 1
+      }
+    ]) as any);
+
+    vi.mocked(db.insert).mockReturnValueOnce({
+      values: vi.fn(() => ({
+        returning: vi.fn(() => Promise.resolve([{
+          id: DELIVERY_ID_1,
+          webhookId: WEBHOOK_ID_1,
+          eventType: 'webhook.test',
+          eventId: 'event-1',
+          payload: { test: true },
+          status: 'pending',
+          attempts: 0,
+          createdAt: new Date(),
+          deliveredAt: null
+        }]))
+      }))
+    } as any);
+
+    queueDeliveryMock.mockResolvedValueOnce(DELIVERY_ID_1);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ payload: { test: true } })
+    });
+
+    expect(res.status).toBe(202);
+    // The decrypted url/secret never leave this route on the enqueue path —
+    // only the webhook's identity and generation snapshot. The worker
+    // reloads and decrypts the row itself, at send time.
+    const call = (queueDeliveryMock.mock.calls as any[])[0];
+    expect(call[0]).toBe(WEBHOOK_ID_1);
+    expect(call[1]).toBe(1);
+    expect(JSON.stringify(call)).not.toContain('user:pass');
+  });
+
+  it('keeps the stored URL when an update re-submits the masked form', async () => {
+    const { encryptSecret } = await import('../services/secretCrypto');
+    const storedPlain = 'https://user:pass@example.com/hook?token=keepme';
+    const encryptedUrl = encryptSecret(storedPlain) as string;
+
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([
+      {
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Device Alerts',
+        url: encryptedUrl,
+        secret: null,
+        events: ['device.created'],
+        headers: [],
+        status: 'active',
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null
+      }
+    ]) as any);
+
+    const updateValuesSpy = vi.fn(() => ({
+      where: vi.fn(() => ({
+        returning: vi.fn(() => Promise.resolve([{
+          id: WEBHOOK_ID_1,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: 'Renamed',
+          url: encryptedUrl,
+          secret: null,
+          events: ['device.created'],
+          headers: [],
+          status: 'active',
+          createdBy: 'user-123',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastDeliveryAt: null
+        }]))
+      }))
+    }));
+    vi.mocked(db.update).mockReturnValueOnce({ set: updateValuesSpy } as any);
+
+    // Editor re-submits the masked URL we previously returned.
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ name: 'Renamed', url: 'https://example.com/hook' })
+    });
+
+    expect(res.status).toBe(200);
+    // url must NOT be overwritten (would otherwise strip credentials).
+    const setPayload = (updateValuesSpy.mock.calls as any[])[0][0];
+    expect(setPayload.url).toBeUndefined();
+    expect(setPayload.name).toBe('Renamed');
+  });
+
+  // Site-ceiling gate contract §3: every PATCH must bump approval_generation
+  // so an already-queued delivery carrying the OLD generation can tell it
+  // has been superseded by this edit and drop rather than deliver stale
+  // config. Before this fix, PATCH never touched the column, so
+  // `row.approvalGeneration !== job.generation` inside the worker could
+  // never be true.
+  it('bumps approval_generation on every PATCH (site-ceiling gate contract §3)', async () => {
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([
+      {
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Device Alerts',
+        url: 'https://example.com/webhook',
+        secret: 'secret-123',
+        events: ['device.created'],
+        headers: [],
+        status: 'active',
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null,
+        approvalGeneration: 1
+      }
+    ]) as any);
+
+    const updateValuesSpy2 = vi.fn(() => ({
+      where: vi.fn(() => ({
+        returning: vi.fn(() => Promise.resolve([{
+          id: WEBHOOK_ID_1,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: 'Renamed Again',
+          url: 'https://example.com/webhook',
+          secret: 'secret-123',
+          events: ['device.created'],
+          headers: [],
+          status: 'active',
+          createdBy: 'user-123',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastDeliveryAt: null,
+          approvalGeneration: 2
+        }]))
+      }))
+    }));
+    vi.mocked(db.update).mockReturnValueOnce({ set: updateValuesSpy2 } as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ name: 'Renamed Again' })
+    });
+
+    expect(res.status).toBe(200);
+    const setPayload = (updateValuesSpy2.mock.calls as any[])[0][0];
+    expect(setPayload.approvalGeneration).toBeDefined();
+  });
+
+  it('rejects unsafe webhook URLs', async () => {
+    validateWebhookUrlSafetyWithDnsMock.mockResolvedValueOnce(['Webhook URL must use HTTPS']);
+
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Unsafe Hook',
+        url: 'http://127.0.0.1/webhook',
+        secret: 'secret-123',
+        events: ['device.created']
+      })
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe('Invalid webhook URL');
+  });
+
+  it('rejects reserved and malformed custom webhook headers', async () => {
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Bad Headers',
+        url: 'https://example.com/webhook',
+        secret: 'secret-123',
+        events: ['device.created'],
+        headers: [
+          { key: 'Host', value: '169.254.169.254' },
+          { key: 'X-Breeze-Event-Type', value: 'forged' },
+          { key: 'Bad Header', value: 'value' },
+          { key: 'X-Test', value: 'line\rbreak' }
+        ]
+      })
+    });
+
+    expect(res.status).toBe(400);
+    expect(db.insert).not.toHaveBeenCalled();
+    const body = await res.json();
+    expect(JSON.stringify(body)).toContain('reserved');
+    expect(JSON.stringify(body)).toContain('RFC token');
+    expect(JSON.stringify(body)).toContain('control characters');
+  });
+
+  it('lists webhooks with pagination', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(mockSelectWhere([{ count: 2 }]) as any)
+      .mockReturnValueOnce(mockSelectList([
+        {
+          id: WEBHOOK_ID_1,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: 'First',
+          url: 'https://example.com/1',
+          secret: 'secret-a',
+          events: ['device.created'],
+          headers: [{ key: 'Authorization', value: 'enc:v1:test' }],
+          status: 'active',
+          createdBy: 'user-123',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastDeliveryAt: null
+        },
+        {
+          id: WEBHOOK_ID_2,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: 'Second',
+          url: 'https://example.com/2',
+          secret: null,
+          events: ['alert.triggered'],
+          headers: [],
+          status: 'disabled',
+          createdBy: 'user-123',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastDeliveryAt: null
+        }
+      ]) as any);
+
+    const res = await app.request('/webhooks?page=1&limit=50', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data).toHaveLength(2);
+    expect(body.pagination.total).toBe(2);
+    expect(body.data[0].secret).toBeUndefined();
+    expect(body.data[0].headers[0]?.value).toEqual({
+      redacted: true,
+      hasSecret: true,
+      masked: '********'
+    });
+    expect(body.data[1].status).toBe('paused');
+  });
+
+  it('queues a test webhook delivery and persists pending delivery row', async () => {
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([
+      {
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Device Alerts',
+        url: 'https://example.com/webhook',
+        secret: 'secret-123',
+        events: ['device.created'],
+        headers: [{ key: 'X-Test', value: '1' }],
+        status: 'active',
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null,
+        retryPolicy: null
+      }
+    ]) as any);
+
+    vi.mocked(db.insert).mockReturnValueOnce({
+      values: vi.fn(() => ({
+        returning: vi.fn(() => Promise.resolve([{
+          id: DELIVERY_ID_1,
+          webhookId: WEBHOOK_ID_1,
+          eventType: 'webhook.test',
+          eventId: 'event-1',
+          payload: { test: true },
+          status: 'pending',
+          attempts: 0,
+          responseStatus: null,
+          responseBody: null,
+          nextRetryAt: null,
+          createdAt: new Date(),
+          deliveredAt: null,
+          errorMessage: null,
+          responseTimeMs: null
+        }]))
+      }))
+    } as any);
+
+    queueDeliveryMock.mockResolvedValueOnce(DELIVERY_ID_1);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ payload: { test: true } })
+    });
+
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.message).toBe('Test delivery queued');
+    expect(body.delivery.status).toBe('pending');
+    expect(queueDeliveryMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Site-ceiling gate contract §3/finding 6: a paused webhook's test job
+  // would just be recorded superseded by the worker's generation check —
+  // reject up front with a clear 409 instead of queueing a job doomed to be
+  // dropped.
+  it('rejects /test with 409 when the webhook is not active', async () => {
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([
+      {
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Device Alerts',
+        url: 'https://example.com/webhook',
+        secret: 'secret-123',
+        events: ['device.created'],
+        headers: [],
+        status: 'disabled',
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null,
+        retryPolicy: null
+      }
+    ]) as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ payload: { test: true } })
+    });
+
+    expect(res.status).toBe(409);
+    expect(queueDeliveryMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects retry when delivery is not failed', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(mockSelectLimit([
+        {
+          id: WEBHOOK_ID_1,
+          orgId: '11111111-1111-1111-1111-111111111111',
+          name: 'Device Alerts',
+          url: 'https://example.com/webhook',
+          secret: 'secret-123',
+          events: ['device.created'],
+          headers: [],
+          status: 'active',
+          createdBy: 'user-123',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          lastDeliveryAt: null,
+          retryPolicy: null
+        }
+      ]) as any)
+      .mockReturnValueOnce(mockSelectLimit([
+        {
+          id: DELIVERY_ID_1,
+          webhookId: WEBHOOK_ID_1,
+          eventType: 'device.created',
+          eventId: 'evt-1',
+          payload: {},
+          status: 'delivered',
+          attempts: 1,
+          responseStatus: 200,
+          responseBody: 'ok',
+          nextRetryAt: null,
+          createdAt: new Date(),
+          deliveredAt: new Date()
+        }
+      ]) as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/retry/${DELIVERY_ID_1}`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe('Only failed deliveries can be retried');
+  });
+
+  it('rejects retry with 409 when the webhook is not active', async () => {
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([
+      {
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Device Alerts',
+        url: 'https://example.com/webhook',
+        secret: 'secret-123',
+        events: ['device.created'],
+        headers: [],
+        status: 'error',
+        createdBy: 'user-123',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        lastDeliveryAt: null,
+        retryPolicy: null
+      }
+    ]) as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/retry/${DELIVERY_ID_1}`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(409);
+    expect(queueDeliveryMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects webhook mutations when permission check fails', async () => {
+    permissionGate.deny = true;
+
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Device Alerts',
+        url: 'https://example.com/webhooks/device',
+        secret: 'secret-123',
+        events: ['device.created']
+      })
+    });
+
+    expect(res.status).toBe(403);
+  });
+
+  it('rejects webhook mutations when MFA check fails', async () => {
+    mfaGate.deny = true;
+
+    const res = await app.request('/webhooks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Device Alerts',
+        url: 'https://example.com/webhooks/device',
+        secret: 'secret-123',
+        events: ['device.created']
+      })
+    });
+
+    expect(res.status).toBe(403);
+  });
+
+  // -------------------------------------------------------------------------
+  // Cross-org isolation tests
+  //
+  // getWebhookWithOrgCheck fetches the webhook by id unconditionally, then
+  // gates on auth.canAccessOrg(webhook.orgId). A foreign-org webhook must
+  // never leak its contents — the only acceptable response is 404.
+  // -------------------------------------------------------------------------
+
+  const FOREIGN_ORG_ID = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+  const FOREIGN_WEBHOOK_ID = '55555555-5555-5555-5555-555555555555';
+
+  const foreignWebhookRow = {
+    id: FOREIGN_WEBHOOK_ID,
+    orgId: FOREIGN_ORG_ID,
+    name: 'Foreign Hook',
+    url: 'https://attacker:secret@foreign.example.com/hook?token=leak-me',
+    secret: 'foreign-secret-should-not-leak',
+    events: ['device.created'],
+    headers: [],
+    status: 'active',
+    createdBy: 'foreign-user',
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    lastDeliveryAt: null,
+    retryPolicy: null,
+    successCount: 0,
+    failureCount: 0,
+    lastSuccessAt: null
+  };
+
+  it('GET /:id — returns 404 and leaks nothing for a webhook belonging to a different org', async () => {
+    // getWebhookWithOrgCheck calls .select().from().where().limit(1)
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([foreignWebhookRow]) as any);
+
+    const res = await app.request(`/webhooks/${FOREIGN_WEBHOOK_ID}`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(404);
+    const text = await res.text();
+    expect(text).not.toContain('attacker');
+    expect(text).not.toContain('leak-me');
+    expect(text).not.toContain('foreign-secret-should-not-leak');
+    expect(text).not.toContain(FOREIGN_ORG_ID);
+  });
+
+  it('PATCH /:id — returns 404 and leaks nothing for a webhook belonging to a different org', async () => {
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([foreignWebhookRow]) as any);
+
+    const res = await app.request(`/webhooks/${FOREIGN_WEBHOOK_ID}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ name: 'Renamed' })
+    });
+
+    expect(res.status).toBe(404);
+    const text = await res.text();
+    expect(text).not.toContain('attacker');
+    expect(text).not.toContain('leak-me');
+    expect(text).not.toContain('foreign-secret-should-not-leak');
+    // db.update must not have been called — no mutation on foreign resource
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /:id — returns 404 and leaks nothing for a webhook belonging to a different org', async () => {
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([foreignWebhookRow]) as any);
+
+    const res = await app.request(`/webhooks/${FOREIGN_WEBHOOK_ID}`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(404);
+    const text = await res.text();
+    expect(text).not.toContain('attacker');
+    expect(text).not.toContain('leak-me');
+    expect(text).not.toContain('foreign-secret-should-not-leak');
+    // db.delete must not have been called — no mutation on foreign resource
+    expect(db.delete).not.toHaveBeenCalled();
+  });
+
+  it('does not carry stored custom headers to a changed webhook origin', async () => {
+    const { encryptSecret } = await import('../services/secretCrypto');
+    const { encryptWebhookHeaders } = await import('../services/notificationChannelSecrets');
+    const encryptedUrl = encryptSecret('https://hooks.example.com/deliver') as string;
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([{
+      id: WEBHOOK_ID_1,
+      orgId: '11111111-1111-1111-1111-111111111111',
+      name: 'Credentialed Hook',
+      url: encryptedUrl,
+      secret: null,
+      events: ['device.created'],
+      headers: encryptWebhookHeaders([{ key: 'Authorization', value: 'Bearer stored' }]),
+      status: 'active',
+      createdBy: 'user-123',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      lastDeliveryAt: null,
+    }]) as any);
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ url: 'https://attacker.example/deliver' }),
+    });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toMatchObject({
+      error: expect.stringMatching(/headers.*re-entered/i),
+    });
+    expect(db.update).not.toHaveBeenCalled();
+  });
+
+  it('allows a webhook origin change when stored headers are explicitly cleared', async () => {
+    const { encryptSecret } = await import('../services/secretCrypto');
+    const { encryptWebhookHeaders } = await import('../services/notificationChannelSecrets');
+    const stored = {
+      id: WEBHOOK_ID_1,
+      orgId: '11111111-1111-1111-1111-111111111111',
+      name: 'Credentialed Hook',
+      url: encryptSecret('https://hooks.example.com/deliver') as string,
+      secret: null,
+      events: ['device.created'],
+      headers: encryptWebhookHeaders([{ key: 'Authorization', value: 'Bearer stored' }]),
+      status: 'active',
+      createdBy: 'user-123',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      lastDeliveryAt: null,
+    };
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([stored]) as any);
+    const setSpy = vi.fn((values: Record<string, unknown>) => ({
+      where: vi.fn(() => ({ returning: vi.fn(async () => [{ ...stored, ...values }]) })),
+    }));
+    vi.mocked(db.update).mockReturnValueOnce({ set: setSpy } as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ url: 'https://replacement.example/deliver', headers: [] }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ headers: [] }));
+  });
+
+  it('returns a conflict with no audit or delivery when the endpoint tuple changed concurrently', async () => {
+    const { encryptSecret } = await import('../services/secretCrypto');
+    const stored = {
+      id: WEBHOOK_ID_1,
+      orgId: '11111111-1111-1111-1111-111111111111',
+      name: 'Credentialed Hook',
+      url: encryptSecret('https://hooks.example.com/deliver') as string,
+      secret: null,
+      events: ['device.created'],
+      headers: [],
+      status: 'active',
+      createdBy: 'user-123',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      lastDeliveryAt: null,
+    };
+    vi.mocked(db.select).mockReturnValueOnce(mockSelectLimit([stored]) as any);
+    vi.mocked(db.update).mockReturnValueOnce({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({ returning: vi.fn(async () => []) })),
+      })),
+    } as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ name: 'Stale edit' }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(writeRouteAudit).not.toHaveBeenCalled();
+    expect(queueDeliveryMock).not.toHaveBeenCalled();
+  });
+
+});

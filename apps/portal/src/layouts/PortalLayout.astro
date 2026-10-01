@@ -1,0 +1,340 @@
+---
+import '../styles/globals.css';
+import { ClientRouter } from 'astro:transitions';
+import { loadPortalBranding, loadPortalProfile } from '../lib/server';
+import { buildPortalNavItems } from '../lib/navItems';
+import { stripBase, withBase } from '../lib/basePath';
+import { buildDocAccentCss } from '../lib/docAccent';
+import { isPortalChromeAccent, PORTAL_CHROME_ACCENT_DEFAULT } from '@breeze/shared';
+import { buildPortalCustomCss } from '../lib/customCss';
+
+interface Props {
+  title: string;
+  /** Partner brand accent for a document rendered on this page (proposal or
+   *  invoice), emitted below as a nonced <style> element (lib/docAccent.ts). */
+  docAccent?: string | null;
+  /** The page sits on a linen sheet laid on the plaster desk. Paper documents
+   *  (proposal, invoice) opt out: their own white page is the sheet, and a
+   *  sheet under a sheet is the nested card the world refuses. */
+  sheet?: boolean;
+}
+
+// Design contract (The Guest Ledger) — a frontmatter comment so it stays out of
+// the HTML customers receive; apps/portal/DESIGN.md is the full record.
+// THESIS: the MSP as concierge; refuses the category default (white sidebar
+// shell, boxed tables, blue accents, pill badges). OWN-WORLD: warm plaster
+// ground, linen cards, deep service-green ink, hairline-ruled ledgers, Literata
+// for titles and money, Hanken Grotesk elsewhere, statuses as a dot plus
+// uppercase tracked text, 12px surfaces. FIRST VIEWPORT: quiet left rail with
+// the firm's name; serif page title + one line of service copy; the ledger.
+const { title, docAccent, sheet = true } = Astro.props;
+// Astro.url.pathname includes the base (e.g. /c/devices); strip it so the
+// active-nav comparison below stays base-agnostic.
+const pathname = stripBase(Astro.url.pathname);
+const branding = await loadPortalBranding(Astro.request);
+const profile = await loadPortalProfile(Astro.request);
+// #2345 — Tickets is hidden when the org's branding has enableTickets: false.
+// Fail-open when the flag is absent (shared-domain portals get no branding row);
+// the API's 403 gate on /portal/tickets/* is the real enforcement.
+const navItems = buildPortalNavItems(branding);
+
+const accentCss = buildDocAccentCss(docAccent ?? branding.primaryColor);
+// Org-authored portal styling (#5940) — saved via the branding editor and
+// returned by /portal/branding, but never reached the DOM until now. Emitted
+// as its own nonced <style> element (see lib/customCss.ts) after the base
+// stylesheet + accent so it can override either, matching the docs' example
+// of targeting `.portal-header`.
+const customCssContent = buildPortalCustomCss(branding.customCss);
+const cspNonce = Astro.locals.cspNonce;
+
+// Curated chrome accent (packages/shared/src/types/portalChromeAccent.ts).
+// The default key ('spruce') needs no override block, so it's treated the
+// same as null/unset/unrecognized — the attribute is simply omitted and the
+// base :root tokens (already spruce) apply.
+const chromeAccent =
+  isPortalChromeAccent(branding.chromeAccent) && branding.chromeAccent !== PORTAL_CHROME_ACCENT_DEFAULT
+    ? branding.chromeAccent
+    : undefined;
+
+const isActive = (href: string) => {
+  if (href === '/') return pathname === '/';
+  return pathname === href || pathname.startsWith(`${href}/`);
+};
+---
+
+<!DOCTYPE html>
+<html lang="en" data-accent={chromeAccent}>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Your proposals, invoices, devices and support — in one place." />
+    <link rel="icon" type="image/svg+xml" href={withBase('/favicon.svg')} />
+    <title>{title} | {branding.name || 'Customer Portal'}</title>
+    {branding.faviconUrl && <link rel="icon" href={branding.faviconUrl} />}
+    {accentCss && <style nonce={cspNonce} set:html={accentCss}></style>}
+    {customCssContent && <style nonce={cspNonce} set:html={customCssContent}></style>}
+    <ClientRouter />
+  </head>
+  <body class="min-h-dvh bg-background antialiased">
+    <a
+      href="#portal-main"
+      class="sr-only rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50"
+    >
+      Skip to main content
+    </a>
+    {/* Was `h-screen overflow-hidden`: a fixed 100vh that clips under the iOS
+        Safari URL bar. dvh tracks the visible viewport instead. */}
+    <div class="flex min-h-dvh">
+      <aside class="hidden w-64 flex-col border-r border-border/70 lg:flex">
+        <div class="flex h-20 items-center px-7">
+          {branding.logoUrl ? (
+            <img src={branding.logoUrl} alt={branding.name || 'Customer Portal'} class="h-8 w-auto" />
+          ) : (
+            <span class="font-display text-xl font-semibold tracking-tight text-foreground">
+              {branding.name || 'Customer Portal'}
+            </span>
+          )}
+        </div>
+
+        <nav class="flex-1 space-y-0.5 px-4 pt-2">
+          {navItems.map((item) => (
+            <a
+              href={withBase(item.href)}
+              data-testid={`portal-nav-${item.href.slice(1) || 'home'}`}
+              aria-current={isActive(item.href) ? 'page' : undefined}
+              class:list={[
+                'group relative flex items-center rounded-md px-3 py-2 text-sm transition-colors duration-150',
+                isActive(item.href)
+                  ? 'font-semibold text-foreground'
+                  : 'font-medium text-muted-foreground hover:bg-accent/60 hover:text-foreground'
+              ]}
+            >
+              {/* The register mark: active entries carry a short ink rule where
+                  a filled pill used to shout. */}
+              <span
+                aria-hidden="true"
+                class:list={[
+                  'mr-3 h-4 w-0.5 rounded-full transition-colors duration-150',
+                  isActive(item.href) ? 'bg-primary' : 'bg-transparent group-hover:bg-border'
+                ]}
+              ></span>
+              {item.label}
+            </a>
+          ))}
+        </nav>
+
+        <div class="px-6 pb-7">
+          <div class="border-t border-border/70 pt-5 text-sm">
+            <p class="font-medium text-foreground">We're here to help.</p>
+            <p class="mt-1 text-muted-foreground">Reach your IT team any time.</p>
+            {branding.supportEmail && (
+              <a href={`mailto:${branding.supportEmail}`} class="mt-3 block font-medium text-primary-on-tint underline-offset-4 hover:underline">
+                {branding.supportEmail}
+              </a>
+            )}
+            {branding.supportPhone && (
+              <a href={`tel:${branding.supportPhone}`} class="mt-1 block font-medium text-primary-on-tint underline-offset-4 hover:underline">
+                {branding.supportPhone}
+              </a>
+            )}
+          </div>
+        </div>
+      </aside>
+
+      <div class="flex min-w-0 flex-1 flex-col">
+        {/* Header and main share one column (max-w-5xl, left-aligned against the
+            rail): the actions sit above the content's right edge, not the
+            viewport's, so a wide screen reads as page + margin rather than
+            three islands. `.portal-header` is the selector the branding docs
+            document as the supported customCss target
+            (apps/docs/.../branding.mdx) — keep it even though nothing else in
+            this file reads the class. */}
+        <header class="portal-header border-b border-border/70">
+          <div class="flex h-16 w-full max-w-6xl items-center justify-between gap-3 px-4 sm:h-20 sm:px-8">
+          <div class="flex min-w-0 items-center gap-3">
+            <details class="relative shrink-0 lg:hidden">
+              <summary class="cursor-pointer list-none rounded-md border border-border bg-card px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent">
+                Menu
+              </summary>
+              <nav class="absolute left-0 top-12 z-30 w-56 rounded-lg border border-border bg-card p-2 shadow-lg shadow-foreground/5">
+                {navItems.map((item) => (
+                  <a
+                    href={withBase(item.href)}
+                    aria-current={isActive(item.href) ? 'page' : undefined}
+                    class:list={[
+                      'group relative flex items-center rounded-md px-3 py-2 text-sm transition-colors duration-150',
+                      isActive(item.href)
+                        ? 'font-semibold text-foreground'
+                        : 'font-medium text-muted-foreground hover:bg-accent/60 hover:text-foreground'
+                    ]}
+                  >
+                    {/* Same register mark the rail carries: the phone menu is
+                        the same navigation, so it marks "you are here" the same
+                        way — a filled accent wash is the pill this world
+                        refuses, and it carried no aria-current at all. */}
+                    <span
+                      aria-hidden="true"
+                      class:list={[
+                        'mr-3 h-4 w-0.5 rounded-full transition-colors duration-150',
+                        isActive(item.href) ? 'bg-primary' : 'bg-transparent group-hover:bg-border'
+                      ]}
+                    ></span>
+                    {item.label}
+                  </a>
+                ))}
+              </nav>
+            </details>
+            {/* Phones get the partner's logo too, not just the rail. */}
+            {branding.logoUrl ? (
+              <img src={branding.logoUrl} alt={branding.name || 'Customer Portal'} class="h-7 w-auto max-w-[150px] lg:hidden" />
+            ) : (
+              <span class="truncate font-display text-xl font-semibold tracking-tight text-foreground lg:hidden">
+                {branding.name || 'Customer Portal'}
+              </span>
+            )}
+            {/* At lg+ the rail carries the brand, so the header's left side names
+                the account instead: the customer's firm, and who is signed in.
+                Without it the desktop header was an 80px band with nothing but
+                the actions at far right. */}
+            {profile && (
+              <div data-testid="portal-account-context" class="hidden min-w-0 lg:block">
+                <p class="truncate text-sm font-semibold text-foreground">{profile.organizationName}</p>
+                <p class="truncate text-xs text-muted-foreground">
+                  Signed in as {profile.name || profile.email}
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div class="flex items-center gap-1">
+            {/* The one quick action a customer reaches for from anywhere:
+                start a ticket. Gated like the nav entry (#2345): hidden only
+                when branding explicitly disables ticketing. */}
+            {branding.enableTickets !== false && (
+              <a
+                href={withBase('/tickets/new')}
+                data-testid="quick-new-ticket"
+                aria-label="New ticket"
+                class="mr-1 inline-flex items-center gap-2 whitespace-nowrap rounded-md bg-primary px-2.5 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background sm:mr-2 sm:px-3.5"
+              >
+                <svg aria-hidden="true" viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                {/* Icon-only on phones so the brand keeps its room. */}
+                <span class="hidden sm:inline">New ticket</span>
+              </a>
+            )}
+            <a href={withBase('/profile')} class="hidden whitespace-nowrap rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground lg:inline-flex">
+              Profile
+            </a>
+            <button
+              type="button"
+              data-portal-logout
+              data-login-path={withBase('/login')}
+              class="whitespace-nowrap rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+            >
+              Sign out
+            </button>
+          </div>
+          </div>
+        </header>
+
+        <main id="portal-main" class="settle-in w-full max-w-6xl flex-1 px-3 pb-12 pt-4 sm:px-8 sm:pt-8">
+          {/* Figure and ground: the page is a sheet on the desk. The rail and
+              header stay on plaster; the content gets a linen surface with a
+              hairline edge, so the leftover width on a wide screen reads as
+              desk rather than as a page that never filled its column. */}
+          <div
+            data-testid="portal-sheet"
+            class:list={[
+              sheet && 'rounded-lg border border-border/70 bg-card px-4 py-6 sm:px-9 sm:py-8',
+            ]}
+          >
+            <slot />
+
+            {/* A ledger page has a foot. Partner footer text when the firm
+                wrote one; otherwise the firm's own name, quietly. No rule of
+                its own: most pages already close on one (ledger foot line,
+                empty-state band) and two rules read as a mistake. */}
+            <footer data-testid="portal-foot" class="mt-12 text-xs text-muted-foreground">
+              {branding.footerText || branding.name || 'Customer Portal'}
+            </footer>
+          </div>
+
+          {/* The support contact used to live only in the desktop sidebar, and
+              the mobile menu carries nav links only, so on a phone a customer
+              had no way to reach their MSP from inside the portal. */}
+          <aside class="mt-12 border-t border-border/70 pt-5 text-sm lg:hidden">
+            <p class="font-medium text-foreground">We're here to help.</p>
+            <p class="mt-1 text-muted-foreground">Reach your IT team any time.</p>
+            {branding.supportEmail && (
+              <a href={`mailto:${branding.supportEmail}`} class="mt-3 block font-medium text-primary-on-tint underline-offset-4 hover:underline">
+                {branding.supportEmail}
+              </a>
+            )}
+            {branding.supportPhone && (
+              <a href={`tel:${branding.supportPhone}`} class="mt-1 block font-medium text-primary-on-tint underline-offset-4 hover:underline">
+                {branding.supportPhone}
+              </a>
+            )}
+          </aside>
+        </main>
+      </div>
+    </div>
+    {/*
+      Bundled (NOT is:inline) so Astro serves it from /portal/_astro/ — allowed by
+      `script-src 'self'` with no per-page hash. An inline script would need a hash
+      that changes per page, which the View-Transitions ClientRouter can't satisfy
+      after a client-side navigation (the initial document's CSP stays in force).
+      The base-aware login path is read from the button's data attribute rather
+      than via define:vars (which would force is:inline again).
+    */}
+    <script>
+      function bindPortalLogout() {
+        const btn = document.querySelector('[data-portal-logout]');
+        if (!(btn instanceof HTMLButtonElement) || btn.dataset.logoutBound === 'true') {
+          return;
+        }
+        btn.dataset.logoutBound = 'true';
+
+        const getCookie = (name: string): string | null => {
+          const target = `${name}=`;
+          for (const part of document.cookie.split(';')) {
+            const trimmed = part.trim();
+            if (trimmed.startsWith(target)) {
+              return decodeURIComponent(trimmed.slice(target.length));
+            }
+          }
+          return null;
+        };
+
+        btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          const loginPath = btn.dataset.loginPath || '/login';
+          try {
+            const csrf = getCookie('breeze_portal_csrf_token');
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (csrf) {
+              headers['x-breeze-csrf'] = csrf;
+            }
+            await fetch('/api/v1/portal/auth/logout', {
+              method: 'POST',
+              credentials: 'include',
+              headers
+            });
+          } catch {
+            // Continue to login even if the logout request fails.
+          }
+
+          try {
+            const { navigate } = await import('astro:transitions/client');
+            await navigate(loginPath, { history: 'replace' });
+          } catch {
+            window.location.replace(loginPath);
+          }
+        });
+      }
+
+      bindPortalLogout();
+      document.addEventListener('astro:page-load', bindPortalLogout);
+    </script>
+  </body>
+</html>

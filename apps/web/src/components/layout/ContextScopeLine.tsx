@@ -1,0 +1,94 @@
+import { useEffect, useState } from 'react';
+import { Globe, Library, Building2 } from 'lucide-react';
+import { getRouteScope, isSingleDocumentRoute } from '../../lib/routeScope';
+import { useOrgStore } from '../../stores/orgStore';
+import { useOrgScope } from '@/hooks/useOrgScope';
+import { useTranslation } from 'react-i18next';
+
+/**
+ * The page-scope half of the two-layer context model. The header switcher
+ * states the user's context; this line — mounted once in DashboardLayout, so
+ * no page can forget it — states what the current PAGE does with that context,
+ * but only when that carries information the switcher alone doesn't:
+ *
+ *   catalog page            → "Catalog — same for every organization"
+ *   fleet view, fleet page  → "Showing all organizations · N"
+ *   fleet view, org-required→ "This page shows one organization at a time"
+ *
+ * Org view on an org page renders nothing (the trigger already says it), as do
+ * partner-settings and device/self surfaces.
+ */
+export default function ContextScopeLine() {
+  const { t } = useTranslation('common');
+  // Pathname is read after mount: this island renders inside the swapped page
+  // content, so SSR must emit nothing scope-specific (the store is empty
+  // server-side anyway) and the real line appears on hydration.
+  const [pathname, setPathname] = useState<string | null>(null);
+  const scope = useOrgScope();
+  const orgCount = useOrgStore((s) => s.organizations.length);
+
+  useEffect(() => {
+    setPathname(window.location.pathname);
+  }, []);
+
+  if (!pathname) return null;
+  // Quote/invoice detail pages: the document names its customer, and this line
+  // is the only scroll-away content above their pinned header chrome — see
+  // isSingleDocumentRoute.
+  if (isSingleDocumentRoute(pathname)) return null;
+  const kind = getRouteScope(pathname);
+  // The organization record names its own org in its header (and chips a
+  // switcher pointing elsewhere), so a scope line here adds nothing — and
+  // "Showing all organizations" would flatly contradict a page about one named
+  // customer. Explicit rather than relying on the fall-through below, so a
+  // future reclassification of the route cannot resurrect the line.
+  if (kind === 'org-record') return null;
+  // Explicit fleet view only — the hook's discriminated union keeps the
+  // transient/loading and error states from reading as fleet.
+  const isFleet = scope.scope === 'all';
+
+  if (kind === 'catalog') {
+    return (
+      <p
+        data-testid="context-scope-line"
+        data-kind="catalog"
+        className="mb-4 flex items-center gap-1.5 text-sm text-muted-foreground"
+      >
+        <Library className="h-3.5 w-3.5" aria-hidden="true" />
+        {t('layout.scope.catalogLine')}
+      </p>
+    );
+  }
+
+  if (kind === 'org-or-all' && isFleet) {
+    return (
+      <p
+        data-testid="context-scope-line"
+        data-kind="fleet"
+        // mt-1: the page's domain-accent strip sits flush against the top of
+        // the scrollable content area (no padding above it) — without this the
+        // banner immediately follows that strip with no breathing room, reading
+        // as clipped/cramped at the content's top edge.
+        className="mb-4 mt-1 flex items-center gap-1.5 text-sm text-primary"
+      >
+        <Globe className="h-3.5 w-3.5" aria-hidden="true" />
+        {t('layout.scope.fleetLine', { count: orgCount })}
+      </p>
+    );
+  }
+
+  if (kind === 'org-required' && isFleet) {
+    return (
+      <p
+        data-testid="context-scope-line"
+        data-kind="org-required"
+        className="mb-4 flex items-center gap-1.5 text-sm text-muted-foreground"
+      >
+        <Building2 className="h-3.5 w-3.5" aria-hidden="true" />
+        {t('layout.scope.orgRequiredLine')}
+      </p>
+    );
+  }
+
+  return null;
+}

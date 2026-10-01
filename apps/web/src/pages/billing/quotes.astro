@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import QuotesPage from '../../components/billing/quotes/QuotesPage';
+---
+
+<DashboardLayout titleKey="titles.billingQuotes">
+  <QuotesPage client:load />
+</DashboardLayout>

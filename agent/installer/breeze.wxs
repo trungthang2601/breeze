@@ -1,0 +1,715 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?ifndef Version?>
+<?define Version=0.1.0?>
+<?endif?>
+<!-- Installer-identity variables (edition parameterization).
+     ProductName/UpgradeCode default to the ORIGINAL "Hosted" edition's
+     values so a bare `wix build breeze.wxs` (no -d overrides) still
+     produces today's package byte-for-byte identical in identity —
+     existing hosted fleets must keep upgrading via the SAME UpgradeCode.
+     build-msi.ps1's -Edition switch supplies overrides for the
+     "Self-Hosted" edition. OtherUpgradeCode is the UpgradeCode of
+     whichever edition this build is NOT — see the cross-edition Upgrade
+     guard below Package for why it exists and why its default is the
+     Self-Hosted GUID (the complement of the Hosted defaults here). -->
+<?ifndef ProductName?>
+<?define ProductName=Breeze Agent?>
+<?endif?>
+<?ifndef UpgradeCode?>
+<?define UpgradeCode={70A57B7A-4F72-4E18-B8D3-7D2783C2C1A9}?>
+<?endif?>
+<!-- {787838E2-1A3E-4B61-8514-75DD922A6B1B} is the PERMANENT UpgradeCode for
+     the "Self-Hosted" edition, generated once for this parameterization
+     work. It must NEVER change — it is how self-hosted fleets recognize
+     their own upgrade lineage, and it is also the value the Hosted
+     edition's cross-edition guard checks for below (as OtherUpgradeCode's
+     default). -->
+<?ifndef OtherUpgradeCode?>
+<?define OtherUpgradeCode={787838E2-1A3E-4B61-8514-75DD922A6B1B}?>
+<?endif?>
+<?ifndef AgentExePath?>
+<?define AgentExePath=..\breeze-agent-windows-amd64.exe?>
+<?endif?>
+<?ifndef BackupExePath?>
+<?define BackupExePath=..\breeze-backup-windows-amd64.exe?>
+<?endif?>
+<?ifndef WatchdogExePath?>
+<?define WatchdogExePath=..\breeze-watchdog-windows-amd64.exe?>
+<?endif?>
+<?ifndef UserHelperExePath?>
+<?define UserHelperExePath=..\breeze-user-helper-windows-amd64.exe?>
+<?endif?>
+<?ifndef UserTaskXmlPath?>
+<?define UserTaskXmlPath=..\service\windows\breeze-agent-user-task.xml?>
+<?endif?>
+<?ifndef InstallUserHelperScriptPath?>
+<?define InstallUserHelperScriptPath=..\scripts\install\install-windows.ps1?>
+<?endif?>
+<?ifndef RemoveUserHelperScriptPath?>
+<?define RemoveUserHelperScriptPath=remove-windows-task.ps1?>
+<?endif?>
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="$(var.ProductName)"
+    Manufacturer="Breeze RMM"
+    Version="$(var.Version)"
+    UpgradeCode="$(var.UpgradeCode)"
+    Scope="perMachine"
+    InstallerVersion="500"
+    Language="1033">
+
+    <SummaryInformation Description="Breeze RMM endpoint agent" />
+    <MediaTemplate EmbedCab="yes" />
+    <!-- Schedule="afterInstallExecute" is LOAD-BEARING — do not move it
+         earlier. The old product's uninstall (RemoveExistingProducts) runs
+         AFTER the new product's files/components are registered, so shared
+         component refcounts keep cmpCleanConfigOnUninstall alive and its
+         RemoveFile rows (secrets.yaml / agent.yaml) do NOT fire during an
+         upgrade. With an early schedule the old product uninstalls while
+         refcount is still 1 and every upgrade would DELETE THE ENROLLMENT
+         CREDENTIALS — and shipped old MSIs can't be changed, so this cannot
+         be mitigated package-side. The protection additionally requires the
+         old MSI to carry the same component GUID for
+         cmpCleanConfigOnUninstall ({D4E5F6A7-...} is hardcoded below, so
+         all shipped versions match). The VM upgrade test MUST assert that
+         secrets.yaml + agent.yaml survive the upgrade — that is the
+         empirical check of this refcount reasoning. The costs of the late schedule (the old
+         uninstall runs after our services/task are set up) are compensated
+         by RecoverBreezeAfterUpgrade / ReRegisterUserHelperTaskAfterUpgrade
+         below.
+
+         AllowSameVersionUpgrades: ProductCode is auto-generated per build,
+         so two builds of the SAME version are unrelated products. Without
+         this flag, reinstalling a rebuilt same-version MSI (common with the
+         signing-service pipeline) installs SIDE-BY-SIDE: two ARP entries
+         both claiming the services, and the eventual uninstall of either
+         one rips the services out from under the survivor.
+
+         Cross-edition guard (OTHEREDITIONFOUND below): Hosted and
+         Self-Hosted are separate PRODUCTS (distinct UpgradeCodes, see the
+         preprocessor block at the top of this file) that install into the
+         exact same paths and claim the exact same service names
+         (BreezeAgent / BreezeWatchdog) — they are NOT upgrade-related to
+         each other, so MajorUpgrade above (which only knows this package's
+         OWN UpgradeCode) does nothing to stop them coexisting. Side-by-side
+         would be the same class of corruption AllowSameVersionUpgrades
+         guards against above (two ARP entries fighting over one set of
+         services/files, whichever uninstalls first yanking them out from
+         under the survivor) — so it must be refused outright in both
+         directions, not merely discouraged. The Upgrade/Launch pair
+         immediately below does that: OnlyDetect="yes" makes it a pure
+         probe (no RemoveExistingProducts action is scheduled for the other
+         product), and the Launch Condition blocks install before any files
+         are touched if the other edition is found. -->
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of Breeze Agent is already installed."
+      AllowSameVersionUpgrades="yes"
+      Schedule="afterInstallExecute" />
+
+    <Upgrade Id="$(var.OtherUpgradeCode)">
+      <UpgradeVersion Minimum="0.0.0.0" IncludeMinimum="yes" OnlyDetect="yes" Property="OTHEREDITIONFOUND" />
+    </Upgrade>
+    <Launch Condition="NOT OTHEREDITIONFOUND" Message="A different edition of the Breeze Agent is already installed. Uninstall it before installing this edition." />
+    <!-- Stock InstallExecuteSequence numbers are LaunchConditions 100,
+         FindRelatedProducts 200, AppSearch 400, so on a silent install
+         OTHEREDITIONFOUND (above) and WINDOWS_CURRENT_MAJOR_VERSION (below)
+         would both still be empty when the Launch conditions are evaluated
+         — the cross-edition guard would never fire and the OS floor would
+         refuse everything. (InstallUISequence already puts AppSearch at 50,
+         before LaunchConditions.) Pull both actions ahead of
+         LaunchConditions explicitly in both sequences so the ordering is
+         never implicit. -->
+    <InstallUISequence>
+      <FindRelatedProducts Before="LaunchConditions" />
+      <AppSearch Before="LaunchConditions" />
+    </InstallUISequence>
+    <InstallExecuteSequence>
+      <FindRelatedProducts Before="LaunchConditions" />
+      <AppSearch Before="LaunchConditions" />
+    </InstallExecuteSequence>
+
+    <Launch Condition="VersionNT64" Message="Breeze Agent requires 64-bit Windows." />
+    <!-- Go 1.22+ (agent/go.mod pins a newer toolchain) structurally requires
+         Windows 10 / Server 2016 or later; Go 1.21 was the last release
+         that ran on Windows 7/8/8.1/Server 2008 R2/2012/2012 R2, and the
+         agent binary compiled against the current toolchain would install
+         successfully on a legacy box and then fail at runtime with no
+         useful message (issue #4608, Option C: declare the floor and block
+         at install time instead).
+
+         DO NOT use VersionNT / WindowsBuild for this check. On Windows 10,
+         Server 2016 and later, Windows Installer reports VersionNT = 603 and
+         WindowsBuild = 9600 (the Windows 8.1 values) on EVERY install, by
+         design: msiexec.exe is manifested only up to Windows 8.1, so the
+         version APIs it calls are shimmed (Microsoft KB 3202260). The
+         `VersionNT >= 1000` floor that shipped in v0.110.0 therefore refused
+         every fresh MSI install on Windows 10/11 with the legacy-OS message.
+         First reported 2026-09-10 via NinjaRMM- and Action1-driven installs
+         of 0.111.1 on Windows 11 24H2, whose log showed VersionNT = 603 next
+         to MsiWin32AssemblySupport = 6.3.26100.8972.
+
+         Registry reads are not shimmed, and
+         HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentMajorVersionNumber
+         (REG_DWORD 10) exists only on Windows 10 / Server 2016 and later;
+         Windows 8.1 and earlier have only the "6.x" CurrentVersion string.
+         So "the value exists" is exactly the Windows-10/Server-2016 floor.
+         `Installed OR` keeps repair/upgrade/uninstall of an already-installed
+         product from ever being blocked by this check (WiX guidance for
+         OS-floor launch conditions). The property must be PUBLIC (all
+         uppercase): WiX refuses a lowercase search property (WIX0012),
+         because AppSearch can only populate public properties. That means
+         `msiexec /i ... WINDOWS_CURRENT_MAJOR_VERSION=1` can satisfy the
+         floor by hand — an admin bypassing a guard on their own machine,
+         accepted. If the HKLM read itself fails (locked-down ACL), the user
+         sees this same legacy-OS message. -->
+    <Property Id="WINDOWS_CURRENT_MAJOR_VERSION">
+      <RegistrySearch Id="WINDOWS_CURRENT_MAJOR_VERSIONSearch"
+                      Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentMajorVersionNumber"
+                      Type="raw"
+                      Bitness="always64" />
+    </Property>
+    <Launch Condition="Installed OR WINDOWS_CURRENT_MAJOR_VERSION" Message="Breeze Agent requires Windows 10 or Windows Server 2016 or later. Legacy Windows versions (7, 8, 8.1, Server 2008 R2 through 2012 R2) are not supported." />
+    <Launch Condition="(NOT SERVER_URL AND NOT ENROLLMENT_KEY) OR (SERVER_URL AND ENROLLMENT_KEY)" Message="SERVER_URL and ENROLLMENT_KEY must be provided together." />
+
+    <?ifdef ServerUrlDefault ?>
+    <Property Id="SERVER_URL" Secure="yes" Value="$(var.ServerUrlDefault)" />
+    <?else?>
+    <Property Id="SERVER_URL" Secure="yes" />
+    <?endif?>
+
+    <?ifdef EnrollmentKeyDefault ?>
+    <Property Id="ENROLLMENT_KEY" Secure="yes" Hidden="yes" Value="$(var.EnrollmentKeyDefault)" />
+    <?else?>
+    <Property Id="ENROLLMENT_KEY" Secure="yes" Hidden="yes" />
+    <?endif?>
+
+    <?ifdef EnrollmentSecretDefault ?>
+    <Property Id="ENROLLMENT_SECRET" Secure="yes" Hidden="yes" Value="$(var.EnrollmentSecretDefault)" />
+    <?else?>
+    <Property Id="ENROLLMENT_SECRET" Secure="yes" Hidden="yes" />
+    <?endif?>
+    <Property Id="BOOTSTRAP_TOKEN" Secure="yes" Hidden="yes" />
+    <!-- Always write a verbose MSI log to %TEMP%\MSI*.LOG and print its path in
+         the failure dialog. Without this, a rolled-back install shows only
+         "Breeze Agent Setup Wizard ended prematurely" with no cause and no log
+         to ask the reporter for — every enroll failure (the agent distinguishes
+         seven categories as exit codes 10-17, see internal/agentapp/enroll_error.go)
+         collapses into an indistinguishable 1603, and support has to talk the
+         user through re-running under `msiexec /i ... /l*v`. That re-run is
+         itself unreliable: the failure is often environmental (expired token,
+         captive portal) and no longer reproduces by the time we ask.
+
+         Secret safety: the `p` flag logs property VALUES, so every property
+         carrying a credential must be Hidden="yes" (WiX emits those into
+         MsiHiddenProperties, and the log prints them as `**********`).
+         ENROLLMENT_KEY, ENROLLMENT_SECRET and BOOTSTRAP_TOKEN are all marked
+         above — KEEP IT THAT WAY when adding any new credential-bearing
+         property, or it lands in a world-readable file under %TEMP%.
+         The bootstrap token also appears inside the filename-bootstrap
+         package path (OriginalDatabase, "Breeze Agent (TOKEN@HOST).msi"),
+         which MSI logs in its header regardless of flags; that is accepted
+         because the same token is already on disk in the file's own name. -->
+    <Property Id="MsiLogging" Value="voicewarmupx" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="POWERSHELL_EXE" Secure="yes" />
+    <Property Id="BREEZE_KILL_CMD" Secure="yes" />
+    <Property Id="BREEZE_ACL_CMD" Secure="yes" />
+    <Property Id="BREEZE_SC_FAILURE_CMD" Secure="yes" />
+    <CustomAction Id="SetPowerShellPath" Property="POWERSHELL_EXE" Value="[System64Folder]WindowsPowerShell\v1.0\powershell.exe" />
+
+    <!-- Kill any running Breeze processes before InstallValidate so file
+         replacement isn't blocked by locked exes.
+         ServiceControl stops BreezeAgent and BreezeWatchdog below, but the
+         user-session desktop helper (spawned via CreateProcessAsUser) is not a
+         service and would otherwise survive an in-place upgrade — causing the
+         sessionbroker binary hash check to fail on the next remote-desktop
+         connection. The CA runs on EVERY install path (fresh install, major
+         upgrade, repair) because a fresh install can land on top of a binary
+         left behind by a previous uninstall or a non-MSI deployment — the
+         MSI install log line we kept seeing was:
+            File: ...\breeze-agent.exe; Won't Overwrite;
+            Existing file is unversioned but modified
+         even on a "first-time" MSI install where the agent was previously
+         dropped onto the box by another mechanism. Skipping the kill on
+         REMOVE is fine because ServiceControl handles service shutdown on
+         uninstall and the user-helper exits cleanly when its tray menu
+         exits. `& exit /b 0` swallows every per-step error so a fresh box
+         with nothing to disarm/stop/kill still returns success (#944).
+
+         Command structure (each step best-effort, joined with single `&`):
+           1. `sc failure ... actions= ""` DISARMS the SCM recovery config
+              that a PREVIOUS install's ConfigureBreezeFailureActions set
+              (restart/5000/...). Without this, taskkill'ing the service
+              processes makes the SCM RESURRECT them ~5s later — the old
+              exes re-lock the install folder mid-file-copy and the upgrade
+              stalls/fails. This only bites when a previous version was
+              installed, which is exactly the reported "hangs on upgrade"
+              shape. Failure actions are re-armed by
+              ConfigureBreezeFailureActions (success), RecoverBreezeAfterUpgrade
+              (upgrade), or RollbackServiceRecovery (failed install).
+           2. `sc stop` watchdog FIRST (so it cannot restart the agent),
+              then the agent — a clean SCM stop never triggers failure
+              actions, unlike a kill.
+           3. Wait ~3s only if BreezeAgent is still RUNNING/PENDING (fresh
+              boxes skip the wait entirely) so the stop can complete before
+              the fallback kill.
+           4. taskkill WITHOUT /T. /T kills the named process's whole child
+              tree — and when this MSI is deployed through Breeze's own
+              script engine, msiexec/powershell run as DESCENDANTS of
+              breeze-agent.exe, so /T killed the very msiexec client
+              performing this install. Every process we actually need dead
+              is already named explicitly.
+
+         Immediate CAs impersonate the installing user, so on an interactive
+         double-click + UAC-consent install the filtered token may be denied
+         on all of these (same class as the old HardenProgramDataAcl bug) —
+         that's why PrepareServiceShutdown below repeats the disarm (both
+         services) + watchdog stop as a deferred LocalSystem action before
+         StopServices. -->
+    <SetProperty Id="BREEZE_KILL_CMD" Value="[System64Folder]cmd.exe" Before="KillBreezeProcesses" Sequence="execute" />
+    <CustomAction
+      Id="KillBreezeProcesses"
+      Property="BREEZE_KILL_CMD"
+      ExeCommand="/c sc failure BreezeWatchdog reset= 0 actions= &quot;&quot; >nul 2>&amp;1 &amp; sc failure BreezeAgent reset= 0 actions= &quot;&quot; >nul 2>&amp;1 &amp; sc stop BreezeWatchdog >nul 2>&amp;1 &amp; sc stop BreezeAgent >nul 2>&amp;1 &amp; (sc query BreezeAgent | findstr &quot;PENDING RUNNING&quot; >nul 2>&amp;1 &amp;&amp; ping -n 4 127.0.0.1 >nul) &amp; taskkill /F /IM breeze-agent.exe /IM breeze-user-helper.exe /IM breeze-watchdog.exe /IM breeze-desktop-helper.exe /IM breeze-backup.exe >nul 2>&amp;1 &amp; exit /b 0"
+      Execute="immediate"
+      Return="ignore" />
+
+    <!-- Deferred/LocalSystem twin of the disarm + watchdog-stop portion of
+         KillBreezeProcesses (the agent stop itself is left to StopServices,
+         which waits properly). The immediate CA above can silently no-op on
+         UAC-filtered tokens; this one always runs with full rights, in the
+         execute script BEFORE StopServices, so:
+           - SCM failure actions are guaranteed disarmed before any process
+             of ours dies (no resurrection race), and
+           - the watchdog is already down when StopServices stops BreezeAgent
+             (StopServices stops the agent first per ServiceControl table
+             order — rows sort by Id, svcControlBreezeAgent &lt;
+             svcControlWatchdog, so renaming those Ids can silently flip the
+             order — and a live watchdog restarting the agent in that window
+             blocks the file copy).
+         Runs on uninstall too — same watchdog race exists there. -->
+    <SetProperty Id="BREEZE_SVC_CMD" Value="[System64Folder]cmd.exe" Before="RollbackServiceRecovery" Sequence="execute" />
+    <CustomAction
+      Id="PrepareServiceShutdown"
+      Property="BREEZE_SVC_CMD"
+      ExeCommand="/c sc failure BreezeWatchdog reset= 0 actions= &quot;&quot; >nul 2>&amp;1 &amp; sc failure BreezeAgent reset= 0 actions= &quot;&quot; >nul 2>&amp;1 &amp; sc stop BreezeWatchdog >nul 2>&amp;1 &amp; exit /b 0"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <!-- If the install fails after PrepareServiceShutdown disarmed recovery,
+         restore the previous state: re-arm failure actions (values must stay
+         in sync with ConfigureBreezeFailureActions below) and restart the
+         services MSI stopped, so a failed upgrade never leaves the box with
+         a dead agent AND no SCM auto-restart. -->
+    <CustomAction
+      Id="RollbackServiceRecovery"
+      Property="BREEZE_SVC_CMD"
+      ExeCommand="/c sc failure BreezeAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000 >nul 2>&amp;1 &amp; sc failure BreezeWatchdog reset= 86400 actions= restart/5000/restart/10000/restart/30000 >nul 2>&amp;1 &amp; sc start BreezeAgent >nul 2>&amp;1 &amp; sc start BreezeWatchdog >nul 2>&amp;1 &amp; ((sc query BreezeAgent | findstr &quot;RUNNING PENDING&quot; >nul 2>&amp;1) || echo %DATE% %TIME% RollbackServiceRecovery: BreezeAgent not running after install rollback > &quot;[ProgramDataBreezeLogsDir]upgrade-recovery-last-error.txt&quot;) &amp; exit /b 0"
+      Execute="rollback"
+      Impersonate="no"
+      Return="ignore" />
+
+    <!-- With Schedule="afterInstallExecute", RemoveExistingProducts runs the
+         OLD product's uninstall AFTER our services are installed/started and
+         our task is registered. Old packages' ServiceControl uninstall-stop
+         events and their UnregisterUserHelperTask CA execute during that
+         nested uninstall and can leave the NEW services stopped and the NEW
+         scheduled task deleted (old MSIs run the freshly-installed copy of
+         remove-windows-task.ps1 — now that its TaskPath bug is fixed, the
+         unregister actually works, so this backstop is mandatory, not
+         paranoia). Stop-vs-delete asymmetry: the service COMPONENTS use
+         Guid="*", which WiX derives deterministically from install path +
+         keypath, so old and new products share the component GUID — during
+         REP the refcount held by the new product suppresses the old
+         ServiceControl Remove="uninstall" (service NOT deleted), while the
+         stop event can still fire. That's why `sc start` here is a
+         sufficient remedy (it cannot recreate a deleted service — VM
+         upgrade test must confirm services exist + RUNNING afterward).
+         These two CAs run after REP, upgrade-only, Return=ignore
+         (worst case they no-op against already-running services / an
+         existing task). Failure-action values must stay in sync with
+         ConfigureBreezeFailureActions. If recovery still leaves BreezeAgent
+         not running, a sentinel line is written to
+         logs\upgrade-recovery-last-error.txt (best-effort; same convention
+         as the user-helper install sentinel) so the dead-agent cause is
+         diagnosable locally — otherwise the only signal would be
+         server-side offline alerting with zero context. -->
+    <CustomAction
+      Id="RecoverBreezeAfterUpgrade"
+      Property="BREEZE_SVC_CMD"
+      ExeCommand="/c sc failure BreezeAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000 >nul 2>&amp;1 &amp; sc failure BreezeWatchdog reset= 86400 actions= restart/5000/restart/10000/restart/30000 >nul 2>&amp;1 &amp; sc start BreezeAgent >nul 2>&amp;1 &amp; sc start BreezeWatchdog >nul 2>&amp;1 &amp; ((sc query BreezeAgent | findstr &quot;RUNNING PENDING&quot; >nul 2>&amp;1) || echo %DATE% %TIME% RecoverBreezeAfterUpgrade: BreezeAgent not running after post-upgrade recovery > &quot;[ProgramDataBreezeLogsDir]upgrade-recovery-last-error.txt&quot;) &amp; exit /b 0"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <CustomAction
+      Id="ReRegisterUserHelperTaskAfterUpgrade"
+      Property="POWERSHELL_EXE"
+      ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#filInstallWindowsPs1]&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <SetProperty Id="BREEZE_ACL_CMD" Value="[System64Folder]cmd.exe" Before="HardenProgramDataAcl" Sequence="execute" />
+    <!-- MUST be deferred + non-impersonated so it runs as LocalSystem.
+         #609/#613 fixed the "folders don't exist yet" facet (added the mkdir
+         guards) but left this Execute="immediate". Immediate CAs impersonate
+         the installing user, and on an interactive double-click + UAC-consent
+         install that token is the *filtered* one (Administrators is DENY_ONLY).
+         icacls /inheritance:r needs WRITE_DAC, which the filtered token lacks,
+         so the action returned ACCESS_DENIED (5) -> 1722 -> rollback -> 1603.
+         Deferred + Impersonate="no" runs as LocalSystem (full rights). It is
+         sequenced After CreateFolders below, which now (unlike the immediate
+         case) actually runs first in the in-script, so the dirs already exist
+         and the mkdir guards are belt-and-suspenders. Return="ignore" mirrors
+         ConfigureBreezeFailureActions: ACL hardening that is blocked by an
+         external control (Controlled Folder Access / ASR / EDR / GPO) must
+         never roll back an otherwise-good install — the folders are still
+         created by CreateFolders with default ProgramData ACLs, and the agent
+         re-applies PROTECTED DACLs to the config dir and (fail-closed) to
+         secrets.yaml at runtime on first config write (see
+         agent/internal/config/permissions_windows.go), so a skipped/blocked
+         icacls here self-heals and never leaves tokens world-readable. -->
+    <CustomAction
+      Id="HardenProgramDataAcl"
+      Property="BREEZE_ACL_CMD"
+      ExeCommand="/c (if not exist &quot;[ProgramDataBreezeDir].&quot; mkdir &quot;[ProgramDataBreezeDir].&quot;) &amp;&amp; (if not exist &quot;[ProgramDataBreezeDataDir].&quot; mkdir &quot;[ProgramDataBreezeDataDir].&quot;) &amp;&amp; (if not exist &quot;[ProgramDataBreezeLogsDir].&quot; mkdir &quot;[ProgramDataBreezeLogsDir].&quot;) &amp;&amp; icacls &quot;[ProgramDataBreezeDir].&quot; /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F &amp;&amp; icacls &quot;[ProgramDataBreezeDataDir].&quot; /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F &amp;&amp; icacls &quot;[ProgramDataBreezeLogsDir].&quot; /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <!-- Set SCM failure-action recovery on both services after they're
+         installed. Mirrors scmService.SetRecoveryActions in
+         agent/internal/winsvcinstall/scm_windows.go, which is what both
+         `breeze-agent.exe service install` and `breeze-watchdog.exe service
+         install` now apply (5s/10s/30s restart escalation with 24-hour counter
+         reset).
+
+         Without this, MSI-installed services have no SCM-driven auto-restart;
+         only `breeze-agent.exe service install` (the manual subcommand)
+         applied the recovery actions before. So every MSI deployment was
+         missing this hardening.
+
+         `sc failure` syntax: spaces after each `=` are mandatory; actions are
+         a slash-separated list of (actionType/delayMs) pairs. `Return="ignore"`
+         (below) is what prevents a transient sc-error from rolling back the
+         install — keep both the static ExeCommand and Return="ignore" in
+         sync if either is ever edited. The same failure-action values are
+         duplicated in RollbackServiceRecovery and RecoverBreezeAfterUpgrade
+         above — edit all three together. -->
+    <SetProperty Id="BREEZE_SC_FAILURE_CMD" Value="[System64Folder]cmd.exe" Before="ConfigureBreezeFailureActions" Sequence="execute" />
+    <CustomAction
+      Id="ConfigureBreezeFailureActions"
+      Property="BREEZE_SC_FAILURE_CMD"
+      ExeCommand="/c &quot;sc failure BreezeAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000 &amp; sc failure BreezeWatchdog reset= 86400 actions= restart/5000/restart/10000/restart/30000&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Breeze">
+        <Component Id="cmpBreezeAgentExe" Guid="*">
+          <File Id="filBreezeAgentExe" Name="breeze-agent.exe" Source="$(var.AgentExePath)" KeyPath="yes" />
+          <ServiceInstall
+            Id="svcInstallBreezeAgent"
+            Name="BreezeAgent"
+            DisplayName="Breeze Agent"
+            Description="Breeze RMM endpoint agent"
+            Type="ownProcess"
+            Arguments="run"
+            Start="auto"
+            ErrorControl="normal"
+            Vital="yes" />
+          <ServiceControl
+            Id="svcControlBreezeAgent"
+            Name="BreezeAgent"
+            Start="install"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+        </Component>
+
+        <Component Id="cmpBreezeBackupExe" Guid="*">
+          <File Id="filBreezeBackupExe" Name="breeze-backup.exe"
+                Source="$(var.BackupExePath)" KeyPath="yes" />
+        </Component>
+
+        <Component Id="cmpBreezeUserHelperExe" Guid="*">
+          <!-- GUI-subsystem sibling of breeze-agent.exe (same Go source, -H windowsgui).
+               Launched by the AgentUserHelper scheduled task at user logon and by the
+               SYSTEM-context sessionbroker spawn paths. GUI subsystem prevents the
+               Windows kernel from allocating a console window for the helper. -->
+          <File Id="filBreezeUserHelperExe" Name="breeze-user-helper.exe"
+                Source="$(var.UserHelperExePath)" KeyPath="yes" />
+        </Component>
+
+        <Component Id="cmpBreezeWatchdogExe" Guid="*">
+          <File Id="filBreezeWatchdogExe" Name="breeze-watchdog.exe"
+                Source="$(var.WatchdogExePath)" KeyPath="yes" />
+          <ServiceInstall Id="svcInstallWatchdog"
+                          Name="BreezeWatchdog"
+                          DisplayName="Breeze RMM Watchdog"
+                          Description="Monitors and recovers the Breeze RMM Agent"
+                          Start="auto"
+                          Type="ownProcess"
+                          ErrorControl="normal"
+                          Arguments="run" />
+          <ServiceControl Id="svcControlWatchdog"
+                          Name="BreezeWatchdog"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+
+        <!-- Register BreezeAgent to run in Safe Mode with Networking. Without this,
+             the SCM won't start the service in safe mode, preventing the agent from
+             auto-clearing the BCD safeboot flag and reconnecting to the server. -->
+        <Component Id="cmpSafeBootNetworkReg" Guid="*">
+          <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Control\SafeBoot\Network\BreezeAgent">
+            <RegistryValue Type="string" Value="Service" />
+          </RegistryKey>
+        </Component>
+
+        <Directory Id="INSTALL_SERVICE_DIR" Name="service">
+          <Directory Id="INSTALL_SERVICE_WINDOWS_DIR" Name="windows">
+            <Component Id="cmpUserTaskXml" Guid="*">
+              <File Id="filUserTaskXml" Source="$(var.UserTaskXmlPath)" KeyPath="yes" />
+            </Component>
+          </Directory>
+        </Directory>
+
+        <Directory Id="INSTALL_SCRIPTS_DIR" Name="scripts">
+          <Directory Id="INSTALL_SCRIPTS_INSTALL_DIR" Name="install">
+            <Component Id="cmpInstallWindowsPs1" Guid="*">
+              <File Id="filInstallWindowsPs1" Source="$(var.InstallUserHelperScriptPath)" KeyPath="yes" />
+            </Component>
+            <Component Id="cmpRemoveWindowsTaskPs1" Guid="*">
+              <File Id="filRemoveWindowsTaskPs1" Source="$(var.RemoveUserHelperScriptPath)" KeyPath="yes" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="ProgramDataBreezeDir" Name="Breeze">
+        <Component Id="cmpProgramDataRoot" Guid="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}" Permanent="yes">
+          <CreateFolder />
+        </Component>
+        <Component Id="cmpCleanConfigOnUninstall" Guid="{D4E5F6A7-B8C9-0123-DEFA-456789012345}">
+          <RegistryValue Root="HKLM" Key="SOFTWARE\Breeze" Name="ConfigCleanup" Type="integer" Value="1" KeyPath="yes" />
+          <RemoveFile Id="rmfAgentYaml" Name="agent.yaml" On="uninstall" />
+          <RemoveFile Id="rmfAgentYamlBak" Name="agent.yaml.bak" On="uninstall" />
+          <!-- secrets.yaml holds the agent auth token and mTLS private key
+               (see internal/config/config.go). Remove on uninstall so a
+               decommissioned machine doesn't leave credentials on disk. The
+               logs/ and data/ directories are intentionally preserved (their
+               components are Permanent="yes") for post-uninstall forensics. -->
+          <RemoveFile Id="rmfSecretsYaml" Name="secrets.yaml" On="uninstall" />
+        </Component>
+        <Directory Id="ProgramDataBreezeDataDir" Name="data">
+          <Component Id="cmpProgramDataData" Guid="{B2C3D4E5-F6A7-8901-BCDE-F12345678901}" Permanent="yes">
+            <CreateFolder />
+          </Component>
+        </Directory>
+        <Directory Id="ProgramDataBreezeLogsDir" Name="logs">
+          <Component Id="cmpProgramDataLogs" Guid="{C3D4E5F6-A7B8-9012-CDEF-123456789012}" Permanent="yes">
+            <CreateFolder />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <CustomAction
+      Id="RegisterUserHelperTask"
+      Property="POWERSHELL_EXE"
+      ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#filInstallWindowsPs1]&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+
+    <CustomAction
+      Id="RollbackRegisterUserHelperTask"
+      Property="POWERSHELL_EXE"
+      ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#filRemoveWindowsTaskPs1]&quot;"
+      Execute="rollback"
+      Impersonate="no"
+      Return="ignore" />
+
+    <CustomAction
+      Id="UnregisterUserHelperTask"
+      Property="POWERSHELL_EXE"
+      ExeCommand="-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[#filRemoveWindowsTaskPs1]&quot;"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <CustomAction
+      Id="EnrollAgent"
+      FileRef="filBreezeAgentExe"
+      ExeCommand="enroll &quot;[ENROLLMENT_KEY]&quot; --server &quot;[SERVER_URL]&quot; --enrollment-secret &quot;[ENROLLMENT_SECRET]&quot; --quiet"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check"
+      HideTarget="yes" />
+
+    <!-- Pass the launched MSI path (which carries the bootstrap token in its
+         filename — Breeze Agent (TOKEN@HOST).msi) to the agent on the deferred
+         CA's command line, via [OriginalDatabase] referenced DIRECTLY.
+
+         MSI formats a deferred CA's Target at SCHEDULE time (the immediate
+         execute-sequence pass), where OriginalDatabase still points at the user's
+         downloaded file — the (TOKEN@HOST) name is intact and is baked into the
+         script. (By deferred EXECUTION time the package is cached to
+         C:\Windows\Installer and OriginalDatabase would be tokenless, but the
+         Target has already been formatted by then.) Verified on the shipped
+         v0.86.0 MSI: the formatted Target carries the full path with the token.
+
+         Do NOT revert this to "[CustomActionData]". For a deferred EXE custom
+         action, [CustomActionData] in the ExeCommand formats to an EMPTY string
+         at schedule time (CustomActionData only exists at deferred-execution time,
+         and only DLL/script CAs can read it — an EXE CA gets nothing on its
+         command line). So the agent received an empty install-data argument and
+         silently skipped enrollment on EVERY install ("no bootstrap token
+         present" then unenrolled). That was the real cause of the field reports.
+         It was misattributed to #1956's bracket-stripping — a real but separate
+         bug that just wasn't the cause of non-enrollment; the prior
+         SetBootstrapData then CustomActionData indirection never delivered the
+         token at all.
+
+         The token rides in PARENTHESES — Breeze Agent (TOKEN@HOST).msi — not
+         square brackets, because "[...]" is MSI's Formatted-field delimiter and a
+         bracketed substring is stripped; parens are literal and survive. The
+         agent parser (installer_filename.go) accepts both. The pipe-delimited
+         <OriginalDatabase>|<BOOTSTRAP_TOKEN>|<SERVER_URL> shape mirrors the
+         agent's resolveBootstrapInputs payload (an explicitly-supplied token +
+         server take precedence; both are empty on the filename-bootstrap path).
+         HideTarget keeps the token out of the verbose log. -->
+    <CustomAction
+      Id="BootstrapEnroll"
+      FileRef="filBreezeAgentExe"
+      ExeCommand="bootstrap --install-data &quot;[OriginalDatabase]|[BOOTSTRAP_TOKEN]|[SERVER_URL]&quot; --quiet"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check"
+      HideTarget="yes" />
+
+    <!-- Task 6 (#2764): best-effort "I'm about to be removed" signal to the
+         server (POST /agents/:id/uninstall-intent), run before secrets.yaml
+         is deleted below so the agent can still authenticate as itself.
+         Return="ignore" — unlike EnrollAgent/BootstrapEnroll above, this
+         must NEVER block or roll back an uninstall. breeze-agent.exe
+         uninstall-notify (runUninstallNotify, internal/agentapp/main.go)
+         always exits 0 regardless of outcome: missing secrets.yaml, a
+         network error, or the 403 tenant_offboarding drain response
+         returned while the device's org is mid-offboarding are all
+         swallowed there too — this Return="ignore" is belt-and-suspenders
+         in case that contract is ever broken. -->
+    <CustomAction
+      Id="UninstallNotify"
+      FileRef="filBreezeAgentExe"
+      ExeCommand="uninstall-notify"
+      Execute="deferred"
+      Impersonate="no"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Run on every install path EXCEPT uninstall. Broadened from the
+           original `WIX_UPGRADE_DETECTED OR Installed` (which skipped fresh
+           installs over a pre-existing non-MSI binary) — see comment at the
+           CA definition above and issue #944. -->
+      <Custom Action="KillBreezeProcesses" Before="InstallValidate" Condition="NOT REMOVE" />
+      <Custom Action="SetPowerShellPath" After="InstallInitialize" />
+      <!-- Rollback CA must be scheduled before the deferred actions whose
+           damage it undoes (rollback script is written in sequence order). -->
+      <Custom Action="RollbackServiceRecovery" Before="PrepareServiceShutdown" />
+      <Custom Action="PrepareServiceShutdown" Before="StopServices" />
+      <Custom Action="HardenProgramDataAcl" After="CreateFolders" Condition="NOT REMOVE" />
+      <!-- Rollback rolls back the FIRST-install case only; on upgrade or
+           repair the existing task is valid prior state and shouldn't be
+           wiped by a rolled-back inner install. -->
+      <Custom Action="RollbackRegisterUserHelperTask" Before="RegisterUserHelperTask" Condition="NOT Installed AND NOT REMOVE AND NOT WIX_UPGRADE_DETECTED" />
+      <!-- RegisterUserHelperTask runs on EVERY install path that isn't
+           uninstall: first install, major upgrade, and `msiexec /fa` repair.
+           The PS script's Register-ScheduledTask -Force is idempotent, so
+           re-registering on repair just refreshes the action to the current
+           XML (the binary path may have changed across versions) — which is
+           the entire point. The previous `NOT Installed AND NOT REMOVE`
+           gate skipped repair, leaving repaired installs with stale task
+           pointers. -->
+      <Custom Action="RegisterUserHelperTask" After="InstallServices" Condition="NOT REMOVE" />
+      <!-- Apply SCM recovery actions immediately after the services are
+           registered. Deferred + non-impersonated so it runs as LocalSystem
+           (which sc.exe needs for SERVICE_CHANGE_CONFIG). -->
+      <Custom Action="ConfigureBreezeFailureActions" After="InstallServices" Condition="NOT REMOVE" />
+      <!-- Enrollment runs after file copy but before InstallServices.
+
+           Return="check" on the EnrollAgent CA means a non-zero exit
+           from breeze-agent.exe enroll rolls back the install cleanly.
+           Admins see a specific cause in four places:
+
+             1. install.log (captured from the CA's stderr)
+             2. C:\ProgramData\Breeze\logs\agent.log (slog structured)
+             3. C:\ProgramData\Breeze\logs\enroll-last-error.txt
+                (single-line timestamped, survives rollback because
+                CA-written files are opaque to MSI)
+             4. Event Viewer, Application, BreezeAgent (Error)
+
+           Installs without ENROLLMENT_KEY skip this CA entirely
+           (condition below requires both SERVER_URL and ENROLLMENT_KEY).
+           The service starts anyway and idles in a wait-for-enrollment
+           loop (see waitForEnrollment in cmd/breeze-agent/main.go), so
+           a later manual enrollment (running breeze-agent.exe enroll
+           with the key and the server URL flag, same arguments used
+           by the CA above) is picked up live without a service
+           restart. This is the intended flow for imaged/sysprep'd
+           deployments. -->
+      <Custom Action="EnrollAgent" Before="InstallServices" Condition="NOT Installed AND SERVER_URL AND ENROLLMENT_KEY" />
+      <!-- Filename/property bootstrap enrollment: only when explicit
+           SERVER_URL+ENROLLMENT_KEY were NOT supplied (those take the
+           EnrollAgent path above). The deferred CA references [OriginalDatabase]
+           directly (baked at schedule time, here, while it still names the
+           downloaded file) — no immediate capture CA is needed. -->
+      <Custom Action="BootstrapEnroll" Before="InstallServices" Condition="NOT Installed AND NOT (SERVER_URL AND ENROLLMENT_KEY)" />
+      <!-- Post-upgrade backstop: undo whatever the OLD product's nested
+           uninstall (REP, scheduled afterInstallExecute) did to the NEW
+           services and scheduled task. See CA definitions above. -->
+      <Custom Action="RecoverBreezeAfterUpgrade" After="RemoveExistingProducts" Condition="WIX_UPGRADE_DETECTED" />
+      <Custom Action="ReRegisterUserHelperTaskAfterUpgrade" After="RecoverBreezeAfterUpgrade" Condition="WIX_UPGRADE_DETECTED" />
+      <!-- NOT UPGRADINGPRODUCTCODE: when THIS version is later the old
+           product being removed by a successor's RemoveExistingProducts,
+           skip task unregistration — the successor has already registered
+           the (shared-path) task and would have it yanked out from under it.
+           Real uninstalls (REMOVE=ALL without an upgrade in flight) still
+           clean up. -->
+      <Custom Action="UnregisterUserHelperTask" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <!-- Same guard as UnregisterUserHelperTask above, and sequenced
+           before the same standard action for the same reason: it must run
+           before RemoveFiles deletes secrets.yaml (rmfSecretsYaml,
+           cmpCleanConfigOnUninstall component above), which is this CA's
+           own credential source. Never fires on an upgrade's nested
+           old-product removal. -->
+      <Custom Action="UninstallNotify" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <Feature Id="MainFeature" Title="Breeze Agent" Level="1">
+      <ComponentRef Id="cmpBreezeAgentExe" />
+      <ComponentRef Id="cmpBreezeBackupExe" />
+      <ComponentRef Id="cmpBreezeUserHelperExe" />
+      <ComponentRef Id="cmpBreezeWatchdogExe" />
+      <ComponentRef Id="cmpSafeBootNetworkReg" />
+      <ComponentRef Id="cmpUserTaskXml" />
+      <ComponentRef Id="cmpInstallWindowsPs1" />
+      <ComponentRef Id="cmpRemoveWindowsTaskPs1" />
+      <ComponentRef Id="cmpProgramDataRoot" />
+      <ComponentRef Id="cmpCleanConfigOnUninstall" />
+      <ComponentRef Id="cmpProgramDataData" />
+      <ComponentRef Id="cmpProgramDataLogs" />
+    </Feature>
+  </Package>
+</Wix>

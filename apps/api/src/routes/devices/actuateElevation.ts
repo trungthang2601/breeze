@@ -1,0 +1,418 @@
+import { Hono } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { and, eq } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
+import { z } from 'zod';
+import { db } from '../../db';
+import {
+  deviceCommands,
+  devices,
+  elevationAudit,
+  elevationRequests,
+  pamRules,
+  users,
+} from '../../db/schema';
+import {
+  authMiddleware,
+  requireMfa,
+  requirePermission,
+  requireScope,
+} from '../../middleware/auth';
+import { PERMISSIONS } from '../../services/permissions';
+import { writeRouteAudit } from '../../services/auditEvents';
+import { type UserPermissions } from '../../services/permissions';
+import {
+  assertDeviceExecuteAllowed,
+  TrustDeniedError,
+} from '../../services/partnerTrust.commands';
+import { trustDenyBody } from '../../services/partnerTrust';
+import { getDeviceWithOrgCheck, canAccessDeviceSite } from './helpers';
+
+export const actuateElevationRoutes = new Hono();
+
+// Display-only aliases for the endpoint event-log identity fields (#4913):
+// the requesting subject and the approving technician are both rows in
+// `users`, so the same table needs two independent joins.
+const requestedByUser = alias(users, 'actuate_elevation_requested_by_user');
+const approvedByUser = alias(users, 'actuate_elevation_approved_by_user');
+
+// toIsoString normalizes a timestamp column read back from postgres.js
+// (a Date) into a JSON-safe ISO string for the command payload. Accepts a
+// plain string too so unit tests can stub fixtures without a real Date.
+function toIsoString(value: unknown): string | null {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
+  return null;
+}
+
+actuateElevationRoutes.use('*', authMiddleware);
+
+// Guard: PAM actuator is DISABLED by default. Enable only when JIT credentials
+// + agent-side target re-validation (Track 6) are deployed. Same env-flag guard
+// STYLE as devPush.ts, but disabled by default in ALL environments (devPush only
+// gates production; it is on-by-default in dev).
+//
+// Scoped to the actuate-elevation path ONLY (#6504) — this router is mounted
+// at `/` alongside sibling routers (e.g. homebrewBootstrapRoutes) in
+// routes/devices/index.ts, and Hono attaches a sub-router's `.use('*', …)`
+// middleware to every route mounted after it at the same base path (see the
+// customFieldValuesRoutes comment there). A bare `'*'` here answered every
+// unmatched `/devices/:id/*` request with this 403 instead of a 404, and made
+// POST /devices/:id/homebrew-bootstrap unreachable whenever the flag is unset
+// (the production default).
+actuateElevationRoutes.use('/:id/actuate-elevation', async (c, next) => {
+  if (process.env.PAM_ACTUATOR_ENABLED !== 'true') {
+    return c.json({ error: 'PAM actuator is disabled' }, 403);
+  }
+  return next();
+});
+
+/**
+ * POST /devices/:id/actuate-elevation
+ *
+ * PAM Track 5: queue an `actuate_elevation` device_command that the agent
+ * picks up as a go signal for the consent.exe prompt that's already up on
+ * the user's screen. The agent mints the local dormant-admin credential and
+ * passes it to the actuator in-process; the secret never crosses the wire.
+ *
+ * This is the server-side push half of the actuator. The agent-side
+ * implementation lives in `agent/internal/pamactuator/`.
+ *
+ * Scope: this PR ships only the command-queueing contract. The wider
+ * approval flow that decides WHEN to call this — match elevation_requests
+ * row against software_policies and fan out to the right agent — is Track 6.
+ *
+ * Auth: organization+ scope, DEVICES_EXECUTE permission, MFA. Same gates
+ * as POST /devices/:id/commands, because functionally that's what this
+ * is: a typed wrapper that validates the elevationRequestId go-signal
+ * payload before insertion.
+ *
+ * The command payload carries only the go signal; the credential is minted
+ * locally by the agent and never shipped. device_commands is intentionally
+ * system-scoped (see CLAUDE.md tenancy notes), but RLS still covers the
+ * `devices` row we read on the way in.
+ *
+ * Single-use enforcement: SELECT + transactional UPDATE-status
+ * 'approved' → 'actuating' + INSERT command happen in a single
+ * `db.transaction`. The UPDATE only fires when status='approved'; if
+ * zero rows are returned, we lost the TOCTOU race and refuse. After a
+ * successful actuation the row sits in 'actuating' until the agent
+ * reports completion (later track) — it cannot be replayed.
+ */
+
+const actuateElevationSchema = z.object({
+  elevationRequestId: z.string().guid(),
+  username: z.string().min(1).max(255).optional(),
+  password: z.string().min(1).max(1024).optional(),
+  timeoutMs: z.number().int().min(1000).max(60000).optional(),
+});
+
+actuateElevationRoutes.post(
+  '/:id/actuate-elevation',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requireMfa(),
+  zValidator('json', actuateElevationSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const deviceId = c.req.param('id')!;
+    const data = c.req.valid('json');
+
+    const device = await getDeviceWithOrgCheck(deviceId, auth);
+    if (!device) {
+      return c.json({ error: 'Device not found' }, 404);
+    }
+    if (!canAccessDeviceSite(device, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if (device.status === 'decommissioned') {
+      return c.json({ error: 'Cannot send commands to a decommissioned device' }, 400);
+    }
+
+    // Transactional single-use enforcement (PR #960 review, blocker 1).
+    //
+    // The route's "proof of approval" is `elevation_requests.status === 'approved'`. To
+    // make that proof one-shot we must transition the row out of 'approved' in the same
+    // transaction as the command insert. Otherwise an approved row can be POSTed N
+    // times and each call queues a new actuate_elevation command — credential replay /
+    // multi-spawn vector.
+    //
+    // The UPDATE WHERE status='approved' atomic-compare-and-swaps the row to
+    // 'actuating'. If zero rows return, either it wasn't approved or we lost the race
+    // against a concurrent POST; either way we refuse with 409.
+    //
+    // Org check (PR #960 review, blocker 3): the WHERE clause includes
+    // `orgId = device.orgId` so the FK pair (id, deviceId, orgId) is the primary
+    // gate, not a post-query assert.
+    //
+    // Audit (PR #960 review, blocker 2): every outcome — success, race-lost,
+    // wrong-status — must land in `elevation_audit` with the cause. 404/decommission
+    // paths above can't write elevation_audit (no valid FK target), so they get only
+    // the route-level audit at the outer scope.
+    let result;
+    try {
+      result = await db.transaction(async (tx) => {
+      const [elevation] = await tx
+        .select({
+          id: elevationRequests.id,
+          deviceId: elevationRequests.deviceId,
+          orgId: elevationRequests.orgId,
+          status: elevationRequests.status,
+          targetExecutablePath: elevationRequests.targetExecutablePath,
+          targetExecutableHash: elevationRequests.targetExecutableHash,
+          subjectUsername: elevationRequests.subjectUsername,
+          metadata: elevationRequests.metadata,
+          approvedAt: elevationRequests.approvedAt,
+          expiresAt: elevationRequests.expiresAt,
+          riskTier: elevationRequests.riskTier,
+          // Display-only identity fields (#4913): resolved here, inside the
+          // same tenant-scoped transaction, so the endpoint event log can show
+          // who requested and who approved without the agent ever holding a
+          // user id. Never select credentials/tokens onto this row.
+          requestedByName: requestedByUser.name,
+          approvedByName: approvedByUser.name,
+          approvedByEmail: approvedByUser.email,
+        })
+        .from(elevationRequests)
+        .leftJoin(requestedByUser, eq(elevationRequests.subjectUserId, requestedByUser.id))
+        .leftJoin(approvedByUser, eq(elevationRequests.approvedByUserId, approvedByUser.id))
+        .where(
+          and(
+            eq(elevationRequests.id, data.elevationRequestId),
+            eq(elevationRequests.deviceId, deviceId),
+            // Blocker 3: org check inside the WHERE clause makes the FK pair the
+            // primary gate (Shape-4 from #905). The cross-org "defensive" check below
+            // becomes defense-in-depth instead of the only line of defense.
+            eq(elevationRequests.orgId, device.orgId),
+          ),
+        )
+        .limit(1);
+
+      if (!elevation) {
+        return { kind: 'not_found' as const };
+      }
+
+      if (elevation.status !== 'approved') {
+        await tx.insert(elevationAudit).values({
+          orgId: device.orgId,
+          elevationRequestId: elevation.id,
+          eventType: 'command_executed',
+          actor: 'technician',
+          actorUserId: auth.user.id,
+          details: {
+            deviceId,
+            outcome: 'rejected_wrong_status',
+            actualStatus: elevation.status,
+          },
+          occurredAt: new Date(),
+        });
+        return { kind: 'wrong_status' as const, status: elevation.status };
+      }
+
+      // Blocker 1: atomic CAS approved → actuating. If concurrent POSTs race, only
+      // one wins; the loser sees rowCount=0 and we 409 with 'race_lost'.
+      const updated = await tx
+        .update(elevationRequests)
+        .set({ status: 'actuating', updatedAt: new Date() })
+        .where(
+          and(
+            eq(elevationRequests.id, elevation.id),
+            eq(elevationRequests.status, 'approved'),
+          ),
+        )
+        .returning({ id: elevationRequests.id });
+
+      if (updated.length === 0) {
+        await tx.insert(elevationAudit).values({
+          orgId: device.orgId,
+          elevationRequestId: elevation.id,
+          eventType: 'command_executed',
+          actor: 'technician',
+          actorUserId: auth.user.id,
+          details: { deviceId, outcome: 'race_lost' },
+          occurredAt: new Date(),
+        });
+        return { kind: 'race_lost' as const };
+      }
+
+      // Track 5 (Path B): echo the stored request's target executable path +
+      // command line into the go-signal payload so the agent's token-launch
+      // actuator knows what to launch. The agent holds no cross-request
+      // state — the server is the source of truth for what was approved.
+      // command_line is captured at ingest time into `metadata` (see
+      // routes/agents/elevationRequests.ts), not a first-class column;
+      // same extraction pattern as routes/pam.ts's `commandLine` field.
+      const metadata = (elevation.metadata ?? {}) as Record<string, unknown>;
+      await assertDeviceExecuteAllowed(deviceId, 'actuate_elevation', auth.user.id);
+
+      // Best-effort display name of the PAM rule that auto-approved this
+      // request, if any (#4913). `pam_rule_id` lives in the jsonb metadata
+      // blob rather than a column (see routes/pam.ts matchPamRule), so this
+      // is a separate lookup rather than a join. Never fatal: a missing or
+      // stale rule id just means the endpoint event shows no rule name.
+      const pamRuleId = typeof metadata.pam_rule_id === 'string' ? metadata.pam_rule_id : null;
+      let matchedRuleName: string | null = null;
+      if (pamRuleId) {
+        const [rule] = await tx
+          .select({ name: pamRules.name })
+          .from(pamRules)
+          .where(eq(pamRules.id, pamRuleId))
+          .limit(1);
+        matchedRuleName = rule?.name ?? null;
+      }
+
+      const [command] = await tx
+        .insert(deviceCommands)
+        .values({
+          deviceId,
+          type: 'actuate_elevation',
+          payload: {
+            elevationRequestId: data.elevationRequestId,
+            timeoutMs: data.timeoutMs ?? 8000,
+            targetPath: elevation.targetExecutablePath ?? '',
+            targetHash: elevation.targetExecutableHash ?? '',
+            commandLine: typeof metadata.command_line === 'string' ? metadata.command_line : '',
+            // Path B places the elevated process in the requesting user's live
+            // session; the agent resolves this name to a session id (falls back
+            // to the console when absent). Path A ignores it. See
+            // pamactuator.Request.SubjectUsername.
+            subjectUsername: elevation.subjectUsername ?? '',
+            // Display-only identity/context fields for the endpoint's local
+            // audit trail (Windows Event Log + audit.jsonl, #4913). These are
+            // names/emails/timestamps resolved server-side for a human
+            // reading the event log — never a user id, token, or credential.
+            requestedByName: elevation.requestedByName ?? null,
+            approvedByName: elevation.approvedByName ?? null,
+            approvedByEmail: elevation.approvedByEmail ?? null,
+            approvedAt: toIsoString(elevation.approvedAt),
+            riskTier: elevation.riskTier ?? null,
+            matchedRuleName,
+            windowEndsAt: toIsoString(elevation.expiresAt),
+          },
+          status: 'pending',
+          createdBy: auth.user.id,
+        })
+        .returning();
+
+      if (!command) {
+        // Should not happen with .returning(); rolled back by throwing.
+        throw new Error('actuate-elevation: device_commands insert returned no row');
+      }
+
+      // Blocker 2: elevation_audit insert on the happy path. The password
+      // is agent-local and never present here.
+      await tx.insert(elevationAudit).values({
+        orgId: device.orgId,
+        elevationRequestId: elevation.id,
+        eventType: 'command_executed',
+        actor: 'technician',
+        actorUserId: auth.user.id,
+        details: {
+          deviceId,
+          commandId: command.id,
+          timeoutMs: data.timeoutMs ?? 8000,
+        },
+        occurredAt: new Date(),
+      });
+
+      return { kind: 'success' as const, command };
+      });
+    } catch (e) {
+      if (e instanceof TrustDeniedError) {
+        return c.json(
+          trustDenyBody({
+            allow: false,
+            code: e.code,
+            capability: 'device_execute',
+            reason: e.reason,
+          }, false),
+          403,
+        );
+      }
+      throw e;
+    }
+
+    if (result.kind === 'not_found') {
+      // Route-level audit only — no elevation_audit because the FK target
+      // doesn't exist for this caller's org.
+      writeRouteAudit(c, {
+        orgId: device.orgId,
+        action: 'device.elevation.actuate.rejected',
+        resourceType: 'device_command',
+        resourceId: data.elevationRequestId,
+        resourceName: 'actuate_elevation',
+        details: { deviceId, outcome: 'elevation_request_not_found' },
+      });
+      return c.json({ error: 'Elevation request not found for this device' }, 404);
+    }
+
+    if (result.kind === 'race_lost') {
+      writeRouteAudit(c, {
+        orgId: device.orgId,
+        action: 'device.elevation.actuate.rejected',
+        resourceType: 'device_command',
+        resourceId: data.elevationRequestId,
+        resourceName: 'actuate_elevation',
+        details: { deviceId, outcome: 'race_lost' },
+      });
+      return c.json(
+        { error: 'Elevation request already being actuated', code: 'race_lost' },
+        409,
+      );
+    }
+
+    if (result.kind === 'wrong_status') {
+      writeRouteAudit(c, {
+        orgId: device.orgId,
+        action: 'device.elevation.actuate.rejected',
+        resourceType: 'device_command',
+        resourceId: data.elevationRequestId,
+        resourceName: 'actuate_elevation',
+        details: { deviceId, outcome: 'wrong_status', status: result.status },
+      });
+      return c.json(
+        { error: 'Elevation request is not approved', code: result.status },
+        409,
+      );
+    }
+
+    const command = result.command;
+
+    // Audit log MUST NOT carry the password. The cleartext is minted by the
+    // agent only and is never present in this request or command payload.
+    writeRouteAudit(c, {
+      orgId: device.orgId,
+      action: 'device.elevation.actuate',
+      resourceType: 'device_command',
+      resourceId: command.id,
+      resourceName: 'actuate_elevation',
+      details: {
+        deviceId,
+        elevationRequestId: data.elevationRequestId,
+        timeoutMs: data.timeoutMs ?? 8000,
+      },
+    });
+
+    return c.json(
+      {
+        id: command.id,
+        deviceId: command.deviceId,
+        type: command.type,
+        status: command.status,
+        elevationRequestId: data.elevationRequestId,
+        createdAt: command.createdAt,
+        enforcementStatus: 'legacy_untracked',
+        enforcementGeneration: null,
+        enforcementReason: 'legacy_v1_actuator',
+        endpointObservedAt: null,
+        cleanupReceivedAt: null,
+        manualRemediationDisposition: 'blocked_manual_remediation',
+      },
+      201,
+    );
+  },
+);

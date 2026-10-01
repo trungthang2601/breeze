@@ -1,0 +1,28 @@
+import { roundToCurrency } from './currency';
+import { toCents } from './quoteMath';
+
+/**
+ * The single pay-amount rule (spec §"Pay-amount rule"):
+ *   chargeNow = deposit set && amountPaid < depositDue ? depositDue − amountPaid : balance
+ * Clamped to the invoice balance so a concurrent manual payment can never push a
+ * Stripe charge past what is owed. Pure + browser-safe: shared by the API
+ * checkout paths and the portal/web "Pay" button labels.
+ */
+/** Input to the deposit-first charge rule. Exported so the portal's re-implemented
+ *  copy (which can't import runtime code from this package) can import the TYPE and
+ *  cannot structurally drift from the server's contract. */
+export interface DepositChargeInput {
+  depositDue: string | null;
+  amountPaid: string;
+  balance: string;
+}
+
+export function computeChargeNow(inv: DepositChargeInput, currencyCode = 'USD'): { amount: string; isDeposit: boolean } {
+  const balanceCents = toCents(inv.balance);
+  const depositCents = inv.depositDue !== null ? toCents(inv.depositDue) : 0;
+  const paidCents = toCents(inv.amountPaid);
+  if (depositCents > 0 && paidCents < depositCents) {
+    return { amount: roundToCurrency(Math.min(depositCents - paidCents, balanceCents) / 100, currencyCode), isDeposit: true };
+  }
+  return { amount: roundToCurrency(inv.balance, currencyCode), isDeposit: false };
+}

@@ -1,0 +1,399 @@
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { Hono } from 'hono';
+import { securityMiddleware, _resetForceHttpsRedirectWarnStateForTests } from './security';
+
+function createApp(options?: Parameters<typeof securityMiddleware>[0]) {
+  const app = new Hono();
+  app.use('*', securityMiddleware(options));
+  app.get('/test', (c) => c.text('ok'));
+  app.get('/health', (c) => c.text('healthy'));
+  app.get('/health/live', (c) => c.text('live'));
+  app.get('/health/ready', (c) => c.text('ready-probe'));
+  app.get('/ready', (c) => c.text('ready'));
+  return app;
+}
+
+describe('securityMiddleware', () => {
+  describe('CSP header', () => {
+    it('sets Content-Security-Policy on all requests', async () => {
+      const app = createApp();
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).toBeTruthy();
+      expect(csp).toContain("default-src 'self'");
+      expect(csp).toContain("frame-ancestors 'none'");
+      expect(csp).toContain("script-src 'self'");
+      expect(csp).toContain("style-src 'self'");
+    });
+
+    it('allows unsafe-inline CSP when explicitly enabled', async () => {
+      const app = createApp({ allowUnsafeInline: 'true' });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).toContain("script-src 'self' 'unsafe-inline'");
+      expect(csp).toContain("style-src 'self' 'unsafe-inline'");
+    });
+
+    it('includes report-uri when cspReportUri is set', async () => {
+      const app = createApp({ cspReportUri: 'https://report.example.com/csp' });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).toContain('report-uri https://report.example.com/csp');
+      expect(csp).toContain('report-to csp-endpoint');
+    });
+
+    it('omits report-uri when cspReportUri is not set', async () => {
+      const app = createApp({ cspReportUri: '' });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).not.toContain('report-uri');
+    });
+  });
+
+  describe('Report-To header', () => {
+    it('sets Report-To when cspReportUri is set', async () => {
+      const app = createApp({ cspReportUri: 'https://report.example.com/csp' });
+      const res = await app.request('/test');
+      const reportTo = res.headers.get('Report-To');
+      expect(reportTo).toBeTruthy();
+      const parsed = JSON.parse(reportTo!);
+      expect(parsed.group).toBe('csp-endpoint');
+      expect(parsed.endpoints[0].url).toBe('https://report.example.com/csp');
+    });
+
+    it('does not set Report-To when cspReportUri is not set', async () => {
+      const app = createApp();
+      const res = await app.request('/test');
+      expect(res.headers.get('Report-To')).toBeNull();
+    });
+  });
+
+  describe('Permissions-Policy header', () => {
+    it('sets Permissions-Policy on all requests', async () => {
+      const app = createApp();
+      const res = await app.request('/test');
+      const pp = res.headers.get('Permissions-Policy');
+      expect(pp).toBe('camera=(), microphone=(), geolocation=()');
+    });
+  });
+
+  describe('HTTPS redirect (TRANSPORT-001 — canonical scheme + Host)', () => {
+    // In this test harness there is no real TCP peer (no `env.incoming.socket`),
+    // so `trustsForwardedHeadersFrom` falls back to its NODE_ENV-based legacy
+    // default: trusted outside production when TRUSTED_PROXY_CIDRS is unset.
+    // The "spoof" case below forces production so that default flips closed,
+    // matching the real deployed posture (TRUST_PROXY_HEADERS/TRUSTED_PROXY_CIDRS
+    // explicitly configured).
+    const PUBLIC_API_URL = 'https://api.example.com';
+
+    it('redirects HTTP to HTTPS, built from PUBLIC_API_URL, when forceHttps is true', async () => {
+      const app = createApp({ forceHttps: 'true', publicApiUrl: PUBLIC_API_URL });
+      const req = new Request('http://api.example.com/test', {
+        headers: { 'x-forwarded-proto': 'http', host: 'api.example.com' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(308);
+      expect(res.headers.get('Location')).toBe('https://api.example.com/test');
+    });
+
+    it('preserves query string in the redirect Location', async () => {
+      const app = createApp({ forceHttps: 'true', publicApiUrl: PUBLIC_API_URL });
+      const req = new Request('http://api.example.com/test?a=1&b=two', {
+        headers: { 'x-forwarded-proto': 'http', host: 'api.example.com' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(308);
+      expect(res.headers.get('Location')).toBe('https://api.example.com/test?a=1&b=two');
+    });
+
+    it('does not redirect when proto is already https', async () => {
+      const app = createApp({ forceHttps: 'true', publicApiUrl: PUBLIC_API_URL });
+      const req = new Request('http://api.example.com/test', {
+        headers: { 'x-forwarded-proto': 'https', host: 'api.example.com' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(200);
+    });
+
+    it('does not redirect when forceHttps is not set', async () => {
+      const app = createApp();
+      const req = new Request('http://api.example.com/test', {
+        headers: { 'x-forwarded-proto': 'http', host: 'api.example.com' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(200);
+    });
+
+    it('does not redirect when forceHttps is true but PUBLIC_API_URL is not configured', async () => {
+      const app = createApp({ forceHttps: 'true' });
+      const req = new Request('http://api.example.com/test', {
+        headers: { 'x-forwarded-proto': 'http', host: 'api.example.com' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(200);
+    });
+
+    it('rejects an unrecognized Host with 400 instead of redirecting to it', async () => {
+      const app = createApp({ forceHttps: 'true', publicApiUrl: PUBLIC_API_URL });
+      const req = new Request('http://attacker.example.net/test', {
+        headers: { 'x-forwarded-proto': 'http', host: 'attacker.example.net' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(400);
+      expect(res.headers.get('Location')).toBeNull();
+    });
+
+    it('ignores a spoofed X-Forwarded-Proto: https from an untrusted peer and still redirects', async () => {
+      const original = process.env.NODE_ENV;
+      const originalCidrs = process.env.TRUSTED_PROXY_CIDRS;
+      try {
+        // Force the proxy-trust gate closed (production default) with no
+        // TRUSTED_PROXY_CIDRS configured — the harness has no real socket peer,
+        // so this is the deployed-equivalent "untrusted peer" posture.
+        process.env.NODE_ENV = 'production';
+        delete process.env.TRUSTED_PROXY_CIDRS;
+        const app = createApp({ forceHttps: 'true', publicApiUrl: PUBLIC_API_URL, nodeEnv: 'production' });
+        const req = new Request('http://api.example.com/test', {
+          headers: { 'x-forwarded-proto': 'https', host: 'api.example.com' },
+        });
+        const res = await app.request(req);
+        // The forwarded header is untrusted and dropped; the direct request URL
+        // (http://) is the only signal left, so the redirect still fires.
+        expect(res.status).toBe(308);
+        expect(res.headers.get('Location')).toBe('https://api.example.com/test');
+      } finally {
+        if (original === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = original;
+        if (originalCidrs === undefined) delete process.env.TRUSTED_PROXY_CIDRS;
+        else process.env.TRUSTED_PROXY_CIDRS = originalCidrs;
+      }
+    });
+
+    it('skips redirect for /health path', async () => {
+      const app = createApp({ forceHttps: 'true', publicApiUrl: PUBLIC_API_URL });
+      const req = new Request('http://api.example.com/health', {
+        headers: { 'x-forwarded-proto': 'http', host: 'api.example.com' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('healthy');
+    });
+
+    it('skips redirect for /ready path', async () => {
+      const app = createApp({ forceHttps: 'true', publicApiUrl: PUBLIC_API_URL });
+      const req = new Request('http://api.example.com/ready', {
+        headers: { 'x-forwarded-proto': 'http', host: 'api.example.com' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('ready');
+    });
+
+    // Regression: an orchestrator/load-balancer probes /health/ready and
+    // /health/live over plain HTTP with a raw IP/localhost Host (NOT the
+    // canonical PUBLIC_API_URL host) and NO X-Forwarded-Proto. Under FORCE_HTTPS
+    // these probe paths must pass through, never 400 for the non-canonical Host
+    // (the CI smoke-test failure this covers) and never redirect.
+    it.each([
+      ['/health/live', 'live'],
+      ['/health/ready', 'ready-probe'],
+    ])('passes %s through under FORCE_HTTPS with a non-canonical Host over http', async (path, body) => {
+      const app = createApp({ forceHttps: 'true', publicApiUrl: PUBLIC_API_URL });
+      const req = new Request(`http://localhost:3001${path}`, {
+        headers: { host: 'localhost:3001' },
+      });
+      const res = await app.request(req);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(body);
+    });
+  });
+
+  describe('next() is called', () => {
+    it('passes through to route handler', async () => {
+      const app = createApp();
+      const res = await app.request('/test');
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('ok');
+    });
+  });
+
+  describe('connect-src tightening (LOW-H3)', () => {
+    it('production CSP does NOT include open ws:/wss: wildcards', async () => {
+      const app = createApp({ nodeEnv: 'production' });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      // Must NOT contain the bare scheme allowlists that permit any host.
+      expect(csp).not.toMatch(/connect-src[^;]*\bws:(?!\/)/);
+      expect(csp).not.toMatch(/connect-src[^;]*\bwss:(?!\/)/);
+      // Must restrict to explicit host(s).
+      expect(csp).toMatch(/connect-src 'self' wss:\/\//);
+    });
+
+    it('production CSP defaults to wss://*.2breeze.app when no env override', async () => {
+      const app = createApp({ nodeEnv: 'production', cspConnectHosts: '' });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).toContain("connect-src 'self' wss://*.2breeze.app");
+    });
+
+    it('production CSP honors CSP_CONNECT_HOSTS allowlist', async () => {
+      const app = createApp({
+        nodeEnv: 'production',
+        cspConnectHosts: 'wss://us.example.com,wss://eu.example.com',
+      });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).toContain("connect-src 'self' wss://us.example.com wss://eu.example.com");
+    });
+
+    it('non-production CSP keeps open ws: wss: for localhost dev', async () => {
+      const app = createApp({ nodeEnv: 'development' });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).toContain("connect-src 'self' ws: wss:");
+    });
+  });
+
+  describe('CSP_ALLOW_UNSAFE_INLINE production lockdown', () => {
+    it('refuses to enable unsafe-inline in production even if env var is true', async () => {
+      const app = createApp({ nodeEnv: 'production', allowUnsafeInline: 'true' });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).not.toContain("'unsafe-inline'");
+      expect(csp).toContain("script-src 'self'");
+      expect(csp).toContain("style-src 'self'");
+    });
+
+    it('still permits unsafe-inline in development when explicitly enabled', async () => {
+      const app = createApp({ nodeEnv: 'development', allowUnsafeInline: 'true' });
+      const res = await app.request('/test');
+      const csp = res.headers.get('Content-Security-Policy');
+      expect(csp).toContain("script-src 'self' 'unsafe-inline'");
+    });
+  });
+});
+
+// #3047: the FORCE_HTTPS redirect used to return without logging under any
+// condition, so a proxy misconfiguration produced a fleet-wide 308 storm with
+// no signal anywhere — /health is exempt and kept returning 200 throughout.
+describe('FORCE_HTTPS redirect warning (#3047)', () => {
+  const opts = { forceHttps: 'true', publicApiUrl: 'https://api.example.com' };
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  const originalCidrs = process.env.TRUSTED_PROXY_CIDRS;
+
+  beforeEach(() => {
+    // Model a configured deployment. With TRUSTED_PROXY_CIDRS unset,
+    // `isTrustedProxySource` returns `NODE_ENV !== 'production'` — so under test
+    // every peer is trusted and the proxy-evidence gate can never be observed.
+    // Naming an explicit CIDR the test peer is not in reproduces the production
+    // semantics this suite is about.
+    process.env.TRUSTED_PROXY_CIDRS = '10.9.9.9/32';
+    _resetForceHttpsRedirectWarnStateForTests();
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    if (originalCidrs === undefined) delete process.env.TRUSTED_PROXY_CIDRS;
+    else process.env.TRUSTED_PROXY_CIDRS = originalCidrs;
+    warnSpy.mockRestore();
+    _resetForceHttpsRedirectWarnStateForTests();
+  });
+
+  // A direct plain-HTTP client with no forwarding headers at all is the redirect
+  // working as designed — a port-80 scanner, an uptime probe, or a deploy that
+  // intentionally runs without a reverse proxy. Warning there would emit a
+  // misconfiguration line per scanner IP on any internet-facing origin, and
+  // per-peer suppression is no defence because each source IP gets its own first
+  // warn. It must redirect silently.
+  it('stays silent for a direct client with no proxy evidence', async () => {
+    const res = await createApp(opts).request('http://api.example.com/test', {
+      headers: { host: 'api.example.com' },
+    });
+
+    expect(res.status).toBe(308);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('warns when a redirect fires, naming the symptom and the two config causes', async () => {
+    const res = await createApp(opts).request('http://api.example.com/test', {
+      headers: { host: 'api.example.com', 'x-forwarded-for': '203.0.113.9' },
+    });
+
+    expect(res.status).toBe(308);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const msg = String(warnSpy.mock.calls[0]?.[0]);
+    expect(msg).toContain('[force-https]');
+    expect(msg).toContain('trustedProxy=');
+    expect(msg).toContain('xForwardedProto=');
+    expect(msg).toContain('TRUSTED_PROXY_CIDRS');
+  });
+
+  // The variant #2988 could not catch: trust gate passes, no scheme header, so
+  // no warning branch in clientIp.ts is reachable.
+  it('reports xForwardedProto=(absent) when the proxy never sends the header', async () => {
+    // Evidence of a proxy via the IP header, but no scheme header — exactly the
+    // variant #2988 could not catch.
+    await createApp(opts).request('http://api.example.com/test', {
+      headers: { host: 'api.example.com', 'x-forwarded-for': '203.0.113.9' },
+    });
+
+    const msg = String(warnSpy.mock.calls[0]?.[0]);
+    expect(msg).toContain('xForwardedProto=(absent)');
+  });
+
+  it('also warns on the 400 branch, which is the same fault via a non-canonical Host', async () => {
+    const res = await createApp(opts).request('http://wrong-host.example.net/test', {
+      headers: { host: 'wrong-host.example.net', 'x-forwarded-for': '203.0.113.9' },
+    });
+
+    expect(res.status).toBe(400);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain('canonicalHost=false');
+  });
+
+  it('suppresses repeats per peer so a redirect storm cannot flood the log', async () => {
+    const app = createApp(opts);
+    for (let i = 0; i < 5; i++) {
+      await app.request('http://api.example.com/test', {
+        headers: { host: 'api.example.com', 'x-forwarded-for': '203.0.113.9' },
+      });
+    }
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // Both negative cases below carry proxy evidence deliberately. Without it they
+  // would pass because the new gate silenced them, not because of the exemption
+  // they claim to test — green for the wrong reason.
+  it('does not warn for health probes, which are exempt from the redirect', async () => {
+    const app = createApp(opts);
+    for (const p of ['/health', '/health/live', '/health/ready', '/ready']) {
+      await app.request(`http://api.example.com${p}`, {
+        headers: { host: 'api.example.com', 'x-forwarded-for': '203.0.113.9' },
+      });
+    }
+
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not warn when FORCE_HTTPS is off', async () => {
+    await createApp({ publicApiUrl: 'https://api.example.com' }).request(
+      'http://api.example.com/test',
+      { headers: { host: 'api.example.com', 'x-forwarded-for': '203.0.113.9' } });
+
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  // X-Forwarded-Proto alone is why hasTrustGatedForwardedHeaders exists as a
+  // superset of the IP-header check: a proxy that forwards only the scheme is
+  // still a proxy, and is precisely the TRANSPORT-001 shape.
+  it('treats a lone X-Forwarded-Proto as proxy evidence', async () => {
+    const res = await createApp(opts).request('http://api.example.com/test', {
+      headers: { host: 'api.example.com', 'x-forwarded-proto': 'http' },
+    });
+
+    expect(res.status).toBe(308);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain('xForwardedProto=http');
+  });
+});

@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import PatchesPage from '../../components/patches/PatchesPage';
+---
+
+<DashboardLayout titleKey="titles.patches">
+  <PatchesPage client:load />
+</DashboardLayout>

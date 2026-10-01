@@ -1,0 +1,769 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
+
+const queueCommandForExecutionMock = vi.fn();
+const queueBackupStopCommandMock = vi.fn();
+const authorizeResilienceResourcesMock = vi.fn();
+const runOutsideDbContextMock = vi.fn((fn: () => unknown) => fn());
+const authzState = vi.hoisted(() => ({
+  allowedPermissions: new Set<string>(['*:*']),
+}));
+const SITE_A = '11111111-1111-4111-8111-111111111111';
+const SITE_B = '22222222-2222-4222-8222-222222222222';
+let permissionsState: any;
+
+function chainMock(resolvedValue: unknown = []) {
+  const chain: Record<string, any> = {};
+  for (const method of ['from', 'where', 'limit', 'returning', 'values', 'set', 'orderBy']) {
+    chain[method] = vi.fn(() => Object.assign(Promise.resolve(resolvedValue), chain));
+  }
+  return Object.assign(Promise.resolve(resolvedValue), chain);
+}
+
+const selectMock = vi.fn(() => chainMock([]));
+const insertMock = vi.fn(() => chainMock([]));
+const updateMock = vi.fn(() => chainMock([]));
+const deleteMock = vi.fn(() => chainMock([]));
+
+vi.mock('../../db', () => ({
+  db: {
+    select: (...args: unknown[]) => selectMock(...(args as [])),
+    insert: (...args: unknown[]) => insertMock(...(args as [])),
+    update: (...args: unknown[]) => updateMock(...(args as [])),
+    delete: (...args: unknown[]) => deleteMock(...(args as [])),
+  },
+  runOutsideDbContext: (...args: unknown[]) => runOutsideDbContextMock(...(args as [any])),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => unknown) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => unknown) => fn()),
+}));
+
+vi.mock('../../db/schema', () => ({
+  backupSnapshotFiles: {
+    id: 'backup_snapshot_files.id',
+    snapshotDbId: 'backup_snapshot_files.snapshot_db_id',
+    sourcePath: 'backup_snapshot_files.source_path',
+  },
+  backupSnapshots: {
+    id: 'backup_snapshots.id',
+    orgId: 'backup_snapshots.org_id',
+    deviceId: 'backup_snapshots.device_id',
+    snapshotId: 'backup_snapshots.snapshot_id',
+  },
+  backupConfigs: {
+    id: 'backup_configs.id',
+    orgId: 'backup_configs.org_id',
+    provider: 'backup_configs.provider',
+    providerConfig: 'backup_configs.provider_config',
+  },
+  restoreJobs: {
+    id: 'restore_jobs.id',
+    orgId: 'restore_jobs.org_id',
+    snapshotId: 'restore_jobs.snapshot_id',
+    deviceId: 'restore_jobs.device_id',
+    restoreType: 'restore_jobs.restore_type',
+    targetPath: 'restore_jobs.target_path',
+    selectedPaths: 'restore_jobs.selected_paths',
+    status: 'restore_jobs.status',
+    startedAt: 'restore_jobs.started_at',
+    completedAt: 'restore_jobs.completed_at',
+    restoredSize: 'restore_jobs.restored_size',
+    restoredFiles: 'restore_jobs.restored_files',
+    targetConfig: 'restore_jobs.target_config',
+    commandId: 'restore_jobs.command_id',
+    createdAt: 'restore_jobs.created_at',
+    updatedAt: 'restore_jobs.updated_at',
+  },
+  deviceCommands: {
+    id: 'device_commands.id',
+    status: 'device_commands.status',
+  },
+  devices: {
+    id: 'devices.id',
+    orgId: 'devices.org_id',
+    siteId: 'devices.site_id',
+    status: 'devices.status',
+  },
+}));
+
+vi.mock('../../middleware/auth', () => ({
+  requireScope: vi.fn(() => (_c: any, next: any) => next()),
+  requirePermission: vi.fn((resource: string, action: string) => (c: any, next: any) => {
+    if (
+      !authzState.allowedPermissions.has('*:*') &&
+      !authzState.allowedPermissions.has(`${resource}:${action}`)
+    ) {
+      return c.json({ error: 'Permission denied' }, 403);
+    }
+    return next();
+  }),
+  requireMfa: vi.fn(() => (_c: any, next: any) => next()),
+}));
+
+vi.mock('../../services/auditEvents', () => ({
+  writeRouteAudit: vi.fn(),
+}));
+
+vi.mock('../../services/commandQueue', () => ({
+  CommandTypes: {
+    BACKUP_RESTORE: 'backup_restore',
+  },
+  queueBackupStopCommand: (...args: unknown[]) => queueBackupStopCommandMock(...(args as [])),
+  queueCommandForExecution: (...args: unknown[]) => queueCommandForExecutionMock(...(args as [])),
+}));
+
+vi.mock('../../services/backupMetrics', () => ({
+  recordBackupDispatchFailure: vi.fn(),
+}));
+
+vi.mock('../../services/resilienceSiteAuthorization', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../services/resilienceSiteAuthorization')>();
+  return {
+    ...actual,
+    authorizeResilienceResources: (...args: unknown[]) => authorizeResilienceResourcesMock(...args),
+  };
+});
+
+import { restoreRoutes } from './restore';
+import { ResilienceAuthorizationError } from '../../services/resilienceSiteAuthorization';
+
+describe('restore routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    selectMock.mockReset();
+    selectMock.mockImplementation(() => chainMock([]));
+    insertMock.mockReset();
+    insertMock.mockImplementation(() => chainMock([]));
+    updateMock.mockReset();
+    updateMock.mockImplementation(() => chainMock([]));
+    deleteMock.mockReset();
+    deleteMock.mockImplementation(() => chainMock([]));
+    permissionsState = undefined;
+    authzState.allowedPermissions.clear();
+    authzState.allowedPermissions.add('*:*');
+    authorizeResilienceResourcesMock.mockResolvedValue({ resources: [] });
+    app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('auth', {
+        principal: { kind: 'user_session' },
+        user: { id: 'user-1', email: 'test@example.com', name: 'Test User', isPlatformAdmin: false },
+        scope: 'organization',
+        orgId: 'org-1',
+        partnerId: null,
+        accessibleOrgIds: ['org-1'],
+        canAccessOrg: (candidateOrgId: string) => candidateOrgId === 'org-1',
+        orgCondition: () => undefined,
+        token: { sub: 'user-1', scope: 'organization' } as any,
+      });
+      if (permissionsState) {
+        c.set('permissions', permissionsState);
+      }
+      await next();
+    });
+    app.route('/', restoreRoutes);
+  });
+
+  it('denies a source-site restore before reading snapshot metadata or creating side effects', async () => {
+    authorizeResilienceResourcesMock.mockRejectedValueOnce(
+      new ResilienceAuthorizationError(403, 'site_access_denied')
+    );
+
+    const res = await app.request('/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshotId: 'snap-db-1', deviceId: 'device-1', restoreType: 'full' }),
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'site_access_denied' });
+    expect(selectMock).not.toHaveBeenCalled();
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+  });
+
+  it('authorizes cancel from restore-job lineage before reading or mutating the job', async () => {
+    authorizeResilienceResourcesMock.mockRejectedValueOnce(
+      new ResilienceAuthorizationError(403, 'site_access_denied')
+    );
+
+    const res = await app.request('/restore/restore-1/cancel', { method: 'POST' });
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'site_access_denied' });
+    expect(selectMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(queueBackupStopCommandMock).not.toHaveBeenCalled();
+  });
+
+  it('denies an explicit out-of-scope restore device filter for site-restricted users', async () => {
+    permissionsState = { allowedSiteIds: [SITE_A] };
+    selectMock.mockReturnValueOnce(chainMock([
+      { id: 'device-in', siteId: SITE_A },
+    ]));
+
+    const res = await app.request('/restore?deviceId=device-out');
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'site_access_denied' });
+    expect(selectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('narrows restore job lists to allowed target device sites for site-restricted users', async () => {
+    permissionsState = { allowedSiteIds: [SITE_A] };
+    const allowedDevicesChain = chainMock([
+      { id: 'device-in', siteId: SITE_A },
+      { id: 'device-out', siteId: SITE_B },
+    ]);
+    const restoreChain = chainMock([makeRestoreJob({ id: 'restore-in', deviceId: 'device-in' })]);
+    selectMock
+      .mockReturnValueOnce(allowedDevicesChain)
+      .mockReturnValueOnce(restoreChain);
+
+    const res = await app.request('/restore');
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toHaveLength(1);
+    expect(restoreChain.where).toHaveBeenCalled();
+    expect(selectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("D17: site-scoped restore listing does not drop a job whose snapshot was retention-deleted (SET NULL)", async () => {
+    // restore_jobs.snapshot_id is ON DELETE SET NULL since 2026-10-15-140004,
+    // so a job can legitimately have snapshotId: null while its device stays
+    // very much in scope. Before the fix, the site-scoping predicate was a
+    // bare `exists (select 1 from backup_snapshots where ... )` keyed off
+    // restore_jobs.snapshot_id — with snapshot_id NULL, no row can ever
+    // satisfy that EXISTS (a NULL join key never matches), so the predicate
+    // silently excluded the job from every site-scoped listing regardless of
+    // whether its own device was allowed. The preceding
+    // `restoreJobs.deviceId IN allowedDeviceIds` condition already bounds the
+    // query correctly on its own, so the EXISTS clause must not re-narrow a
+    // null-snapshot row out.
+    permissionsState = { allowedSiteIds: [SITE_A] };
+    const allowedDevicesChain = chainMock([{ id: 'device-in', siteId: SITE_A }]);
+    const restoreChain = chainMock([
+      makeRestoreJob({ id: 'restore-in', deviceId: 'device-in', snapshotId: null }),
+    ]);
+    selectMock
+      .mockReturnValueOnce(allowedDevicesChain)
+      .mockReturnValueOnce(restoreChain);
+
+    const res = await app.request('/restore');
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toHaveLength(1);
+
+    // Inspect the compiled WHERE predicate directly (the mock resolves
+    // whatever is queued regardless of the predicate, so asserting on the
+    // response body alone can't tell a correct query from a broken one that
+    // happens to be fed the "right" mocked rows) — this is the same
+    // PgDialect().sqlToQuery() technique used elsewhere in this repo to pin
+    // raw `sql` fragment text (see recoveryBootstrap.test.ts).
+    const whereArg = restoreChain.where.mock.calls[0]![0] as SQL;
+    const { sql: compiledSql } = new PgDialect().sqlToQuery(whereArg);
+    const normalized = compiledSql.toLowerCase();
+    expect(normalized).toContain('is null');
+    expect(normalized).toContain('or exists (');
+  });
+
+  it('keeps unrestricted restore list behavior unchanged', async () => {
+    const restoreChain = chainMock([
+      makeRestoreJob({ id: 'restore-in', deviceId: 'device-in' }),
+      makeRestoreJob({ id: 'restore-out', deviceId: 'device-out' }),
+    ]);
+    selectMock.mockReturnValueOnce(restoreChain);
+
+    const res = await app.request('/restore');
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toHaveLength(2);
+    expect(selectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('denies restore creation without backup read permission even when device execution is allowed', async () => {
+    authzState.allowedPermissions.clear();
+    authzState.allowedPermissions.add('devices:execute');
+
+    const res = await app.request('/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshotId: 'snap-db-1', restoreType: 'full' }),
+    });
+
+    expect(res.status).toBe(403);
+    expect(selectMock).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+  });
+
+  it('creates a restore job and persists the queued command id', async () => {
+    selectMock
+      .mockReturnValueOnce(
+        chainMock([{ id: 'snap-db-1', orgId: 'org-1', deviceId: 'device-1', snapshotId: 'provider-snap-1', configId: 'cfg-1' }])
+      )
+      .mockReturnValueOnce(chainMock([{ id: 'device-1', status: 'online' }]))
+      .mockReturnValueOnce(chainMock([{ provider: 's3', providerConfig: { bucket: 'breeze-backups', region: 'us-east-1' } }]));
+    insertMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'pending',
+        targetPath: null,
+        startedAt: null,
+        completedAt: null,
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: null,
+        commandId: null,
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+    queueCommandForExecutionMock.mockResolvedValueOnce({
+      command: { id: 'command-1', status: 'sent' },
+    });
+    updateMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'running',
+        targetPath: null,
+        startedAt: new Date('2026-04-01T00:00:00Z'),
+        completedAt: null,
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: null,
+        commandId: 'command-1',
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+
+    const res = await app.request('/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshotId: 'snap-db-1', restoreType: 'full' }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.commandId).toBe('command-1');
+    expect(runOutsideDbContextMock).toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).toHaveBeenCalledWith(
+      'device-1',
+      'backup_restore',
+      {
+        restoreJobId: 'restore-1',
+        snapshotId: 'provider-snap-1',
+        targetPath: '',
+        selectedPaths: [],
+        provider: 's3',
+        providerConfig: { bucket: 'breeze-backups', region: 'us-east-1' },
+      },
+      { userId: 'user-1' }
+    );
+  });
+
+  // D12: once backupResultPersistence.ts indexes the agent's stable
+  // originalPath (e.g. C:\assure\src\content\prefix\pick.txt) instead of the
+  // transient VSS shadow-copy device path, a selective restore's selectedPaths
+  // — which the agent also matches by originalPath — must exact-match
+  // backup_snapshot_files.source_path and succeed, instead of 400ing with
+  // "Selected path is not available in this snapshot".
+  it('accepts a selective restore selection matching the indexed originalPath', async () => {
+    selectMock
+      .mockReturnValueOnce(
+        chainMock([{ id: 'snap-db-1', orgId: 'org-1', deviceId: 'device-1', snapshotId: 'provider-snap-1', configId: 'cfg-1' }])
+      )
+      .mockReturnValueOnce(
+        chainMock([{ id: 'file-1', sourcePath: 'C:\\assure\\src\\content\\prefix\\pick.txt' }])
+      )
+      .mockReturnValueOnce(chainMock([{ id: 'device-1', status: 'online' }]))
+      .mockReturnValueOnce(chainMock([{ provider: 's3', providerConfig: { bucket: 'breeze-backups', region: 'us-east-1' } }]));
+    insertMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'selective',
+        selectedPaths: ['C:\\assure\\src\\content\\prefix\\pick.txt'],
+        status: 'pending',
+        targetPath: null,
+        startedAt: null,
+        completedAt: null,
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: null,
+        commandId: null,
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+    queueCommandForExecutionMock.mockResolvedValueOnce({
+      command: { id: 'command-1', status: 'sent' },
+    });
+    updateMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'selective',
+        selectedPaths: ['C:\\assure\\src\\content\\prefix\\pick.txt'],
+        status: 'running',
+        targetPath: null,
+        startedAt: new Date('2026-04-01T00:00:00Z'),
+        completedAt: null,
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: null,
+        commandId: 'command-1',
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+
+    const res = await app.request('/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        snapshotId: 'snap-db-1',
+        restoreType: 'selective',
+        selectedPaths: ['C:\\assure\\src\\content\\prefix\\pick.txt'],
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.commandId).toBe('command-1');
+  });
+
+  it('fails the restore request when no backup destination config can be resolved for the snapshot', async () => {
+    selectMock
+      .mockReturnValueOnce(
+        chainMock([{ id: 'snap-db-1', orgId: 'org-1', deviceId: 'device-1', snapshotId: 'provider-snap-1', configId: 'cfg-missing' }])
+      )
+      .mockReturnValueOnce(chainMock([{ id: 'device-1', status: 'online' }]))
+      .mockReturnValueOnce(chainMock([]));
+
+    const res = await app.request('/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshotId: 'snap-db-1', restoreType: 'full' }),
+    });
+
+    expect(res.status).toBe(422);
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+  });
+
+  it('returns a legacy-snapshot message (not a misleading "not found") when configId is null', async () => {
+    // Legacy snapshot: configId was never recorded, so there is no destination
+    // to resolve. Only two selects run (snapshot + device) — the provider-config
+    // lookup is skipped entirely because snapshot.configId is null.
+    selectMock
+      .mockReturnValueOnce(
+        chainMock([{ id: 'snap-db-1', orgId: 'org-1', deviceId: 'device-1', snapshotId: 'provider-snap-1', configId: null }])
+      )
+      .mockReturnValueOnce(chainMock([{ id: 'device-1', status: 'online' }]));
+
+    const res = await app.request('/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshotId: 'snap-db-1', restoreType: 'full' }),
+    });
+
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.reason).toBe('legacy_snapshot');
+    expect(body.error).toContain('predates backup destination tracking');
+    // Must NOT masquerade as a genuine misconfiguration.
+    expect(body.error).not.toBe('Backup destination configuration not found for this snapshot');
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+  });
+
+  it('returns a restore job by id', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'running',
+        targetPath: null,
+        startedAt: new Date('2026-04-01T00:00:00Z'),
+        completedAt: null,
+        restoredSize: 1024,
+        restoredFiles: 4,
+        targetConfig: {
+          result: {
+            status: 'running',
+            commandType: 'backup_restore',
+          },
+        },
+        commandId: 'command-1',
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+
+    const res = await app.request('/restore/restore-1', {
+      method: 'GET',
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.id).toBe('restore-1');
+    expect(body.data.commandId).toBe('command-1');
+    expect(body.data.resultDetails).toEqual({
+      status: 'running',
+      commandType: 'backup_restore',
+    });
+  });
+
+  it('surfaces immediate dispatch failure details through the read API', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-2',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'failed',
+        targetPath: null,
+        startedAt: null,
+        completedAt: new Date('2026-04-01T00:00:00Z'),
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: {
+          error: 'Device is offline, cannot execute command',
+        },
+        commandId: null,
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+
+    const res = await app.request('/restore/restore-2', {
+      method: 'GET',
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.errorSummary).toBe('Device is offline, cannot execute command');
+    expect(body.data.resultDetails).toMatchObject({
+      status: 'failed',
+      error: 'Device is offline, cannot execute command',
+    });
+  });
+
+  it('returns 404 when a restore job is not found by id', async () => {
+    selectMock.mockReturnValueOnce(chainMock([]));
+
+    const res = await app.request('/restore/missing-restore', {
+      method: 'GET',
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 409 and does not create a restore job when the target device is offline', async () => {
+    selectMock
+      .mockReturnValueOnce(
+        chainMock([{ id: 'snap-db-1', orgId: 'org-1', deviceId: 'device-1', snapshotId: 'provider-snap-1' }])
+      )
+      .mockReturnValueOnce(chainMock([{ id: 'device-1', status: 'offline' }]));
+
+    const res = await app.request('/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshotId: 'snap-db-1', restoreType: 'full' }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  it('marks the restore failed and returns 502 when command dispatch fails after row creation', async () => {
+    selectMock
+      .mockReturnValueOnce(
+        chainMock([{ id: 'snap-db-1', orgId: 'org-1', deviceId: 'device-1', snapshotId: 'provider-snap-1', configId: 'cfg-1' }])
+      )
+      .mockReturnValueOnce(chainMock([{ id: 'device-1', status: 'online' }]))
+      .mockReturnValueOnce(chainMock([{ provider: 's3', providerConfig: { bucket: 'breeze-backups', region: 'us-east-1' } }]));
+    insertMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'pending',
+        targetPath: null,
+        startedAt: null,
+        completedAt: null,
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: null,
+        commandId: null,
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+    queueCommandForExecutionMock.mockResolvedValueOnce({
+      error: 'Command bus unavailable',
+    });
+    updateMock.mockReturnValue({
+      set: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue([]),
+        returning: vi.fn().mockResolvedValue([]),
+      }),
+    } as any);
+
+    const res = await app.request('/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshotId: 'snap-db-1', restoreType: 'full' }),
+    });
+
+    expect(res.status).toBe(502);
+    expect(updateMock).toHaveBeenCalled();
+  });
+
+  it('cancels a running restore job and queues backup_stop', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-3',
+        orgId: 'org-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'running',
+        targetPath: null,
+        startedAt: new Date('2026-04-01T00:00:00Z'),
+        completedAt: null,
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: null,
+        commandId: 'command-3',
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+    updateMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-3',
+        orgId: 'org-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'cancelled',
+        targetPath: null,
+        startedAt: new Date('2026-04-01T00:00:00Z'),
+        completedAt: new Date('2026-04-01T01:00:00Z'),
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: {
+          error: 'Cancelled by user',
+          result: { status: 'cancelled', error: 'Cancelled by user' },
+        },
+        commandId: 'command-3',
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T01:00:00Z'),
+      }])
+    );
+    queueBackupStopCommandMock.mockResolvedValueOnce({ command: { id: 'stop-1', status: 'sent' } });
+
+    const res = await app.request('/restore/restore-3/cancel', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.status).toBe('cancelled');
+    expect(queueBackupStopCommandMock).toHaveBeenCalledWith('device-1', { userId: 'user-1' });
+  });
+
+  it('removes a pending restore dispatch before cancelling', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-4',
+        orgId: 'org-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'pending',
+        targetPath: null,
+        startedAt: null,
+        completedAt: null,
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: null,
+        commandId: 'command-4',
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T00:00:00Z'),
+      }])
+    );
+    updateMock.mockReturnValueOnce(
+      chainMock([{
+        id: 'restore-4',
+        orgId: 'org-1',
+        snapshotId: 'snap-db-1',
+        deviceId: 'device-1',
+        restoreType: 'full',
+        selectedPaths: [],
+        status: 'cancelled',
+        targetPath: null,
+        startedAt: null,
+        completedAt: new Date('2026-04-01T01:00:00Z'),
+        restoredSize: null,
+        restoredFiles: null,
+        targetConfig: {
+          error: 'Cancelled by user',
+          result: { status: 'cancelled', error: 'Cancelled by user' },
+        },
+        commandId: 'command-4',
+        createdAt: new Date('2026-04-01T00:00:00Z'),
+        updatedAt: new Date('2026-04-01T01:00:00Z'),
+      }])
+    );
+    deleteMock.mockReturnValueOnce(chainMock([{ id: 'command-4' }]));
+
+    const res = await app.request('/restore/restore-4/cancel', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(queueBackupStopCommandMock).not.toHaveBeenCalled();
+  });
+});
+
+function makeRestoreJob(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'restore-1',
+    snapshotId: 'snap-db-1',
+    deviceId: 'device-1',
+    restoreType: 'full',
+    selectedPaths: [],
+    status: 'running',
+    targetPath: null,
+    startedAt: null,
+    completedAt: null,
+    restoredSize: null,
+    restoredFiles: null,
+    targetConfig: null,
+    commandId: null,
+    createdAt: new Date('2026-04-01T00:00:00Z'),
+    updatedAt: new Date('2026-04-01T00:00:00Z'),
+    ...overrides,
+  };
+}

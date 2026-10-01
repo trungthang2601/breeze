@@ -1,0 +1,171 @@
+---
+title: AI Computer Control
+description: The screenshot, screen-analysis, and mouse/keyboard control tools the AI assistant can use on a device's desktop, plus the AI Operator task-delegation preview.
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Beyond querying your fleet and running scripts, the Breeze AI assistant can look at and interact with a device's own desktop: it can capture a screenshot, analyze what's on screen against a description you give it, and — with a second person's approval — move the mouse and type on the device directly. This page covers those three tools, plus the two remote-session tools that sit in the same part of the codebase, and the separate **AI Operator** preview for handing off a longer-running task.
+
+<Aside type="note">
+  This page does **not** cover the AI's broader device-management toolset — running commands and scripts, managing services, file operations, disk cleanup, security scans, and so on. Those are documented on [AI Features](/features/ai/#tool-tiers), along with the full tier system and approval workflow this page relies on.
+</Aside>
+
+---
+
+## Available Tools
+
+| Tool | Description | Tier | Approval |
+|------|-------------|------|----------|
+| `take_screenshot` | Capture a screenshot of the device screen | Tier 3 | Supervised — approve in chat |
+| `analyze_screen` | Capture a screenshot and analyze it against a context you describe | Tier 3 | Supervised — approve in chat |
+| `computer_control` | Send mouse/keyboard input and capture a screenshot after each action | Tier 3 | **Four-eyes** — a second person approves |
+| `list_remote_sessions` | List active and recent remote sessions (terminal, desktop, file transfer) | Tier 1 | No |
+| `create_remote_session` | Open a new remote terminal or file-transfer session to a device | Tier 3 | **Four-eyes** — a second person approves |
+
+<Aside type="caution">
+  `computer_control` and `create_remote_session` are classified **four-eyes**, not supervised — the requesting technician cannot approve their own request. Breeze treats direct input control and unattended remote-session creation as surveillance-grade access, so a *different* user has to approve it from **Approval History** (or the mobile app). `take_screenshot` and `analyze_screen` stay supervised: the requester approves their own screenshot request in chat. See [AI Features → Approval workflow](/features/ai/#approval-workflow) for what four-eyes and supervised mean and who can approve each.
+</Aside>
+
+---
+
+## Screen capture & analysis
+
+### take_screenshot
+
+Captures a screenshot of the device screen and returns the image for visual analysis. The device must be online.
+
+| Parameter | Description |
+|-----------|-------------|
+| `deviceId` | The device UUID (required) |
+| `monitor` | Monitor index to capture (default: 0 = primary) |
+
+```
+"Take a screenshot of DESKTOP-A1B2C3"
+"Show me what's currently on the CFO's screen"
+```
+
+### analyze_screen
+
+Takes a screenshot and analyzes what's visible against a context you describe — for example, "error dialogs" or "performance issues." Useful for troubleshooting what the user sees without opening a full remote session.
+
+| Parameter | Description |
+|-----------|-------------|
+| `deviceId` | The device UUID (required) |
+| `context` | What to look for or analyze on screen |
+| `monitor` | Monitor index to capture (default: 0) |
+
+```
+"Check DESKTOP-FINANCE-01's screen for any error dialogs"
+"Is the user stuck on a Windows Update screen?"
+```
+
+---
+
+## Computer control
+
+### computer_control
+
+Sends mouse and keyboard input to a device and returns a screenshot after each action by default. The device must be online.
+
+| Action | Requires |
+|--------|----------|
+| `screenshot` | — |
+| `left_click`, `right_click`, `middle_click`, `double_click` | `x`, `y` |
+| `mouse_move` | `x`, `y` |
+| `scroll` | `x`, `y`, `scrollDelta` |
+| `key` | `key` (optionally `modifiers`: `ctrl`, `alt`, `shift`, `meta`) |
+| `type` | `text` |
+
+```
+"Click the 'Retry' button at 640, 480 on SERVER-01"
+"Type the license key into the activation dialog on DESKTOP-A1B2C3"
+```
+
+<Aside>
+  Every `computer_control` invocation is **four-eyes**: the AI raises the proposed action, and a different user has to approve it from Approval History before it reaches the device. There is no self-approval path for this tool, even for a sole administrator — see [AI Features → Approving your own request](/features/ai/#approving-your-own-request-when-you-are-the-only-approver) for what happens when an organization has no second eligible approver.
+</Aside>
+
+---
+
+## Remote session tools
+
+Two tools give the AI limited visibility into and control over [Remote Access](/features/remote-access/) sessions. Full session mechanics (WebRTC, TURN, WebSocket fallback, Quick Support) are documented on that page — this is only what the AI assistant itself can do.
+
+### list_remote_sessions
+
+Lists active and recent remote sessions, filterable by status, type, and device. A non-system caller only sees their own sessions. Tier 1, read-only, no rate limit.
+
+### create_remote_session
+
+Opens a new `terminal` or `file_transfer` session to an online device. `desktop` sessions are not created through this tool. Four-eyes approval, same reasoning as `computer_control`: an unattended session is surveillance-grade access. If the organization is not verified for remote control, the tool returns an error rather than opening a session.
+
+```
+"Open a terminal session to SERVER-DB-02"
+```
+
+---
+
+## Safety & limits
+
+### Timeouts
+
+All three device-control tools use a 120-second timeout — the same budget as `execute_command`, since each does an agent round-trip and, for `analyze_screen`, an additional vision pass.
+
+| Tool | Timeout |
+|------|---------|
+| `take_screenshot` | 120s |
+| `analyze_screen` | 120s |
+| `computer_control` | 120s |
+
+### Rate limits
+
+| Tool | Limit | Window |
+|------|-------|--------|
+| `take_screenshot` | 10 requests | 5 minutes |
+| `analyze_screen` | 10 requests | 5 minutes |
+| `computer_control` | 20 requests | 5 minutes |
+| `create_remote_session` | 10 requests | 5 minutes |
+
+### Permissions
+
+| Tool | Required Permission |
+|------|---------------------|
+| `take_screenshot` | `devices:execute` |
+| `analyze_screen` | `devices:execute` |
+| `computer_control` | `devices:execute` |
+| `list_remote_sessions` | `devices:read` |
+| `create_remote_session` | `devices:execute` |
+
+### Production allowlist
+
+Screen contents are the most sensitive RMM output there is — credentials, customer data, anything on the display. In production, `take_screenshot`, `analyze_screen`, and `computer_control` additionally require an explicit entry in the `MCP_EXECUTE_TOOL_ALLOWLIST` environment variable, same as any other Tier 3+ tool reached through the MCP server. See [MCP Server → Production allowlist](/features/mcp-server/#production-allowlist-for-destructive-tools).
+
+---
+
+## AI Operator (preview)
+
+**AI Operator** is a different shape of automation from the tools above: instead of a single tool call inside a chat turn, it's a long-running *task* — investigate, act, verify, document — that keeps working after you close the browser, pausing only at the step that needs your approval.
+
+<Aside type="caution">
+  AI Operator ships **disabled**, behind two feature flags plus the main `BREEZE_AI_AGENTS_ENABLED` kill switch, and only one recipe — **service recovery** — currently exists. It's documented in full on [AI Agents → AI Operator (preview)](/features/ai-agents/#ai-operator-preview), including the **Delegate to Operator** button, what the task page shows, and the service-recovery approval flow. See [Environment Variables → AI Operator](/deploy/environment/#ai-operator-preview-off-by-default) for the flags.
+</Aside>
+
+---
+
+## Troubleshooting
+
+**Tool execution times out.**
+`take_screenshot`, `analyze_screen`, and `computer_control` all use a 120-second timeout. If the device is under heavy load or has a slow connection, retry once it settles.
+
+**"Device not online" error.**
+All five tools on this page require the device to have an active WebSocket connection. Check the device's status in the dashboard; if it shows online but commands still fail, the agent may need to be restarted.
+
+**Approval request not appearing in the UI.**
+Tier 3 actions emit an `approval_required` event to the AI chat session. `computer_control` and `create_remote_session` requests don't show a self-approve option even for the requester — a different user has to approve from **Approval History** or the mobile app. See [AI Features → Pending approvals survive a restart](/features/ai/#pending-approvals-survive-a-restart).
+
+**"Tool rate limit exceeded" error.**
+Each tool's per-user limit resets on its own window (see [Rate limits](#rate-limits) above). The error message includes the reset time.
+
+**"Not in MCP_EXECUTE_TOOL_ALLOWLIST" error.**
+In production, `take_screenshot`, `analyze_screen`, and `computer_control` must be explicitly listed in `MCP_EXECUTE_TOOL_ALLOWLIST` to be callable through the MCP server. See [MCP Server → Troubleshooting](/features/mcp-server/#tool-returns-not-in-mcp_execute_tool_allowlist).

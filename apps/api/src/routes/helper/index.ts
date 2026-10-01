@@ -1,0 +1,744 @@
+/**
+ * Helper Chat Routes
+ *
+ * REST + SSE endpoints for the Breeze Helper (tray) AI chat.
+ * Auth: Helper-scoped bearer token (brz_ prefix) via helperAuth middleware.
+ * Sessions are scoped to the device (no user ID required).
+ */
+
+import { Hono } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { z } from 'zod';
+import { streamSSE } from 'hono/streaming';
+import { eq, and, desc, sql, asc } from 'drizzle-orm';
+import { db, withSystemDbAccessContext } from '../../db';
+import { aiSessions, aiMessages, devices } from '../../db/schema';
+import { streamingSessionManager } from '../../services/streamingSessionManager';
+import { buildHelperSystemPrompt } from '../../services/helperAiAgent';
+import {
+  clientToolsSchema,
+  createClientDeclaredMcpServer,
+  clientDeclaredToolMcpNames,
+  requestClientDeclaredTool,
+  resolveClientDeclaredTool,
+  peekClientDeclaredToolName,
+  failPendingClientDeclaredForSession,
+  CLIENT_DECLARED_MCP_SERVER_NAME,
+  type ClientToolDeclaration,
+} from '../../services/clientSessionTools';
+import { getHelperAllowedMcpToolNames, type HelperPermissionLevel } from '../../services/helperToolFilter';
+import { resolveHelperPermissionLevelForDevice } from '../../services/helperPermissions';
+import { sanitizeUserMessage } from '../../services/aiInputSanitizer';
+import { storeScreenshot } from '../../services/screenshotStorage';
+import { checkBudget } from '../../services/aiCostTracker';
+import { getEffectiveAiBudget } from '../../services/effectiveSettings';
+import { getRedis, rateLimiter } from '../../services';
+import { createSessionPreToolUse, createSessionPostToolUse, settleBlockedTurnForNewMessage } from '../../services/aiAgentSdk';
+import { helperAuth, type HelperDevice } from '../../middleware/helperAuth';
+import type { ActiveSession } from '../../services/streamingSessionManager';
+import { LlmUnavailableError, resolveLlmConfig, type UsableLlmConfig } from '../../services/llm/llmConfigResolver';
+import { captureException } from '../../services/sentry';
+import {
+  isAiBudgetLockTimeout,
+  releaseUnusedAiBudgetReservation,
+  reserveAiBudget,
+} from '../../services/aiBudgetReservations';
+
+const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const HELPER_RATE_LIMIT = 30;
+const HELPER_RATE_WINDOW_SECONDS = 60;
+const DEFAULT_PERMISSION_LEVEL: HelperPermissionLevel = 'basic';
+
+export const helperRoutes = new Hono();
+
+// Helper auth middleware (helper-scoped token based) — extracted to
+// ../../middleware/helperAuth for reuse; behavior unchanged.
+helperRoutes.use('*', helperAuth);
+
+// ============================================
+// Helper Pre-flight Checks
+// ============================================
+
+/** Read persisted client-declared tools (stored in contextSnapshot at create). */
+function clientToolsFromSession(session: typeof aiSessions.$inferSelect): ClientToolDeclaration[] {
+  const snapshot = session.contextSnapshot as Record<string, unknown> | null;
+  const raw = snapshot?.clientTools;
+  return Array.isArray(raw) ? (raw as ClientToolDeclaration[]) : [];
+}
+
+async function runHelperPreFlight(
+  sessionId: string,
+  content: string,
+  device: HelperDevice,
+  partnerId: string | null,
+): Promise<
+  | { ok: true; session: typeof aiSessions.$inferSelect; sanitizedContent: string; systemPrompt: string; maxBudgetUsd: number | undefined; allowedTools: string[]; clientTools: ClientToolDeclaration[]; resolved: UsableLlmConfig }
+  | { ok: false; error: string; status: number }
+> {
+  // Fetch session
+  const [session] = await db
+    .select()
+    .from(aiSessions)
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .limit(1);
+
+  if (!session) {
+    return { ok: false, error: 'Session not found', status: 404 };
+  }
+
+  if (session.status !== 'active') {
+    return { ok: false, error: 'Session is not active', status: 400 };
+  }
+
+  // Check session expiration
+  const sessionAge = Date.now() - new Date(session.createdAt).getTime();
+  if (sessionAge > SESSION_MAX_AGE_MS) {
+    await db
+      .update(aiSessions)
+      .set({ status: 'expired', updatedAt: new Date() })
+      .where(eq(aiSessions.id, sessionId));
+    return { ok: false, error: 'Session has expired. Please start a new session.', status: 410 };
+  }
+
+  if (session.turnCount >= session.maxTurns) {
+    return { ok: false, error: `Session turn limit reached (${session.maxTurns})`, status: 400 };
+  }
+
+  let resolved;
+  try {
+    resolved = await resolveLlmConfig(partnerId);
+  } catch (error) {
+    captureException(error, undefined, { service: 'helperRoutes', orgId: device.orgId });
+    return { ok: false, error: 'AI configuration could not be loaded. Try again.', status: 503 };
+  }
+  if (resolved.source === 'unavailable') {
+    return { ok: false, error: 'ai_unavailable', status: 503 };
+  }
+
+  // Rate limit per device
+  const redis = getRedis();
+  if (redis) {
+    const rateKey = `helper_rate:${device.id}`;
+    const rateCheck = await rateLimiter(redis, rateKey, HELPER_RATE_LIMIT, HELPER_RATE_WINDOW_SECONDS);
+    if (!rateCheck.allowed) {
+      return { ok: false, error: 'Rate limit exceeded. Please wait before sending another message.', status: 429 };
+    }
+  }
+
+  // Budget check
+  try {
+    const budgetError = await checkBudget(
+      device.orgId,
+      resolved.source === 'partner' ? 'partner_key' : 'platform',
+    );
+    if (budgetError) return { ok: false, error: budgetError, status: 402 };
+  } catch (err) {
+    console.error('[Helper] Budget check failed:', err);
+    return { ok: false, error: 'Unable to verify budget.', status: 500 };
+  }
+
+  // Sanitize input
+  const { sanitized: sanitizedContent, flags } = sanitizeUserMessage(content);
+  if (flags.length > 0) {
+    console.warn('[Helper] Input sanitization flags:', flags, 'session:', sessionId);
+  }
+
+  const permissionLevel = await resolveHelperPermissionLevelForDevice(device.id, DEFAULT_PERMISSION_LEVEL);
+
+  // When the session declared its own tools, the model runs against THOSE
+  // (client-declared MCP server + their allowlist) instead of the built-in
+  // device toolset — the generic client-tools seam.
+  const clientTools = clientToolsFromSession(session);
+  const hasClientTools = clientTools.length > 0;
+
+  const systemPrompt = buildHelperSystemPrompt({
+    hostname: device.hostname,
+    deviceId: device.id,
+    orgId: device.orgId,
+    permissionLevel,
+    osType: device.osType,
+    osVersion: device.osVersion,
+    agentVersion: device.agentVersion,
+    hasClientTools,
+  });
+
+  const allowedTools = hasClientTools
+    ? clientDeclaredToolMcpNames(clientTools)
+    : getHelperAllowedMcpToolNames(permissionLevel);
+
+  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, allowedTools, clientTools, resolved };
+}
+
+// ============================================
+// Session Title Generator
+// ============================================
+
+function generateSessionTitle(content: string): string {
+  const cleaned = content.replace(/\s+/g, ' ').trim();
+  if (cleaned.length <= 80) return cleaned;
+  const truncated = cleaned.slice(0, 80);
+  const lastSpace = truncated.lastIndexOf(' ');
+  return (lastSpace > 20 ? truncated.slice(0, lastSpace) : truncated) + '…';
+}
+
+// ============================================
+// POST /chat/sessions — Create helper AI session
+// ============================================
+
+helperRoutes.post(
+  '/chat/sessions',
+  zValidator('json', z.object({
+    helperUser: z.string().max(100).optional(),
+    clientTools: clientToolsSchema.optional(),
+  }).optional()),
+  async (c) => {
+    const device = c.get('helperDevice');
+    const auth = c.get('auth');
+    const body = c.req.valid('json') ?? {};
+    let resolved;
+    try {
+      resolved = await resolveLlmConfig(auth.helperDevicePartnerId ?? null);
+    } catch (error) {
+      captureException(error, c, { service: 'helperRoutes', orgId: device.orgId });
+      return c.json({ error: 'AI configuration could not be loaded. Try again.' }, 503);
+    }
+    if (resolved.source === 'unavailable') {
+      return c.json({ error: 'ai_unavailable' }, 503);
+    }
+    const permissionLevel: HelperPermissionLevel = await resolveHelperPermissionLevelForDevice(
+      device.id,
+      DEFAULT_PERMISSION_LEVEL,
+    );
+
+    const clientTools = body.clientTools ?? [];
+    const hasClientTools = clientTools.length > 0;
+
+    const systemPrompt = buildHelperSystemPrompt({
+      hostname: device.hostname,
+      deviceId: device.id,
+      orgId: device.orgId,
+      permissionLevel,
+      osType: device.osType,
+      osVersion: device.osVersion,
+      agentVersion: device.agentVersion,
+      hasClientTools,
+    });
+
+    // #6473 — mirrors createSession in services/aiAgent.ts: without this,
+    // Helper-originated sessions also fell back to the ai_sessions schema
+    // column default (50) instead of the configured org/partner
+    // maxTurnsPerSession. withSystemDbAccessContext matches every other
+    // getEffectiveAiBudget caller (aiCostTracker.ts) — required for the
+    // partner-axis `partners` read.
+    const budget = await withSystemDbAccessContext(() => getEffectiveAiBudget(device.orgId));
+
+    const [session] = await db
+      .insert(aiSessions)
+      .values({
+        orgId: device.orgId,
+        userId: null,
+        deviceId: device.id,
+        model: resolved.model,
+        systemPrompt,
+        maxTurns: budget.maxTurnsPerSession,
+        contextSnapshot: {
+          permissionLevel,
+          deviceId: device.id,
+          hostname: device.hostname,
+          osType: device.osType,
+          source: 'helper',
+          ...(body.helperUser ? { helperUser: body.helperUser } : {}),
+          ...(hasClientTools ? { clientTools } : {}),
+        },
+      })
+      .returning();
+
+    if (!session) {
+      return c.json({ error: 'Failed to create session' }, 500);
+    }
+
+    return c.json({ id: session.id, orgId: device.orgId }, 201);
+  },
+);
+
+// ============================================
+// POST /chat/sessions/:id/messages — Send message + SSE stream
+// ============================================
+
+helperRoutes.post(
+  '/chat/sessions/:id/messages',
+  zValidator('json', z.object({
+    content: z.string().min(1).max(10000),
+  })),
+  async (c) => {
+    const device = c.get('helperDevice');
+    const auth = c.get('auth');
+    const sessionId = c.req.param('id');
+    const { content } = c.req.valid('json');
+
+    // Pre-flight checks
+    const preflight = await runHelperPreFlight(
+      sessionId,
+      content,
+      device,
+      auth.helperDevicePartnerId ?? null,
+    );
+    if (!preflight.ok) {
+      return c.json({ error: preflight.error }, preflight.status as 400);
+    }
+
+    const { session: dbSession, sanitizedContent, systemPrompt, allowedTools, clientTools, resolved } = preflight;
+
+    // When the session declared client tools, build the generic client-declared
+    // MCP server: each model tool call publishes `client_tool_request` and parks
+    // a resolver until the helper posts to /tool-results. Sessions without
+    // declarations pass no factory and keep the built-in device MCP path.
+    const mcpServerFactory = clientTools.length > 0
+      ? (
+          _getAuth: unknown,
+          _onPreToolUse: unknown,
+          _onPostToolUse: unknown,
+          getSession: () => ActiveSession,
+        ) => ({
+          server: createClientDeclaredMcpServer(clientTools, (toolName, input) => {
+            const session = getSession();
+            const toolUseId = session.toolUseIdQueue.shift() ?? crypto.randomUUID();
+            return requestClientDeclaredTool(session, toolUseId, toolName, input);
+          }),
+          name: CLIENT_DECLARED_MCP_SERVER_NAME,
+        })
+      : undefined;
+
+    const priorSession = streamingSessionManager.get(sessionId);
+    if (priorSession?.state === 'processing') {
+      const settle = await settleBlockedTurnForNewMessage(priorSession);
+      if (settle !== 'concluded') {
+        return c.json({
+          error: settle === 'not_blocked_on_approvals'
+            ? 'A message is already being processed for this session'
+            : 'The assistant is wrapping up the previous turn — please try again in a moment',
+        }, 409);
+      }
+    }
+    if (streamingSessionManager.get(sessionId)) streamingSessionManager.remove(sessionId);
+
+    // S8: no stable request identity reaches this surface — the client sends
+    // no message/draft id — so the key is random per dispatch. The unique
+    // (org_id, idempotency_key) index is therefore a structural guarantee
+    // that two dispatches never share a reservation row, NOT a replay guard.
+    // The one caller with a real identity uses it: `ai-agent-run:${run.id}`
+    // in services/aiAgents/runLoop.ts. Give this one a stable key only when
+    // the request schema starts carrying a client-generated id.
+    let reservation;
+    try {
+      reservation = await reserveAiBudget({
+        orgId: dbSession.orgId,
+        billingSource: resolved.source === 'partner' ? 'partner_key' : 'platform',
+        sessionId,
+        idempotencyKey: `helper-chat:${sessionId}:${crypto.randomUUID()}`,
+      });
+    } catch (err) {
+      if (isAiBudgetLockTimeout(err)) return c.json({ error: 'AI_BUDGET_LOCK_TIMEOUT' }, 503);
+      throw err;
+    }
+    if (reservation.kind === 'denied') return c.json({ error: reservation.message }, 402);
+    const budgetReservationId = reservation.reservationId;
+    const reservedMaxBudgetUsd = reservation.kind === 'reserved'
+      ? reservation.reservedCostCents / 100
+      : undefined;
+
+    // Get or create streaming session.
+    //
+    // The `resolveLlmConfig` check earlier in this handler already 503s an
+    // unavailable partner config, but it cannot see this one: `getOrCreate`
+    // resolves the WIRE model inside the manager, so a catalog revision with no
+    // verified mapping for THIS session's model fails closed only here. Same
+    // catch shape as ai.ts — otherwise it reaches `app.onError` as a 500.
+    let activeSession;
+    try {
+      activeSession = await streamingSessionManager.getOrCreate(
+        sessionId,
+        {
+          orgId: dbSession.orgId,
+          sdkSessionId: dbSession.sdkSessionId,
+          model: dbSession.model,
+          maxTurns: dbSession.maxTurns,
+          turnCount: dbSession.turnCount,
+          systemPrompt: dbSession.systemPrompt,
+        },
+        auth,
+        c,
+        systemPrompt,
+        reservedMaxBudgetUsd,
+        resolved,
+        allowedTools,
+        mcpServerFactory as Parameters<typeof streamingSessionManager.getOrCreate>[8],
+        { budgetReservationId },
+      );
+    } catch (err) {
+      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
+      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
+      throw err;
+    }
+
+    // Concurrent message guard. If the turn is blocked only on pending
+    // approval waits (PAM-gated helper tools), settle them so the assistant
+    // can conclude and answer this message (#3089 — shared helper, see ai.ts).
+    if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetReservationId)) {
+      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
+      return c.json({ error: 'A message is already being processed for this session' }, 409);
+    }
+
+    // Save user message
+    try {
+      await db.insert(aiMessages).values({
+        sessionId,
+        role: 'user',
+        content: sanitizedContent,
+      });
+    } catch (err) {
+      console.error('[Helper] Failed to save user message:', err);
+      activeSession.state = 'idle';
+      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
+      return c.json({ error: 'Failed to save message' }, 500);
+    }
+
+    // Auto-generate title from first message
+    if (!dbSession.title) {
+      const title = generateSessionTitle(sanitizedContent);
+      try {
+        await db
+          .update(aiSessions)
+          .set({ title })
+          .where(eq(aiSessions.id, sessionId));
+        activeSession.eventBus.publish({ type: 'title_updated', title });
+      } catch (err) {
+        console.error('[Helper] Failed to auto-set session title:', err);
+      }
+    }
+
+    // Push message and start timeout
+    activeSession.inputController.pushMessage(sanitizedContent);
+    streamingSessionManager.startTurnTimeout(activeSession);
+
+    const subscriptionId = crypto.randomUUID();
+
+    return streamSSE(c, async (stream) => {
+      const events = activeSession.eventBus.subscribe(subscriptionId);
+
+      try {
+        for await (const event of events) {
+          await stream.writeSSE({
+            event: event.type,
+            data: JSON.stringify(event),
+          });
+          if (event.type === 'done') break;
+        }
+      } catch (err) {
+        console.error('[Helper] Stream error:', err);
+        await stream.writeSSE({
+          event: 'error',
+          data: JSON.stringify({
+            type: 'error',
+            message: err instanceof Error ? err.message : 'Stream failed',
+          }),
+        });
+      } finally {
+        activeSession.eventBus.unsubscribe(subscriptionId);
+      }
+    });
+  },
+);
+
+// ============================================
+// POST /chat/sessions/:id/tool-results — the helper reports a client-declared
+// tool outcome. helperAuth (applied to all routes) + session-owner check pin it
+// to the same device; the bridge resolves the parked SDK tool call.
+// ============================================
+
+helperRoutes.post(
+  '/chat/sessions/:id/tool-results',
+  zValidator('json', z.object({
+    toolUseId: z.string().min(1).max(200),
+    output: z.unknown().optional(),
+    error: z.string().max(10000).optional(),
+  })),
+  async (c) => {
+    const device = c.get('helperDevice');
+    const sessionId = c.req.param('id');
+    const { toolUseId, output, error } = c.req.valid('json');
+
+    // Session-owner check: the session must belong to this device.
+    const [session] = await db
+      .select({ id: aiSessions.id })
+      .from(aiSessions)
+      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+      .limit(1);
+
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    // Recover the parked call's tool name BEFORE resolving (which drains the
+    // entry), so the persisted transcript row carries it. Generic: this route
+    // has no knowledge of any specific tool.
+    const toolName = peekClientDeclaredToolName(sessionId, toolUseId);
+
+    const outcome = resolveClientDeclaredTool(sessionId, toolUseId, { output, error });
+    if (outcome === 'duplicate') {
+      return c.json({ error: 'Tool result already submitted' }, 409);
+    }
+    if (outcome === 'not_found') {
+      return c.json({ error: 'unknown_tool_request' }, 404);
+    }
+
+    // Persist a tool_result row so reopening the session from History renders
+    // the same cards/citations the live stream did. The SDK's post-tool-use
+    // hook never runs for the bridged client-declared path, so this is the only
+    // place a client tool's output is recorded. Generic: output = whatever the
+    // client posted (its output, or an { error } payload).
+    try {
+      await db.insert(aiMessages).values({
+        sessionId,
+        role: 'tool_result',
+        toolName: toolName ?? null,
+        toolOutput: error !== undefined ? { error } : (output ?? null),
+        toolUseId,
+      });
+    } catch (err) {
+      console.error('[Helper] Failed to persist tool_result message:', err);
+    }
+
+    return c.json({ ok: true });
+  },
+);
+
+// ============================================
+// GET /device-info — Return device details for the authenticated device
+// ============================================
+
+helperRoutes.get('/device-info', async (c) => {
+  const device = c.get('helperDevice');
+
+  const [row] = await db
+    .select({
+      hostname: devices.hostname,
+      displayName: devices.displayName,
+      osType: devices.osType,
+      osVersion: devices.osVersion,
+      status: devices.status,
+      lastSeenAt: devices.lastSeenAt,
+      agentVersion: devices.agentVersion,
+    })
+    .from(devices)
+    .where(eq(devices.id, device.id))
+    .limit(1);
+
+  if (!row) {
+    return c.json({ error: 'Device not found' }, 404);
+  }
+
+  return c.json({
+    hostname: row.hostname,
+    displayName: row.displayName,
+    osType: row.osType,
+    osVersion: row.osVersion,
+    status: row.status,
+    lastSeenAt: row.lastSeenAt,
+    agentVersion: row.agentVersion,
+  });
+});
+
+// ============================================
+// GET /config — Return helper configuration
+// ============================================
+
+helperRoutes.get('/config', async (c) => {
+  const device = c.get('helperDevice');
+  const permissionLevel = await resolveHelperPermissionLevelForDevice(device.id, DEFAULT_PERMISSION_LEVEL);
+
+  return c.json({
+    enabled: true,
+    permissionLevel,
+    allowScreenCapture: true,
+    sessionRetentionHours: 24,
+  });
+});
+
+// ============================================
+// POST /screenshots — Upload helper screenshot
+// ============================================
+
+helperRoutes.post(
+  '/screenshots',
+  zValidator('json', z.object({
+    imageBase64: z.string().max(2_000_000),
+    width: z.number().int().min(1).max(10000),
+    height: z.number().int().min(1).max(10000),
+    sessionId: z.string().guid().optional(),
+    reason: z.string().max(200).optional(),
+  })),
+  async (c) => {
+    const device = c.get('helperDevice');
+    const { imageBase64, width, height, sessionId, reason } = c.req.valid('json');
+
+    const stored = await storeScreenshot({
+      deviceId: device.id,
+      orgId: device.orgId,
+      sessionId,
+      imageBase64,
+      width,
+      height,
+      capturedBy: 'helper',
+      reason,
+      retentionHours: 24,
+    });
+
+    return c.json({
+      id: stored.id,
+      storageKey: stored.storageKey,
+      sizeBytes: stored.sizeBytes,
+      expiresAt: stored.expiresAt,
+    });
+  },
+);
+
+// ============================================
+// GET /chat/sessions — List sessions for this device
+// ============================================
+
+helperRoutes.get('/chat/sessions', async (c) => {
+  const device = c.get('helperDevice');
+  const helperUser = c.req.query('helperUser');
+
+  const conditions = [eq(aiSessions.deviceId, device.id)];
+
+  if (helperUser) {
+    conditions.push(
+      sql`${aiSessions.contextSnapshot}->>'helperUser' = ${helperUser}`,
+    );
+  }
+
+  const sessions = await db
+    .select({
+      id: aiSessions.id,
+      title: aiSessions.title,
+      status: aiSessions.status,
+      contextSnapshot: aiSessions.contextSnapshot,
+      turnCount: aiSessions.turnCount,
+      createdAt: aiSessions.createdAt,
+      updatedAt: aiSessions.updatedAt,
+    })
+    .from(aiSessions)
+    .where(and(...conditions))
+    .orderBy(desc(aiSessions.updatedAt))
+    .limit(50);
+
+  return c.json(
+    sessions.map((s) => ({
+      id: s.id,
+      title: s.title,
+      status: s.status,
+      helperUser: (s.contextSnapshot as Record<string, unknown> | null)?.helperUser ?? null,
+      turnCount: s.turnCount,
+      createdAt: s.createdAt,
+      updatedAt: s.updatedAt,
+    })),
+  );
+});
+
+// ============================================
+// GET /chat/sessions/:id/messages — Load messages for a session
+// ============================================
+
+helperRoutes.get('/chat/sessions/:id/messages', async (c) => {
+  const device = c.get('helperDevice');
+  const sessionId = c.req.param('id');
+
+  // Verify the session belongs to this device
+  const [session] = await db
+    .select({ id: aiSessions.id })
+    .from(aiSessions)
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .limit(1);
+
+  if (!session) {
+    return c.json({ error: 'Session not found' }, 404);
+  }
+
+  const messages = await db
+    .select({
+      id: aiMessages.id,
+      role: aiMessages.role,
+      content: aiMessages.content,
+      toolName: aiMessages.toolName,
+      toolOutput: aiMessages.toolOutput,
+      createdAt: aiMessages.createdAt,
+    })
+    .from(aiMessages)
+    .where(eq(aiMessages.sessionId, sessionId))
+    .orderBy(asc(aiMessages.createdAt));
+
+  return c.json(messages);
+});
+
+// ============================================
+// DELETE /chat/sessions/:id — Close session
+// ============================================
+
+helperRoutes.delete('/chat/sessions/:id', async (c) => {
+  const device = c.get('helperDevice');
+  const sessionId = c.req.param('id');
+
+  const [session] = await db
+    .select()
+    .from(aiSessions)
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .limit(1);
+
+  if (!session) {
+    return c.json({ error: 'Session not found' }, 404);
+  }
+
+  await db
+    .update(aiSessions)
+    .set({ status: 'closed', updatedAt: new Date() })
+    .where(eq(aiSessions.id, sessionId));
+
+  // Unblock and drain any parked client-declared tool calls before teardown.
+  failPendingClientDeclaredForSession(sessionId);
+  streamingSessionManager.remove(sessionId);
+
+  return c.json({ success: true });
+});
+
+// ============================================
+// POST /chat/sessions/:id/flag — Flag session for review
+// ============================================
+
+helperRoutes.post(
+  '/chat/sessions/:id/flag',
+  zValidator('json', z.object({ reason: z.string().max(1000).optional() })),
+  async (c) => {
+    const device = c.get('helperDevice');
+    const sessionId = c.req.param('id');
+    const { reason } = c.req.valid('json');
+
+    const [session] = await db
+      .select({ id: aiSessions.id })
+      .from(aiSessions)
+      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+      .limit(1);
+
+    if (!session) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+
+    await db
+      .update(aiSessions)
+      .set({ flaggedAt: new Date(), flagReason: reason ?? null, updatedAt: new Date() })
+      .where(eq(aiSessions.id, sessionId));
+
+    return c.json({ success: true });
+  },
+);

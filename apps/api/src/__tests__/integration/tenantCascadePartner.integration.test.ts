@@ -1,0 +1,316 @@
+/**
+ * End-to-end integration test for `cascadeDeletePartner` (synthetic canary
+ * cleanup — see routes/internal/synthetic.ts).
+ *
+ * `cascadeDeletePartner` is the most destructive code in the synthetic control
+ * plane: it hard-deletes a partner and ALL descendant tenant data. The unit
+ * test (tenantCascade.partner.test.ts) mocks the DB and can only prove call
+ * ordering — it cannot see real SQL, RLS, or FK behaviour. This test exercises
+ * the real thing against Postgres as the forced-RLS `breeze_app` role and
+ * proves the load-bearing properties:
+ *
+ *   1. Every row keyed on the purged partner is gone — across the partner-axis
+ *      sweep (users, roles, partner_users) AND the per-org cascade (orgs, sites,
+ *      alert_templates, org-scoped audit_logs).
+ *   2. A SECOND partner's data is completely untouched (no cross-tenant leak).
+ *   3. `totalRowsDeleted` reflects ACTUAL rows removed, so a silent zero-row
+ *      no-op (e.g. a missing-RLS-context regression, #1375) would be visible
+ *      rather than masquerading as success.
+ *   4. The purge_started + purged audit rows are written with org_id = NULL so
+ *      they survive the cascade.
+ *   5. Idempotent: a re-run on an already-purged partner deletes zero rows and
+ *      does not throw.
+ */
+import './setup';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { sql } from 'drizzle-orm';
+import { getTestDb } from './setup';
+import { cascadeDeletePartner } from '../../services/tenantCascade';
+import {
+  partnerWideScope,
+  persistedSiteScopeValues,
+  siteScopeFingerprint,
+} from '../../services/siteScope';
+
+// Mirrors PERFORMED_BY in routes/internal/synthetic.ts — audit_logs.actor_id is
+// a uuid column, so the synthetic actor is the nil-uuid sentinel.
+const SENTINEL = '00000000-0000-0000-0000-000000000000';
+
+interface PartnerSeed {
+  partnerId: string;
+  userId: string;
+  roleId: string;
+  orgId: string;
+  siteId: string;
+}
+
+async function seedPartner(label: string): Promise<PartnerSeed> {
+  const testDb = getTestDb();
+  const suffix = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+
+  const [partner] = (await testDb.execute(sql`
+    INSERT INTO partners (name, slug, status, created_at, updated_at)
+    VALUES (${`Canary ${label}`}, ${`canary-${label}-${suffix}`}, 'active', now(), now())
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  const partnerId = partner!.id;
+
+  const [user] = (await testDb.execute(sql`
+    INSERT INTO users (partner_id, email, name, status, created_at, updated_at)
+    VALUES (${partnerId}, ${`signup-canary+${label}-${suffix}@2breeze.app`}, 'Canary User', 'active', now(), now())
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  const userId = user!.id;
+
+  const [role] = (await testDb.execute(sql`
+    INSERT INTO roles (partner_id, scope, name)
+    VALUES (${partnerId}, 'partner', ${`Canary Role ${label}`})
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  const roleId = role!.id;
+
+  // partner_users links user → role → partner. It is a partner-axis table that
+  // FK-references roles, so the topological sweep MUST delete it before roles.
+  await testDb.execute(sql`
+    INSERT INTO partner_users (partner_id, user_id, role_id, org_access)
+    VALUES (${partnerId}, ${userId}, ${roleId}, 'all')
+  `);
+
+  const [org] = (await testDb.execute(sql`
+    INSERT INTO organizations (partner_id, name, slug, status, currency_code, created_at, updated_at)
+    VALUES (${partnerId}, ${`Org ${label}`}, ${`org-${label}-${suffix}`}, 'active', 'USD', now(), now())
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  const orgId = org!.id;
+
+  const [site] = (await testDb.execute(sql`
+    INSERT INTO sites (org_id, name, created_at, updated_at)
+    VALUES (${orgId}, ${`Site ${label}`}, now(), now())
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  const siteId = site!.id;
+
+  await testDb.execute(sql`
+    INSERT INTO alert_templates (org_id, name, conditions, severity, title_template, message_template)
+    VALUES (${orgId}, ${`Template ${label}`}, '{}'::jsonb, 'info', 't', 'm')
+  `);
+
+  await testDb.execute(sql`
+    INSERT INTO audit_logs (org_id, actor_type, actor_id, action, resource_type, result, timestamp)
+    VALUES (${orgId}, 'user', ${userId}, 'test.seed', 'test', 'success', now())
+  `);
+
+  // Partner-axis catalog item + one price-book row (multi-currency wave 3,
+  // #3775). catalog_item_prices is swept by the dynamic partner_id sweep, not a
+  // cascade list — this is the only functional proof that the purge reaches it.
+  const [item] = (await testDb.execute(sql`
+    INSERT INTO catalog_items (partner_id, item_type, name, cost_currency)
+    VALUES (${partnerId}, 'service', ${`Item ${label}`}, 'USD')
+    RETURNING id
+  `)) as unknown as Array<{ id: string }>;
+  await testDb.execute(sql`
+    INSERT INTO catalog_item_prices (item_id, partner_id, currency_code, unit_price)
+    VALUES (${item!.id}, ${partnerId}, 'USD', 10.00)
+  `);
+  // Org-axis override that ALSO carries a denormalized partner_id (composite
+  // same-partner FKs). It is reached by BOTH the org cascade and the dynamic
+  // partner_id sweep — assert the purge leaves none behind.
+  await testDb.execute(sql`
+    INSERT INTO catalog_item_org_pricing (catalog_item_id, org_id, partner_id, currency_code, unit_price)
+    VALUES (${item!.id}, ${orgId}, ${partnerId}, 'USD', 9.00)
+  `);
+
+  return { partnerId, userId, roleId, orgId, siteId };
+}
+
+async function countById(table: string, column: string, id: string): Promise<number> {
+  const rows = (await getTestDb().execute(
+    sql`SELECT 1 FROM ${sql.raw(`"${table}"`)} WHERE ${sql.raw(`"${column}"`)} = ${id}`,
+  )) as unknown as unknown[];
+  return rows.length;
+}
+
+describe('cascadeDeletePartner — end-to-end', () => {
+  let purge: PartnerSeed;
+  let control: PartnerSeed;
+
+  beforeEach(async () => {
+    purge = await seedPartner('purge');
+    control = await seedPartner('control');
+  });
+
+  it('removes every row keyed on the purged partner and leaves the control partner intact', async () => {
+    const stats = await cascadeDeletePartner(purge.partnerId, SENTINEL);
+
+    // Real rows were deleted — not a silent zero-row no-op.
+    expect(stats.totalRowsDeleted).toBeGreaterThan(0);
+    expect(stats.orgsDeleted).toBe(1);
+    expect(stats.tablesDeleted.partners).toBe(1);
+
+    // Purged partner: gone across both the partner-axis sweep and the org cascade.
+    expect(await countById('partners', 'id', purge.partnerId)).toBe(0);
+    expect(await countById('partner_users', 'partner_id', purge.partnerId)).toBe(0);
+    expect(await countById('users', 'partner_id', purge.partnerId)).toBe(0);
+    expect(await countById('roles', 'partner_id', purge.partnerId)).toBe(0);
+    expect(await countById('organizations', 'partner_id', purge.partnerId)).toBe(0);
+    expect(await countById('sites', 'id', purge.siteId)).toBe(0);
+    expect(await countById('alert_templates', 'org_id', purge.orgId)).toBe(0);
+    expect(await countById('audit_logs', 'org_id', purge.orgId)).toBe(0);
+    expect(await countById('catalog_items', 'partner_id', purge.partnerId)).toBe(0);
+    expect(await countById('catalog_item_prices', 'partner_id', purge.partnerId)).toBe(0);
+    expect(await countById('catalog_item_org_pricing', 'partner_id', purge.partnerId)).toBe(0);
+
+    // Control partner: every row untouched (no cross-tenant leak).
+    expect(await countById('partners', 'id', control.partnerId)).toBe(1);
+    expect(await countById('partner_users', 'partner_id', control.partnerId)).toBe(1);
+    expect(await countById('users', 'partner_id', control.partnerId)).toBe(1);
+    expect(await countById('roles', 'partner_id', control.partnerId)).toBe(1);
+    expect(await countById('organizations', 'partner_id', control.partnerId)).toBe(1);
+    expect(await countById('sites', 'id', control.siteId)).toBe(1);
+    expect(await countById('alert_templates', 'org_id', control.orgId)).toBe(1);
+    expect(await countById('audit_logs', 'org_id', control.orgId)).toBe(1);
+    expect(await countById('catalog_items', 'partner_id', control.partnerId)).toBe(1);
+    expect(await countById('catalog_item_prices', 'partner_id', control.partnerId)).toBe(1);
+    expect(await countById('catalog_item_org_pricing', 'partner_id', control.partnerId)).toBe(1);
+  });
+
+  it('purges a partner whose Service Management is bound to a partner-wide PSA connection (#5075 W04)', async () => {
+    // partners.service_management_psa_connection_id -> psa_connections.id is
+    // ON DELETE RESTRICT, and the partner-axis sweep deletes partner-wide
+    // connections BEFORE the final partners DELETE. Without the un-wire
+    // pre-clear this purge aborts with 23503. This is the live shape: PATCH
+    // /orgs/partners/me only ever binds partner-wide (org_id IS NULL) rows.
+    const testDb = getTestDb();
+    const [conn] = (await testDb.execute(sql`
+      INSERT INTO psa_connections (partner_id, org_id, provider, name, credentials, created_at, updated_at)
+      VALUES (${purge.partnerId}, NULL, 'connectwise', 'Canary PSA', '{}'::jsonb, now(), now())
+      RETURNING id
+    `)) as unknown as Array<{ id: string }>;
+    await testDb.execute(sql`
+      UPDATE partners
+      SET service_management_mode = 'external', service_management_psa_connection_id = ${conn!.id}
+      WHERE id = ${purge.partnerId}
+    `);
+
+    const stats = await cascadeDeletePartner(purge.partnerId, SENTINEL);
+
+    expect(stats.tablesDeleted.partners).toBe(1);
+    expect(stats.tablesDeleted['partners.service_management_unwired']).toBe(1);
+    expect(await countById('partners', 'id', purge.partnerId)).toBe(0);
+    expect(await countById('psa_connections', 'id', conn!.id)).toBe(0);
+    expect(await countById('partners', 'id', control.partnerId)).toBe(1);
+  });
+
+  // #3198 W01: reports became org XOR partner (2026-10-27-130100). reports.partner_id
+  // has NO ON DELETE action, so a partner-owned definition is reached ONLY by the
+  // dynamic partner_id sweep; its runs go via report_runs.report_id ON DELETE
+  // CASCADE and their deliveries via report_run_deliveries' existing cascade.
+  // cascadeDeletePartner runs cascadeDeleteOrg for every child org first, so
+  // org-owned reports under the purged partner's orgs are purged too.
+  it('partner purge removes partner-owned report definitions + runs + deliveries AND org-owned reports of its child orgs, leaving another partner\'s reports intact (#3198 W01)', async () => {
+    async function seedReports(seed: PartnerSeed) {
+      const testDb = getTestDb();
+      const scope = partnerWideScope(seed.partnerId);
+      const cols = persistedSiteScopeValues({
+        principalKind: 'user',
+        scope,
+        principalUserId: seed.userId,
+        capturedAt: new Date(),
+        fingerprint: siteScopeFingerprint(scope),
+      });
+      const [partnerReport] = (await testDb.execute(sql`
+        INSERT INTO reports (
+          partner_id, org_id, name, type, created_by,
+          execution_scope_version, execution_scope_kind, execution_scope_site_ids,
+          execution_scope_user_id, execution_scope_fingerprint,
+          execution_scope_captured_at, execution_scope_principal_kind
+        ) VALUES (
+          ${seed.partnerId}, NULL, 'Partner AR aging', 'ar_aging', ${seed.userId},
+          ${cols.executionScopeVersion}, ${cols.executionScopeKind}, NULL,
+          ${cols.executionScopeUserId}, ${cols.executionScopeFingerprint},
+          ${cols.executionScopeCapturedAt!.toISOString()}::timestamptz, ${cols.executionScopePrincipalKind}
+        ) RETURNING id
+      `)) as unknown as Array<{ id: string }>;
+      const [partnerRun] = (await testDb.execute(sql`
+        INSERT INTO report_runs (report_id, status, requested_by_kind, requested_by_user_id)
+        VALUES (${partnerReport!.id}, 'completed', 'user', ${seed.userId})
+        RETURNING id
+      `)) as unknown as Array<{ id: string }>;
+      await testDb.execute(sql`
+        INSERT INTO report_run_deliveries (report_run_id, recipient_user_id, channel)
+        VALUES (${partnerRun!.id}, ${seed.userId}, 'email')
+      `);
+      const [orgReport] = (await testDb.execute(sql`
+        INSERT INTO reports (org_id, partner_id, name, type, created_by)
+        VALUES (${seed.orgId}, NULL, 'Org inventory', 'device_inventory', ${seed.userId})
+        RETURNING id
+      `)) as unknown as Array<{ id: string }>;
+      const [orgRun] = (await testDb.execute(sql`
+        INSERT INTO report_runs (report_id, status) VALUES (${orgReport!.id}, 'completed')
+        RETURNING id
+      `)) as unknown as Array<{ id: string }>;
+      return {
+        partnerReportId: partnerReport!.id,
+        partnerRunId: partnerRun!.id,
+        orgReportId: orgReport!.id,
+        orgRunId: orgRun!.id,
+      };
+    }
+    const purged = await seedReports(purge);
+    const kept = await seedReports(control);
+    // Precondition: the seed really landed (otherwise every "0" below is vacuous).
+    expect(await countById('reports', 'partner_id', purge.partnerId)).toBe(1);
+    expect(await countById('reports', 'org_id', purge.orgId)).toBe(1);
+    expect(await countById('report_run_deliveries', 'report_run_id', purged.partnerRunId)).toBe(1);
+
+    // Must not abort with 23503 on the no-ON-DELETE reports.partner_id FK.
+    const stats = await cascadeDeletePartner(purge.partnerId, SENTINEL);
+
+    expect(stats.tablesDeleted.partners).toBe(1);
+    expect(stats.tablesDeleted.reports ?? 0).toBeGreaterThanOrEqual(1);
+    expect(await countById('reports', 'id', purged.partnerReportId)).toBe(0);
+    expect(await countById('report_runs', 'id', purged.partnerRunId)).toBe(0);
+    expect(await countById('report_run_deliveries', 'report_run_id', purged.partnerRunId)).toBe(0);
+    expect(await countById('reports', 'id', purged.orgReportId)).toBe(0);
+    expect(await countById('report_runs', 'id', purged.orgRunId)).toBe(0);
+
+    // The other partner's partner-owned AND org-owned reports are untouched.
+    expect(await countById('reports', 'id', kept.partnerReportId)).toBe(1);
+    expect(await countById('report_runs', 'id', kept.partnerRunId)).toBe(1);
+    expect(await countById('report_run_deliveries', 'report_run_id', kept.partnerRunId)).toBe(1);
+    expect(await countById('reports', 'id', kept.orgReportId)).toBe(1);
+    expect(await countById('report_runs', 'id', kept.orgRunId)).toBe(1);
+  });
+
+  it('writes purge_started and purged audit rows with org_id = NULL', async () => {
+    await cascadeDeletePartner(purge.partnerId, SENTINEL);
+
+    const rows = (await getTestDb().execute(sql`
+      SELECT action, org_id, actor_id, result
+      FROM audit_logs
+      WHERE resource_id = ${purge.partnerId}
+        AND action LIKE 'test.synthetic_partner.%'
+      ORDER BY timestamp ASC
+    `)) as unknown as Array<{ action: string; org_id: string | null; actor_id: string; result: string }>;
+
+    const actions = rows.map((r) => r.action);
+    expect(actions).toContain('test.synthetic_partner.purge_started');
+    expect(actions).toContain('test.synthetic_partner.purged');
+    for (const r of rows) {
+      expect(r.org_id).toBeNull();
+      expect(r.actor_id).toBe(SENTINEL);
+    }
+  });
+
+  it('is idempotent — a re-run on an already-purged partner deletes zero rows', async () => {
+    await cascadeDeletePartner(purge.partnerId, SENTINEL);
+    const stats = await cascadeDeletePartner(purge.partnerId, SENTINEL);
+
+    expect(stats.totalRowsDeleted).toBe(0);
+    expect(stats.orgsDeleted).toBe(0);
+    expect(stats.tablesDeleted.partners ?? 0).toBe(0);
+
+    // Control still intact after both runs.
+    expect(await countById('partners', 'id', control.partnerId)).toBe(1);
+  });
+});

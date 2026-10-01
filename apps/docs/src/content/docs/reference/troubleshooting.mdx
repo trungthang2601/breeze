@@ -1,0 +1,389 @@
+---
+title: Troubleshooting
+description: Fixes for common Breeze RMM deployment issues, including missing env vars, release manifest trust anchor errors, TLS provisioning, and migrations.
+sidebar:
+  order: 3
+  label: Troubleshooting
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Deployment Issues
+
+### Deploy script fails with "Missing required env var"
+
+**Cause**: Required variables not set in `.env.prod`.
+
+**Fix**: Ensure all required variables are set:
+
+```bash
+# Required in every deployment:
+BREEZE_DOMAIN, DATABASE_URL, BREEZE_VERSION, BREEZE_API_IMAGE_DIGEST,
+BREEZE_WEB_IMAGE_DIGEST, BREEZE_BINARIES_IMAGE_DIGEST, CADDY_IMAGE_REF,
+CLOUDFLARED_IMAGE_REF, REDIS_IMAGE_REF, COTURN_IMAGE_REF, BILLING_IMAGE_REF,
+REDIS_PASSWORD, JWT_SECRET, AGENT_ENROLLMENT_SECRET, APP_ENCRYPTION_KEY,
+MFA_ENCRYPTION_KEY, ENROLLMENT_KEY_PEPPER, MFA_RECOVERY_CODE_PEPPER,
+RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS, PUBLIC_API_URL,
+REMOTE_ACCESS_ADMISSION_MODE, REMOTE_WS_AUTH_MODE, REMOTE_WS_REDIS_TOPOLOGY,
+REMOTE_WS_LEGACY_TICKET_WRITER_DRAINED_AT, REMOTE_WS_LEGACY_VIEWER_ISSUER_DRAINED_AT
+
+# Additionally required when ENABLE_MONITORING=true:
+METRICS_SCRAPE_TOKEN, GRAFANA_ADMIN_PASSWORD, POSTGRES_EXPORTER_DSN
+```
+
+### API refuses to boot: `RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS must be set in production`
+
+**Cause**: This variable is the trust anchor that the API uses to verify signed release manifests before serving binaries (so a compromised GitHub release alone can't deliver tampered binaries). It is **required in production** for both `BINARY_SOURCE=github` and `BINARY_SOURCE=local`. Older `.env` templates shipped it empty, so upgrades can surface this on first boot.
+
+**Fix**: For the official Breeze releases, use the published trust anchor:
+
+```bash
+RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS=yzx8ftmcls6uBetFC5SYnZhBo+cbur3IX50TbBthTso=
+```
+
+This is a **public** key (also embedded in the agent and CI), so it is safe to commit. Only change it if you build and sign your own binaries. `BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS` is accepted as an alias.
+
+**Do not auto-rotate or overwrite this value.** It is a deliberately pinned trust anchor — automatically replacing it with a "new" key defeats the protection, since the source of that key becomes the thing an attacker targets. If a real signing-key rotation ever ships, trust both keys during the overlap by comma-separating them (`RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS=old,new`) rather than replacing.
+
+### TLS certificate not provisioning
+
+**Cause**: DNS not pointing to server, or ports 80/443 blocked.
+
+**Fix**:
+1. Verify DNS: `dig +short breeze.yourdomain.com`
+2. Check ports: `sudo ss -tlnp | grep -E ':(80|443)'`
+3. Check Caddy logs: `docker logs breeze-caddy`
+
+### Database migration fails
+
+**Cause**: PostgreSQL not ready or connection string incorrect.
+
+**Fix**: run from the host with `.env.prod` sourced (`set -a; source .env.prod; set +a`):
+```bash
+# Check PostgreSQL is running (prod uses a managed Postgres instance, not a
+# local container)
+pg_isready -d "$DATABASE_URL"
+
+# Check connection string
+docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod exec api env | grep DATABASE_URL
+```
+
+## Agent Issues
+
+### Agent not appearing in dashboard
+
+**Causes**:
+1. Enrollment failed
+2. WebSocket connection blocked
+3. Agent can't resolve server hostname
+
+**Fix**:
+```bash
+# Check agent logs
+sudo journalctl -u breeze-agent -n 50
+
+# Test connectivity from agent
+curl -v https://breeze.yourdomain.com/health
+
+# Verify enrollment
+sudo cat /etc/breeze/config.json
+```
+
+### Agent shows "offline" despite running
+
+**Cause**: WebSocket connection dropping or heartbeat not reaching API.
+
+**Fix**:
+1. Check agent logs for reconnection messages
+2. Verify API WebSocket handling: `docker logs breeze-api | grep "ws"`
+3. Check if a firewall is terminating long-lived connections (increase WebSocket timeout)
+
+### Terminal not connecting
+
+**Common causes**:
+- Browser sends resize before server `onOpen` completes
+- WebSocket messages rejected by validation
+
+**Fix**: Check API logs for WebSocket errors. The terminal uses `term-` prefixed command IDs that bypass database lookup.
+
+## Performance Issues
+
+### High API response times
+
+**Check**:
+```bash
+# Prometheus metrics
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9090/api/v1/query?query=histogram_quantile(0.95,rate(http_request_duration_seconds_bucket[5m]))
+
+# Database slow queries (prod uses a managed Postgres instance, not a
+# local container; run with .env.prod sourced)
+psql "$DATABASE_URL" -c "SELECT * FROM pg_stat_activity WHERE state = 'active';"
+```
+
+### Postgres `write CONNECT_TIMEOUT` while the database is healthy
+
+A `write CONNECT_TIMEOUT <host>:<port>` error does **not** always mean the
+database or the network failed. The driver's 10s connect budget covers socket
+creation, TCP, TLS, authentication, and the first ready-for-query — every one of
+which needs the API's event loop to run a socket callback. A saturated main
+thread expires that timer with Postgres and the network both fine, and the error
+then points at the wrong subsystem.
+
+**Check** whether the loop was starved at the time:
+
+```bash
+# Is the loop stalled right now? (1 = at or above the starvation threshold)
+curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" \
+  https://breeze.yourdomain.com/metrics/scrape | grep breeze_nodejs_eventloop
+
+# Did the API log a stall? (throttled; one line per run of breaching samples)
+docker compose logs api | grep '\[event-loop\]'
+```
+
+If `breeze_nodejs_eventloop_monitored` is `0`, the monitor is off and the other
+gauges are meaningless — the API cannot tell starvation from connectivity, and
+reports the cause as `unknown`. See
+[Event-loop lag monitor](/deploy/environment/#event-loop-lag-monitor).
+
+When Sentry is configured, the same verdict arrives as a `connect_timeout_cause`
+tag on the error (`event-loop-starvation`, `connectivity`, or `unknown`), with an
+`event_loop_lag_bucket` tag alongside it.
+
+**Fix**: treat it as load, not as a connection fault — the usual causes are a
+CPU-bound request path or a burst of agent traffic. Raising `connect_timeout`
+alone only lengthens the failing request; it does not unstall the loop.
+
+### Redis memory growing (and OOM errors that survive a restart)
+
+Breeze runs Redis with **`maxmemory-policy noeviction`** and a `256mb` default
+`maxmemory` (see [`REDIS_MAXMEMORY`](/deploy/environment/#docker-deployment)).
+That is deliberate: BullMQ job hashes and remote-session lease records must
+never be evicted out from under a running job, so Redis refuses new writes
+rather than silently discarding data. Both the remote-WS topology monitor and
+`scripts/prod/deploy.sh` enforce the policy — do not switch it to an LRU policy.
+
+The trade-off is that a full Redis **does not self-heal**. Once `used_memory`
+reaches `maxmemory`, writes fail with `OOM command not allowed when used memory
+> 'maxmemory'`, which surfaces as failing logins, stalled queues, and generic
+"network error" banners in the UI. Because AOF persistence replays the same
+over-cap dataset on startup, `docker compose restart redis` comes straight back
+up full. Raising the ceiling is the fix — not restarting.
+
+**Check** how close you are. Prod Redis requires auth (`requirepass`), so pass
+the password from the mounted secret:
+
+```bash
+docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod exec -T redis \
+  sh -ec 'redis-cli --no-auth-warning -a "$(cat /run/secrets/redis_password)" \
+    info memory' | grep -E '^(used_memory_human|maxmemory_human):'
+```
+
+**Fix**: raise `REDIS_MAXMEMORY` in `.env.prod` (e.g. `1gb`) and recreate the
+container so the new ceiling is written into the generated config:
+
+```bash
+docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod up -d --force-recreate redis
+```
+
+Redis comes back with the larger ceiling, the AOF replays, and queued work
+resumes. To confirm the new value took effect:
+
+```bash
+docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod exec -T redis \
+  sh -ec 'redis-cli --no-auth-warning -a "$(cat /run/secrets/redis_password)" \
+    config get maxmemory maxmemory-policy'
+```
+
+<Aside type="caution" title="Don't delete the Redis volume">
+  `docker volume rm breeze_redis_data` clears the OOM condition, but it also
+  throws away every queued BullMQ job, scheduled task state, and in-flight
+  session record. Raise `REDIS_MAXMEMORY` instead; keep wiping the volume as a
+  last resort when Redis will not start at all.
+</Aside>
+
+If memory keeps climbing after a raise, that is a leak rather than a sizing
+problem — capture `info keyspace` and the largest keys
+(`redis-cli --no-auth-warning -a … --bigkeys`) and
+[open an issue](https://github.com/LanternOps/breeze/issues/new).
+
+### Disk space running low
+
+```bash
+# Check Docker volumes
+docker system df
+
+# Prune unused images
+docker image prune -a
+
+# Check backup retention
+ls -la /var/backups/breeze/
+```
+
+## Container Issues
+
+### Container won't start
+
+```bash
+# Check container logs
+docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod logs <service-name>
+
+# Check resource limits
+docker stats --no-stream
+
+# Recreate container
+docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod up -d --force-recreate <service-name>
+```
+
+### Health check failing
+
+```bash
+# Manual health check
+docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod exec api \
+  wget --no-verbose --tries=1 --spider http://localhost:3001/health
+
+# Check readiness
+curl http://localhost:3001/health/ready
+```
+
+## Windows MSI Installer
+
+Most MSI problems come down to a failed enrollment during install. The agent is
+built to leave a trail in **four places** when enrollment fails, so you almost
+never have to guess:
+
+| Sink | Where | How to read it |
+|---|---|---|
+| Installer log | `install.log` (only when you pass `/l*v`, see below) | The agent's stderr is captured here — look for `Enrollment failed:` |
+| Agent log | `C:\ProgramData\Breeze\logs\agent.log` | Full structured log of the agent, including the enroll attempt |
+| Last-error marker | `C:\ProgramData\Breeze\logs\enroll-last-error.txt` | One timestamped line with the friendly failure reason |
+| Windows Event Log | Application log, source `BreezeAgent` | `Get-EventLog` / Event Viewer |
+
+### Always install with a log
+
+`msiexec` is silent by default. Pass `/l*v` to write a **verbose** log so you (and
+whoever triages the issue) can see exactly what happened:
+
+```powershell
+# Run from an elevated (Administrator) PowerShell or cmd prompt.
+# /i = install, /qn = no UI, /l*v = verbose log to install.log
+msiexec /i "breeze-agent [ABCD1234XY@breeze.example.com].msi" /qn /l*v install.log
+```
+
+`/l*v <path>` logs everything (the `*`) verbosely (the `v`) to the file you name.
+Use an absolute path you can find afterwards, e.g. `/l*v C:\breeze-install.log`.
+
+<Aside type="tip">
+  For a **zero-config** installer downloaded from the dashboard, do **not** pass
+  `SERVER_URL`/`ENROLLMENT_KEY` — the enrollment token is embedded in the
+  `[TOKEN@HOST]` block in the filename. Keep the filename intact (see
+  [Agent Installation](/agents/installation)). Only supply the properties below
+  when using a plain, un-tokenized MSI.
+</Aside>
+
+For a plain MSI, `SERVER_URL` and `ENROLLMENT_KEY` **must be supplied together**
+(the installer aborts with `SERVER_URL and ENROLLMENT_KEY must be provided together`
+if only one is present):
+
+```powershell
+msiexec /i breeze-agent.msi /qn /l*v install.log `
+  SERVER_URL=https://breeze.yourdomain.com `
+  ENROLLMENT_KEY=YOUR_ENROLLMENT_KEY
+```
+
+Supported MSI properties: `SERVER_URL`, `ENROLLMENT_KEY`, `ENROLLMENT_SECRET`,
+`BOOTSTRAP_TOKEN`.
+
+### Reading the Breeze agent log
+
+After an install (successful or not), the agent's own log is the richest source:
+
+```powershell
+# Tail the agent log live
+Get-Content C:\ProgramData\Breeze\logs\agent.log -Wait -Tail 50
+
+# Just the enrollment outcome (one line, if the last enroll failed)
+Get-Content C:\ProgramData\Breeze\logs\enroll-last-error.txt
+
+# Enrollment errors from the Windows Event Log
+Get-EventLog -LogName Application -Source BreezeAgent -Newest 20 |
+  Format-List TimeGenerated, EntryType, Message
+```
+
+<Aside type="note">
+  `enroll-last-error.txt` is cleared at the start of every enrollment attempt, so
+  if it's absent the most recent enroll succeeded. `agent.log` is not cleared —
+  it's the place to look for ongoing (post-install) agent behavior.
+</Aside>
+
+### MSI exits non-zero / device never appears
+
+**Cause**: Enrollment failed during install (bad key, wrong server URL, network
+blocked, or a usage-limited key that's already exhausted).
+
+**Fix**:
+1. Re-run with `/l*v install.log` (above) and search the log for
+   `Enrollment failed:` — the agent surfaces the underlying reason there rather
+   than a generic Windows error.
+2. Cross-check `enroll-last-error.txt` for the same message in one line.
+3. Confirm the box can reach the server: `curl.exe -v https://breeze.yourdomain.com/health`.
+4. If the key is usage-limited, confirm it hasn't hit `maxUsage` in the dashboard.
+
+### MSI install succeeds but agent shows offline
+
+Enrollment succeeded (the row exists) but the service isn't reporting in. Check
+the service and the log:
+
+```powershell
+Get-Service BreezeAgent
+Get-Content C:\ProgramData\Breeze\logs\agent.log -Wait -Tail 50
+```
+
+See [Agent shows "offline" despite running](#agent-shows-offline-despite-running)
+for WebSocket/firewall causes.
+
+## Server-Side Installer Issues
+
+### "Generate Link" fails with `Server URL not configured (set PUBLIC_API_URL or API_URL)`
+
+**Cause**: The API container can't see a `PUBLIC_API_URL` or `API_URL` env var, so it has no base URL to mint the installer share link against. The bundled `docker-compose.yml` derives this from `BREEZE_DOMAIN` (since [#613](https://github.com/LanternOps/breeze/pull/613) / v0.65.7+), so this only bites custom or older compose files.
+
+**Fix**:
+1. Set `PUBLIC_API_URL=https://<your-domain>` in `/opt/breeze/.env` (or wherever your compose `.env` lives).
+2. If you use a custom compose file, explicitly map the variable into the `api` service. Docker Compose only forwards env vars to a container when they appear in that service's `environment:` block — having the value in `.env` is necessary but not sufficient.
+
+   ```yaml
+   api:
+     environment:
+       PUBLIC_API_URL: ${PUBLIC_API_URL}
+   ```
+3. `docker compose up -d api` to recreate the container.
+
+## Reporting an Issue
+
+Before opening a [GitHub issue](https://github.com/LanternOps/breeze/issues),
+search existing issues — your problem may already be tracked. When you do file
+one, include the following so it can be triaged without a back-and-forth:
+
+- **What you were doing** and what you expected vs. what happened.
+- **Breeze version** — server (`BREEZE_VERSION` in your `.env`) and agent
+  (`breeze-agent version`).
+- **Platform** — OS and architecture of the affected machine.
+- **Relevant logs** (redact secrets — tokens, `ENROLLMENT_SECRET`, hostnames you
+  don't want public):
+
+  | Area | Log to attach |
+  |---|---|
+  | Windows MSI install | `install.log` from `msiexec /l*v`, plus `C:\ProgramData\Breeze\logs\agent.log` |
+  | Agent enrollment | `enroll-last-error.txt` and the `BreezeAgent` Event Log entries |
+  | Agent (Linux) | `sudo journalctl -u breeze-agent -n 200` |
+  | Agent (macOS) | `/Library/Application Support/Breeze/logs/agent.log` |
+  | Desktop/user helper (macOS) | `~/Library/Logs/Breeze/desktop-helper.log` (per logged-in user) |
+  | Server / API | `docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod logs -f api` |
+
+<Aside type="caution">
+  Scrub bearer tokens (`brz_...`), enrollment secrets, and any internal hostnames
+  or IPs before attaching logs to a **public** issue.
+</Aside>
+
+- Join the community Discord for real-time help.

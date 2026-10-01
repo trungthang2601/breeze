@@ -1,0 +1,189 @@
+---
+title: PSA Integrations
+description: Connect Breeze to your PSA platform to sync tickets, encrypt credentials, and keep alerts and devices tied to external work items.
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+PSA (Professional Services Automation) integrations connect Breeze to the ticketing platform your service desk already runs on. Connections are database-backed with encrypted credential storage and configurable sync settings.
+
+<Aside type="caution">
+  Ticket syncing itself is not implemented yet -- there is no automatic or manual sync, and no ticket mappings are created. You can create, test, and configure a connection today, but no ticket data moves between Breeze and your PSA until sync ships.
+</Aside>
+
+You manage PSA connections from **Integrations → PSA**. The tab is deep-linkable at `/integrations#psa`.
+
+<Aside>
+  PSA connections are backed by a dedicated database table with encrypted credential storage. Credentials are encrypted at rest using AES-256-GCM before they are written to the database, and they are never returned in API responses — only a `hasCredentials` indicator is exposed.
+</Aside>
+
+---
+
+## Supported Providers
+
+Breeze supports six PSA providers. Pick one when you create a connection; each provider has its own set of relevant credential fields.
+
+| Provider | Instance URL example |
+|----------|----------------------|
+| **Jira** | `https://your-domain.atlassian.net` |
+| **ServiceNow** | `https://instance.service-now.com` |
+| **ConnectWise** | `https://api-na.myconnectwise.net` |
+| **Autotask** | `https://webservices.autotask.net/atservices/1.6/atws.asmx` |
+| **Freshservice** | `https://your-domain.freshservice.com` |
+| **Zendesk** | `https://your-domain.zendesk.com` |
+
+Not every credential field applies to every provider. Fill in the ones your provider needs and leave the rest blank — for example, Jira uses an email/username plus an API token, ConnectWise uses a public/private key pair, and ServiceNow uses a username and password. The instance URL placeholder in the form updates to match the provider you select.
+
+---
+
+## Connection Ownership
+
+A PSA connection is owned either by a **single organization** or **partner-wide** (all organizations under your partner). Since one MSP typically runs one PSA for all its customers, partner-wide is the natural choice: one connection serves every org. The scope is chosen when the connection is created and cannot be changed afterwards; creating a partner-wide connection requires full-partner access.
+
+A partner-wide connection is visible to any partner-scope user — but the tickets and device/alert mappings underneath it are still filtered to the organizations you can access, so a restricted technician never sees another customer's work items through a shared connection.
+
+## Connecting a PSA Platform
+
+<Steps>
+1. Open **Integrations → PSA** (or go straight to `/integrations#psa`) and click **Add connection**.
+
+2. Give the connection a **name** (for example, "ConnectWise — Contoso") and choose the **provider** from the dropdown. A short hint under the provider field describes the credentials that provider expects.
+
+3. Under **Connection details**, enter the **Instance URL** for your PSA platform and, optionally, a **Default queue** (the board, queue, or project that new tickets land in).
+
+4. Under **Credentials**, fill in the fields your provider requires — any combination of **Username**, **Password**, **API Token**, **Client ID**, and **Client Secret**. Secret fields are masked; use the eye toggle to reveal what you typed. Only the fields relevant to your provider need values.
+
+5. Under **Sync settings**, choose your sync preferences (see [Ticket Sync Settings](#ticket-sync-settings) below) -- these are saved but not yet acted on.
+
+6. Click **Create connection**. Breeze encrypts the credentials and saves the connection.
+
+7. Open the connection again in **Edit** mode and click **Test connection** to verify the credentials are valid (see [Testing a Connection](#testing-a-connection)).
+</Steps>
+
+<Aside type="caution">
+  The `APP_ENCRYPTION_KEY` environment variable must always be set — the API refuses to start without it in any environment, because it is the key used to encrypt PSA credentials at rest. If credential encryption fails, connection creation returns a "Failed to encrypt credentials" error.
+</Aside>
+
+### Credentials You May Need
+
+| Field | Used for |
+|-------|----------|
+| **Instance URL** | The base URL of your PSA platform |
+| **Default queue** | The board / queue / project new tickets are created in |
+| **Username** | Login or email for providers that authenticate with a user identity |
+| **Password** | Password for providers that authenticate with username + password |
+| **API Token** | Token-based authentication (e.g. Jira, Zendesk, Freshservice) |
+| **Client ID** | OAuth / API client identifier where the provider requires one |
+| **Client Secret** | OAuth / API client secret |
+
+<Aside>
+  When you edit an existing connection, credential fields are shown blank with a "keep existing" hint. Leave a secret field empty to keep the stored value unchanged; type a new value only when you want to rotate it. Credentials are replaced as a whole — partial credential updates are not supported.
+</Aside>
+
+---
+
+## Testing a Connection
+
+The **Test connection** button is available when you edit an existing connection. It sends a live request to the PSA platform using the stored credentials and reports the result in a dialog:
+
+- On success, Breeze shows a confirmation and records the test outcome on the connection (a `lastTestedAt` timestamp and a `verified` status).
+- On failure, Breeze shows the error returned by the provider along with a prompt to re-check your credentials and instance URL.
+
+<Aside type="tip">
+  If you just created a connection, reopen it with **Edit** to reach the **Test connection** button. Testing before you rely on sync catches bad credentials, an incorrect instance URL, or a provider that requires IP allowlisting for API access.
+</Aside>
+
+---
+
+## Managing Connections
+
+The PSA tab lists every connection with its provider, name, and status. You can search connections by name or provider and filter by status. Each row offers these actions:
+
+| Action | What it does |
+|--------|--------------|
+| **Edit** | Open the connection to change its name, credentials, or sync settings, or to test it |
+| **Pause / Resume** | Toggle the connection between `active` and `paused` |
+| **Delete** | Remove the connection permanently |
+
+Connection status is one of:
+
+| Status | Meaning |
+|--------|---------|
+| **Active** | The connection is enabled |
+| **Paused** | The connection and its credentials are retained but marked inactive |
+| **Error** | The most recent test failed |
+
+<Aside type="caution">
+  Deleting a connection cannot be undone. If the connection is currently active, Breeze warns you before deleting.
+</Aside>
+
+---
+
+## Importing Companies
+
+Ticket sync is not implemented yet, but you can still bring a PSA's company list into Breeze as organizations, one connection at a time.
+
+On the PSA tab, each connection for a provider with a company/account object shows an **Import companies** button. ConnectWise, Autotask, Freshservice, ServiceNow, and Zendesk support this; Jira does not, because it has no company object to map onto an organization, so the button is not shown for a Jira connection.
+
+<Steps>
+
+1. Click **Import companies** on the connection you want to pull from.
+
+2. Click **Fetch** to pull the company list from the PSA. This is a live request — up to 1,000 companies are fetched per import, and nothing is created yet.
+
+3. Review the preview. Each row is auto-checked to be imported unless it already matches an existing organization; uncheck any row you don't want to bring in.
+
+4. Choose what to do with a row that matches an org already imported from this connection: **Skip** it, or **Update** it with the PSA's current data.
+
+5. Click **Import** to create or update the selected organizations.
+
+</Steps>
+
+The preview calls out anything that affects the result:
+
+- **Partial company list** — if the PSA connection responded too slowly, paged too many times, or the listing hit the 1,000-company cap, the warning names which of those three happened and how many companies were actually fetched. Any company that was never read is not linked, and importing again later is the way to catch up on a company list larger than the cap.
+- **Already linked** — companies already imported from this connection are called out, not treated as an error.
+- **Malformed records** — companies the PSA returned without a usable ID or name are skipped and counted separately; this reflects a data-quality issue on the PSA's side, not a failed import.
+
+---
+
+## Ticket Sync Settings
+
+Each connection carries sync settings, configured under **Sync settings** when you create or edit it -- but syncing itself is not implemented yet (see the caution at the top of this page), so these fields have no effect today.
+
+| Setting | Options | Purpose (once sync ships) |
+|---------|---------|---------|
+| **Enable sync** | On / Off | Master switch for automatic syncing on this connection |
+| **Sync interval** | Every 15 minutes, 30 minutes, hourly, every 6 hours, daily | How often Breeze would run an automatic sync |
+| **Sync direction** | Inbound, Outbound, Bidirectional | Which way ticket data would flow between Breeze and the PSA |
+| **Auto-close / sync on close** | On / Off | Keep ticket close state in sync between the two systems |
+| **Include notes** | On / Off | Carry ticket notes across during sync |
+
+The interval, direction, auto-close, and notes controls are only editable while **Enable sync** is on.
+
+---
+
+## Troubleshooting
+
+**Connection test fails.**
+Confirm the credentials are correct and that the PSA platform's API is reachable from your Breeze API server. Some providers require IP allowlisting or VPN access. Double-check the instance URL matches the provider format shown in the form, and re-check any secret fields you may have left blank on edit.
+
+**"Failed to encrypt credentials" when saving a connection.**
+The `APP_ENCRYPTION_KEY` environment variable is not set or is invalid. This variable is required in every environment and the API will not start without it. On Breeze-hosted accounts this is already configured.
+
+**Editing a connection wiped my credentials.**
+Credentials are replaced as a whole, not merged. On the edit form, leave a secret field blank to keep its existing value — only type into it when you intend to rotate that credential.
+
+**No tickets are showing up.**
+This is expected today -- ticket syncing is not implemented yet, so no ticket mappings are ever created (see the caution at the top of this page).
+
+**A connection shows the Error status.**
+The most recent connection test failed. Open the connection, run **Test connection** to see the provider's error message, and correct the credentials or instance URL as needed.
+
+---
+
+## Related
+
+- [Integrations overview](/features/integrations/) — the full Integrations page, including communication, monitoring, accounting, distributor, and network integrations.
+- [Ticketing](/features/ticketing/) — Breeze's native ticketing system that PSA connections sync against.
+- [Webhooks](/features/webhooks/) — push real-time event notifications to external systems, including your PSA or messaging tools.

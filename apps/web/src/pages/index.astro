@@ -1,0 +1,10 @@
+---
+import DashboardLayout from '../layouts/DashboardLayout.astro';
+import DashboardPage from '../components/dashboard/DashboardPage';
+---
+
+<DashboardLayout titleKey="titles.dashboard">
+  <div class="animate-in" data-testid="dashboard-root">
+    <DashboardPage client:load />
+  </div>
+</DashboardLayout>

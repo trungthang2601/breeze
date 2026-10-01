@@ -1,0 +1,706 @@
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+// rerender is used by the liveTick refetch test below.
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import PamRulesTab from './PamRulesTab';
+import { fetchWithAuth } from '../../stores/auth';
+import { showToast } from '../shared/Toast';
+import type { PamRule } from './types';
+
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+  // usePermissions() (PAM RBAC UI gating, PR review fix) reads grants off the
+  // store; grant the admin wildcard here so this file's existing tests (which
+  // predate the gating) keep exercising full functionality. Negative gating
+  // is covered in the sibling PamRulesTab.permissions.test.tsx-style suite.
+  useAuthStore: Object.assign(
+    (selector: (s: { user: { permissions: { resource: string; action: string }[] } }) => unknown) =>
+      selector({ user: { permissions: [{ resource: '*', action: '*' }] } }),
+    { getState: () => ({ tokens: null }) },
+  ),
+}));
+
+vi.mock('../shared/Toast', () => ({
+  showToast: vi.fn(),
+}));
+
+vi.mock('@/lib/navigation', () => ({
+  navigateTo: vi.fn(),
+}));
+
+const fetchWithAuthMock = vi.mocked(fetchWithAuth);
+const showToastMock = vi.mocked(showToast);
+
+function makeJsonResponse(payload: unknown, ok = true, status = ok ? 200 : 500): Response {
+  return {
+    ok,
+    status,
+    statusText: ok ? 'OK' : 'ERROR',
+    json: vi.fn().mockResolvedValue(payload),
+  } as unknown as Response;
+}
+
+const signedRule: PamRule = {
+  id: 'rule-1',
+  orgId: 'org-1',
+  name: 'Allow signed Microsoft installers',
+  enabled: true,
+  priority: 10,
+  matchSigner: 'Microsoft Corporation',
+  verdict: 'auto_approve',
+  createdAt: '2026-06-10T00:00:00.000Z',
+  updatedAt: '2026-06-10T00:00:00.000Z',
+};
+
+/**
+ * URL-routed fetch mock. The tab and modal now fetch /orgs/sites and
+ * /orgs/organizations alongside /pam/rules, so order-based Once-chains are
+ * brittle; route by URL+method instead.
+ */
+function installFetchRoutes({
+  rules = [] as PamRule[],
+  sites = [] as Array<{ id: string; name: string }>,
+  orgs = [{ id: 'org-1', name: 'Acme' }],
+  defaultUnmatchedVerdict = 'require_approval' as 'require_approval' | 'auto_deny',
+}: {
+  rules?: PamRule[];
+  sites?: Array<{ id: string; name: string }>;
+  orgs?: Array<{ id: string; name: string }>;
+  defaultUnmatchedVerdict?: 'require_approval' | 'auto_deny';
+} = {}) {
+  fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    const method = init?.method ?? 'GET';
+    if (url.startsWith('/orgs/organizations')) return makeJsonResponse({ data: orgs });
+    if (url.startsWith('/orgs/sites')) return makeJsonResponse({ data: sites });
+    if (url === '/pam/config' && method === 'GET') {
+      return makeJsonResponse({ success: true, config: { orgId: 'org-1', defaultUnmatchedVerdict } });
+    }
+    if (url === '/pam/config' && method === 'PUT') {
+      return makeJsonResponse({ success: true, config: {} });
+    }
+    if (url === '/pam/rules' && method === 'POST') {
+      return makeJsonResponse({ success: true, rule: rules[0] ?? signedRule }, true, 201);
+    }
+    if (url.startsWith('/pam/rules/') && method !== 'GET') {
+      return makeJsonResponse({ success: true, rule: rules[0] ?? signedRule });
+    }
+    return makeJsonResponse({ success: true, rules });
+  });
+}
+
+function findMutationCall(url: string, method: string) {
+  return fetchWithAuthMock.mock.calls.find(
+    (c) => c[0] === url && (c[1] as RequestInit | undefined)?.method === method,
+  );
+}
+
+function bodyOf(call: ReturnType<typeof findMutationCall>): Record<string, unknown> {
+  return JSON.parse((call?.[1] as RequestInit).body as string);
+}
+
+async function openCreateModal() {
+  await waitFor(() => screen.getByTestId('pam-add-rule-btn'));
+  fireEvent.click(screen.getByTestId('pam-add-rule-btn'));
+}
+
+describe('PamRulesTab', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('shows the empty state when no rules exist', async () => {
+    installFetchRoutes({ rules: [] });
+    render(<PamRulesTab />);
+    await waitFor(() => {
+      expect(screen.getByText('No PAM rules yet')).toBeInTheDocument();
+    });
+  });
+
+  it('shows the evaluation-order copy: software policies are evaluated first', async () => {
+    installFetchRoutes({ rules: [] });
+    render(<PamRulesTab />);
+    await waitFor(() => screen.getByTestId('pam-add-rule-btn'));
+    expect(
+      screen.getByText(/Software policies are evaluated first/i),
+    ).toBeInTheDocument();
+  });
+
+  describe('default unmatched verdict', () => {
+    it('loads the current default verdict from GET /pam/config', async () => {
+      installFetchRoutes({ rules: [], defaultUnmatchedVerdict: 'auto_deny' });
+      render(<PamRulesTab />);
+      await waitFor(() => {
+        expect((screen.getByTestId('pam-default-unmatched-verdict') as HTMLSelectElement).value).toBe(
+          'auto_deny',
+        );
+      });
+    });
+
+    it('PUTs the new default verdict on change', async () => {
+      installFetchRoutes({ rules: [] });
+      render(<PamRulesTab />);
+      await waitFor(() => {
+        expect((screen.getByTestId('pam-default-unmatched-verdict') as HTMLSelectElement).value).toBe(
+          'require_approval',
+        );
+      });
+
+      fireEvent.change(screen.getByTestId('pam-default-unmatched-verdict'), {
+        target: { value: 'auto_deny' },
+      });
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/config', 'PUT')).toBeDefined();
+      });
+      expect(bodyOf(findMutationCall('/pam/config', 'PUT'))).toEqual({
+        defaultUnmatchedVerdict: 'auto_deny',
+      });
+    });
+  });
+
+  it('re-fetches rules when the liveTick prop changes', async () => {
+    installFetchRoutes({ rules: [signedRule] });
+    const { rerender } = render(<PamRulesTab liveTick={0} />);
+    await waitFor(() => screen.getByTestId('pam-rule-row-rule-1'));
+    const rulesCallsBefore = fetchWithAuthMock.mock.calls.filter(
+      (c) => c[0] === '/pam/rules',
+    ).length;
+
+    rerender(<PamRulesTab liveTick={1} />);
+    await waitFor(() => {
+      const after = fetchWithAuthMock.mock.calls.filter((c) => c[0] === '/pam/rules').length;
+      expect(after).toBe(rulesCallsBefore + 1);
+    });
+  });
+
+  it('renders rules sorted by priority with a criteria summary', async () => {
+    const catchAll: PamRule = {
+      ...signedRule,
+      id: 'rule-2',
+      name: 'Catch-all deny',
+      priority: 500,
+      matchSigner: null,
+      matchPathGlob: '**',
+      verdict: 'auto_deny',
+    };
+    installFetchRoutes({ rules: [catchAll, signedRule] });
+    render(<PamRulesTab />);
+    await waitFor(() => {
+      expect(screen.getByTestId('pam-rule-row-rule-1')).toBeInTheDocument();
+    });
+    const rows = screen.getAllByTestId(/^pam-rule-row-/);
+    // priority 10 sorts before priority 500
+    expect(rows[0]).toHaveAttribute('data-testid', 'pam-rule-row-rule-1');
+    expect(screen.getByText('signer=Microsoft Corporation')).toBeInTheDocument();
+  });
+
+  describe('stale risk-tier badge (#3128)', () => {
+    it('renders the badge when matchRiskTierStale is true', async () => {
+      const staleRule: PamRule = {
+        ...signedRule,
+        id: 'rule-stale',
+        name: 'Stale tool rule',
+        matchSigner: null,
+        matchToolName: 'run_script',
+        matchRiskTier: 1,
+        matchRiskTierStale: true,
+        matchRiskTierValidTiers: [2, 3],
+      };
+      installFetchRoutes({ rules: [staleRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => {
+        expect(screen.getByTestId('pam-rule-stale-tier-rule-stale')).toBeInTheDocument();
+      });
+      expect(screen.getByTestId('pam-rule-stale-tier-rule-stale')).toHaveAttribute(
+        'title',
+        'Risk tier 1 no longer matches anything this rule can select, so it can never match. Tiers currently in use: 2, 3.',
+      );
+    });
+
+    it('does not render the badge when matchRiskTierStale is false', async () => {
+      const freshRule: PamRule = {
+        ...signedRule,
+        id: 'rule-fresh',
+        name: 'Fresh tool rule',
+        matchSigner: null,
+        matchToolName: 'run_script',
+        matchRiskTier: 2,
+        matchRiskTierStale: false,
+        matchRiskTierValidTiers: null,
+      };
+      installFetchRoutes({ rules: [freshRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-row-rule-fresh'));
+      expect(screen.queryByTestId('pam-rule-stale-tier-rule-fresh')).toBeNull();
+    });
+
+    it('does not render the badge when matchRiskTierStale is absent', async () => {
+      installFetchRoutes({ rules: [signedRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-row-rule-1'));
+      expect(screen.queryByTestId('pam-rule-stale-tier-rule-1')).toBeNull();
+    });
+  });
+
+  describe('suspended auto_approve rule — re-approval (§6B, fix/pam-dedicated-permissions)', () => {
+    const suspendedRule: PamRule = {
+      ...signedRule,
+      id: 'rule-suspended',
+      name: 'Auto-elevate installer',
+      verdict: 'require_approval',
+      suspendedVerdict: 'auto_approve',
+      reapprovedAt: null,
+      reapprovedByUserId: null,
+    };
+
+    it('shows the "suspended pending re-approval" badge and a Re-approve action', async () => {
+      installFetchRoutes({ rules: [suspendedRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-row-rule-suspended'));
+      expect(screen.getByTestId('pam-rule-suspended-badge-rule-suspended')).toBeInTheDocument();
+      expect(screen.getByTestId('pam-rule-reapprove-rule-suspended')).toBeInTheDocument();
+    });
+
+    it('does NOT show the badge for an ordinary require_approval rule (no suspendedVerdict)', async () => {
+      const ordinaryRule: PamRule = { ...signedRule, id: 'rule-ordinary', verdict: 'require_approval' };
+      installFetchRoutes({ rules: [ordinaryRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-row-rule-ordinary'));
+      expect(screen.queryByTestId('pam-rule-suspended-badge-rule-ordinary')).toBeNull();
+      expect(screen.queryByTestId('pam-rule-reapprove-rule-ordinary')).toBeNull();
+    });
+
+    it('does NOT show the badge once reapprovedAt is stamped (already handled)', async () => {
+      const reapprovedRule: PamRule = {
+        ...suspendedRule,
+        id: 'rule-reapproved',
+        verdict: 'auto_approve',
+        suspendedVerdict: null,
+        reapprovedAt: '2026-10-16T00:00:00.000Z',
+      };
+      installFetchRoutes({ rules: [reapprovedRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-row-rule-reapproved'));
+      expect(screen.queryByTestId('pam-rule-suspended-badge-rule-reapproved')).toBeNull();
+    });
+
+    // PR review fix: `suspendedVerdict` alone is the live signal — it is
+    // nulled out by the PATCH { reapprove: true } handler AND by an explicit
+    // verdict edit (decideApprovalRequest/pam.ts's `payload.verdict !==
+    // undefined` branch). `reapprovedAt` is a permanent historical stamp
+    // that is never cleared, so a rule that was re-approved once before and
+    // later got a fresh suspendedVerdict set (e.g. quarantined again) must
+    // still show the badge/action — gating on `!rule.reapprovedAt` as well
+    // would wrongly hide it forever after the first re-approval.
+    it('shows the badge/action based on suspendedVerdict alone, even when a stale reapprovedAt is still stamped from an earlier cycle', async () => {
+      const reQuarantinedRule: PamRule = {
+        ...suspendedRule,
+        id: 'rule-requarantined',
+        suspendedVerdict: 'auto_approve',
+        reapprovedAt: '2026-09-01T00:00:00.000Z',
+      };
+      installFetchRoutes({ rules: [reQuarantinedRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-row-rule-requarantined'));
+      expect(screen.getByTestId('pam-rule-suspended-badge-rule-requarantined')).toBeInTheDocument();
+      expect(screen.getByTestId('pam-rule-reapprove-rule-requarantined')).toBeInTheDocument();
+    });
+
+    it('clicking Re-approve PATCHes { reapprove: true } through runAction and refetches', async () => {
+      installFetchRoutes({ rules: [suspendedRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-reapprove-rule-suspended'));
+
+      fireEvent.click(screen.getByTestId('pam-rule-reapprove-rule-suspended'));
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/rules/rule-suspended', 'PATCH')).toBeDefined();
+      });
+      expect(bodyOf(findMutationCall('/pam/rules/rule-suspended', 'PATCH'))).toEqual({ reapprove: true });
+    });
+
+    it('surfaces a failed re-approve via a toast (runAction error path)', async () => {
+      fetchWithAuthMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? 'GET';
+        if (url === '/pam/rules/rule-suspended' && method === 'PATCH') {
+          return makeJsonResponse({ error: 'Rule is not suspended pending re-approval' }, false, 400);
+        }
+        if (url === '/pam/config' && method === 'GET') {
+          return makeJsonResponse({ success: true, config: { orgId: 'org-1', defaultUnmatchedVerdict: 'require_approval' } });
+        }
+        return makeJsonResponse({ success: true, rules: [suspendedRule] });
+      });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-reapprove-rule-suspended'));
+
+      fireEvent.click(screen.getByTestId('pam-rule-reapprove-rule-suspended'));
+
+      await waitFor(() => {
+        expect(showToastMock).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'error' }),
+        );
+      });
+    });
+  });
+
+  it('renders a scope cell: Org-wide or the resolved site name', async () => {
+    const siteScoped: PamRule = {
+      ...signedRule,
+      id: 'rule-3',
+      name: 'HQ only',
+      siteId: 'site-1',
+    };
+    installFetchRoutes({
+      rules: [signedRule, siteScoped],
+      sites: [{ id: 'site-1', name: 'HQ' }],
+    });
+    render(<PamRulesTab />);
+    await waitFor(() => {
+      expect(screen.getByTestId('pam-rule-scope-rule-1')).toHaveTextContent('Org-wide');
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('pam-rule-scope-rule-3')).toHaveTextContent('HQ');
+    });
+  });
+
+  it('toggles a rule enabled state via PATCH', async () => {
+    installFetchRoutes({ rules: [signedRule] });
+    render(<PamRulesTab />);
+    await waitFor(() => screen.getByTestId('pam-rule-toggle-rule-1'));
+    fireEvent.click(screen.getByTestId('pam-rule-toggle-rule-1'));
+    await waitFor(() => {
+      expect(fetchWithAuthMock).toHaveBeenCalledWith(
+        '/pam/rules/rule-1',
+        expect.objectContaining({ method: 'PATCH' }),
+      );
+    });
+    expect(bodyOf(findMutationCall('/pam/rules/rule-1', 'PATCH'))).toEqual({ enabled: false });
+  });
+
+  it('gates rule deletion behind a confirm dialog', async () => {
+    installFetchRoutes({ rules: [signedRule] });
+    render(<PamRulesTab />);
+    await waitFor(() => screen.getByTestId('pam-rule-delete-rule-1'));
+
+    // First click opens the confirm dialog — no DELETE goes out yet.
+    fireEvent.click(screen.getByTestId('pam-rule-delete-rule-1'));
+    await waitFor(() => screen.getByTestId('pam-rule-delete-confirm'));
+    expect(findMutationCall('/pam/rules/rule-1', 'DELETE')).toBeUndefined();
+
+    // Confirming fires the DELETE.
+    fireEvent.click(screen.getByTestId('pam-rule-delete-confirm'));
+    await waitFor(() => {
+      expect(findMutationCall('/pam/rules/rule-1', 'DELETE')).toBeDefined();
+    });
+  });
+
+  it('does not DELETE when the confirm dialog is cancelled', async () => {
+    installFetchRoutes({ rules: [signedRule] });
+    render(<PamRulesTab />);
+    await waitFor(() => screen.getByTestId('pam-rule-delete-rule-1'));
+
+    fireEvent.click(screen.getByTestId('pam-rule-delete-rule-1'));
+    await waitFor(() => screen.getByTestId('pam-rule-delete-confirm'));
+    fireEvent.click(screen.getByText('Cancel'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('pam-rule-delete-confirm')).toBeNull();
+    });
+    expect(findMutationCall('/pam/rules/rule-1', 'DELETE')).toBeUndefined();
+  });
+
+  it('creates a rule through the modal, sending a clean executable-shaped payload', async () => {
+    installFetchRoutes({ rules: [] });
+    render(<PamRulesTab />);
+    await openCreateModal();
+
+    fireEvent.change(screen.getByTestId('pam-rule-name'), {
+      target: { value: 'Allow signed Microsoft installers' },
+    });
+    fireEvent.change(screen.getByTestId('pam-rule-signer'), {
+      target: { value: 'Microsoft Corporation' },
+    });
+    fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+    await waitFor(() => {
+      expect(fetchWithAuthMock).toHaveBeenCalledWith(
+        '/pam/rules',
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+    const payload = bodyOf(findMutationCall('/pam/rules', 'POST'));
+    expect(payload).toMatchObject({
+      name: 'Allow signed Microsoft installers',
+      matchSigner: 'Microsoft Corporation',
+      matchToolName: null,
+      matchRiskTier: null,
+      verdict: 'require_approval',
+      enabled: true,
+      siteId: null,
+    });
+    // Single accessible org: the server resolves it — no orgId in the body.
+    expect('orgId' in payload).toBe(false);
+  });
+
+  it('blocks submission client-side when no criterion is provided', async () => {
+    installFetchRoutes({ rules: [] });
+    render(<PamRulesTab />);
+    await openCreateModal();
+
+    fireEvent.change(screen.getByTestId('pam-rule-name'), { target: { value: 'No criteria' } });
+    fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent('At least one match criterion');
+    });
+    // No POST went out
+    expect(findMutationCall('/pam/rules', 'POST')).toBeUndefined();
+  });
+
+  it('blocks the ignore verdict for tool-action rules client-side', async () => {
+    installFetchRoutes({ rules: [] });
+    render(<PamRulesTab />);
+    await openCreateModal();
+
+    fireEvent.change(screen.getByTestId('pam-rule-name'), { target: { value: 'Tool rule' } });
+    fireEvent.click(screen.getByTestId('pam-rule-shape-tool'));
+    fireEvent.change(screen.getByTestId('pam-rule-toolname'), { target: { value: 'run_script' } });
+    // The ignore option is disabled in the select for tool shape; force the state
+    // by asserting the option is disabled instead.
+    const verdictSelect = screen.getByTestId('pam-rule-verdict') as HTMLSelectElement;
+    const ignoreOption = Array.from(verdictSelect.options).find((o) => o.value === 'ignore');
+    expect(ignoreOption?.disabled).toBe(true);
+  });
+
+  describe('time window', () => {
+    const windowedRule: PamRule = {
+      ...signedRule,
+      id: 'rule-w',
+      name: 'Business hours',
+      timeWindow: { start: '08:00', end: '18:00', days: [1, 2, 3, 4, 5], timezone: 'Europe/Berlin' },
+    };
+
+    it('preserves days and timezone when editing only the name', async () => {
+      installFetchRoutes({ rules: [windowedRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-edit-rule-w'));
+      fireEvent.click(screen.getByTestId('pam-rule-edit-rule-w'));
+
+      fireEvent.change(screen.getByTestId('pam-rule-name'), {
+        target: { value: 'Business hours v2' },
+      });
+      fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/rules/rule-w', 'PATCH')).toBeDefined();
+      });
+      const payload = bodyOf(findMutationCall('/pam/rules/rule-w', 'PATCH'));
+      expect(payload.timeWindow).toEqual({
+        start: '08:00',
+        end: '18:00',
+        days: [1, 2, 3, 4, 5],
+        timezone: 'Europe/Berlin',
+      });
+    });
+
+    it('round-trips days and timezone inputs into the create payload', async () => {
+      installFetchRoutes({ rules: [] });
+      render(<PamRulesTab />);
+      await openCreateModal();
+
+      // Days/timezone inputs only appear once the window section is active.
+      expect(screen.queryByTestId('pam-rule-window-day-1')).toBeNull();
+
+      fireEvent.change(screen.getByTestId('pam-rule-name'), { target: { value: 'Windowed' } });
+      fireEvent.change(screen.getByTestId('pam-rule-signer'), { target: { value: 'Acme Corp' } });
+      fireEvent.change(screen.getByTestId('pam-rule-window-start'), { target: { value: '08:00' } });
+      fireEvent.change(screen.getByTestId('pam-rule-window-end'), { target: { value: '18:00' } });
+      fireEvent.click(screen.getByTestId('pam-rule-window-day-1'));
+      fireEvent.click(screen.getByTestId('pam-rule-window-day-2'));
+      fireEvent.change(screen.getByTestId('pam-rule-window-timezone'), {
+        target: { value: 'Europe/Berlin' },
+      });
+      fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/rules', 'POST')).toBeDefined();
+      });
+      const payload = bodyOf(findMutationCall('/pam/rules', 'POST'));
+      expect(payload.timeWindow).toEqual({
+        start: '08:00',
+        end: '18:00',
+        days: [1, 2],
+        timezone: 'Europe/Berlin',
+      });
+    });
+
+    it('omits days when none are selected and timezone when empty', async () => {
+      installFetchRoutes({ rules: [] });
+      render(<PamRulesTab />);
+      await openCreateModal();
+
+      fireEvent.change(screen.getByTestId('pam-rule-name'), { target: { value: 'Windowed' } });
+      fireEvent.change(screen.getByTestId('pam-rule-signer'), { target: { value: 'Acme Corp' } });
+      fireEvent.change(screen.getByTestId('pam-rule-window-start'), { target: { value: '08:00' } });
+      fireEvent.change(screen.getByTestId('pam-rule-window-end'), { target: { value: '18:00' } });
+      fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/rules', 'POST')).toBeDefined();
+      });
+      const payload = bodyOf(findMutationCall('/pam/rules', 'POST'));
+      expect(payload.timeWindow).toEqual({ start: '08:00', end: '18:00' });
+    });
+
+    it('drops stale days and timezone after the window is fully cleared and re-entered', async () => {
+      installFetchRoutes({ rules: [windowedRule] });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-edit-rule-w'));
+      fireEvent.click(screen.getByTestId('pam-rule-edit-rule-w'));
+
+      // Clear both ends of the window, then re-enter a new one.
+      fireEvent.change(screen.getByTestId('pam-rule-window-start'), { target: { value: '' } });
+      fireEvent.change(screen.getByTestId('pam-rule-window-end'), { target: { value: '' } });
+      fireEvent.change(screen.getByTestId('pam-rule-window-start'), { target: { value: '09:00' } });
+      fireEvent.change(screen.getByTestId('pam-rule-window-end'), { target: { value: '17:00' } });
+      fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/rules/rule-w', 'PATCH')).toBeDefined();
+      });
+      const payload = bodyOf(findMutationCall('/pam/rules/rule-w', 'PATCH'));
+      // Old days/timezone must not silently resurface with the new window.
+      expect(payload.timeWindow).toEqual({ start: '09:00', end: '17:00' });
+    });
+
+    it('blocks submit with an inline error when start is set without end', async () => {
+      installFetchRoutes({ rules: [] });
+      render(<PamRulesTab />);
+      await openCreateModal();
+
+      fireEvent.change(screen.getByTestId('pam-rule-name'), { target: { value: 'Half window' } });
+      fireEvent.change(screen.getByTestId('pam-rule-signer'), { target: { value: 'Acme Corp' } });
+      fireEvent.change(screen.getByTestId('pam-rule-window-start'), { target: { value: '08:00' } });
+      fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent(/start and end/i);
+      });
+      expect(findMutationCall('/pam/rules', 'POST')).toBeUndefined();
+    });
+  });
+
+  describe('site scoping', () => {
+    const sites = [
+      { id: 'site-1', name: 'HQ' },
+      { id: 'site-2', name: 'Warehouse' },
+    ];
+
+    it('sends the selected site uuid when a site is picked', async () => {
+      installFetchRoutes({ rules: [], sites });
+      render(<PamRulesTab />);
+      await openCreateModal();
+
+      await waitFor(() => {
+        expect(
+          (screen.getByTestId('pam-rule-site') as HTMLSelectElement).options.length,
+        ).toBeGreaterThan(1);
+      });
+      fireEvent.change(screen.getByTestId('pam-rule-name'), { target: { value: 'HQ rule' } });
+      fireEvent.change(screen.getByTestId('pam-rule-signer'), { target: { value: 'Acme Corp' } });
+      fireEvent.change(screen.getByTestId('pam-rule-site'), { target: { value: 'site-1' } });
+      fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/rules', 'POST')).toBeDefined();
+      });
+      expect(bodyOf(findMutationCall('/pam/rules', 'POST')).siteId).toBe('site-1');
+    });
+
+    it('preselects the site when editing a site-scoped rule', async () => {
+      const siteScoped: PamRule = { ...signedRule, id: 'rule-s', siteId: 'site-2' };
+      installFetchRoutes({ rules: [siteScoped], sites });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-edit-rule-s'));
+      fireEvent.click(screen.getByTestId('pam-rule-edit-rule-s'));
+
+      await waitFor(() => {
+        expect((screen.getByTestId('pam-rule-site') as HTMLSelectElement).value).toBe('site-2');
+      });
+    });
+  });
+
+  describe('organization scoping (partner scope)', () => {
+    const orgs = [
+      { id: 'org-1', name: 'Acme' },
+      { id: 'org-2', name: 'Beta LLC' },
+    ];
+
+    it('shows an org select for multi-org users, scopes the sites fetch, and sends the choice', async () => {
+      installFetchRoutes({ rules: [], orgs, sites: [{ id: 'site-9', name: 'Beta HQ' }] });
+      render(<PamRulesTab />);
+      await openCreateModal();
+
+      await waitFor(() => {
+        expect((screen.getByTestId('pam-rule-org') as HTMLSelectElement).value).toBe('org-1');
+      });
+      // Sites are fetched scoped to the selected org.
+      await waitFor(() => {
+        expect(
+          fetchWithAuthMock.mock.calls.some(
+            (c) => typeof c[0] === 'string' && c[0].includes('/orgs/sites') && c[0].includes('organizationId=org-1'),
+          ),
+        ).toBe(true);
+      });
+
+      fireEvent.change(screen.getByTestId('pam-rule-org'), { target: { value: 'org-2' } });
+      await waitFor(() => {
+        expect(
+          fetchWithAuthMock.mock.calls.some(
+            (c) => typeof c[0] === 'string' && c[0].includes('/orgs/sites') && c[0].includes('organizationId=org-2'),
+          ),
+        ).toBe(true);
+      });
+
+      fireEvent.change(screen.getByTestId('pam-rule-name'), { target: { value: 'Beta rule' } });
+      fireEvent.change(screen.getByTestId('pam-rule-signer'), { target: { value: 'Acme Corp' } });
+      fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/rules', 'POST')).toBeDefined();
+      });
+      const payload = bodyOf(findMutationCall('/pam/rules', 'POST'));
+      expect(payload.orgId).toBe('org-2');
+      expect(payload.siteId).toBe(null);
+    });
+
+    it('hides the org select for single-org users', async () => {
+      installFetchRoutes({ rules: [] });
+      render(<PamRulesTab />);
+      await openCreateModal();
+
+      await waitFor(() => {
+        expect(screen.getByTestId('pam-rule-site')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('pam-rule-org')).toBeNull();
+    });
+
+    it('does not send orgId on edit', async () => {
+      installFetchRoutes({ rules: [signedRule], orgs });
+      render(<PamRulesTab />);
+      await waitFor(() => screen.getByTestId('pam-rule-edit-rule-1'));
+      fireEvent.click(screen.getByTestId('pam-rule-edit-rule-1'));
+
+      // Org is fixed on edit: no editable org select.
+      await waitFor(() => screen.getByTestId('pam-rule-site'));
+      expect(screen.queryByTestId('pam-rule-org')).toBeNull();
+
+      fireEvent.change(screen.getByTestId('pam-rule-name'), { target: { value: 'Renamed' } });
+      fireEvent.click(screen.getByTestId('pam-rule-submit'));
+
+      await waitFor(() => {
+        expect(findMutationCall('/pam/rules/rule-1', 'PATCH')).toBeDefined();
+      });
+      expect('orgId' in bodyOf(findMutationCall('/pam/rules/rule-1', 'PATCH'))).toBe(false);
+    });
+  });
+});

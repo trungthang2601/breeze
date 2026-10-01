@@ -1,0 +1,24 @@
+//go:build !darwin
+
+package tunnel
+
+// IsScreenSharingSupported returns false on non-macOS platforms.
+func IsScreenSharingSupported() bool {
+	return false
+}
+
+// EnableScreenSharing is a no-op on non-macOS platforms.
+// VNC tunnels can still work if a VNC server is running.
+func EnableScreenSharing() error {
+	return nil
+}
+
+// DisableScreenSharing is a no-op on non-macOS platforms.
+func DisableScreenSharing() error {
+	return nil
+}
+
+// IsScreenSharingRunning always returns false on non-macOS.
+func IsScreenSharingRunning() bool {
+	return false
+}

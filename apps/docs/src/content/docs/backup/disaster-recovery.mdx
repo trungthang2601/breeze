@@ -1,0 +1,124 @@
+---
+title: Disaster Recovery Plans
+description: Build disaster recovery plans with ordered recovery groups, RTO and RPO targets, test and live execution types, and execution history tracking.
+sidebar:
+  order: 14
+  label: "Disaster Recovery"
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+Disaster Recovery (DR) plans let you define how to bring your systems back online after a major incident. You organize devices into ordered recovery groups, set overall RTO/RPO targets, and rehearse the plan before you need it.
+
+---
+
+## Creating a DR Plan
+
+<Steps>
+1. Navigate to the **Disaster Recovery** section.
+2. Click **Create Plan**.
+3. Enter the plan details:
+   - **Name** — descriptive label (e.g., "Primary site failover")
+   - **Description** — operator notes explaining the plan's scope and assumptions
+   - **RPO target** — maximum acceptable data loss in minutes
+   - **RTO target** — maximum acceptable recovery time in minutes
+4. Click **Save**.
+</Steps>
+
+---
+
+## Adding Recovery Groups
+
+Recovery groups define which devices to recover and in what order. Groups execute sequentially — group 1 completes before group 2 starts.
+
+<Steps>
+1. Open your DR plan.
+2. Click **Add Recovery Group**.
+3. Configure the group:
+   - **Name** — e.g., "Domain Controllers", "Database Servers", "Application Tier"
+   - **Devices** — select which devices belong to this group
+   - **Step type** — how to restore each device in the group; see [Step Types](#step-types) below
+   - **Sequence order** — execution priority (lower numbers run first)
+   - **Dependencies** — optionally set a group to depend on another group completing first
+4. Repeat for each recovery tier.
+</Steps>
+
+### Step Types
+
+Every recovery group has one step type, which determines how its devices are restored:
+
+| Step type | What it does |
+|---|---|
+| VM restore from backup | Restores the snapshot as a new Hyper-V virtual machine. |
+| VM instant boot | Boots a VM directly from backup storage while data migrates to the host in the background. |
+| Hyper-V restore | Restores a Hyper-V export/backup back onto a Hyper-V host. |
+| SQL Server restore | Restores a SQL Server backup chain. |
+| Bare-metal recover (boot media) | Boots the device from [Breeze recovery media](/backup/bare-metal-recovery/#recover-from-breeze-recovery-media) and enters a recovery code. |
+| Bare-metal rebuild (rebuild engine) | Runs the [rebuild engine](/backup/bare-metal-recovery/#rebuilding-a-linux-disk-from-scratch-breeze-backup-rebuild) against a Linux rebuild host. See [Bare-metal rebuild step](#bare-metal-rebuild-step) below. |
+
+#### Bare-metal rebuild step
+
+The **bare-metal rebuild** step type behaves differently depending on the execution type:
+
+- **Rehearsal** — rebuilds each group device's latest **bare-metal restorable** snapshot into a VHDX image on a rebuild host, without touching production hardware. Configure:
+  - **Rebuild host** — the online Linux device (with `qemu-utils` installed) that runs the rehearsal rebuilds.
+  - **Output directory** — where the rebuild host writes one VHDX image per device.
+  - **Wait timeout (minutes)** — how long to wait for each device's rebuild to check in before the step is marked failed.
+- **Failover** and **Failback** — boot each group device from Breeze recovery media instead, restoring it in place with its original device identity. The rebuild host and output directory settings are only used for rehearsals.
+
+Each device recovers from its own latest snapshot marked **Bare-metal restorable**; a device with no such snapshot fails the step with a specific "no restorable snapshot" error rather than a generic one. During execution, the per-device recovery status is shown in the execution view, where you can also **Reissue code** (rotate an unused recovery code) or **Cancel recovery** for a device that's in progress.
+
+### Example Recovery Order
+
+| Order | Group | Devices | Why |
+|-------|-------|---------|-----|
+| 1 | Domain Controllers | DC01, DC02 | Authentication must be online first |
+| 2 | Database Servers | SQL01, SQL02 | Applications need their data layer |
+| 3 | Application Servers | APP01–APP04 | Now that auth and data are up |
+| 4 | File Servers | FS01 | Lower priority, can wait |
+
+<Aside type="tip">
+  Model your recovery groups after your service dependency chain. If Application Server depends on Database Server, put the database in an earlier group.
+</Aside>
+
+---
+
+## Execution Types
+
+| Type | What happens | When to use |
+|------|-------------|-------------|
+| **Rehearsal** | Validates recovery steps without modifying production systems | Regular DR testing (quarterly recommended) |
+| **Failover** | Live execution — actually restores systems according to the plan | Real disaster or planned migration |
+| **Failback** | Returns services to the primary environment after a failover | After the original site is repaired |
+
+---
+
+## Running a DR Plan
+
+<Steps>
+1. Open the plan and click **Execute**.
+2. Select the execution type: **Rehearsal**, **Failover**, or **Failback**.
+3. Confirm to start.
+4. Recovery groups execute in sequence order. Track progress in the execution detail view.
+5. To stop a running execution, click **Abort**.
+</Steps>
+
+If a group can't start, the execution error names the specific missing prerequisite — for example, no restorable snapshot for a device, or no valid recovery source — instead of a generic error, so you know exactly what to fix before retrying.
+
+### Viewing Execution History
+
+Past executions are listed on the plan detail page, showing:
+- Execution type (rehearsal/failover/failback)
+- Start and end times
+- Status (running, completed, failed, aborted)
+- Per-group results
+
+---
+
+## DR Testing Best Practices
+
+- **Rehearse quarterly** at minimum. Real disasters are not the time to discover your plan doesn't work.
+- **Start with a rehearsal** before relying on a plan for production failover.
+- **Review after each rehearsal** — update device assignments, sequence orders, and targets based on what you learned.
+- **Keep plans current** — when you add or decommission servers, update the recovery groups.
+- **Combine with SLA monitoring** — your [SLA policies](/backup/sla/) track whether RPO/RTO targets are achievable day-to-day, giving you confidence before a DR event.

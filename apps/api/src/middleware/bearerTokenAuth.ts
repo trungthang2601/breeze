@@ -1,0 +1,542 @@
+import type { Context, Next } from 'hono';
+import { HTTPException } from 'hono/http-exception';
+import * as Sentry from '@sentry/node';
+import { createRemoteJWKSet, jwtVerify, type JWTPayload, type JWTVerifyResult } from 'jose';
+import { and, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
+import {
+  OAUTH_AUTH_EPOCH_ENFORCE_AFTER,
+  OAUTH_ISSUER,
+  OAUTH_RESOURCE_URL,
+} from '../config/env';
+import {
+  db,
+  runOutsideDbContext,
+  withDbAccessContext,
+  withSystemDbAccessContext,
+} from '../db';
+import { oauthClientBlocks, oauthGrants, organizations, partnerUsers, users } from '../db/schema';
+import { isGrantRevoked, isJtiRevoked } from '../oauth/revocationCache';
+import { activeGrantCondition } from '../oauth/grantStatus';
+import { assertActiveTenantContext, TenantInactiveError } from '../services/tenantStatus';
+
+interface OAuthApiKeyContext {
+  id: string;
+  orgId: string | null;
+  partnerId: string | null;
+  name: string;
+  keyPrefix: string;
+  scopes: string[];
+  rateLimit: number;
+  createdBy: string;
+  oauthGrantId?: string;
+  oauthClientId?: string;
+}
+
+let cachedJwks: ReturnType<typeof createRemoteJWKSet> | null = null;
+
+export type LiveOAuthUserResult =
+  | {
+      ok: true;
+      userId: string;
+      authEpoch: number;
+      legacyClaim: boolean;
+      /**
+       * Whether the `grant_id` passed in resolves to a live `oauth_grants`
+       * row. `null` when no grant id was supplied (nothing was asked).
+       * Resolved in the SAME query as the user so bearer admission stays a
+       * single system-context round-trip.
+       */
+      grantActive: boolean | null;
+    }
+  | {
+      ok: false;
+      status: 401 | 503;
+      reason:
+        | 'user_missing'
+        | 'user_inactive'
+        | 'auth_epoch_mismatch'
+        | 'legacy_claim_expired'
+        | 'live_state_unavailable';
+    };
+
+type LiveOAuthAuthorizationReason = LiveOAuthUserResult extends infer Result
+  ? Result extends { reason: infer Reason }
+    ? Reason
+    : never
+  : never;
+
+function recordLiveOAuthAuthorization(
+  reason: 'authorized' | LiveOAuthAuthorizationReason,
+  legacyClaim: boolean,
+): void {
+  Sentry.metrics.count('breeze.oauth.live_authorization', 1, {
+    attributes: { reason, legacyClaim },
+  });
+}
+
+export async function assertLiveOAuthUser(
+  payload: JWTPayload,
+  now: Date,
+  opts: { grantId?: string | null } = {},
+): Promise<LiveOAuthUserResult> {
+  const userId = typeof payload.sub === 'string' && payload.sub.length > 0
+    ? payload.sub
+    : null;
+  if (!userId) {
+    return { ok: false, status: 401, reason: 'user_missing' };
+  }
+
+  const grantId = typeof opts.grantId === 'string' && opts.grantId.length > 0 ? opts.grantId : null;
+
+  // ONE system-context round-trip proves both live facts bearer admission
+  // needs: the user is still active at the claimed auth epoch, and the Grant
+  // the token was minted under is still durably live. They were two
+  // sequential queries; on an OAuth-heavy tenant that doubled the per-request
+  // pool pressure on an already hot path for no isolation benefit — both reads
+  // are in the same system context anyway. The LEFT JOIN keeps a missing or
+  // revoked Grant as a row with a NULL join side rather than no row at all, so
+  // "user gone" stays distinguishable from "grant dead".
+  let liveUser: { id: string; status: string; authEpoch: number; grantActive: boolean } | undefined;
+  try {
+    [liveUser] = await runOutsideDbContext(() =>
+      withSystemDbAccessContext(() =>
+        db
+          .select({
+            id: users.id,
+            status: users.status,
+            authEpoch: users.authEpoch,
+            grantActive: sql<boolean>`${oauthGrants.id} IS NOT NULL`,
+          })
+          .from(users)
+          .leftJoin(
+            oauthGrants,
+            grantId ? activeGrantCondition(grantId, now) : sql`false`,
+          )
+          .where(eq(users.id, userId))
+          .limit(1),
+      ),
+    );
+  } catch {
+    return { ok: false, status: 503, reason: 'live_state_unavailable' };
+  }
+
+  if (!liveUser) {
+    return { ok: false, status: 401, reason: 'user_missing' };
+  }
+  if (liveUser.status !== 'active') {
+    return { ok: false, status: 401, reason: 'user_inactive' };
+  }
+
+  const claimedEpoch = payload.auth_epoch;
+  if (claimedEpoch === undefined) {
+    if (
+      OAUTH_AUTH_EPOCH_ENFORCE_AFTER
+      && now.getTime() >= OAUTH_AUTH_EPOCH_ENFORCE_AFTER.getTime()
+    ) {
+      return { ok: false, status: 401, reason: 'legacy_claim_expired' };
+    }
+    return {
+      ok: true,
+      userId,
+      authEpoch: liveUser.authEpoch,
+      legacyClaim: true,
+      grantActive: grantId ? liveUser.grantActive : null,
+    };
+  }
+
+  if (
+    typeof claimedEpoch !== 'number'
+    || !Number.isSafeInteger(claimedEpoch)
+    || claimedEpoch !== liveUser.authEpoch
+  ) {
+    return { ok: false, status: 401, reason: 'auth_epoch_mismatch' };
+  }
+
+  return {
+    ok: true,
+    userId,
+    authEpoch: liveUser.authEpoch,
+    legacyClaim: false,
+    grantActive: grantId ? liveUser.grantActive : null,
+  };
+}
+
+function getJwks() {
+  if (!cachedJwks) cachedJwks = createRemoteJWKSet(new URL(`${OAUTH_ISSUER}/.well-known/jwks.json`));
+  return cachedJwks;
+}
+
+export function _resetJwksCacheForTests() {
+  cachedJwks = null;
+}
+
+/**
+ * Map OAuth scopes (mcp:read / mcp:write / mcp:execute) to the internal ai:*
+ * scope vocabulary the MCP route handlers were built around. Without this,
+ * every OAuth-authed MCP call fails the `ai:read` gate in routes/mcpServer.ts
+ * even though the OAuth grant already scoped the token for MCP use. We
+ * additively keep the original mcp:* scopes so future code paths can branch
+ * on the OAuth vocabulary if needed.
+ *
+ * Mapping (target state — in effect since 2026-05-15 per Task 24 / MCP MED-4):
+ *   mcp:read    → ai:read       (tools/list, read-only tool calls)
+ *   mcp:write   → ai:read, ai:write
+ *   mcp:execute → ai:read, ai:write, ai:execute
+ *
+ * `ai:execute_admin` is intentionally NOT granted via OAuth — it gates the
+ * most destructive operations and remains API-key-only by policy.
+ *
+ * Historical note: through 2026-05-15 we also expanded `mcp:write` to grant
+ * `ai:execute` so pre-split refresh tokens (issued before `mcp:execute`
+ * existed) didn't silently lose tool execution mid-lifetime. The 14-day
+ * refresh-token TTL means every pre-split token has now expired, so the
+ * legacy expansion was removed. Tokens that still present only `mcp:write`
+ * must re-consent to obtain `mcp:execute` for tool execution. We emit a
+ * one-time warn-log per client_id when this happens so operators can see
+ * who's still on a pre-split token.
+ */
+const LEGACY_MCP_WRITE_WARNED_CLIENT_IDS = new Set<string>();
+
+function warnLegacyMcpWriteSeen(clientId: string | undefined): void {
+  const key = clientId ?? '<no-client-id>';
+  if (LEGACY_MCP_WRITE_WARNED_CLIENT_IDS.has(key)) return;
+  LEGACY_MCP_WRITE_WARNED_CLIENT_IDS.add(key);
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[oauth] mcp:write presented without mcp:execute — ai:execute denied (client_id=${key}). Re-consent required for tool execution.`,
+  );
+}
+
+function expandOAuthScopes(oauthScopes: string[], clientId?: string): string[] {
+  const out = new Set<string>(oauthScopes);
+  let sawLegacyMcpWriteOnly = false;
+  for (const s of oauthScopes) {
+    if (s === 'mcp:read') {
+      out.add('ai:read');
+    } else if (s === 'mcp:write') {
+      out.add('ai:read');
+      out.add('ai:write');
+      if (!oauthScopes.includes('mcp:execute')) {
+        sawLegacyMcpWriteOnly = true;
+      }
+    } else if (s === 'mcp:execute') {
+      out.add('ai:read');
+      out.add('ai:write');
+      out.add('ai:execute');
+    }
+  }
+  if (sawLegacyMcpWriteOnly) warnLegacyMcpWriteSeen(clientId);
+  return Array.from(out);
+}
+
+export function _resetLegacyMcpWriteWarningsForTests() {
+  LEGACY_MCP_WRITE_WARNED_CLIENT_IDS.clear();
+}
+
+/**
+ * Resolve the actual list of orgs a partner-scope OAuth caller can reach.
+ *
+ * Defense-in-depth: without this, partner-scope OAuth tokens were passing
+ * `accessibleOrgIds: null` to the DB context, which downstream
+ * `auth.orgCondition()` interprets as "system scope, no filter" — meaning the
+ * application-layer SQL filter is removed and we rely entirely on RLS. RLS is
+ * still the primary tenant boundary, but the app-layer filter is a critical
+ * second guard rail for any future code that bypasses the breeze_app role or
+ * loses RLS GUCs (e.g. a worker, a misconfigured pool, a DELETE from a
+ * privileged side-channel).
+ *
+ * This is the canonical shared partner→org resolver: it is consumed both by
+ * the OAuth/bearer path here and by routes/mcpServer.ts (which dropped its own
+ * duplicate copy in favor of this export). It mirrors `computeAccessibleOrgIds`
+ * in middleware/auth.ts but lives here rather than there to avoid widening that
+ * file's export surface. Returns `string[]` (never null) so the resulting
+ * `accessibleOrgIds` always carries an explicit allowlist; an empty list
+ * correctly produces "no rows match" rather than "all rows".
+ *
+ * Pre-auth lookup: this runs BEFORE we set the request's real RLS context,
+ * so partner_users / organizations are queried via withSystemDbAccessContext
+ * — same pattern as auth.ts. The returned list is then used to build the
+ * non-system context the request actually runs under.
+ */
+export async function resolvePartnerAccessibleOrgIds(
+  partnerId: string,
+  userId: string,
+): Promise<string[]> {
+  return withSystemDbAccessContext(async () => {
+    const [partnerMembership] = await db
+      .select({
+        orgAccess: partnerUsers.orgAccess,
+        orgIds: partnerUsers.orgIds,
+      })
+      .from(partnerUsers)
+      .where(
+        and(eq(partnerUsers.userId, userId), eq(partnerUsers.partnerId, partnerId)),
+      )
+      .limit(1);
+
+    if (!partnerMembership) return [];
+    if (partnerMembership.orgAccess === 'none') return [];
+
+    if (partnerMembership.orgAccess === 'selected') {
+      const selected = (partnerMembership.orgIds ?? []).filter(
+        (v): v is string => typeof v === 'string' && v.length > 0,
+      );
+      // Mirrors computeAccessibleOrgIds in auth.ts — see the long comment
+      // there. The partner's hidden 'quick_support' org is always granted,
+      // because it can never appear in the curated orgIds list and its absence
+      // shows up as a silent zero-row read of the technician's own sessions.
+      // Both paths must agree, or session-JWT and OAuth/MCP callers behave
+      // differently for the same user.
+      const orgFilter = selected.length > 0
+        ? or(
+            inArray(organizations.id, selected),
+            eq(organizations.type, 'quick_support'),
+          )
+        : eq(organizations.type, 'quick_support');
+      const rows = await db
+        .select({ id: organizations.id })
+        .from(organizations)
+        .where(
+          and(
+            eq(organizations.partnerId, partnerId),
+            orgFilter,
+            inArray(organizations.status, ['active', 'trial']),
+            isNull(organizations.deletedAt),
+          ),
+        );
+      return rows.map((r) => r.id);
+    }
+
+    // orgAccess === 'all' — list every org under this partner.
+    const rows = await db
+      .select({ id: organizations.id })
+      .from(organizations)
+      .where(
+        and(
+          eq(organizations.partnerId, partnerId),
+          inArray(organizations.status, ['active', 'trial']),
+          isNull(organizations.deletedAt),
+        ),
+      );
+    return rows.map((r) => r.id);
+  });
+}
+
+// Exported for unit tests that exercise the partner-scope resolution path.
+export const _resolvePartnerAccessibleOrgIdsForTests = resolvePartnerAccessibleOrgIds;
+
+async function filterBlockedOAuthClientOrgIds(orgIds: string[], clientId: string | undefined): Promise<string[]> {
+  if (!clientId || orgIds.length === 0) return orgIds;
+
+  return withSystemDbAccessContext(async () => {
+    const now = new Date();
+    const rows = await db
+      .select({ orgId: oauthClientBlocks.orgId })
+      .from(oauthClientBlocks)
+      .where(
+        and(
+          eq(oauthClientBlocks.clientId, clientId),
+          inArray(oauthClientBlocks.orgId, orgIds),
+          or(isNull(oauthClientBlocks.blockedUntil), gt(oauthClientBlocks.blockedUntil, now)),
+        ),
+      );
+    if (rows.length === 0) return orgIds;
+    const blocked = new Set(rows.map((row) => row.orgId));
+    return orgIds.filter((orgId) => !blocked.has(orgId));
+  });
+}
+
+export async function bearerTokenAuthMiddleware(c: Context, next: Next) {
+  if (!OAUTH_ISSUER || !OAUTH_RESOURCE_URL) {
+    throw new HTTPException(500, { message: 'OAuth not configured: OAUTH_ISSUER and OAUTH_RESOURCE_URL must be set' });
+  }
+
+  const auth = c.req.header('Authorization') ?? '';
+  if (!auth.startsWith('Bearer ')) throw new HTTPException(401, { message: 'missing bearer token' });
+
+  const token = auth.slice(7);
+  let payload: JWTPayload & {
+    partner_id?: string | null;
+    org_id?: string | null;
+    grant_id?: string | null;
+    auth_epoch?: number;
+    scope?: string;
+  };
+
+  try {
+    const result: JWTVerifyResult = await jwtVerify(token, getJwks(), {
+      issuer: OAUTH_ISSUER,
+      audience: OAUTH_RESOURCE_URL,
+      algorithms: ['EdDSA'],
+      // Require `exp` — without it the token never expires, defeating
+      // the entire 10-minute access-token lifetime model.
+      requiredClaims: ['exp'],
+    });
+    payload = result.payload as typeof payload;
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    // jose throws errors with codes like ERR_JWS_*, ERR_JWT_*, ERR_JWKS_NO_MATCHING_KEY.
+    // Anything else (no code, or non-jose code) is almost certainly a network/IO problem
+    // talking to the JWKS endpoint - fail loud (503) rather than silently 401-ing every request.
+    const isJoseError = typeof code === 'string' && code.startsWith('ERR_');
+    if (!isJoseError) {
+      console.error('[oauth] jwt verification failed for non-token reason (jwks fetch?)', e);
+      throw new HTTPException(503, { message: 'oauth verification temporarily unavailable' });
+    }
+    throw new HTTPException(401, { message: `invalid token: ${code ?? (e as Error).message}` });
+  }
+
+  if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
+    recordLiveOAuthAuthorization('user_missing', payload.auth_epoch === undefined);
+    throw new HTTPException(401, { message: 'token missing required claims' });
+  }
+
+  // Read the claim now (not to reject on it yet — rejection order below is
+  // unchanged) so the Grant's durable state resolves in the same query.
+  const grantIdClaim = typeof payload.grant_id === 'string' && payload.grant_id.length > 0
+    ? payload.grant_id
+    : null;
+  const liveUser = await assertLiveOAuthUser(payload, new Date(), { grantId: grantIdClaim });
+  if (!liveUser.ok) {
+    recordLiveOAuthAuthorization(liveUser.reason, payload.auth_epoch === undefined);
+    const message = liveUser.status === 503
+      ? `oauth live authorization temporarily unavailable: ${liveUser.reason}`
+      : `oauth live authorization denied: ${liveUser.reason}`;
+    throw new HTTPException(liveUser.status, { message });
+  }
+  recordLiveOAuthAuthorization('authorized', liveUser.legacyClaim);
+
+  if (typeof payload.jti === 'string' && await isJtiRevoked(payload.jti)) {
+    throw new HTTPException(401, { message: 'token revoked' });
+  }
+  // Grant-wide revocation: when a refresh token is revoked or a connected app
+  // is deleted, every access JWT minted from the same Grant must die. The
+  // grant_id claim is set by buildExtraTokenClaims (see oauth/provider.ts).
+  if (!grantIdClaim) {
+    throw new HTTPException(401, { message: 'token missing required claims' });
+  }
+  // Redis first (eager, cheap, covers the window before a durable sweep
+  // lands), then the durable answer already fetched alongside the user. A DB
+  // failure never reaches here as "active": assertLiveOAuthUser has already
+  // returned 503 for it, so uncertainty is fail-closed on both halves.
+  if (await isGrantRevoked(grantIdClaim)) {
+    throw new HTTPException(401, { message: 'token revoked' });
+  }
+  if (!liveUser.grantActive) {
+    throw new HTTPException(401, { message: 'token revoked' });
+  }
+  const clientIdClaim = typeof (payload as { client_id?: unknown }).client_id === 'string'
+    ? (payload as { client_id?: string }).client_id
+    : typeof (payload as { azp?: unknown }).azp === 'string'
+      ? (payload as { azp?: string }).azp
+      : undefined;
+
+  // Org-wide OAuth client block: covers the "no Cursor in Acme Corp for the
+  // next 30 days" admin lever. Org-scoped bearers are rejected outright.
+  // Partner-scoped bearers are filtered below so a block removes only the
+  // blocked org from the partner-wide allowlist while preserving access to
+  // other orgs under the partner.
+  if (typeof payload.org_id === 'string' && clientIdClaim) {
+    const unblocked = await filterBlockedOAuthClientOrgIds([payload.org_id], clientIdClaim);
+    if (unblocked.length === 0) {
+      throw new HTTPException(403, { message: 'oauth client blocked for this organization' });
+    }
+  }
+  if (!payload.partner_id) {
+    throw new HTTPException(401, { message: 'token missing required claims' });
+  }
+  try {
+    // OAuth bearers run with `strictForOauth: true` — pending/suspended/churned
+    // partners are rejected here even though first-party session JWTs would
+    // admit `pending` (so partnerGuard can redirect them to billing). An OAuth
+    // grant for a pending partner should never have been issued (consent in
+    // oauthInteraction.ts blocks it), and a partner flipped to
+    // suspended/churned post-issuance must lose access at request time —
+    // belt-and-suspenders with the proactive revoke in
+    // /admin/partners/:id/suspend-for-abuse.
+    await assertActiveTenantContext(
+      {
+        scope: payload.org_id ? 'organization' : 'partner',
+        partnerId: payload.partner_id,
+        orgId: payload.org_id ?? null,
+      },
+      { strictForOauth: true },
+    );
+  } catch (err) {
+    if (err instanceof TenantInactiveError) {
+      throw new HTTPException(401, { message: 'tenant inactive' });
+    }
+    throw err;
+  }
+
+  const oauthScopes = (payload.scope ?? '').split(' ').filter(Boolean);
+  const effectiveScopes = expandOAuthScopes(oauthScopes, clientIdClaim);
+
+  (c.set as (key: 'apiKey', value: OAuthApiKeyContext) => void)('apiKey', {
+    id: `oauth:${typeof payload.jti === 'string' ? payload.jti : 'no-jti'}`,
+    orgId: payload.org_id ?? null,
+    partnerId: payload.partner_id,
+    name: 'OAuth bearer',
+    keyPrefix: 'oauth',
+    scopes: effectiveScopes,
+    rateLimit: 1000,
+    createdBy: payload.sub,
+    ...(typeof payload.grant_id === 'string' ? { oauthGrantId: payload.grant_id } : {}),
+    ...(clientIdClaim ? { oauthClientId: clientIdClaim } : {}),
+  });
+  if (payload.org_id) c.set('apiKeyOrgId', payload.org_id);
+
+  // Defense-in-depth: resolve the concrete org allowlist for partner-scope
+  // OAuth tokens BEFORE entering the request DB context. Without this we
+  // were passing `accessibleOrgIds: null`, which downstream code interprets
+  // as "system scope, no filter" — defeating the app-layer org filter and
+  // leaning entirely on RLS. See resolvePartnerAccessibleOrgIds() above.
+  const partnerAccessibleOrgIds = payload.org_id
+    ? null
+    : await filterBlockedOAuthClientOrgIds(
+        await resolvePartnerAccessibleOrgIds(payload.partner_id, payload.sub),
+        clientIdClaim,
+      );
+
+  await withDbAccessContext(
+    payload.org_id
+      ? {
+          scope: 'organization',
+          orgId: payload.org_id,
+          accessibleOrgIds: [payload.org_id],
+          // MCP-OAUTH-06: an org-scoped bearer gets NO partner-axis allowlist.
+          // A non-empty accessiblePartnerIds makes breeze_has_partner_access()
+          // pass, which on dual-axis tables (e.g. deployment_invites, whose RLS
+          // is `partner_access OR org_access`) would expose the ENTIRE partner's
+          // rows — leaking sibling-org data to a single-org caller. [] confines
+          // the token to its own org axis.
+          accessiblePartnerIds: [],
+          userId: payload.sub,
+          // Own partner — enables read-only visibility of the partner's
+          // partner-wide rows on every table carrying a
+          // `breeze_current_partner_id()` RLS SELECT branch: the CATALOG tables
+          // (scripts/alert_templates/script_categories/script_tags),
+          // cis_baselines, tenant_variables, and as of #2468 the whole
+          // configuration-policy chain + backup_profiles. This is deliberately
+          // narrower than the partner-axis capability above: currentPartnerId
+          // grants READS only — every WRITE still goes through
+          // breeze_has_partner_access, which an org token never holds.
+          currentPartnerId: payload.partner_id,
+        }
+      : {
+          scope: 'partner',
+          orgId: null,
+          // Resolved list (possibly []) — NEVER null for partner-scope tokens.
+          // [] correctly produces "no rows match" (e.g. fresh tenant with no
+          // orgs yet); null would mean "no filter, see everything".
+          accessibleOrgIds: partnerAccessibleOrgIds ?? [],
+          accessiblePartnerIds: [payload.partner_id],
+          userId: payload.sub,
+          // Own partner — read-visibility of partner-wide catalog rows.
+          currentPartnerId: payload.partner_id,
+        },
+    async () => {
+      await next();
+    }
+  );
+}

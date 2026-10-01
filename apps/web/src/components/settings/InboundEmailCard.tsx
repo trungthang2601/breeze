@@ -1,0 +1,430 @@
+import { useCallback, useEffect, useState } from 'react';
+import { fetchWithAuth } from '../../stores/auth';
+import { fetchAllOrganizationsFrom } from '../../lib/fetchAllOrganizations';
+import { runAction, handleActionError } from '../../lib/runAction';
+import { navigateTo } from '@/lib/navigation';
+import { loginPathWithNext } from '../../lib/authScope';
+import { showToast } from '../shared/Toast';
+import { CustomerDomainsCard } from './CustomerDomainsCard';
+import { Trans, useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+
+// How inbound mail from an unmatched ("unknown") sender is handled. Mirrors the
+// API's PartnerInboundPolicy union (settings.ticketing.inbound.unknownSenderMode).
+type UnknownSenderMode = 'quarantine' | 'triage' | 'drop';
+
+interface InboundConfig {
+  enabled: boolean;
+  address: string;
+  addressOverride: string | null;
+  inboundLocalPart: string | null;
+  defaultTriageOrgId: string | null;
+  autoresponderEnabled: boolean;
+  unknownSenderMode: UnknownSenderMode;
+  dropUnverifiedSenders: boolean;
+  autoresponseSubject: string | null;
+  autoresponseBody: string | null;
+  // Reply-content mode. Not yet edited by this card, but carried through so a save
+  // preserves a value set via the API (the PATCH route replaces the inbound
+  // sub-object wholesale — an omitted field is destroyed).
+  fullMessageReply: boolean;
+  slug: string;
+  domainConfigured: boolean;
+  // Connected M365 shared mailboxes (status 'connected'). Absent on an older
+  // API → 0 → the card behaves exactly as it did before this field existed.
+  connectedMailboxCount?: number;
+  // Mirrors the API's IS_HOSTED. Absent (older API) is treated as hosted so we
+  // don't show a self-host-only variable name to a hosted partner.
+  isHosted?: boolean;
+}
+
+// The self-hosted setup section added in #3586.
+const INBOUND_DOCS_URL = 'https://docs.breezermm.com/deploy/environment/#inbound-email-to-ticket-mailgun';
+
+interface OrgOption {
+  id: string;
+  name: string;
+}
+
+const UNAUTHORIZED = () => void navigateTo(loginPathWithNext(), { replace: true });
+
+export default function InboundEmailCard() {
+  const { t } = useTranslation('settings');
+  const saveError = t('inboundEmail.saveError');
+  const friendlyCode = (code: string): string | undefined =>
+    code === 'ORG_NOT_ACCESSIBLE' ? t('inboundEmail.orgNotAccessible') : undefined;
+  const [cfg, setCfg] = useState<InboundConfig | null>(null);
+  const [orgs, setOrgs] = useState<OrgOption[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [localPartDraft, setLocalPartDraft] = useState('');
+
+  const loadConfig = useCallback(async () => {
+    const res = await fetchWithAuth('/ticket-config');
+    if (!res.ok) {
+      setError(true);
+      return;
+    }
+    const body = (await res.json()) as { data: { inbound: InboundConfig } };
+    const nextCfg: InboundConfig = {
+      ...body.data.inbound,
+      inboundLocalPart: body.data.inbound.inboundLocalPart ?? null,
+    };
+    setCfg(nextCfg);
+    setLocalPartDraft(nextCfg.inboundLocalPart ?? (nextCfg.address?.split('@')[0] ?? ''));
+  }, []);
+
+  const loadOrgs = useCallback(async () => {
+    try {
+      const list = await fetchAllOrganizationsFrom<OrgOption>('/orgs/organizations');
+      setOrgs(list);
+    } catch {
+      // Degrade silently — mirrors the previous non-ok behavior.
+    }
+  }, []);
+
+  const loadAll = useCallback(
+    async () => {
+      setLoading(true);
+      setError(false);
+      try {
+        await Promise.all([loadConfig(), loadOrgs()]);
+      } catch {
+        setError(true);
+      }
+      setLoading(false);
+    },
+    [loadConfig, loadOrgs],
+  );
+
+  useEffect(() => {
+    void loadAll();
+  }, [loadAll]);
+
+  const saveConfig = useCallback(
+    async (
+      patch: Partial<
+        Pick<
+          InboundConfig,
+          | 'enabled'
+          | 'defaultTriageOrgId'
+          | 'autoresponderEnabled'
+          | 'unknownSenderMode'
+          | 'dropUnverifiedSenders'
+          | 'autoresponseSubject'
+          | 'autoresponseBody'
+        >
+      >,
+    ) => {
+      if (!cfg) return;
+      const next = { ...cfg, ...patch };
+      // Send the COMPLETE ticketing.inbound object — PATCH /partners/me deep-merges
+      // `ticketing` one level but replaces the `inbound` sub-object wholesale, so any
+      // omitted inbound field is destroyed (this also retires the legacy
+      // `triageUnknownSenders` key, which we no longer send).
+      // Include `address` ONLY when there is a real self-hosted override (never the
+      // derived value, which would persist a derived address as a spurious override).
+      const inbound: Record<string, unknown> = {
+        enabled: next.enabled,
+        defaultTriageOrgId: next.defaultTriageOrgId,
+        autoresponderEnabled: next.autoresponderEnabled,
+        unknownSenderMode: next.unknownSenderMode,
+        dropUnverifiedSenders: next.dropUnverifiedSenders,
+        autoresponseSubject: next.autoresponseSubject,
+        autoresponseBody: next.autoresponseBody,
+        // Preserve reply mode across a wholesale-replace save, even though this
+        // card does not edit it yet.
+        ...(next.fullMessageReply ? { fullMessageReply: true } : {}),
+      };
+      if (next.addressOverride) inbound.address = next.addressOverride;
+      setSaving(true);
+      try {
+        await runAction({
+          request: () =>
+            fetchWithAuth('/orgs/partners/me', {
+              method: 'PATCH',
+              body: JSON.stringify({ settings: { ticketing: { inbound } } }),
+            }),
+          errorFallback: saveError,
+          successMessage: t('inboundEmail.saved'),
+          friendly: friendlyCode,
+          onUnauthorized: UNAUTHORIZED,
+        });
+        setCfg(next);
+      } catch (err) {
+        handleActionError(err, saveError);
+      } finally {
+        setSaving(false);
+      }
+    },
+    [cfg, saveError, t],
+  );
+
+  const saveLocalPart = useCallback(async () => {
+    if (!cfg) return;
+    const value = localPartDraft.trim().toLowerCase();
+    const current = cfg.inboundLocalPart ?? cfg.address.split('@')[0];
+    if (value === current) return;
+    const ok = window.confirm(
+      t('inboundEmail.changeAddressConfirm'),
+    );
+    if (!ok) return;
+    setSaving(true);
+    try {
+      await runAction({
+        request: () =>
+          fetchWithAuth('/orgs/partners/me', {
+            method: 'PATCH',
+            body: JSON.stringify({ inboundLocalPart: value }),
+          }),
+        errorFallback: saveError,
+        successMessage: t('inboundEmail.addressUpdated'),
+        friendly: friendlyCode,
+        onUnauthorized: UNAUTHORIZED,
+      });
+      const domainPart = cfg.address.split('@')[1] ?? '';
+      setCfg({ ...cfg, inboundLocalPart: value, address: cfg.addressOverride ?? `${value}@${domainPart}` });
+    } catch (err) {
+      handleActionError(err, saveError);
+    } finally {
+      setSaving(false);
+    }
+  }, [cfg, localPartDraft, saveError, t]);
+
+  const copyAddress = useCallback(() => {
+    if (cfg?.address) {
+      void navigator.clipboard?.writeText(cfg.address);
+      showToast({ type: 'success', message: t('inboundEmail.addressCopied') });
+    }
+  }, [cfg, t]);
+
+  if (loading)
+    return (
+      <p className="mt-6 text-center text-sm text-muted-foreground" data-testid="inbound-email-loading">
+        {t('common:states.loading')}
+      </p>
+    );
+  if (error || !cfg)
+    return (
+      <p className="mt-6 text-center text-sm text-muted-foreground" data-testid="inbound-email-error">
+        {t('inboundEmail.loadFailed')}{' '}
+        <button
+          type="button"
+          onClick={() => void loadAll()}
+          className="underline hover:text-foreground"
+          data-testid="inbound-email-retry"
+        >
+          {t('common:actions.retry')}
+        </button>
+      </p>
+    );
+
+  return (
+    <div className="max-w-3xl space-y-6" data-testid="inbound-email-card">
+      <section className="rounded-lg border p-4" data-testid="inbound-toggles-section">
+        <h2 className="mb-1 text-sm font-semibold">{t('inboundEmail.title')}</h2>
+        <p className="mb-3 text-xs text-muted-foreground">
+          {t('inboundEmail.description')}
+        </p>
+
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={cfg.enabled}
+            disabled={saving}
+            onChange={(e) => void saveConfig({ enabled: e.target.checked })}
+            data-testid="inbound-enabled-toggle"
+          />
+          {t('inboundEmail.enable')}
+        </label>
+
+        <div className="mt-3">
+          <label className="text-xs font-medium" htmlFor="inbound-triage-org">
+            {t('inboundEmail.triageOrganization')}
+          </label>
+          <select
+            id="inbound-triage-org"
+            value={cfg.defaultTriageOrgId ?? ''}
+            disabled={saving}
+            onChange={(e) => void saveConfig({ defaultTriageOrgId: e.target.value || null })}
+            className="mt-0.5 block w-full rounded-md border bg-background px-2.5 py-1.5 text-sm"
+            data-testid="inbound-triage-org"
+          >
+            <option value="">{t('common:labels.none')}</option>
+            {orgs.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <fieldset className="mt-4" data-testid="inbound-unknown-sender-mode">
+          <legend className="text-xs font-medium">{t('inboundEmail.unknownSenders')}</legend>
+          <p className="mb-1.5 text-xs text-muted-foreground">
+            {t('inboundEmail.unknownDescription')}
+          </p>
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="radio"
+              name="unknown-sender-mode"
+              className="mt-0.5"
+              checked={cfg.unknownSenderMode === 'quarantine'}
+              disabled={saving}
+              onChange={() => void saveConfig({ unknownSenderMode: 'quarantine' })}
+              data-testid="inbound-unknown-quarantine"
+            />
+            <span>
+              {t('inboundEmail.quarantine')} <span className="text-muted-foreground">({t('inboundEmail.default')})</span>
+              <span className="block text-xs text-muted-foreground">
+                {t('inboundEmail.quarantineDescription')}
+              </span>
+            </span>
+          </label>
+          <label className="mt-2 flex items-start gap-2 text-sm">
+            <input
+              type="radio"
+              name="unknown-sender-mode"
+              className="mt-0.5"
+              checked={cfg.unknownSenderMode === 'triage'}
+              disabled={saving || !cfg.defaultTriageOrgId}
+              onChange={() => void saveConfig({ unknownSenderMode: 'triage' })}
+              data-testid="inbound-unknown-triage"
+            />
+            <span>
+              {t('inboundEmail.routeToTriage')}
+              <span className="block text-xs text-muted-foreground">
+                {t('inboundEmail.triageDescription')}
+                {!cfg.defaultTriageOrgId && ` ${t('inboundEmail.selectTriageFirst')}`}
+              </span>
+            </span>
+          </label>
+          <label className="mt-2 flex items-start gap-2 text-sm">
+            <input
+              type="radio"
+              name="unknown-sender-mode"
+              className="mt-0.5"
+              checked={cfg.unknownSenderMode === 'drop'}
+              disabled={saving}
+              onChange={() => void saveConfig({ unknownSenderMode: 'drop' })}
+              data-testid="inbound-unknown-drop"
+            />
+            <span>
+              {t('inboundEmail.dropSilently')}
+              <span className="block text-xs text-muted-foreground">
+                {t('inboundEmail.dropDescription')}
+              </span>
+            </span>
+          </label>
+        </fieldset>
+
+        <label className="mt-4 flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={cfg.dropUnverifiedSenders}
+            disabled={saving}
+            onChange={(e) => void saveConfig({ dropUnverifiedSenders: e.target.checked })}
+            data-testid="inbound-drop-unverified-toggle"
+          />
+          <span>
+            {t('inboundEmail.dropUnverified')}
+            <span className="block text-xs text-muted-foreground">
+              <Trans i18nKey="inboundEmail.dropUnverifiedDescription" t={t} components={{ all: <em /> }} />
+            </span>
+          </span>
+        </label>
+
+        <label className="mt-3 flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={cfg.autoresponderEnabled}
+            disabled={saving}
+            onChange={(e) => void saveConfig({ autoresponderEnabled: e.target.checked })}
+            data-testid="inbound-autoresponder-toggle"
+          />
+          {t('inboundEmail.enableAutoresponse')}
+        </label>
+
+        <p className="mt-3 text-xs text-muted-foreground">
+          {t('inboundEmail.editEmailTemplates')}{' '}
+          <button
+            type="button"
+            className="underline hover:text-foreground"
+            data-testid="inbound-edit-email-templates"
+            onClick={() => void navigateTo('/settings/partner#email-templates')}
+          >
+            {t('inboundEmail.editEmailTemplatesLink')}
+          </button>
+        </p>
+      </section>
+
+      <section className="rounded-lg border p-4" data-testid="inbound-address-section">
+        <h2 className="mb-1 text-sm font-semibold">{t('inboundEmail.address')}</h2>
+        {cfg.domainConfigured ? (
+          <div className="mt-0.5 flex items-center gap-2">
+            <input
+              value={localPartDraft}
+              onChange={(e) => setLocalPartDraft(e.target.value)}
+              className="w-40 rounded-md border px-2.5 py-1.5 text-sm"
+              data-testid="inbound-localpart"
+              aria-label={t('inboundEmail.localPart')}
+            />
+            <span className="text-sm text-muted-foreground">@{cfg.address.split('@')[1] ?? ''}</span>
+            <button
+              type="button"
+              onClick={saveLocalPart}
+              disabled={saving || localPartDraft === (cfg.inboundLocalPart ?? cfg.address.split('@')[0])}
+              className="rounded-md border px-2.5 py-1.5 text-sm"
+              data-testid="inbound-localpart-save"
+            >
+              {t('common:actions.save')}
+            </button>
+            <button
+              type="button"
+              onClick={copyAddress}
+              className="rounded-md border px-2.5 py-1.5 text-sm"
+              data-testid="inbound-address-copy"
+            >
+              {t('common:actions.copy')}
+            </button>
+          </div>
+        ) : (cfg.connectedMailboxCount ?? 0) > 0 ? (
+          // Only the NATIVE address is missing — mail is still arriving via the
+          // connected M365 mailbox(es) listed in the card below, which need no
+          // inbound domain. Rendering the amber "not configured" error here told
+          // M365-only operators their working setup was broken (#3598).
+          <p className="mt-0.5 text-xs text-muted-foreground" data-testid="inbound-address-via-mailbox">
+            {t('inboundEmail.addressViaMailbox')}
+          </p>
+        ) : (
+          <p className="mt-0.5 text-xs text-amber-600" data-testid="inbound-address-unconfigured">
+            {cfg.isHosted === false ? (
+              <Trans
+                i18nKey="inboundEmail.domainNotConfiguredSelfHosted"
+                t={t}
+                components={{
+                  var: <code className="rounded bg-muted px-1 py-0.5 font-mono" />,
+                  docs: (
+                    <a
+                      href={INBOUND_DOCS_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline"
+                      data-testid="inbound-address-unconfigured-docs"
+                    />
+                  ),
+                }}
+              />
+            ) : (
+              t('inboundEmail.domainNotConfigured')
+            )}
+          </p>
+        )}
+      </section>
+
+      <CustomerDomainsCard />
+    </div>
+  );
+}

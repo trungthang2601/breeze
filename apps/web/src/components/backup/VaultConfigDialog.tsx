@@ -1,0 +1,244 @@
+import { useCallback, useState } from 'react';
+import { HardDrive, Loader2, Server, Usb, X } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { extractApiError } from '@/lib/apiError';
+import { fetchWithAuth } from '../../stores/auth';
+import { useTranslation } from 'react-i18next';
+import { useDeviceOptions } from '../../hooks/useDeviceOptions';
+import { DeviceOptionPicker } from '../filters/DeviceOptionPicker';
+import '../../lib/i18n';
+
+// ── Types ──────────────────────────────────────────────────────────
+
+type VaultType = 'local' | 'smb' | 'usb';
+
+type Vault = {
+  id: string;
+  deviceId: string;
+  vaultPath: string;
+  type: VaultType;
+  retentionCount?: number | null;
+  [key: string]: unknown;
+};
+
+type VaultConfigDialogProps = {
+  vault: Vault | null;
+  onClose: (saved?: boolean) => void;
+};
+
+const typeOptions: { value: VaultType; label: string; icon: typeof HardDrive; description: string }[] = [
+  { value: 'local', label: 'Local', icon: HardDrive, description: 'Local disk path' },
+  { value: 'smb', label: 'SMB', icon: Server, description: 'Network SMB share' },
+  { value: 'usb', label: 'USB', icon: Usb, description: 'USB attached storage' },
+];
+
+// ── Component ─────────────────────────────────────────────────────
+
+export default function VaultConfigDialog({ vault, onClose }: VaultConfigDialogProps) {
+  const { t } = useTranslation('backup');
+  const isEdit = !!vault;
+
+  const [deviceId, setDeviceId] = useState(vault?.deviceId ?? '');
+  const [vaultPath, setVaultPath] = useState(vault?.vaultPath ?? '');
+  const [vaultType, setVaultType] = useState<VaultType>(vault?.type ?? 'local');
+  const [retentionCount, setRetentionCount] = useState(vault?.retentionCount ?? 3);
+  const [deviceSearch, setDeviceSearch] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
+  const deviceOptions = useDeviceOptions({
+    search: deviceSearch,
+    includeIds: deviceId ? [deviceId] : [],
+  });
+
+  const handleSave = useCallback(async () => {
+    setError(undefined);
+
+    if (!deviceId.trim()) {
+      setError('Please select a device');
+      return;
+    }
+    if (!deviceOptions.canSubmit) {
+      setError('Device choice is not ready. Retry before saving.');
+      return;
+    }
+    if (!vaultPath.trim()) {
+      setError('Please enter a vault path');
+      return;
+    }
+    if (retentionCount < 1 || retentionCount > 100) {
+      setError('Retention count must be between 1 and 100');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const body = {
+        deviceId,
+        vaultPath,
+        type: vaultType,
+        retentionCount,
+      };
+
+      const url = isEdit ? `/backup/vault/${vault.id}` : '/backup/vault';
+      const method = isEdit ? 'PATCH' : 'POST';
+
+      const response = await fetchWithAuth(url, {
+        method,
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(extractApiError(data, `Failed to ${isEdit ? 'update' : 'create'} vault`));
+      }
+
+      onClose(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'An error occurred');
+    } finally {
+      setSaving(false);
+    }
+  }, [deviceId, deviceOptions.canSubmit, isEdit, onClose, retentionCount, vault?.id, vaultPath, vaultType]);
+
+  const placeholderExamples: Record<VaultType, string> = {
+    local: '/mnt/backup/vault or D:\\Backups\\Vault',
+    smb: '\\\\nas-01\\backups\\vault',
+    usb: 'E:\\BreeezeVault',
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="w-full max-w-lg rounded-lg border bg-card p-6 shadow-xl">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-semibold text-foreground">
+            {isEdit ? 'Edit Vault' : 'Add Vault'}
+          </h3>
+          <button
+            type="button"
+            onClick={() => onClose()}
+            className="rounded-md p-1 hover:bg-muted"
+          >
+            <X className="h-4 w-4 text-muted-foreground" />
+          </button>
+        </div>
+
+        {error && (
+          <div className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </div>
+        )}
+
+        <div className="mt-4 space-y-4">
+          {/* Device Picker */}
+          <div>
+            <label htmlFor="vault-device" className="text-xs font-medium text-muted-foreground">
+              {t('vaultConfigDialog.device')} </label>
+            {isEdit ? (
+              <div className="mt-1 rounded-md border bg-muted/20 px-3 py-2 text-sm">
+                {deviceOptions.state === 'loading'
+                  ? t('vaultConfigDialog.loadingDevices')
+                  : deviceOptions.state === 'error' || !deviceOptions.canSubmit
+                    ? (deviceOptions.error?.message ?? 'Selected device could not be resolved')
+                    : (deviceOptions.options[0]?.displayName ?? deviceOptions.options[0]?.hostname ?? deviceId)}
+              </div>
+            ) : (
+              <DeviceOptionPicker
+                className="mt-1"
+                result={deviceOptions}
+                selectedIds={deviceId ? [deviceId] : []}
+                onSelectedIdsChange={(ids) => setDeviceId(ids[0] ?? '')}
+                search={deviceSearch}
+                onSearchChange={setDeviceSearch}
+                selectionMode="single"
+              />
+            )}
+          </div>
+
+          {/* Vault Path */}
+          <div>
+            <label htmlFor="vault-path" className="text-xs font-medium text-muted-foreground">
+              {t('vaultConfigDialog.vaultPath')} </label>
+            <input
+              id="vault-path"
+              value={vaultPath}
+              onChange={(e) => setVaultPath(e.target.value)}
+              placeholder={placeholderExamples[vaultType]}
+              className="mt-1 h-10 w-full rounded-md border bg-background px-3 font-mono text-sm"
+            />
+          </div>
+
+          {/* Vault Type */}
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">{t('vaultConfigDialog.vaultType')}</label>
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              {typeOptions.map((opt) => {
+                const Icon = opt.icon;
+                return (
+                  <label
+                    key={opt.value}
+                    className={cn(
+                      'flex cursor-pointer items-center gap-2 rounded-md border p-3 text-sm transition',
+                      vaultType === opt.value
+                        ? 'border-primary/40 bg-primary/10'
+                        : 'border-muted hover:border-muted-foreground/30'
+                    )}
+                  >
+                    <input
+                      type="radio"
+                      name="vaultType"
+                      value={opt.value}
+                      checked={vaultType === opt.value}
+                      onChange={() => setVaultType(opt.value)}
+                      className="hidden"
+                    />
+                    <Icon className={cn('h-4 w-4', vaultType === opt.value ? 'text-primary' : 'text-muted-foreground')} />
+                    <div>
+                      <span className="font-medium text-foreground">{opt.label}</span>
+                      <p className="text-[10px] text-muted-foreground">{opt.description}</p>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Retention Count */}
+          <div>
+            <label htmlFor="vault-retention" className="text-xs font-medium text-muted-foreground">
+              {t('vaultConfigDialog.retentionCount')} </label>
+            <input
+              id="vault-retention"
+              type="number"
+              min={1}
+              max={100}
+              value={retentionCount}
+              onChange={(e) => setRetentionCount(Number(e.target.value) || 3)}
+              className="mt-1 h-10 w-full rounded-md border bg-background px-3 text-sm"
+            />
+            <p className="mt-1 chart-legend-xs text-muted-foreground">
+              {t('vaultConfigDialog.numberOfSnapshotsToKeepInTheVault')} </p>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="mt-6 flex items-center justify-end gap-2 border-t pt-4">
+          <button
+            type="button"
+            onClick={() => onClose()}
+            className="rounded-md border px-4 py-2 text-sm font-medium text-muted-foreground hover:bg-muted"
+          >
+            {t('vaultConfigDialog.cancel')} </button>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving || !deviceOptions.canSubmit}
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+            {isEdit ? 'Update Vault' : 'Create Vault'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

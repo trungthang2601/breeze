@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import UsersPage from '../../components/settings/UsersPage';
+---
+
+<DashboardLayout titleKey="titles.settingsUsers">
+  <UsersPage client:load />
+</DashboardLayout>

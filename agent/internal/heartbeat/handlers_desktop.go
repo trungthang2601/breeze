@@ -1,0 +1,917 @@
+package heartbeat
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/ipc"
+	"github.com/breeze-rmm/agent/internal/remote/desktop"
+	"github.com/breeze-rmm/agent/internal/remote/tools"
+	"github.com/breeze-rmm/agent/internal/sessionbroker"
+)
+
+const (
+	maxDesktopDisplayIndex  = 16
+	maxDesktopCoordinateAbs = 100000
+	maxDesktopScrollDelta   = 120
+	maxDesktopKeyBytes      = 64
+	maxDesktopModifierBytes = 16
+	maxDesktopModifiers     = 8
+
+	// Cap for the caller-supplied idle timeout in the direct-mode (map-payload)
+	// decoder. Same maximum as the IPC path (userhelper), but note the
+	// enforcement DIFFERS: this decoder has no error channel so it CLAMPS,
+	// whereas the IPC path REJECTS out-of-range input with an error. Either way
+	// the agent can't be pushed past it. 0 = disabled.
+	maxIdleTimeoutMinutes = 1440 // 24h
+
+	// Fallback grace window when the server omits graceSec. The 12h max-session
+	// ceiling is NOT duplicated here: desktop.ClampMaxDuration owns it for both
+	// decoders.
+	defaultRevocationLeaseGrace = desktop.DefaultRevocationLeaseGrace
+)
+
+var desktopInputTypes = map[string]struct{}{
+	"mouse_move":   {},
+	"mouse_click":  {},
+	"mouse_down":   {},
+	"mouse_up":     {},
+	"mouse_scroll": {},
+	"key_press":    {},
+	"key_down":     {},
+	"key_up":       {},
+}
+
+var desktopMouseButtons = map[string]struct{}{
+	"":       {},
+	"left":   {},
+	"right":  {},
+	"middle": {},
+}
+
+var desktopInputModifiers = map[string]string{
+	"alt":     "alt",
+	"cmd":     "meta",
+	"control": "ctrl",
+	"ctrl":    "ctrl",
+	"meta":    "meta",
+	"shift":   "shift",
+	"super":   "meta",
+	"win":     "meta",
+}
+
+// handleSASFromHelper is called when the user helper requests a Secure
+// Attention Sequence. The service process (this process) is SCM-registered
+// and is the most reliable path for SendSAS(FALSE). The helper can also
+// attempt InvokeSAS() as a fallback (see session_control.go), but SendSAS
+// may be ignored by Windows if the caller is not SCM-registered.
+func (h *Heartbeat) handleSASFromHelper(session *sessionbroker.Session, env *ipc.Envelope) {
+	log.Info("SAS request from user helper",
+		"identity", session.IdentityKey,
+		"winSession", session.WinSessionID,
+	)
+
+	sasErr := desktop.InvokeSAS()
+	resp := ipc.SASResponse{OK: sasErr == nil}
+	if sasErr != nil {
+		resp.Error = sasErr.Error()
+		log.Warn("SAS invocation failed", "error", sasErr.Error())
+	} else {
+		log.Info("SAS invoked successfully from service context")
+	}
+
+	if err := session.SendNotify(env.ID, ipc.TypeSASResponse, resp); err != nil {
+		log.Warn("failed to send SAS response to helper", "error", err.Error())
+	}
+}
+
+// serviceUnavailable returns a failed CommandResult for commands that cannot
+// operate from Session 0 (Windows service mode).
+func serviceUnavailable(command string, start time.Time) tools.CommandResult {
+	return tools.CommandResult{
+		Status:     "failed",
+		Error:      command + " unavailable in headless/service mode; use WebRTC instead",
+		DurationMs: time.Since(start).Milliseconds(),
+	}
+}
+
+func init() {
+	handlerRegistry[tools.CmdStartDesktop] = handleStartDesktop
+	handlerRegistry[tools.CmdStopDesktop] = handleStopDesktop
+	handlerRegistry[tools.CmdDesktopStreamStart] = handleDesktopStreamStart
+	handlerRegistry[tools.CmdDesktopStreamStop] = handleDesktopStreamStop
+	handlerRegistry[tools.CmdDesktopInput] = handleDesktopInput
+	handlerRegistry[tools.CmdDesktopConfig] = handleDesktopConfig
+	handlerRegistry[tools.CmdListSessions] = handleListSessions
+}
+
+func handleStartDesktop(h *Heartbeat, cmd Command) tools.CommandResult {
+	start := time.Now()
+	sessionID, _ := cmd.Payload["sessionId"].(string)
+	offer, _ := cmd.Payload["offer"].(string)
+	log.Info("start_desktop command received",
+		"commandId", cmd.ID,
+		"sessionId", sessionID,
+		"hasOffer", offer != "",
+		"isService", h.isService,
+		"isHeadless", h.isHeadless,
+		"hasBroker", h.sessionBroker != nil,
+	)
+	if sessionID == "" || offer == "" {
+		return tools.CommandResult{
+			Status:     "failed",
+			Error:      "missing sessionId or offer",
+			DurationMs: time.Since(start).Milliseconds(),
+		}
+	}
+	if err := validateDesktopSessionID(sessionID); err != nil {
+		return tools.CommandResult{
+			Status:     "failed",
+			Error:      err.Error(),
+			DurationMs: time.Since(start).Milliseconds(),
+		}
+	}
+
+	// SEC-038 start fence. Checked before ANY side effect — before leases,
+	// before the consent prompt, before capture — so a superseded or
+	// post-terminal start cannot spawn a helper, show a banner, or take a
+	// lease on its way to being refused.
+	fenceInput, genErr := parseDesktopStartGeneration(cmd.Payload)
+	if genErr != nil {
+		// Fail closed: a generation we cannot compare is one we cannot honour.
+		log.Warn("refusing start_desktop with a malformed start generation",
+			"sessionId", sessionID, "commandId", cmd.ID, "error", genErr.Error())
+		return tools.NewErrorResult(
+			desktopStartFenceError(desktopFenceReasonMalformed, genErr.Error()),
+			time.Since(start).Milliseconds())
+	}
+	fenceInput.CommandID = cmd.ID
+	decision := h.desktopStartFence.admitStart(sessionID, fenceInput)
+	if decision.NeedsSync {
+		// W05: the fence has no in-process record of this session — fresh
+		// install, a lost or corrupt state file, an evicted entry, or simply
+		// the first start since this agent started. The payload alone cannot
+		// be ordered against a terminal the endpoint may have forgotten, so
+		// ask the control plane what it currently believes and decide on that.
+		// Bounded, once per session, and fail-closed on no answer.
+		if !h.syncDesktopFence(sessionID) {
+			return tools.NewErrorResult(
+				desktopStartFenceError(desktopFenceReasonUnsynced,
+					"the control plane did not confirm this session's generation"),
+				time.Since(start).Milliseconds())
+		}
+		decision = h.desktopStartFence.admitStart(sessionID, fenceInput)
+	}
+	if !decision.Admitted {
+		log.Warn("refusing start_desktop at the desktop start fence",
+			"sessionId", sessionID,
+			"commandId", cmd.ID,
+			"reason", string(decision.Reason),
+			"generation", fenceInput.Generation,
+			"highWater", decision.HighWater,
+		)
+		return tools.NewErrorResult(
+			desktopStartFenceError(decision.Reason, ""),
+			time.Since(start).Milliseconds())
+	}
+
+	// Parse optional ICE servers from payload
+	var iceServers []desktop.ICEServerConfig
+	if raw, ok := cmd.Payload["iceServers"].([]interface{}); ok {
+		for _, item := range raw {
+			if m, ok := item.(map[string]interface{}); ok {
+				username, _ := m["username"].(string)
+				credential, _ := m["credential"].(string)
+				s := desktop.ICEServerConfig{
+					URLs:       m["urls"],
+					Username:   username,
+					Credential: credential,
+				}
+				iceServers = append(iceServers, s)
+			}
+		}
+	}
+
+	// Parse optional display index (multi-monitor selection)
+	displayIndex := desktop.PrimaryMonitorIndex()
+	if di, ok := cmd.Payload["displayIndex"].(float64); ok {
+		if di < 0 || di > maxDesktopDisplayIndex || math.Trunc(di) != di {
+			return tools.CommandResult{
+				Status:     "failed",
+				Error:      fmt.Sprintf("displayIndex must be an integer between 0 and %d", maxDesktopDisplayIndex),
+				DurationMs: time.Since(start).Milliseconds(),
+			}
+		}
+		displayIndex = int(di)
+	}
+
+	policy := parseDesktopSessionPolicy(cmd.Payload)
+	if policy.RevocationLease == nil {
+		// Fail closed. Without a lease the control plane has no way to end this
+		// session once the operator's authorization changes, and the API refuses
+		// to dispatch a start to an agent that has not declared the capability —
+		// so reaching here means a malformed or downgraded payload.
+		return tools.NewErrorResult(desktop.ErrRevocationLeaseRequired, time.Since(start).Milliseconds())
+	}
+
+	// Explicit per-session target (multi-session hosts): the Windows session
+	// this connect is shadowing, if any. Recorded before the consent gate so
+	// the consent prompt lands in the right session, and remembered under
+	// sessionID so the stop path (handleConsentSessionEnd, via
+	// h.takeDesktopTarget) routes the banner-hide/end-notify to the same user.
+	// "" means untargeted/legacy — every helper below keeps the pre-existing
+	// machine-global selection in that case.
+	targetSession := ""
+	if ts, ok := cmd.Payload["targetSessionId"].(float64); ok {
+		targetSession = strconv.Itoa(int(ts))
+	}
+	h.setDesktopTarget(sessionID, targetSession)
+
+	// Consent gate (Task 9): when the API attached a `prompt` block in mode
+	// "consent", ask the end user BEFORE starting any capture. A denial (or a
+	// policy-driven block when no user can answer) short-circuits with a
+	// `consent_denied` marker the API ingests to finalize the session as
+	// `denied`. An older API that sends no prompt leaves this path untouched.
+	prompt := parseDesktopPrompt(cmd.Payload)
+
+	// On-demand (RDS) hosts run zero helpers at rest: the helper this connect
+	// needs does not exist yet and is only spawned while a lease is held on its
+	// {session, role}. Take the leases BEFORE the consent gate so the consent
+	// dialog has a user helper to render in, and so the capture helper is
+	// already spawning while the user decides.
+	onDemand := h.lifecycleMode() == "on-demand"
+	if onDemand && h.sessionBroker != nil {
+		if targetSession == "" {
+			// Legacy callers (no picker) get the console session — at rest an
+			// RDS host has zero helpers, so an untargeted connect must still
+			// pick a concrete session to lease.
+			targetSession = h.sessionBroker.ConsoleSessionID()
+			if n, err := strconv.Atoi(targetSession); err == nil {
+				cmd.Payload["targetSessionId"] = float64(n) // startDesktopViaHelper re-parses payload
+			}
+			h.setDesktopTarget(sessionID, targetSession)
+		}
+		winID, err := resolveDesktopTargetWinID(targetSession)
+		if err != nil {
+			h.takeDesktopTarget(sessionID)
+			return tools.NewErrorResult(err, time.Since(start).Milliseconds())
+		}
+		wantConsentUI := prompt != nil && prompt.Mode != "off"
+		if failure := h.acquireDesktopLeases(sessionID, winID, wantConsentUI); failure != nil {
+			h.takeDesktopTarget(sessionID)
+			failure.DurationMs = time.Since(start).Milliseconds()
+			return *failure
+		}
+		if wantConsentUI {
+			// Give the user-role helper a bounded head start so the consent
+			// dialog can render in-session; not-ready degrades to the
+			// policy's consentUnavailableBehavior (helperPresent=false).
+			waitCtx, cancelWait := context.WithTimeout(context.Background(), consentHelperWait)
+			res := h.lifecycleController().WaitForHelperReady(waitCtx, sessionbroker.HelperKey{WindowsSessionID: winID, Role: ipc.HelperRoleUser})
+			cancelWait()
+			if res.Status != sessionbroker.HelperWaitReady {
+				log.Warn("consent helper not ready in target session",
+					"sessionId", sessionID, "target", targetSession, "status", string(res.Status))
+			}
+		}
+	}
+
+	if prompt != nil && prompt.Mode == "consent" {
+		verdict, helperPresent, timedOut := h.requestConsent(sessionID, prompt, targetSession)
+		proceed, reason := decideConsent(verdict, helperPresent, timedOut, prompt.ConsentUnavailableBehavior)
+		if !proceed {
+			log.Info("remote session denied by consent gate",
+				"sessionId", sessionID, "reason", reason)
+			// The session never started — no disconnect event will ever arrive
+			// to release this via handleConsentSessionEnd, so clear it here.
+			h.releaseDesktopLeases(sessionID)
+			h.takeDesktopTarget(sessionID)
+			return consentDeniedResult(sessionID, reason, time.Since(start).Milliseconds())
+		}
+	}
+
+	// Route through IPC helper when running headless (no display access).
+	// ScreenCaptureKit requires a GUI session (Aqua) — root daemons on macOS
+	// cannot capture the screen directly even with TCC permission.
+	// Linux is excluded: there is no IPC helper on Linux in Phase 1, so a booted-
+	// headless Linux box must take the direct path (the X11 capturer resolves the
+	// display itself). Never gate Linux on the latched-at-boot headless flag.
+	if (h.isService || h.isHeadless) && h.sessionBroker != nil && runtime.GOOS != "linux" {
+		result := h.startDesktopViaHelper(sessionID, offer, iceServers, displayIndex, policy, cmd.Payload)
+		// A start is admitted long before it streams: consent, helper spawn
+		// and capture setup all happen after the fence decision, and a stop
+		// arriving inside that window finds nothing to stop. Re-check the
+		// tombstone now that the session exists, and tear it down if one
+		// landed meanwhile.
+		if result.Status == "completed" && h.desktopSessionTerminalAfterStart(sessionID) {
+			return tools.NewErrorResult(desktopStartTombstonedError(), time.Since(start).Milliseconds())
+		}
+		if result.Status == "completed" && prompt != nil {
+			h.afterDesktopStart(sessionID, prompt, targetSession)
+			result = withConsentGranted(result, prompt)
+		} else if result.Status != "completed" {
+			// Helper start failed — no live session, so no disconnect event
+			// will come to release the target or the leases. Clear both now.
+			// startDesktopOnDemand already did this for the on-demand path;
+			// both are idempotent, and this covers every other failure exit.
+			h.releaseDesktopLeases(sessionID)
+			h.takeDesktopTarget(sessionID)
+		}
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result
+	}
+
+	// Direct mode (console or non-Windows). Note: when there is no session
+	// broker (h.sessionBroker == nil), requestConsent returns helper-absent
+	// immediately, so the consent gate above never blocks the session. In that
+	// case consentUnavailableBehavior (the policy fallback) governs whether to
+	// proceed or block — the console user is NOT interactively prompted here.
+	answer, err := h.desktopMgr.StartSession(sessionID, offer, iceServers, displayIndex, policy)
+	if err != nil {
+		// Direct start failed — same reasoning as the helper-start-failed case
+		// above: nothing will disconnect to release the target.
+		h.releaseDesktopLeases(sessionID)
+		h.takeDesktopTarget(sessionID)
+		return tools.NewErrorResult(err, time.Since(start).Milliseconds())
+	}
+	// Same post-start tombstone re-check as the helper path above.
+	if h.desktopSessionTerminalAfterStart(sessionID) {
+		return tools.NewErrorResult(desktopStartTombstonedError(), time.Since(start).Milliseconds())
+	}
+	if onDemand {
+		// Not reachable in production (on-demand implies a Windows service, which
+		// always takes the helper path above) but a lease taken must always end up
+		// either renewed or released — never left to silently expire.
+		h.startDesktopLeaseRenewal(sessionID)
+	}
+	resultData := map[string]any{
+		"sessionId": sessionID,
+		"answer":    answer,
+	}
+	if prompt != nil {
+		h.afterDesktopStart(sessionID, prompt, targetSession)
+		if prompt.Mode == "consent" {
+			resultData["consentReason"] = "user"
+		}
+	}
+	return tools.NewSuccessResult(resultData, time.Since(start).Milliseconds())
+}
+
+// parseDesktopSessionPolicy extracts the agent-enforced session policy from a
+// start_desktop payload. Absent clipboard fields default to permissive so an
+// older API that doesn't send them preserves existing behavior; timeouts of 0
+// mean disabled. Findings #2 and #7.
+func parseDesktopSessionPolicy(payload map[string]any) desktop.SessionPolicy {
+	// Start from the shared default so this map-payload decoder and the IPC
+	// decoder (ipc.DesktopStartRequest.ResolveSessionPolicy) can't drift on
+	// what "default" means (permissive clipboard, no lifetime limits).
+	policy := desktop.DefaultSessionPolicy()
+	if cb, ok := payload["clipboard"].(map[string]any); ok {
+		if v, ok := cb["hostToViewer"].(bool); ok {
+			policy.ClipboardHostToViewer = v
+		}
+		if v, ok := cb["viewerToHost"].(bool); ok {
+			policy.ClipboardViewerToHost = v
+		}
+	}
+	// Clamp the lifetime fields defensively. The server already clamps these
+	// (remoteAccessPolicy.ts), but this direct-mode decoder must never trust a
+	// hostile/buggy value verbatim.
+	//
+	// idleTimeoutMinutes: <=0 still means "disabled"; over-cap clamps down.
+	// maxSessionDurationHours: 0 no longer means "unlimited" — it, and anything
+	// over the 12h cap, resolves to the cap. Both decoders funnel through
+	// desktop.clampMaxDuration (via DefaultSessionPolicy + the assignment
+	// below) so they cannot drift apart the way they did while "0" meant two
+	// different things on the two paths.
+	if v, ok := payload["idleTimeoutMinutes"].(float64); ok && v > 0 {
+		policy.IdleTimeout = time.Duration(math.Min(v, maxIdleTimeoutMinutes)) * time.Minute
+	}
+	if v, ok := payload["maxSessionDurationHours"].(float64); ok {
+		// desktop.ClampMaxDuration is the SHARED clamp both decoders use, so 0
+		// (formerly "unlimited"), a negative value and anything over 12h all
+		// resolve identically here and on the IPC path.
+		policy.MaxDuration = desktop.ClampMaxDuration(time.Duration(v * float64(time.Hour)))
+	}
+	policy.RevocationLease = parseRevocationLease(payload)
+	return policy
+}
+
+// parseRevocationLease extracts the server-issued revocation lease from a
+// direct-mode start_desktop payload. Returns nil when the block is absent or
+// unusable — the caller refuses the start rather than running unrevokable.
+//
+// This decoder only reshapes the loose JSON map into the wire struct; every
+// validation and back-fill rule (usable expiry, usable renew cadence, 12h
+// hard-deadline fallback, 90s grace fallback, monotonic deadlines) lives in
+// desktop.NormalizeRevocationLease, which the IPC decoder and the helper's
+// validator also call. Keeping the rules in one place is what stops the two
+// paths from disagreeing about what a valid lease is — they already did once,
+// and the looser side accepted an all-zero block, i.e. an unrevokable session.
+func parseRevocationLease(payload map[string]any) *desktop.RevocationLease {
+	raw, ok := payload["revocationLease"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	var wire ipc.RevocationLease
+	if v, ok := raw["token"].(string); ok {
+		wire.Token = v
+	}
+	if v, ok := raw["expiresAt"].(float64); ok {
+		wire.ExpiresAtUnixMs = int64(v)
+	}
+	if v, ok := raw["hardDeadline"].(float64); ok {
+		wire.HardDeadlineUnixMs = int64(v)
+	}
+	if v, ok := raw["renewEverySec"].(float64); ok {
+		wire.RenewEverySec = int64(v)
+	}
+	if v, ok := raw["graceSec"].(float64); ok {
+		wire.GraceSec = int64(v)
+	}
+	lease, err := desktop.NormalizeRevocationLease(&wire)
+	if err != nil {
+		log.Warn("dropping unusable revocationLease block from start_desktop", "error", err.Error())
+		return nil
+	}
+	return lease
+}
+
+func handleStopDesktop(h *Heartbeat, cmd Command) tools.CommandResult {
+	start := time.Now()
+	sessionID, errResult := requireValidatedDesktopSessionID(cmd.Payload)
+	if errResult != nil {
+		errResult.DurationMs = time.Since(start).Milliseconds()
+		return *errResult
+	}
+
+	// SEC-038 terminal tombstone. Installed FIRST, and unconditionally —
+	// including when no session is running under this id. A stop can overtake
+	// the start it was meant to cancel, and before this the unknown-session
+	// stop was a silent no-op that let the late start run. A malformed
+	// terminalGeneration does not block the tombstone: the stop is still an
+	// unambiguous terminal decision, only its generation is unusable.
+	stopInput, genErr := parseDesktopTerminalGeneration(cmd.Payload)
+	if genErr != nil {
+		// Log-only, deliberately. The defect cannot be reported in the command
+		// result: desktopCommandResultSchema (apps/api/src/routes/agentWs.ts)
+		// is .strict(), so an extra key would make the API drop the whole stop
+		// confirmation as malformed — and W03's pending -> confirmed phase
+		// transition is driven by exactly that confirmation. Surfacing it needs
+		// an allowed field on the server side first; tracked with W03/W05.
+		// A malformed generation is in any case only reachable from a buggy or
+		// tampered server, and it never weakens the fence: the tombstone below
+		// is installed regardless.
+		log.Warn("stop_desktop carried a malformed terminal generation; tombstoning anyway",
+			"sessionId", sessionID, "commandId", cmd.ID, "error", genErr.Error())
+	}
+	h.desktopStartFence.noteStop(sessionID, stopInput)
+
+	// Drop any on-demand helper leases first: the lease is what keeps the
+	// helper alive, and it must be released even if the stop below fails.
+	// No-op in always-on mode / when nothing was leased.
+	h.releaseDesktopLeases(sessionID)
+
+	// State-based routing: if an IPC helper actually owns this session, stop it
+	// over IPC; otherwise stop the direct desktopMgr session. Never gate on the
+	// headless flag — on Linux (and any box whose headless state flips between
+	// start and stop) a direct session is never in desktopOwners, so a
+	// flag-gated helper path would strand the live capture. desktopOwners is only
+	// populated by the helper start path, so this is safe on every platform.
+	if h.sessionBroker != nil {
+		if session := h.desktopOwnerSession(sessionID); session != nil {
+			// Forward the terminal generation so the helper's own fence
+			// records the same tombstone this one just installed.
+			req := ipc.DesktopStopRequest{SessionID: sessionID}
+			if stopInput.HasGeneration {
+				req.TerminalGeneration = strconv.FormatInt(stopInput.Generation, 10)
+			}
+			_, err := session.SendCommand("desk-stop-"+sessionID, ipc.TypeDesktopStop, req, 10*time.Second)
+			if err != nil {
+				return tools.NewErrorResult(fmt.Errorf("IPC desktop_stop: %w", err), time.Since(start).Milliseconds())
+			}
+			h.forgetDesktopOwner(sessionID)
+			return tools.NewSuccessResult(map[string]any{"stopped": true}, time.Since(start).Milliseconds())
+		}
+	}
+
+	h.desktopMgr.StopSession(sessionID)
+	return tools.NewSuccessResult(map[string]any{"stopped": true}, time.Since(start).Milliseconds())
+}
+
+func handleListSessions(h *Heartbeat, cmd Command) tools.CommandResult {
+	start := time.Now()
+
+	detector := sessionbroker.NewSessionDetector()
+	detected, err := detector.ListSessions()
+	if err != nil {
+		return tools.NewErrorResult(err, time.Since(start).Milliseconds())
+	}
+
+	// Merge with broker state to show which sessions have connected helpers
+	var helperSessions []sessionbroker.SessionInfo
+	if h.sessionBroker != nil {
+		helperSessions = h.sessionBroker.AllSessions()
+	}
+
+	helperByWinSession := make(map[string]bool)
+	for _, hs := range helperSessions {
+		if hs.WinSessionID != "" {
+			helperByWinSession[hs.WinSessionID] = true
+		}
+	}
+
+	items := sessionbroker.BuildSessionInfoItems(detected, helperByWinSession)
+
+	return tools.NewSuccessResult(map[string]any{
+		"sessions": items,
+	}, time.Since(start).Milliseconds())
+}
+
+// handleDesktopStreamStart is the WS-relay fallback path: frames are pushed to
+// the API over the agent's own WebSocket instead of peer-to-peer WebRTC.
+//
+// It deliberately carries NO revocation lease and runs no lease watchdog. It
+// does not need one: unlike a WebRTC session, every frame passes through the
+// server, so the server can (and does) cut it — the ~30s desktop_stream loop in
+// routes/desktopWs.ts revalidates and drops the relay. The lease exists
+// precisely because the API is NOT in the WebRTC media path; here it is.
+// Follow-up: fold this path into the same revalidation function the lease renew
+// uses, so the two revocation deadlines are provably the same policy.
+func handleDesktopStreamStart(h *Heartbeat, cmd Command) tools.CommandResult {
+	start := time.Now()
+
+	// WS-based desktop streaming cannot work from headless mode (no display).
+	// The viewer should use WebRTC (start_desktop) when connecting to a headless agent.
+	if h.isService || h.isHeadless {
+		return serviceUnavailable("desktop_stream_start", start)
+	}
+
+	sessionID, errResult := requireValidatedDesktopSessionID(cmd.Payload)
+	if errResult != nil {
+		errResult.DurationMs = time.Since(start).Milliseconds()
+		return *errResult
+	}
+
+	config := desktop.DefaultStreamConfig()
+	if q, ok := cmd.Payload["quality"].(float64); ok && q >= 1 && q <= 100 {
+		config.Quality = int(q)
+	}
+	if s, ok := cmd.Payload["scaleFactor"].(float64); ok && s > 0 && s <= 1.0 {
+		config.ScaleFactor = s
+	}
+	if f, ok := cmd.Payload["maxFps"].(float64); ok && f >= 1 && f <= 30 {
+		config.MaxFPS = int(f)
+	}
+	displayIndex := desktop.PrimaryMonitorIndex()
+	if di, ok := cmd.Payload["displayIndex"].(float64); ok {
+		if di < 0 || di > maxDesktopDisplayIndex || math.Trunc(di) != di {
+			return tools.CommandResult{
+				Status:     "failed",
+				Error:      fmt.Sprintf("displayIndex must be an integer between 0 and %d", maxDesktopDisplayIndex),
+				DurationMs: time.Since(start).Milliseconds(),
+			}
+		}
+		displayIndex = int(di)
+	}
+
+	startSession := h.wsDesktopStart
+	if startSession == nil {
+		startSession = h.wsDesktopMgr.StartSession
+	}
+	w, h2, err := startSession(sessionID, displayIndex, config, func(sid string, data []byte) error {
+		if h.wsClient != nil {
+			return h.wsClient.SendDesktopFrame(sid, data)
+		}
+		return fmt.Errorf("ws client not available")
+	})
+	if err != nil {
+		return tools.NewErrorResult(err, time.Since(start).Milliseconds())
+	}
+	return tools.NewSuccessResult(map[string]any{
+		"sessionId":    sessionID,
+		"screenWidth":  w,
+		"screenHeight": h2,
+	}, time.Since(start).Milliseconds())
+}
+
+func handleDesktopStreamStop(h *Heartbeat, cmd Command) tools.CommandResult {
+	start := time.Now()
+	sessionID, errResult := requireValidatedDesktopSessionID(cmd.Payload)
+	if errResult != nil {
+		errResult.DurationMs = time.Since(start).Milliseconds()
+		return *errResult
+	}
+
+	rawFinalizationID, hasFinalizationID := cmd.Payload["finalizationId"]
+	if !hasFinalizationID {
+		// Compatibility for pre-Wave-4 API instances. This executes the stop,
+		// but intentionally returns no ID-bound outcome and therefore can never
+		// satisfy the API's durable-proof parser.
+		h.wsDesktopMgr.StopSession(sessionID)
+		return tools.NewSuccessResult(map[string]any{"stopped": true}, time.Since(start).Milliseconds())
+	}
+
+	finalizationID, ok := rawFinalizationID.(string)
+	if !ok || finalizationID == "" || finalizationID != cmd.ID {
+		return tools.CommandResult{
+			Status:     "failed",
+			Error:      "invalid finalizationId",
+			DurationMs: time.Since(start).Milliseconds(),
+		}
+	}
+
+	outcome := "already_absent"
+	if h.wsDesktopMgr.StopSession(sessionID) {
+		outcome = "stopped"
+	}
+	return tools.NewSuccessResult(map[string]any{
+		"sessionId":      sessionID,
+		"finalizationId": finalizationID,
+		"outcome":        outcome,
+	}, time.Since(start).Milliseconds())
+}
+
+func handleDesktopInput(h *Heartbeat, cmd Command) tools.CommandResult {
+	start := time.Now()
+
+	// Input injection cannot work from headless mode (no display context).
+	// WebRTC sessions handle input via the data channel in the user helper.
+	if h.isService || h.isHeadless {
+		return serviceUnavailable("desktop_input", start)
+	}
+
+	sessionID, errResult := requireValidatedDesktopSessionID(cmd.Payload)
+	if errResult != nil {
+		errResult.DurationMs = time.Since(start).Milliseconds()
+		return *errResult
+	}
+
+	e, ok := cmd.Payload["event"].(map[string]any)
+	if !ok {
+		return tools.CommandResult{
+			Status:     "failed",
+			Error:      "missing or invalid event payload",
+			DurationMs: time.Since(start).Milliseconds(),
+		}
+	}
+	event, err := normalizeDesktopInputEvent(e)
+	if err != nil {
+		return tools.CommandResult{
+			Status:     "failed",
+			Error:      err.Error(),
+			DurationMs: time.Since(start).Milliseconds(),
+		}
+	}
+	if err := h.wsDesktopMgr.HandleInput(sessionID, event); err != nil {
+		return tools.NewErrorResult(err, time.Since(start).Milliseconds())
+	}
+	return tools.NewSuccessResult(map[string]any{"ok": true}, time.Since(start).Milliseconds())
+}
+
+func handleDesktopConfig(h *Heartbeat, cmd Command) tools.CommandResult {
+	start := time.Now()
+	if h.isService || h.isHeadless {
+		return serviceUnavailable("desktop_config", start)
+	}
+	sessionID, errResult := requireValidatedDesktopSessionID(cmd.Payload)
+	if errResult != nil {
+		errResult.DurationMs = time.Since(start).Milliseconds()
+		return *errResult
+	}
+
+	config := desktop.StreamConfig{}
+	hasField := false
+	if q, ok := cmd.Payload["quality"].(float64); ok && q >= 1 && q <= 100 {
+		config.Quality = int(q)
+		hasField = true
+	}
+	if s, ok := cmd.Payload["scaleFactor"].(float64); ok && s > 0 && s <= 1.0 {
+		config.ScaleFactor = s
+		hasField = true
+	}
+	if f, ok := cmd.Payload["maxFps"].(float64); ok && f >= 1 && f <= 30 {
+		config.MaxFPS = int(f)
+		hasField = true
+	}
+	if !hasField {
+		return tools.CommandResult{
+			Status:     "failed",
+			Error:      "no valid config fields provided (quality: 1-100, scaleFactor: 0-1, maxFps: 1-30)",
+			DurationMs: time.Since(start).Milliseconds(),
+		}
+	}
+	if err := h.wsDesktopMgr.UpdateConfig(sessionID, config); err != nil {
+		return tools.NewErrorResult(err, time.Since(start).Milliseconds())
+	}
+	return tools.NewSuccessResult(map[string]any{"ok": true}, time.Since(start).Milliseconds())
+}
+
+func requireValidatedDesktopSessionID(payload map[string]any) (string, *tools.CommandResult) {
+	sessionID, errResult := tools.RequirePayloadString(payload, "sessionId")
+	if errResult != nil {
+		return "", errResult
+	}
+	if err := validateDesktopSessionID(sessionID); err != nil {
+		return "", &tools.CommandResult{
+			Status: "failed",
+			Error:  err.Error(),
+		}
+	}
+	return sessionID, nil
+}
+
+func validateDesktopSessionID(sessionID string) error {
+	if !desktopSessionIDPattern.MatchString(sessionID) {
+		return fmt.Errorf("invalid sessionId")
+	}
+	return nil
+}
+
+func normalizeDesktopInputEvent(raw map[string]any) (desktop.InputEvent, error) {
+	var event desktop.InputEvent
+
+	eventType, ok := raw["type"].(string)
+	if !ok || strings.TrimSpace(eventType) == "" {
+		return event, fmt.Errorf("event type is required")
+	}
+	event.Type = strings.ToLower(strings.TrimSpace(eventType))
+	if _, ok := desktopInputTypes[event.Type]; !ok {
+		return event, fmt.Errorf("invalid event type")
+	}
+
+	x, err := readDesktopCoordinate(raw["x"])
+	if err != nil {
+		return event, fmt.Errorf("invalid x coordinate")
+	}
+	y, err := readDesktopCoordinate(raw["y"])
+	if err != nil {
+		return event, fmt.Errorf("invalid y coordinate")
+	}
+	event.X = x
+	event.Y = y
+
+	button, err := normalizeDesktopButton(raw["button"])
+	if err != nil {
+		return event, err
+	}
+	event.Button = button
+
+	key, err := normalizeDesktopKey(raw["key"])
+	if err != nil {
+		return event, err
+	}
+	event.Key = key
+
+	delta, err := normalizeDesktopScrollDelta(raw["delta"])
+	if err != nil {
+		return event, err
+	}
+	event.Delta = delta
+
+	modifiers, err := normalizeDesktopModifiers(raw["modifiers"])
+	if err != nil {
+		return event, err
+	}
+	event.Modifiers = modifiers
+
+	// This relay rebuilds the event field by field, so anything not copied here
+	// is dropped. Caps Lock state has to survive it or issue #3595 would stay
+	// broken on every session that falls back from WebRTC to the WebSocket
+	// transport.
+	capsLock, err := normalizeDesktopCapsLock(raw["capsLock"])
+	if err != nil {
+		return event, err
+	}
+	event.CapsLock = capsLock
+
+	switch event.Type {
+	case "mouse_click", "mouse_down", "mouse_up":
+		if event.Button == "" {
+			event.Button = "left"
+		}
+	case "key_press", "key_down", "key_up":
+		if event.Key == "" {
+			return event, fmt.Errorf("key is required for keyboard events")
+		}
+	case "mouse_scroll":
+		if event.Delta == 0 {
+			return event, fmt.Errorf("delta is required for mouse_scroll")
+		}
+	}
+
+	return event, nil
+}
+
+// normalizeDesktopCapsLock reads the viewer's Caps Lock assertion. Absent stays
+// absent (nil) rather than collapsing to false — the agent distinguishes "the
+// viewer did not state it" from "the viewer says it is off".
+func normalizeDesktopCapsLock(value any) (*bool, error) {
+	if value == nil {
+		return nil, nil
+	}
+	state, ok := value.(bool)
+	if !ok {
+		return nil, fmt.Errorf("invalid capsLock")
+	}
+	return &state, nil
+}
+
+func readDesktopCoordinate(value any) (int, error) {
+	if value == nil {
+		return 0, nil
+	}
+	number, ok := value.(float64)
+	if !ok || math.IsNaN(number) || math.IsInf(number, 0) || math.Trunc(number) != number || math.Abs(number) > maxDesktopCoordinateAbs {
+		return 0, fmt.Errorf("invalid coordinate")
+	}
+	return int(number), nil
+}
+
+func normalizeDesktopButton(value any) (string, error) {
+	if value == nil {
+		return "", nil
+	}
+	button, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid mouse button")
+	}
+	if button == "" {
+		return "", nil
+	}
+	button = strings.ToLower(strings.TrimSpace(button))
+	if _, ok := desktopMouseButtons[button]; !ok {
+		return "", fmt.Errorf("invalid mouse button")
+	}
+	return button, nil
+}
+
+func normalizeDesktopKey(value any) (string, error) {
+	if value == nil {
+		return "", nil
+	}
+	key, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid key")
+	}
+	if key == "" {
+		return "", nil
+	}
+	key = strings.TrimSpace(key)
+	if key == "" || len(key) > maxDesktopKeyBytes {
+		return "", fmt.Errorf("invalid key")
+	}
+	return key, nil
+}
+
+func normalizeDesktopScrollDelta(value any) (int, error) {
+	if value == nil {
+		return 0, nil
+	}
+	delta, ok := value.(float64)
+	if !ok || math.IsNaN(delta) || math.IsInf(delta, 0) || math.Trunc(delta) != delta || math.Abs(delta) > maxDesktopScrollDelta {
+		return 0, fmt.Errorf("invalid scroll delta")
+	}
+	return int(delta), nil
+}
+
+func normalizeDesktopModifiers(value any) ([]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	rawModifiers, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid modifiers")
+	}
+	if len(rawModifiers) > maxDesktopModifiers {
+		return nil, fmt.Errorf("too many modifiers")
+	}
+
+	normalized := make([]string, 0, len(rawModifiers))
+	seen := make(map[string]struct{}, len(rawModifiers))
+	for _, rawModifier := range rawModifiers {
+		modifier, ok := rawModifier.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid modifier")
+		}
+		modifier = strings.ToLower(strings.TrimSpace(modifier))
+		if modifier == "" || len(modifier) > maxDesktopModifierBytes {
+			return nil, fmt.Errorf("invalid modifier")
+		}
+		canonical, ok := desktopInputModifiers[modifier]
+		if !ok {
+			return nil, fmt.Errorf("invalid modifier")
+		}
+		if _, ok := seen[canonical]; ok {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		normalized = append(normalized, canonical)
+	}
+	return normalized, nil
+}

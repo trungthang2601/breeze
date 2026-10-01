@@ -1,0 +1,81 @@
+{
+  "page": {
+    "title": "Start a support session",
+    "intro": "Someone helping you with this computer asked you to open this page. Nothing happens until you download and run the program yourself."
+  },
+  "branding": {
+    "title": "{{partner}} Quick Support",
+    "subtitle": "You are getting help from {{partner}}. Nothing happens until you download and run the program yourself."
+  },
+  "steps": {
+    "one": {
+      "title": "Enter the code your technician gave you",
+      "body": "The code is 9 numbers. It only works for a few minutes."
+    },
+    "two": {
+      "title": "Download the support app",
+      "body": "The button below saves a small program that already knows your code."
+    },
+    "three": {
+      "title": "Run it and approve the Windows prompt",
+      "body": "Open the file you just saved, then allow it to run. That is all you have to do."
+    }
+  },
+  "code": {
+    "heading": "Enter the code you were given",
+    "help": "The person helping you will read out a code of 9 numbers, like 234-567-892. Dashes do not matter.",
+    "label": "Support code",
+    "placeholder": "234-567-892",
+    "submit": "Continue",
+    "formatError": "That is not a complete code yet. A code has 9 characters, for example 234-567-892."
+  },
+  "checking": "Checking that code…",
+  "invalid": {
+    "title": "That code no longer works",
+    "body": "A support code stops working a short time after it is created, and it can only be used once. Ask the person helping you to read out a new code, then type it in above."
+  },
+  "checkFailed": {
+    "title": "The code could not be checked",
+    "body": "The connection to the internet may have dropped. Check your connection and try the code again.",
+    "retry": "Try again"
+  },
+  "rateLimited": {
+    "title": "Too many attempts",
+    "body": "You have tried a code too many times. Please wait a moment, then try again.",
+    "retry": "Try again"
+  },
+  "ready": {
+    "title": "Your code works",
+    "codeIntro": "Your code is {{code}}."
+  },
+  "mobile": {
+    "title": "Open this page on the Windows computer that needs help",
+    "body": "This phone or tablet cannot be shared with the person helping you. Go to the Windows computer with the problem and open this page there.",
+    "downloadHidden": "There is nothing to download on this device."
+  },
+  "download": {
+    "windows": "Download for Windows",
+    "manualFallback": "If the download prompts for a code, enter: {{code}}",
+    "hintEdge": "Microsoft Edge may say the file is not downloaded very often. Choose Keep, and then Keep anyway, to finish saving it.",
+    "hintChrome": "Google Chrome may show a warning about the file at the bottom of the window. Choose Keep to finish saving it.",
+    "hintGeneric": "If your browser asks whether to keep the file, choose to keep it.",
+    "windowsOnly": "The support program is only available for Windows computers today.",
+    "macosLabel": "macOS (Mac computers)",
+    "macosBadge": "Coming soon",
+    "macosBody": "The program is not ready for Mac computers yet. Ask the person helping you what to do instead.",
+    "macosPrimaryTitle": "The support program is not ready for Mac computers yet",
+    "macosPrimaryBody": "Ask the person helping you what to do instead, or open this page on a Windows computer that needs help."
+  },
+  "windowsPrompt": {
+    "title": "Windows will ask you before it runs",
+    "body": "When you open the file, Windows shows a prompt asking whether you want to allow it to run. The file is digitally signed, so that prompt names a publisher: it should read {{publisher}}. If it says the publisher is unknown, or names anyone you were not expecting, close the prompt and call the person helping you instead of continuing.",
+    "publisher": "the publisher of Breeze"
+  },
+  "trust": {
+    "title": "What the program does",
+    "seeScreen": "While the session is running, the person helping you can see your screen.",
+    "temporary": "The program runs once and then removes itself. Nothing stays installed on this computer.",
+    "stopAnyTime": "You can stop sharing whenever you want by closing the program window.",
+    "onlyIfExpected": "If you were not expecting this, do not run it. Close this page and contact the support people you normally deal with."
+  }
+}

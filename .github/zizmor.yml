@@ -1,0 +1,12 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin
+  cache-poisoning:
+    # Accepted tradeoff (2026-06): the release workflow uses setup-node /
+    # rust-cache / go caches while producing signed artifacts. Disabling
+    # caches there would add tens of minutes per release. Revisit if the
+    # threat model changes (e.g. untrusted PRs ever gain cache write).
+    ignore:
+      - release.yml

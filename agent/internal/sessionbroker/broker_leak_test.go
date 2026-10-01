@@ -1,0 +1,629 @@
+package sessionbroker
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/ipc"
+)
+
+// withKeepaliveTiming overrides the package-level keepalive ping interval and
+// timeout for a single test and restores them on cleanup.
+//
+// Tests that call this MUST NOT call t.Parallel(): the overrides are
+// package-level vars and would race under parallel execution.
+func withKeepaliveTiming(t *testing.T, interval, timeout time.Duration) {
+	t.Helper()
+	prevInterval := keepalivePingInterval
+	prevTimeout := keepaliveTimeout
+	keepalivePingInterval = interval
+	keepaliveTimeout = timeout
+	t.Cleanup(func() {
+		keepalivePingInterval = prevInterval
+		keepaliveTimeout = prevTimeout
+	})
+}
+
+// newPairedSession builds a broker-side Session plus a client ipc.Conn for
+// tests that need to drive the server-initiated keepalive path. The client
+// side intentionally does NOT auto-reply to pings so the timeout can fire.
+func newPairedSession(t *testing.T, sessionID, identity string) (*Session, *ipc.Conn) {
+	t.Helper()
+	return createTestSessionWith(t, sessionID, identity)
+}
+
+func createTestSessionWith(t *testing.T, sessionID, identity string) (*Session, *ipc.Conn) {
+	t.Helper()
+	serverConn, clientConn := createSocketPair(t)
+	serverIPC := ipc.NewConn(serverConn)
+	clientIPC := ipc.NewConn(clientConn)
+	session := NewSession(serverIPC, 1000, identity, "testuser", "x11:0", sessionID, []string{"notify", "tray", "desktop"})
+	return session, clientIPC
+}
+
+// Stranded capture sessions (no pongs) must be closed by the keepalive loop.
+func TestKeepaliveReapsStrandedSession(t *testing.T) {
+	// 20ms ping cadence, 30ms pong timeout — keeps the whole test under 100ms.
+	withKeepaliveTiming(t, 20*time.Millisecond, 30*time.Millisecond)
+
+	session, clientIPC := newPairedSession(t, "leak-1", "2000")
+	defer clientIPC.Close()
+
+	// Force lastPongAt into the past so the first tick triggers the timeout
+	// without having to wait for natural drift.
+	session.lastPongAt.Store(time.Now().Add(-time.Second).UnixNano())
+
+	// Drain client writes so the broker's first Send doesn't block on the
+	// socket buffer. We ignore read errors — the socket will close mid-test.
+	go func() {
+		for {
+			if _, err := clientIPC.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+
+	b := &Broker{
+		sessions:   map[string]*Session{session.SessionID: session},
+		byIdentity: map[string][]*Session{session.IdentityKey: {session}},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.runKeepalive(session)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		_ = session.Close()
+		t.Fatal("runKeepalive did not exit after pong timeout")
+	}
+
+	if !session.IsClosed() {
+		t.Fatal("stranded session should have been Close()d by keepalive")
+	}
+}
+
+// A healthy session whose client reports pongs must NOT be closed.
+func TestKeepaliveKeepsHealthySessionAlive(t *testing.T) {
+	withKeepaliveTiming(t, 20*time.Millisecond, 80*time.Millisecond)
+
+	session, clientIPC := newPairedSession(t, "healthy-1", "3000")
+	defer clientIPC.Close()
+
+	// Fake a fresh pong immediately so the age check never trips.
+	session.NotePong()
+
+	// Pretend the client is responsive: refresh lastPongAt whenever we see a
+	// ping. We DO NOT actually call conn.Send from the test — the real
+	// receive path on the server consumes pongs, but here we only need the
+	// age to stay fresh.
+	stopDrain := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopDrain:
+				return
+			default:
+			}
+			env, err := clientIPC.Recv()
+			if err != nil {
+				return
+			}
+			if env.Type == ipc.TypePing {
+				session.NotePong()
+			}
+		}
+	}()
+	defer close(stopDrain)
+
+	b := &Broker{
+		sessions:   map[string]*Session{session.SessionID: session},
+		byIdentity: map[string][]*Session{session.IdentityKey: {session}},
+	}
+
+	keepaliveDone := make(chan struct{})
+	go func() {
+		b.runKeepalive(session)
+		close(keepaliveDone)
+	}()
+
+	// Run for ~3 ping intervals, then Close() the session and verify
+	// runKeepalive exits cleanly via Done().
+	time.Sleep(80 * time.Millisecond)
+
+	if session.IsClosed() {
+		t.Fatal("healthy session must not be closed by keepalive")
+	}
+
+	_ = session.Close()
+
+	select {
+	case <-keepaliveDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("runKeepalive did not exit after session.Close()")
+	}
+}
+
+// roleSupportsKeepalive must keep watchdog connections out of the generic
+// keepalive path. Regression for the eviction loop introduced when PR #443
+// added unconditional runKeepalive: the watchdog IPC client only handles
+// TypeWatchdogPong and never replies to TypePing, so every watchdog
+// connection was being evicted at keepaliveTimeout and reconnecting forever.
+func TestRoleSupportsKeepalive_ExcludesWatchdog(t *testing.T) {
+	cases := []struct {
+		role ipc.HelperRole
+		want bool
+	}{
+		{ipc.HelperRoleSystem, true},
+		{ipc.HelperRoleUser, true},
+		{ipc.HelperRoleWatchdog, false},
+		{"", true}, // unknown roles default to system in handleConnection — keepalive applies
+	}
+	for _, c := range cases {
+		if got := roleSupportsKeepalive(c.role); got != c.want {
+			t.Errorf("roleSupportsKeepalive(%q) = %v, want %v", c.role, got, c.want)
+		}
+	}
+}
+
+// maybeStartKeepalive must NOT start the keepalive goroutine for a watchdog
+// session: a never-ponging watchdog session must remain alive past the
+// keepalive timeout. This is the integration-level guard against a future
+// refactor accidentally re-introducing the unconditional runKeepalive call
+// at the handleConnection site. See PR #443 / #462.
+func TestMaybeStartKeepalive_WatchdogSessionStaysAlive(t *testing.T) {
+	withKeepaliveTiming(t, 10*time.Millisecond, 25*time.Millisecond)
+
+	session, clientIPC := newPairedSession(t, "watchdog-1", "S-1-5-18")
+	defer clientIPC.Close()
+
+	// Force lastPongAt deep into the past so that IF runKeepalive ran, the
+	// very first tick would close the session. The test asserts the opposite.
+	session.lastPongAt.Store(time.Now().Add(-time.Hour).UnixNano())
+
+	b := &Broker{
+		sessions:   map[string]*Session{session.SessionID: session},
+		byIdentity: map[string][]*Session{session.IdentityKey: {session}},
+	}
+
+	b.maybeStartKeepalive(session, ipc.HelperRoleWatchdog)
+
+	// Wait well past 2× keepaliveTimeout to give any rogue keepalive goroutine
+	// multiple ticks to fire. Session must still be open.
+	time.Sleep(60 * time.Millisecond)
+
+	if session.IsClosed() {
+		t.Fatal("watchdog session was closed by keepalive — gating regressed")
+	}
+
+	_ = session.Close()
+}
+
+// Conversely, maybeStartKeepalive MUST start the keepalive goroutine for a
+// system-role session, so a stranded system helper is still reaped. Pairs
+// with the watchdog test above to lock in the gating direction.
+func TestMaybeStartKeepalive_SystemSessionIsReaped(t *testing.T) {
+	withKeepaliveTiming(t, 10*time.Millisecond, 20*time.Millisecond)
+
+	session, clientIPC := newPairedSession(t, "system-1", "S-1-5-18")
+	defer clientIPC.Close()
+
+	session.lastPongAt.Store(time.Now().Add(-time.Hour).UnixNano())
+
+	go func() {
+		for {
+			if _, err := clientIPC.Recv(); err != nil {
+				return
+			}
+		}
+	}()
+
+	b := &Broker{
+		sessions:   map[string]*Session{session.SessionID: session},
+		byIdentity: map[string][]*Session{session.IdentityKey: {session}},
+	}
+
+	b.maybeStartKeepalive(session, ipc.HelperRoleSystem)
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if session.IsClosed() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("system session was not closed by keepalive within deadline")
+}
+
+// When the cap is hit, a new connection for the same identity must evict the
+// oldest-idle existing session rather than being rejected.
+func TestAdmitOrEvictEvictsIdleSession(t *testing.T) {
+	now := time.Now()
+	identity := "evict-id"
+
+	sessions := make([]*Session, 0, MaxConnectionsPerIdentity)
+	for i := 0; i < MaxConnectionsPerIdentity; i++ {
+		s, client := newPairedSession(t, strings.Repeat("x", i+1), identity)
+		defer client.Close()
+		// All sessions start recent.
+		s.LastSeen = now
+		sessions = append(sessions, s)
+	}
+	// Mark index 2 as the oldest-idle (past EvictIdleThreshold).
+	victim := sessions[2]
+	victim.LastSeen = now.Add(-(EvictIdleThreshold + 10*time.Second))
+
+	b := &Broker{
+		sessions:   make(map[string]*Session),
+		byIdentity: map[string][]*Session{identity: sessions},
+	}
+	for _, s := range sessions {
+		b.sessions[s.SessionID] = s
+	}
+
+	if !b.admitOrEvict(identity) {
+		t.Fatal("admitOrEvict returned false, expected eviction to make room")
+	}
+	if !victim.IsClosed() {
+		t.Fatal("oldest-idle session should have been closed")
+	}
+	if got := len(b.byIdentity[identity]); got != MaxConnectionsPerIdentity-1 {
+		t.Fatalf("byIdentity len after eviction = %d, want %d", got, MaxConnectionsPerIdentity-1)
+	}
+	if _, stillPresent := b.sessions[victim.SessionID]; stillPresent {
+		t.Fatal("evicted session should have been removed from b.sessions")
+	}
+}
+
+// If every existing session is recent, admitOrEvict must refuse to
+// evict and the caller will reject with "max connections exceeded".
+func TestAdmitOrEvictRejectsWhenAllRecent(t *testing.T) {
+	now := time.Now()
+	identity := "noevict-id"
+
+	sessions := make([]*Session, 0, MaxConnectionsPerIdentity)
+	for i := 0; i < MaxConnectionsPerIdentity; i++ {
+		s, client := newPairedSession(t, "recent-"+strings.Repeat("y", i+1), identity)
+		defer client.Close()
+		s.LastSeen = now // all fresh
+		sessions = append(sessions, s)
+	}
+
+	b := &Broker{
+		sessions:   make(map[string]*Session),
+		byIdentity: map[string][]*Session{identity: sessions},
+	}
+	for _, s := range sessions {
+		b.sessions[s.SessionID] = s
+	}
+
+	if b.admitOrEvict(identity) {
+		t.Fatal("admitOrEvict returned true, expected rejection when all sessions are recent")
+	}
+	for _, s := range sessions {
+		if s.IsClosed() {
+			t.Fatal("no session should be closed when none are idle")
+		}
+	}
+}
+
+// keepaliveHangGuard bounds how long a keepalive test waits for a loop that
+// should already have made its decision. Every keepalive decision below is
+// reached within a few ticks, so this is a guard against runKeepalive never
+// returning at all — NOT a race window that a busy CI runner can lose. Keep it
+// far wider than any plausible scheduling delay: a flaky failure here must
+// always mean "the loop is wedged", never "the runner was slow".
+func keepaliveHangGuard(pingInterval time.Duration) time.Duration {
+	return 100 * keepaliveMaxSendFailures * pingInterval
+}
+
+// After repeated send failures (at the threshold), the keepalive loop must
+// close the session. The pong-age check is the real wedge detector, so the
+// send side deliberately tolerates fewer than keepaliveMaxSendFailures
+// consecutive failures — that tolerance is pinned by
+// TestKeepaliveToleratesSendFailuresBelowThreshold below.
+func TestKeepaliveClosesAfterRepeatedSendFailures(t *testing.T) {
+	const pingInterval = 10 * time.Millisecond
+
+	// Very short interval so we fire multiple ticks fast; timeout is far in
+	// the future so only the send-failure path can close the session.
+	withKeepaliveTiming(t, pingInterval, time.Hour)
+
+	session, clientIPC := newPairedSession(t, "sendfail-1", "4000")
+
+	// The helper goes away. Closing only the peer is NOT enough to make the
+	// broker's sends fail promptly: the peer's Close() sends a FIN, which ends
+	// only our READ direction — the local send direction stays open, so the
+	// next Write still lands in the send buffer. Writes start erroring only
+	// once the peer's RST comes back, and when that happens is an OS/scheduler
+	// property we do not control. Measured on macOS loopback, one or two writes
+	// succeed first: fast enough to hide the race behind 10ms ticks, but never
+	// synchronous. On a loaded Windows runner there is no bound we can rely on,
+	// and this test only budgeted 500ms to collect three consecutive failures —
+	// the most likely reason it intermittently failed with "wsasend: An
+	// established connection was aborted" (issue #2967 records the symptom but
+	// no failure-counter log, so plain tick starvation is also consistent; this
+	// change removes both possibilities).
+	_ = clientIPC.Close()
+
+	// So close the BROKER side too, which is what actually makes this
+	// deterministic. On a locally-closed socket ipc.Conn.Send fails at its
+	// opening SetWriteDeadline — an fd refcount check inside net, with no
+	// syscall, no RST and no timer — so every tick fails immediately and
+	// identically on every platform. The loop is guaranteed to accumulate
+	// keepaliveMaxSendFailures on consecutive ticks and exit on tick
+	// keepaliveMaxSendFailures. That is the input runKeepalive actually
+	// contracts on — "SendTyped keeps returning errors" — so forcing it
+	// directly tests the loop instead of the host's TCP teardown timing.
+	if err := session.conn.Close(); err != nil {
+		t.Fatalf("close broker-side conn: %v", err)
+	}
+
+	b := &Broker{
+		sessions:   map[string]*Session{session.SessionID: session},
+		byIdentity: map[string][]*Session{session.IdentityKey: {session}},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.runKeepalive(session)
+		close(done)
+	}()
+
+	// Exit is bounded by keepaliveMaxSendFailures × pingInterval, so this is
+	// purely a hang guard (see keepaliveHangGuard).
+	hangGuard := keepaliveHangGuard(pingInterval)
+	select {
+	case <-done:
+	case <-time.After(hangGuard):
+		// Close the session so the loop exits via Done(), then wait for it
+		// before failing. Leaving the goroutine running past the end of the
+		// test lets the race detector fire on withKeepaliveTiming's cleanup and
+		// bury the actual failure message under a stack dump.
+		// The second wait is bounded too: if the loop is wedged somewhere that
+		// does not observe Done(), give up rather than hang the package until
+		// the go test timeout.
+		_ = session.Close()
+		select {
+		case <-done:
+		case <-time.After(hangGuard):
+		}
+		t.Fatalf("runKeepalive did not exit within %v (plus up to %v grace); expected it to give up after %d consecutive send failures",
+			hangGuard, hangGuard, keepaliveMaxSendFailures)
+	}
+
+	if !session.IsClosed() {
+		t.Fatal("session should have been closed after repeated send failures")
+	}
+}
+
+// scriptedConn is a net.Conn whose write path fails on demand, so a test can
+// drive runKeepalive's send-failure counter exactly instead of provoking real
+// socket errors and hoping the OS cooperates (issue #2967).
+//
+// The scripted failure point is SetWriteDeadline rather than Write, and that
+// choice is load-bearing: ipc.Conn.Send poisons the Conn on a Write error, so
+// a Write-based script would only ever be consulted once — every later Send
+// would short-circuit on the poison flag and the counter would stop advancing.
+// The deadline-set error path deliberately does not poison, so each tick
+// re-enters the script and failures stay countable and recoverable.
+type scriptedConn struct {
+	// attempts counts send attempts (arming writes), not total calls.
+	attempts atomic.Int64
+	// failAttempt reports whether the nth attempt (1-based) should fail.
+	failAttempt func(n int64) bool
+}
+
+// SetWriteDeadline counts and scripts send attempts. ipc.Conn.Send calls this
+// twice per send: once to arm an absolute deadline, then once via defer to
+// clear it with the zero time. Only the arming call is a send attempt; the
+// deferred clear is ignored so the counter matches sends one-for-one.
+func (c *scriptedConn) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		return nil
+	}
+	n := c.attempts.Add(1)
+	if c.failAttempt(n) {
+		return fmt.Errorf("scripted send failure on attempt %d", n)
+	}
+	return nil
+}
+
+func (c *scriptedConn) Write(p []byte) (int, error)     { return len(p), nil }
+func (c *scriptedConn) Read([]byte) (int, error)        { return 0, io.EOF }
+func (c *scriptedConn) Close() error                    { return nil }
+func (c *scriptedConn) LocalAddr() net.Addr             { return &net.TCPAddr{IP: net.IPv4zero} }
+func (c *scriptedConn) RemoteAddr() net.Addr            { return &net.TCPAddr{IP: net.IPv4zero} }
+func (c *scriptedConn) SetDeadline(time.Time) error     { return nil }
+func (c *scriptedConn) SetReadDeadline(time.Time) error { return nil }
+
+// newScriptedSession builds a Session whose transport fails sends according to
+// failAttempt. No sockets are involved, so nothing here depends on OS timing.
+func newScriptedSession(t *testing.T, sessionID string, failAttempt func(n int64) bool) (*Session, *scriptedConn) {
+	t.Helper()
+	conn := &scriptedConn{failAttempt: failAttempt}
+	session := NewSession(ipc.NewConn(conn), 1000, "9000", "testuser", "x11:0", sessionID,
+		[]string{"notify", "tray", "desktop"})
+	return session, conn
+}
+
+// The loop must give up after EXACTLY keepaliveMaxSendFailures consecutive
+// send failures — not earlier. Without this assertion the suite stays green
+// if the threshold regresses to 1, because every other keepalive test only
+// checks that the session eventually closes.
+func TestKeepaliveClosesAtSendFailureThreshold(t *testing.T) {
+	const pingInterval = 10 * time.Millisecond
+	withKeepaliveTiming(t, pingInterval, time.Hour)
+
+	session, conn := newScriptedSession(t, "threshold-1", func(int64) bool { return true })
+
+	b := &Broker{
+		sessions:   map[string]*Session{session.SessionID: session},
+		byIdentity: map[string][]*Session{session.IdentityKey: {session}},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.runKeepalive(session)
+		close(done)
+	}()
+
+	hangGuard := keepaliveHangGuard(pingInterval)
+	select {
+	case <-done:
+	case <-time.After(hangGuard):
+		_ = session.Close()
+		select {
+		case <-done:
+		case <-time.After(hangGuard):
+		}
+		t.Fatalf("runKeepalive did not exit within %v (plus up to %v grace) with every send failing",
+			hangGuard, hangGuard)
+	}
+
+	// Reading the counter after <-done is safe: the channel close orders the
+	// loop's final write before this read.
+	if got := conn.attempts.Load(); got != keepaliveMaxSendFailures {
+		t.Errorf("keepalive made %d send attempts before giving up, want exactly %d",
+			got, keepaliveMaxSendFailures)
+	}
+	if !session.IsClosed() {
+		t.Error("session should have been closed at the send-failure threshold")
+	}
+}
+
+// Fewer than keepaliveMaxSendFailures consecutive failures must NOT close the
+// session, and a success must reset the counter. Pins both halves of the
+// tolerance that keepaliveMaxSendFailures exists to provide.
+func TestKeepaliveToleratesSendFailuresBelowThreshold(t *testing.T) {
+	const pingInterval = 10 * time.Millisecond
+	withKeepaliveTiming(t, pingInterval, time.Hour)
+
+	// Fail every attempt except every keepaliveMaxSendFailures'th, so the run
+	// of consecutive failures never exceeds keepaliveMaxSendFailures-1 and the
+	// counter is reset by a success each cycle.
+	session, conn := newScriptedSession(t, "tolerate-1", func(n int64) bool {
+		return n%keepaliveMaxSendFailures != 0
+	})
+
+	b := &Broker{
+		sessions:   map[string]*Session{session.SessionID: session},
+		byIdentity: map[string][]*Session{session.IdentityKey: {session}},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.runKeepalive(session)
+		close(done)
+	}()
+
+	// Poll the attempt counter rather than sleeping a fixed span: a slow runner
+	// only takes longer to reach the target, it never fails early. The only way
+	// to miss the target is a loop that stops attempting sends, which is itself
+	// a real failure.
+	const wantAttempts = 3 * keepaliveMaxSendFailures
+	hangGuard := keepaliveHangGuard(pingInterval)
+	deadline := time.Now().Add(hangGuard)
+	for conn.attempts.Load() < wantAttempts {
+		if session.IsClosed() {
+			t.Fatalf("session closed after %d send attempts — fewer than %d consecutive failures must be tolerated",
+				conn.attempts.Load(), keepaliveMaxSendFailures)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("keepalive made only %d send attempts in %v, want at least %d",
+				conn.attempts.Load(), hangGuard, wantAttempts)
+		}
+		time.Sleep(pingInterval / 2)
+	}
+
+	if session.IsClosed() {
+		t.Fatal("session must stay open while failures never reach the threshold")
+	}
+
+	// The loop is healthy; make sure it still exits on Done().
+	_ = session.Close()
+	select {
+	case <-done:
+	case <-time.After(hangGuard):
+		t.Fatalf("runKeepalive did not exit within %v after session.Close()", hangGuard)
+	}
+}
+
+// The RecvLoop → dispatchHelperMessage path must route ipc.TypePong to
+// s.NotePong(). Verifies the real dispatch switch, not a test copy of it,
+// so a regression (typo in the case label, accidental reordering above
+// HandleResponse, dispatch routed elsewhere) would fail this test.
+func TestRecvLoopDispatchesPongToNotePong(t *testing.T) {
+	session, clientIPC := newPairedSession(t, "pong-dispatch", "5000")
+	defer clientIPC.Close()
+
+	// Seed lastPongAt far in the past so we can detect a successful
+	// NotePong() by observing LastPongAge drop back near zero.
+	session.lastPongAt.Store(time.Now().Add(-time.Hour).UnixNano())
+	if age := session.LastPongAge(); age < 59*time.Minute {
+		t.Fatalf("precondition: expected seeded stale pong age, got %v", age)
+	}
+
+	b := &Broker{
+		sessions:   map[string]*Session{session.SessionID: session},
+		byIdentity: map[string][]*Session{session.IdentityKey: {session}},
+	}
+
+	recvDone := make(chan struct{})
+	go func() {
+		session.RecvLoop(b.dispatchHelperMessage)
+		close(recvDone)
+	}()
+
+	// Client-side: emit a broker-initiated keepalive pong envelope. The
+	// broker's dispatch must route it through the TypePong case and call
+	// NotePong(), which resets lastPongAt to ~now.
+	if err := clientIPC.SendTyped("keepalive", ipc.TypePong, nil); err != nil {
+		t.Fatalf("client SendTyped TypePong: %v", err)
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if session.LastPongAge() < time.Second {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if age := session.LastPongAge(); age > time.Second {
+		t.Fatalf("LastPongAge did not reset after RecvLoop dispatched TypePong; got %v", age)
+	}
+
+	_ = session.Close()
+	select {
+	case <-recvDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("RecvLoop did not exit after session.Close()")
+	}
+}
+
+// Under-cap identities should always admit without touching anything.
+func TestAdmitOrEvictUnderCapAdmits(t *testing.T) {
+	identity := "under-cap"
+	s, client := newPairedSession(t, "solo", identity)
+	defer client.Close()
+
+	b := &Broker{
+		sessions:   map[string]*Session{s.SessionID: s},
+		byIdentity: map[string][]*Session{identity: {s}},
+	}
+
+	if !b.admitOrEvict(identity) {
+		t.Fatal("admitOrEvict returned false under cap")
+	}
+	if s.IsClosed() {
+		t.Fatal("under-cap admit must not close any existing session")
+	}
+}

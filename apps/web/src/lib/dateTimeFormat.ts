@@ -1,0 +1,175 @@
+import type { TimeFormat } from '@breeze/shared';
+import { normalizeTimeFormat, readResolvedTimeFormatPreference } from './appearance';
+import { resolvedFormattingLocale } from './i18n/format';
+
+type DateInput = string | number | Date | null | undefined;
+type FormatMode = 'date' | 'time' | 'dateTime';
+
+export type UserDateTimeFormatOptions = Intl.DateTimeFormatOptions & {
+  fallback?: string;
+  locale?: Intl.LocalesArgument;
+  timeFormat?: TimeFormat | null;
+};
+
+const TIME_OPTION_KEYS: Array<keyof Intl.DateTimeFormatOptions> = [
+  'hour',
+  'minute',
+  'second',
+  'fractionalSecondDigits',
+  'timeStyle',
+];
+
+const DATE_OPTION_KEYS: Array<keyof Intl.DateTimeFormatOptions> = [
+  'weekday',
+  'era',
+  'year',
+  'month',
+  'day',
+  'dateStyle',
+];
+
+function parseDate(value: DateInput): Date | null {
+  if (value === null || value === undefined || value === '') return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * Runs an Intl-backed formatter, tolerating an invalid `timeZone`.
+ *
+ * A non-IANA zone (e.g. a Windows OS zone id like "Pacific Standard Time")
+ * makes `toLocale*String` throw `RangeError: Invalid time zone specified`,
+ * which would otherwise blank the whole caller. On failure we retry in the
+ * browser-local zone so the timestamp still renders.
+ */
+function safeLocaleFormat(
+  format: (locale: Intl.LocalesArgument, options: Intl.DateTimeFormatOptions) => string,
+  locale: Intl.LocalesArgument,
+  options: Intl.DateTimeFormatOptions
+): string {
+  try {
+    return format(locale, options);
+  } catch {
+    const { timeZone: _timeZone, timeZoneName: _timeZoneName, ...localZoneOptions } = options;
+    try {
+      return format(locale, localZoneOptions);
+    } catch {
+      return format(locale, {});
+    }
+  }
+}
+
+function fallbackFor(value: DateInput, fallback?: string): string {
+  if (fallback !== undefined) return fallback;
+  return typeof value === 'string' ? value : '';
+}
+
+/**
+ * Resolves the hour cycle to format with, in priority order: an explicit
+ * per-call override, then the user's stored appearance preference, then the
+ * browser/OS's own 24h-vs-12h convention. Falling through all the way to
+ * browser detection (rather than stopping at "nothing stored") matters
+ * because otherwise an unset preference silently inherited the app UI
+ * locale's default hour cycle instead of the user's actual environment —
+ * e.g. a 24h-clock browser rendered AM/PM on the English UI locale (#4231).
+ */
+export function getEffectiveTimeFormat(explicit?: TimeFormat | null): TimeFormat {
+  return normalizeTimeFormat(explicit) ?? readResolvedTimeFormatPreference();
+}
+
+function formatIncludesTime(options: Intl.DateTimeFormatOptions, mode: FormatMode): boolean {
+  if (mode === 'time') return true;
+  if (mode === 'date') return false;
+  if (TIME_OPTION_KEYS.some((key) => options[key] !== undefined)) return true;
+  if (DATE_OPTION_KEYS.some((key) => options[key] !== undefined)) return false;
+  return true;
+}
+
+export function withUserTimeFormatOptions(
+  options: Intl.DateTimeFormatOptions,
+  timeFormat: TimeFormat | undefined,
+  mode: FormatMode
+): Intl.DateTimeFormatOptions {
+  if (!timeFormat || !formatIncludesTime(options, mode)) return options;
+  const next: Intl.DateTimeFormatOptions = { ...options };
+  delete next.hour12;
+  delete next.hourCycle;
+  next.hourCycle = timeFormat === '24h' ? 'h23' : 'h12';
+  return next;
+}
+
+function splitFormatOptions({ fallback, locale, timeFormat, ...intlOptions }: UserDateTimeFormatOptions) {
+  return {
+    fallback,
+    locale: locale ?? resolvedFormattingLocale(),
+    timeFormat: getEffectiveTimeFormat(timeFormat),
+    intlOptions,
+  };
+}
+
+export function formatDateTime(value: DateInput, options: UserDateTimeFormatOptions = {}): string {
+  const date = parseDate(value);
+  const { fallback, locale, timeFormat, intlOptions } = splitFormatOptions(options);
+  if (!date) return fallbackFor(value, fallback);
+  return safeLocaleFormat(
+    (loc, opts) => date.toLocaleString(loc, opts),
+    locale,
+    withUserTimeFormatOptions(intlOptions, timeFormat, 'dateTime')
+  );
+}
+
+export function formatTime(value: DateInput, options: UserDateTimeFormatOptions = {}): string {
+  const date = parseDate(value);
+  const { fallback, locale, timeFormat, intlOptions } = splitFormatOptions(options);
+  if (!date) return fallbackFor(value, fallback);
+  return safeLocaleFormat(
+    (loc, opts) => date.toLocaleTimeString(loc, opts),
+    locale,
+    withUserTimeFormatOptions(intlOptions, timeFormat, 'time')
+  );
+}
+
+export function formatDate(value: DateInput, options: UserDateTimeFormatOptions = {}): string {
+  const date = parseDate(value);
+  const { fallback, locale, intlOptions } = splitFormatOptions(options);
+  if (!date) return fallbackFor(value, fallback);
+  return safeLocaleFormat(
+    (loc, opts) => date.toLocaleDateString(loc, opts),
+    locale,
+    intlOptions
+  );
+}
+
+const RELATIVE_UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
+  ['year', 365 * 24 * 3_600_000],
+  ['month', 30 * 24 * 3_600_000],
+  ['day', 24 * 3_600_000],
+  ['hour', 3_600_000],
+  ['minute', 60_000],
+];
+
+/**
+ * "3 hours ago" / "in 5 minutes", in the user's formatting locale.
+ *
+ * Anything inside a minute renders as the locale's "now" rather than
+ * "0 seconds ago", because a sync that finished 12 seconds ago and one that
+ * finished 50 seconds ago are the same fact to the reader.
+ */
+export function formatRelativeTime(
+  value: DateInput,
+  options: { now?: Date; locale?: Intl.LocalesArgument; fallback?: string } = {}
+): string {
+  const date = parseDate(value);
+  if (!date) return fallbackFor(value, options.fallback);
+  const locale = options.locale ?? resolvedFormattingLocale();
+  const deltaMs = date.getTime() - (options.now ?? new Date()).getTime();
+  try {
+    const formatter = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+    for (const [unit, ms] of RELATIVE_UNITS) {
+      if (Math.abs(deltaMs) >= ms) return formatter.format(Math.round(deltaMs / ms), unit);
+    }
+    return formatter.format(0, 'second');
+  } catch {
+    return fallbackFor(value, options.fallback);
+  }
+}

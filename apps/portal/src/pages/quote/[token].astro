@@ -1,0 +1,34 @@
+---
+import PublicDocumentLayout from '../../layouts/PublicDocumentLayout.astro';
+import PublicQuoteView from '../../components/portal/PublicQuoteView';
+import { portalApi } from '../../lib/api';
+import { buildServerApiConfig } from '../../lib/server';
+
+const { token } = Astro.params;
+const response = await portalApi.getPublicQuote(token!, buildServerApiConfig(Astro.request));
+
+// An invalid/expired/revoked token returns 401 from the API. This page is
+// public, so we must NOT redirect a prospect to the portal login — just render
+// PublicQuoteView's own "invalid or expired" fallback (no specific error text
+// for the generic 401, which would otherwise read "Session expired").
+const initial = response.data?.data ?? null;
+// A replaced proposal answers 410 QUOTE_SUPERSEDED and carries only the
+// partner's branding — enough to say who to contact, nothing that would leak
+// the withdrawn pricing or the successor's link.
+const supersededBranding = response.statusCode === 410 && response.code === 'QUOTE_SUPERSEDED'
+  ? ((response.errorData as { branding?: { partnerName?: string } } | undefined)?.branding ?? {})
+  : null;
+const error = response.statusCode === 401 || supersededBranding ? undefined : response.error;
+const partnerName = initial?.branding?.partnerName ?? supersededBranding?.partnerName;
+const title = partnerName ? `Proposal from ${partnerName}` : 'Proposal';
+---
+
+<PublicDocumentLayout
+  title={title}
+  docAccent={initial?.branding?.primaryColor}
+  supportEmail={initial?.branding?.supportEmail}
+  supportPhone={initial?.branding?.supportPhone}
+  partnerName={partnerName}
+>
+  <PublicQuoteView token={token!} initial={initial} error={error} superseded={supersededBranding} client:load />
+</PublicDocumentLayout>

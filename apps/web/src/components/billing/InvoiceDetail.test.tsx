@@ -1,0 +1,717 @@
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { useLayoutEffect } from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import InvoiceDetail from './InvoiceDetail';
+import type { InvoiceDetail as InvoiceDetailData } from './invoiceTypes';
+import { _resetShowMarginMemoryForTests } from './billingUi';
+import { fetchWithAuth } from '../../stores/auth';
+
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+  // usePermissions() (billing-RBAC UI gating) reads grants off the store; grant
+  // the admin wildcard so every gated control renders and these tests exercise
+  // full functionality.
+  useAuthStore: Object.assign(
+    (selector: (s: { user: { permissions: { resource: string; action: string }[] } }) => unknown) =>
+      selector({ user: { permissions: [{ resource: '*', action: '*' }] } }),
+    { getState: () => ({ tokens: null }) },
+  ),
+}));
+vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
+const showToast = vi.fn();
+vi.mock('../shared/Toast', () => ({ showToast: (a: unknown) => showToast(a) }));
+
+const fetchMock = vi.mocked(fetchWithAuth);
+const json = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
+  ({ ok, status, statusText: ok ? 'OK' : 'ERR', json: vi.fn().mockResolvedValue(payload) }) as unknown as Response;
+
+const lines: InvoiceDetailData['lines'] = [
+  {
+    id: 'l1', invoiceId: 'inv-1', sourceType: 'catalog', parentLineId: null, catalogItemId: 'c1',
+    name: null, description: 'Widget', quantity: '1.00', unitPrice: '120.00', costBasis: '80.00', revenueAllocation: '120.00',
+    taxable: true, customerVisible: true, lineTotal: '120.00', isUnapprovedTime: false, sortOrder: 0, deviceCount: 0,
+    workedMinutes: null,
+  },
+  {
+    id: 'l2', invoiceId: 'inv-1', sourceType: 'bundle', parentLineId: 'l1', catalogItemId: 'c2',
+    name: null, description: 'Hidden component', quantity: '1.00', unitPrice: '0.00', costBasis: '10.00', revenueAllocation: null,
+    taxable: false, customerVisible: false, lineTotal: '0.00', isUnapprovedTime: false, sortOrder: 0, deviceCount: 0,
+    workedMinutes: null,
+  },
+];
+
+const issued: InvoiceDetailData = {
+  invoice: {
+    id: 'inv-1', invoiceNumber: 'INV-0007', orgId: 'org-1', siteId: null, status: 'sent',
+    currencyCode: 'USD', issueDate: '2026-06-01', dueDate: '2026-06-30', sentAt: null, subtotal: '120.00',
+    taxRate: '0.000', taxTotal: '0.00', total: '120.00', amountPaid: '0.00', balance: '120.00',
+    billToName: 'Acme', notes: null, termsAndConditions: null, sellerSnapshot: null, createdAt: '2026-06-01T00:00:00Z',
+  },
+  lines,
+};
+
+/**
+ * Records the due-date input's committed DOM value. A layout effect runs
+ * synchronously in the mutation phase of the very commit that produced the
+ * DOM, so it reads what the field actually showed at that commit without
+ * depending on when React's scheduler gets around to passive effects — same
+ * technique used to pin down #4659 (AiBudgetThresholdsInput).
+ */
+function CommitProbe({ testId, seen }: { testId: string; seen: string[] }) {
+  useLayoutEffect(() => {
+    const el = document.querySelector(`[data-testid="${testId}"]`) as HTMLInputElement | null;
+    if (!el) throw new Error(`CommitProbe: no element matching [data-testid="${testId}"]`);
+    seen.push(el.value);
+  });
+  return null;
+}
+
+describe('InvoiceDetail', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // The cost/margin toggle persists to localStorage (plus an in-memory
+    // mirror that survives storage clears) — reset both so each test starts
+    // from the default (internal view OFF).
+    localStorage.clear();
+    _resetShowMarginMemoryForTests();
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [] });
+      return json({ data: {} });
+    });
+  });
+
+  it('hides cost/margin, hidden components and the margin panel until the internal view is on — and persists the choice', async () => {
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+
+    // Customer view (default): hidden bundle child not rendered, no per-line
+    // cost/margin columns, and no margin summary panel — "no margin on screen"
+    // is the default until the operator opts in.
+    expect(screen.queryByTestId('invoice-detail-line-l2')).not.toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Cost' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Margin' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-margin')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('invoice-detail-toggle-margin'));
+    expect(screen.getByTestId('invoice-detail-line-l2')).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Cost' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Margin' })).toBeInTheDocument();
+    expect(screen.getByTestId('invoice-margin')).toBeInTheDocument();
+    // The preference persists under the SAME key the quote surfaces use, so
+    // "hide cost & margin" holds across the whole billing area.
+    expect(localStorage.getItem('breeze:quote-editor-show-margin')).toBe('1');
+  });
+
+  // #6467: the note is structured data (`workedMinutes`), not baked into
+  // `description` — so it survives regardless of what the description says,
+  // and renders localised via the shared `common:ticketTimeBilling.billedVsWorked` key.
+  it('shows the worked-vs-billed note for a time_entry line whose worked minutes differ from billed', async () => {
+    const withNote: InvoiceDetailData = {
+      ...issued,
+      lines: [{
+        id: 'l3', invoiceId: 'inv-1', sourceType: 'time_entry', parentLineId: null, catalogItemId: null,
+        name: null, description: 'On-site', quantity: '1.00', unitPrice: '225.00', costBasis: null, revenueAllocation: null,
+        taxable: false, customerVisible: true, lineTotal: '225.00', isUnapprovedTime: false, sortOrder: 0, deviceCount: 0,
+        workedMinutes: 30,
+      }],
+    };
+    render(<InvoiceDetail detail={withNote} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-detail-line-worked-vs-billed-l3')).toHaveTextContent('0.50 h worked · 1.00 h billed');
+  });
+
+  it('shows no worked-vs-billed note when worked minutes equal the billed quantity', async () => {
+    const noNote: InvoiceDetailData = {
+      ...issued,
+      lines: [{
+        id: 'l4', invoiceId: 'inv-1', sourceType: 'time_entry', parentLineId: null, catalogItemId: null,
+        name: null, description: 'Remote', quantity: '1.00', unitPrice: '150.00', costBasis: null, revenueAllocation: null,
+        taxable: false, customerVisible: true, lineTotal: '150.00', isUnapprovedTime: false, sortOrder: 0, deviceCount: 0,
+        workedMinutes: 60,
+      }],
+    };
+    render(<InvoiceDetail detail={noNote} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.queryByTestId('invoice-detail-line-worked-vs-billed-l4')).not.toBeInTheDocument();
+  });
+
+  it('renders the internal margin summary (billed-only, one-time, excludes tax)', async () => {
+    // Internal view pre-enabled via the persisted preference.
+    localStorage.setItem('breeze:quote-editor-show-margin', '1');
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+
+    // l1 is the only top-level line: revenue 120 − cost (80×1) = 40. l2 is a bundle
+    // child (parentLineId 'l1'), so it's excluded from the summary regardless of
+    // visibility — its cost is already rolled into the parent.
+    expect(screen.getByTestId('invoice-margin-cost')).toHaveTextContent('$80.00');
+    expect(screen.getByTestId('invoice-margin-net-onetime')).toHaveTextContent('$40.00');
+    // Invoices are one-time → the recurring profit rows never appear.
+    expect(screen.queryByTestId('invoice-margin-net-monthly')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-margin-net-annual')).not.toBeInTheDocument();
+    // Every counted line has a cost → no "estimate incomplete" warning.
+    expect(screen.queryByTestId('invoice-margin-missing-cost')).not.toBeInTheDocument();
+  });
+
+  it('counts a bundle once — a VISIBLE component is not double-counted', async () => {
+    // A bundle persists as a parent rollup line whose costBasis is the full bundle
+    // cost (Σ component costs) PLUS child component lines that each carry their own
+    // costBasis. Here the parent (p1) rolls up cost 80 / revenue 120, and a VISIBLE
+    // component child (c1) carries its own cost 10. Summing every line would give
+    // cost 90 / net 30; folding over top-level lines only gives the correct
+    // cost 80 / net 40 — the parent already includes the component's cost.
+    const bundle: InvoiceDetailData = {
+      ...issued,
+      lines: [
+        { ...lines[0], id: 'p1', parentLineId: null, costBasis: '80.00', revenueAllocation: '120.00', customerVisible: true, quantity: '1.00', unitPrice: '120.00', lineTotal: '120.00' },
+        { ...lines[1], id: 'c1', parentLineId: 'p1', costBasis: '10.00', revenueAllocation: '40.00', customerVisible: true, quantity: '1.00', unitPrice: '0.00', lineTotal: '0.00' },
+      ],
+    };
+    localStorage.setItem('breeze:quote-editor-show-margin', '1');
+    render(<InvoiceDetail detail={bundle} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-margin-cost')).toHaveTextContent('$80.00');
+    expect(screen.getByTestId('invoice-margin-net-onetime')).toHaveTextContent('$40.00');
+    expect(screen.queryByTestId('invoice-margin-missing-cost')).not.toBeInTheDocument();
+  });
+
+  it('warns in the margin summary when a billed line has no cost', async () => {
+    const noCost: InvoiceDetailData = {
+      ...issued,
+      lines: [{ ...lines[0], costBasis: null }],
+    };
+    localStorage.setItem('breeze:quote-editor-show-margin', '1');
+    render(<InvoiceDetail detail={noCost} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-margin-missing-cost')).toHaveTextContent('1 line missing a cost');
+    // The line is excluded from the net, so profit reads as $0.00 (not negative).
+    expect(screen.getByTestId('invoice-margin-net-onetime')).toHaveTextContent('$0.00');
+  });
+
+  it('records a payment via the form', async () => {
+    const onChanged = vi.fn();
+    fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
+      if (input.endsWith('/payments') && opts?.method === 'POST') return json({ data: { id: 'pay-1' } });
+      if (input.endsWith('/payments')) return json({ data: [] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={onChanged} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-form')).toBeInTheDocument());
+
+    // Submit disabled until an amount is entered, with a tooltip explaining why (#1975).
+    expect(screen.getByTestId('invoice-payment-submit')).toBeDisabled();
+    expect(screen.getByTestId('invoice-payment-submit')).toHaveAttribute('title', 'Enter a payment amount to record it');
+    // Reason is also exposed to assistive tech via aria-describedby (#1975).
+    expect(screen.getByTestId('invoice-payment-submit')).toHaveAttribute('aria-describedby', 'invoice-payment-submit-hint');
+    expect(document.getElementById('invoice-payment-submit-hint')).toHaveTextContent('Enter a payment amount to record it');
+    fireEvent.change(screen.getByTestId('invoice-payment-amount'), { target: { value: '50' } });
+    // Tooltip and aria-describedby clear once an amount is present.
+    expect(screen.getByTestId('invoice-payment-submit')).not.toHaveAttribute('title');
+    expect(screen.getByTestId('invoice-payment-submit')).not.toHaveAttribute('aria-describedby');
+    fireEvent.change(screen.getByTestId('invoice-payment-method'), { target: { value: 'check' } });
+    fireEvent.click(screen.getByTestId('invoice-payment-submit'));
+
+    // Confirm dialog must open before the POST fires.
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-confirm')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('invoice-payment-confirm'));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    const postCall = fetchMock.mock.calls.find((c) => String(c[0]).endsWith('/payments') && (c[1] as RequestInit)?.method === 'POST');
+    expect(JSON.parse((postCall![1] as RequestInit).body as string)).toMatchObject({ amount: 50, method: 'check' });
+  });
+
+  it.each([true, false])('warns about a QuickBooks reversal only when the record is untouched (%s)', async (quickbooksRecordUntouched) => {
+    const onChanged = vi.fn();
+    fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
+      if (opts?.method === 'DELETE') return json({ data: issued.invoice, quickbooksRecordUntouched });
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p-qb', invoiceId: 'inv-1', amount: '40.00', method: 'check', reference: null, receivedAt: '2026-06-11', note: null, createdAt: '', source: 'quickbooks' },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={onChanged} />);
+    fireEvent.click(await screen.findByTestId('invoice-payment-void-p-qb'));
+    fireEvent.click(screen.getByTestId('invoice-payment-reverse-confirm'));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenCalledWith('/invoices/inv-1/payments/p-qb', { method: 'DELETE' });
+    if (quickbooksRecordUntouched) {
+      expect(showToast).toHaveBeenCalledWith({ type: 'warning', message: 'Reverse this in QuickBooks too' });
+      expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+    } else {
+      expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+      expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'warning' }));
+    }
+  });
+
+  it('surfaces the server refusal when QuickBooks pull would re-import a reversed payment', async () => {
+    const onChanged = vi.fn();
+    fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
+      if (opts?.method === 'DELETE') return json({ error: 'Reverse in QuickBooks instead', code: 'QUICKBOOKS_OWNED_PAYMENT' }, false, 409);
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p-qb', invoiceId: 'inv-1', amount: '40.00', method: 'check', reference: null, receivedAt: '2026-06-11', note: null, createdAt: '', source: 'quickbooks' },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={onChanged} />);
+    fireEvent.click(await screen.findByTestId('invoice-payment-void-p-qb'));
+    fireEvent.click(screen.getByTestId('invoice-payment-reverse-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' })));
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'warning' }));
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+  });
+
+  it('blocks payment recording on a draft and explains why', async () => {
+    const draft: InvoiceDetailData = {
+      ...issued,
+      invoice: { ...issued.invoice, status: 'draft', invoiceNumber: null },
+    };
+    render(<InvoiceDetail detail={draft} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    // The payment form / pay-link must not be offered before an invoice is issued.
+    expect(screen.queryByTestId('invoice-payment-form')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-payment-submit')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-pay-link')).not.toBeInTheDocument();
+    // Instead the operator is told what unlocks it.
+    expect(screen.getByTestId('invoice-payments-draft-hint')).toHaveTextContent('Issue this invoice to record payments.');
+  });
+
+  it('shows the void action for an issued invoice and opens the dialog', async () => {
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('invoice-void-open'));
+    expect(screen.getByTestId('invoice-void-dialog')).toBeInTheDocument();
+    // Void submit disabled until a reason is entered.
+    expect(screen.getByTestId('invoice-void-submit')).toBeDisabled();
+    fireEvent.change(screen.getByTestId('invoice-void-reason'), { target: { value: 'Duplicate' } });
+    expect(screen.getByTestId('invoice-void-submit')).not.toBeDisabled();
+  });
+
+  it('copies the durable public link via GET /public-link when Stripe is connected', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/public-link')) return json({ data: { url: 'https://portal.test/portal/invoice/tok-abc' } });
+      if (input.endsWith('/payments')) return json({ data: [] });
+      return json({ data: {} });
+    });
+    Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    render(<InvoiceDetail detail={{ ...issued, stripeConnected: true }} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.queryByTestId('invoice-stripe-nudge')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('invoice-pay-link'));
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some((c) => String(c[0]).endsWith('/public-link'))).toBe(true);
+    });
+  });
+
+  it('shows the connect-Stripe nudge but KEEPS the copy-link action when not connected', async () => {
+    // The public page degrades to view+PDF without Stripe, so the durable link
+    // stays copyable — unlike the retired one-shot Stripe checkout copy.
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-stripe-nudge')).toBeInTheDocument();
+    expect(screen.getByTestId('invoice-pay-link')).toBeInTheDocument();
+  });
+
+  it('shows a dashed empty state with an Editor CTA on an empty draft (no CTA once issued)', async () => {
+    const emptyDraft: InvoiceDetailData = {
+      ...issued,
+      invoice: { ...issued.invoice, status: 'draft', invoiceNumber: null },
+      lines: [],
+    };
+    const { rerender } = render(<InvoiceDetail detail={emptyDraft} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    // No bare table header — a dashed card explains the state and routes to the
+    // Editor (mirrors QuoteDetail's empty state).
+    expect(screen.queryByTestId('invoice-detail-lines')).not.toBeInTheDocument();
+    expect(screen.getByTestId('invoice-detail-empty')).toBeInTheDocument();
+    expect(screen.getByTestId('invoice-detail-empty-edit')).toBeInTheDocument();
+
+    // Issued + empty: state renders, but the CTA is gone — there is no Editor
+    // tab to send the user to once the invoice has left draft.
+    rerender(<InvoiceDetail detail={{ ...issued, lines: [] }} onChanged={vi.fn()} />);
+    expect(screen.getByTestId('invoice-detail-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-detail-empty-edit')).not.toBeInTheDocument();
+  });
+
+  it('explains an all-internal invoice instead of rendering a bare table when the internal view is off', async () => {
+    const allHidden: InvoiceDetailData = {
+      ...issued,
+      lines: [{ ...lines[0], customerVisible: false }],
+    };
+    render(<InvoiceDetail detail={allHidden} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-detail-all-hidden')).toBeInTheDocument();
+
+    // Turning the internal view on reveals the hidden line and drops the notice.
+    fireEvent.click(screen.getByTestId('invoice-detail-toggle-margin'));
+    expect(screen.queryByTestId('invoice-detail-all-hidden')).not.toBeInTheDocument();
+    expect(screen.getByTestId('invoice-detail-line-l1')).toBeInTheDocument();
+  });
+
+  it('badges Stripe payments as Online and hides manual void on them', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p1', invoiceId: 'inv-1', amount: '120.00', method: 'card', reference: 'pi_x', receivedAt: '2026-06-10', note: null, createdAt: '', source: 'stripe' },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={{ ...issued, stripeConnected: true }} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p1')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-payment-online-p1')).toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-payment-void-p1')).not.toBeInTheDocument();
+  });
+
+  it('badges QuickBooks-pulled payments and lets the server decide whether reversal is allowed', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p2', invoiceId: 'inv-1', amount: '120.00', method: 'check', reference: 'QB-9012', receivedAt: '2026-06-11', note: null, createdAt: '', source: 'quickbooks' },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p2')).toBeInTheDocument());
+
+    expect(screen.getByTestId('invoice-payment-quickbooks-p2')).toHaveTextContent('QuickBooks');
+    expect(screen.getByTestId('invoice-payment-void-p2')).toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-payment-online-p2')).not.toBeInTheDocument();
+  });
+
+  it('keeps the void affordance and adds no badge on operator-recorded payments', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p3', invoiceId: 'inv-1', amount: '120.00', method: 'cash', reference: null, receivedAt: '2026-06-12', note: null, createdAt: '', source: 'manual' },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p3')).toBeInTheDocument());
+
+    expect(screen.getByTestId('invoice-payment-void-p3')).toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-payment-quickbooks-p3')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-payment-online-p3')).not.toBeInTheDocument();
+  });
+
+  // Phase D2, Task 7 — pushed Breeze-origin payments carry a sync badge but
+  // stay hand-voidable: the push does not transfer ownership, so a void must
+  // still propagate the deletion to QuickBooks (unlike the pull-owned rows
+  // above, where a Breeze-side reverse would never touch the books).
+  it('badges a synced Breeze-origin payment and STILL offers the void button', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p4', invoiceId: 'inv-1', amount: '120.00', method: 'cash', reference: null, receivedAt: '2026-06-13', note: null, createdAt: '', source: 'manual', accountingSync: { status: 'synced', lastError: null } },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p4')).toBeInTheDocument());
+
+    expect(screen.getByTestId('invoice-payment-qbosync-p4')).toHaveTextContent('In QuickBooks');
+    expect(screen.getByTestId('invoice-payment-void-p4')).toBeInTheDocument();
+  });
+
+  it('shows a pending payment as syncing', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p5', invoiceId: 'inv-1', amount: '120.00', method: 'cash', reference: null, receivedAt: '2026-06-14', note: null, createdAt: '', source: 'manual', accountingSync: { status: 'pending', lastError: null } },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p5')).toBeInTheDocument());
+
+    expect(screen.getByTestId('invoice-payment-qbosync-p5')).toHaveTextContent('Syncing');
+  });
+
+  it('surfaces the sync error text and reason on a failed push', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p6', invoiceId: 'inv-1', amount: '120.00', method: 'card', reference: 'pi_y', receivedAt: '2026-06-15', note: null, createdAt: '', source: 'stripe', accountingSync: { status: 'error', lastError: 'QuickBooks rejected the payment sync (HTTP 400)' } },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p6')).toBeInTheDocument());
+
+    const badge = screen.getByTestId('invoice-payment-qbosync-p6');
+    expect(badge).toHaveTextContent('QuickBooks sync failed');
+    expect(badge).toHaveAttribute('title', 'QuickBooks rejected the payment sync (HTTP 400)');
+  });
+
+  it('renders no sync badge when a payment has no QuickBooks mapping', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p7', invoiceId: 'inv-1', amount: '120.00', method: 'cash', reference: null, receivedAt: '2026-06-16', note: null, createdAt: '', source: 'manual', accountingSync: null },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p7')).toBeInTheDocument());
+
+    expect(screen.queryByTestId('invoice-payment-qbosync-p7')).not.toBeInTheDocument();
+  });
+
+  it('allows attempting a QuickBooks-origin reversal without a pushed-payment sync badge', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p8', invoiceId: 'inv-1', amount: '120.00', method: 'check', reference: 'QB-1', receivedAt: '2026-06-17', note: null, createdAt: '', source: 'quickbooks', accountingSync: null },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p8')).toBeInTheDocument());
+
+    expect(screen.getByTestId('invoice-payment-quickbooks-p8')).toBeInTheDocument();
+    expect(screen.getByTestId('invoice-payment-void-p8')).toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-payment-qbosync-p8')).not.toBeInTheDocument();
+  });
+});
+
+describe('InvoiceDetail — Stripe currency-mismatch warning (#3777)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    _resetShowMarginMemoryForTests();
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [] });
+      return json({ data: {} });
+    });
+  });
+
+  it('renders the warn-don\'t-block copy when the API reports a currency mismatch', async () => {
+    render(
+      <InvoiceDetail
+        detail={{
+          ...issued,
+          invoice: { ...issued.invoice, currencyCode: 'EUR' },
+          stripeConnected: true,
+          stripeAccountCurrency: 'USD',
+          currencyWarning: {
+            code: 'CURRENCY_DIFFERS_FROM_STRIPE_ACCOUNT',
+            documentCurrency: 'EUR',
+            accountCurrency: 'USD',
+            message: 'server copy',
+          },
+        }}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    const warning = screen.getByTestId('invoice-stripe-currency-warning');
+    expect(warning.textContent).toContain('EUR');
+    expect(warning.textContent).toContain('USD');
+    // Never blocks the pay-link action.
+    expect(screen.getByTestId('invoice-pay-link')).not.toBeDisabled();
+  });
+
+  it('renders the "currency not cached — refresh" warning for STRIPE_ACCOUNT_CURRENCY_UNKNOWN (review F6)', async () => {
+    render(
+      <InvoiceDetail
+        detail={{
+          ...issued,
+          stripeConnected: true,
+          stripeAccountCurrency: null,
+          currencyWarning: {
+            code: 'STRIPE_ACCOUNT_CURRENCY_UNKNOWN',
+            documentCurrency: 'EUR',
+            accountCurrency: null,
+            message: 'server copy',
+          },
+        }}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    const warning = screen.getByTestId('invoice-stripe-currency-warning');
+    expect(warning.textContent).toMatch(/not (been )?cached|refresh/i);
+    expect(warning.textContent).not.toContain('null');
+    expect(screen.getByTestId('invoice-pay-link')).not.toBeDisabled();
+  });
+
+  it('renders nothing when the currencies match (warning null)', async () => {
+    render(
+      <InvoiceDetail
+        detail={{ ...issued, stripeConnected: true, stripeAccountCurrency: 'USD', currencyWarning: null }}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.queryByTestId('invoice-stripe-currency-warning')).not.toBeInTheDocument();
+  });
+
+  it('renders nothing when Stripe is not connected, even if a stale warning is present', async () => {
+    render(
+      <InvoiceDetail
+        detail={{
+          ...issued,
+          stripeConnected: false,
+          currencyWarning: {
+            code: 'CURRENCY_DIFFERS_FROM_STRIPE_ACCOUNT',
+            documentCurrency: 'EUR',
+            accountCurrency: 'USD',
+            message: 'server copy',
+          },
+        }}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.queryByTestId('invoice-stripe-currency-warning')).not.toBeInTheDocument();
+  });
+});
+
+describe('InvoiceDetail — QuickBooks accounting sync rail card', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    _resetShowMarginMemoryForTests();
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [] });
+      return json({ data: {} });
+    });
+  });
+
+  it('omits the card entirely when the API reports no accounting sync row', async () => {
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.queryByTestId('invoice-detail-accounting-sync')).not.toBeInTheDocument();
+  });
+
+  it('renders the card in the rail when accountingSync is present', async () => {
+    render(
+      <InvoiceDetail
+        detail={{
+          ...issued,
+          accountingSync: {
+            provider: 'quickbooks',
+            syncStatus: 'error',
+            lastSyncedAt: null,
+            lastError: 'QuickBooks rejected the invoice sync (HTTP 500)',
+            remoteDocNumber: null,
+            remoteDeleted: false,
+          },
+        }}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.getByTestId('invoice-detail-accounting-sync')).toBeInTheDocument();
+    expect(screen.getByTestId('invoice-accounting-sync-error')).toHaveTextContent('HTTP 500');
+  });
+
+  // #4544: the card must key off the INVOICE's own status, not just the
+  // mapping row's syncStatus — a voided invoice's mapping can still read
+  // 'error'/'pending' from before the void.
+  it('passes the invoice status through so a voided invoice hides the Push button even with an otherwise-pushable mapping', async () => {
+    render(
+      <InvoiceDetail
+        detail={{
+          ...issued,
+          invoice: { ...issued.invoice, status: 'void' },
+          accountingSync: {
+            provider: 'quickbooks',
+            syncStatus: 'error',
+            lastSyncedAt: null,
+            lastError: 'QuickBooks rejected the invoice sync (HTTP 500)',
+            remoteDocNumber: null,
+            remoteDeleted: false,
+          },
+        }}
+        onChanged={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.queryByTestId('invoice-accounting-sync-push')).not.toBeInTheDocument();
+  });
+
+  it('refetches the invoice after a successful push', async () => {
+    const onChanged = vi.fn();
+    render(
+      <InvoiceDetail
+        detail={{
+          ...issued,
+          accountingSync: {
+            provider: 'quickbooks',
+            syncStatus: 'pending',
+            lastSyncedAt: null,
+            lastError: null,
+            remoteDocNumber: null,
+            remoteDeleted: false,
+          },
+        }}
+        onChanged={onChanged}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.includes('/accounting/quickbooks/invoices/')) {
+        return json({ syncStatus: 'synced', docNumber: 'INV-0007', taxVarianceCents: null });
+      }
+      if (input.endsWith('/payments')) return json({ data: [] });
+      return json({ data: {} });
+    });
+
+    fireEvent.click(screen.getByTestId('invoice-accounting-sync-push'));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/accounting/quickbooks/invoices/inv-1/push',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  // #4807 (mirrors #4659/#4033): `dueDateDraft` used to re-seed from
+  // `invoice.dueDate` in a `useEffect`, i.e. in a commit AFTER the one that
+  // delivered the new prop. Because a passive effect is deferred, a keystroke
+  // landing in that window was silently reverted by the stale date the
+  // effect had captured. Re-seeding during render (this fix) leaves no such
+  // commit — assert exactly that.
+  it('re-seeds a changed dueDate prop within the same commit, not a later one (#4807)', async () => {
+    const seen: string[] = [];
+    // The inline editor (and thus the input the probe reads) only mounts
+    // after "Edit" is clicked, so the probe is added to the tree in a
+    // SEPARATE rerender from the one that opens it — otherwise its layout
+    // effect would fire before the input exists.
+    const bare = (dueDate: string) => <InvoiceDetail detail={{ ...issued, invoice: { ...issued.invoice, dueDate } }} onChanged={vi.fn()} />;
+    const probed = (dueDate: string) => (
+      <>
+        {bare(dueDate)}
+        <CommitProbe testId="invoice-due-date-input" seen={seen} />
+      </>
+    );
+
+    const { rerender } = render(bare('2026-06-30'));
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('invoice-due-date-edit'));
+    await waitFor(() => expect(screen.getByTestId('invoice-due-date-input')).toBeInTheDocument());
+
+    rerender(probed('2026-06-30')); // add the probe once the field exists
+    seen.length = 0;
+
+    rerender(probed('2026-07-15'));
+
+    // One commit, already showing the new due date. An earlier entry still
+    // reading '2026-06-30' is the old effect-driven seed — the window that
+    // made the field clobberable mid-keystroke.
+    expect(seen).toEqual(['2026-07-15']);
+  });
+
+  // Discriminating test per the issue's required pattern: type a draft, then
+  // let an unrelated (equal-valued) prop refetch land — the draft must
+  // survive rather than being discarded by a resync that changed nothing.
+  it('keeps a typed due-date draft when an unrelated refetch hands back the same dueDate', async () => {
+    const { rerender } = render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('invoice-due-date-edit'));
+
+    const input = screen.getByTestId('invoice-due-date-input') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '2026-08-01' } });
+
+    // A fresh detail object, same persisted due date — an unrelated resync
+    // (e.g. the payments-list refresh on the same page).
+    rerender(<InvoiceDetail detail={{ ...issued, invoice: { ...issued.invoice } }} onChanged={vi.fn()} />);
+
+    expect(screen.getByTestId('invoice-due-date-input')).toHaveValue('2026-08-01');
+  });
+});

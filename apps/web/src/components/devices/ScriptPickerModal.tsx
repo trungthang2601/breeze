@@ -1,0 +1,485 @@
+import { useState, useMemo, useEffect } from 'react';
+import { X, Search, Play, Loader2, ChevronLeft } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { cn } from '@/lib/utils';
+import { Dialog } from '../shared/Dialog';
+import { fetchLiveSessions, type LiveSession } from '../../services/deviceActions';
+import { hasSecretParameters, runtimeParameters, secretsBlockedForRun, type ScriptParameter } from '../scripts/ScriptFormSchema';
+import ScriptParametersForm, { validateParameters } from '../scripts/ScriptParametersForm';
+import { fetchAllScripts } from '@/lib/scriptsFetch';
+
+export type ScriptLanguage = 'powershell' | 'bash' | 'python' | 'cmd';
+export type OSType = 'windows' | 'macos' | 'linux';
+export type ScriptRunAsSelection = 'system' | 'user';
+
+export type Script = {
+  id: string;
+  name: string;
+  description?: string;
+  language: ScriptLanguage;
+  category: string;
+  osTypes: OSType[];
+  isSystem?: boolean;
+  parameters?: ScriptParameter[];
+  /**
+   * The script's SAVED run context (#4888). `GET /scripts` selects whole rows,
+   * so this has always been on the wire — it is surfaced on the type now that
+   * callers need to name the default they are inheriting ("Script default
+   * (Elevated)") instead of silently replacing it.
+   */
+  runAs?: 'system' | 'user' | 'elevated';
+};
+
+type ScriptPickerModalProps = {
+  isOpen: boolean;
+  onClose: () => void;
+  onSelect: (script: Script, runAs: ScriptRunAsSelection, parameters?: Record<string, unknown>, targetSessionId?: number) => void;
+  deviceHostname?: string;
+  deviceOs?: OSType | OSType[];
+  // Single-device context only: enables the RDS session-target dropdown for
+  // runAs=user when the device reports on-demand helper lifecycle.
+  deviceId?: string;
+  helperLifecycleMode?: 'always-on' | 'on-demand' | null;
+  /**
+   * #4888 — lets a host that owns its OWN run-context control suppress this
+   * modal's. The fleet Fix flow does exactly that: this select has no "script
+   * default" option and resets to `'system'` on every open, so a host that
+   * forwarded its value straight into a request would silently downgrade an
+   * `elevated` script to `system` the moment the picker started being
+   * honoured. FixPickerModal hides it and renders a `RunContextSelect` that
+   * can express "leave the script's default alone".
+   *
+   * When hidden, `onSelect` still receives a `runAs` argument (`'system'`);
+   * a host that hides the control must ignore it.
+   */
+  showRunAsSelector?: boolean;
+};
+
+const languageConfig: Record<ScriptLanguage, { label: string; color: string; icon: string }> = {
+  powershell: { label: 'PowerShell', color: 'bg-blue-500/20 text-blue-700', icon: 'PS' },
+  bash: { label: 'Bash', color: 'bg-green-500/20 text-green-700', icon: '$' },
+  python: { label: 'Python', color: 'bg-yellow-500/20 text-yellow-700', icon: 'Py' },
+  cmd: { label: 'CMD', color: 'bg-gray-500/20 text-gray-700', icon: '>' }
+};
+
+export default function ScriptPickerModal({
+  isOpen,
+  onClose,
+  onSelect,
+  deviceHostname,
+  deviceOs,
+  deviceId,
+  helperLifecycleMode,
+  showRunAsSelector = true
+}: ScriptPickerModalProps) {
+  const { t } = useTranslation('devices');
+  const [scripts, setScripts] = useState<Script[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [query, setQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState<string>('all');
+  const [runAs, setRunAs] = useState<ScriptRunAsSelection>('system');
+
+  // RDS session targeting: only offered for a single on-demand device when
+  // running as the logged-in user. All sessions (incl. disconnected) are
+  // selectable for scripts — a process keeps running in a disconnected session.
+  const [liveSessions, setLiveSessions] = useState<LiveSession[]>([]);
+  const [targetSessionId, setTargetSessionId] = useState<number | undefined>();
+  const showSessionTarget = showRunAsSelector && runAs === 'user' && helperLifecycleMode === 'on-demand' && !!deviceId;
+
+  // Parameter step state
+  const [view, setView] = useState<'list' | 'params'>('list');
+  const [selectedScript, setSelectedScript] = useState<Script | null>(null);
+  const [paramValues, setParamValues] = useState<Record<string, unknown>>({});
+  const [paramError, setParamError] = useState<string | undefined>();
+
+  useEffect(() => {
+    if (isOpen) {
+      setRunAs('system');
+      setView('list');
+      setSelectedScript(null);
+      setParamValues({});
+      setParamError(undefined);
+      fetchScripts();
+    }
+  }, [isOpen]);
+
+  // Reset the session target whenever the modal opens or closes.
+  useEffect(() => {
+    setTargetSessionId(undefined);
+    setLiveSessions([]);
+  }, [isOpen]);
+
+  // Fetch live sessions only once the dropdown is actually shown.
+  useEffect(() => {
+    if (!showSessionTarget || !deviceId) return;
+    fetchLiveSessions(deviceId).then(setLiveSessions).catch(() => setLiveSessions([]));
+  }, [showSessionTarget, deviceId]);
+
+  async function fetchScripts() {
+    try {
+      setLoading(true);
+      setError(undefined);
+
+      // #3301 — walk every page; a bare request returned only the first 50, so
+      // a script past that could not be picked to run on a device.
+      const { data: scriptList } = await fetchAllScripts({ includeSystem: true });
+
+      // Transform scripts
+      const transformedScripts: Script[] = scriptList
+        .map((s: Record<string, unknown>) => ({
+          id: s.id as string,
+          name: (s.name ?? t('scriptPickerModal.unnamedScript')) as string,
+          description: s.description as string | undefined,
+          language: (s.language ?? 'bash') as ScriptLanguage,
+          category: (s.category ?? t('scriptPickerModal.generalCategory')) as string,
+          osTypes: (s.osTypes ?? s.os_types ?? ['macos', 'linux']) as OSType[],
+          isSystem: s.isSystem as boolean | undefined,
+          parameters: Array.isArray(s.parameters) ? (s.parameters as ScriptParameter[]) : undefined
+        }));
+
+      setScripts(transformedScripts);
+    } catch (err) {
+      // fetchAllScripts throws the failed Response, not an Error.
+      if (err instanceof Response) {
+        setError(t('scriptPickerModal.errors.fetch'));
+        return;
+      }
+      setError(err instanceof Error ? err.message : t('scriptPickerModal.errors.load'));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const categories = useMemo(() => {
+    const cats = new Set(scripts.map(s => s.category));
+    return Array.from(cats).sort();
+  }, [scripts]);
+
+  const filteredScripts = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    let osFilter: OSType[] | null = null;
+    if (deviceOs) {
+      osFilter = Array.isArray(deviceOs) ? deviceOs : [deviceOs];
+    }
+
+    return scripts.filter(script => {
+      const matchesQuery = normalizedQuery.length === 0
+        ? true
+        : script.name.toLowerCase().includes(normalizedQuery) ||
+          (script.description?.toLowerCase().includes(normalizedQuery) ?? false);
+      const matchesCategory = categoryFilter === 'all' ? true : script.category === categoryFilter;
+      const matchesOs = !osFilter || osFilter.some(os => script.osTypes.includes(os));
+
+      return matchesQuery && matchesCategory && matchesOs;
+    });
+  }, [scripts, query, categoryFilter, deviceOs]);
+
+  const handleSelect = (script: Script) => {
+    // The parameter STEP is gated on the whole definition list: a fully-bound
+    // script asks for nothing but still injects values per device, so the
+    // operator sees the contract (and a Run button) rather than a run that
+    // fires the instant they click the row. Only a script with no parameters
+    // at all runs straight through.
+    if (!script.parameters || script.parameters.length === 0) {
+      onSelect(script, runAs, undefined, showSessionTarget ? targetSessionId : undefined);
+      onClose();
+      return;
+    }
+
+    // Seeding stays runtime-only (#3409 PR3). A bound parameter is resolved per
+    // target device by the server, so it must never enter `paramValues` — a
+    // supplied value would be ignored and reported back in `ignoredParameters`.
+    const defaults: Record<string, unknown> = {};
+    for (const param of runtimeParameters(script.parameters)) {
+      if (param.defaultValue !== undefined) {
+        if (param.type === 'number') {
+          defaults[param.name] = Number(param.defaultValue) || 0;
+        } else if (param.type === 'boolean') {
+          defaults[param.name] = param.defaultValue === 'true';
+        } else {
+          defaults[param.name] = param.defaultValue;
+        }
+      } else {
+        defaults[param.name] = param.type === 'boolean' ? false : param.type === 'number' ? 0 : '';
+      }
+    }
+    setParamValues(defaults);
+    setSelectedScript(script);
+    setParamError(undefined);
+    setView('params');
+  };
+
+  // Secrets ride an environment variable in the sealed command envelope, which
+  // neither the user-context helper IPC nor a session-targeted run can carry —
+  // the server refuses both (#3409 PR4c-2). The run context is chosen on the
+  // list step and the script on the parameter step, so this is the first point
+  // where both halves are known. Advisory only: the server gate is
+  // authoritative and the operator may still submit.
+  const secretsBlocked = hasSecretParameters(selectedScript?.parameters)
+    && secretsBlockedForRun({ runAs, targetSessionId: showSessionTarget ? targetSessionId : undefined });
+
+  const handleBack = () => {
+    setSelectedScript(null);
+    setParamValues({});
+    setParamError(undefined);
+    setView('list');
+  };
+
+  const handleRunScript = () => {
+    if (!selectedScript?.parameters) return;
+    const error = validateParameters(selectedScript.parameters, paramValues);
+    if (error) {
+      setParamError(error);
+      return;
+    }
+    onSelect(selectedScript, runAs, paramValues, showSessionTarget ? targetSessionId : undefined);
+    onClose();
+  };
+
+  return (
+    <Dialog open={isOpen} onClose={onClose} title={t('scriptPickerModal.title')} maxWidth="2xl" className="max-h-[80vh] overflow-hidden flex flex-col">
+      {view === 'list' ? (
+        <>
+          {/* Header */}
+          <div className="flex items-center justify-between border-b px-6 py-4">
+            <div>
+              <h2 className="text-lg font-semibold">{t('scriptPickerModal.title')}</h2>
+              {deviceHostname && (
+                <p className="text-sm text-muted-foreground">
+                  {t('scriptPickerModal.runOnDevice', { hostname: deviceHostname })}
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+
+          {/* Filters */}
+          <div className="border-b px-6 py-3">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <div className="relative flex-1">
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <input
+                  type="search"
+                  placeholder={t('scriptPickerModal.searchPlaceholder')}
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                  className="h-9 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                />
+              </div>
+              {categories.length > 0 && (
+                <select
+                  value={categoryFilter}
+                  onChange={e => setCategoryFilter(e.target.value)}
+                  className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                >
+                  <option value="all">{t('scriptPickerModal.allCategories')}</option>
+                  {categories.map(cat => (
+                    <option key={cat} value={cat}>
+                      {cat}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {showRunAsSelector && (
+                <select
+                  value={runAs}
+                  onChange={e => setRunAs(e.target.value as ScriptRunAsSelection)}
+                  data-testid="script-run-as"
+                  aria-label={t('common:runContext.label')}
+                  className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                >
+                  <option value="system">{t('scriptPickerModal.runAs.system')}</option>
+                  <option value="user">{t('scriptPickerModal.runAs.user')}</option>
+                </select>
+              )}
+              {showSessionTarget && (
+                <select
+                  value={targetSessionId ?? ''}
+                  onChange={e => setTargetSessionId(e.target.value === '' ? undefined : Number(e.target.value))}
+                  data-testid="script-session-target"
+                  aria-label={t('common:runContext.sessionLabel')}
+                  className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                >
+                  <option value="">{t('scriptPickerModal.sessionAny')}</option>
+                  {liveSessions.map(s => (
+                    <option key={s.sessionId} value={s.sessionId}>
+                      {s.username} — {s.sessionId} ({s.state})
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+          </div>
+
+          {/* Content */}
+          <div className="flex-1 overflow-y-auto p-4">
+            {loading ? (
+              <div className="flex items-center justify-center py-12">
+                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+              </div>
+            ) : error ? (
+              <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                {error}
+              </div>
+            ) : filteredScripts.length === 0 ? (
+              <div className="py-12 text-center text-sm text-muted-foreground">
+                {scripts.length === 0 ? t('scriptPickerModal.empty') : t('scriptPickerModal.emptySearch')}
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {filteredScripts.map(script => {
+                  // Two separate facts, so two separate badges: how many values
+                  // the operator will be asked for, and how many the server
+                  // injects. Collapsing them into one total would over-report
+                  // the work ("2 param(s)" for one question) and hiding the
+                  // bound ones would under-report what actually reaches the
+                  // device — a fully-bound script would look parameterless.
+                  const runtimeCount = runtimeParameters(script.parameters).length;
+                  const boundCount = (script.parameters?.length ?? 0) - runtimeCount;
+                  return (
+                    <button
+                      key={script.id}
+                      type="button"
+                      onClick={() => handleSelect(script)}
+                      className="flex w-full items-start gap-3 rounded-lg border p-4 text-left transition hover:bg-muted/50"
+                    >
+                      <div className={cn(
+                        'flex h-8 w-8 shrink-0 items-center justify-center rounded text-xs font-bold',
+                        languageConfig[script.language].color
+                      )}>
+                        {languageConfig[script.language].icon}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium">{script.name}</p>
+                        {script.description && (
+                          <p className="mt-0.5 text-sm text-muted-foreground line-clamp-2">
+                            {script.description}
+                          </p>
+                        )}
+                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                          <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5">
+                            {script.category}
+                          </span>
+                          <span>
+                            {script.osTypes.join(', ')}
+                          </span>
+                          {runtimeCount > 0 && (
+                            <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5">
+                              {t('scriptPickerModal.paramCount', { count: runtimeCount })}
+                            </span>
+                          )}
+                          {boundCount > 0 && (
+                            <span
+                              data-testid={`script-bound-param-count-${script.id}`}
+                              className="inline-flex items-center rounded-full bg-muted px-2 py-0.5"
+                            >
+                              {t('scriptPickerModal.boundParamCount', { count: boundCount })}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <Play className="h-4 w-4 shrink-0 text-muted-foreground" />
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Footer */}
+          <div className="flex items-center justify-between border-t px-6 py-4">
+            <p className="text-sm text-muted-foreground">
+              {t('scriptPickerModal.availableCount', { count: filteredScripts.length })}
+            </p>
+            <button
+              type="button"
+              onClick={onClose}
+              className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+            >
+              {t('common:actions.cancel')}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          {/* Parameter step header */}
+          <div className="flex items-center justify-between border-b px-6 py-4">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={handleBack}
+                className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                aria-label={t('scriptPickerModal.backToList')}
+              >
+                <ChevronLeft className="h-5 w-5" />
+              </button>
+              <div>
+                <h2 className="text-lg font-semibold">{t('scriptPickerModal.configureParameters')}</h2>
+                {selectedScript && (
+                  <p className="text-sm text-muted-foreground">{selectedScript.name}</p>
+                )}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+
+          {/* Parameter step content */}
+          <div className="flex-1 overflow-y-auto p-6 space-y-4">
+            {paramError && (
+              <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                {paramError}
+              </div>
+            )}
+            {secretsBlocked && (
+              <p
+                data-testid="script-picker-secrets-require-system"
+                className="rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-xs text-amber-600 dark:text-amber-500"
+              >
+                {t('scripts:secretParameters.requiresSystemContext')}
+              </p>
+            )}
+            {selectedScript?.parameters && (
+              <ScriptParametersForm
+                parameters={selectedScript.parameters}
+                values={paramValues}
+                onChange={(name, value) => setParamValues(prev => ({ ...prev, [name]: value }))}
+              />
+            )}
+          </div>
+
+          {/* Parameter step footer */}
+          <div className="flex items-center justify-end gap-3 border-t px-6 py-4">
+            <button
+              type="button"
+              onClick={onClose}
+              className="h-10 rounded-md border px-4 text-sm font-medium text-muted-foreground transition hover:text-foreground"
+            >
+              {t('common:actions.cancel')}
+            </button>
+            <button
+              type="button"
+              onClick={handleRunScript}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:bg-primary/90"
+            >
+              <Play className="h-4 w-4" />
+              {t('scriptPickerModal.runScript')}
+            </button>
+          </div>
+        </>
+      )}
+    </Dialog>
+  );
+}

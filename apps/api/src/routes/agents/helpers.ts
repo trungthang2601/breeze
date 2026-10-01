@@ -1,0 +1,3533 @@
+import { z } from 'zod';
+import { and, desc, eq, gte, inArray, isNull, or, sql } from 'drizzle-orm';
+import { randomBytes } from 'crypto';
+import { db } from '../../db';
+import type { AgentAuthContext } from '../../middleware/agentAuth';
+import {
+  devices,
+  deviceCommands,
+  deviceDisks,
+  deviceFilesystemSnapshots,
+  automationPolicies,
+  cisBaselines,
+  cisBaselineResults,
+  cisRemediationActions,
+  softwareComplianceStatus,
+  softwarePolicies,
+  securityStatus,
+  securityThreats,
+  securityScans,
+  sensitiveDataFindings,
+  sensitiveDataScans,
+  organizations,
+  partners,
+  deviceGroupMemberships,
+  configPolicyAssignments,
+  configurationPolicies,
+  fileEgressPolicies,
+  configPolicyEffectiveFeatureLinks,
+  configPolicyEventLogSettings,
+  configPolicyMonitoringSettings,
+  configPolicyMonitoringWatches,
+  configPolicyOnedriveSettings,
+  configPolicyOnedriveLibraries,
+  onedriveDeviceState,
+  pamOrgConfig,
+  agentVersions,
+} from '../../db/schema';
+import { getRedis } from '../../services/redis';
+import { publishEvent } from '../../services/eventBus';
+import { scheduleSoftwareComplianceCheck } from '../../jobs/softwareComplianceWorker';
+import {
+  recordSensitiveDataFinding,
+  recordSensitiveDataRemediationDecision,
+  recordSoftwareRemediationDecision
+} from '../metrics';
+import { queueCommandForExecution } from '../../services/commandQueue';
+import { parseCisCollectorOutput } from '../../services/cisHardening';
+import {
+  claimFilesystemScanGeneration,
+  setFilesystemScanGeneration,
+  getFilesystemScanState,
+  mergeFilesystemAnalysisPayload,
+  parseFilesystemAnalysisStdout,
+  readCheckpointPendingDirectories,
+  readHotDirectories,
+  saveFilesystemSnapshot,
+  upsertFilesystemScanState,
+} from '../../services/filesystemAnalysis';
+import { recordSoftwarePolicyAudit } from '../../services/softwarePolicyService';
+import {
+  resolvePatchConfigForDevice,
+  buildRoleOsFilterConditions,
+  matchesRoleOsFilter,
+} from '../../services/featureConfigResolver';
+import { resolveEffectiveWarrantyInlineSettings } from '../../services/warrantyPolicyResolution';
+import { warrantyHpCmslCollectionEffective } from '@breeze/shared/validators';
+import { policyOwnershipCondition } from '../../services/configPolicyOwnership';
+import { resolveUserGroupMembershipCached } from '../../services/onedriveGraph';
+import { captureException } from '../../services/sentry';
+import { getBinaryEdition } from '../../services/binaryEdition';
+import { redactSecretsDeep, redactOptionalSecretText } from '../../services/secretRedaction';
+import { CloudflareMtlsService } from '../../services/cloudflareMtls';
+import { normalizeCertificateSerial } from '../../services/agentCertificateBinding';
+import { isAllowedPolicyConfigProbe } from './policyProbeSafety';
+import { resolveMonitorsForDevice } from '../../services/monitors/monitorResolver';
+import { MONITOR_KIND_SPECS, applyOverrides } from '../../services/monitors/kinds';
+import { monitorDefinitions } from '../../db/schema/monitorDefinitions';
+import { PAM_DEFAULTS, parsePamSettings, type PamSettings } from './pamSettings';
+import {
+  normalizeAgentUpdatePolicy,
+  type AgentUpdateSettings,
+} from './agentUpdatePolicy';
+import {
+  normalizeScanPath,
+  osRootScanPath,
+  isAlwaysMaintenanceWindow,
+  parseMaintenanceWindow,
+  resolveInheritedAgentVersionPins,
+} from '@breeze/shared';
+import {
+  type SecurityProviderValue,
+  type SecurityStatusPayload,
+  type PolicyRegistryProbeUpdate,
+  type PolicyConfigProbeUpdate,
+  type PolicyProbeConfigUpdate,
+  commandResultSchema,
+  securityStatusIngestSchema,
+  securityCommandTypes,
+  filesystemAnalysisCommandType,
+  sensitiveDataCommandTypes,
+  filesystemDiskThresholdPercent,
+  filesystemThresholdCooldownMinutes,
+  filesystemAutoResumeMaxRuns,
+  uuidRegex,
+} from './schemas';
+
+// Re-export for convenience — route files import as AgentContext
+export type AgentContext = AgentAuthContext;
+
+// ============================================
+// Generic Utilities
+// ============================================
+
+export function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+export function asBoolean(value: unknown, defaultValue = false): boolean {
+  return typeof value === 'boolean' ? value : defaultValue;
+}
+
+export function asInt(value: unknown, defaultValue = 0): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.trunc(parsed);
+  }
+  return defaultValue;
+}
+
+export function parseDate(value: unknown): Date | null {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/**
+ * Validates a string is a valid ISO 8601 date (YYYY-MM-DD) suitable for a
+ * PostgreSQL `date` column.  Returns the date string or null.
+ */
+export function sanitizeDate(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
+  const d = new Date(trimmed + 'T00:00:00Z');
+  if (Number.isNaN(d.getTime())) return null;
+  // `new Date()` silently rolls impossible calendar dates over ('2026-02-31'
+  // becomes 2026-03-03) and is therefore NOT a validity check on its own. The
+  // original string would then reach a Postgres `date` column and raise 22008,
+  // aborting the entire enclosing ingest transaction. Round-trip to confirm the
+  // date the caller wrote is the date we parsed.
+  return d.toISOString().slice(0, 10) === trimmed ? trimmed : null;
+}
+
+/**
+ * Strict timestamp parser that requires ISO 8601 / RFC 3339 format before
+ * accepting — rejects ambiguous locale-dependent strings that `new Date()`
+ * might parse inconsistently across JS engines.
+ * Returns a Date or null (never throws).
+ */
+export function sanitizeTimestamp(value: unknown): Date | null {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const trimmed = value.trim();
+  // Must start with an ISO date prefix to rule out locale strings
+  if (!/^\d{4}-\d{2}-\d{2}[T ]/.test(trimmed)) return null;
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+export function normalizeStateValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return null;
+}
+
+export function readTrimmedString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && uuidRegex.test(value);
+}
+
+export function parseResultJson(stdout: string | undefined): Record<string, unknown> | undefined {
+  if (!stdout) return undefined;
+  try {
+    const parsed = JSON.parse(stdout);
+    return isObject(parsed) ? parsed : undefined;
+  } catch {
+    console.warn('[agents] Failed to parse command result JSON:', stdout?.slice(0, 500));
+    return undefined;
+  }
+}
+
+// ============================================
+// Normalization
+// ============================================
+
+export function normalizeAgentArchitecture(architecture: string | null | undefined): 'amd64' | 'arm64' | null {
+  if (!architecture) return null;
+  const normalized = architecture.trim().toLowerCase();
+  if (normalized === 'amd64' || normalized === 'x86_64' || normalized === 'x64') {
+    return 'amd64';
+  }
+  if (normalized === 'arm64' || normalized === 'aarch64') {
+    return 'arm64';
+  }
+  return null;
+}
+
+export function normalizeProvider(raw: unknown): SecurityProviderValue {
+  if (typeof raw !== 'string') return 'other';
+  const value = raw.trim().toLowerCase();
+  switch (value) {
+    case 'windows_defender':
+    case 'microsoft_defender':
+    case 'defender':
+    case 'prov-defender':
+      return 'windows_defender';
+    case 'bitdefender':
+    case 'prov-bitdefender':
+      return 'bitdefender';
+    case 'sophos':
+      return 'sophos';
+    case 'sentinelone':
+    case 'sentinel_one':
+    case 'sentinel':
+    case 'prov-sentinelone':
+      return 'sentinelone';
+    case 'crowdstrike':
+    case 'prov-crowdstrike':
+      return 'crowdstrike';
+    case 'malwarebytes':
+      return 'malwarebytes';
+    case 'eset':
+      return 'eset';
+    case 'kaspersky':
+      return 'kaspersky';
+    case 'elastic_defend':
+    case 'elastic_endpoint':
+    case 'elastic_agent':
+    case 'elastic':
+      return 'elastic_defend';
+    default:
+      return 'other';
+  }
+}
+
+export function normalizeEncryptionStatus(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim().toLowerCase();
+  if (value === '') return null;
+  if (value === 'encrypted' || value === 'partial' || value === 'unencrypted' || value === 'unknown') {
+    return value;
+  }
+  if (value.includes('encrypt')) return 'encrypted';
+  if (value.includes('unencrypt')) return 'unencrypted';
+  return value.slice(0, 50);
+}
+
+export function normalizeSeverity(raw: unknown): 'low' | 'medium' | 'high' | 'critical' {
+  if (typeof raw !== 'string') return 'medium';
+  const value = raw.trim().toLowerCase();
+  if (value === 'critical') return 'critical';
+  if (value === 'high') return 'high';
+  if (value === 'low') return 'low';
+  return 'medium';
+}
+
+export function normalizeKnownOsType(raw: unknown): 'windows' | 'macos' | 'linux' | null {
+  if (typeof raw !== 'string') return null;
+  const value = raw.trim().toLowerCase();
+  if (value === 'windows' || value === 'macos' || value === 'linux') {
+    return value;
+  }
+  return null;
+}
+
+export function inferPatchOsType(source: string, deviceOs: unknown): 'windows' | 'macos' | 'linux' | null {
+  const normalizedDeviceOs = normalizeKnownOsType(deviceOs);
+  if (normalizedDeviceOs) {
+    return normalizedDeviceOs;
+  }
+
+  switch (source) {
+    case 'microsoft':
+      return 'windows';
+    case 'apple':
+      return 'macos';
+    case 'linux':
+      return 'linux';
+    default:
+      return null;
+  }
+}
+
+// ============================================
+// Version Comparison / artifact-edition compatibility
+// ============================================
+//
+// Moved to services/agentEditionCompat.ts (#4093) so the DISPATCH path
+// (services/commandQueue.ts) can gate on the same predicate the heartbeat
+// offer path uses. This module imports services/commandQueue, so a direct
+// import in the other direction would be a cycle. Re-exported here: every
+// existing import site (and the suites that mock `./helpers`) keeps working.
+export {
+  parseComparableVersion,
+  compareAgentVersions,
+  AGENT_EDITION_CHECK_INTRODUCED,
+  agentAcceptsServedEdition,
+  editionWithheldDetail,
+  type EditionWithheldContext,
+} from '../../services/agentEditionCompat';
+
+// ============================================
+// Policy Probe Processing
+// ============================================
+
+export function sortPolicyRegistryProbes(probes: PolicyRegistryProbeUpdate[]): PolicyRegistryProbeUpdate[] {
+  return [...probes].sort((left, right) => {
+    const pathCompare = left.registry_path.localeCompare(right.registry_path);
+    if (pathCompare !== 0) return pathCompare;
+    return left.value_name.localeCompare(right.value_name);
+  });
+}
+
+export function sortPolicyConfigProbes(probes: PolicyConfigProbeUpdate[]): PolicyConfigProbeUpdate[] {
+  return [...probes].sort((left, right) => {
+    const pathCompare = left.file_path.localeCompare(right.file_path);
+    if (pathCompare !== 0) return pathCompare;
+    return left.config_key.localeCompare(right.config_key);
+  });
+}
+
+export function derivePolicyStateProbesFromRules(rules: unknown): {
+  registry: PolicyRegistryProbeUpdate[];
+  config: PolicyConfigProbeUpdate[];
+} {
+  if (!Array.isArray(rules)) {
+    return { registry: [], config: [] };
+  }
+
+  const registryProbes = new Map<string, PolicyRegistryProbeUpdate>();
+  const configProbes = new Map<string, PolicyConfigProbeUpdate>();
+
+  for (const rawRule of rules) {
+    if (!isObject(rawRule)) {
+      continue;
+    }
+
+    const type = readTrimmedString(rawRule.type ?? rawRule.name)?.toLowerCase();
+    if (type === 'registry_check') {
+      const registryPath = readTrimmedString(rawRule.registryPath ?? rawRule.registry_path);
+      const valueName = readTrimmedString(rawRule.registryValueName ?? rawRule.registry_value_name);
+      if (!registryPath || !valueName) {
+        continue;
+      }
+
+      const dedupeKey = `${registryPath.toLowerCase()}::${valueName.toLowerCase()}`;
+      if (!registryProbes.has(dedupeKey)) {
+        registryProbes.set(dedupeKey, {
+          registry_path: registryPath,
+          value_name: valueName
+        });
+      }
+      continue;
+    }
+
+    if (type === 'config_check') {
+      const filePath = readTrimmedString(rawRule.configFilePath ?? rawRule.config_file_path);
+      const configKey = readTrimmedString(rawRule.configKey ?? rawRule.config_key);
+      if (!filePath || !configKey || !isAllowedPolicyConfigProbe(filePath, configKey)) {
+        continue;
+      }
+
+      const dedupeKey = `${filePath.toLowerCase()}::${configKey.toLowerCase()}`;
+      if (!configProbes.has(dedupeKey)) {
+        configProbes.set(dedupeKey, {
+          file_path: filePath,
+          config_key: configKey
+        });
+      }
+    }
+  }
+
+  return {
+    registry: sortPolicyRegistryProbes(Array.from(registryProbes.values())),
+    config: sortPolicyConfigProbes(Array.from(configProbes.values()))
+  };
+}
+
+export async function buildPolicyProbeConfigUpdate(orgId: string | null | undefined): Promise<PolicyProbeConfigUpdate | null> {
+  if (!orgId) {
+    return null;
+  }
+
+  // Dual-ownership (#2129): the device's probe list must also cover
+  // partner-wide compliance policies (org_id NULL) owned by this org's
+  // partner — the evaluation worker fans those out to this device, so the
+  // agent has to collect their registry/config state too.
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+
+  const ownershipCondition = org?.partnerId
+    ? or(
+        eq(automationPolicies.orgId, orgId),
+        and(isNull(automationPolicies.orgId), eq(automationPolicies.partnerId, org.partnerId))
+      )
+    : eq(automationPolicies.orgId, orgId);
+
+  const policyRows = await db
+    .select({ rules: automationPolicies.rules })
+    .from(automationPolicies)
+    .where(
+      and(
+        ownershipCondition,
+        eq(automationPolicies.enabled, true)
+      )
+    );
+
+  const registryByKey = new Map<string, PolicyRegistryProbeUpdate>();
+  const configByKey = new Map<string, PolicyConfigProbeUpdate>();
+
+  for (const row of policyRows) {
+    const probes = derivePolicyStateProbesFromRules(row.rules);
+    for (const probe of probes.registry) {
+      const key = `${probe.registry_path.toLowerCase()}::${probe.value_name.toLowerCase()}`;
+      if (!registryByKey.has(key)) {
+        registryByKey.set(key, probe);
+      }
+    }
+    for (const probe of probes.config) {
+      const key = `${probe.file_path.toLowerCase()}::${probe.config_key.toLowerCase()}`;
+      if (!configByKey.has(key)) {
+        configByKey.set(key, probe);
+      }
+    }
+  }
+
+  return {
+    policy_registry_state_probes: sortPolicyRegistryProbes(Array.from(registryByKey.values())),
+    policy_config_state_probes: sortPolicyConfigProbes(Array.from(configByKey.values()))
+  };
+}
+
+// ============================================
+// Security Operations
+// ============================================
+
+export function getSecurityStatusFromResult(resultData: Record<string, unknown> | undefined): SecurityStatusPayload | undefined {
+  if (!resultData) return undefined;
+
+  const nested = isObject(resultData.status) ? resultData.status : undefined;
+  const candidate = nested ?? resultData;
+  const parsed = securityStatusIngestSchema.safeParse(candidate);
+  if (!parsed.success) {
+    // Previously this dropped the whole update with no trace at all, which is
+    // the same diagnostic dead end #3641 is about — a security-status update
+    // that vanishes between the device and the row.
+    console.warn(
+      '[agents/helpers] Discarding security status result: payload failed validation:',
+      parsed.error.issues.slice(0, 5).map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')
+    );
+    return undefined;
+  }
+  return parsed.data;
+}
+
+export async function upsertSecurityStatusForDevice(deviceId: string, orgId: string, payload: SecurityStatusPayload): Promise<void> {
+  const avProducts = Array.isArray(payload.avProducts) ? payload.avProducts : [];
+  // `preferredProduct` only backfills the top-level summary when the payload
+  // omits it entirely. The current Go agent always marshals `provider` and
+  // `realTimeProtection` (non-pointer fields, no omitempty), so these fallbacks
+  // are unreachable from it — they exist for partial payloads from other
+  // producers (e.g. script-result ingestion via getSecurityStatusFromResult).
+  // The array itself is persisted below; it is the evidence behind the derived
+  // `realTimeProtection` boolean. See #3641 / #3593.
+  const preferredProduct = avProducts.find((p) => p.realTimeProtection) ?? avProducts[0];
+  const provider = normalizeProvider(payload.provider ?? preferredProduct?.provider);
+  const avProductsValue = payload.avProducts ?? null;
+
+  await db
+    .insert(securityStatus)
+    .values({
+      deviceId,
+      orgId,
+      provider,
+      providerVersion: asString(payload.providerVersion) ?? null,
+      definitionsVersion: asString(payload.definitionsVersion) ?? null,
+      definitionsDate: parseDate(payload.definitionsDate),
+      realTimeProtection: payload.realTimeProtection ?? preferredProduct?.realTimeProtection ?? false,
+      lastScan: parseDate(payload.lastScan),
+      lastScanType: asString(payload.lastScanType) ?? null,
+      threatCount: payload.threatCount ?? 0,
+      firewallEnabled: payload.firewallEnabled ?? null,
+      encryptionStatus: normalizeEncryptionStatus(payload.encryptionStatus),
+      encryptionDetails: payload.encryptionDetails ?? null,
+      localAdminSummary: payload.localAdminSummary ?? null,
+      passwordPolicySummary: payload.passwordPolicySummary ?? null,
+      avProducts: avProductsValue,
+      gatekeeperEnabled: payload.gatekeeperEnabled ?? payload.guardianEnabled ?? null,
+      updatedAt: new Date()
+    })
+    .onConflictDoUpdate({
+      target: securityStatus.deviceId,
+      set: {
+        provider,
+        providerVersion: asString(payload.providerVersion) ?? null,
+        definitionsVersion: asString(payload.definitionsVersion) ?? null,
+        definitionsDate: parseDate(payload.definitionsDate),
+        realTimeProtection: payload.realTimeProtection ?? preferredProduct?.realTimeProtection ?? false,
+        lastScan: parseDate(payload.lastScan),
+        lastScanType: asString(payload.lastScanType) ?? null,
+        threatCount: payload.threatCount ?? 0,
+        firewallEnabled: payload.firewallEnabled ?? null,
+        encryptionStatus: normalizeEncryptionStatus(payload.encryptionStatus),
+        encryptionDetails: payload.encryptionDetails ?? null,
+        localAdminSummary: payload.localAdminSummary ?? null,
+        passwordPolicySummary: payload.passwordPolicySummary ?? null,
+        avProducts: avProductsValue,
+        gatekeeperEnabled: payload.gatekeeperEnabled ?? payload.guardianEnabled ?? null,
+        updatedAt: new Date()
+      }
+    });
+}
+
+async function updateThreatStatusForAction(command: typeof deviceCommands.$inferSelect): Promise<void> {
+  const payload = isObject(command.payload) ? command.payload : {};
+  const threatId = payload.threatId;
+  const threatPath = asString(payload.path);
+
+  let targetId: string | undefined;
+  if (isUuid(threatId)) {
+    targetId = threatId;
+  } else if (threatPath) {
+    const [threat] = await db
+      .select({ id: securityThreats.id })
+      .from(securityThreats)
+      .where(and(eq(securityThreats.deviceId, command.deviceId), eq(securityThreats.filePath, threatPath)))
+      .orderBy(desc(securityThreats.detectedAt))
+      .limit(1);
+    targetId = threat?.id;
+  }
+
+  if (!targetId) return;
+
+  const now = new Date();
+  if (command.type === securityCommandTypes.quarantine) {
+    await db
+      .update(securityThreats)
+      .set({ status: 'quarantined', resolvedAt: null, resolvedBy: null })
+      .where(eq(securityThreats.id, targetId));
+    return;
+  }
+
+  if (command.type === securityCommandTypes.remove) {
+    await db
+      .update(securityThreats)
+      .set({ status: 'removed', resolvedAt: now, resolvedBy: 'agent' })
+      .where(eq(securityThreats.id, targetId));
+    return;
+  }
+
+  if (command.type === securityCommandTypes.restore) {
+    await db
+      .update(securityThreats)
+      .set({ status: 'allowed', resolvedAt: now, resolvedBy: 'agent' })
+      .where(eq(securityThreats.id, targetId));
+  }
+}
+
+export async function handleSecurityCommandResult(
+  command: typeof deviceCommands.$inferSelect,
+  resultData: z.infer<typeof commandResultSchema>
+): Promise<void> {
+  const [deviceRow] = await db
+    .select({ orgId: devices.orgId })
+    .from(devices)
+    .where(eq(devices.id, command.deviceId))
+    .limit(1);
+  const orgId = deviceRow?.orgId;
+  if (!orgId) return;
+
+  const resultJson = parseResultJson(resultData.stdout);
+  const parsedStatus = getSecurityStatusFromResult(resultJson);
+  if (parsedStatus) {
+    await upsertSecurityStatusForDevice(command.deviceId, orgId, parsedStatus);
+  }
+
+  if (command.type === securityCommandTypes.collectStatus) {
+    return;
+  }
+
+  if (command.type === securityCommandTypes.scan) {
+    const payload = isObject(command.payload) ? command.payload : {};
+    const scanType = asString(resultJson?.scanType) ?? asString(payload.scanType) ?? 'quick';
+    const scanRecordId = asString(resultJson?.scanRecordId) ?? asString(payload.scanRecordId);
+    const threatsValue = Array.isArray(resultJson?.threats) ? resultJson.threats : [];
+    const threatsFoundRaw = resultJson?.threatsFound;
+    const threatsFound = typeof threatsFoundRaw === 'number'
+      ? Math.max(0, Math.floor(threatsFoundRaw))
+      : threatsValue.length;
+    const completedAt = new Date();
+    const durationSeconds = Math.max(0, Math.round((resultData.durationMs ?? 0) / 1000));
+
+    const timedOut = resultJson?.timedOut === true;
+    const filesScannedRaw = resultJson?.filesScanned;
+    const itemsScanned = typeof filesScannedRaw === 'number' && Number.isFinite(filesScannedRaw)
+      ? Math.max(0, Math.floor(filesScannedRaw))
+      : null;
+    // #6263 W01: a scan that hit its policy deadline is an outcome, not an
+    // error — the threats it did find are real and are ingested below.
+    const scanStatus = resultData.status !== 'completed'
+      ? 'failed'
+      : timedOut ? 'timed_out' : 'completed';
+
+    let existingScan: { id: string } | undefined;
+    if (isUuid(scanRecordId)) {
+      [existingScan] = await db
+        .select({ id: securityScans.id })
+        .from(securityScans)
+        .where(and(eq(securityScans.id, scanRecordId), eq(securityScans.deviceId, command.deviceId)))
+        .limit(1);
+    }
+
+    if (existingScan) {
+      await db
+        .update(securityScans)
+        .set({
+          status: scanStatus,
+          completedAt,
+          duration: durationSeconds,
+          threatsFound,
+          itemsScanned
+        })
+        .where(eq(securityScans.id, existingScan.id));
+    } else {
+      await db.insert(securityScans).values({
+        ...(isUuid(scanRecordId) ? { id: scanRecordId } : {}),
+        deviceId: command.deviceId,
+        orgId,
+        scanType,
+        status: scanStatus,
+        startedAt: command.createdAt ?? new Date(),
+        completedAt,
+        threatsFound,
+        duration: durationSeconds,
+        itemsScanned
+      });
+    }
+
+    if (resultData.status === 'completed' && threatsValue.length > 0) {
+      const provider = normalizeProvider(parsedStatus?.provider);
+      const inserts: Array<typeof securityThreats.$inferInsert> = [];
+
+      for (const threat of threatsValue) {
+        if (!isObject(threat)) continue;
+        const quarantinedTo = asString(threat.quarantinedTo) ?? '';
+        inserts.push({
+          deviceId: command.deviceId,
+          orgId,
+          provider,
+          threatName: asString(threat.name) ?? asString(threat.threatName) ?? 'Unknown Threat',
+          threatType: asString(threat.type) ?? asString(threat.threatType) ?? asString(threat.category) ?? null,
+          severity: normalizeSeverity(threat.severity),
+          // The agent auto-quarantined this one during the walk (payload
+          // autoQuarantine). Recording it as 'detected' would show the tech a
+          // live threat and offer them a Quarantine button for a file that is
+          // already encoded away.
+          status: quarantinedTo ? 'quarantined' : 'detected',
+          filePath: asString(threat.path) ?? asString(threat.filePath) ?? null,
+          processName: asString(threat.processName) ?? null,
+          detectedAt: completedAt,
+          // #2434: `threat` is the raw agent/AV threat object parsed out of
+          // stdout (stdout is deliberately NOT redacted at the ingest
+          // chokepoint). AV records routinely embed the offending command line
+          // or script fragment, so redact every string in the blob. quarantinedTo
+          // is a local path and belongs in the details blob too.
+          details: redactSecretsDeep(threat)
+        });
+      }
+
+      if (inserts.length > 0) {
+        await db.insert(securityThreats).values(inserts);
+      }
+    }
+
+    return;
+  }
+
+  if (
+    command.type === securityCommandTypes.quarantine ||
+    command.type === securityCommandTypes.remove ||
+    command.type === securityCommandTypes.restore
+  ) {
+    if (resultData.status === 'completed') {
+      await updateThreatStatusForAction(command);
+    }
+  }
+}
+
+// ============================================
+// Sensitive Data Discovery
+// ============================================
+
+const sensitiveDataTypeValues = new Set(['pii', 'pci', 'phi', 'credential', 'financial']);
+const sensitiveDataRiskValues = new Set(['low', 'medium', 'high', 'critical']);
+
+function normalizeSensitiveDataType(value: unknown): 'pii' | 'pci' | 'phi' | 'credential' | 'financial' | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  if (!sensitiveDataTypeValues.has(normalized)) return null;
+  return normalized as 'pii' | 'pci' | 'phi' | 'credential' | 'financial';
+}
+
+function normalizeSensitiveRisk(value: unknown, dataType: string): 'low' | 'medium' | 'high' | 'critical' {
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (sensitiveDataRiskValues.has(normalized)) {
+      return normalized as 'low' | 'medium' | 'high' | 'critical';
+    }
+  }
+
+  if (dataType === 'credential' || dataType === 'pci') return 'critical';
+  if (dataType === 'phi' || dataType === 'financial') return 'high';
+  if (dataType === 'pii') return 'medium';
+  return 'low';
+}
+
+function normalizeSensitiveConfidence(value: unknown, dataType: string): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.max(0, Math.min(1, value));
+  }
+  switch (dataType) {
+    case 'credential':
+      return 0.95;
+    case 'pci':
+      return 0.9;
+    case 'phi':
+      return 0.8;
+    case 'financial':
+      return 0.78;
+    case 'pii':
+      return 0.72;
+    default:
+      return 0.5;
+  }
+}
+
+function mapRemediationActionFromCommandType(commandType: string): 'encrypt' | 'secure_delete' | 'quarantine' | null {
+  if (commandType === sensitiveDataCommandTypes.encrypt) return 'encrypt';
+  if (commandType === sensitiveDataCommandTypes.secureDelete) return 'secure_delete';
+  if (commandType === sensitiveDataCommandTypes.quarantine) return 'quarantine';
+  return null;
+}
+
+export async function handleSensitiveDataCommandResult(
+  command: typeof deviceCommands.$inferSelect,
+  resultData: z.infer<typeof commandResultSchema>
+): Promise<void> {
+  if (
+    command.type !== sensitiveDataCommandTypes.scan
+    && command.type !== sensitiveDataCommandTypes.encrypt
+    && command.type !== sensitiveDataCommandTypes.secureDelete
+    && command.type !== sensitiveDataCommandTypes.quarantine
+  ) {
+    return;
+  }
+
+  const payload = isObject(command.payload) ? command.payload : {};
+  const resultJson = parseResultJson(resultData.stdout);
+  const now = new Date();
+
+  if (command.type === sensitiveDataCommandTypes.scan) {
+    const scanId = asString(resultJson?.scanId) ?? asString(payload.scanId);
+    if (!isUuid(scanId)) {
+      return;
+    }
+
+    const [scan] = await db
+      .select({
+        id: sensitiveDataScans.id,
+        orgId: sensitiveDataScans.orgId,
+        deviceId: sensitiveDataScans.deviceId,
+        summary: sensitiveDataScans.summary
+      })
+      .from(sensitiveDataScans)
+      .where(and(eq(sensitiveDataScans.id, scanId), eq(sensitiveDataScans.deviceId, command.deviceId)))
+      .limit(1);
+
+    if (!scan) {
+      return;
+    }
+
+    const existingSummary = isObject(scan.summary) ? scan.summary : {};
+    const scanSummary = isObject(resultJson?.summary) ? resultJson.summary : {};
+    const findingsRaw = Array.isArray(resultJson?.findings) ? resultJson.findings : [];
+
+    const normalizedFindings: Array<{
+      filePath: string;
+      dataType: 'pii' | 'pci' | 'phi' | 'credential' | 'financial';
+      patternId: string;
+      matchCount: number;
+      risk: 'low' | 'medium' | 'high' | 'critical';
+      confidence: number;
+      fileOwner: string | null;
+      fileModifiedAt: Date | null;
+    }> = [];
+    for (const rawFinding of findingsRaw) {
+      if (!isObject(rawFinding)) continue;
+      const filePath = readTrimmedString(rawFinding.filePath);
+      const dataType = normalizeSensitiveDataType(rawFinding.dataType);
+      if (!filePath || !dataType) continue;
+
+      const patternId = readTrimmedString(rawFinding.patternId) ?? 'unknown';
+      const matchCount = Math.max(1, asInt(rawFinding.matchCount, 1));
+      const risk = normalizeSensitiveRisk(rawFinding.risk, dataType);
+      const confidence = normalizeSensitiveConfidence(rawFinding.confidence, dataType);
+      normalizedFindings.push({
+        filePath,
+        dataType,
+        patternId,
+        matchCount,
+        risk,
+        confidence,
+        fileOwner: readTrimmedString(rawFinding.fileOwner),
+        fileModifiedAt: parseDate(rawFinding.fileModifiedAt),
+      });
+    }
+
+    const dedupedFindings = Array.from(
+      new Map(
+        normalizedFindings.map((finding) => [
+          `${finding.filePath}::${finding.dataType}::${finding.patternId}`,
+          finding
+        ])
+      ).values()
+    );
+
+    const byRisk: Record<string, number> = {};
+    const byStatus: Record<string, number> = { open: dedupedFindings.length };
+    for (const finding of dedupedFindings) {
+      byRisk[finding.risk] = (byRisk[finding.risk] ?? 0) + 1;
+    }
+
+    await db
+      .update(sensitiveDataScans)
+      .set({
+        status: resultData.status === 'completed' ? 'completed' : 'failed',
+        completedAt: now,
+        summary: {
+          ...existingSummary,
+          commandId: command.id,
+          commandStatus: resultData.status,
+          // #2434: agent-supplied summary blob parsed from raw stdout.
+          agentSummary: redactSecretsDeep(scanSummary),
+          findingsCount: dedupedFindings.length,
+          findings: {
+            total: dedupedFindings.length,
+            byRisk,
+            byStatus,
+          },
+          completedAt: now.toISOString(),
+        }
+      })
+      .where(eq(sensitiveDataScans.id, scan.id));
+
+    if (resultData.status !== 'completed') {
+      return;
+    }
+
+    for (const finding of dedupedFindings) {
+      const [existingOpen] = await db
+        .select({
+          id: sensitiveDataFindings.id,
+          occurrenceCount: sensitiveDataFindings.occurrenceCount,
+        })
+        .from(sensitiveDataFindings)
+        .where(and(
+          eq(sensitiveDataFindings.orgId, scan.orgId),
+          eq(sensitiveDataFindings.deviceId, scan.deviceId),
+          eq(sensitiveDataFindings.filePath, finding.filePath),
+          eq(sensitiveDataFindings.dataType, finding.dataType),
+          eq(sensitiveDataFindings.patternId, finding.patternId),
+          eq(sensitiveDataFindings.status, 'open')
+        ))
+        .limit(1);
+
+      if (existingOpen) {
+        await db
+          .update(sensitiveDataFindings)
+          .set({
+            matchCount: finding.matchCount,
+            risk: finding.risk,
+            confidence: finding.confidence,
+            fileOwner: finding.fileOwner,
+            fileModifiedAt: finding.fileModifiedAt,
+            lastSeenAt: now,
+            occurrenceCount: (existingOpen.occurrenceCount ?? 1) + 1,
+          })
+          .where(eq(sensitiveDataFindings.id, existingOpen.id));
+        continue;
+      }
+
+      await db.insert(sensitiveDataFindings).values({
+        orgId: scan.orgId,
+        deviceId: scan.deviceId,
+        scanId: scan.id,
+        filePath: finding.filePath,
+        dataType: finding.dataType,
+        patternId: finding.patternId,
+        matchCount: finding.matchCount,
+        risk: finding.risk,
+        confidence: finding.confidence,
+        fileOwner: finding.fileOwner,
+        fileModifiedAt: finding.fileModifiedAt,
+        firstSeenAt: now,
+        lastSeenAt: now,
+        occurrenceCount: 1,
+        status: 'open'
+      });
+    }
+
+    const credentialFindings = dedupedFindings.filter((finding) => finding.dataType === 'credential');
+    if (dedupedFindings.length > 0) {
+      const findingMetricCounts = new Map<string, number>();
+      for (const finding of dedupedFindings) {
+        const key = `${finding.dataType}::${finding.risk}`;
+        findingMetricCounts.set(key, (findingMetricCounts.get(key) ?? 0) + 1);
+      }
+      for (const [key, count] of findingMetricCounts.entries()) {
+        const [dataType, risk] = key.split('::');
+        recordSensitiveDataFinding(dataType ?? 'unknown', risk ?? 'unknown', count);
+      }
+
+      await publishEvent(
+        'compliance.sensitive_data_found',
+        scan.orgId,
+        {
+          deviceId: scan.deviceId,
+          scanId: scan.id,
+          findingCount: dedupedFindings.length,
+          criticalCount: dedupedFindings.filter((finding) => finding.risk === 'critical').length,
+        },
+        'agents.command.result'
+      );
+    }
+
+    if (credentialFindings.length > 0) {
+      await publishEvent(
+        'compliance.credential_exposed',
+        scan.orgId,
+        {
+          deviceId: scan.deviceId,
+          scanId: scan.id,
+          findingCount: credentialFindings.length,
+          criticalCount: credentialFindings.filter((finding) => finding.risk === 'critical').length,
+        },
+        'agents.command.result'
+      );
+    }
+    return;
+  }
+
+  const findingId = asString(payload.findingId);
+  const action = mapRemediationActionFromCommandType(command.type);
+  if (!isUuid(findingId) || !action) {
+    return;
+  }
+
+  const [finding] = await db
+    .select({
+      id: sensitiveDataFindings.id,
+      orgId: sensitiveDataFindings.orgId,
+      deviceId: sensitiveDataFindings.deviceId,
+      scanId: sensitiveDataFindings.scanId
+    })
+    .from(sensitiveDataFindings)
+    .where(and(
+      eq(sensitiveDataFindings.id, findingId),
+      eq(sensitiveDataFindings.deviceId, command.deviceId)
+    ))
+    .limit(1);
+
+  if (!finding) {
+    return;
+  }
+
+  await db
+    .update(sensitiveDataFindings)
+    .set({
+      remediationAction: action,
+      status: resultData.status === 'completed' ? 'remediated' : 'open',
+      remediatedAt: resultData.status === 'completed' ? now : null,
+      remediationMetadata: {
+        commandId: command.id,
+        commandStatus: resultData.status,
+        completedAt: now.toISOString(),
+        keyRef: readTrimmedString(payload.encryptionKeyRef),
+        keyVersion: readTrimmedString(payload.encryptionKeyVersion),
+        provider: readTrimmedString(payload.encryptionProvider),
+      }
+    })
+    .where(eq(sensitiveDataFindings.id, finding.id));
+
+  if (resultData.status === 'completed') {
+    recordSensitiveDataRemediationDecision(`${action}_completed`, 1);
+    await publishEvent(
+      'compliance.sensitive_data_remediated',
+      finding.orgId,
+      {
+        findingId: finding.id,
+        scanId: finding.scanId,
+        deviceId: finding.deviceId,
+        action,
+        remediatedAt: now.toISOString(),
+      },
+      'agents.command.result'
+    );
+  } else {
+    recordSensitiveDataRemediationDecision(`${action}_failed`, 1);
+  }
+}
+
+// ============================================
+// Software Remediation
+// ============================================
+
+const softwareUninstallCommandType = 'software_uninstall';
+const cisBenchmarkCommandType = 'cis_benchmark';
+const cisRemediationCommandType = 'apply_cis_remediation';
+
+export async function handleSoftwareRemediationCommandResult(
+  command: typeof deviceCommands.$inferSelect,
+  resultData: z.infer<typeof commandResultSchema>
+): Promise<void> {
+  if (command.type !== softwareUninstallCommandType) {
+    return;
+  }
+
+  const payload = isObject(command.payload) ? command.payload : {};
+  const policyId = readTrimmedString(payload.policyId);
+  if (!policyId || !isUuid(policyId)) {
+    console.warn(
+      `[agents/helpers] software_uninstall command ${command.id} for device ${command.deviceId} ` +
+      `has missing or invalid policyId — cannot update compliance status`
+    );
+    return;
+  }
+
+  const softwareName = readTrimmedString(payload.name) ?? 'unknown';
+  const softwareVersion = readTrimmedString(payload.version);
+  const [policy] = await db
+    .select({
+      id: softwarePolicies.id,
+      orgId: softwarePolicies.orgId,
+      name: softwarePolicies.name,
+    })
+    .from(softwarePolicies)
+    .where(eq(softwarePolicies.id, policyId))
+    .limit(1);
+
+  if (!policy) {
+    return;
+  }
+
+  const [compliance] = await db
+    .select({
+      id: softwareComplianceStatus.id,
+      remediationErrors: softwareComplianceStatus.remediationErrors,
+    })
+    .from(softwareComplianceStatus)
+    .where(and(
+      eq(softwareComplianceStatus.policyId, policyId),
+      eq(softwareComplianceStatus.deviceId, command.deviceId),
+    ))
+    .limit(1);
+
+  if (!compliance) {
+    return;
+  }
+
+  if (resultData.status !== 'completed') {
+    const existingErrors = Array.isArray(compliance.remediationErrors)
+      ? compliance.remediationErrors
+      : [];
+    const entry = {
+      commandId: command.id,
+      softwareName,
+      softwareVersion: softwareVersion ?? null,
+      // #2434: self-redact rather than depend on the ingest chokepoint two
+      // modules away (idempotent — already-redacted text passes through).
+      message: redactOptionalSecretText(resultData.error)
+        ?? redactOptionalSecretText(resultData.stderr)
+        ?? 'Uninstall command failed',
+      status: resultData.status,
+      exitCode: resultData.exitCode ?? null,
+      failedAt: new Date().toISOString(),
+    };
+    const nextErrors = [...existingErrors, entry].slice(-25);
+
+    await db
+      .update(softwareComplianceStatus)
+      .set({
+        remediationStatus: 'failed',
+        lastRemediationAttempt: new Date(),
+        remediationErrors: nextErrors,
+      })
+      .where(eq(softwareComplianceStatus.id, compliance.id));
+
+    recordSoftwarePolicyAudit({
+      orgId: policy.orgId,
+      policyId: policy.id,
+      deviceId: command.deviceId,
+      action: 'remediation_command_failed',
+      actor: 'system',
+      details: {
+        commandId: command.id,
+        policyName: policy.name,
+        softwareName,
+        softwareVersion: softwareVersion ?? null,
+        commandStatus: resultData.status,
+        exitCode: resultData.exitCode ?? null,
+        // #2434: self-redact (see above) — this lands in audit_logs.details.
+        error: redactOptionalSecretText(resultData.error) ?? null,
+      },
+    }).catch((err) => {
+      console.error('[agents/helpers] Audit write failed for remediation_command_failed:', err);
+    });
+    recordSoftwareRemediationDecision('command_result_failed');
+    return;
+  }
+
+  await db
+    .update(softwareComplianceStatus)
+    .set({
+      // Mark the current remediation attempt as completed and trigger a verification scan.
+      // If violations remain after verification, the next evaluation can queue remediation again.
+      remediationStatus: 'completed',
+      lastRemediationAttempt: new Date(),
+      remediationErrors: null,
+    })
+    .where(eq(softwareComplianceStatus.id, compliance.id));
+
+  let verificationJobId: string | undefined;
+  try {
+    verificationJobId = await scheduleSoftwareComplianceCheck(policy.id, [command.deviceId]);
+  } catch (err) {
+    console.error('[agents/helpers] Failed to schedule verification scan after remediation:', err);
+  }
+
+  recordSoftwarePolicyAudit({
+    orgId: policy.orgId,
+    policyId: policy.id,
+    deviceId: command.deviceId,
+    action: 'software_uninstalled',
+    actor: 'system',
+    details: {
+      commandId: command.id,
+      policyName: policy.name,
+      softwareName,
+      softwareVersion: softwareVersion ?? null,
+      verificationJobId: verificationJobId ?? 'schedule_failed',
+    },
+  }).catch((err) => {
+    console.error('[agents/helpers] Audit write failed for software_uninstalled:', err);
+  });
+  recordSoftwareRemediationDecision('command_result_completed');
+}
+
+export async function handleCisCommandResult(
+  command: typeof deviceCommands.$inferSelect,
+  resultData: z.infer<typeof commandResultSchema>
+): Promise<void> {
+  if (command.type !== cisBenchmarkCommandType && command.type !== cisRemediationCommandType) {
+    return;
+  }
+
+  const payload = isObject(command.payload) ? command.payload : {};
+
+  if (command.type === cisBenchmarkCommandType) {
+    const baselineId = readTrimmedString(payload.baselineId);
+    if (!baselineId || !isUuid(baselineId)) {
+      console.warn(`[agents/helpers] cis_benchmark command ${command.id} missing valid baselineId`);
+      return;
+    }
+
+    // Resolve the baseline in the AGENT'S OWN context (#4673 W03).
+    //
+    // This read used to escape to a system context because the agent's
+    // ORG-scoped RLS context had breeze_current_partner_id() NULL, making a
+    // partner-wide baseline (org_id NULL) invisible. W02 populates that GUC
+    // from the device org's partner, and `cis_baselines_partner_wide_select`
+    // (2026-08-10-cis-baselines-partner-ownership.sql) grants exactly the
+    // SELECT branch this needs — so the escape is now dead weight: a second
+    // pooled connection and a full RLS bypass for a by-primary-key read.
+    //
+    // This is a deliberate TIGHTENING. The escaped read returned EVERY
+    // tenant's baselines and leaned on the org/partner re-check below; under
+    // the agent's own context a foreign tenant's baseline now reads as absent
+    // and takes the same "not found" branch. Both callers swallow that, so a
+    // miss is a discarded scan result plus a log line, never a wrong-tenant
+    // write. The re-check below stays as defense in depth.
+    const [baseline] = await db
+      .select({
+        id: cisBaselines.id,
+        orgId: cisBaselines.orgId,
+        partnerId: cisBaselines.partnerId,
+        name: cisBaselines.name,
+      })
+      .from(cisBaselines)
+      .where(eq(cisBaselines.id, baselineId))
+      .limit(1);
+
+    if (!baseline) {
+      console.warn(`[agents/helpers] cis_benchmark command ${command.id}: baseline ${baselineId} not found`);
+      return;
+    }
+
+    // Defense-in-depth: the device must actually be governed by this baseline.
+    // Org-owned -> same org. Partner-wide -> the device's org must belong to
+    // the owning partner. A plain `deviceRow.orgId !== baseline.orgId` would
+    // reject every partner-wide result, since baseline.orgId is NULL.
+    const [deviceRow] = await db
+      .select({ orgId: devices.orgId })
+      .from(devices)
+      .where(eq(devices.id, command.deviceId))
+      .limit(1);
+
+    // The owning partner is only needed for the partner-wide branch, so it is
+    // a separate lookup rather than a join on the device query: org-owned
+    // baselines are the common case and must not pay for it on every result
+    // the fleet reports.
+    let devicePartnerId: string | null = null;
+    if (deviceRow && baseline.partnerId) {
+      const [orgRow] = await db
+        .select({ partnerId: organizations.partnerId })
+        .from(organizations)
+        .where(eq(organizations.id, deviceRow.orgId))
+        .limit(1);
+      devicePartnerId = orgRow?.partnerId ?? null;
+    }
+
+    const governed = !!deviceRow && (baseline.partnerId
+      ? devicePartnerId === baseline.partnerId
+      : deviceRow.orgId === baseline.orgId);
+    if (!deviceRow || !governed) {
+      console.warn(
+        `[agents/helpers] cis_benchmark command ${command.id}: ownership mismatch ` +
+        `baseline.orgId=${baseline.orgId} baseline.partnerId=${baseline.partnerId} ` +
+        `device.orgId=${deviceRow?.orgId} device.partnerId=${devicePartnerId}`,
+      );
+      return;
+    }
+
+    // Idempotency guard: prevent duplicate result rows if the agent delivers the same command result more than once
+    const [existingForCommand] = await db
+      .select({ id: cisBaselineResults.id })
+      .from(cisBaselineResults)
+      .where(and(
+        eq(cisBaselineResults.baselineId, baseline.id),
+        eq(cisBaselineResults.deviceId, command.deviceId),
+        sql`${cisBaselineResults.summary} ->> 'commandId' = ${command.id}`,
+      ))
+      .limit(1);
+
+    if (existingForCommand) {
+      console.debug(`[agents/helpers] cis_benchmark command ${command.id}: duplicate result skipped (idempotency)`);
+      return;
+    }
+
+    const [previousResult] = await db
+      .select({
+        score: cisBaselineResults.score,
+      })
+      .from(cisBaselineResults)
+      .where(and(
+        eq(cisBaselineResults.baselineId, baseline.id),
+        eq(cisBaselineResults.deviceId, command.deviceId),
+      ))
+      .orderBy(desc(cisBaselineResults.checkedAt))
+      .limit(1);
+
+    // #2434: the success path parses findings out of RAW stdout (stdout is not
+    // redacted at the ingest chokepoint), and each finding carries free-text
+    // `message` / `evidence` / `remediation` produced by the collector — a
+    // failing check's evidence can quote the very config value (connection
+    // string, service-account password) that made it fail.
+    //
+    // Redact only the JSON-safe sub-parts. Do NOT hand the whole object to
+    // redactSecretsDeep: `checkedAt` is a Date, and a generic object walk
+    // would rebuild it as `{}` (Object.entries(new Date()) === []), which
+    // makes Drizzle's timestamp mapper throw on insert — a throw the caller
+    // swallows, so successful scans would silently stop persisting while
+    // failed ones (which rebuild checkedAt below) kept working.
+    const collected = parseCisCollectorOutput(resultData.stdout);
+    let parsed: ReturnType<typeof parseCisCollectorOutput> = {
+      ...collected,
+      findings: redactSecretsDeep(collected.findings) as typeof collected.findings,
+      rawSummary: redactSecretsDeep(collected.rawSummary) as typeof collected.rawSummary,
+    };
+    if (resultData.status !== 'completed') {
+      // #2434: error/stderr arrive already-redacted from the ingest chokepoint,
+      // but redact again here rather than depending on a caller two modules
+      // away — this handler is reachable from both ingest legs and the
+      // failure branch writes agent text straight into a user-visible finding.
+      // Every sibling persistence service (backup/restore/vault) self-redacts
+      // for the same reason; redaction is idempotent, so this is free.
+      const failureError = redactOptionalSecretText(resultData.error);
+      const failureStderr = redactOptionalSecretText(resultData.stderr);
+      parsed = {
+        checkedAt: new Date(),
+        findings: [{
+          checkId: 'collector.runtime',
+          title: 'CIS collector execution',
+          severity: 'high',
+          status: 'fail',
+          message: failureError ?? failureStderr ?? 'CIS collector execution failed',
+          evidence: null,
+          remediation: null,
+        }],
+        totalChecks: 1,
+        passedChecks: 0,
+        failedChecks: 1,
+        score: 0,
+        rawSummary: {
+          error: failureError ?? null,
+          stderr: failureStderr ?? null,
+          status: resultData.status,
+        },
+      };
+    }
+
+    const summary = {
+      ...(parsed.rawSummary ?? {}),
+      commandId: command.id,
+      commandStatus: resultData.status,
+    };
+
+    const [inserted] = await db
+      .insert(cisBaselineResults)
+      .values({
+        // The DEVICE's org, never the baseline's. cis_baseline_results.org_id
+        // is NOT NULL and a partner-wide baseline has no org, so sourcing it
+        // from the baseline would throw here for every partner-wide scan.
+        orgId: deviceRow.orgId,
+        deviceId: command.deviceId,
+        baselineId: baseline.id,
+        checkedAt: parsed.checkedAt,
+        totalChecks: parsed.totalChecks,
+        passedChecks: parsed.passedChecks,
+        failedChecks: parsed.failedChecks,
+        score: parsed.score,
+        findings: parsed.findings,
+        summary,
+      })
+      .returning({
+        id: cisBaselineResults.id,
+        score: cisBaselineResults.score,
+        failedChecks: cisBaselineResults.failedChecks,
+        checkedAt: cisBaselineResults.checkedAt,
+      });
+
+    if (!inserted) {
+      console.error(
+        `[agents/helpers] cis_benchmark command ${command.id}: failed to insert baseline result (baseline=${baseline.id}, device=${command.deviceId})`,
+      );
+      return;
+    }
+
+    if (inserted.failedChecks > 0) {
+      publishEvent(
+        'compliance.cis_deviation',
+        deviceRow.orgId,
+        {
+          baselineId: baseline.id,
+          baselineName: baseline.name,
+          deviceId: command.deviceId,
+          resultId: inserted.id,
+          failedChecks: inserted.failedChecks,
+          checkedAt: inserted.checkedAt.toISOString(),
+        },
+        'agent-command-result'
+      ).catch((error) => {
+        console.error('[agents/helpers] Failed to publish compliance.cis_deviation:', error);
+        captureException(error);
+      });
+    }
+
+    const previousScore = previousResult?.score ?? null;
+    if (previousScore === null || previousScore !== inserted.score) {
+      publishEvent(
+        'compliance.cis_score_changed',
+        deviceRow.orgId,
+        {
+          baselineId: baseline.id,
+          baselineName: baseline.name,
+          deviceId: command.deviceId,
+          previousScore,
+          currentScore: inserted.score,
+          delta: previousScore === null ? null : inserted.score - previousScore,
+          resultId: inserted.id,
+          checkedAt: inserted.checkedAt.toISOString(),
+        },
+        'agent-command-result'
+      ).catch((error) => {
+        console.error('[agents/helpers] Failed to publish compliance.cis_score_changed:', error);
+        captureException(error);
+      });
+    }
+
+    return;
+  }
+
+  const actionId = readTrimmedString(payload.actionId);
+  if (!actionId || !isUuid(actionId)) {
+    console.warn(`[agents/helpers] apply_cis_remediation command ${command.id} missing valid actionId`);
+    return;
+  }
+
+  const [action] = await db
+    .select({
+      id: cisRemediationActions.id,
+      orgId: cisRemediationActions.orgId,
+      baselineId: cisRemediationActions.baselineId,
+      baselineResultId: cisRemediationActions.baselineResultId,
+      checkId: cisRemediationActions.checkId,
+      actionName: cisRemediationActions.action,
+      details: cisRemediationActions.details,
+      beforeState: cisRemediationActions.beforeState,
+      afterState: cisRemediationActions.afterState,
+      rollbackHint: cisRemediationActions.rollbackHint,
+    })
+    .from(cisRemediationActions)
+    .where(eq(cisRemediationActions.id, actionId))
+    .limit(1);
+
+  if (!action) {
+    console.warn(`[agents/helpers] apply_cis_remediation command ${command.id}: remediation action ${actionId} not found`);
+    return;
+  }
+
+  const completed = resultData.status === 'completed';
+  const payloadDetails = isObject(payload.details) ? payload.details : null;
+  const resultPayload = parseResultJson(resultData.stdout);
+  const resultDetails = resultPayload && isObject(resultPayload.details)
+    ? resultPayload.details
+    : null;
+  const beforeStateFromResult = resultPayload && isObject(resultPayload.beforeState)
+    ? resultPayload.beforeState
+    : resultPayload && isObject(resultPayload.before_state)
+      ? resultPayload.before_state
+      : null;
+  const afterStateFromResult = resultPayload && isObject(resultPayload.afterState)
+    ? resultPayload.afterState
+    : resultPayload && isObject(resultPayload.after_state)
+      ? resultPayload.after_state
+      : null;
+  const rollbackHint = readTrimmedString(
+    (resultPayload?.rollbackHint as unknown)
+      ?? (resultPayload?.rollback_hint as unknown)
+      ?? (resultDetails?.rollbackHint as unknown)
+      ?? (resultDetails?.rollback_hint as unknown)
+      ?? (payloadDetails?.rollbackHint as unknown)
+      ?? (payloadDetails?.rollback_hint as unknown)
+      ?? action.rollbackHint
+  );
+
+  const updatedDetails = {
+    ...(action.details ?? {}),
+    ...(payloadDetails ?? {}),
+    ...(resultDetails ?? {}),
+    commandId: command.id,
+    commandStatus: resultData.status,
+    exitCode: resultData.exitCode ?? null,
+    error: resultData.error ?? null,
+    stderr: resultData.stderr ?? null,
+    completedAt: new Date().toISOString(),
+  };
+
+  // #2434: resultDetails / beforeState / afterState / rollbackHint are all
+  // derived from RAW stdout (unredacted at the chokepoint). before/afterState
+  // hold the ACTUAL values of the registry keys or config the remediation
+  // changed — a service-account password living in a registry value would be
+  // persisted verbatim and rendered in the CIS UI. Redaction is idempotent, so
+  // the already-redacted error/stderr in updatedDetails pass through unharmed.
+  await db
+    .update(cisRemediationActions)
+    .set({
+      status: completed ? 'completed' : 'failed',
+      executedAt: new Date(),
+      details: redactSecretsDeep(updatedDetails) as Record<string, unknown>,
+      beforeState: redactSecretsDeep(beforeStateFromResult ?? action.beforeState ?? null) as Record<string, unknown> | null,
+      afterState: redactSecretsDeep(afterStateFromResult ?? action.afterState ?? null) as Record<string, unknown> | null,
+      rollbackHint: redactOptionalSecretText(rollbackHint ?? null),
+    })
+    .where(eq(cisRemediationActions.id, action.id));
+
+  if (completed) {
+    publishEvent(
+      'compliance.cis_remediation_applied',
+      action.orgId,
+      {
+        actionId: action.id,
+        baselineId: action.baselineId,
+        baselineResultId: action.baselineResultId,
+        deviceId: command.deviceId,
+        checkId: action.checkId,
+        action: action.actionName,
+        commandId: command.id,
+      },
+      'agent-command-result'
+    ).catch((error) => {
+      console.error('[agents/helpers] Failed to publish compliance.cis_remediation_applied:', error);
+      captureException(error);
+    });
+  }
+}
+
+// ============================================
+// Filesystem Analysis
+// ============================================
+
+/**
+ * The volume a threshold-triggered scan targets: the device's OS root, in the
+ * same normalised form every other producer uses, so the result handler keys
+ * its snapshot on the key a `GET /filesystem` with no `?path=` reads back.
+ */
+export function getFilesystemThresholdScanPath(osType: unknown): string {
+  return osRootScanPath(osType);
+}
+
+export async function maybeQueueThresholdFilesystemAnalysis(
+  device: Pick<typeof devices.$inferSelect, 'id' | 'osType' | 'orgId'>,
+  diskPercent: number
+): Promise<{ queued: boolean; path?: string; thresholdPercent?: number }> {
+  if (!Number.isFinite(diskPercent) || diskPercent < filesystemDiskThresholdPercent) {
+    return { queued: false };
+  }
+
+  const cooldownStart = new Date(Date.now() - filesystemThresholdCooldownMinutes * 60 * 1000);
+  const [recentSnapshot] = await db
+    .select({ id: deviceFilesystemSnapshots.id })
+    .from(deviceFilesystemSnapshots)
+    .where(
+      and(
+        eq(deviceFilesystemSnapshots.deviceId, device.id),
+        gte(deviceFilesystemSnapshots.capturedAt, cooldownStart)
+      )
+    )
+    .orderBy(desc(deviceFilesystemSnapshots.capturedAt))
+    .limit(1);
+
+  if (recentSnapshot) {
+    return { queued: false };
+  }
+
+  const [recentCommand] = await db
+    .select({ id: deviceCommands.id })
+    .from(deviceCommands)
+    .where(
+      and(
+        eq(deviceCommands.deviceId, device.id),
+        eq(deviceCommands.type, filesystemAnalysisCommandType),
+        gte(deviceCommands.createdAt, cooldownStart)
+      )
+    )
+    .orderBy(desc(deviceCommands.createdAt))
+    .limit(1);
+
+  if (recentCommand) {
+    return { queued: false };
+  }
+
+  const path = getFilesystemThresholdScanPath(device.osType);
+  const [thresholdCommand] = await db.insert(deviceCommands).values({
+    deviceId: device.id,
+    type: filesystemAnalysisCommandType,
+    payload: {
+      path,
+      trigger: 'threshold',
+      thresholdPercent: filesystemDiskThresholdPercent,
+      maxDepth: 32,
+      topFiles: 50,
+      topDirs: 30,
+      maxEntries: 10_000_000,
+      workers: 6,
+      timeoutSeconds: 300,
+      scanMode: 'baseline',
+      autoContinue: true,
+      resumeAttempt: 0,
+      followSymlinks: false,
+    },
+    status: 'pending',
+  }).returning({ id: deviceCommands.id });
+
+  if (thresholdCommand) {
+    await setFilesystemScanGeneration(device.id, device.orgId, path, thresholdCommand.id);
+  }
+
+  return {
+    queued: true,
+    path,
+    thresholdPercent: filesystemDiskThresholdPercent,
+  };
+}
+
+export async function handleFilesystemAnalysisCommandResult(
+  command: typeof deviceCommands.$inferSelect,
+  resultData: z.infer<typeof commandResultSchema>,
+  orgId: string
+): Promise<void> {
+  if (resultData.status !== 'completed') {
+    return;
+  }
+
+  const payload = isObject(command.payload) ? command.payload : {};
+  const trigger = asString(payload.trigger);
+  const snapshotTrigger = trigger === 'threshold' ? 'threshold' : 'on_demand';
+  const scanMode = asString(payload.scanMode) === 'incremental' ? 'incremental' : 'baseline';
+
+  const parsed = parseFilesystemAnalysisStdout(resultData.stdout ?? '');
+  if (Object.keys(parsed).length === 0) {
+    captureException(new Error(`filesystem_analysis command ${command.id} dropped: unparseable stdout`));
+    // A completed scan whose stdout is empty or non-JSON produces no snapshot,
+    // which surfaces to the user as an empty Disk Cleanup tab with no error.
+    console.warn(
+      `[agents/helpers] filesystem_analysis command ${command.id} (device ${command.deviceId}) completed with unparseable/empty stdout (len=${resultData.stdout?.length ?? 0}); no snapshot written`
+    );
+    return;
+  }
+
+  // orgId comes from the caller's agent-auth context, which already resolved
+  // the device's org — no need to re-query it here. The OS, however, is not in
+  // that context (AgentAuthContext carries no OS), and the scan-path key is
+  // OS-dependent: guessing POSIX would key every Windows device on '/' and
+  // recreate the very defect this wave closes. One indexed primary-key lookup.
+  const [deviceRow] = await db
+    .select({ osType: devices.osType })
+    .from(devices)
+    .where(eq(devices.id, command.deviceId))
+    .limit(1);
+
+  if (!deviceRow) {
+    captureException(new Error(`filesystem_analysis command ${command.id} dropped: unknown device`));
+    console.warn(
+      `[agents/helpers] filesystem_analysis command ${command.id} has no devices row for ${command.deviceId}; no snapshot written`
+    );
+    return;
+  }
+
+  const osType = deviceRow.osType;
+  // Every producer (the scan route, the AI tool, the threshold queue) already
+  // sends the normalised form; normalising again is what makes an in-flight
+  // command queued by the PREVIOUS release land on the right key too.
+  const scanPath = normalizeScanPath(osType, asString(payload.path) ?? osRootScanPath(osType));
+
+  // A savepoint inside the request context rolls back the receipt along with
+  // both writes, even when the caller catches a post-processing failure.
+  const persisted = await db.transaction(async (tx) => {
+    const claim = await claimFilesystemScanGeneration(command.deviceId, scanPath, command.id, tx, orgId);
+    if (claim === 'superseded' || claim === 'already_applied') {
+      captureException(new Error(`filesystem_analysis command ${command.id} dropped: ${claim}`));
+      return null;
+    }
+
+    // The scan-state read and the disk-usage read are independent; run them
+    // together. The disk figure is only consumed by the scan-state upsert below.
+    const [currentState, diskRows] = await Promise.all([
+      getFilesystemScanState(command.deviceId, scanPath, tx),
+      tx
+        .select({
+          mountPoint: deviceDisks.mountPoint,
+          usedPercent: deviceDisks.usedPercent,
+        })
+        .from(deviceDisks)
+        .where(eq(deviceDisks.deviceId, command.deviceId))
+        .limit(64),
+    ]);
+
+    // Defect 8: match the SCANNED volume's own disk row. The old code took
+    // `LIMIT 1` — an arbitrary row — so a `D:\` scan recorded `C:`'s 80% as D's
+    // baseline and every later `D:\` scan read a huge delta and forced a full
+    // rescan. No match means no figure, which means the next scan takes a
+    // baseline rather than comparing against an unrelated disk.
+    const matchedDisk = diskRows.find(
+      (disk) => normalizeScanPath(osType, disk.mountPoint) === scanPath
+    );
+    const currentDiskUsedPercent =
+      typeof matchedDisk?.usedPercent === 'number' ? matchedDisk.usedPercent : null;
+
+    const existingAggregate = isObject(currentState?.aggregate) ? currentState.aggregate : {};
+    const mergedPayload = scanMode === 'baseline'
+      ? mergeFilesystemAnalysisPayload(existingAggregate, parsed)
+      : parsed;
+    const pendingDirs = readCheckpointPendingDirectories(mergedPayload.checkpoint, 50_000);
+    const hasCheckpoint = scanMode === 'baseline' && pendingDirs.length > 0;
+    const snapshotPayload = hasCheckpoint
+      ? {
+        ...mergedPayload,
+        partial: true,
+        reason: `checkpoint pending ${pendingDirs.length} directories`,
+        checkpoint: { pendingDirs },
+        scanMode,
+      }
+      : {
+        ...mergedPayload,
+        scanMode,
+      };
+
+    await saveFilesystemSnapshot(command.deviceId, orgId, snapshotTrigger, scanPath, snapshotPayload, tx);
+
+    const hotFromRun = extractHotDirectoriesFromSnapshotPayload(snapshotPayload, 24);
+    const mergedHotDirectories = Array.from(
+      new Set([
+        ...hotFromRun,
+        ...readHotDirectories(currentState?.hotDirectories, 24),
+      ])
+    ).slice(0, 24);
+
+    // Baseline completion is defined solely by having no pending checkpoint
+    // directories left to resume. The snapshot's `partial` flag must NOT gate
+    // this: `partial` is also set (and stays sticky across merges) for routine
+    // max-depth truncation, which is not a resumable condition — folding it in
+    // here left `lastBaselineCompletedAt` permanently null on any deep tree, which
+    // forced every subsequent scan back to a full baseline and defeated the
+    // incremental hot-directory path.
+    const baselineCompleted = scanMode === 'baseline' && pendingDirs.length === 0;
+    await upsertFilesystemScanState(command.deviceId, orgId, scanPath, {
+      lastRunMode: scanMode,
+      lastBaselineCompletedAt: baselineCompleted
+        ? new Date()
+        : currentState?.lastBaselineCompletedAt ?? null,
+      lastDiskUsedPercent: currentDiskUsedPercent ?? currentState?.lastDiskUsedPercent ?? null,
+      checkpoint: hasCheckpoint ? { pendingDirs } : {},
+      aggregate: scanMode === 'baseline' && !baselineCompleted ? mergedPayload : {},
+      hotDirectories: mergedHotDirectories,
+    }, tx);
+    return { hasCheckpoint, pendingDirs };
+  });
+  if (!persisted) return;
+  const { hasCheckpoint, pendingDirs } = persisted;
+
+  if (!hasCheckpoint || scanMode !== 'baseline') {
+    return;
+  }
+
+  const autoContinue = asBoolean(payload.autoContinue, true);
+  if (!autoContinue) {
+    return;
+  }
+
+  const resumeAttempt = Math.max(0, asInt(payload.resumeAttempt, 0));
+  if (resumeAttempt >= filesystemAutoResumeMaxRuns) {
+    return;
+  }
+
+  const [inFlightScan] = await db
+    .select({ id: deviceCommands.id })
+    .from(deviceCommands)
+    .where(
+      and(
+        eq(deviceCommands.deviceId, command.deviceId),
+        eq(deviceCommands.type, filesystemAnalysisCommandType),
+        // Only a scan of this volume suppresses its continuation.
+        sql`${deviceCommands.payload}->>'path' = ${scanPath}`,
+        sql`${deviceCommands.status} IN ('pending', 'sent')`
+      )
+    )
+    .limit(1);
+
+  if (inFlightScan) {
+    return;
+  }
+
+  const nextPayload: Record<string, unknown> = {
+    ...(isObject(payload) ? payload : {}),
+    path: scanPath,
+    scanMode: 'baseline',
+    checkpoint: { pendingDirs },
+    autoContinue: true,
+    resumeAttempt: resumeAttempt + 1,
+  };
+  delete nextPayload.targetDirectories;
+
+  const queued = await queueCommandForExecution(
+    command.deviceId,
+    filesystemAnalysisCommandType,
+    nextPayload,
+    {
+      userId: command.createdBy ?? undefined,
+      preferHeartbeat: false,
+    }
+  );
+  if (queued.command) {
+    await setFilesystemScanGeneration(command.deviceId, orgId, scanPath, queued.command.id);
+    return;
+  }
+
+  const [fallbackCommand] = await db.insert(deviceCommands).values({
+    deviceId: command.deviceId,
+    type: filesystemAnalysisCommandType,
+    payload: nextPayload,
+    status: 'pending',
+    createdBy: command.createdBy,
+  }).returning({ id: deviceCommands.id });
+
+  if (fallbackCommand) {
+    await setFilesystemScanGeneration(command.deviceId, orgId, scanPath, fallbackCommand.id);
+  }
+}
+
+export function extractHotDirectoriesFromSnapshotPayload(payload: Record<string, unknown>, limit: number): string[] {
+  const rootPath = asString(payload.path);
+  const rawDirs = Array.isArray(payload.topLargestDirectories) ? payload.topLargestDirectories : [];
+  const paths = rawDirs
+    .map((entry) => {
+      if (!isObject(entry)) return null;
+      return asString(entry.path) ?? null;
+    })
+    .filter((path): path is string => path !== null && path !== rootPath);
+  return Array.from(new Set(paths)).slice(0, limit);
+}
+
+// ============================================
+// Event Log Policy Settings
+// ============================================
+
+export type EventLogLevel = 'info' | 'warning' | 'error' | 'critical';
+export type EventLogCategory = 'security' | 'hardware' | 'application' | 'system';
+
+export interface EventLogSettings {
+  retentionDays: number;
+  maxEventsPerCycle: number;
+  collectCategories: EventLogCategory[];
+  minimumLevel: EventLogLevel;
+  collectionIntervalMinutes: number;
+  rateLimitPerHour: number;
+}
+
+export const EVENT_LOG_DEFAULTS: EventLogSettings = {
+  retentionDays: 30,
+  maxEventsPerCycle: 100,
+  collectCategories: ['security', 'hardware', 'application', 'system'],
+  minimumLevel: 'info',
+  // 15m default (was 5m) — issue #2390 subprocess-churn backoff. Keep in sync
+  // with eventLogInlineSettingsSchema (shared validators) and the agent's
+  // NewEventLogCollector default.
+  collectionIntervalMinutes: 15,
+  rateLimitPerHour: 12000,
+};
+
+const LEVEL_PRIORITY: Record<string, number> = {
+  device: 5,
+  device_group: 4,
+  site: 3,
+  organization: 2,
+  partner: 1,
+};
+
+async function resolveDeviceEventLogSettings(deviceId: string): Promise<EventLogSettings> {
+  // 1. Load device
+  const [device] = await db
+    .select({
+      orgId: devices.orgId,
+      siteId: devices.siteId,
+      deviceRole: devices.deviceRole,
+      osType: devices.osType,
+    })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) return EVENT_LOG_DEFAULTS;
+
+  // 2. Load org (for partnerId)
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, device.orgId))
+    .limit(1);
+
+  // 3. Load device group memberships
+  const groupRows = await db
+    .select({ groupId: deviceGroupMemberships.groupId })
+    .from(deviceGroupMemberships)
+    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupIds = groupRows.map((r) => r.groupId);
+
+  // 4. Build target match conditions
+  const targetConditions = [
+    and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId)),
+    and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId)),
+    and(eq(configPolicyAssignments.level, 'organization'), eq(configPolicyAssignments.targetId, device.orgId)),
+  ];
+  if (groupIds.length > 0) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'device_group'), inArray(configPolicyAssignments.targetId, groupIds))!
+    );
+  }
+  if (org?.partnerId) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId))!
+    );
+  }
+
+  // 5. Single query: assignments → active policies → event_log feature link → settings
+  const rows = await db
+    .select({
+      level: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      roleFilter: configPolicyAssignments.roleFilter,
+      osFilter: configPolicyAssignments.osFilter,
+      retentionDays: configPolicyEventLogSettings.retentionDays,
+      maxEventsPerCycle: configPolicyEventLogSettings.maxEventsPerCycle,
+      collectCategories: configPolicyEventLogSettings.collectCategories,
+      minimumLevel: configPolicyEventLogSettings.minimumLevel,
+      collectionIntervalMinutes: configPolicyEventLogSettings.collectionIntervalMinutes,
+      rateLimitPerHour: configPolicyEventLogSettings.rateLimitPerHour,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+    .innerJoin(configPolicyEffectiveFeatureLinks, and(
+      eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+      eq(configPolicyEffectiveFeatureLinks.featureType, 'event_log'),
+    ))
+    .innerJoin(configPolicyEventLogSettings, eq(configPolicyEventLogSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id))
+    .where(and(
+      eq(configurationPolicies.status, 'active'),
+      policyOwnershipCondition({ orgId: device.orgId, partnerId: org?.partnerId ?? null }),
+      or(...targetConditions),
+      ...buildRoleOsFilterConditions({ deviceRole: device.deviceRole, osType: device.osType }),
+    ));
+
+  // Filter by deviceRole and osType using canonical predicate
+  const eligibleRows = rows.filter((r) =>
+    matchesRoleOsFilter(r, { deviceRole: device.deviceRole, osType: device.osType })
+  );
+
+  if (eligibleRows.length === 0) return EVENT_LOG_DEFAULTS;
+
+  // 6. Sort by level priority DESC, then assignment priority ASC — first match wins
+  eligibleRows.sort((a, b) => {
+    const levelDiff = (LEVEL_PRIORITY[b.level] ?? 0) - (LEVEL_PRIORITY[a.level] ?? 0);
+    if (levelDiff !== 0) return levelDiff;
+    return a.assignmentPriority - b.assignmentPriority;
+  });
+
+  const winner = eligibleRows[0];
+  if (!winner) return EVENT_LOG_DEFAULTS;
+  return {
+    retentionDays: winner.retentionDays,
+    maxEventsPerCycle: winner.maxEventsPerCycle,
+    collectCategories: winner.collectCategories as EventLogCategory[],
+    minimumLevel: winner.minimumLevel as EventLogLevel,
+    collectionIntervalMinutes: winner.collectionIntervalMinutes,
+    rateLimitPerHour: winner.rateLimitPerHour,
+  };
+}
+
+const EVENT_LOG_CACHE_TTL_SECONDS = 120; // 2 minutes
+
+/**
+ * Resolve event_log policy settings for a device via full hierarchy.
+ * Uses Redis cache with 2-min TTL. Falls back to defaults if no policy found.
+ */
+export async function getDeviceEventLogSettings(deviceId: string): Promise<EventLogSettings> {
+  const redis = getRedis();
+  const cacheKey = `eventlog:settings:device:${deviceId}`;
+
+  // Try cache first
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached) as EventLogSettings;
+      }
+    } catch (cacheErr) {
+      console.warn(`[eventlog] Redis cache read failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  // Resolve via full hierarchy: device → device_group → site → org → partner
+  const settings = await resolveDeviceEventLogSettings(deviceId);
+
+  // Cache the result
+  if (redis) {
+    try {
+      await redis.set(cacheKey, JSON.stringify(settings), 'EX', EVENT_LOG_CACHE_TTL_SECONDS);
+    } catch (cacheErr) {
+      console.warn(`[eventlog] Redis cache write failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  return settings;
+}
+
+/**
+ * Build event_log config update payload for heartbeat response.
+ * Returns agent-facing settings, including defaults when no policy is assigned.
+ * This ensures stale non-default agent settings get reset after policy removal.
+ */
+export async function buildEventLogConfigUpdate(deviceId: string): Promise<{
+  max_events_per_cycle: number;
+  collect_categories: string[];
+  minimum_level: string;
+  collection_interval_minutes: number;
+}> {
+  const settings = await getDeviceEventLogSettings(deviceId);
+
+  return {
+    max_events_per_cycle: settings.maxEventsPerCycle,
+    collect_categories: settings.collectCategories,
+    minimum_level: settings.minimumLevel,
+    collection_interval_minutes: settings.collectionIntervalMinutes,
+  };
+}
+
+/**
+ * Org-scoped retention lookup for the event-log retention worker.
+ *
+ * Resolves the winning event_log policy for an org across BOTH assignment levels
+ * that can reach it — its own `level='organization'` assignment and its
+ * partner's `level='partner'` assignment — with the closer (org) level winning,
+ * matching `resolveDeviceEventLogSettings`'s precedence. Falls back to
+ * `EVENT_LOG_DEFAULTS.retentionDays` when no active policy applies.
+ *
+ * Before #3963 this filtered on `level='organization'` alone, so an MSP that set
+ * fleet-wide retention with one partner-wide policy silently got the 30-day
+ * default on every org — no error, no log line, because a partner-wide row is
+ * `org_id NULL` and an org-axis-only predicate returns zero rows rather than
+ * failing (CLAUDE.md, "Partner-Wide First"). Same shape as #3954/#3962.
+ *
+ * Two axes are in play and both had to be fixed:
+ *  - ASSIGNMENT: `config_policy_assignments.targetId` is polymorphic, so a
+ *    `level='partner'` row targets `partners.id` and can never equal an org id.
+ *  - OWNERSHIP: a partner-wide policy carries `org_id NULL` + `partner_id`, so
+ *    `policyOwnershipCondition` (#2930) is needed to admit it.
+ *
+ * RLS: the caller must be able to see partner-owned rows. Under a system context
+ * every branch short-circuits true; under an org-scoped context the
+ * `configuration_policies_partner_wide_select` branch (#4673 W01) grants it, but
+ * only when the context carries `currentPartnerId`.
+ */
+export async function getOrgEventLogRetentionDays(orgId: string): Promise<number> {
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+
+  // Not reachable by the schema (`organizations.partner_id` is NOT NULL and the
+  // caller read this org id out of `organizations` moments earlier), so an empty
+  // result means the invariant broke. Say it out loud: falling through quietly
+  // would silently resolve org-only — the exact #3963 failure, one join upstream
+  // — and this decides how long a customer's event logs are kept.
+  if (!org) {
+    console.error(
+      `[eventlog] organizations row missing for org ${orgId}; partner-wide retention policies cannot apply, falling back to org-level resolution`
+    );
+    captureException(new Error(`eventLogRetention: organizations row missing for org ${orgId}`));
+  }
+
+  const targetConditions = [
+    and(eq(configPolicyAssignments.level, 'organization'), eq(configPolicyAssignments.targetId, orgId))!,
+  ];
+  if (org?.partnerId) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId))!
+    );
+  }
+
+  const rows = await db
+    .select({
+      level: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      retentionDays: configPolicyEventLogSettings.retentionDays,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+    .innerJoin(configPolicyEffectiveFeatureLinks, and(
+      eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+      eq(configPolicyEffectiveFeatureLinks.featureType, 'event_log'),
+    ))
+    .innerJoin(configPolicyEventLogSettings, eq(configPolicyEventLogSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id))
+    .where(and(
+      eq(configurationPolicies.status, 'active'),
+      policyOwnershipCondition({ orgId, partnerId: org?.partnerId ?? null }),
+      or(...targetConditions),
+    ));
+
+  if (rows.length === 0) return EVENT_LOG_DEFAULTS.retentionDays;
+
+  // Same precedence as resolveDeviceEventLogSettings: level priority DESC
+  // (organization beats partner), then assignment priority ASC — which is what
+  // the previous single-level `.orderBy(priority).limit(1)` did, so the
+  // org-only case is unchanged.
+  rows.sort((a, b) => {
+    const levelDiff = (LEVEL_PRIORITY[b.level] ?? 0) - (LEVEL_PRIORITY[a.level] ?? 0);
+    if (levelDiff !== 0) return levelDiff;
+    return a.assignmentPriority - b.assignmentPriority;
+  });
+
+  return rows[0]!.retentionDays;
+}
+
+// ============================================
+// Monitoring (Service & Process) Policy Settings
+// ============================================
+
+export interface MonitoringWatchConfig {
+  watch_type: 'service' | 'process';
+  name: string;
+  alert_on_stop: boolean;
+  alert_after_consecutive_failures: number;
+  auto_restart: boolean;
+  max_restart_attempts: number;
+  restart_cooldown_seconds: number;
+  cpu_threshold_percent?: number;
+  memory_threshold_mb?: number;
+  threshold_duration_seconds?: number;
+}
+
+export interface MonitoringConfigUpdate {
+  check_interval_seconds: number;
+  watches: MonitoringWatchConfig[];
+}
+
+export interface FileEgressConfigUpdate {
+  enabled: boolean;
+  watch_removable: boolean;
+  watch_network_shares: boolean;
+  watch_uploads: boolean;
+  /** null => agent uses its built-in default process list. */
+  upload_process_watchlist: string[] | null;
+  ignore_globs: string[];
+  min_file_size_bytes: number;
+}
+
+// Resolve the file-egress (DLP) policy that applies to a device.
+// file_egress_policies is a STANDALONE dual-axis (org XOR partner) table with no
+// assignment hierarchy, so the most-specific ACTIVE policy wins: an org-owned
+// policy (org_id = device.orgId) takes precedence over a partner-wide one
+// (org_id NULL, partner_id = the device org's partner). Read in the caller's own
+// context — the file_egress_policies_partner_wide_select RLS branch plus the
+// agent context's breeze_current_partner_id() make partner-wide rows visible
+// without escaping to a system context (mirrors the monitoring W03 pattern; the
+// deprecated runOutsideDbContext escape is deliberately NOT used).
+export async function buildFileEgressConfigUpdate(deviceId: string): Promise<FileEgressConfigUpdate | null> {
+  const [device] = await db
+    .select({ orgId: devices.orgId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+  if (!device) return null;
+
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, device.orgId))
+    .limit(1);
+
+  const ownershipCondition = org?.partnerId
+    ? or(
+        eq(fileEgressPolicies.orgId, device.orgId),
+        and(isNull(fileEgressPolicies.orgId), eq(fileEgressPolicies.partnerId, org.partnerId))
+      )
+    : eq(fileEgressPolicies.orgId, device.orgId);
+
+  const rows = await db
+    .select({
+      orgId: fileEgressPolicies.orgId,
+      enabled: fileEgressPolicies.enabled,
+      watchRemovable: fileEgressPolicies.watchRemovable,
+      watchNetworkShares: fileEgressPolicies.watchNetworkShares,
+      watchUploads: fileEgressPolicies.watchUploads,
+      uploadProcessWatchlist: fileEgressPolicies.uploadProcessWatchlist,
+      ignoreGlobs: fileEgressPolicies.ignoreGlobs,
+      minFileSizeBytes: fileEgressPolicies.minFileSizeBytes,
+    })
+    .from(fileEgressPolicies)
+    .where(and(eq(fileEgressPolicies.isActive, true), ownershipCondition));
+
+  if (rows.length === 0) return null;
+
+  // Org-owned (org_id NOT NULL) wins over partner-wide (org_id NULL).
+  rows.sort((a, b) => (a.orgId ? 0 : 1) - (b.orgId ? 0 : 1));
+  const winner = rows[0];
+  if (!winner) return null;
+
+  return {
+    enabled: winner.enabled,
+    watch_removable: winner.watchRemovable,
+    watch_network_shares: winner.watchNetworkShares,
+    watch_uploads: winner.watchUploads,
+    upload_process_watchlist: winner.uploadProcessWatchlist ?? null,
+    ignore_globs: winner.ignoreGlobs ?? [],
+    min_file_size_bytes: winner.minFileSizeBytes,
+  };
+}
+
+/**
+ * The defaults `config_policy_monitoring_watches` itself carries, so a
+ * monitor-derived watch and a policy-tab watch for the same service are
+ * indistinguishable on the wire (configurationPolicies.ts:425-427).
+ * maxRestartAttempts / restartCooldownSeconds are the fallback when a
+ * restart_service response carries no explicit values (W05c1).
+ */
+const MONITOR_WATCH_DEFAULTS = {
+  maxRestartAttempts: 3,
+  restartCooldownSeconds: 300,
+  alertAfterConsecutiveFailures: 2,
+} as const;
+
+/** `check_interval_seconds` when monitors deliver watches but no policy resolved. */
+const MONITOR_ONLY_CHECK_INTERVAL_SECONDS = 60;
+
+/**
+ * Service/process watches derived from the device's EFFECTIVE MONITOR SET
+ * (#5287 W04). W02 made `service` and `process` monitors first-class authoring
+ * objects but nothing delivered them; this is that delivery.
+ *
+ * Runs in the CALLER'S OWN DB CONTEXT. `monitor_definitions_partner_wide_select`
+ * (W02) is what lets a partner-wide monitor's definition be read on the agent
+ * path, because middleware/agentAuth sets `breeze.current_partner_id`. Wrapping
+ * this in a system context would be the forbidden request-path escalation
+ * (#2417) and would double-hold a pooled connection (#1105).
+ *
+ * Discriminated so a device that vanished mid-request (raced a delete/org
+ * move) is never folded into "resolved with zero monitor-derived watches" —
+ * see the `resolveDeviceMonitoringSettings` caller (#5677).
+ */
+type MonitorDerivedWatchesResult =
+  | { kind: 'device_missing' }
+  | { kind: 'resolved'; watches: MonitoringWatchConfig[] };
+
+async function resolveMonitorDerivedWatches(deviceId: string): Promise<MonitorDerivedWatchesResult> {
+  const resolution = await resolveMonitorsForDevice(deviceId);
+  if (resolution.kind === 'device_missing') return { kind: 'device_missing' };
+  const effective = resolution.monitors;
+  const enabledIds = effective.filter((m) => m.enabled).map((m) => m.monitorId);
+  if (enabledIds.length === 0) return { kind: 'resolved', watches: [] };
+
+  const definitions = await db
+    .select({
+      id: monitorDefinitions.id,
+      kind: monitorDefinitions.kind,
+      condition: monitorDefinitions.condition,
+      responses: monitorDefinitions.responses,
+    })
+    .from(monitorDefinitions)
+    .where(and(
+      inArray(monitorDefinitions.id, enabledIds),
+      eq(monitorDefinitions.enabled, true),
+      inArray(monitorDefinitions.kind, ['service', 'process']),
+    ));
+
+  const overridesById = new Map(effective.map((m) => [m.monitorId, m.overrides]));
+  const watches: MonitoringWatchConfig[] = [];
+
+  for (const def of definitions) {
+    const spec = MONITOR_KIND_SPECS[def.kind];
+    if (!spec) continue;
+    let condition: Record<string, unknown>;
+    try {
+      condition = applyOverrides(spec, def.condition, overridesById.get(def.id) ?? null);
+    } catch (err) {
+      // An out-of-range override is an authoring bug on ONE monitor. Dropping
+      // that monitor is right; failing the whole heartbeat block would strand
+      // every other watch on the device. But it is NOT transient — it recurs on
+      // every heartbeat forever — so it must be visible: without this log the
+      // watch simply vanishes from the device's config with nothing anywhere
+      // to explain it. Mirrors monitorScriptWorker's handling of the same throw.
+      console.error('[monitoring] dropping monitor with an invalid override', {
+        monitorId: def.id,
+        deviceId,
+        error: err,
+      });
+      captureException(err);
+      continue;
+    }
+
+    const name = def.kind === 'service'
+      ? (condition.serviceName as string | undefined)
+      : (condition.processName as string | undefined);
+    if (!name) continue;
+
+    const restartResponse = (def.responses ?? []).find(
+      (a) => a?.type === 'execute_command' && a?.kind === 'restart_service',
+    );
+
+    watches.push({
+      watch_type: def.kind === 'service' ? 'service' : 'process',
+      name,
+      alert_on_stop: true,
+      alert_after_consecutive_failures:
+        (condition.consecutiveFailures as number | undefined) ?? MONITOR_WATCH_DEFAULTS.alertAfterConsecutiveFailures,
+      // Spec §Responses: an execute_command response of kind 'restart_service'
+      // supersedes the agent-side flag, so the restart still happens locally
+      // and offline. A free-text `command` is NOT sniffed for intent — the
+      // explicit discriminator is the contract.
+      auto_restart: restartResponse !== undefined,
+      max_restart_attempts: (restartResponse?.maxAttempts as number | undefined) ?? MONITOR_WATCH_DEFAULTS.maxRestartAttempts,
+      restart_cooldown_seconds: (restartResponse?.cooldownSeconds as number | undefined) ?? MONITOR_WATCH_DEFAULTS.restartCooldownSeconds,
+    });
+  }
+
+  return { kind: 'resolved', watches };
+}
+
+/**
+ * Union monitor-derived watches with the policy tab's, keyed on
+ * (watch_type, lower(name)). The MONITOR wins every field except:
+ *  - `auto_restart`, which is OR'd — never lowered, because it drives the
+ *    agent's own offline-capable restart; and
+ *  - the process thresholds, which fall back to the policy row, because a
+ *    `service`/`process` monitor authors none (that is `process_resource`).
+ */
+function unionMonitoringWatches(
+  monitorWatches: MonitoringWatchConfig[],
+  policyWatches: MonitoringWatchConfig[],
+): MonitoringWatchConfig[] {
+  const key = (w: MonitoringWatchConfig) => `${w.watch_type}:${w.name.toLowerCase()}`;
+  const merged = new Map<string, MonitoringWatchConfig>();
+
+  for (const w of monitorWatches) merged.set(key(w), { ...w });
+
+  for (const p of policyWatches) {
+    const k = key(p);
+    const existing = merged.get(k);
+    if (!existing) {
+      merged.set(k, { ...p });
+      continue;
+    }
+    existing.auto_restart = existing.auto_restart || p.auto_restart;
+    if (existing.cpu_threshold_percent == null && p.cpu_threshold_percent != null) {
+      existing.cpu_threshold_percent = p.cpu_threshold_percent;
+    }
+    if (existing.memory_threshold_mb == null && p.memory_threshold_mb != null) {
+      existing.memory_threshold_mb = p.memory_threshold_mb;
+    }
+    if (existing.threshold_duration_seconds == null && p.threshold_duration_seconds != null) {
+      existing.threshold_duration_seconds = p.threshold_duration_seconds;
+    }
+  }
+
+  return [...merged.values()];
+}
+
+async function resolveDeviceMonitoringSettings(deviceId: string): Promise<MonitoringConfigUpdate | null> {
+  // Monitors are the primary source and win the union (#5287 W04); the policy
+  // tab is read FIRST only so its query sequence is untouched by this change —
+  // helpers.partnerWidePolicies.test.ts pins that sequence and must stay green
+  // unmodified. Both sources emit the same frozen `MonitoringWatchConfig`
+  // shape; the union below is order-independent.
+  const policy = await resolvePolicyMonitoringSettings(deviceId);
+  const monitorResult = await resolveMonitorDerivedWatches(deviceId);
+
+  // A device that vanished between authentication and here (raced a
+  // delete/org move) must NOT be folded into "resolved with zero
+  // monitor-derived watches": unioning `[]` into a truthy (possibly also
+  // empty) policy result would produce the #2949 "stop watching" clear
+  // signal for monitors this device still legitimately has, purely because
+  // of the race — not because resolution actually found zero (#5677). Omit
+  // the monitoring update entirely this heartbeat instead, same as
+  // `resolvePolicyMonitoringSettings` already does when its own device
+  // lookup misses.
+  if (monitorResult.kind === 'device_missing') {
+    // Surface this: the device just authenticated the heartbeat that reached
+    // this code, so a vanish between then and here should be rare. Silently
+    // omitting the monitoring update is the right behavior (see above), but
+    // silent AND invisible would hide a real bug (e.g. a stale deviceId)
+    // behind "just a benign race" forever (#5677 review).
+    console.warn(`[monitoring] device vanished mid-resolution, omitting monitoring update for device ${deviceId}`);
+    return null;
+  }
+  const monitorWatches = monitorResult.watches;
+
+  // Null ONLY when both sources are empty AND no policy resolved. A policy that
+  // resolved with zero enabled watches still returns `watches: []` below — that
+  // is the #2949 "stop watching" signal.
+  if (!policy && monitorWatches.length === 0) return null;
+
+  return {
+    check_interval_seconds: policy?.check_interval_seconds ?? MONITOR_ONLY_CHECK_INTERVAL_SECONDS,
+    watches: unionMonitoringWatches(monitorWatches, policy?.watches ?? []),
+  };
+}
+
+async function resolvePolicyMonitoringSettings(deviceId: string): Promise<MonitoringConfigUpdate | null> {
+  // 1. Load device
+  const [device] = await db
+    .select({
+      orgId: devices.orgId,
+      siteId: devices.siteId,
+      deviceRole: devices.deviceRole,
+      osType: devices.osType,
+    })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) return null;
+
+  // 2. Load org (for partnerId)
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, device.orgId))
+    .limit(1);
+
+  // 3. Load device group memberships
+  const groupRows = await db
+    .select({ groupId: deviceGroupMemberships.groupId })
+    .from(deviceGroupMemberships)
+    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupIds = groupRows.map((r) => r.groupId);
+
+  // 4. Build target match conditions
+  const targetConditions = [
+    and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId)),
+    and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId)),
+    and(eq(configPolicyAssignments.level, 'organization'), eq(configPolicyAssignments.targetId, device.orgId)),
+  ];
+  if (groupIds.length > 0) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'device_group'), inArray(configPolicyAssignments.targetId, groupIds))!
+    );
+  }
+  if (org?.partnerId) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId))!
+    );
+  }
+
+  // 5-7. Policy join + the winning row's watches, both in the CALLER'S OWN
+  // context (#4673 W03). config_policy_monitoring_watches' RLS walks
+  // settings_id → feature link → configuration_policies; for a partner-owned
+  // policy that chain used to need breeze_has_partner_access, which no agent or
+  // org context carries, so the read escaped to a system context. Wave 1's
+  // `config_policy_monitoring_watches_partner_wide_select` now grants exactly
+  // that chain on SELECT via breeze_current_partner_id(), and Wave 2 sets the
+  // GUC on agent contexts — so both reads resolve here without a second pooled
+  // connection. Both are pinned to this device's own hierarchy.
+  // 5. Single query: assignments → active policies → monitoring feature link → settings
+  const rows = await db
+    .select({
+      level: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      roleFilter: configPolicyAssignments.roleFilter,
+      osFilter: configPolicyAssignments.osFilter,
+      settingsId: configPolicyMonitoringSettings.id,
+      checkIntervalSeconds: configPolicyMonitoringSettings.checkIntervalSeconds,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+    .innerJoin(configPolicyEffectiveFeatureLinks, and(
+      eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+      eq(configPolicyEffectiveFeatureLinks.featureType, 'monitoring'),
+    ))
+    .innerJoin(configPolicyMonitoringSettings, eq(configPolicyMonitoringSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id))
+    .where(and(
+      eq(configurationPolicies.status, 'active'),
+      policyOwnershipCondition({ orgId: device.orgId, partnerId: org?.partnerId ?? null }),
+      or(...targetConditions),
+      ...buildRoleOsFilterConditions({ deviceRole: device.deviceRole, osType: device.osType }),
+    ));
+
+  // Filter by deviceRole and osType using canonical predicate
+  const eligibleRows = rows.filter((r) =>
+    matchesRoleOsFilter(r, { deviceRole: device.deviceRole, osType: device.osType })
+  );
+
+  if (eligibleRows.length === 0) return null;
+
+  // 6. Sort by level priority DESC, then assignment priority ASC — first match wins
+  eligibleRows.sort((a, b) => {
+    const levelDiff = (LEVEL_PRIORITY[b.level] ?? 0) - (LEVEL_PRIORITY[a.level] ?? 0);
+    if (levelDiff !== 0) return levelDiff;
+    return a.assignmentPriority - b.assignmentPriority;
+  });
+
+  const winner = eligibleRows[0];
+  if (!winner) return null;
+
+  // 7. Load watches for the winning settings row
+  const watches = await db
+    .select()
+    .from(configPolicyMonitoringWatches)
+    .where(and(
+      eq(configPolicyMonitoringWatches.settingsId, winner.settingsId),
+      eq(configPolicyMonitoringWatches.enabled, true),
+      isNull(configPolicyMonitoringWatches.retiredAt),
+    ))
+    .orderBy(configPolicyMonitoringWatches.sortOrder);
+
+  // A winning policy row with zero enabled watches is a valid resolution — it
+  // means "clear whatever watches were previously delivered", not "no policy
+  // matched" (that case already returned null above at the empty-rows check).
+  // Collapsing both to null used to make heartbeat.ts omit monitoring_settings
+  // from the payload, so the agent (which handles an empty array fine — see
+  // agent/internal/monitoring/monitor.go ApplyConfig) could never be told to
+  // stop watching something it was configured to watch on a prior heartbeat
+  // (#2949).
+  return {
+    check_interval_seconds: winner.checkIntervalSeconds,
+    watches: watches.map((w) => {
+      const entry: MonitoringWatchConfig = {
+        watch_type: w.watchType,
+        name: w.name,
+        alert_on_stop: w.alertOnStop,
+        alert_after_consecutive_failures: w.alertAfterConsecutiveFailures,
+        auto_restart: w.autoRestart,
+        max_restart_attempts: w.maxRestartAttempts,
+        restart_cooldown_seconds: w.restartCooldownSeconds,
+      };
+      if (w.cpuThresholdPercent != null) entry.cpu_threshold_percent = w.cpuThresholdPercent;
+      if (w.memoryThresholdMb != null) entry.memory_threshold_mb = w.memoryThresholdMb;
+      if (w.thresholdDurationSeconds) entry.threshold_duration_seconds = w.thresholdDurationSeconds;
+      return entry;
+    }),
+  };
+}
+
+const MONITORING_CACHE_TTL_SECONDS = 120; // 2 minutes
+
+export async function buildMonitoringConfigUpdate(deviceId: string): Promise<MonitoringConfigUpdate | null> {
+  const redis = getRedis();
+  const cacheKey = `monitoring:settings:device:${deviceId}`;
+
+  // Try cache first
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached) as MonitoringConfigUpdate;
+      }
+    } catch (cacheErr) {
+      console.warn(`[monitoring] Redis cache read failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  const settings = await resolveDeviceMonitoringSettings(deviceId);
+
+  // Cache the result when non-null (null results are not cached to allow quick policy activation)
+  if (redis && settings) {
+    try {
+      await redis.set(cacheKey, JSON.stringify(settings), 'EX', MONITORING_CACHE_TTL_SECONDS);
+    } catch (cacheErr) {
+      console.warn(`[monitoring] Redis cache write failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  return settings;
+}
+
+// ============================================
+// Enrollment / Auth
+// ============================================
+
+export function generateAgentId(): string {
+  return randomBytes(32).toString('hex');
+}
+
+export function generateApiKey(): string {
+  return `brz_${randomBytes(32).toString('hex')}`;
+}
+
+// ============================================
+// mTLS
+// ============================================
+
+// Per-process dedup for the malformed-maintenance-window warning. The read
+// below runs on the heartbeat hot path; without this, a single misconfigured
+// org would emit one warn per device per heartbeat. Cleared by tests.
+const warnedMalformedWindowOrgs = new Set<string>();
+
+// Same rationale for the "pinned build missing for platform/arch" fail-closed
+// path (issue #2124): a persistent misconfig would otherwise fire per device per
+// heartbeat. Deduped per (component, platform, arch, version) so Sentry sees the
+// freeze ONCE per process rather than a flood. Cleared by tests.
+const warnedMissingPinBuilds = new Set<string>();
+
+/** Test-only: reset the malformed-window + missing-pin warn dedup between cases. */
+export function __resetMalformedWindowWarnCache(): void {
+  warnedMalformedWindowOrgs.clear();
+  warnedMissingPinBuilds.clear();
+}
+
+/** Pull the `defaults` sub-object out of a settings JSONB blob (safe for null). */
+function extractSettingsDefaults(settings: unknown): Record<string, unknown> {
+  const root = isObject(settings) ? settings : {};
+  return isObject(root.defaults) ? root.defaults : {};
+}
+
+/**
+ * Effective per-component update version pins (issue #2124). `null` means "no
+ * pin" → track the globally promoted latest version (historical behaviour).
+ */
+export interface AgentVersionPins {
+  agent: string | null;
+  watchdog: string | null;
+}
+
+/**
+ * The full effective agent-update config for an org: the update-policy gate
+ * inputs PLUS the version pins. Both are resolved from the SAME single org⋈
+ * partner join (see getOrgAgentUpdateConfig) so the heartbeat hot path pays one
+ * round trip for everything it needs.
+ */
+export interface AgentUpdateConfig {
+  settings: AgentUpdateSettings;
+  pins: AgentVersionPins;
+}
+
+/**
+ * Resolve the EFFECTIVE agent update config for an org (Org > General). The
+ * update-POLICY fields (`agentUpdatePolicy`, `maintenanceWindow`) use the same
+ * partner-locks precedence as the settings UI / `getEffectiveOrgSettings`: a
+ * partner-set field wins and locks; the org value applies only where the partner
+ * has not set it (merged independently per field).
+ *
+ * `agentVersionPins` deliberately uses DIFFERENT, weaker precedence —
+ * INHERIT-WITH-OVERRIDE (issue #2124, per maintainer): a partner pin is an
+ * inherited DEFAULT, but an org-set pin WINS for that org, per component and by
+ * presence (so an org may pin 'latest' to override a partner pin back to global
+ * latest). Pins are intentionally exempt from the partner lock model in v1 — this
+ * is what lets a partner pilot a new version on one org without unsetting the
+ * fleet-wide default. See the assertNotLocked exemption in routes/orgs.ts.
+ *
+ * Returns a normalized policy + raw maintenance-window string (the gating
+ * decision lives in `shouldSendAgentUpgrade`) AND the normalized version pins
+ * (the heartbeat turns these into concrete upgrade targets, fail-closed when a
+ * pinned version has no build for the device's platform/arch). Orgs (and
+ * partners) that never configured a field resolve to permissive/no-pin defaults,
+ * preserving historical behaviour.
+ *
+ * Hot path: this runs once per device per heartbeat, so org + partner settings
+ * are fetched in a single joined round trip rather than two queries. A thrown
+ * error propagates to the heartbeat gate, which fails CLOSED (#2125); a missing
+ * org/partner row is NOT an error — it falls back to the permissive default like
+ * an unconfigured org, matching the pre-effective-settings behaviour.
+ *
+ * Issue #2123: before this, the gate read org-local `settings.defaults` only, so
+ * a partner-locked policy (e.g. Manual) had zero runtime effect and unconfigured
+ * child orgs fell back to the permissive default despite the partner lock.
+ * Issue #2124 rides version pins on top of the exact same join and precedence so
+ * there is one resolver, not two.
+ */
+export async function getOrgAgentUpdateConfig(orgId: string): Promise<AgentUpdateConfig> {
+  // LEFT JOIN so a missing partner (shouldn't happen) still returns the org row
+  // and falls back to org-local settings rather than dropping the whole lookup.
+  const [row] = await db
+    .select({ orgSettings: organizations.settings, partnerSettings: partners.settings })
+    .from(organizations)
+    .leftJoin(partners, eq(partners.id, organizations.partnerId))
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+
+  const orgDefaults = extractSettingsDefaults(row?.orgSettings);
+  const partnerDefaults = extractSettingsDefaults(row?.partnerSettings);
+
+  // Effective merge, per field (mirrors effectiveSettings.mergeCategory): a
+  // partner-set field wins and locks; the org value fills the gap only where the
+  // partner has not set that field. `in` (not truthiness) matches mergeCategory,
+  // which locks any key the partner has present.
+  const effectivePolicy =
+    'agentUpdatePolicy' in partnerDefaults
+      ? partnerDefaults.agentUpdatePolicy
+      : orgDefaults.agentUpdatePolicy;
+  const effectiveWindow =
+    'maintenanceWindow' in partnerDefaults
+      ? partnerDefaults.maintenanceWindow
+      : orgDefaults.maintenanceWindow;
+  // Version pins: inherit-with-override, per component (issue #2124). Resolved
+  // via the shared `resolveInheritedAgentVersionPins` (packages/shared) — the
+  // SAME function `getOrgAgentVersionPinsBatch`
+  // (services/orgAgentVersionPins.ts, issue #5285) calls, so the two resolvers
+  // can never silently drift apart. See that function's docstring for the
+  // full precedence contract.
+  const pins: AgentVersionPins = resolveInheritedAgentVersionPins(orgDefaults, partnerDefaults);
+
+  const policy = normalizeAgentUpdatePolicy(effectivePolicy);
+  const rawWindow = typeof effectiveWindow === 'string' ? effectiveWindow.trim() : '';
+  // The explicit "24/7"/empty always-state means "no restriction" → null, same
+  // as an absent window. Only a real window string is carried through to the gate.
+  const maintenanceWindow = rawWindow && !isAlwaysMaintenanceWindow(rawWindow) ? rawWindow : null;
+  // New writes are validated at save time (issue #1963), but a legacy malformed
+  // value still parses to null in the gate and fails open (lifts the time
+  // restriction). Surface that so the silently-lifted restriction is observable
+  // rather than an invisible 24/7-updates surprise. This runs on the heartbeat
+  // hot path (once per device per heartbeat), so dedupe per org for the process
+  // lifetime — otherwise one misconfigured org spams the log every heartbeat.
+  if (
+    maintenanceWindow !== null &&
+    parseMaintenanceWindow(maintenanceWindow) === null &&
+    !warnedMalformedWindowOrgs.has(orgId)
+  ) {
+    warnedMalformedWindowOrgs.add(orgId);
+    console.warn(
+      `[agents/helpers] Ignoring malformed maintenance window for org ${orgId}; ` +
+      `agent updates are NOT time-restricted (failing open). value=${JSON.stringify(maintenanceWindow)}`,
+    );
+  }
+  return { settings: { policy, maintenanceWindow }, pins };
+}
+
+/**
+ * Back-compat thin wrapper: resolve only the update-policy gate settings.
+ * Retained so existing callers/tests that only need the gate keep their surface;
+ * the heartbeat resolves the full config (settings + pins) via
+ * getOrgAgentUpdateConfig in a single round trip.
+ */
+export async function getOrgAgentUpdatePolicy(orgId: string): Promise<AgentUpdateSettings> {
+  return (await getOrgAgentUpdateConfig(orgId)).settings;
+}
+
+/**
+ * Resolve the candidate upgrade-target version for a component on a device's
+ * platform/arch, honoring an effective version pin (issue #2124).
+ *
+ *  - `pin === null` → the globally promoted latest build (`is_latest = true`),
+ *    or `null` if none is registered. This is byte-for-byte the pre-#2124
+ *    behaviour, so unpinned tenants are unaffected.
+ *  - `pin === '<version>'` → that EXACT version, but only if a build is
+ *    registered for (component, platform, arch). If not, returns `null` and
+ *    logs — a pin whose build is missing for this platform/arch **fails closed**
+ *    (withholds the upgrade) rather than silently falling back to latest, which
+ *    would defeat the holdback/rollback intent of the pin.
+ *
+ * Returns only the candidate version string. The caller keeps the existing
+ * decision to actually send it (dev-build guard, update-policy gate, version
+ * comparison) so heartbeat semantics are otherwise unchanged. `agentVersions`
+ * is a global (non-tenant) table, so this is safe to call in any DB context.
+ */
+export async function resolvePinnedUpgradeTarget(args: {
+  component: string;
+  platform: string;
+  architecture: string;
+  pin: string | null;
+  agentId?: string;
+}): Promise<string | null> {
+  const { component, platform, architecture, pin, agentId } = args;
+
+  if (pin === null) {
+    // LOCKSTEP (#3499): this promoted-row query is duplicated by
+    // services/promotedAgentVersion.ts (which resolves the BYTES the download
+    // route serves) and by GET /agent-versions/latest (which serves the
+    // CHECKSUM). All three must use the same predicates and the same
+    // created_at tiebreak — if the version offered here is not the version
+    // whose bytes get served, agents are told to upgrade to something that
+    // fails checksum verification on arrival.
+    const [latest] = await db
+      .select({ version: agentVersions.version })
+      .from(agentVersions)
+      .where(
+        and(
+          eq(agentVersions.platform, platform),
+          eq(agentVersions.architecture, architecture),
+          eq(agentVersions.component, component),
+          eq(agentVersions.isLatest, true),
+          // Each server only serves its own build edition (#4072) — same
+          // scoping as the download/register/promote paths. Without this, a
+          // row registered for the OTHER edition could be resolved and
+          // offered, and the agent would hard-refuse it after download.
+          eq(agentVersions.edition, getBinaryEdition()),
+        ),
+      )
+      .orderBy(desc(agentVersions.createdAt)) // newest first if multiple isLatest rows exist
+      .limit(1);
+    return latest?.version ?? null;
+  }
+
+  const [pinned] = await db
+    .select({ version: agentVersions.version })
+    .from(agentVersions)
+    .where(
+      and(
+        eq(agentVersions.platform, platform),
+        eq(agentVersions.architecture, architecture),
+        eq(agentVersions.component, component),
+        eq(agentVersions.version, pin),
+        // Edition-scoped like the latest-promoted lookup above (#4072).
+        eq(agentVersions.edition, getBinaryEdition()),
+      ),
+    )
+    .limit(1);
+
+  if (!pinned) {
+    // Fail-closed, but loudly: an operator pinned a version with no build for
+    // this platform/arch (typo, or a build that was never published). Withhold
+    // the upgrade AND surface it. Per-heartbeat stdout alone is not enough — this
+    // is the same class of invisible, fleet-wide freeze the #2125 gate catch
+    // routes to Sentry, so match that bar. Deduped per (component/platform/arch/
+    // version) so a persistent misconfig captures ONCE per process, not per beat.
+    console.warn(
+      `[agents] update withheld for ${agentId ?? 'device'}: pinned ${component} version ` +
+        `"${pin}" has no registered ${getBinaryEdition()}-edition build for ` +
+        `${platform}/${architecture} (fail closed; a build registered under the other ` +
+        `edition does not count — #4072)`,
+    );
+    const key = `${component}:${platform}:${architecture}:${pin}`;
+    if (!warnedMissingPinBuilds.has(key)) {
+      warnedMissingPinBuilds.add(key);
+      captureException(
+        new Error(
+          `Agent update withheld (#2124): pinned ${component} version "${pin}" has no ` +
+            `registered ${getBinaryEdition()}-edition build for ${platform}/${architecture}; ` +
+            `fleet freeze until a build is published under this edition or the pin is corrected.`,
+        ),
+      );
+    }
+    return null;
+  }
+  return pinned.version;
+}
+
+export async function getOrgHelperSettings(orgId: string): Promise<{ enabled: boolean }> {
+  const [org] = await db
+    .select({ settings: organizations.settings })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+  const settings = isObject(org?.settings) ? org.settings : {};
+  const helper = isObject(settings.helper) ? settings.helper : {};
+  const enabled = typeof helper.enabled === 'boolean' ? helper.enabled : false;
+  return { enabled };
+}
+
+export async function getOrgMtlsSettings(orgId: string): Promise<{ certLifetimeDays: number; expiredCertPolicy: 'auto_reissue' | 'quarantine' }> {
+  const [org] = await db
+    .select({ settings: organizations.settings })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+  const settings = isObject(org?.settings) ? org.settings : {};
+  const mtls = isObject(settings.mtls) ? settings.mtls : {};
+  const certLifetimeDays = typeof mtls.certLifetimeDays === 'number' && mtls.certLifetimeDays >= 1 && mtls.certLifetimeDays <= 365
+    ? Math.round(mtls.certLifetimeDays)
+    : 90;
+  const expiredCertPolicy = mtls.expiredCertPolicy === 'quarantine' ? 'quarantine' : 'auto_reissue';
+  return { certLifetimeDays, expiredCertPolicy };
+}
+
+export async function issueMtlsCertForDevice(deviceId: string, orgId: string): Promise<{
+  certificate: string;
+  privateKey: string;
+  expiresAt: string;
+  serialNumber: string;
+} | null> {
+  const cfService = CloudflareMtlsService.fromEnv();
+  if (!cfService) return null;
+
+  let cert;
+  try {
+    const mtlsSettings = await getOrgMtlsSettings(orgId);
+    cert = await cfService.issueCertificate(mtlsSettings.certLifetimeDays);
+  } catch (err) {
+    // I9: issueCertificate throws a typed, body-free CloudflareMtlsError now;
+    // log the bounded name rather than the whole error object.
+    console.error(
+      '[agents] mTLS cert issuance failed, falling back to bearer-only auth:',
+      err instanceof Error ? err.name : 'unknown',
+    );
+    return null;
+  }
+
+  try {
+    // Wave 5 Task 6 fix round 3 (code review): `cert.serialNumber` is
+    // Cloudflare's raw `serial_number` API field — format not guaranteed to
+    // match the canonical uppercase-hex-no-separators form the certificate
+    // binding decision (services/agentCertificateBinding.ts) compares
+    // against. Normalize with the same shared helper used everywhere else a
+    // serial crosses a trust boundary, so this (initial enrollment/
+    // provisioning/quarantine-reissue) path stores rows canonical too.
+    await db
+      .update(devices)
+      .set({
+        mtlsCertSerialNumber: normalizeCertificateSerial(cert.serialNumber),
+        mtlsCertExpiresAt: new Date(cert.expiresOn),
+        mtlsCertIssuedAt: new Date(cert.issuedOn),
+        mtlsCertCfId: cert.id,
+      })
+      .where(eq(devices.id, deviceId));
+  } catch (dbErr) {
+    console.error('[agents] mTLS cert issued but DB update failed — orphaned cert on Cloudflare:', {
+      deviceId, cfCertId: cert.id, error: dbErr,
+    });
+  }
+
+  return {
+    certificate: cert.certificate,
+    privateKey: cert.privateKey,
+    expiresAt: cert.expiresOn,
+    serialNumber: cert.serialNumber,
+  };
+}
+
+// ============================================
+// Helper Settings (policy-driven)
+// ============================================
+
+export interface HelperSettings {
+  enabled: boolean;
+  /**
+   * Whether Breeze Assist draws its system-tray icon. Independent of
+   * `enabled` — the helper still serves chat, remote-access consent and PAM
+   * dialogs with the icon hidden (#3202). Defaults to true; only an explicit
+   * false hides it (the agent treats an absent field as true so an older
+   * server can never blank a fleet's trays).
+   */
+  showTrayIcon: boolean;
+  showOpenPortal: boolean;
+  showDeviceInfo: boolean;
+  showRequestSupport: boolean;
+  portalUrl?: string;
+  /**
+   * Helper lifecycle override for RDS hosts ('auto' | 'always-on' |
+   * 'on-demand'). Undefined = auto. Precedence on the agent: explicit local
+   * agent config > this value > RDS auto-detection. Cached with the rest of
+   * the helper settings (120s) — mode changes land within TTL + heartbeat.
+   */
+  lifecycleMode?: 'auto' | 'always-on' | 'on-demand';
+}
+
+const HELPER_DEFAULTS: HelperSettings = {
+  enabled: false,
+  showTrayIcon: true,
+  showOpenPortal: true,
+  showDeviceInfo: true,
+  showRequestSupport: true,
+};
+
+// Resolves the helper feature settings for a device from configuration
+// policies. Returns null when NO helper feature link matched — callers
+// distinguish "no policy" (legacy org fallback applies) from an explicit
+// enabled:false (which must win; see buildHelperConfigUpdate).
+export async function resolveDeviceHelperSettings(deviceId: string): Promise<HelperSettings | null> {
+  // 1. Load device
+  const [device] = await db
+    .select({ orgId: devices.orgId, siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) return null;
+
+  // 2. Load org (for partnerId)
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, device.orgId))
+    .limit(1);
+
+  // 3. Load device group memberships
+  const groupRows = await db
+    .select({ groupId: deviceGroupMemberships.groupId })
+    .from(deviceGroupMemberships)
+    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupIds = groupRows.map((r) => r.groupId);
+
+  // 4. Build target match conditions
+  const targetConditions = [
+    and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId)),
+    and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId)),
+    and(eq(configPolicyAssignments.level, 'organization'), eq(configPolicyAssignments.targetId, device.orgId)),
+  ];
+  if (groupIds.length > 0) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'device_group'), inArray(configPolicyAssignments.targetId, groupIds))!
+    );
+  }
+  if (org?.partnerId) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId))!
+    );
+  }
+
+  // 5. Single query: assignments → active policies → helper feature link (pure JSONB)
+  const rows = await db
+    .select({
+      level: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      inlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+    .innerJoin(configPolicyEffectiveFeatureLinks, and(
+      eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+      eq(configPolicyEffectiveFeatureLinks.featureType, 'helper'),
+    ))
+    .where(and(
+      eq(configurationPolicies.status, 'active'),
+      policyOwnershipCondition({ orgId: device.orgId, partnerId: org?.partnerId ?? null }),
+      or(...targetConditions),
+    ));
+
+  if (rows.length === 0) return null;
+
+  // 6. Sort by level priority DESC, then assignment priority ASC — first match wins
+  rows.sort((a, b) => {
+    const levelDiff = (LEVEL_PRIORITY[b.level] ?? 0) - (LEVEL_PRIORITY[a.level] ?? 0);
+    if (levelDiff !== 0) return levelDiff;
+    return a.assignmentPriority - b.assignmentPriority;
+  });
+
+  const winner = rows[0];
+  if (!winner?.inlineSettings) return null;
+
+  const s = winner.inlineSettings as Record<string, unknown>;
+  return {
+    enabled: typeof s.enabled === 'boolean' ? s.enabled : HELPER_DEFAULTS.enabled,
+    showTrayIcon: typeof s.showTrayIcon === 'boolean' ? s.showTrayIcon : HELPER_DEFAULTS.showTrayIcon,
+    showOpenPortal: typeof s.showOpenPortal === 'boolean' ? s.showOpenPortal : HELPER_DEFAULTS.showOpenPortal,
+    showDeviceInfo: typeof s.showDeviceInfo === 'boolean' ? s.showDeviceInfo : HELPER_DEFAULTS.showDeviceInfo,
+    showRequestSupport: typeof s.showRequestSupport === 'boolean' ? s.showRequestSupport : HELPER_DEFAULTS.showRequestSupport,
+    portalUrl: typeof s.portalUrl === 'string' && s.portalUrl ? s.portalUrl : undefined,
+    lifecycleMode: s.lifecycleMode === 'auto' || s.lifecycleMode === 'always-on' || s.lifecycleMode === 'on-demand'
+      ? s.lifecycleMode
+      : undefined,
+  };
+}
+
+const HELPER_CACHE_TTL_SECONDS = 120;
+
+/**
+ * Build helper config update payload for heartbeat response.
+ * Resolves helper policy settings via the config policy hierarchy.
+ * Falls back to org-level helperEnabled for backward compatibility,
+ * then to defaults if no policy found.
+ */
+export async function buildHelperConfigUpdate(deviceId: string, orgId: string): Promise<HelperSettings> {
+  const redis = getRedis();
+  const cacheKey = `helper:settings:device:${deviceId}`;
+
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return JSON.parse(cached) as HelperSettings;
+    } catch (cacheErr) {
+      console.warn(`[helper] Redis cache read failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  // Try config policy resolution first
+  let settings = await resolveDeviceHelperSettings(deviceId);
+
+  // Legacy org-level fallback applies ONLY when no policy matched at all. An
+  // explicit enabled:false policy must win over organizations.settings.helper
+  // (previously `!settings.enabled` fell through, and the fallback also
+  // discarded the four resolved UI fields).
+  if (settings === null) {
+    let orgEnabled = false;
+    try {
+      orgEnabled = (await getOrgHelperSettings(orgId)).enabled;
+    } catch {
+      // defaults are fine
+    }
+    settings = { ...HELPER_DEFAULTS, enabled: orgEnabled };
+  }
+
+  if (redis) {
+    try {
+      await redis.set(cacheKey, JSON.stringify(settings), 'EX', HELPER_CACHE_TTL_SECONDS);
+    } catch (cacheErr) {
+      console.warn(`[helper] Redis cache write failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  return settings;
+}
+
+// ============================================
+// PAM Settings (policy-driven)
+// ============================================
+
+/**
+ * Org-level fallback when no 'pam' config-policy feature link resolves for the
+ * device. Orgs that had deliberately configured PAM before the opt-in switch
+ * carry an explicit uac_interception_enabled=true on their pam_org_config row
+ * (grandfathered by migration 2026-07-01); everyone else falls to PAM_DEFAULTS
+ * (opt-in: off). An explicit config-policy feature link always wins over this.
+ */
+async function resolveOrgPamFallback(orgId: string): Promise<PamSettings> {
+  const [cfg] = await db
+    .select({ enabled: pamOrgConfig.uacInterceptionEnabled })
+    .from(pamOrgConfig)
+    .where(eq(pamOrgConfig.orgId, orgId))
+    .limit(1);
+  if (cfg && typeof cfg.enabled === 'boolean') {
+    return { uacInterceptionEnabled: cfg.enabled };
+  }
+  return PAM_DEFAULTS;
+}
+
+async function resolveDevicePamSettings(deviceId: string): Promise<PamSettings> {
+  // 1. Load device
+  const [device] = await db
+    .select({ orgId: devices.orgId, siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) return PAM_DEFAULTS;
+
+  // 2. Load org (for partnerId)
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, device.orgId))
+    .limit(1);
+
+  // 3. Load device group memberships
+  const groupRows = await db
+    .select({ groupId: deviceGroupMemberships.groupId })
+    .from(deviceGroupMemberships)
+    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupIds = groupRows.map((r) => r.groupId);
+
+  // 4. Build target match conditions
+  const targetConditions = [
+    and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId)),
+    and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId)),
+    and(eq(configPolicyAssignments.level, 'organization'), eq(configPolicyAssignments.targetId, device.orgId)),
+  ];
+  if (groupIds.length > 0) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'device_group'), inArray(configPolicyAssignments.targetId, groupIds))!
+    );
+  }
+  if (org?.partnerId) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId))!
+    );
+  }
+
+  // 5. Single query: assignments → active policies → pam feature link (pure JSONB)
+  const rows = await db
+    .select({
+      level: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      inlineSettings: configPolicyEffectiveFeatureLinks.inlineSettings,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+    .innerJoin(configPolicyEffectiveFeatureLinks, and(
+      eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+      eq(configPolicyEffectiveFeatureLinks.featureType, 'pam'),
+    ))
+    .where(and(
+      eq(configurationPolicies.status, 'active'),
+      policyOwnershipCondition({ orgId: device.orgId, partnerId: org?.partnerId ?? null }),
+      or(...targetConditions),
+    ));
+
+  if (rows.length === 0) return resolveOrgPamFallback(device.orgId);
+
+  // 6. Sort by level priority DESC, then assignment priority ASC — first match wins
+  rows.sort((a, b) => {
+    const levelDiff = (LEVEL_PRIORITY[b.level] ?? 0) - (LEVEL_PRIORITY[a.level] ?? 0);
+    if (levelDiff !== 0) return levelDiff;
+    return a.assignmentPriority - b.assignmentPriority;
+  });
+
+  const winner = rows[0];
+  if (!winner?.inlineSettings) return resolveOrgPamFallback(device.orgId);
+
+  return parsePamSettings(winner.inlineSettings);
+}
+
+const PAM_CACHE_TTL_SECONDS = 120;
+
+/**
+ * Build PAM config update payload for heartbeat response.
+ * Resolves pam policy settings via the config policy hierarchy, then the
+ * org-level grandfather flag, then PAM_DEFAULTS (uacInterceptionEnabled: false).
+ * Cached per-device in Redis for 120s — policy changes propagate within ~2min + heartbeat interval.
+ */
+export async function buildPamConfigUpdate(deviceId: string): Promise<PamSettings> {
+  const redis = getRedis();
+  const cacheKey = `pam:settings:device:${deviceId}`;
+
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return JSON.parse(cached) as PamSettings;
+    } catch (cacheErr) {
+      console.warn(`[pam] Redis cache read failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  const settings = await resolveDevicePamSettings(deviceId);
+
+  if (redis) {
+    try {
+      await redis.set(cacheKey, JSON.stringify(settings), 'EX', PAM_CACHE_TTL_SECONDS);
+    } catch (cacheErr) {
+      console.warn(`[pam] Redis cache write failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  return settings;
+}
+
+// ============================================
+// Patch Source Enforcement Config (#1872)
+// ============================================
+
+export interface PatchSourceSettings {
+  /**
+   * When true the Windows agent suppresses the native Windows Update
+   * automatic-install channel (NoAutoUpdate=1) so updates flow only through
+   * Breeze's approval rings. False explicitly tells the agent to revert any
+   * enforcement Breeze previously applied (a pre-existing admin GPO is left
+   * untouched, agent-side). Breeze's own WUA-driven install path is unaffected.
+   */
+  exclusiveWindowsUpdate: boolean;
+}
+
+/**
+ * Resolves the patch feature link for the device and surfaces the
+ * sole-source-enforcement flag for the heartbeat config push. A device with no
+ * patch policy assigned resolves to `false`, which the agent treats as "revert
+ * any prior Breeze enforcement" — so removing the policy cleanly reverts the
+ * endpoint. The caller (heartbeat) omits the block entirely on a resolver error
+ * so a transient failure never triggers an unintended revert.
+ */
+export async function buildPatchSourceConfigUpdate(deviceId: string): Promise<PatchSourceSettings> {
+  const patch = await resolvePatchConfigForDevice(deviceId);
+  return { exclusiveWindowsUpdate: patch?.exclusiveWindowsUpdate ?? false };
+}
+
+// ============================================
+// HP CMSL Warranty Collection Config (#5511 W02)
+// ============================================
+
+export interface WarrantySettings {
+  /**
+   * When true the (Windows-only) agent may collect HP warranty data on the
+   * device via HP's CMSL. False explicitly tells the agent to stop — so
+   * unassigning the policy, or a nearer policy replacing the link without an
+   * hpCmsl block, cleanly revokes collection.
+   */
+  hpCmslEnabled: boolean;
+}
+
+/**
+ * Resolves the warranty feature link for the device and surfaces the HP CMSL
+ * collection flag for the heartbeat config push. A device with no warranty
+ * policy assigned resolves to `false`, which the agent treats as "stop
+ * collecting". The caller (heartbeat) omits the block entirely on a resolver
+ * error so a transient failure never revokes collection fleet-wide — which is
+ * why this function deliberately does NOT catch.
+ *
+ * `warrantyHpCmslCollectionEffective` additionally requires an acceptance
+ * recorded against the CURRENT HP_CMSL_EULA_ID: an enabled block with no
+ * consent, or one naming superseded terms, delivers `false` (contract D2/D3).
+ * Collection never runs on an acceptance we cannot point at.
+ */
+export async function buildWarrantyConfigUpdate(deviceId: string): Promise<WarrantySettings> {
+  const inlineSettings = await resolveEffectiveWarrantyInlineSettings(deviceId);
+  return { hpCmslEnabled: warrantyHpCmslCollectionEffective(inlineSettings) };
+}
+
+// ============================================
+// OneDrive Helper Config
+// ============================================
+
+export interface OnedriveConfigUpdate {
+  base: {
+    silentAccountConfig: boolean;
+    filesOnDemand: boolean;
+    kfmSilentOptIn: boolean;
+    kfmFolders: string[];
+    kfmBlockOptOut: boolean;
+    tenantAssociationId: string | null;
+    restartOnChange: boolean;
+  };
+  libraries: Array<{
+    libraryId: string;
+    displayName: string;
+    siteUrl: string | null;
+    targetingMode: string;
+    groupId: string | null;
+    groupName: string | null;
+    hiveScope: string;
+    allowedUpns: string[];
+  }>;
+}
+
+async function resolveDeviceOnedriveSettings(deviceId: string): Promise<OnedriveConfigUpdate | null> {
+  // 1. Load device
+  const [device] = await db
+    .select({ orgId: devices.orgId, siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) return null;
+
+  // 2. Load org (for partnerId)
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, device.orgId))
+    .limit(1);
+
+  // 3. Load device group memberships
+  const groupRows = await db
+    .select({ groupId: deviceGroupMemberships.groupId })
+    .from(deviceGroupMemberships)
+    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupIds = groupRows.map((r) => r.groupId);
+
+  // 4. Build target match conditions (closest-level-wins hierarchy)
+  const targetConditions = [
+    and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId)),
+    and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId)),
+    and(eq(configPolicyAssignments.level, 'organization'), eq(configPolicyAssignments.targetId, device.orgId)),
+  ];
+  if (groupIds.length > 0) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'device_group'), inArray(configPolicyAssignments.targetId, groupIds))!
+    );
+  }
+  if (org?.partnerId) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId))!
+    );
+  }
+
+  // 5. Single query: assignments → active policies → onedrive_helper feature link → settings
+  //
+  // DELIBERATELY org-only, unlike the sibling resolvers fixed for #2930.
+  // `onedrive_helper` is the sole member of ORG_SCOPED_ONLY_FEATURE_TYPES
+  // (packages/shared/src/constants/configFeatureTypes.ts): its settings carry
+  // per-tenant M365 library mappings that a partner-wide policy has no owning
+  // org to anchor to, and featureLinks.ts rejects the link with a 400 at write
+  // time. A partner-owned row therefore cannot exist here — adding the
+  // dual-axis predicate would be dead code that implies support we don't have.
+  // Supporting partner-wide OneDrive is a schema/product change, not a resolver
+  // fix.
+  const rows = await db
+    .select({
+      level: configPolicyAssignments.level,
+      assignmentPriority: configPolicyAssignments.priority,
+      settingsId: configPolicyOnedriveSettings.id,
+      silentAccountConfig: configPolicyOnedriveSettings.silentAccountConfig,
+      filesOnDemand: configPolicyOnedriveSettings.filesOnDemand,
+      kfmSilentOptIn: configPolicyOnedriveSettings.kfmSilentOptIn,
+      kfmFolders: configPolicyOnedriveSettings.kfmFolders,
+      kfmBlockOptOut: configPolicyOnedriveSettings.kfmBlockOptOut,
+      tenantAssociationId: configPolicyOnedriveSettings.tenantAssociationId,
+      restartOnChange: configPolicyOnedriveSettings.restartOnChange,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+    .innerJoin(configPolicyEffectiveFeatureLinks, and(
+      eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+      eq(configPolicyEffectiveFeatureLinks.featureType, 'onedrive_helper'),
+    ))
+    .innerJoin(configPolicyOnedriveSettings, eq(configPolicyOnedriveSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id))
+    .where(and(
+      eq(configurationPolicies.status, 'active'),
+      eq(configurationPolicies.orgId, device.orgId),
+      or(...targetConditions),
+    ));
+
+  if (rows.length === 0) return null;
+
+  // 6. Sort by level priority DESC, then assignment priority ASC — first match wins
+  rows.sort((a, b) => {
+    const levelDiff = (LEVEL_PRIORITY[b.level] ?? 0) - (LEVEL_PRIORITY[a.level] ?? 0);
+    if (levelDiff !== 0) return levelDiff;
+    return a.assignmentPriority - b.assignmentPriority;
+  });
+
+  const winner = rows[0];
+  if (!winner) return null;
+
+  // 7. Load enabled libraries for the winning settings row, in sort order
+  const libs = await db
+    .select()
+    .from(configPolicyOnedriveLibraries)
+    .where(and(
+      eq(configPolicyOnedriveLibraries.settingsId, winner.settingsId),
+      eq(configPolicyOnedriveLibraries.enabled, true),
+    ))
+    .orderBy(configPolicyOnedriveLibraries.sortOrder);
+
+  const [state] = libs.length > 0
+    ? await db
+      .select()
+      .from(onedriveDeviceState)
+      .where(eq(onedriveDeviceState.deviceId, deviceId))
+      .limit(1)
+    : [];
+
+  // Phase 4: tag enabled graph_group libraries with the reported UPNs whose
+  // transitive Entra membership includes the rule's groupId. Fail closed:
+  // no UPNs / no groupId / Graph error → no tag → the agent never mounts it.
+  const graphRules = libs.filter((l) => l.targetingMode === 'graph_group' && l.groupId);
+  // Guard the jsonb shape: a corrupt/non-array signedInUpns value degrades to
+  // no-tagging (delivery of non-graph libraries must survive) instead of throwing.
+  // zod validates ingest, so a non-array here means an out-of-band write — worth a log.
+  const rawUpns = state?.signedInUpns;
+  if (rawUpns != null && !Array.isArray(rawUpns)) {
+    console.warn(`[agents] graph_group tagging: signed_in_upns is not an array for device ${deviceId}; treating as empty`);
+  }
+  const reportedUpns = (Array.isArray(rawUpns) ? rawUpns : []).filter(
+    (u): u is string => typeof u === 'string' && u.length > 0
+  );
+  // Dedupe case-insensitively, keeping the first occurrence's casing: the agent already
+  // dedupes case-insensitively via EqualFold before reporting, so which casing survives
+  // here is cosmetic. This is defense-in-depth against a stale agent version or an
+  // out-of-band write — each duplicate otherwise costs a Graph resolution and produces
+  // duplicate allowedUpns entries on the wire.
+  const seenUpns = new Set<string>();
+  const upns = reportedUpns.filter((u) => {
+    const key = u.toLowerCase();
+    if (seenUpns.has(key)) return false;
+    seenUpns.add(key);
+    return true;
+  });
+  // Group ids are GUIDs from two sources (Graph responses vs. the stored rule,
+  // which future entry paths may brace/uppercase) — normalize both sides so a
+  // formatting mismatch can't silently fail-close the library forever.
+  const normalizeGuid = (g: string) => g.replace(/^\{|\}$/g, '').toLowerCase();
+  const allowedByLib = new Map<string, string[]>();
+  if (graphRules.length > 0 && upns.length > 0) {
+    // Aggregate deadline: per-call timeouts bound each round-trip, but 16 UPNs
+    // × (token + up to 5 membership pages) can still sum past the agent's
+    // heartbeat client timeout — which would drop the WHOLE response including
+    // already-claimed commands. Past the budget, remaining UPNs stay untagged
+    // this cycle (fail closed) and retry next heartbeat against a warm cache.
+    const taggingDeadline = Date.now() + 15_000;
+
+    // Resolved through a small fixed-size worker pool rather than one at a
+    // time: a multi-session host (RDS/VDI) reports a UPN per logged-on user,
+    // and serialized round-trips sum into the 15s budget fast enough that the
+    // last users go untagged — their libraries then silently don't mount. The
+    // cap stays small on purpose: these calls share one org's Graph token and
+    // rate limit, so widening it trades a burst of 429s for the latency win.
+    const TAGGING_CONCURRENCY = 4;
+    const memberships = new Array<Set<string> | null>(upns.length).fill(null);
+    let nextIndex = 0;
+    let budgetExhausted = false;
+
+    const worker = async () => {
+      for (;;) {
+        const i = nextIndex++;
+        if (i >= upns.length) return;
+        if (Date.now() > taggingDeadline) {
+          budgetExhausted = true;
+          return;
+        }
+        const res = await resolveUserGroupMembershipCached(device.orgId, upns[i]!);
+        if (res.kind !== 'ok') {
+          // Deliberately no UPN in the log line — it's end-user PII; the code +
+          // deviceId is enough to triage.
+          console.warn(`[agents] graph_group tagging: membership lookup failed for device ${deviceId}: ${res.code}`);
+          continue;
+        }
+        memberships[i] = new Set(res.data.groupIds.map(normalizeGuid));
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(TAGGING_CONCURRENCY, upns.length) }, () => worker()),
+    );
+
+    if (budgetExhausted) {
+      console.warn(`[agents] graph_group tagging: time budget exhausted for device ${deviceId}; remaining UPNs untagged this cycle`);
+    }
+
+    // Applied in the original UPN order (not completion order) so allowedUpns
+    // is deterministic for a given input regardless of how the pool interleaved.
+    for (let i = 0; i < upns.length; i++) {
+      const groupIds = memberships[i];
+      if (!groupIds) continue;
+      for (const rule of graphRules) {
+        if (rule.groupId && groupIds.has(normalizeGuid(rule.groupId))) {
+          const arr = allowedByLib.get(rule.id) ?? [];
+          arr.push(upns[i]!);
+          allowedByLib.set(rule.id, arr);
+        }
+      }
+    }
+  }
+
+  return {
+    base: {
+      silentAccountConfig: winner.silentAccountConfig,
+      filesOnDemand: winner.filesOnDemand,
+      kfmSilentOptIn: winner.kfmSilentOptIn,
+      kfmFolders: (winner.kfmFolders as string[]) ?? [],
+      kfmBlockOptOut: winner.kfmBlockOptOut,
+      tenantAssociationId: winner.tenantAssociationId,
+      restartOnChange: winner.restartOnChange,
+    },
+    libraries: libs.map((l) => ({
+      libraryId: l.libraryId,
+      displayName: l.displayName,
+      siteUrl: l.siteUrl,
+      targetingMode: l.targetingMode,
+      groupId: l.groupId,
+      groupName: l.groupName,
+      hiveScope: l.hiveScope,
+      allowedUpns: allowedByLib.get(l.id) ?? [],
+    })),
+  };
+}
+
+export async function buildOnedriveHelperConfigUpdate(deviceId: string): Promise<OnedriveConfigUpdate | null> {
+  return resolveDeviceOnedriveSettings(deviceId);
+}

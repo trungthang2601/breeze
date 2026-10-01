@@ -1,0 +1,256 @@
+import { sql, type SQL } from 'drizzle-orm';
+import {
+  pgTable, uuid, text, varchar, char, boolean, numeric, integer, jsonb, timestamp, date, pgEnum,
+  index, uniqueIndex, foreignKey, check
+} from 'drizzle-orm/pg-core';
+import { partners, organizations } from './orgs';
+import { users, bytea } from './users';
+import { supportedCurrencies } from './currency';
+
+export const catalogItemTypeEnum = pgEnum('catalog_item_type', ['hardware', 'software', 'service']);
+export const catalogBillingTypeEnum = pgEnum('catalog_billing_type', ['one_time', 'recurring']);
+export const catalogBillingFrequencyEnum = pgEnum('catalog_billing_frequency', ['monthly', 'quarterly', 'annual']);
+
+// Drizzle partial-index predicate helper (kept local; drizzle-kit only needs it
+// for drift detection — the real index is created in the SQL migration).
+function sqlSkuNotNull(t: { sku: unknown }): SQL {
+  return sql`${t.sku} IS NOT NULL`;
+}
+
+// Partner-axis (RLS shape 3). partner_id is the isolation axis.
+export const catalogItems = pgTable('catalog_items', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  itemType: catalogItemTypeEnum('item_type').notNull(),
+  name: varchar('name', { length: 255 }).notNull(),
+  sku: varchar('sku', { length: 100 }),
+  description: text('description'),
+  billingType: catalogBillingTypeEnum('billing_type').notNull().default('one_time'),
+  billingFrequency: catalogBillingFrequencyEnum('billing_frequency'),
+  commitmentTermMonths: integer('commitment_term_months'),
+  // Sell prices live in catalog_item_prices (per currency) with per-org
+  // overrides in catalog_item_org_pricing. The deprecated `unit_price`
+  // read-mirror of the partner-currency row was dropped by
+  // 2026-10-17-130000-drop-catalog-items-unit-price.sql (#3812).
+  costBasis: numeric('cost_basis', { precision: 12, scale: 2 }),
+  markupPercent: numeric('markup_percent', { precision: 6, scale: 2 }),
+  // Multi-currency wave 3: currency of cost_basis. NOT NULL, no default —
+  // every writer stamps it (createCatalogItem defaults to the partner currency).
+  costCurrency: char('cost_currency', { length: 3 }).notNull().references(() => supportedCurrencies.code),
+  unitOfMeasure: varchar('unit_of_measure', { length: 50 }).notNull().default('each'),
+  taxable: boolean('taxable').notNull().default(true),
+  taxCategory: varchar('tax_category', { length: 100 }),
+  isBundle: boolean('is_bundle').notNull().default(false),
+  attributes: jsonb('attributes').notNull().default({}),
+  isActive: boolean('is_active').notNull().default(true),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (t) => [
+  index('catalog_items_partner_type_idx').on(t.partnerId, t.itemType),
+  index('catalog_items_partner_active_idx').on(t.partnerId, t.isActive),
+  uniqueIndex('catalog_items_id_partner_uq').on(t.id, t.partnerId),
+  // partial: only enforce uniqueness when sku is present
+  // (the real partial unique index is created in the SQL migration; drizzle-kit
+  // only needs the predicate for drift detection)
+  uniqueIndex('catalog_items_partner_sku_uq').on(t.partnerId, t.sku).where(sqlSkuNotNull(t))
+]);
+
+// Partner-axis (RLS shape 3). Per-currency sell price book (multi-currency
+// wave 3). UNIQUE(item_id, currency_code); composite FK proves same partner.
+export const catalogItemPrices = pgTable('catalog_item_prices', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  itemId: uuid('item_id').notNull(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  currencyCode: char('currency_code', { length: 3 }).notNull().references(() => supportedCurrencies.code),
+  unitPrice: numeric('unit_price', { precision: 12, scale: 2 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('catalog_item_prices_item_currency_uq').on(t.itemId, t.currencyCode),
+  index('catalog_item_prices_partner_idx').on(t.partnerId),
+  foreignKey({
+    columns: [t.itemId, t.partnerId],
+    foreignColumns: [catalogItems.id, catalogItems.partnerId],
+    name: 'catalog_item_prices_item_partner_fk'
+  }).onDelete('cascade')
+]);
+
+// Partner-axis (RLS shape 3). One manually-uploaded product image per catalog
+// item, stored as a bytea blob (mirrors quote_images). partner_id denormalized
+// for the partner-axis policy; cascades when the item is deleted.
+export const catalogItemImages = pgTable('catalog_item_images', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  catalogItemId: uuid('catalog_item_id').notNull().references(() => catalogItems.id, { onDelete: 'cascade' }),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  imageData: bytea('image_data').notNull(),
+  mime: varchar('mime', { length: 64 }).notNull(),
+  byteSize: integer('byte_size').notNull(),
+  sha256: char('sha256', { length: 64 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('catalog_item_images_item_uq').on(t.catalogItemId),
+  index('catalog_item_images_partner_idx').on(t.partnerId)
+]);
+
+// Org-axis (RLS shape 1, direct org_id). Per-customer sell-price override in an
+// explicit currency. partner_id is denormalized ONLY for the composite FKs that
+// prove item, org, and override share one partner — the RLS axis stays org_id.
+export const catalogItemOrgPricing = pgTable('catalog_item_org_pricing', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  catalogItemId: uuid('catalog_item_id').notNull().references(() => catalogItems.id, { onDelete: 'cascade' }),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  partnerId: uuid('partner_id').notNull(),
+  currencyCode: char('currency_code', { length: 3 }).notNull().references(() => supportedCurrencies.code),
+  unitPrice: numeric('unit_price', { precision: 12, scale: 2 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('catalog_item_org_pricing_item_org_uq').on(t.catalogItemId, t.orgId),
+  index('catalog_item_org_pricing_org_idx').on(t.orgId),
+  index('catalog_item_org_pricing_partner_idx').on(t.partnerId),
+  foreignKey({
+    columns: [t.catalogItemId, t.partnerId],
+    foreignColumns: [catalogItems.id, catalogItems.partnerId],
+    name: 'catalog_item_org_pricing_item_partner_fk'
+  }).onDelete('cascade'),
+  foreignKey({
+    columns: [t.orgId, t.partnerId],
+    foreignColumns: [organizations.id, organizations.partnerId],
+    name: 'catalog_item_org_pricing_org_partner_fk'
+  })
+]);
+
+// Partner-axis via denormalized partner_id (RLS shape 3, flat policy — avoids the
+// nested-EXISTS bound-param bug; also enforces components share the bundle's partner).
+export const catalogBundleComponents = pgTable('catalog_bundle_components', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  bundleItemId: uuid('bundle_item_id').notNull().references(() => catalogItems.id, { onDelete: 'cascade' }),
+  componentItemId: uuid('component_item_id').notNull().references(() => catalogItems.id, { onDelete: 'restrict' }),
+  quantity: numeric('quantity', { precision: 12, scale: 2 }).notNull().default('1'),
+  showOnInvoice: boolean('show_on_invoice').notNull().default(false),
+  revenueAllocation: numeric('revenue_allocation', { precision: 12, scale: 2 }),
+  // Currency the allocation was authored in (#3775 review #7). Stamped at write
+  // time from the bundle price being edited; an allocation is only USED when
+  // this equals the target currency — otherwise it is unavailable, never
+  // relabelled. Required whenever revenue_allocation is set (CHECK below).
+  allocationCurrency: char('allocation_currency', { length: 3 }).references(() => supportedCurrencies.code),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('catalog_bundle_components_bundle_comp_uq').on(t.bundleItemId, t.componentItemId),
+  index('catalog_bundle_components_partner_idx').on(t.partnerId),
+  check('catalog_bundle_components_allocation_currency_chk', sql`${t.revenueAllocation} IS NULL OR ${t.allocationCurrency} IS NOT NULL`)
+]);
+
+// Partner-axis (RLS shape 3). TD SYNNEX EC Express Price & Availability SOAP
+// connector config for a partner. Secret-bearing values (email, password,
+// customerNo) live encrypted in credentials. No base_url: the endpoint host is
+// server-controlled via a region map.
+export const tdSynnexEcExpressIntegrations = pgTable('td_synnex_ec_express_integrations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  region: varchar('region', { length: 8 }).notNull().default('US'),
+  credentials: jsonb('credentials').notNull().default({}),
+  settings: jsonb('settings').notNull().default({}),
+  enabled: boolean('enabled').notNull().default(false),
+  lastTestStatus: varchar('last_test_status', { length: 30 }),
+  lastTestAt: timestamp('last_test_at'),
+  lastTestError: text('last_test_error'),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('td_synnex_ec_express_partner_uq').on(t.partnerId)
+]);
+
+// Partner-axis (RLS shape 3). Holds TD SYNNEX Digital Bridge catalog API
+// configuration for a partner. Secret-bearing values live in credentials.
+export const tdSynnexDigitalBridgeIntegrations = pgTable('td_synnex_digital_bridge_integrations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  environment: varchar('environment', { length: 20 }).notNull().default('sandbox'),
+  region: varchar('region', { length: 50 }).notNull().default('US'),
+  baseUrl: text('base_url').notNull(),
+  authType: varchar('auth_type', { length: 20 }).notNull().default('api_key'),
+  credentials: jsonb('credentials').notNull().default({}),
+  settings: jsonb('settings').notNull().default({}),
+  enabled: boolean('enabled').notNull().default(false),
+  lastTestStatus: varchar('last_test_status', { length: 30 }),
+  lastTestAt: timestamp('last_test_at'),
+  lastTestError: text('last_test_error'),
+  lastSyncAt: timestamp('last_sync_at'),
+  lastError: text('last_error'),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('td_synnex_digital_bridge_partner_uq').on(t.partnerId),
+  index('td_synnex_digital_bridge_partner_enabled_idx').on(t.partnerId, t.enabled)
+]);
+
+// Partner-axis (RLS shape 3). TD SYNNEX nightly SFTP P&A file connector config.
+// Secret-bearing values (accountNumber, password) live encrypted in credentials.
+// No host column: the SFTP host is server-controlled via a region map, and the
+// username ('u'/'c' + accountNumber) and remote filename (accountNumber + '.zip')
+// are derived, so a partner cannot point this connector at an arbitrary host.
+export const tdSynnexSftpIntegrations = pgTable('td_synnex_sftp_integrations', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  region: varchar('region', { length: 8 }).notNull().default('US'),
+  accountNumber: varchar('account_number', { length: 32 }),
+  credentials: jsonb('credentials').notNull().default({}),
+  settings: jsonb('settings').notNull().default({}),
+  enabled: boolean('enabled').notNull().default(false),
+  lastTestStatus: varchar('last_test_status', { length: 30 }),
+  lastTestAt: timestamp('last_test_at'),
+  lastTestError: text('last_test_error'),
+  lastSyncAt: timestamp('last_sync_at'),
+  lastSyncStatus: varchar('last_sync_status', { length: 20 }),
+  lastSyncError: text('last_sync_error'),
+  lastFileName: text('last_file_name'),
+  lastRowCount: integer('last_row_count'),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('td_synnex_sftp_partner_uq').on(t.partnerId)
+]);
+
+// Partner-axis (RLS shape 3). Price & availability rows ingested from the
+// nightly SFTP flat file, one per (partner, TD SYNNEX SKU).
+export const tdSynnexPriceAvailability = pgTable('td_synnex_price_availability', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  partnerId: uuid('partner_id').notNull().references(() => partners.id),
+  synnexSku: varchar('synnex_sku', { length: 64 }).notNull(),
+  mfgPartNo: varchar('mfg_part_no', { length: 128 }),
+  tdPartNo: varchar('td_part_no', { length: 128 }),
+  name: text('name'),
+  description: text('description'),
+  manufacturer: varchar('manufacturer', { length: 64 }),
+  status: varchar('status', { length: 32 }),
+  // Spec field 40: A=Active, B=Special order, C=EOL, T=To be discontinued.
+  abcCode: varchar('abc_code', { length: 8 }),
+  currency: varchar('currency', { length: 8 }),
+  cost: numeric('cost', { precision: 12, scale: 4 }),
+  costWithoutPromo: numeric('cost_without_promo', { precision: 12, scale: 4 }),
+  msrp: numeric('msrp', { precision: 12, scale: 4 }),
+  mapPrice: numeric('map_price', { precision: 12, scale: 4 }),
+  totalQty: integer('total_qty'),
+  warehouses: jsonb('warehouses').notNull().default([]),
+  weight: numeric('weight', { precision: 10, scale: 3 }),
+  upc: varchar('upc', { length: 32 }),
+  unspsc: varchar('unspsc', { length: 16 }),
+  etaDate: date('eta_date'),
+  raw: jsonb('raw').notNull().default({}),
+  fileDate: date('file_date'),
+  syncedAt: timestamp('synced_at').defaultNow().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (t) => [
+  uniqueIndex('td_synnex_pa_partner_sku_uq').on(t.partnerId, t.synnexSku),
+  index('td_synnex_pa_partner_mfg_idx').on(t.partnerId, t.mfgPartNo),
+  index('td_synnex_pa_partner_synced_idx').on(t.partnerId, t.syncedAt),
+  index('td_synnex_pa_partner_upc_idx').on(t.partnerId, t.upc)
+]);

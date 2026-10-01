@@ -1,0 +1,887 @@
+import { EVENT_SUBSCRIBER_IDS, isSubscriberId, type SubscriberId } from '../services/eventSubscriberIds';
+import { resolveDefaultModel } from '../services/aiModel';
+
+// The single truthy/falsey vocabulary for boolean-ish env vars. Kept as two
+// named sets rather than inline literals so a reader that must distinguish
+// "explicitly off" from "unrecognized" (abuseSignalsEnabled below) can never
+// drift from what envFlag() itself accepts. Matches the boolean typo-guards in
+// config/validate.ts.
+const RECOGNIZED_TRUE_FLAG_VALUES: ReadonlySet<string> = new Set(['1', 'true', 'yes', 'on']);
+const RECOGNIZED_FALSE_FLAG_VALUES: ReadonlySet<string> = new Set(['0', 'false', 'no', 'off']);
+
+export function envFlag(name: string, fallback = false): boolean {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  return RECOGNIZED_TRUE_FLAG_VALUES.has(raw.trim().toLowerCase());
+}
+
+export type RemoteAccessAdmissionMode = 'open' | 'closed';
+export type RemoteWsRuntimeAuthMode = 'post_upgrade' | 'pre_upgrade';
+export type RemoteWsRedisTopology = 'standalone-single-primary';
+
+function requiredEnum<T extends string>(
+  source: NodeJS.ProcessEnv,
+  name: string,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  const raw = source[name]?.trim();
+  const productionLike = (
+    source.NODE_ENV === 'production'
+    || source.DEPLOYMENT_ENV === 'staging'
+  );
+  if (!raw) {
+    if (productionLike) throw new Error(`${name} is required`);
+    return fallback;
+  }
+  if (!allowed.includes(raw as T)) {
+    throw new Error(`${name} must be one of: ${allowed.join(', ')}`);
+  }
+  return raw as T;
+}
+
+export function getRemoteWsRuntimeConfig(
+  source: NodeJS.ProcessEnv = process.env,
+): {
+  admissionMode: RemoteAccessAdmissionMode;
+  authMode: RemoteWsRuntimeAuthMode;
+  redisTopology: RemoteWsRedisTopology;
+  legacyTicketWriterDrainedAt: string | undefined;
+  legacyViewerIssuerDrainedAt: string | undefined;
+} {
+  return {
+    admissionMode: requiredEnum(
+      source,
+      'REMOTE_ACCESS_ADMISSION_MODE',
+      ['open', 'closed'] as const,
+      'open',
+    ),
+    authMode: requiredEnum(
+      source,
+      'REMOTE_WS_AUTH_MODE',
+      ['post_upgrade', 'pre_upgrade'] as const,
+      'post_upgrade',
+    ),
+    redisTopology: requiredEnum(
+      source,
+      'REMOTE_WS_REDIS_TOPOLOGY',
+      ['standalone-single-primary'] as const,
+      'standalone-single-primary',
+    ),
+    legacyTicketWriterDrainedAt:
+      source.REMOTE_WS_LEGACY_TICKET_WRITER_DRAINED_AT?.trim() || undefined,
+    legacyViewerIssuerDrainedAt:
+      source.REMOTE_WS_LEGACY_VIEWER_ISSUER_DRAINED_AT?.trim() || undefined,
+  };
+}
+
+export const MCP_OAUTH_ENABLED = envFlag('MCP_OAUTH_ENABLED');
+
+/** Strictly decode the dedicated partner export cursor HMAC key from base64. */
+export function decodePartnerApiCursorSigningKey(value: string | undefined): Buffer | null {
+  const trimmed = value?.trim();
+  if (!trimmed || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(trimmed)) {
+    return null;
+  }
+  const decoded = Buffer.from(trimmed, 'base64');
+  return decoded.toString('base64') === trimmed ? decoded : null;
+}
+
+export const PARTNER_API_CURSOR_SIGNING_KEY =
+  decodePartnerApiCursorSigningKey(process.env.PARTNER_API_CURSOR_SIGNING_KEY) ?? Buffer.alloc(0);
+
+// Google Workspace identity tools. Defaults OFF everywhere; an org must also
+// have an explicit google_workspace_connections row before any tool is usable.
+// Gates tool registration (aiAgentSdkTools.ts) and the connect routes.
+export const GOOGLE_WORKSPACE_ENABLED = envFlag('GOOGLE_WORKSPACE_ENABLED', false);
+
+// AI operator (spec docs/superpowers/specs/ai-mcp/2026-08-22-ai-agents-program-and-wave1-design.md §5.1).
+// Platform kill switch: false forces every effective agent to enabled=false.
+// Default OFF until the wave-3 runner ships.
+export const AI_AGENTS_ENABLED = envFlag('BREEZE_AI_AGENTS_ENABLED', false);
+
+// Wave 5 Part B (#3827). Sub-flag of BREEZE_AI_AGENTS_ENABLED: gates
+// attemptPolicyDecision (policyDecide.ts) — an agent-originated, supervised-
+// scope action-intent whose operation is in the operator's per-agent
+// actAssets.supervisedActionKeys ⊆ POLICY_DECIDABLE_TIER3 is authorized by
+// policy instead of human fanout. Default OFF (dark-ship): when false,
+// resolvePolicyDecisionState returns 'human_required' exactly as Part A —
+// byte-identical to the merged behavior before this wave (Global
+// Constraints, plan header). Read at CALL time, like isHosted()/breezeRole()
+// above, so a test can flip it per-case without vi.resetModules().
+export function policyDecideEnabled(): boolean {
+  return envFlag('BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED', false);
+}
+
+// SEC-038 W06 (#5537). When on, every remote-desktop start dispatch site
+// refuses an agent that has not declared desktopFenceProtocolVersion=1 (the
+// durable start/terminal generation fence from W04/W05) with 503
+// agent_upgrade_required — the same fail-closed shape as the #5481
+// revocation-lease gate. Default OFF: the release that introduces the gate is
+// a fleet no-op (old agents stay protected by the lease), and the flag is
+// flipped one release later once agents have auto-updated. Read at CALL time
+// so a test can flip it per-case without vi.resetModules().
+export function remoteDesktopFenceRequired(): boolean {
+  return envFlag('REMOTE_DESKTOP_FENCE_REQUIRED', false);
+}
+
+// Caller verification (anti-vishing, #6354). W01 ships the backend dark:
+// every caller-verification route returns 404 `feature_disabled` to an
+// AUTHENTICATED caller (auth runs first, so an anonymous request still gets
+// 401 — routerAuthGate.contract.test.ts requires that of every mounted route)
+// and the release gate refuses with `feature_disabled` while this is off. The
+// cross-wave contract is deliberately stricter than envFlag(): ONLY the exact
+// string 'true' enables it — '1' / 'yes' / 'on' / 'TRUE' stay off. Read at
+// CALL time so a test can flip it per-case without vi.resetModules().
+export function callerVerificationEnabled(): boolean {
+  return process.env.CALLER_VERIFICATION_ENABLED === 'true';
+}
+
+// #4442 W04 (AI sweeps act mode). A SUB-flag of
+// BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED, not a replacement for it: the sweep
+// lane widens autonomy to targets the run never established for itself (a
+// sweep proposal is fanned out per DEVICE from one device-less run), so it has
+// to be revocable on its own — turning it off must not disarm the
+// alert-triggered policy-decide lane that has been running independently.
+// Both flags are required for a sweep-minted intent to reach policy-decide.
+// Default OFF: with this false, resolvePolicyDecisionState returns
+// 'human_required' for every scoped intent without evaluating anything else,
+// which is byte-identical to the behaviour before this wave (see
+// policyDecide.sweepFlagOff.test.ts, the regression control for exactly that).
+// Read at CALL time, like policyDecideEnabled above, so a test can flip it
+// per case without vi.resetModules().
+// Task A7 (tool-catalog W1, spec docs/superpowers/plans/ai-mcp/2026-09-07-tool-catalog-w1-tool-sources-mcp.md).
+// Platform kill switch for the tool-catalog / tool-sources feature. Default
+// OFF (dark-ship). Read at CALL time, like policyDecideEnabled() above, so a
+// test can flip it per-case without vi.resetModules().
+export function toolSourcesEnabled(): boolean {
+  return envFlag('TOOL_SOURCES_ENABLED', false);
+}
+
+// Topology rollout deployment kill switch. Partner and organization flags are
+// still resolved for ordinary rollouts; setting this optional switch forces
+// every effective topology feature off. Read at call time so rollback does not
+// require a module reload and tests can change it per case.
+export function topologyGloballyDisabled(): boolean {
+  return envFlag('TOPOLOGY_DISABLED', false);
+}
+
+// Task A7. Sub-flag of toolSourcesEnabled(): whether a tool source's outbound
+// fetch may target a private/loopback/link-local address. Default OFF, and
+// refused outright on the hosted platform (validate.ts superRefine) — a
+// tool source that can reach a partner's internal network from a shared
+// hosted egress path is an SSRF vector, so this is self-hosted-only.
+export function toolSourcesAllowPrivateEgress(): boolean {
+  return envFlag('TOOL_SOURCES_ALLOW_PRIVATE_EGRESS', false);
+}
+
+export function sweepActEnabled(): boolean {
+  return envFlag('BREEZE_AI_AGENTS_SWEEP_ACT_ENABLED', false);
+}
+
+export type BreezeRegion = 'eu' | 'us';
+
+// Deployment region. Hosted regions are single-region deployments (one API +
+// worker per region), so the process knows its own region from env and every
+// org it serves lives in it. Used to pick the artifact blob bucket and, later,
+// the sandbox region (spec §8 "Residency"). Previously read inline by
+// routes/mcpServer.ts for partner-trust bootstrap; that reader now calls this.
+// Unrecognised values resolve to 'us' here; config/validate.ts refuses them at
+// boot so a typo cannot reach production.
+export function breezeRegion(): BreezeRegion {
+  const raw = (process.env.BREEZE_REGION ?? '').trim().toLowerCase();
+  return raw === 'eu' ? 'eu' : 'us';
+}
+
+/**
+ * AI script authoring, review, and reviewer-gated execution (spec
+ * 2026-09-11-ai-script-authoring-and-review-design.md §8).
+ *
+ * W01b shipped this dark. W03 (#5612) turns it ON by default: the human loop,
+ * the review card and the verification job are all in place, so a proposal can
+ * no longer reach a device without a human reading a truthful summary of it.
+ * W05 removes the flag. Call-time, not a module const: the flag is read per
+ * tool-registration and per run_script call, and tests flip it without
+ * vi.resetModules(). The compose template's `:-true` default must agree.
+ */
+export function aiScriptAuthoringEnabled(): boolean {
+  return envFlag('BREEZE_AI_SCRIPT_AUTHORING_ENABLED', true);
+}
+
+// W02 (#5612): the script-proposal reviewer's PLATFORM DEFAULT model.
+// `resolveReviewerModel(orgId)` in services/scriptProposals/reviewer.ts
+// reads the effective `ai_script_policies.reviewer_model` (org override, else
+// partner — W04) first and falls back to this constant. Unset ⇒ the platform
+// default model (which itself honours ANTHROPIC_MODEL for self-hosted
+// gateways, #1412).
+export const AI_SCRIPT_REVIEWER_MODEL =
+  process.env.BREEZE_AI_SCRIPT_REVIEWER_MODEL?.trim() || resolveDefaultModel();
+
+// AI Operator durable tasks (#5205 W06, spec §11.2 "Feature controls").
+//
+// Two INDEPENDENT flags, both default OFF, both read at CALL time so a test
+// (and an operator) can flip one without a module reload:
+//
+//  - `AI_OPERATOR_TASKS_ENABLED` gates task ADMISSION and continuation-run
+//    admission. It does NOT gate the reconciler: spec §11.2 is explicit that
+//    turning admission off must still let late results land and in-flight
+//    effects settle, otherwise disabling the feature would strand every live
+//    task with an unobserved external side effect. "Off" means "start nothing
+//    new", never "stop watching what already happened".
+//  - `AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED` gates the one recipe, per
+//    spec §13's "each recipe ships behind its own flag". Task infrastructure
+//    and each executable recipe are separately controlled on purpose.
+//
+// The pre-existing AI kill switches (`AI_AGENTS_ENABLED` and the DB kill
+// switch) remain OVERRIDING gates above both of these — they fence admission
+// AND dispatch claims, and they too leave the reconciler running.
+export function aiOperatorTasksEnabled(): boolean {
+  return envFlag('AI_OPERATOR_TASKS_ENABLED', false);
+}
+
+export function aiOperatorServiceRecoveryEnabled(): boolean {
+  return envFlag('AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED', false);
+}
+
+/**
+ * AI execution-plane workspaces (spec §8 "Hosted only", §2.2 D-I).
+ *
+ * THREE conditions, all read at CALL time so a test can flip one without
+ * vi.resetModules(): the deployment is hosted, the AI agents platform switch is
+ * on, and this sub-flag is on. Default OFF.
+ *
+ * Hosted-only is not squeamishness: the sandbox runs on a third-party vendor
+ * under LanternOps' own account and billing, so a self-hosted deployment
+ * enabling it would be spending our money in our tenant. config/validate.ts
+ * refuses the flag in production without IS_HOSTED=true, a `vercel` backend and
+ * all three Vercel credentials, so a misconfigured deploy fails at boot rather
+ * than at the first analysis run.
+ */
+export function aiWorkspaceEnabled(): boolean {
+  return (
+    isHosted()
+    && envFlag('BREEZE_AI_AGENTS_ENABLED', false)
+    && envFlag('BREEZE_AI_WORKSPACE_ENABLED', false)
+  );
+}
+
+// Microsoft 365 identity tools. Defaults OFF everywhere; an org must also have
+// an explicit m365_connections row before any tool is usable. Gates tool
+// registration (aiAgentSdkTools.ts) and the connect routes.
+export const M365_ENABLED = envFlag('M365_ENABLED', false);
+
+// New customer Graph-read consent initiation is dark by default and rolled out
+// independently per organization. Read at call time so disabling initiation
+// does not require module reloads and does not gate existing connection flows.
+export function m365CustomerGraphReadOnboardingEnabled(): boolean {
+  return envFlag('M365_CUSTOMER_GRAPH_READ_ONBOARDING_ENABLED', false);
+}
+
+// New customer Graph-actions consent initiation is dark by default and rolled
+// out independently per organization. Read at call time so disabling
+// initiation does not require module reloads and does not gate existing
+// connection flows.
+export function m365CustomerGraphActionsOnboardingEnabled(): boolean {
+  return envFlag('M365_CUSTOMER_GRAPH_ACTIONS_ONBOARDING_ENABLED', false);
+}
+
+// Microsoft 365 tenant sync (spec §10). Dark by default and boot-validated.
+// Read at CALL time, never as a module-scope const: the ticker registration in
+// jobs/m365SyncWorker.ts removes its repeat entry when this is off, so an
+// operator flipping the flag and restarting must actually stop the scheduler.
+export function isM365TenantSyncEnabled(): boolean {
+  return envFlag('M365_TENANT_SYNC_ENABLED', false);
+}
+
+/**
+ * Positive-integer env knob with a hard clamp. A knob is a capacity dial an
+ * operator turns under load; an unparseable or out-of-range value must land on
+ * a safe number rather than NaN (which would make `depth > NaN` false and
+ * disable backpressure entirely).
+ */
+function positiveIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (!raw || !/^\d+$/.test(raw.trim())) return fallback;
+  const parsed = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(Math.max(parsed, min), max);
+}
+
+/** Per-API-instance `sync-domain` concurrency (spec §5.3). */
+export function m365SyncConcurrency(): number {
+  return positiveIntEnv('M365_SYNC_CONCURRENCY', 4, 1, 64);
+}
+
+/** Ticker backpressure ceiling on waiting+prioritized+delayed+active (spec §5.2 step 1). */
+export function m365SyncMaxBacklog(): number {
+  return positiveIntEnv('M365_SYNC_MAX_BACKLOG', 500, 1, 100_000);
+}
+
+/** Rows claimed per tick (spec §5.2 step 3, §5.9 — this is the capacity dial). */
+export function m365SyncTickBatch(): number {
+  return positiveIntEnv('M365_SYNC_TICK_BATCH', 200, 1, 5_000);
+}
+
+// Inbound email-to-ticket flood protection. The global BullMQ inbound-queue
+// processing ceiling (jobs per second) is backpressure: it bounds the RATE of
+// ticket creation across all senders, NOT the total. Over-rate jobs are delayed
+// (never dropped) and still processed, so a sustained flood is slowed, not
+// capped. (Per-sender/domain/partner sliding-window caps were considered but
+// deferred: no implementation can be both exact and avoid a held-transaction
+// Redis call under #1105; the rate ceiling here is the protection that ships.)
+/** Global BullMQ inbound-queue processing ceiling (jobs per second). */
+export function inboundQueueMaxPerSec(): number {
+  return positiveIntEnv('INBOUND_QUEUE_MAX_PER_SEC', 20, 1, 5_000);
+}
+
+// Breeze AI for Office (Excel add-in / client AI). The Entra application
+// (client) ID of the multi-tenant add-in app registration. Empty = the whole
+// /client-ai surface is dark (exchange and admin routes return 404), mirroring
+// the M365_ENABLED gating style.
+export const CLIENT_AI_ENTRA_CLIENT_ID = process.env.CLIENT_AI_ENTRA_CLIENT_ID?.trim() ?? '';
+
+export const QBO_CLIENT_ID = process.env.QBO_CLIENT_ID?.trim() ?? '';
+export const QBO_CLIENT_SECRET = process.env.QBO_CLIENT_SECRET?.trim() ?? '';
+export const QBO_REDIRECT_URI = process.env.QBO_REDIRECT_URI?.trim() ?? '';
+export const QBO_ENVIRONMENT = process.env.QBO_ENVIRONMENT?.trim() ?? '';
+// Intuit's shared-secret used to verify inbound CDC webhook signatures
+// (Phase D). '' when unset — a region without the Intuit webhook configured
+// relies entirely on the 15-minute reconcile sweep instead.
+export const QBO_WEBHOOK_VERIFIER_TOKEN = process.env.QBO_WEBHOOK_VERIFIER_TOKEN?.trim() ?? '';
+
+// Read at call time so tests can flip `IS_HOSTED` per-test without `vi.resetModules()`.
+export function isHosted(): boolean {
+  return envFlag('IS_HOSTED');
+}
+
+export type IpClassifyProvider = 'ipinfo' | 'ipdata' | 'none';
+
+let warnedAboutIpClassifyConfig = false;
+
+/**
+ * Optional IP-classification provider configuration. Invalid or incomplete
+ * configuration deliberately degrades to the offline classifier: trust
+ * classification must never prevent API boot or block a request.
+ */
+export function ipClassifyProvider(
+  source: NodeJS.ProcessEnv = process.env,
+): IpClassifyProvider {
+  const raw = (source.IP_CLASSIFY_PROVIDER ?? '').trim().toLowerCase();
+  const key = (source.IP_CLASSIFY_API_KEY ?? '').trim();
+
+  if (raw === '' || raw === 'none') return 'none';
+  if (raw !== 'ipinfo' && raw !== 'ipdata') {
+    if (!warnedAboutIpClassifyConfig) {
+      warnedAboutIpClassifyConfig = true;
+      console.warn(`[IPClassify] Unknown provider ${JSON.stringify(raw)}; using offline fallback`);
+    }
+    return 'none';
+  }
+  if (!key) {
+    if (!warnedAboutIpClassifyConfig) {
+      warnedAboutIpClassifyConfig = true;
+      console.warn(`[IPClassify] ${raw} is configured without IP_CLASSIFY_API_KEY; using offline fallback`);
+    }
+    return 'none';
+  }
+  return raw;
+}
+
+export function ipClassifyApiKey(source: NodeJS.ProcessEnv = process.env): string {
+  return (source.IP_CLASSIFY_API_KEY ?? '').trim();
+}
+
+// Signup-abuse detection (services/abuseSignals) is a HOSTED-operator concern:
+// it exists to police untrusted public signups on a multi-tenant service. A
+// self-hosted install is normally one IT team managing its own machines, where
+// the same heuristics are mostly noise or actively wrong —
+// `invariant.active_no_payment` (services/abuseSignals/invariants.ts: every
+// `status='active'` partner with a NULL `payment_method_attached_at`) fires on
+// every partner forever, because self-host has no billing writer at all: the
+// partner is created `active` directly at email verification (`status:
+// rec.hostedExpectation ? 'pending' : 'active'` in routes/auth/verifyEmail.ts)
+// and nothing on a self-hosted deployment ever stamps that column.
+// `rmm.device_ip_scatter` just describes remote workers, and the fleet-shape
+// detectors flag an ordinary lab of unnamed test VMs.
+//
+// (Deliberately NOT phrased as "payment_method_attached_at is only written by
+// X" — an unqualified claim of exactly that shape about this column was proven
+// false in production and is now retracted at length in
+// services/partnerActivation.ts. The column additionally has an in-repo writer,
+// routes/internal/synthetic.ts. The self-host argument above needs neither
+// claim: no writer runs there at all.)
+//
+// So it defaults to `isHosted()` rather than being on for everyone. Note this
+// keys off the TRUTHY reading of IS_HOSTED, not the affirmative-self-host
+// helper below: the failure that matters here is a hosted deployment silently
+// NOT policing its signups, so an unset/garbage IS_HOSTED leaves detection off
+// entirely rather than half-configured. Be aware that "off" is quiet: the only
+// artifact is one `[AbuseSignals] Disabled` line at boot from
+// jobs/abuseSignalsSweep.ts — no alert, no /health field — so an operator who
+// expected detection has to go read the startup logs to discover it isn't
+// running. That is the opposite polarity from selfHostAllowsPrivateNetwork,
+// which fails closed toward *strictness* because there the risk runs the other
+// way.
+//
+// ABUSE_SIGNALS_ENABLED overrides in both directions, so a self-hoster running
+// a genuine multi-tenant service can opt in, and a hosted deployment can switch
+// the subsystem off without a redeploy. Only the RECOGNIZED vocabularies count:
+// an unrecognized value (`ture`, `enabled`) falls through to the IS_HOSTED
+// default with a warning rather than reading as "off", because the previous
+// `envFlag`-based override turned a hosted deployment's detection OFF on any
+// typo — precisely the silent-non-policing failure this comment says the
+// default exists to avoid. config/validate.ts refuses boot on such a value, so
+// the fallback here is only reachable in a process that skipped the validator.
+// Empty stays "unset" on purpose: both compose files inject the key as
+// `${ABUSE_SIGNALS_ENABLED:-}`, so "" is what the majority of stacks pass.
+export function abuseSignalsEnabled(): boolean {
+  const raw = (process.env.ABUSE_SIGNALS_ENABLED ?? '').trim();
+  if (raw === '') return isHosted();
+  const normalized = raw.toLowerCase();
+  if (RECOGNIZED_TRUE_FLAG_VALUES.has(normalized)) return true;
+  if (RECOGNIZED_FALSE_FLAG_VALUES.has(normalized)) return false;
+  console.warn(
+    `[AbuseSignals] Ignoring unrecognized ABUSE_SIGNALS_ENABLED value ${JSON.stringify(raw)} ` +
+      '— expected true/false, 1/0, yes/no or on/off. Falling back to the IS_HOSTED default.',
+  );
+  return isHosted();
+}
+
+// True ONLY for an affirmative opt-out: ABUSE_SIGNALS_ENABLED explicitly set to
+// a recognized falsey value. Unset / empty / unrecognized / truthy all return
+// false, so this is strictly narrower than `!abuseSignalsEnabled()` — the
+// default-off self-host path and the typo path are both excluded.
+//
+// Exists so a caller can distinguish "the operator turned this off" from
+// "detection merely isn't running here" before taking an action that is
+// destructive or otherwise not safe to perform on the ambiguous default (the
+// abuse queue's Redis teardown, jobs/abuseSignalsSweep.ts). Intentionally
+// unused inside this module.
+export function abuseSignalsExplicitlyDisabled(): boolean {
+  return RECOGNIZED_FALSE_FLAG_VALUES.has(
+    (process.env.ABUSE_SIGNALS_ENABLED ?? '').trim().toLowerCase(),
+  );
+}
+
+export type EventDispatchMode = 'off' | 'shadow' | 'enforce';
+
+/** Wave 3.5c (#4085). off = today's in-process delivery only. shadow = mirror
+ * routing plans into receipts, execute nothing via the queue. enforce = the
+ * subscribers listed in EVENT_DISPATCH_QUEUE_SUBSCRIBERS deliver via BullMQ
+ * ONLY (skipped locally); everyone else stays local. Unrecognized values fall
+ * back to 'off' with a warning — a typo must never silently change delivery. */
+export function eventDispatchMode(): EventDispatchMode {
+  const raw = (process.env.EVENT_DISPATCH_MODE ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'off') return 'off';
+  if (raw === 'shadow' || raw === 'enforce') return raw;
+  console.warn(`[config] EVENT_DISPATCH_MODE="${raw}" is not off|shadow|enforce — treating as off`);
+  return 'off';
+}
+
+export function eventDispatchQueueSubscribers(): ReadonlySet<SubscriberId> {
+  const raw = (process.env.EVENT_DISPATCH_QUEUE_SUBSCRIBERS ?? '').trim();
+  const out = new Set<SubscriberId>();
+  if (raw === '') return out;
+  for (const part of raw.split(',').map((p) => p.trim()).filter(Boolean)) {
+    if (isSubscriberId(part)) out.add(part);
+    else console.warn(`[config] EVENT_DISPATCH_QUEUE_SUBSCRIBERS contains unknown id "${part}" (known: ${EVENT_SUBSCRIBER_IDS.join(', ')}) — ignoring`);
+  }
+  return out;
+}
+
+export type BreezeRole = 'all' | 'api' | 'worker';
+
+/**
+ * Process role for the 3.5d split (#4086). `all` (default) = today's
+ * all-in-one process. Introduced in 3.5b (#4084) so socket-local dispatch can
+ * fail LOUDLY in a worker-role process instead of silently reporting every
+ * agent offline.
+ */
+export function breezeRole(): BreezeRole {
+  const raw = (process.env.BREEZE_ROLE ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'all') return 'all';
+  if (raw === 'api' || raw === 'worker') return raw;
+  console.warn(`[config] BREEZE_ROLE="${raw}" is not all|api|worker — treating as all`);
+  return 'all';
+}
+
+// Recognizes an AFFIRMATIVE self-host declaration: IS_HOSTED explicitly set to
+// a recognized falsey signal ('false'/'0'/'no'/'off'). Unset / empty / garbage /
+// truthy all return false, so security-weakening, self-host-only features stay
+// CLOSED unless self-host is positively declared. This is the #570 hardening
+// lesson — an unmapped IS_HOSTED (value in .env but not threaded through compose)
+// must never silently weaken security. Pure (takes the raw value) so callers
+// reading a `source`/`data` object rather than process.env can reuse it.
+// Mirrors the fail-closed gate in services/dnsProviders/index.ts.
+export function isRecognizedSelfHostSignal(raw: string | undefined): boolean {
+  return RECOGNIZED_FALSE_FLAG_VALUES.has((raw ?? '').trim().toLowerCase());
+}
+
+// Gate for "may this deployment reach RFC1918/ULA (and plain-HTTP) targets over
+// safeFetch?" for the internal-OIDC/SSO discovery path (issue #2293). The DNS-
+// provider (services/dnsProviders/index.ts) and PSA (services/psa/http.ts)
+// integrations currently carry their own equivalent IS_HOSTED-affirmative gates
+// — consolidating all three onto this helper is a worthwhile follow-up, but as
+// of now this function is called only by the SSO routes. Opens ONLY when
+// self-host is AFFIRMATIVELY declared; unset/empty/garbage/truthy IS_HOSTED
+// stays strict (#570 fail-closed lesson). Loopback, link-local, cloud metadata,
+// and CGNAT remain blocked in BOTH modes at the safeFetch/urlSafety layer
+// regardless. `!isHosted()` is implied by the falsey-set membership but kept
+// explicit so the truthy/falsey vocabularies can never drift apart silently.
+export function selfHostAllowsPrivateNetwork(): boolean {
+  return isRecognizedSelfHostSignal(process.env.IS_HOSTED) && !isHosted();
+}
+
+// Public URL of the breeze-billing payment-setup landing page. Empty on
+// self-host. Consumed by the OAuth consent redirect (see Phase 2 Task 2.1
+// of docs/superpowers/plans/onboarding-signup/2026-04-29-mcp-bootstrap-cleanup.md) — the
+// consent handler redirects users to BILLING_URL?uid=<UID> when their
+// partner.status != 'active'. Distinct from BREEZE_BILLING_URL, which is
+// the internal service-to-service base URL used by breezeBillingClient.ts.
+export const BILLING_URL = process.env.BILLING_URL ?? '';
+
+// DCR (Dynamic Client Registration) defaults OFF in all environments.
+// Production deployments must explicitly opt in by setting OAUTH_DCR_ENABLED=true,
+// AND must then choose an anti-spam posture (boot-refused otherwise — see
+// config/validate.ts), EITHER:
+//   - OAUTH_DCR_REQUIRE_IAT=true  → every POST /oauth/reg needs an initial-
+//     access-token issued out-of-band. Closes the public-spam vector, but is
+//     INCOMPATIBLE with public MCP clients (Claude Desktop / claude.ai) that
+//     register via anonymous RFC 7591 DCR and have no way to supply an IAT.
+//   - OAUTH_DCR_ALLOW_ANONYMOUS=true → deliberately permit anonymous DCR. This
+//     is the required posture for a public MCP server: anonymous DCR is the
+//     only registration path Claude's connector can use. Residual spam risk is
+//     bounded by the compensating controls already on /oauth/reg — per-IP rate
+//     limiting (oauth.ts), forced public clients (token_endpoint_auth_method
+//     'none'), mandatory PKCE S256, software_id rejection, and the daily GC of
+//     stale unused clients (jobs/oauthCleanup.ts).
+// Setting both is allowed (IAT wins at the provider); setting neither with DCR
+// enabled is a boot-refused misconfig so an accidental deploy can't open an
+// ungated registration endpoint.
+export const OAUTH_DCR_ENABLED = envFlag('OAUTH_DCR_ENABLED', false);
+export const OAUTH_DCR_REQUIRE_IAT = envFlag('OAUTH_DCR_REQUIRE_IAT', false);
+export const OAUTH_DCR_ALLOW_ANONYMOUS = envFlag('OAUTH_DCR_ALLOW_ANONYMOUS', false);
+export const OAUTH_ISSUER = process.env.OAUTH_ISSUER ?? '';
+export const OAUTH_RESOURCE_URL = process.env.OAUTH_RESOURCE_URL ?? '';
+
+export interface OAuthAuthEpochDeadlineOptions {
+  oauthEnabled: boolean;
+  nodeEnv: string | undefined;
+}
+
+export function parseOAuthAuthEpochEnforceAfter(
+  raw: string | undefined,
+  options: OAuthAuthEpochDeadlineOptions,
+): Date | null {
+  const value = raw?.trim() ?? '';
+  const strictEnvironment = options.nodeEnv === 'production' || options.nodeEnv === 'staging';
+  if (!value) {
+    if (options.oauthEnabled && strictEnvironment) {
+      throw new Error(
+        'OAUTH_AUTH_EPOCH_ENFORCE_AFTER is required when MCP OAuth is enabled in production or staging',
+      );
+    }
+    return null;
+  }
+
+  // Require a complete timestamp and an explicit UTC/offset suffix. A local
+  // timestamp would move the compatibility boundary with host timezone.
+  const absoluteIso =
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/u;
+  const timestamp = Date.parse(value);
+  if (!absoluteIso.test(value) || !Number.isFinite(timestamp)) {
+    throw new Error('OAUTH_AUTH_EPOCH_ENFORCE_AFTER must be a valid absolute ISO timestamp');
+  }
+  return new Date(timestamp);
+}
+
+// Import-time resolution must never THROW, for two reasons:
+//   1. config/validate.ts imports this module. A module-scope throw here runs
+//      before the boot validator can collect and report every misconfigured
+//      key, replacing an actionable aggregated message with a bare import
+//      stack trace — and skipping the rest of the checks entirely.
+//   2. env.ts is imported by jobs, seeds, scripts and unrelated test suites
+//      that merely want one unrelated constant. Any of them running with
+//      NODE_ENV=production would die on import even though they never touch
+//      OAuth or event sockets.
+// The authoritative "required in production" and "must be a valid absolute
+// ISO timestamp" refusals therefore live in config/validate.ts, which runs
+// first in bootstrap(). The fallback below is only reachable in a process that
+// bypassed that validator, so it takes the CLOSED value: a deadline already in
+// the past rejects every claimless legacy access token.
+function resolveOAuthAuthEpochEnforceAfterAtImport(): Date | null {
+  try {
+    return parseOAuthAuthEpochEnforceAfter(process.env.OAUTH_AUTH_EPOCH_ENFORCE_AFTER, {
+      oauthEnabled: MCP_OAUTH_ENABLED,
+      nodeEnv: process.env.NODE_ENV,
+    });
+  } catch {
+    return new Date(0);
+  }
+}
+
+export const OAUTH_AUTH_EPOCH_ENFORCE_AFTER = resolveOAuthAuthEpochEnforceAfterAtImport();
+
+export type EventPermissionEpochMode = 'compat' | 'enforce';
+
+export function parseEventPermissionEpochMode(
+  raw: string | undefined,
+  nodeEnv: string | undefined,
+): EventPermissionEpochMode {
+  const value = raw?.trim().toLowerCase();
+  const strictEnvironment = nodeEnv === 'production' || nodeEnv === 'staging';
+  if (!value) {
+    if (strictEnvironment) {
+      throw new Error(
+        'EVENT_PERMISSION_EPOCH_MODE is required in production and staging',
+      );
+    }
+    return 'compat';
+  }
+  if (value !== 'compat' && value !== 'enforce') {
+    throw new Error('EVENT_PERMISSION_EPOCH_MODE must be compat or enforce');
+  }
+  return value;
+}
+
+// Non-throwing at import for the same reasons as the OAuth deadline above;
+// config/validate.ts owns the boot refusal. The fallback is the CLOSED mode:
+// `enforce` rejects tickets that carry no permissions epoch, whereas `compat`
+// still accepts version-one tickets.
+function resolveEventPermissionEpochModeAtImport(): EventPermissionEpochMode {
+  try {
+    return parseEventPermissionEpochMode(
+      process.env.EVENT_PERMISSION_EPOCH_MODE,
+      process.env.NODE_ENV,
+    );
+  } catch {
+    return 'enforce';
+  }
+}
+
+export const EVENT_PERMISSION_EPOCH_MODE = resolveEventPermissionEpochModeAtImport();
+
+// Optional override for the consent UI base. Defaults to '' (relative path)
+// — in prod the API and web share the same origin behind Caddy, so a
+// relative redirect works. In local dev where API and web run on different
+// ports, set this to e.g. http://localhost:4321 so the browser navigates
+// to the web origin instead of the API origin.
+export const OAUTH_CONSENT_URL_BASE = process.env.OAUTH_CONSENT_URL_BASE ?? '';
+export const OAUTH_JWKS_PRIVATE_JWK = process.env.OAUTH_JWKS_PRIVATE_JWK ?? '';
+export const OAUTH_JWKS_PUBLIC_JWK = process.env.OAUTH_JWKS_PUBLIC_JWK ?? '';
+export const OAUTH_COOKIE_SECRET = process.env.OAUTH_COOKIE_SECRET ?? '';
+
+// Kill-switch for the role-level MFA gate (Task 8 of the launch-readiness
+// sprint). Defaults OFF for this release (#4491): the reconcile migration
+// (2026-10-11-170000-partner-admin-force-mfa-reconcile.sql) flips
+// force_mfa on every EXISTING Partner Admin role, and enforcing on upgrade
+// with no warning would lock those admins into enrolment unexpectedly.
+// Enforcement returns to default ON once the notification-period feature
+// (#5306 — grace window, banner, deadline before force_mfa takes effect)
+// ships. Set MFA_FORCE_FOR_PARTNER_ADMIN=true to opt in and enforce now.
+// Read at call time so tests and runtime overrides don't need module
+// re-evaluation.
+export function mfaForcePartnerAdmin(): boolean {
+  return envFlag('MFA_FORCE_FOR_PARTNER_ADMIN', false);
+}
+
+/**
+ * #1374 — when true (the DEFAULT), an L4 (critical-tier) approval requires the
+ * approver device's `platform_bound_basis` to be in
+ * `L4_TRUSTED_PLATFORM_BOUND_BASES` (services/authenticatorAssurance.ts), not
+ * merely `is_platform_bound = true`.
+ *
+ * DEFAULT TRUE, deliberately: pre-#1374 mobile registrations forced
+ * is_platform_bound = true with NO attestation of any kind, so leaving this off
+ * leaves a critical-tier bypass open. Set to `false` ONLY as a break-glass
+ * revert — it re-opens that bypass for every legacy mobile key, and the
+ * `breeze_authenticator_l4_basis_total{outcome="would_deny"}` series is what
+ * makes the resulting blast radius visible.
+ *
+ * Read at CALL time (like mfaForcePartnerAdmin / policyDecideEnabled above) so
+ * ops can flip it without a code change and tests need no module reload.
+ *
+ * Unlike a plain `envFlag(name, true)` this distinguishes "explicitly off" from
+ * "unrecognized" — same treatment as abuseSignalsEnabled() — because on a
+ * default-TRUE security gate, `envFlag`'s "anything not in the true-vocabulary
+ * is false" rule would let a typo (`=flase`) silently DISABLE enforcement.
+ * config/validate.ts additionally refuses boot on such a value.
+ */
+export function authenticatorAttestationEnforced(): boolean {
+  const raw = (process.env.BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED ?? '').trim();
+  if (raw === '') return true;
+  const normalized = raw.toLowerCase();
+  if (RECOGNIZED_TRUE_FLAG_VALUES.has(normalized)) return true;
+  if (RECOGNIZED_FALSE_FLAG_VALUES.has(normalized)) return false;
+  console.warn(
+    `[Authenticator] Ignoring unrecognized BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED value ${JSON.stringify(raw)} ` +
+      '— expected true/false, 1/0, yes/no or on/off. Keeping L4 attestation enforcement ON.',
+  );
+  return true;
+}
+
+/**
+ * Apple App Attest configuration (#1374 W03).
+ *
+ * `appId` is Apple's "<TeamID>.<bundle id>" form and is hashed into the
+ * attestation's rpIdHash, so a wrong value here rejects every genuine
+ * attestation rather than accepting a foreign one — fail-closed either way.
+ * Default matches the committed identifiers (apps/mobile/eas.json team
+ * D8W6N2JYMA, apps/mobile/app.json bundle com.breeze.rmm).
+ */
+export const APPLE_APP_ATTEST_APP_ID =
+  process.env.APPLE_APP_ATTEST_APP_ID?.trim() || 'D8W6N2JYMA.com.breeze.rmm';
+
+/**
+ * Which App Attest environment's aaguid sentinel is accepted.
+ *
+ * DEFAULTS TO `production`, and only the exact string `development` opts out.
+ * A typo, an empty value, or a missing variable must NOT silently accept
+ * development attestations: those come from any developer-signed build of the
+ * app, which would hand an attacker the very L4 basis this wave exists to
+ * protect. Read at call time so ops can flip it without a rebuild and tests
+ * need no module reload.
+ *
+ * Unlike a plain equality test this WARNS on an unrecognized value — same
+ * treatment as authenticatorAttestationEnforced() above, and for the same
+ * reason. The failure mode is asymmetric and nasty: a typo (`Development`,
+ * `dev`, a trailing space) resolves to production, and then EVERY genuine
+ * attestation from a development build fails check 8 forever, fleet-wide, in a
+ * way that is indistinguishable request-by-request from a forged blob. Failing
+ * safe is right; failing safe *silently* is what makes a misconfiguration take
+ * weeks to find. It stays a warning rather than a boot refusal because the
+ * wrong value can only ever reject, never admit.
+ */
+export function appleAppAttestEnvironment(): 'production' | 'development' {
+  const raw = process.env.APPLE_APP_ATTEST_ENVIRONMENT?.trim() ?? '';
+  if (raw === 'development') return 'development';
+  if (raw !== '' && raw !== 'production') {
+    console.warn(
+      `[Authenticator] Ignoring unrecognized APPLE_APP_ATTEST_ENVIRONMENT value ${JSON.stringify(raw)} ` +
+        '— expected exactly "production" or "development". Treating it as production, which will reject ' +
+        'every development-build App Attest attestation.',
+    );
+  }
+  return 'production';
+}
+
+// Delegant service configuration for M365 helpdesk agent capability.
+// Delegant is a sibling service that manages AI-agent identity and governance.
+export const DELEGANT_BASE_URL = process.env.DELEGANT_BASE_URL ?? '';
+export const DELEGANT_SERVICE_TOKEN = process.env.DELEGANT_SERVICE_TOKEN ?? '';
+export const DELEGANT_PRINCIPAL_SIGNING_KEY = process.env.DELEGANT_PRINCIPAL_SIGNING_KEY ?? '';
+export const DELEGANT_PRINCIPAL_KID = process.env.DELEGANT_PRINCIPAL_KID ?? '';
+
+// Cloudflare Access JWT trust on /auth/login (Discussion #702). Read at call
+// time so tests can flip per-test without resetting modules.
+export function cfAccessTrustEnabled(): boolean {
+  return envFlag('CF_ACCESS_TRUST_ENABLED');
+}
+
+const CF_ACCESS_TEAM_DOMAIN_PATTERN =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$/;
+
+/** Accept only the canonical bare hostname Cloudflare assigns to one team. */
+export function canonicalCfAccessTeamDomain(raw: string): string | null {
+  if (!raw || raw !== raw.trim() || !CF_ACCESS_TEAM_DOMAIN_PATTERN.test(raw)) return null;
+  try {
+    const parsed = new URL(`https://${raw}`);
+    if (
+      parsed.username
+      || parsed.password
+      || parsed.port
+      || parsed.pathname !== '/'
+      || parsed.search
+      || parsed.hash
+      || parsed.hostname !== raw
+    ) return null;
+    return parsed.hostname;
+  } catch {
+    return null;
+  }
+}
+
+export function cfAccessTeamDomain(): string {
+  return canonicalCfAccessTeamDomain(process.env.CF_ACCESS_TEAM_DOMAIN ?? '') ?? '';
+}
+export function cfAccessAud(): string {
+  return (process.env.CF_ACCESS_AUD ?? '').trim();
+}
+export function cfAccessTrustsMfa(): boolean {
+  return envFlag('CF_ACCESS_TRUSTS_MFA');
+}
+
+// Browser authentication transition enforcement is unconditional. Terminal
+// logout preparation remains independently staged until every supported
+// client has adopted that separate completion protocol.
+export function authBrowserTerminalPreparationEnabled(): boolean {
+  return envFlag('AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED', false);
+}
+
+// Emergency kill switches for ML/AI producers. These are intentionally read at
+// call time so ops can flip process/runtime env and workers can stop writing
+// outputs without a redeploy.
+export function mlFeaturesGloballyDisabled(): boolean {
+  return (
+    envFlag('ML_FEATURES_DISABLED') ||
+    envFlag('ML_OUTPUTS_DISABLED') ||
+    envFlag('ML_GLOBAL_KILL_SWITCH')
+  );
+}
+
+function mlFlagEnvNames(flag: string): string[] {
+  const normalized = flag
+    .replace(/^ml\./, '')
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toUpperCase();
+  const disabledName = `ML_${normalized}_DISABLED`;
+  const names = [disabledName];
+  if (disabledName.endsWith('_ENABLED_DISABLED')) {
+    names.push(disabledName.replace(/_ENABLED_DISABLED$/, '_DISABLED'));
+  }
+  return names;
+}
+
+function isFlagListed(raw: string | undefined, flag: string): boolean {
+  if (!raw) return false;
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .some((entry) => {
+      if (entry === flag || entry === '*' || entry === 'ml.*') return true;
+      if (entry.endsWith('.*')) return flag.startsWith(entry.slice(0, -1));
+      return false;
+    });
+}
+
+export function mlFeatureGloballyDisabled(flag: string): boolean {
+  if (mlFeaturesGloballyDisabled()) return true;
+  if (isFlagListed(process.env.ML_DISABLED_FLAGS, flag)) return true;
+  return mlFlagEnvNames(flag).some((name) => envFlag(name));
+}
+
+export type StripeSessionRevocationMode = 'enforce' | 'observe';
+
+/**
+ * Enforcement gate for fail-closed Checkout-session revocation (SEC-150).
+ *
+ * `enforce` (default): a transition that could not prove every open Checkout
+ * session for the invoice is non-payable is REFUSED (503
+ * STRIPE_REVOCATION_PENDING); the durable intent stays and the sweep retries.
+ * `observe`: the intent is still written and Stripe is still called, but a
+ * failure never blocks the transition — the de-escalation lever for an incident.
+ *
+ * Rollback is a flip to `observe`, never a migration revert: code that ignores
+ * `revocation_requested` re-opens the finding and strands the intent rows.
+ * An unrecognized value falls back to `enforce` with a warning — a typo must
+ * never silently unlock the fail-open path.
+ */
+export function stripeSessionRevocationMode(): StripeSessionRevocationMode {
+  const raw = (process.env.STRIPE_SESSION_REVOCATION_MODE ?? '').trim().toLowerCase();
+  if (raw === '' || raw === 'enforce') return 'enforce';
+  if (raw === 'observe') return 'observe';
+  console.warn(`[config] STRIPE_SESSION_REVOCATION_MODE="${raw}" is not enforce|observe — treating as enforce`);
+  return 'enforce';
+}

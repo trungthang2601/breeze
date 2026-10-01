@@ -1,0 +1,787 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('./invoiceService', () => ({
+  listInvoices: vi.fn().mockResolvedValue([]),
+  getInvoice: vi.fn().mockResolvedValue({ invoice: { id: 'inv-1' }, lines: [] }),
+  createManualInvoice: vi.fn().mockResolvedValue({ id: 'inv-1', status: 'draft' }),
+  addManualLine: vi.fn().mockResolvedValue({ id: 'line-1' }),
+  addCatalogLine: vi.fn().mockResolvedValue({ id: 'line-1' }),
+  addBundleLine: vi.fn().mockResolvedValue({ id: 'line-1' }),
+  addContractLine: vi.fn().mockResolvedValue({ id: 'line-1' }),
+  updateLine: vi.fn().mockResolvedValue({ id: 'inv-1', status: 'draft' }),
+  removeLine: vi.fn().mockResolvedValue({ id: 'inv-1', status: 'draft' }),
+  updateInvoice: vi.fn().mockResolvedValue({ id: 'inv-1', status: 'draft' }),
+  deleteDraftInvoice: vi.fn().mockResolvedValue(undefined),
+  assembleDraftFromOrg: vi.fn().mockResolvedValue({ invoice: { id: 'inv-1' }, lines: [] }),
+  assembleDraftFromTicket: vi.fn().mockResolvedValue({ invoice: { id: 'inv-1' }, lines: [] }),
+  issueInvoice: vi.fn().mockResolvedValue({ id: 'inv-1', status: 'sent', invoiceNumber: 'INV-100' }),
+  recordPayment: vi.fn().mockResolvedValue({ invoice: { id: 'inv-1', status: 'paid' } }),
+  voidPayment: vi.fn().mockResolvedValue({ invoice: { id: 'inv-1', status: 'sent' } }),
+  voidInvoice: vi.fn().mockResolvedValue({ invoice: { id: 'inv-1', status: 'void' }, lines: [] }),
+  lockContractLineMaterializationSource: vi.fn().mockResolvedValue({
+    invoice: { id: 'inv-1', orgId: 'org-1' },
+    contract: { id: 'contract-1', orgId: 'org-1' },
+  }),
+}));
+
+vi.mock('./invoiceCheckout', () => ({
+  createInvoicePayLink: vi.fn().mockResolvedValue({ url: 'https://pay.example.test/inv-1' }),
+}));
+
+vi.mock('./contractService', () => ({
+  getContract: vi.fn().mockResolvedValue({ contract: { id: 'contract-1' }, lines: [], periods: [] }),
+  computeContractEstimate: vi.fn().mockResolvedValue({ lines: [] }),
+  materializeContractLineOntoInvoice: vi.fn().mockResolvedValue({
+    baseLine: { id: 'line-1' }, overageLine: null, overage: null, pricedFrom: 'contract_snapshot',
+  }),
+}));
+
+vi.mock('./permissions', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./permissions')>()),
+  getUserPermissions: vi.fn(),
+}));
+
+import { registerBillingTools } from './aiToolsBilling';
+import { getUserPermissions } from './permissions';
+import * as invoiceService from './invoiceService';
+import * as contractService from './contractService';
+import type { AiTool } from './aiTools';
+import { InvoiceServiceError } from './invoiceTypes';
+
+const auth = {
+  user: { id: 'u-1' },
+  partnerId: 'p-1',
+  accessibleOrgIds: ['org-1'],
+  scope: 'partner',
+} as any;
+
+/** The same caller under an ORG-scoped principal (a client-portal-ish session). */
+const orgScopedAuth = { ...auth, scope: 'organization' } as any;
+const selectedSiteAuth = { ...auth, allowedSiteIds: ['site-visible'] } as any;
+const nullSiteClosureAuth = { ...auth, allowedSiteIds: null } as any;
+const systemAuth = { ...auth, scope: 'system', partnerId: null, accessibleOrgIds: null } as any;
+
+const actor = { userId: 'u-1', partnerId: 'p-1', accessibleOrgIds: ['org-1'] };
+// Evidence the actor carries once resolved from the caller's REAL permissions.
+const contractActor = { ...actor, permissions: new Set(['contracts:read']) };
+/** A resolved permission set granting contracts:read (the happy path). */
+const contractReaderPerms = {
+  permissions: [{ resource: 'contracts', action: 'read' }],
+  partnerId: 'p-1', orgId: null, roleId: 'role-1', scope: 'partner',
+} as never;
+const now = new Date('2026-07-01T00:00:00.000Z');
+
+function contractRow(id = 'contract-1'): Awaited<ReturnType<typeof contractService.getContract>>['contract'] {
+  return {
+    id,
+    partnerId: 'p-1',
+    orgId: 'org-1',
+    name: 'Managed services',
+    status: 'active',
+    billingTiming: 'advance',
+    intervalMonths: 1,
+    startDate: '2026-07-01',
+    endDate: null,
+    nextBillingAt: null,
+    autoIssue: false,
+    autoRenew: false,
+    renewalTermMonths: null,
+    renewalNoticeDays: null,
+    currencyCode: 'USD',
+    notes: null,
+    terms: null,
+    createdBy: 'u-1',
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function contractLineRow(
+  patch: Partial<Awaited<ReturnType<typeof contractService.getContract>>['lines'][number]>
+): Awaited<ReturnType<typeof contractService.getContract>>['lines'][number] {
+  return {
+    id: 'contract-line-1',
+    contractId: 'contract-1',
+    orgId: 'org-1',
+    lineType: 'per_device',
+    description: 'Managed endpoint coverage',
+    catalogItemId: null,
+    unitPrice: '12.50',
+    manualQuantity: null,
+    siteId: null,
+    siteName: null,
+    site: null,
+    deviceRoles: null,
+    deviceGroupId: null,
+    deviceGroupName: null,
+    deviceGroup: null,
+    includedQuantity: null,
+    overageMode: null,
+    overageUnitPrice: null,
+    taxable: true,
+    sortOrder: 0,
+    createdAt: now,
+    ...patch,
+  };
+}
+
+function getTool(): AiTool {
+  const map = new Map<string, AiTool>();
+  registerBillingTools(map);
+  const t = map.get('manage_invoices');
+  if (!t) throw new Error('manage_invoices not registered');
+  return t;
+}
+
+function getReadTool(name: 'get_invoice' | 'list_invoices'): AiTool {
+  const map = new Map<string, AiTool>();
+  registerBillingTools(map);
+  const t = map.get(name);
+  if (!t) throw new Error(`${name} not registered`);
+  return t;
+}
+
+describe('manage_invoices', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getUserPermissions).mockResolvedValue(contractReaderPerms);
+  });
+
+  it('documents invoice-currency money inputs and non-blocking pay-link currency warnings', () => {
+    const tool = getTool();
+    const properties = tool.definition.input_schema.properties as Record<string, { description?: string }>;
+
+    expect(properties.currencyCode?.description).toContain('currencyCode');
+    expect(properties.action?.description).toContain('CURRENCY_DIFFERS_FROM_STRIPE_ACCOUNT');
+    expect(properties.action?.description).toMatch(/relay.*to the user/i);
+    expect(properties.action?.description).toContain('does not block');
+    expect(properties.payment?.description).toContain("invoice's currencyCode");
+  });
+
+  it('create_draft calls createManualInvoice with an actor built from auth', async () => {
+    const out = await getTool().handler({ action: 'create_draft', orgId: 'org-1' }, auth);
+
+    expect(invoiceService.createManualInvoice).toHaveBeenCalledWith(
+      { orgId: 'org-1', siteId: undefined, notes: undefined, termsAndConditions: undefined },
+      { userId: 'u-1', partnerId: 'p-1', accessibleOrgIds: ['org-1'] },
+    );
+    expect(JSON.parse(out)).toMatchObject({ id: 'inv-1', status: 'draft' });
+  });
+
+  it('assemble_from_org forwards the currencyCode override and surfaces blockedByCurrency (#3776)', async () => {
+    vi.mocked(invoiceService.assembleDraftFromOrg).mockResolvedValueOnce({
+      invoice: { id: 'inv-1', currencyCode: 'EUR' }, lines: [], stripeConnected: false,
+      blockedByCurrency: [{ currencyCode: 'USD', count: 2, amount: '40.00' }],
+    } as any);
+    const out = await getTool().handler(
+      { action: 'assemble_from_org', orgId: 'org-1', from: '2026-06-01', to: '2026-06-30', currencyCode: 'EUR' }, auth);
+    expect(invoiceService.assembleDraftFromOrg).toHaveBeenCalledWith(
+      { orgId: 'org-1', siteId: undefined, from: '2026-06-01', to: '2026-06-30', currencyCode: 'EUR' }, actor);
+    expect(JSON.parse(out).blockedByCurrency).toEqual([{ currencyCode: 'USD', count: 2, amount: '40.00' }]);
+  });
+
+  it('assemble_from_ticket forwards the currencyCode override as opts (#3776)', async () => {
+    await getTool().handler({ action: 'assemble_from_ticket', ticketId: 't-1', currencyCode: 'EUR' }, auth);
+    expect(invoiceService.assembleDraftFromTicket).toHaveBeenCalledWith('t-1', actor, { currencyCode: 'EUR' });
+    await getTool().handler({ action: 'assemble_from_ticket', ticketId: 't-1' }, auth);
+    expect(invoiceService.assembleDraftFromTicket).toHaveBeenLastCalledWith('t-1', actor, { currencyCode: undefined });
+  });
+
+  it('add_contract_line denies a caller without contracts:read at the ACTOR level', async () => {
+    // The caller holds invoices:write (they reached the handler) but not
+    // contracts:read. The ContractActor is fail-closed BY CONSTRUCTION, so the
+    // evidence set must come from a REAL resolution — this used to be
+    // hard-coded to `new Set(['contracts:read'])`, which forged exactly the
+    // permission the contract service was relying on the actor to prove.
+    vi.mocked(getUserPermissions).mockResolvedValue({
+      permissions: [{ resource: 'invoices', action: 'write' }],
+      partnerId: 'p-1', orgId: null, roleId: 'role-1', scope: 'partner',
+    } as never);
+
+    const out = await getTool().handler(
+      { action: 'add_contract_line', invoiceId: 'inv-1', contractId: 'contract-1', contractLineId: 'contract-line-1' },
+      auth,
+    );
+
+    expect(JSON.parse(out)).toEqual({
+      error: 'Adding a contract line requires the contracts:read permission',
+      code: 'CONTRACTS_READ_REQUIRED',
+    });
+    // Denied BEFORE any lock, read or materialization.
+    expect(invoiceService.lockContractLineMaterializationSource).not.toHaveBeenCalled();
+    expect(contractService.getContract).not.toHaveBeenCalled();
+    expect(contractService.materializeContractLineOntoInvoice).not.toHaveBeenCalled();
+  });
+
+  it('add_contract_line passes REAL resolved permission evidence to the contract service', async () => {
+    vi.mocked(getUserPermissions).mockResolvedValue({
+      permissions: [
+        { resource: 'contracts', action: 'read' },
+        { resource: 'contracts', action: 'write' },
+      ],
+      partnerId: 'p-1', orgId: null, roleId: 'role-1', scope: 'partner',
+    } as never);
+
+    await getTool().handler(
+      { action: 'add_contract_line', invoiceId: 'inv-1', contractId: 'contract-1', contractLineId: 'contract-line-1' },
+      auth,
+    );
+
+    expect(getUserPermissions).toHaveBeenCalledWith('u-1', expect.objectContaining({ partnerId: 'p-1' }), { bypassCache: true });
+    // contracts:manage was NOT granted, so it must not appear in the evidence.
+    const passedActor = vi.mocked(contractService.getContract).mock.calls[0]?.[1];
+    expect(passedActor?.permissions?.has('contracts:read')).toBe(true);
+    expect(passedActor?.permissions?.has('contracts:write')).toBe(true);
+    expect(passedActor?.permissions?.has('contracts:manage')).toBe(false);
+  });
+
+  it('add_contract_line resolves authoritative contract line values before materializing it', async () => {
+    vi.mocked(contractService.getContract).mockResolvedValueOnce({
+      contract: contractRow(),
+      lines: [
+        contractLineRow({
+          id: 'contract-line-1',
+          description: 'Managed endpoint coverage',
+          unitPrice: '12.50',
+          taxable: true,
+          catalogItemId: 'catalog-1',
+        }),
+      ],
+      periods: [],
+    });
+    const capturedDevices = [
+      { id: 'd1', hostname: 'one', role: 'server', siteId: null },
+      { id: 'd2', hostname: 'two', role: 'server', siteId: null },
+      { id: 'd3', hostname: 'three', role: 'server', siteId: null },
+    ];
+    vi.mocked(contractService.computeContractEstimate).mockImplementationOnce(async (_id, _actor, evidence) => {
+      evidence!.set('contract-line-1', capturedDevices);
+      return {
+      currencyCode: 'USD',
+      periodTotal: '37.50',
+      lines: [{ lineId: 'contract-line-1', lineType: 'per_device', quantity: 3, value: '37.50', live: true, counted: 3, included: null, overage: 0, overageMode: null, overageValue: '0.00' }],
+      uncoveredDevices: null,
+      overages: [],
+      };
+    });
+
+    const out = await getTool().handler(
+      {
+        action: 'add_contract_line',
+        invoiceId: 'inv-1',
+        contractId: 'contract-1',
+        contractLineId: 'contract-line-1',
+        line: {
+          description: 'AI supplied value must be ignored',
+          quantity: 999,
+          unitPrice: 1,
+          taxable: false,
+        },
+      },
+      auth,
+    );
+
+    expect(contractService.getContract).toHaveBeenCalledWith('contract-1', contractActor);
+    expect(contractService.computeContractEstimate).toHaveBeenCalledWith('contract-1', contractActor, expect.any(Map));
+    expect(contractService.materializeContractLineOntoInvoice).toHaveBeenCalledWith(actor, {
+      invoiceId: 'inv-1',
+      contract: expect.objectContaining({ id: 'contract-1', currencyCode: 'USD' }),
+      line: expect.objectContaining({ id: 'contract-line-1', catalogItemId: 'catalog-1' }),
+      resolved: { counted: 3, billed: 3, included: null, overage: 0, overageMode: null },
+      deviceEvidence: capturedDevices,
+      currencyCode: 'USD',
+    });
+    expect(invoiceService.addContractLine).not.toHaveBeenCalled();
+    expect(JSON.parse(out)).toEqual({ line: { id: 'line-1' }, pricedFrom: 'contract_snapshot', overages: [] });
+  });
+
+  it('add_contract_line preserves an unrestricted system producer', async () => {
+    const line = contractLineRow({ lineType: 'flat', manualQuantity: '1.00' });
+    vi.mocked(contractService.getContract).mockResolvedValueOnce({
+      contract: contractRow(), lines: [line], periods: [],
+    });
+    vi.mocked(contractService.computeContractEstimate).mockResolvedValueOnce({
+      currencyCode: 'USD', periodTotal: '12.50',
+      lines: [{ lineId: line.id, lineType: 'flat', quantity: 1, value: '12.50', live: false, counted: 1, included: null, overage: 0, overageMode: null, overageValue: '0.00' }],
+      uncoveredDevices: null, overages: [],
+    });
+
+    const out = JSON.parse(await getTool().handler({
+      action: 'add_contract_line', invoiceId: 'inv-1', contractId: 'contract-1', contractLineId: line.id,
+    }, systemAuth));
+
+    const systemActor = { userId: 'u-1', partnerId: null, accessibleOrgIds: null };
+    expect(invoiceService.lockContractLineMaterializationSource).toHaveBeenCalledWith('inv-1', 'contract-1', systemActor);
+    expect(contractService.getContract).toHaveBeenCalledWith('contract-1', {
+      ...systemActor, permissions: new Set(['contracts:read']),
+    });
+    expect(out.line).toEqual({ id: 'line-1' });
+  });
+
+  it.each([
+    ['organization scope', orgScopedAuth, 'PARTNER_SCOPE_REQUIRED'],
+    ['selected-site scope', selectedSiteAuth, 'FULL_PARTNER_SCOPE_REQUIRED'],
+    ['malformed null site closure', nullSiteClosureAuth, 'FULL_PARTNER_SCOPE_REQUIRED'],
+  ])('add_contract_line denies %s before any contract or invoice effect', async (_label, deniedAuth, code) => {
+    const out = JSON.parse(await getTool().handler({
+      action: 'add_contract_line',
+      invoiceId: 'inv-1',
+      contractId: 'contract-1',
+      contractLineId: 'contract-line-1',
+    }, deniedAuth));
+
+    expect(out).toMatchObject({ code });
+    expect(invoiceService.lockContractLineMaterializationSource).not.toHaveBeenCalled();
+    expect(contractService.getContract).not.toHaveBeenCalled();
+    expect(contractService.computeContractEstimate).not.toHaveBeenCalled();
+    expect(contractService.materializeContractLineOntoInvoice).not.toHaveBeenCalled();
+  });
+
+  it('add_contract_line stops when the composite invoice/source lock rejects cross-organization input', async () => {
+    vi.mocked(invoiceService.lockContractLineMaterializationSource).mockRejectedValueOnce(
+      new InvoiceServiceError('Contract line is not available for this invoice', 404, 'INVALID_STATE'),
+    );
+
+    const out = JSON.parse(await getTool().handler({
+      action: 'add_contract_line',
+      invoiceId: 'inv-1',
+      contractId: 'contract-2',
+      contractLineId: 'contract-line-2',
+    }, auth));
+
+    expect(out).toMatchObject({ code: 'INVALID_STATE' });
+    expect(invoiceService.lockContractLineMaterializationSource).toHaveBeenCalledTimes(1);
+    expect(contractService.getContract).not.toHaveBeenCalled();
+    expect(contractService.computeContractEstimate).not.toHaveBeenCalled();
+    expect(contractService.materializeContractLineOntoInvoice).not.toHaveBeenCalled();
+  });
+
+  it('add_contract_line locks invoice then contract and materializes the allowance line re-read under those locks', async () => {
+    const rereadLine = contractLineRow({
+      includedQuantity: '30.00', overageMode: 'bill', overageUnitPrice: '15.00',
+    });
+    vi.mocked(contractService.getContract).mockResolvedValueOnce({
+      contract: contractRow(), lines: [rereadLine], periods: [],
+    });
+    vi.mocked(contractService.computeContractEstimate).mockResolvedValueOnce({
+      currencyCode: 'USD', periodTotal: '390.00',
+      lines: [{ lineId: rereadLine.id, lineType: 'per_device', quantity: 30, value: '375.00', live: true, counted: 31, included: 30, overage: 1, overageMode: 'bill', overageValue: '15.00' }],
+      uncoveredDevices: null, overages: [],
+    });
+
+    await getTool().handler({
+      action: 'add_contract_line', invoiceId: 'inv-1', contractId: 'contract-1', contractLineId: rereadLine.id,
+    }, auth);
+
+    expect(invoiceService.lockContractLineMaterializationSource).toHaveBeenCalledWith('inv-1', 'contract-1', actor);
+    expect(vi.mocked(invoiceService.lockContractLineMaterializationSource).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(contractService.getContract).mock.invocationCallOrder[0]!,
+    );
+    expect(contractService.materializeContractLineOntoInvoice).toHaveBeenCalledWith(actor, expect.objectContaining({
+      line: expect.objectContaining({ includedQuantity: '30.00', overageUnitPrice: '15.00' }),
+      resolved: { counted: 31, billed: 30, included: 30, overage: 1, overageMode: 'bill' },
+    }));
+  });
+
+  it('add_contract_line materializes bill overage and reports its invoice line id', async () => {
+    const line = contractLineRow({ includedQuantity: '25.00', overageMode: 'bill', overageUnitPrice: '12.00' });
+    vi.mocked(contractService.getContract).mockResolvedValueOnce({ contract: contractRow(), lines: [line], periods: [] });
+    vi.mocked(contractService.computeContractEstimate).mockResolvedValueOnce({
+      currencyCode: 'USD', periodTotal: '262.00',
+      lines: [{ lineId: line.id, lineType: 'per_device', quantity: 25, value: '250.00', live: true, counted: 26, included: 25, overage: 1, overageMode: 'bill', overageValue: '12.00' }],
+      uncoveredDevices: null,
+      overages: [{ contractLineId: line.id, invoiceLineId: null, description: line.description, counted: 26, included: 25, overage: 1, mode: 'bill' }],
+    });
+    vi.mocked(contractService.materializeContractLineOntoInvoice).mockResolvedValueOnce({
+      baseLine: { id: 'base-line' }, overageLine: { id: 'overage-line' }, pricedFrom: 'contract_snapshot',
+      overage: { contractLineId: line.id, invoiceLineId: 'overage-line', description: line.description, counted: 26, included: 25, overage: 1, mode: 'bill' },
+    } as never);
+
+    const out = JSON.parse(await getTool().handler({
+      action: 'add_contract_line', invoiceId: 'inv-1', contractId: 'contract-1', contractLineId: line.id,
+    }, auth));
+
+    expect(contractService.materializeContractLineOntoInvoice).toHaveBeenCalledTimes(1);
+    expect(out).toEqual({
+      line: { id: 'base-line' }, pricedFrom: 'contract_snapshot',
+      overages: [{ contractLineId: line.id, invoiceLineId: 'overage-line', description: line.description, counted: 26, included: 25, overage: 1, mode: 'bill' }],
+    });
+  });
+
+  it('add_contract_line materializes no sibling for flag overage and reports the flag', async () => {
+    const line = contractLineRow({ includedQuantity: '25.00', overageMode: 'flag', overageUnitPrice: null });
+    vi.mocked(contractService.getContract).mockResolvedValueOnce({ contract: contractRow(), lines: [line], periods: [] });
+    vi.mocked(contractService.computeContractEstimate).mockResolvedValueOnce({
+      currencyCode: 'USD', periodTotal: '250.00',
+      lines: [{ lineId: line.id, lineType: 'per_device', quantity: 25, value: '250.00', live: true, counted: 26, included: 25, overage: 1, overageMode: 'flag', overageValue: '0.00' }],
+      uncoveredDevices: null,
+      overages: [{ contractLineId: line.id, invoiceLineId: null, description: line.description, counted: 26, included: 25, overage: 1, mode: 'flag' }],
+    });
+    vi.mocked(contractService.materializeContractLineOntoInvoice).mockResolvedValueOnce({
+      baseLine: { id: 'base-line' }, overageLine: null, pricedFrom: 'contract_snapshot',
+      overage: { contractLineId: line.id, invoiceLineId: null, description: line.description, counted: 26, included: 25, overage: 1, mode: 'flag' },
+    } as never);
+
+    const out = JSON.parse(await getTool().handler({
+      action: 'add_contract_line', invoiceId: 'inv-1', contractId: 'contract-1', contractLineId: line.id,
+    }, auth));
+
+    expect(contractService.materializeContractLineOntoInvoice).toHaveBeenCalledTimes(1);
+    expect(out.overages).toEqual([expect.objectContaining({ mode: 'flag', invoiceLineId: null })]);
+  });
+
+  it('add_contract_line returns an error when the contract line is not on the scoped contract', async () => {
+    vi.mocked(contractService.getContract).mockResolvedValueOnce({
+      contract: contractRow(),
+      lines: [
+        contractLineRow({
+          id: 'contract-line-1',
+          description: 'Managed endpoint coverage',
+          unitPrice: '12.50',
+          taxable: true,
+          catalogItemId: null,
+        }),
+      ],
+      periods: [],
+    });
+
+    const out = await getTool().handler(
+      {
+        action: 'add_contract_line',
+        invoiceId: 'inv-1',
+        contractId: 'contract-1',
+        contractLineId: 'missing-line',
+      },
+      auth,
+    );
+
+    expect(JSON.parse(out)).toEqual({ error: 'Contract line not found for this contract' });
+    expect(contractService.computeContractEstimate).not.toHaveBeenCalled();
+    expect(invoiceService.addContractLine).not.toHaveBeenCalled();
+  });
+
+  it('issue calls issueInvoice', async () => {
+    await getTool().handler({ action: 'issue', invoiceId: 'inv-1' }, auth);
+
+    expect(invoiceService.issueInvoice).toHaveBeenCalledWith(
+      'inv-1',
+      expect.objectContaining({ userId: 'u-1' }),
+    );
+  });
+
+  it('record_payment calls recordPayment with the payment payload and actor', async () => {
+    // receivedAt is validated against recordPaymentSchema's isoDate (YYYY-MM-DD),
+    // the same shape the POST /invoices/:id/payments route enforces.
+    const payment = {
+      amount: 125,
+      method: 'card',
+      reference: 'ch_123',
+      receivedAt: '2026-07-01',
+    };
+
+    const out = await getTool().handler(
+      { action: 'record_payment', invoiceId: 'inv-1', payment },
+      auth,
+    );
+
+    expect(invoiceService.recordPayment).toHaveBeenCalledWith('inv-1', payment, actor);
+    expect(JSON.parse(out)).toEqual({ invoice: { id: 'inv-1', status: 'paid' } });
+  });
+
+  it('void calls voidInvoice with positional args, reissue option, and actor', async () => {
+    const out = await getTool().handler(
+      { action: 'void', invoiceId: 'inv-1', reason: 'Customer cancellation', reissue: true },
+      auth,
+    );
+
+    expect(invoiceService.voidInvoice).toHaveBeenCalledWith(
+      'inv-1',
+      'Customer cancellation',
+      { reissue: true },
+      actor,
+    );
+    expect(JSON.parse(out)).toEqual({ invoice: { id: 'inv-1', status: 'void' }, lines: [] });
+  });
+
+  it('void_payment calls voidPayment with paymentId and actor', async () => {
+    const out = await getTool().handler({ action: 'void_payment', paymentId: 'pay-1' }, auth);
+
+    expect(invoiceService.voidPayment).toHaveBeenCalledWith('pay-1', actor);
+    expect(JSON.parse(out)).toEqual({ invoice: { id: 'inv-1', status: 'sent' } });
+  });
+
+  it('REFUSES record_payment under an org-scoped principal', async () => {
+    // The payment write reaches accounting_entity_mappings / accounting_connections,
+    // which are PARTNER-axis under RLS: an org-scoped principal sees zero rows
+    // there, so requestPaymentPush would silently no-op and the payment would
+    // never reach QuickBooks with no error anywhere. The HTTP route gates this
+    // with requireScope; the tool layer must too (review wave 2, finding 5).
+    const out = await getTool().handler(
+      {
+        action: 'record_payment',
+        invoiceId: 'inv-1',
+        payment: { amount: 125, method: 'card', receivedAt: '2026-07-01' },
+      },
+      orgScopedAuth,
+    );
+
+    expect(JSON.parse(out)).toMatchObject({ code: 'PARTNER_SCOPE_REQUIRED' });
+    expect(invoiceService.recordPayment).not.toHaveBeenCalled();
+  });
+
+  it('REFUSES void_payment under an org-scoped principal', async () => {
+    const out = await getTool().handler({ action: 'void_payment', paymentId: 'pay-1' }, orgScopedAuth);
+
+    expect(JSON.parse(out)).toMatchObject({ code: 'PARTNER_SCOPE_REQUIRED' });
+    expect(invoiceService.voidPayment).not.toHaveBeenCalled();
+  });
+
+  // SUPERSEDED BY #6110 finding 1. This used to read "still ALLOWS an org-scoped
+  // principal the non-payment actions" — the payment gate was deliberately
+  // narrow. Scope parity with the HTTP door closed that: every route file under
+  // `routes/invoices/` is `requireScope('partner','system')` (invoices.ts:20,
+  // lifecycle.ts:24), so issuing an invoice at org scope was reachable through
+  // the tool and through nothing else.
+  it('refuses an org-scoped principal the non-payment actions too (was: allowed)', async () => {
+    const out = await getTool().handler({ action: 'issue', invoiceId: 'inv-1' }, orgScopedAuth);
+
+    expect(JSON.parse(out)).toMatchObject({ code: 'PARTNER_SCOPE_REQUIRED' });
+    expect(invoiceService.issueInvoice).not.toHaveBeenCalled();
+  });
+
+  it('a PARTNER-scoped principal still gets the non-payment actions', async () => {
+    await getTool().handler({ action: 'issue', invoiceId: 'inv-1' }, auth);
+
+    expect(invoiceService.issueInvoice).toHaveBeenCalled();
+  });
+
+  it('allows both payment actions under a SYSTEM principal', async () => {
+    await getTool().handler({ action: 'void_payment', paymentId: 'pay-1' }, { ...auth, scope: 'system' } as any);
+
+    expect(invoiceService.voidPayment).toHaveBeenCalled();
+  });
+
+  it('returns a JSON error when a service action rejects with InvoiceServiceError', async () => {
+    vi.mocked(invoiceService.recordPayment).mockRejectedValueOnce(
+      new InvoiceServiceError('Payment exceeds balance', 400, 'OVERPAYMENT'),
+    );
+
+    const out = await getTool().handler(
+      {
+        action: 'record_payment',
+        invoiceId: 'inv-1',
+        payment: { amount: 999, method: 'card', receivedAt: '2026-07-01' },
+      },
+      auth,
+    );
+
+    expect(JSON.parse(out)).toEqual({ error: 'Payment exceeds balance', code: 'OVERPAYMENT' });
+  });
+
+  it('preserves InvoiceServiceError.details (ALL_BLOCKED_BY_CURRENCY recovery groups) like the HTTP handler does (#3776 review #6)', async () => {
+    const blockedByCurrency = [{ currencyCode: 'EUR', count: 2, amount: '125.00' }];
+    vi.mocked(invoiceService.assembleDraftFromOrg).mockRejectedValueOnce(
+      new InvoiceServiceError('All unbilled work is in EUR', 409, 'ALL_BLOCKED_BY_CURRENCY', { blockedByCurrency }),
+    );
+
+    const out = await getTool().handler(
+      { action: 'assemble_from_org', orgId: 'org-1', from: '2026-06-01', to: '2026-06-30' },
+      auth,
+    );
+
+    expect(JSON.parse(out)).toEqual({
+      error: 'All unbilled work is in EUR',
+      code: 'ALL_BLOCKED_BY_CURRENCY',
+      details: { blockedByCurrency },
+    });
+  });
+
+  it('omits the details key entirely when the InvoiceServiceError carries none', async () => {
+    vi.mocked(invoiceService.recordPayment).mockRejectedValueOnce(
+      new InvoiceServiceError('Nope', 400, 'OVERPAYMENT'),
+    );
+    const out = await getTool().handler(
+      { action: 'record_payment', invoiceId: 'inv-1', payment: { amount: 1, method: 'card', receivedAt: '2026-07-01' } },
+      auth,
+    );
+    expect(JSON.parse(out)).toEqual({ error: 'Nope', code: 'OVERPAYMENT' });
+    expect('details' in JSON.parse(out)).toBe(false);
+  });
+
+  it('record_payment with an incomplete payload returns a structured VALIDATION_ERROR instead of reaching recordPayment (BUG1 sibling fix)', async () => {
+    const out = await getTool().handler(
+      { action: 'record_payment', invoiceId: 'inv-1', payment: { amount: 999 } },
+      auth,
+    );
+
+    const parsed = JSON.parse(out);
+    expect(parsed.code).toBe('VALIDATION_ERROR');
+    expect(invoiceService.recordPayment).not.toHaveBeenCalled();
+  });
+
+  it('add_manual_line with a missing quantity/unitPrice returns a structured VALIDATION_ERROR (BUG1 sibling fix)', async () => {
+    const out = await getTool().handler(
+      { action: 'add_manual_line', invoiceId: 'inv-1', line: { name: 'Widget', taxable: false } },
+      auth,
+    );
+
+    const parsed = JSON.parse(out);
+    expect(parsed.code).toBe('VALIDATION_ERROR');
+    expect(invoiceService.addManualLine).not.toHaveBeenCalled();
+  });
+
+  it('update_line with an invalid patch field returns a structured VALIDATION_ERROR (BUG1 sibling fix)', async () => {
+    const out = await getTool().handler(
+      { action: 'update_line', invoiceId: 'inv-1', lineId: 'line-1', patch: { quantity: 'not-a-number' } },
+      auth,
+    );
+
+    const parsed = JSON.parse(out);
+    expect(parsed.code).toBe('VALIDATION_ERROR');
+    expect(invoiceService.updateLine).not.toHaveBeenCalled();
+  });
+
+  it('update_header with an invalid patch field returns a structured VALIDATION_ERROR (BUG1 sibling fix)', async () => {
+    const out = await getTool().handler(
+      { action: 'update_header', invoiceId: 'inv-1', patch: { dueDate: 'not-a-date' } },
+      auth,
+    );
+
+    const parsed = JSON.parse(out);
+    expect(parsed.code).toBe('VALIDATION_ERROR');
+    expect(invoiceService.updateInvoice).not.toHaveBeenCalled();
+  });
+
+  it('delete_draft awaits deleteDraftInvoice and returns {"ok":true} instead of the string "undefined" (BUG2 fix)', async () => {
+    const out = await getTool().handler({ action: 'delete_draft', invoiceId: 'inv-1' }, auth);
+
+    expect(invoiceService.deleteDraftInvoice).toHaveBeenCalledWith('inv-1', actor);
+    expect(JSON.parse(out)).toEqual({ ok: true });
+  });
+
+  it('re-throws non-service errors from service actions', async () => {
+    const err = new Error('database unavailable');
+    vi.mocked(invoiceService.voidPayment).mockRejectedValueOnce(err);
+
+    await expect(
+      getTool().handler({ action: 'void_payment', paymentId: 'pay-1' }, auth),
+    ).rejects.toBe(err);
+  });
+
+  it('unknown action returns a JSON error', async () => {
+    const out = await getTool().handler({ action: 'nope' }, auth);
+
+    expect(JSON.parse(out)).toHaveProperty('error');
+  });
+
+  it('issue without invoiceId returns a structured VALIDATION_ERROR instead of coercing "undefined" (#2362 sweep)', async () => {
+    const out = await getTool().handler({ action: 'issue' }, auth);
+
+    const parsed = JSON.parse(out);
+    expect(parsed.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error).toContain('invoiceId');
+    expect(invoiceService.issueInvoice).not.toHaveBeenCalled();
+  });
+
+  it('add_catalog_line without catalogItemId/quantity returns a structured VALIDATION_ERROR (#2362 sweep)', async () => {
+    const out = await getTool().handler({ action: 'add_catalog_line', invoiceId: 'inv-1' }, auth);
+
+    const parsed = JSON.parse(out);
+    expect(parsed.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error).toContain('catalogItemId');
+    expect(parsed.error).toContain('quantity');
+    expect(invoiceService.addCatalogLine).not.toHaveBeenCalled();
+  });
+});
+
+describe('get_invoice / list_invoices deposit fields', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each(['list_invoices', 'get_invoice'] as const)('%s documents per-currency grouping', (name) => {
+    const description = getReadTool(name).definition.description;
+
+    expect(description).toContain('currencyCode');
+    expect(description).toContain('group by currencyCode');
+  });
+
+  it('get_invoice adds depositPaid=true when amountPaid covers depositDue', async () => {
+    vi.mocked(invoiceService.getInvoice).mockResolvedValueOnce({
+      invoice: { id: 'inv-1', depositDue: '100.00', amountPaid: '100.00' },
+      lines: [],
+      stripeConnected: false,
+    } as any);
+
+    const out = await getReadTool('get_invoice').handler({ invoiceId: 'inv-1' }, auth);
+
+    expect(JSON.parse(out).invoice).toMatchObject({ depositDue: '100.00', depositPaid: true });
+  });
+
+  it('get_invoice adds depositPaid=false when amountPaid is short of depositDue', async () => {
+    vi.mocked(invoiceService.getInvoice).mockResolvedValueOnce({
+      invoice: { id: 'inv-1', depositDue: '100.00', amountPaid: '40.00' },
+      lines: [],
+      stripeConnected: false,
+    } as any);
+
+    const out = await getReadTool('get_invoice').handler({ invoiceId: 'inv-1' }, auth);
+
+    expect(JSON.parse(out).invoice).toMatchObject({ depositDue: '100.00', depositPaid: false });
+  });
+
+  it('get_invoice omits depositPaid when no deposit is configured', async () => {
+    vi.mocked(invoiceService.getInvoice).mockResolvedValueOnce({
+      invoice: { id: 'inv-1', depositDue: null, amountPaid: '0.00' },
+      lines: [],
+      stripeConnected: false,
+    } as any);
+
+    const out = await getReadTool('get_invoice').handler({ invoiceId: 'inv-1' }, auth);
+
+    expect(JSON.parse(out).invoice).toEqual({ id: 'inv-1', depositDue: null, amountPaid: '0.00' });
+    expect(JSON.parse(out).invoice).not.toHaveProperty('depositPaid');
+  });
+
+  it('list_invoices adds depositPaid per row using integer-cents comparison', async () => {
+    vi.mocked(invoiceService.listInvoices).mockResolvedValueOnce([
+      { id: 'inv-1', depositDue: '68.20', amountPaid: '68.20' },
+      { id: 'inv-2', depositDue: '100.00', amountPaid: '99.99' },
+      { id: 'inv-3', depositDue: null, amountPaid: '0.00' },
+    ] as any);
+
+    const out = await getReadTool('list_invoices').handler({}, auth);
+    const { invoices } = JSON.parse(out);
+
+    expect(invoices[0]).toMatchObject({ depositPaid: true });
+    expect(invoices[1]).toMatchObject({ depositPaid: false });
+    expect(invoices[2]).not.toHaveProperty('depositPaid');
+  });
+});
+
+/** #6110 finding 1 — every route file under `routes/invoices/` is
+ *  `requireScope('partner','system')` (invoices.ts:20, lifecycle.ts:24,
+ *  payments.ts:12, assembly.ts:17, bulk.ts:11). Before this, only the two
+ *  payment actions of manage_invoices were gated. */
+describe('invoice tools refuse organization scope (#6110 finding 1)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('manage_invoices refuses an org-scoped caller on a NON-payment action too', async () => {
+    const out = await getTool().handler(
+      { action: 'delete_draft', invoiceId: 'inv-1' }, orgScopedAuth,
+    );
+    expect(JSON.parse(out)).toMatchObject({ code: 'PARTNER_SCOPE_REQUIRED' });
+    expect(invoiceService.deleteDraftInvoice).not.toHaveBeenCalled();
+  });
+
+  it.each(['list_invoices', 'get_invoice'] as const)('%s refuses an org-scoped caller', async (name) => {
+    const out = await getReadTool(name).handler({ invoiceId: 'inv-1' }, orgScopedAuth);
+    expect(JSON.parse(out)).toMatchObject({ code: 'PARTNER_SCOPE_REQUIRED' });
+    expect(invoiceService.getInvoice).not.toHaveBeenCalled();
+    expect(invoiceService.listInvoices).not.toHaveBeenCalled();
+  });
+
+  it('still admits a partner-scoped caller', async () => {
+    const out = await getReadTool('get_invoice').handler({ invoiceId: 'inv-1' }, auth);
+    expect(JSON.parse(out)).not.toMatchObject({ code: 'PARTNER_SCOPE_REQUIRED' });
+    expect(invoiceService.getInvoice).toHaveBeenCalled();
+  });
+});

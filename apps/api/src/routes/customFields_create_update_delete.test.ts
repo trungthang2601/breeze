@@ -1,0 +1,734 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+import { customFieldRoutes } from './customFields';
+
+// Valid UUID constants
+const FIELD_ID_1 = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const FIELD_ID_2 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const ORG_ID = '11111111-1111-1111-1111-111111111111';
+const ORG_ID_2 = '22222222-2222-2222-2222-222222222222';
+const PARTNER_ID = '33333333-3333-3333-3333-333333333333';
+
+vi.mock('../services', () => ({}));
+
+vi.mock('../services/auditEvents', () => ({
+  writeRouteAudit: vi.fn()
+}));
+
+vi.mock('../db', () => ({
+  db: {
+    select: vi.fn(),
+    insert: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn()
+  }
+,
+  runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+}));
+
+vi.mock('../db/schema', () => ({
+  customFieldDefinitions: {
+    id: 'id',
+    orgId: 'orgId',
+    partnerId: 'partnerId',
+    name: 'name',
+    fieldKey: 'fieldKey',
+    type: 'type',
+    options: 'options',
+    required: 'required',
+    defaultValue: 'defaultValue',
+    deviceTypes: 'deviceTypes', scriptWrite: 'scriptWrite',
+    createdAt: 'createdAt',
+    updatedAt: 'updatedAt'
+  }
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+      scope: 'organization',
+      orgId: '11111111-1111-1111-1111-111111111111',
+      partnerId: null,
+      accessibleOrgIds: ['11111111-1111-1111-1111-111111111111'],
+      canAccessOrg: (orgId: string) => orgId === '11111111-1111-1111-1111-111111111111'
+    });
+    return next();
+  }),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next())
+}));
+
+import { db } from '../db';
+import { authMiddleware } from '../middleware/auth';
+
+function makeField(overrides: Record<string, unknown> = {}) {
+  return {
+    id: FIELD_ID_1,
+    orgId: ORG_ID,
+    partnerId: null,
+    name: 'Serial Number',
+    fieldKey: 'serial_number',
+    type: 'text',
+    options: null,
+    required: false,
+    defaultValue: null,
+    deviceTypes: null, scriptWrite: false,
+    createdAt: new Date('2026-01-01'),
+    updatedAt: new Date('2026-01-01'),
+    ...overrides
+  };
+}
+
+
+describe('customFields routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+        scope: 'organization',
+        orgId: ORG_ID,
+        partnerId: null,
+        accessibleOrgIds: [ORG_ID],
+        canAccessOrg: (orgId: string) => orgId === ORG_ID
+      });
+      return next();
+    });
+    app = new Hono();
+    app.route('/custom-fields', customFieldRoutes);
+  });
+
+  // ----------------------------------------------------------------
+  // POST / - Create custom field
+  // ----------------------------------------------------------------
+  describe('POST /custom-fields', () => {
+    it('should create a custom field for org-scoped user', async () => {
+      const created = makeField();
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([created])
+        })
+      } as any);
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Serial Number',
+          fieldKey: 'serial_number',
+          type: 'text'
+        })
+      });
+
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.data.id).toBe(FIELD_ID_1);
+      expect(body.data.name).toBe('Serial Number');
+    });
+
+    it('should accept explicit null for options and deviceTypes (#724 regression guard)', async () => {
+      // The web Custom Fields form serializes unused fields as JSON null
+      // rather than omitting them. createCustomFieldSchema must accept
+      // null for options + deviceTypes so non-Dropdown creates (Text,
+      // Number, Boolean, Date) succeed instead of 400'ing with an opaque
+      // Zod error. Regression test for issue #724.
+      const created = makeField();
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([created])
+        })
+      } as any);
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Department',
+          fieldKey: 'department',
+          type: 'text',
+          options: null,
+          deviceTypes: null
+        })
+      });
+
+      expect(res.status).toBe(201);
+    });
+
+    it('should reject when both orgId and partnerId provided', async () => {
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Field',
+          fieldKey: 'field',
+          type: 'text',
+          orgId: ORG_ID,
+          partnerId: PARTNER_ID
+        })
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('either orgId or partnerId');
+    });
+
+    it('should reject when org user has no orgId', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'organization',
+          orgId: null,
+          partnerId: null,
+          accessibleOrgIds: [],
+          canAccessOrg: () => false
+        });
+        return next();
+      });
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Field',
+          fieldKey: 'field',
+          type: 'text'
+        })
+      });
+
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.error).toContain('Organization context required');
+    });
+
+    it('should validate required fields', async () => {
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Field'
+          // missing fieldKey and type
+        })
+      });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('should validate fieldKey format', async () => {
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Field',
+          fieldKey: 'Invalid-Key',
+          type: 'text'
+        })
+      });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('should validate type enum', async () => {
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Field',
+          fieldKey: 'field',
+          type: 'invalid_type'
+        })
+      });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('should allow partner scope to create org-scoped field with valid org access', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'partner',
+          orgId: null,
+          partnerId: PARTNER_ID,
+          accessibleOrgIds: [ORG_ID],
+          canAccessOrg: (orgId: string) => orgId === ORG_ID
+        });
+        return next();
+      });
+
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([makeField({ orgId: ORG_ID, partnerId: null })])
+        })
+      } as any);
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Field',
+          fieldKey: 'field',
+          type: 'text',
+          orgId: ORG_ID
+        })
+      });
+
+      expect(res.status).toBe(201);
+    });
+
+    it('should reject partner creating field for inaccessible org', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-123', email: 'test@example.com', name: 'Test User' },
+          scope: 'partner',
+          orgId: null,
+          partnerId: PARTNER_ID,
+          accessibleOrgIds: [ORG_ID],
+          canAccessOrg: (orgId: string) => orgId === ORG_ID
+        });
+        return next();
+      });
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Field',
+          fieldKey: 'field',
+          type: 'text',
+          orgId: ORG_ID_2
+        })
+      });
+
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.error).toContain('Access to this organization denied');
+    });
+
+    it('should create with deviceTypes', async () => {
+      const created = makeField({ deviceTypes: ['windows', 'macos'] });
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([created])
+        })
+      } as any);
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Field',
+          fieldKey: 'field',
+          type: 'dropdown',
+          deviceTypes: ['windows', 'macos'],
+          options: { choices: ['A', 'B'] }
+        })
+      });
+
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.data.deviceTypes).toEqual(['windows', 'macos']);
+    });
+
+    it('accepts a dropdown created with the shared {label,value} choices shape', async () => {
+      const created = makeField({
+        name: 'Contract Tier',
+        fieldKey: 'contract_tier',
+        type: 'dropdown',
+        options: { choices: [{ label: 'Gold', value: 'gold' }, { label: 'Silver', value: 'silver' }] }
+      });
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([created])
+        })
+      } as any);
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Contract Tier',
+          fieldKey: 'contract_tier',
+          type: 'dropdown',
+          options: { choices: [{ label: 'Gold', value: 'gold' }, { label: 'Silver', value: 'silver' }] }
+        })
+      });
+
+      expect(res.status).toBe(201);
+    });
+
+    it('preserves text minLength/maxLength instead of stripping them', async () => {
+      let inserted: any;
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockImplementation((v: any) => {
+          inserted = v;
+          return { returning: vi.fn().mockResolvedValue([makeField({ name: 'Asset Tag', fieldKey: 'asset_tag', options: v.options })]) };
+        })
+      } as any);
+
+      await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'Asset Tag',
+          fieldKey: 'asset_tag',
+          type: 'text',
+          options: { minLength: 3, maxLength: 32 }
+        })
+      });
+
+      expect(inserted.options).toEqual({ minLength: 3, maxLength: 32 });
+    });
+  });
+
+  // ----------------------------------------------------------------
+  // PATCH /:id - Update custom field
+  // ----------------------------------------------------------------
+  describe('PATCH /custom-fields/:id', () => {
+    it('should update a custom field', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeField()])
+          })
+        })
+      } as any);
+      vi.mocked(db.update).mockReturnValueOnce({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([makeField({ name: 'Updated Name' })])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/custom-fields/${FIELD_ID_1}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Updated Name' })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.name).toBe('Updated Name');
+    });
+
+    it('should return 404 for non-existent field', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/custom-fields/${FIELD_ID_1}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Updated' })
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('should return 403 when user cannot edit field from different org', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeField({ orgId: ORG_ID_2 })])
+          })
+        })
+      } as any);
+
+      // getCustomFieldWithAccess will return null due to org mismatch
+      const res = await app.request(`/custom-fields/${FIELD_ID_1}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Hack' })
+      });
+
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // ----------------------------------------------------------------
+  // DELETE /:id - Delete custom field
+  // ----------------------------------------------------------------
+  describe('scriptWrite (#2698)', () => {
+    /**
+     * These assert what the ROUTE hands the database, not what the mocked
+     * database hands back — a `.returning()` mock would echo any value and
+     * pass vacuously whether or not the route wired the column through.
+     */
+    it('defaults scriptWrite to false on create', async () => {
+      const values = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([makeField()])
+      });
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'RAM slot type', fieldKey: 'ram_slot_type', type: 'text' })
+      });
+
+      expect(res.status).toBe(201);
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({ scriptWrite: false }));
+    });
+
+    it('passes scriptWrite true through to the insert', async () => {
+      const values = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([makeField({ scriptWrite: true })])
+      });
+      vi.mocked(db.insert).mockReturnValueOnce({ values } as any);
+
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'RAM slot type', fieldKey: 'ram_slot_type', type: 'text', scriptWrite: true
+        })
+      });
+
+      expect(res.status).toBe(201);
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({ scriptWrite: true }));
+      expect((await res.json()).data.scriptWrite).toBe(true);
+    });
+
+    it('rejects a non-boolean scriptWrite', async () => {
+      const res = await app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({
+          name: 'RAM slot type', fieldKey: 'ram_slot_type', type: 'text', scriptWrite: 'yes'
+        })
+      });
+      expect(res.status).toBe(400);
+    });
+
+    it('toggles scriptWrite on update', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeField()])
+          })
+        })
+      } as any);
+      const set = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([makeField({ scriptWrite: true })])
+        })
+      });
+      vi.mocked(db.update).mockReturnValueOnce({ set } as any);
+
+      const res = await app.request(`/custom-fields/${FIELD_ID_1}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ scriptWrite: true })
+      });
+
+      expect(res.status).toBe(200);
+      expect(set).toHaveBeenCalledWith(expect.objectContaining({ scriptWrite: true }));
+      expect((await res.json()).data.scriptWrite).toBe(true);
+    });
+
+    it('leaves scriptWrite untouched when the update omits it', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeField()])
+          })
+        })
+      } as any);
+      const set = vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([makeField({ name: 'Renamed' })])
+        })
+      });
+      vi.mocked(db.update).mockReturnValueOnce({ set } as any);
+
+      const res = await app.request(`/custom-fields/${FIELD_ID_1}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'Renamed' })
+      });
+
+      expect(res.status).toBe(200);
+      expect(set).toHaveBeenCalledWith(expect.not.objectContaining({ scriptWrite: expect.anything() }));
+    });
+  });
+
+  describe('DELETE /custom-fields/:id', () => {
+    it('should delete a custom field', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeField()])
+          })
+        })
+      } as any);
+      vi.mocked(db.delete).mockReturnValueOnce({
+        where: vi.fn().mockResolvedValue(undefined)
+      } as any);
+
+      const res = await app.request(`/custom-fields/${FIELD_ID_1}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.id).toBe(FIELD_ID_1);
+    });
+
+    it('should return 404 when deleting non-existent field', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/custom-fields/${FIELD_ID_1}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('should reject deleting field from another org (multi-tenant isolation)', async () => {
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeField({ orgId: ORG_ID_2 })])
+          })
+        })
+      } as any);
+
+      const res = await app.request(`/custom-fields/${FIELD_ID_1}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('should reject invalid UUID param for delete', async () => {
+      const res = await app.request('/custom-fields/not-a-uuid', {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(400);
+    });
+  });
+
+  // ----------------------------------------------------------------
+  // Database-level key conflicts (#3257 W02/W03)
+  // ----------------------------------------------------------------
+  describe('key conflicts surface as 409, not 500', () => {
+    /**
+     * Two database guards on custom_field_definitions can refuse a create, and
+     * BOTH are the caller's own to fix:
+     *
+     *  - P0001 from the anti-shadowing trigger (#3257 W03,
+     *    2026-10-11-141000-custom-field-no-cross-axis-shadowing.sql) — the key
+     *    collides with one on the OTHER ownership axis under this partner.
+     *  - 23505 from W02's per-axis unique indexes — the key already exists on
+     *    THIS axis.
+     *
+     * Before this mapping both fell through to the global error handler as a
+     * bare 500, which tells the operator nothing about a condition whose fix is
+     * one word (rename the key). The errors are raised inside PostgreSQL, so the
+     * only way to reach them from a route unit test is to make the mocked insert
+     * throw the driver's shape.
+     *
+     * These use the DrizzleQueryError shape — SQLSTATE on `.cause`, a generic
+     * "Failed query: …" on the outer `.message` — deliberately. A handler
+     * reading a bare `err.code` would pass a flat-error test and still return
+     * 500 for every real Drizzle-issued insert; `pgErrorCode`/`pgErrorNode` walk
+     * the `.cause` chain, and only this shape proves they are being used.
+     */
+    function drizzleWrapped(code: string, message: string): Error {
+      const driverError = Object.assign(new Error(message), { code, severity: 'ERROR' });
+      return Object.assign(
+        new Error('Failed query: insert into "custom_field_definitions" ...'),
+        { cause: driverError }
+      );
+    }
+
+    function insertRejects(err: Error) {
+      vi.mocked(db.insert).mockReturnValueOnce({
+        values: vi.fn().mockReturnValue({
+          returning: vi.fn().mockRejectedValue(err)
+        })
+      } as any);
+    }
+
+    async function postCreate() {
+      return app.request('/custom-fields', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ name: 'UDF 7', fieldKey: 'udf7', type: 'text' })
+      });
+    }
+
+    it('maps the anti-shadowing P0001 to 409 field-key-shadowed', async () => {
+      insertRejects(drizzleWrapped(
+        'P0001',
+        'custom field key "udf7" already exists as an all-organizations field for this partner'
+      ));
+
+      const res = await postCreate();
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.code).toBe('field-key-shadowed');
+      // The trigger's copy is written for a human and discloses nothing about
+      // the conflicting row beyond the key and the axis, so it is passed
+      // through verbatim rather than replaced with something vaguer.
+      expect(body.error).toContain('udf7');
+      expect(body.error).toContain('all-organizations field for this partner');
+    });
+
+    it('maps a duplicate key 23505 to 409 field-key-duplicate', async () => {
+      insertRejects(drizzleWrapped(
+        '23505',
+        'duplicate key value violates unique constraint "custom_field_definitions_org_key_uq"'
+      ));
+
+      const res = await postCreate();
+
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.code).toBe('field-key-duplicate');
+      expect(body.error).toContain('udf7');
+      // The driver message names the internal index and (in `detail`) the
+      // offending column VALUES. Neither belongs in a client response, so this
+      // path builds its own copy instead of echoing the error.
+      expect(body.error).not.toContain('custom_field_definitions_org_key_uq');
+      expect(body.error).not.toContain('duplicate key value');
+    });
+
+    /**
+     * Anything that is NOT one of the two mapped conditions must keep
+     * propagating. Swallowing unknown SQLSTATEs into a 409 would turn a real
+     * outage — a dead connection, a permission problem — into a message telling
+     * the operator to rename their field.
+     */
+    it('does not swallow an unrelated database error', async () => {
+      insertRejects(drizzleWrapped('08006', 'connection failure'));
+
+      const res = await postCreate();
+
+      expect(res.status).not.toBe(409);
+      expect(res.status).toBeGreaterThanOrEqual(500);
+    });
+  });
+
+});

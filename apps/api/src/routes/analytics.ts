@@ -1,0 +1,2047 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { and, eq, sql, gte, lte, ne, inArray, isNull, or, desc, type SQL } from 'drizzle-orm';
+import { db } from '../db';
+import {
+  analyticsDashboards,
+  dashboardWidgets,
+  capacityPredictions,
+  capacityThresholds,
+  deviceMetrics,
+  mlFeedbackEvents,
+  metricAnomalyCandidates,
+  metricAnomalies,
+  metricAnomalyEpisodes,
+  metricRollups,
+  devices,
+  slaDefinitions as slaDefinitionsTable,
+  slaCompliance as slaComplianceTable
+} from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { writeRouteAudit } from '../services/auditEvents';
+import { captureException } from '../services/sentry';
+import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import { slaDefinitionOutOfScope, slaScopeNarrowed, type SlaTargetShape } from '../services/slaSiteScope';
+import { METRIC_ANOMALY_V1_SHADOW_VERSION } from '../services/metricAnomalies';
+
+export const analyticsRoutes = new Hono();
+const requireAnalyticsRead = requirePermission(
+  PERMISSIONS.DEVICES_READ.resource,
+  PERMISSIONS.DEVICES_READ.action,
+);
+const requireAnalyticsWrite = requirePermission(
+  PERMISSIONS.ORGS_WRITE.resource,
+  PERMISSIONS.ORGS_WRITE.action,
+);
+
+function getPagination(query: { page?: string; limit?: string }) {
+  const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(query.limit ?? '50', 10) || 50));
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+async function ensureOrgAccess(
+  orgId: string,
+  auth: Pick<AuthContext, 'scope' | 'orgId' | 'accessibleOrgIds' | 'canAccessOrg'>
+) {
+  if (auth.scope === 'organization') {
+    return auth.orgId === orgId;
+  }
+
+  if (auth.scope === 'partner') {
+    return auth.canAccessOrg(orgId);
+  }
+
+  // system scope has access to all
+  return true;
+}
+
+async function getOrgIdsForAuth(
+  auth: Pick<AuthContext, 'scope' | 'orgId' | 'accessibleOrgIds'>
+): Promise<string[] | null> {
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) return null;
+    return [auth.orgId];
+  }
+
+  if (auth.scope === 'partner') {
+    return auth.accessibleOrgIds ?? [];
+  }
+
+  // system scope - return null to indicate no filtering needed
+  return null;
+}
+
+// Resolve the device IDs a site-restricted caller may read within their org,
+// narrowed by `permissions.allowedSiteIds`. Returns null when the caller has no
+// site restriction (no narrowing needed). Site is an app-layer concept only —
+// Postgres RLS does NOT defend it — so a site-restricted user must not read
+// per-device metrics / capacity predictions for devices in other sites within
+// the same org. Mirrors browserSecurity.ts `resolveSiteAllowedDeviceIds`.
+async function resolveSiteAllowedDeviceIds(
+  orgId: string,
+  perms: UserPermissions | undefined,
+): Promise<string[] | null> {
+  if (!perms?.allowedSiteIds) return null;
+  const orgDevices = await db
+    .select({ id: devices.id, siteId: devices.siteId })
+    .from(devices)
+    // Ephemeral Quick Support devices live in the hidden 'quick_support' org that
+    // stays inside accessibleOrgIds for RLS, so nothing excludes them for us —
+    // every analytics enumeration in this file has to say so explicitly.
+    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false)));
+  return orgDevices
+    .filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId))
+    .map((d) => d.id);
+}
+
+// `permissions`-shaped caller adapted to the AuthContext shape the shared SLA
+// gate speaks, so routes and the AI tool layer run the SAME implementation
+// (services/slaSiteScope.ts).
+function slaScopeAuthFor(perms: UserPermissions | undefined) {
+  return {
+    allowedSiteIds: perms?.allowedSiteIds,
+    canAccessSite: (siteId: string | null | undefined) =>
+      // `perms` undefined means unrestricted, in which case the gate is never
+      // consulted (`slaScopeNarrowed` is false) — the guard is for the type.
+      !!perms && typeof siteId === 'string' && canAccessSite(perms, siteId),
+  };
+}
+
+/**
+ * Drop SLA definitions whose `target_type`/`target_ids` name sites or devices a
+ * site-restricted caller cannot reach. Site is an app-layer axis only — RLS
+ * does not defend it — and both this route and `query_analytics` filtered on
+ * `org_id` alone, disclosing out-of-scope compliance figures and the target
+ * UUIDs themselves.
+ */
+async function filterSlaDefinitionsForSiteScope<T extends SlaTargetShape>(
+  orgId: string | null | undefined,
+  perms: UserPermissions | undefined,
+  rows: T[],
+): Promise<T[]> {
+  const scopeAuth = slaScopeAuthFor(perms);
+  if (!slaScopeNarrowed(scopeAuth) || rows.length === 0) return rows;
+  const needsDeviceAxis = rows.some((r) => (r.targetType ?? '').toLowerCase() === 'device');
+  // `null` means "not resolved" and DENIES downstream; `[]` means "resolved to
+  // nothing". A narrowed caller with no orgId cannot resolve a device set, so
+  // it must get `[]` rather than `null` collapsing into "unrestricted"
+  // (review #6110). Only `needsDeviceAxis === false` may pass `null`, and then
+  // no row reaches the device branch at all.
+  const allowedDeviceIds = needsDeviceAxis
+    ? (orgId ? (await resolveSiteAllowedDeviceIds(orgId, perms)) ?? [] : [])
+    : null;
+  return rows.filter((r) => !slaDefinitionOutOfScope(scopeAuth, r, allowedDeviceIds));
+}
+
+const timeSeriesQuerySchema = z.object({
+  deviceIds: z.array(z.string().guid()).min(1),
+  metricTypes: z.array(z.string().min(1)).min(1),
+  startTime: z.string().min(1),
+  endTime: z.string().min(1),
+  aggregation: z.enum(['avg', 'min', 'max', 'sum', 'count', 'p95', 'p99']),
+  interval: z.enum(['minute', 'hour', 'day', 'week', 'month']),
+  groupBy: z.array(z.string().min(1)).optional()
+});
+
+const metricColumnMap: Record<string, any> = {
+  cpu_usage: deviceMetrics.cpuPercent,
+  cpu: deviceMetrics.cpuPercent,
+  'CPU Utilization': deviceMetrics.cpuPercent,
+  memory_usage: deviceMetrics.ramPercent,
+  memory: deviceMetrics.ramPercent,
+  ram: deviceMetrics.ramPercent,
+  'Memory Utilization': deviceMetrics.ramPercent,
+  disk_usage: deviceMetrics.diskPercent,
+  disk: deviceMetrics.diskPercent,
+  'Disk Usage': deviceMetrics.diskPercent,
+  network_in: deviceMetrics.networkInBytes,
+  network_out: deviceMetrics.networkOutBytes,
+  'Network Throughput': deviceMetrics.bandwidthInBps,
+  process_count: deviceMetrics.processCount,
+};
+
+function aggregationSql(col: any, agg: string) {
+  switch (agg) {
+    case 'avg': return sql<number>`avg(${col})`;
+    case 'min': return sql<number>`min(${col})`;
+    case 'max': return sql<number>`max(${col})`;
+    case 'sum': return sql<number>`sum(${col})`;
+    case 'count': return sql<number>`count(${col})`;
+    case 'p95': return sql<number>`percentile_cont(0.95) within group (order by ${col})`;
+    case 'p99': return sql<number>`percentile_cont(0.99) within group (order by ${col})`;
+    default: throw new Error(`Unsupported aggregation type: ${agg}`);
+  }
+}
+
+function metricRollupNameForQuery(metricType: string): string | undefined {
+  const normalized = metricType.trim().toLowerCase();
+  if (normalized === 'cpu_usage' || normalized === 'cpu' || normalized === 'cpu utilization') return 'cpu_percent';
+  if (normalized === 'memory_usage' || normalized === 'memory' || normalized === 'ram' || normalized === 'memory utilization') return 'ram_percent';
+  if (normalized === 'ram_used_mb') return 'ram_used_mb';
+  if (normalized === 'disk_usage' || normalized === 'disk' || normalized === 'disk usage') return 'disk_percent';
+  if (normalized === 'disk_used_gb') return 'disk_used_gb';
+  if (normalized === 'network_in' || normalized === 'bandwidth_in') return 'bandwidth_in_bps';
+  if (normalized === 'network_out' || normalized === 'bandwidth_out') return 'bandwidth_out_bps';
+  if (normalized === 'network throughput') return 'bandwidth_in_bps';
+  if (normalized === 'process_count') return 'process_count';
+  return undefined;
+}
+
+function rollupBucketSeconds(interval: string): number | undefined {
+  if (interval === 'hour') return 3600;
+  if (interval === 'day') return 86400;
+  return undefined;
+}
+
+function rollupAggregationSql(agg: string) {
+  switch (agg) {
+    case 'avg':
+      return sql<number>`sum(${metricRollups.avgValue} * ${metricRollups.sampleCount}) / nullif(sum(${metricRollups.sampleCount}), 0)`;
+    case 'min':
+      return sql<number>`min(${metricRollups.minValue})`;
+    case 'max':
+      return sql<number>`max(${metricRollups.maxValue})`;
+    case 'count':
+      return sql<number>`sum(${metricRollups.sampleCount})`;
+    default:
+      return undefined;
+  }
+}
+
+const listDashboardsSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional()
+});
+
+const createDashboardSchema = z.object({
+  orgId: z.string().guid().optional(),
+  name: z.string().min(1).max(255),
+  description: z.string().optional(),
+  layout: z.record(z.string(), z.any()).refine(
+    (val) => JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ).optional().default({})
+});
+
+const updateDashboardSchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  description: z.string().optional(),
+  layout: z.record(z.string(), z.any()).refine(
+    (val) => JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ).optional()
+});
+
+const createWidgetSchema = z.object({
+  name: z.string().min(1).max(255),
+  type: z.string().min(1).max(100),
+  config: z.record(z.string(), z.any()).refine(
+    (val) => JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ).optional().default({}),
+  layout: z.record(z.string(), z.any()).refine(
+    (val) => JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ).optional()
+});
+
+const updateWidgetSchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  type: z.string().min(1).max(100).optional(),
+  config: z.record(z.string(), z.any()).refine(
+    (val) => JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ).optional(),
+  layout: z.record(z.string(), z.any()).refine(
+    (val) => JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ).optional()
+});
+
+function mapWidgetToApi(widget: typeof dashboardWidgets.$inferSelect) {
+  return {
+    id: widget.id,
+    dashboardId: widget.dashboardId,
+    name: widget.title,
+    type: widget.widgetType,
+    config: (widget.dataSource ?? {}) as Record<string, unknown>,
+    layout: (widget.position ?? {}) as Record<string, unknown>,
+    chartType: widget.chartType,
+    visualization: (widget.visualization ?? {}) as Record<string, unknown>,
+    refreshInterval: widget.refreshInterval,
+    createdAt: widget.createdAt,
+    updatedAt: widget.updatedAt
+  };
+}
+
+const capacityQuerySchema = z.object({
+  deviceId: z.string().guid().optional(),
+  metricType: z.string().min(1).optional().default('disk'),
+  range: z.string().optional().default('30d')
+});
+
+const optionalBooleanQuery = z.preprocess((value) => {
+  if (value === undefined) return undefined;
+  if (typeof value === 'string') return ['true', '1', 'yes'].includes(value.toLowerCase());
+  return value;
+}, z.boolean()).optional().default(false);
+
+const anomalyEvaluationQuerySchema = z.object({
+  orgId: z.string().guid().optional(),
+  deviceId: z.string().guid().optional(),
+  range: z.enum(['7d', '30d', '90d']).optional().default('30d'),
+  includeV1: optionalBooleanQuery,
+});
+
+function capacityRollupMetricName(metricType: string): string {
+  if (metricType === 'cpu') return 'cpu_percent';
+  if (metricType === 'memory') return 'ram_percent';
+  return 'disk_percent';
+}
+
+function rangeDays(range: string): number {
+  if (range === '7d') return 7;
+  if (range === '90d') return 90;
+  return 30;
+}
+
+function zeroAnomalyEvaluationResponse(options: {
+  since: Date;
+  until: Date;
+  range: string;
+  orgId?: string;
+  deviceId?: string;
+  includeV1?: boolean;
+}) {
+  return {
+    window: {
+      range: options.range,
+      since: options.since.toISOString(),
+      until: options.until.toISOString(),
+    },
+    orgId: options.orgId,
+    deviceId: options.deviceId,
+    total: 0,
+    status: {
+      open: 0,
+      dismissed: 0,
+      promoted: 0,
+      resolved: 0,
+      cleared: 0,
+    },
+    rates: {
+      dismissRate: 0,
+      promoteRate: 0,
+      resolveRate: 0,
+    },
+    feedback: {
+      total: 0,
+      dismissed: 0,
+      promoted: 0,
+      resolved: 0,
+    },
+    episodes: zeroEpisodeEvaluation(),
+    ...(options.includeV1 ? {
+      v1Shadow: zeroV1ShadowEvaluation(0),
+    } : {}),
+  };
+}
+
+function zeroEpisodeEvaluation() {
+  return {
+    total: 0,
+    byStatus: { open: 0, resolved: 0, dismissed: 0 },
+    byCloseReason: { cleared: 0, expired_offline: 0, expired_no_data: 0, detection_off: 0, user: 0, snoozed: 0 },
+    medianDurationSeconds: null as number | null,
+    recurrenceShare: 0,
+    humanLabelledShare: 0,
+  };
+}
+
+function zeroV1ShadowEvaluation(totalV0: number) {
+  return {
+    modelVersion: METRIC_ANOMALY_V1_SHADOW_VERSION,
+    totalCandidates: 0,
+    overlapWithV0: 0,
+    v1Only: 0,
+    v0Only: totalV0,
+    labeledOutcomes: {
+      total: 0,
+      dismissed: 0,
+      promoted: 0,
+      resolved: 0,
+    },
+    rates: {
+      overlapRate: 0,
+      v1OnlyRate: 0,
+      v0OnlyRate: totalV0 > 0 ? 1 : 0,
+      dismissRate: 0,
+      promoteRate: 0,
+      resolveRate: 0,
+    },
+  };
+}
+
+const listSlaSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional()
+});
+
+const createSlaSchema = z.object({
+  orgId: z.string().guid().optional(),
+  name: z.string().min(1).max(255),
+  description: z.string().optional(),
+  uptimeTarget: z.number().min(0).max(100).optional(),
+  responseTimeTarget: z.number().optional(),
+  resolutionTimeTarget: z.number().optional(),
+  measurementWindow: z.enum(['daily', 'weekly', 'monthly']).optional().default('monthly'),
+  targetType: z.enum(['device', 'site', 'organization']).optional().default('organization'),
+  targetIds: z.array(z.string().guid()).optional(),
+  excludeMaintenanceWindows: z.boolean().optional().default(false),
+  excludeWeekends: z.boolean().optional().default(false),
+});
+
+const executiveSummarySchema = z.object({
+  periodType: z.enum(['daily', 'weekly', 'monthly']).optional(),
+  range: z.string().optional(),
+  startDate: z.string().optional(),
+  endDate: z.string().optional(),
+});
+
+analyticsRoutes.use('*', authMiddleware);
+
+// ============================================
+// ANALYTICS QUERIES
+// ============================================
+
+analyticsRoutes.post(
+  '/query',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  zValidator('json', timeSeriesQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const data = c.req.valid('json');
+
+    writeRouteAudit(c, {
+      orgId: auth.orgId,
+      action: 'analytics.query.execute',
+      resourceType: 'analytics_query',
+      details: {
+        deviceCount: data.deviceIds.length,
+        metricCount: data.metricTypes.length,
+        aggregation: data.aggregation
+      }
+    });
+
+    const startTime = new Date(data.startTime);
+    const endTime = new Date(data.endTime);
+    if (Number.isNaN(startTime.getTime()) || Number.isNaN(endTime.getTime())) {
+      return c.json({ error: 'Invalid startTime or endTime' }, 400);
+    }
+
+    // Site-scope gate: device IDs arrive in the request body, so the :deviceId
+    // URL scanner can't catch this. RLS only defends the org axis — a
+    // site-restricted caller must not read metrics for devices outside their
+    // site allowlist. If ANY requested id is out of scope, deny the batch
+    // (matches the project convention in sentinelOne.ts `hasDeniedDeviceSite`).
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && auth.orgId) {
+      const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
+      const allowedSet = new Set(allowedDeviceIds ?? []);
+      if (data.deviceIds.some((id) => !allowedSet.has(id))) {
+        return c.json({ error: 'Access to one or more device sites denied' }, 403);
+      }
+    }
+
+    const interval = data.interval;
+    const metricMap: Record<string, any> = {
+      ...metricColumnMap,
+      ram_used_mb: deviceMetrics.ramUsedMb,
+      disk_used_gb: deviceMetrics.diskUsedGb,
+      bandwidth_in: deviceMetrics.bandwidthInBps,
+      bandwidth_out: deviceMetrics.bandwidthOutBps,
+      'network throughput': deviceMetrics.bandwidthInBps,
+    };
+
+    const series: Array<{
+      metricType: string;
+      aggregation: string;
+      interval: string;
+      data: Array<{ timestamp: string; value: number | null }>;
+    }> = [];
+
+    for (const metricType of data.metricTypes) {
+      const normalizedMetricType = metricType.trim();
+      const metricColumn =
+        metricMap[normalizedMetricType] ?? metricMap[normalizedMetricType.toLowerCase()];
+      if (!metricColumn) {
+        series.push({
+          metricType,
+          aggregation: data.aggregation,
+          interval: data.interval,
+          data: [],
+          warning: `Unknown metric type "${metricType}". Valid types: ${Object.keys(metricMap).join(', ')}`
+        } as any);
+        continue;
+      }
+
+      const rollupMetricName = metricRollupNameForQuery(normalizedMetricType);
+      const bucketSeconds = rollupBucketSeconds(interval);
+      const rollupValue = rollupAggregationSql(data.aggregation);
+      let rows: Array<{ bucket: Date | string; value: number | null }> = [];
+
+      if (rollupMetricName && bucketSeconds && rollupValue) {
+        const rollupBucket = metricRollups.bucketStart;
+        const rollupOrgCondition =
+          typeof auth?.orgCondition === 'function'
+            ? auth.orgCondition(metricRollups.orgId)
+            : auth?.orgId
+              ? eq(metricRollups.orgId, auth.orgId)
+              : undefined;
+        rows = await db
+          .select({
+            bucket: rollupBucket,
+            value: rollupValue
+          })
+          .from(metricRollups)
+          .where(
+            and(
+              inArray(metricRollups.deviceId, data.deviceIds),
+              eq(metricRollups.sourceTable, 'device_metrics'),
+              eq(metricRollups.bucketSeconds, bucketSeconds),
+              eq(metricRollups.metricName, rollupMetricName),
+              sql`${metricRollups.sampleCount} > 0`,
+              ...(rollupOrgCondition ? [rollupOrgCondition] : []),
+              gte(metricRollups.bucketStart, startTime),
+              lte(metricRollups.bucketStart, endTime)
+            )
+          )
+          .groupBy(rollupBucket)
+          .orderBy(rollupBucket);
+      }
+
+      const bucket = sql<Date>`date_trunc(${interval}, ${deviceMetrics.timestamp})`;
+      const value = aggregationSql(metricColumn, data.aggregation);
+
+      // Org-scope: join devices table to ensure deviceIds belong to the user's org
+      const orgCondition =
+        typeof auth?.orgCondition === 'function'
+          ? auth.orgCondition(devices.orgId)
+          : auth?.orgId
+            ? eq(devices.orgId, auth.orgId)
+            : undefined;
+
+      if (rows.length === 0) {
+        rows = await db
+          .select({
+            bucket,
+            value
+          })
+          .from(deviceMetrics)
+          .innerJoin(devices, eq(deviceMetrics.deviceId, devices.id))
+          .where(
+            and(
+              inArray(deviceMetrics.deviceId, data.deviceIds),
+              ...(orgCondition ? [orgCondition] : []),
+              gte(deviceMetrics.timestamp, startTime),
+              lte(deviceMetrics.timestamp, endTime)
+            )
+          )
+          .groupBy(bucket)
+          .orderBy(bucket);
+      }
+
+      series.push({
+        metricType,
+        aggregation: data.aggregation,
+        interval: data.interval,
+        data: rows.map((row) => ({
+          timestamp: row.bucket instanceof Date ? row.bucket.toISOString() : new Date(String(row.bucket)).toISOString(),
+          value: row.value === null ? null : Number(row.value)
+        }))
+      });
+    }
+
+    return c.json({
+      query: data,
+      series
+    });
+  }
+);
+
+// ============================================
+// DASHBOARDS
+// ============================================
+
+analyticsRoutes.get(
+  '/dashboards',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  zValidator('query', listDashboardsSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+
+    const conditions: ReturnType<typeof eq>[] = [];
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      conditions.push(eq(analyticsDashboards.orgId, auth.orgId));
+    } else if (auth.scope === 'partner') {
+      if (query.orgId) {
+        const hasAccess = await ensureOrgAccess(query.orgId, auth);
+        if (!hasAccess) {
+          return c.json({ error: 'Access to this organization denied' }, 403);
+        }
+        conditions.push(eq(analyticsDashboards.orgId, query.orgId));
+      } else {
+        const orgIds = await getOrgIdsForAuth(auth);
+        if (!orgIds || orgIds.length === 0) {
+          return c.json({ data: [], pagination: { page, limit, total: 0 } });
+        }
+        conditions.push(inArray(analyticsDashboards.orgId, orgIds));
+      }
+    } else if (auth.scope === 'system' && query.orgId) {
+      conditions.push(eq(analyticsDashboards.orgId, query.orgId));
+    }
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(analyticsDashboards)
+      .where(whereCondition);
+    const total = Number(countResult[0]?.count ?? 0);
+
+    const pageData = await db
+      .select()
+      .from(analyticsDashboards)
+      .where(whereCondition)
+      .orderBy(desc(analyticsDashboards.updatedAt), desc(analyticsDashboards.id))
+      .limit(limit)
+      .offset(offset);
+
+    const dashboardIds = pageData.map((dashboard) => dashboard.id);
+    const widgetRows = dashboardIds.length
+      ? await db
+          .select({
+            id: dashboardWidgets.id,
+            dashboardId: dashboardWidgets.dashboardId
+          })
+          .from(dashboardWidgets)
+          .where(inArray(dashboardWidgets.dashboardId, dashboardIds))
+      : [];
+
+    const widgetIdsByDashboardId = new Map<string, string[]>();
+    for (const row of widgetRows) {
+      const widgetIds = widgetIdsByDashboardId.get(row.dashboardId) ?? [];
+      widgetIds.push(row.id);
+      widgetIdsByDashboardId.set(row.dashboardId, widgetIds);
+    }
+
+    return c.json({
+      data: pageData.map((dashboard) => ({
+        ...dashboard,
+        widgetIds: widgetIdsByDashboardId.get(dashboard.id) ?? []
+      })),
+      pagination: { page, limit, total }
+    });
+  }
+);
+
+analyticsRoutes.post(
+  '/dashboards',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsWrite,
+  requireMfa(),
+  zValidator('json', createDashboardSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const data = c.req.valid('json');
+
+    let orgId = data.orgId;
+
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      orgId = auth.orgId;
+    } else if (auth.scope === 'partner') {
+      if (!orgId) {
+        const singleOrg = auth.accessibleOrgIds?.[0];
+        if (auth.accessibleOrgIds?.length === 1 && singleOrg) {
+          orgId = singleOrg;
+        } else {
+          return c.json({ error: 'orgId is required when partner has multiple organizations' }, 400);
+        }
+      }
+      const hasAccess = await ensureOrgAccess(orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+    } else if (auth.scope === 'system') {
+      if (!orgId) {
+        return c.json({ error: 'orgId is required for system scope' }, 400);
+      }
+    }
+
+    const [dashboard] = await db
+      .insert(analyticsDashboards)
+      .values({
+        orgId: orgId as string,
+        name: data.name,
+        description: data.description,
+        layout: data.layout ?? {},
+        createdBy: auth.user?.id
+      })
+      .returning();
+    if (!dashboard) {
+      return c.json({ error: 'Failed to create dashboard' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: dashboard.orgId,
+      action: 'analytics.dashboard.create',
+      resourceType: 'analytics_dashboard',
+      resourceId: dashboard.id,
+      resourceName: dashboard.name
+    });
+
+    return c.json({ ...dashboard, widgetIds: [] }, 201);
+  }
+);
+
+analyticsRoutes.get(
+  '/dashboards/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const dashboardId = c.req.param('id')!;
+    const rows = await db
+      .select({
+        dashboardId: analyticsDashboards.id,
+        orgId: analyticsDashboards.orgId,
+        name: analyticsDashboards.name,
+        description: analyticsDashboards.description,
+        isDefault: analyticsDashboards.isDefault,
+        isSystem: analyticsDashboards.isSystem,
+        layout: analyticsDashboards.layout,
+        createdBy: analyticsDashboards.createdBy,
+        createdAt: analyticsDashboards.createdAt,
+        updatedAt: analyticsDashboards.updatedAt,
+        widgetId: dashboardWidgets.id,
+        widgetDashboardId: dashboardWidgets.dashboardId,
+        widgetType: dashboardWidgets.widgetType,
+        widgetTitle: dashboardWidgets.title,
+        widgetDataSource: dashboardWidgets.dataSource,
+        widgetChartType: dashboardWidgets.chartType,
+        widgetVisualization: dashboardWidgets.visualization,
+        widgetPosition: dashboardWidgets.position,
+        widgetRefreshInterval: dashboardWidgets.refreshInterval,
+        widgetCreatedAt: dashboardWidgets.createdAt,
+        widgetUpdatedAt: dashboardWidgets.updatedAt
+      })
+      .from(analyticsDashboards)
+      .leftJoin(dashboardWidgets, eq(dashboardWidgets.dashboardId, analyticsDashboards.id))
+      .where(eq(analyticsDashboards.id, dashboardId))
+      .orderBy(desc(dashboardWidgets.createdAt));
+
+    if (rows.length === 0) {
+      return c.json({ error: 'Dashboard not found' }, 404);
+    }
+
+    const dashboard = rows[0]!;
+    const hasAccess = await ensureOrgAccess(dashboard.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const widgetData = rows
+      .filter((row) => row.widgetId !== null)
+      .map((row) => ({
+        id: row.widgetId as string,
+        dashboardId: row.widgetDashboardId as string,
+        name: row.widgetTitle as string,
+        type: row.widgetType as string,
+        config: (row.widgetDataSource ?? {}) as Record<string, unknown>,
+        layout: (row.widgetPosition ?? {}) as Record<string, unknown>,
+        chartType: row.widgetChartType,
+        visualization: (row.widgetVisualization ?? {}) as Record<string, unknown>,
+        refreshInterval: row.widgetRefreshInterval,
+        createdAt: row.widgetCreatedAt as Date,
+        updatedAt: row.widgetUpdatedAt as Date
+      }));
+
+    return c.json({
+      id: dashboard.dashboardId,
+      orgId: dashboard.orgId,
+      name: dashboard.name,
+      description: dashboard.description,
+      isDefault: dashboard.isDefault,
+      isSystem: dashboard.isSystem,
+      layout: dashboard.layout,
+      createdBy: dashboard.createdBy,
+      createdAt: dashboard.createdAt,
+      updatedAt: dashboard.updatedAt,
+      widgetIds: widgetData.map((widget) => widget.id),
+      widgets: widgetData
+    });
+  }
+);
+
+analyticsRoutes.patch(
+  '/dashboards/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsWrite,
+  requireMfa(),
+  zValidator('json', updateDashboardSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const dashboardId = c.req.param('id')!;
+    const updates = c.req.valid('json');
+
+    if (Object.keys(updates).length === 0) {
+      return c.json({ error: 'No updates provided' }, 400);
+    }
+
+    const [dashboard] = await db
+      .select()
+      .from(analyticsDashboards)
+      .where(eq(analyticsDashboards.id, dashboardId))
+      .limit(1);
+    if (!dashboard) {
+      return c.json({ error: 'Dashboard not found' }, 404);
+    }
+
+    const hasAccess = await ensureOrgAccess(dashboard.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const setData: {
+      name?: string;
+      description?: string;
+      layout?: Record<string, unknown>;
+      updatedAt: Date;
+    } = {
+      updatedAt: new Date()
+    };
+    if (updates.name !== undefined) {
+      setData.name = updates.name;
+    }
+    if (updates.description !== undefined) {
+      setData.description = updates.description;
+    }
+    if (updates.layout !== undefined) {
+      setData.layout = updates.layout;
+    }
+
+    const [updatedDashboard] = await db
+      .update(analyticsDashboards)
+      .set(setData)
+      .where(eq(analyticsDashboards.id, dashboardId))
+      .returning();
+    if (!updatedDashboard) {
+      return c.json({ error: 'Dashboard not found' }, 404);
+    }
+
+    const widgetRows = await db
+      .select({ id: dashboardWidgets.id })
+      .from(dashboardWidgets)
+      .where(eq(dashboardWidgets.dashboardId, dashboardId));
+    const widgetIds = widgetRows.map((row) => row.id);
+
+    writeRouteAudit(c, {
+      orgId: dashboard.orgId,
+      action: 'analytics.dashboard.update',
+      resourceType: 'analytics_dashboard',
+      resourceId: dashboard.id,
+      resourceName: updatedDashboard.name,
+      details: { changedFields: Object.keys(updates) }
+    });
+
+    return c.json({ ...updatedDashboard, widgetIds });
+  }
+);
+
+analyticsRoutes.delete(
+  '/dashboards/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const dashboardId = c.req.param('id')!;
+    const [dashboard] = await db
+      .select()
+      .from(analyticsDashboards)
+      .where(eq(analyticsDashboards.id, dashboardId))
+      .limit(1);
+
+    if (!dashboard) {
+      return c.json({ error: 'Dashboard not found' }, 404);
+    }
+
+    const hasAccess = await ensureOrgAccess(dashboard.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    await db.delete(dashboardWidgets).where(eq(dashboardWidgets.dashboardId, dashboardId));
+    await db.delete(analyticsDashboards).where(eq(analyticsDashboards.id, dashboardId));
+
+    writeRouteAudit(c, {
+      orgId: dashboard.orgId,
+      action: 'analytics.dashboard.delete',
+      resourceType: 'analytics_dashboard',
+      resourceId: dashboard.id,
+      resourceName: dashboard.name
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+analyticsRoutes.post(
+  '/dashboards/:id/widgets',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsWrite,
+  requireMfa(),
+  zValidator('json', createWidgetSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const dashboardId = c.req.param('id')!;
+    const data = c.req.valid('json');
+    const [dashboard] = await db
+      .select()
+      .from(analyticsDashboards)
+      .where(eq(analyticsDashboards.id, dashboardId))
+      .limit(1);
+
+    if (!dashboard) {
+      return c.json({ error: 'Dashboard not found' }, 404);
+    }
+
+    const hasAccess = await ensureOrgAccess(dashboard.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const now = new Date();
+    const [widget] = await db
+      .insert(dashboardWidgets)
+      .values({
+        dashboardId,
+        title: data.name,
+        widgetType: data.type,
+        dataSource: data.config ?? {},
+        position: data.layout ?? {},
+        updatedAt: now
+      })
+      .returning();
+    if (!widget) {
+      return c.json({ error: 'Failed to create widget' }, 500);
+    }
+
+    await db
+      .update(analyticsDashboards)
+      .set({ updatedAt: now })
+      .where(eq(analyticsDashboards.id, dashboardId));
+
+    writeRouteAudit(c, {
+      orgId: dashboard.orgId,
+      action: 'analytics.widget.create',
+      resourceType: 'analytics_widget',
+      resourceId: widget.id,
+      resourceName: widget.title,
+      details: { dashboardId: dashboard.id, type: widget.widgetType }
+    });
+
+    return c.json(mapWidgetToApi(widget), 201);
+  }
+);
+
+analyticsRoutes.patch(
+  '/widgets/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsWrite,
+  requireMfa(),
+  zValidator('json', updateWidgetSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const widgetId = c.req.param('id')!;
+    const updates = c.req.valid('json');
+
+    if (Object.keys(updates).length === 0) {
+      return c.json({ error: 'No updates provided' }, 400);
+    }
+
+    const [widgetRecord] = await db
+      .select({
+        id: dashboardWidgets.id,
+        dashboardId: dashboardWidgets.dashboardId,
+        title: dashboardWidgets.title,
+        orgId: analyticsDashboards.orgId
+      })
+      .from(dashboardWidgets)
+      .innerJoin(analyticsDashboards, eq(dashboardWidgets.dashboardId, analyticsDashboards.id))
+      .where(eq(dashboardWidgets.id, widgetId))
+      .limit(1);
+
+    if (!widgetRecord) {
+      return c.json({ error: 'Widget not found' }, 404);
+    }
+
+    const hasAccess = await ensureOrgAccess(widgetRecord.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const setData: {
+      title?: string;
+      widgetType?: string;
+      dataSource?: Record<string, unknown>;
+      position?: Record<string, unknown>;
+      updatedAt: Date;
+    } = {
+      updatedAt: new Date()
+    };
+    if (updates.name !== undefined) {
+      setData.title = updates.name;
+    }
+    if (updates.type !== undefined) {
+      setData.widgetType = updates.type;
+    }
+    if (updates.config !== undefined) {
+      setData.dataSource = updates.config;
+    }
+    if (updates.layout !== undefined) {
+      setData.position = updates.layout;
+    }
+
+    const [updatedWidget] = await db
+      .update(dashboardWidgets)
+      .set(setData)
+      .where(eq(dashboardWidgets.id, widgetId))
+      .returning();
+    if (!updatedWidget) {
+      return c.json({ error: 'Widget not found' }, 404);
+    }
+
+    writeRouteAudit(c, {
+      orgId: widgetRecord.orgId,
+      action: 'analytics.widget.update',
+      resourceType: 'analytics_widget',
+      resourceId: updatedWidget.id,
+      resourceName: updatedWidget.title,
+      details: { changedFields: Object.keys(updates) }
+    });
+
+    return c.json(mapWidgetToApi(updatedWidget));
+  }
+);
+
+analyticsRoutes.delete(
+  '/widgets/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth');
+    const widgetId = c.req.param('id')!;
+    const [widgetRecord] = await db
+      .select({
+        id: dashboardWidgets.id,
+        dashboardId: dashboardWidgets.dashboardId,
+        title: dashboardWidgets.title,
+        orgId: analyticsDashboards.orgId
+      })
+      .from(dashboardWidgets)
+      .innerJoin(analyticsDashboards, eq(dashboardWidgets.dashboardId, analyticsDashboards.id))
+      .where(eq(dashboardWidgets.id, widgetId))
+      .limit(1);
+
+    if (!widgetRecord) {
+      return c.json({ error: 'Widget not found' }, 404);
+    }
+
+    const hasAccess = await ensureOrgAccess(widgetRecord.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const now = new Date();
+    await db.delete(dashboardWidgets).where(eq(dashboardWidgets.id, widgetId));
+    await db
+      .update(analyticsDashboards)
+      .set({ updatedAt: now })
+      .where(eq(analyticsDashboards.id, widgetRecord.dashboardId));
+
+    writeRouteAudit(c, {
+      orgId: widgetRecord.orgId,
+      action: 'analytics.widget.delete',
+      resourceType: 'analytics_widget',
+      resourceId: widgetRecord.id,
+      resourceName: widgetRecord.title
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+// ============================================
+// CAPACITY & SLA
+// ============================================
+
+analyticsRoutes.get(
+  '/anomalies/evaluation',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  zValidator('query', anomalyEvaluationQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    if (query.orgId && !(await ensureOrgAccess(query.orgId, auth))) {
+      return c.json({ error: 'Access to this organization denied' }, 403);
+    }
+
+    const effectiveOrgId = query.orgId ?? auth.orgId;
+    const until = new Date();
+    const since = new Date(until.getTime() - rangeDays(query.range) * 24 * 60 * 60 * 1000);
+
+    let allowedDeviceIds: string[] | null = null;
+    if (perms?.allowedSiteIds && effectiveOrgId) {
+      allowedDeviceIds = await resolveSiteAllowedDeviceIds(effectiveOrgId, perms);
+      if (query.deviceId && !(allowedDeviceIds ?? []).includes(query.deviceId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      if (!query.deviceId && (allowedDeviceIds ?? []).length === 0) {
+        return c.json(zeroAnomalyEvaluationResponse({
+          since,
+          until,
+          range: query.range,
+          orgId: effectiveOrgId,
+          includeV1: query.includeV1,
+        }));
+      }
+    }
+
+    const anomalyOrgCondition =
+      query.orgId
+        ? eq(metricAnomalies.orgId, query.orgId)
+        : typeof auth?.orgCondition === 'function'
+          ? auth.orgCondition(metricAnomalies.orgId)
+          : auth?.orgId
+            ? eq(metricAnomalies.orgId, auth.orgId)
+            : undefined;
+
+    const feedbackOrgCondition =
+      query.orgId
+        ? eq(mlFeedbackEvents.orgId, query.orgId)
+        : typeof auth?.orgCondition === 'function'
+          ? auth.orgCondition(mlFeedbackEvents.orgId)
+          : auth?.orgId
+            ? eq(mlFeedbackEvents.orgId, auth.orgId)
+            : undefined;
+
+    const candidateOrgCondition =
+      query.orgId
+        ? eq(metricAnomalyCandidates.orgId, query.orgId)
+        : typeof auth?.orgCondition === 'function'
+          ? auth.orgCondition(metricAnomalyCandidates.orgId)
+          : auth?.orgId
+            ? eq(metricAnomalyCandidates.orgId, auth.orgId)
+            : undefined;
+
+    const anomalyConditions: SQL[] = [
+      gte(metricAnomalies.detectedAt, since),
+      ...(anomalyOrgCondition ? [anomalyOrgCondition] : []),
+      ...(query.deviceId ? [eq(metricAnomalies.deviceId, query.deviceId)] : []),
+      ...(allowedDeviceIds !== null && !query.deviceId && allowedDeviceIds.length > 0
+        ? [inArray(metricAnomalies.deviceId, allowedDeviceIds)]
+        : []),
+    ];
+
+    const feedbackAnomalyConditions: SQL[] = [
+      gte(metricAnomalies.detectedAt, since),
+      ...(query.deviceId ? [eq(metricAnomalies.deviceId, query.deviceId)] : []),
+      ...(allowedDeviceIds !== null && !query.deviceId && allowedDeviceIds.length > 0
+        ? [inArray(metricAnomalies.deviceId, allowedDeviceIds)]
+        : []),
+    ];
+
+    const statusRows = await db
+      .select({
+        status: metricAnomalies.status,
+        count: sql<number>`count(*)`,
+      })
+      .from(metricAnomalies)
+      .where(and(...anomalyConditions))
+      .groupBy(metricAnomalies.status);
+
+    const feedbackRows = await db
+      .select({
+        eventType: mlFeedbackEvents.eventType,
+        count: sql<number>`count(*)`,
+      })
+      .from(mlFeedbackEvents)
+      .innerJoin(
+        metricAnomalies,
+        and(
+          sql`${mlFeedbackEvents.sourceId} = ${metricAnomalies.id}::text`,
+          eq(metricAnomalies.orgId, mlFeedbackEvents.orgId),
+        ),
+      )
+      .where(and(
+        eq(mlFeedbackEvents.sourceType, 'anomaly'),
+        inArray(mlFeedbackEvents.eventType, ['anomaly.dismissed', 'anomaly.promoted', 'anomaly.resolved']),
+        gte(mlFeedbackEvents.occurredAt, since),
+        ...(feedbackOrgCondition ? [feedbackOrgCondition] : []),
+        ...feedbackAnomalyConditions,
+      ))
+      .groupBy(mlFeedbackEvents.eventType);
+
+    const status = { open: 0, dismissed: 0, promoted: 0, resolved: 0, cleared: 0 };
+    for (const row of statusRows) {
+      const key = String(row.status);
+      if (key === 'open' || key === 'dismissed' || key === 'promoted' || key === 'resolved' || key === 'cleared') {
+        status[key] = Number(row.count) || 0;
+      }
+    }
+
+    // cleared members are automatic (auto-resolve, spec D5/D7), never a human
+    // label — excluded from `total` and therefore from every rate denominator
+    // below, but still surfaced as its own count in `status.cleared`.
+    const total = status.open + status.dismissed + status.promoted + status.resolved;
+    const feedback = { total: 0, dismissed: 0, promoted: 0, resolved: 0 };
+    for (const row of feedbackRows) {
+      const count = Number(row.count) || 0;
+      if (row.eventType === 'anomaly.dismissed') feedback.dismissed += count;
+      if (row.eventType === 'anomaly.promoted') feedback.promoted += count;
+      if (row.eventType === 'anomaly.resolved') feedback.resolved += count;
+    }
+    feedback.total = feedback.dismissed + feedback.promoted + feedback.resolved;
+
+    const episodeOrgCondition =
+      query.orgId
+        ? eq(metricAnomalyEpisodes.orgId, query.orgId)
+        : typeof auth?.orgCondition === 'function'
+          ? auth.orgCondition(metricAnomalyEpisodes.orgId)
+          : auth?.orgId
+            ? eq(metricAnomalyEpisodes.orgId, auth.orgId)
+            : undefined;
+
+    const episodeConditions: SQL[] = [
+      gte(metricAnomalyEpisodes.firstSeenAt, since),
+      ...(episodeOrgCondition ? [episodeOrgCondition] : []),
+      ...(query.deviceId ? [eq(metricAnomalyEpisodes.deviceId, query.deviceId)] : []),
+      ...(allowedDeviceIds !== null && !query.deviceId && allowedDeviceIds.length > 0
+        ? [inArray(metricAnomalyEpisodes.deviceId, allowedDeviceIds)]
+        : []),
+    ];
+
+    const episodeGroupRows = await db
+      .select({
+        status: metricAnomalyEpisodes.status,
+        closeReason: metricAnomalyEpisodes.closeReason,
+        count: sql<number>`count(*)`,
+      })
+      .from(metricAnomalyEpisodes)
+      .where(and(...episodeConditions))
+      .groupBy(metricAnomalyEpisodes.status, metricAnomalyEpisodes.closeReason);
+
+    const [episodeAggRow] = await db
+      .select({
+        total: sql<number>`count(*)`,
+        recurring: sql<number>`count(*) filter (where ${metricAnomalyEpisodes.recurrenceCount} >= 1)`,
+        // A8: denominator = closed episodes except snoozed successors (the echo
+        // of an earlier human dismiss); numerator = the ones a human labelled,
+        // by closing them or by promoting them (linked alert), however they closed.
+        labelEligibleClosed: sql<number>`count(*) filter (where ${metricAnomalyEpisodes.status} <> 'open' and ${metricAnomalyEpisodes.closeReason} is distinct from 'snoozed')`,
+        humanLabelled: sql<number>`count(*) filter (where ${metricAnomalyEpisodes.status} <> 'open' and ${metricAnomalyEpisodes.closeReason} is distinct from 'snoozed' and (${metricAnomalyEpisodes.closeReason} = 'user' or ${metricAnomalyEpisodes.linkedAlertId} is not null))`,
+        medianDurationSeconds: sql<number | null>`percentile_cont(0.5) within group (order by extract(epoch from (${metricAnomalyEpisodes.resolvedAt} - ${metricAnomalyEpisodes.firstSeenAt}))) filter (where ${metricAnomalyEpisodes.resolvedAt} is not null)`,
+      })
+      .from(metricAnomalyEpisodes)
+      .where(and(...episodeConditions));
+
+    const episodeByStatus = { open: 0, resolved: 0, dismissed: 0 };
+    const episodeByCloseReason = { cleared: 0, expired_offline: 0, expired_no_data: 0, detection_off: 0, user: 0, snoozed: 0 };
+    for (const row of episodeGroupRows) {
+      const statusKey = String(row.status);
+      if (statusKey === 'open' || statusKey === 'resolved' || statusKey === 'dismissed') {
+        episodeByStatus[statusKey] += Number(row.count) || 0;
+      }
+      const reasonKey = row.closeReason ? String(row.closeReason) : null;
+      if (reasonKey && reasonKey in episodeByCloseReason) {
+        episodeByCloseReason[reasonKey as keyof typeof episodeByCloseReason] += Number(row.count) || 0;
+      }
+    }
+
+    const episodeTotal = Number(episodeAggRow?.total) || 0;
+    const episodeRecurring = Number(episodeAggRow?.recurring) || 0;
+    const episodeLabelEligibleClosed = Number(episodeAggRow?.labelEligibleClosed) || 0;
+    const episodeHumanLabelled = Number(episodeAggRow?.humanLabelled) || 0;
+    const episodeMedianDurationSeconds =
+      episodeAggRow?.medianDurationSeconds == null ? null : Math.round(Number(episodeAggRow.medianDurationSeconds));
+
+    const episodes = {
+      total: episodeTotal,
+      byStatus: episodeByStatus,
+      byCloseReason: episodeByCloseReason,
+      medianDurationSeconds: episodeMedianDurationSeconds,
+      recurrenceShare: episodeTotal > 0 ? episodeRecurring / episodeTotal : 0,
+      humanLabelledShare: episodeLabelEligibleClosed > 0 ? episodeHumanLabelled / episodeLabelEligibleClosed : 0,
+    };
+
+    let v1Shadow: ReturnType<typeof zeroV1ShadowEvaluation> | undefined;
+    if (query.includeV1) {
+      const candidateConditions: SQL[] = [
+        gte(metricAnomalyCandidates.detectedAt, since),
+        eq(metricAnomalyCandidates.modelVersion, METRIC_ANOMALY_V1_SHADOW_VERSION),
+        ...(candidateOrgCondition ? [candidateOrgCondition] : []),
+        ...(query.deviceId ? [eq(metricAnomalyCandidates.deviceId, query.deviceId)] : []),
+        ...(allowedDeviceIds !== null && !query.deviceId && allowedDeviceIds.length > 0
+          ? [inArray(metricAnomalyCandidates.deviceId, allowedDeviceIds)]
+          : []),
+      ];
+
+      // Keep the v0 side of the overlap join bounded to the same eval window as
+      // `total` (which is filtered by metricAnomalies.detectedAt >= since). Without
+      // this, an in-window candidate could match a v0 anomaly detected outside the
+      // window — inflating overlapWithV0 and understating v1Only against a window the
+      // user did not ask about.
+      const overlapJoin = and(
+        gte(metricAnomalies.detectedAt, since),
+        eq(metricAnomalies.orgId, metricAnomalyCandidates.orgId),
+        eq(metricAnomalies.deviceId, metricAnomalyCandidates.deviceId),
+        eq(metricAnomalies.sourceTable, metricAnomalyCandidates.sourceTable),
+        eq(metricAnomalies.metricName, metricAnomalyCandidates.metricName),
+        eq(metricAnomalies.anomalyType, metricAnomalyCandidates.anomalyType),
+        eq(metricAnomalies.bucketSeconds, metricAnomalyCandidates.bucketSeconds),
+        eq(metricAnomalies.windowStart, metricAnomalyCandidates.windowStart),
+      );
+
+      const [candidateTotalRows, overlapRows, v1FeedbackRows] = await Promise.all([
+        db
+          .select({ totalCandidates: sql<number>`count(*)` })
+          .from(metricAnomalyCandidates)
+          .where(and(...candidateConditions)),
+        db
+          .select({ overlapWithV0: sql<number>`count(distinct ${metricAnomalyCandidates.id})` })
+          .from(metricAnomalyCandidates)
+          .innerJoin(metricAnomalies, overlapJoin)
+          .where(and(...candidateConditions)),
+        db
+          .select({
+            eventType: mlFeedbackEvents.eventType,
+            count: sql<number>`count(*)`,
+          })
+          .from(mlFeedbackEvents)
+          .innerJoin(
+            metricAnomalies,
+            and(
+              sql`${mlFeedbackEvents.sourceId} = ${metricAnomalies.id}::text`,
+              eq(metricAnomalies.orgId, mlFeedbackEvents.orgId),
+            ),
+          )
+          .innerJoin(metricAnomalyCandidates, overlapJoin)
+          .where(and(
+            eq(mlFeedbackEvents.sourceType, 'anomaly'),
+            inArray(mlFeedbackEvents.eventType, ['anomaly.dismissed', 'anomaly.promoted', 'anomaly.resolved']),
+            gte(mlFeedbackEvents.occurredAt, since),
+            ...candidateConditions,
+          ))
+          .groupBy(mlFeedbackEvents.eventType),
+      ]);
+
+      const totalCandidates = Number(candidateTotalRows[0]?.totalCandidates) || 0;
+      const overlapWithV0 = Number(overlapRows[0]?.overlapWithV0) || 0;
+      const labeledOutcomes = { total: 0, dismissed: 0, promoted: 0, resolved: 0 };
+      for (const row of v1FeedbackRows) {
+        const count = Number(row.count) || 0;
+        if (row.eventType === 'anomaly.dismissed') labeledOutcomes.dismissed += count;
+        if (row.eventType === 'anomaly.promoted') labeledOutcomes.promoted += count;
+        if (row.eventType === 'anomaly.resolved') labeledOutcomes.resolved += count;
+      }
+      labeledOutcomes.total = labeledOutcomes.dismissed + labeledOutcomes.promoted + labeledOutcomes.resolved;
+
+      const v1Only = Math.max(totalCandidates - overlapWithV0, 0);
+      // Approximate: subtracts the distinct-candidate overlap count from the v0
+      // anomaly total. The overlap join is effectively 1:1 (its key set is a
+      // superset of both unique indexes), so distinct candidates ≈ distinct v0
+      // anomalies in practice; the Math.max guards the residual mismatch. This is
+      // a shadow-eval diagnostic, not an exact set difference.
+      const v0Only = Math.max(total - overlapWithV0, 0);
+      v1Shadow = {
+        modelVersion: METRIC_ANOMALY_V1_SHADOW_VERSION,
+        totalCandidates,
+        overlapWithV0,
+        v1Only,
+        v0Only,
+        labeledOutcomes,
+        rates: {
+          overlapRate: totalCandidates > 0 ? overlapWithV0 / totalCandidates : 0,
+          v1OnlyRate: totalCandidates > 0 ? v1Only / totalCandidates : 0,
+          v0OnlyRate: total > 0 ? v0Only / total : 0,
+          dismissRate: labeledOutcomes.total > 0 ? labeledOutcomes.dismissed / labeledOutcomes.total : 0,
+          promoteRate: labeledOutcomes.total > 0 ? labeledOutcomes.promoted / labeledOutcomes.total : 0,
+          resolveRate: labeledOutcomes.total > 0 ? labeledOutcomes.resolved / labeledOutcomes.total : 0,
+        },
+      };
+    }
+
+    return c.json({
+      window: {
+        range: query.range,
+        since: since.toISOString(),
+        until: until.toISOString(),
+      },
+      orgId: effectiveOrgId,
+      deviceId: query.deviceId,
+      total,
+      status,
+      rates: {
+        dismissRate: total > 0 ? status.dismissed / total : 0,
+        promoteRate: total > 0 ? status.promoted / total : 0,
+        resolveRate: total > 0 ? status.resolved / total : 0,
+      },
+      feedback,
+      episodes,
+      ...(v1Shadow ? { v1Shadow } : {}),
+    });
+  }
+);
+
+analyticsRoutes.get(
+  '/capacity',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  zValidator('query', capacityQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const metricType = query.metricType.toLowerCase();
+
+    // Site-scope gate. RLS defends only the org axis; a site-restricted caller
+    // must not drill into per-device capacity/metrics for devices in other
+    // sites within the same org. `allowedDeviceIds === null` means unrestricted.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    let allowedDeviceIds: string[] | null = null;
+    if (perms?.allowedSiteIds && auth?.orgId) {
+      allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
+      // Explicit per-device drill-down must target an in-scope device.
+      if (query.deviceId && !(allowedDeviceIds ?? []).includes(query.deviceId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+    }
+
+    const predictionOrgCondition =
+      typeof auth?.orgCondition === 'function'
+        ? auth.orgCondition(capacityPredictions.orgId)
+        : auth?.orgId
+          ? eq(capacityPredictions.orgId, auth.orgId)
+          : undefined;
+
+    // When site-restricted and no explicit deviceId, constrain per-device
+    // predictions to the in-scope set while keeping org-wide rows (deviceId is
+    // nullable on capacity_predictions) visible.
+    const predictionSiteCondition =
+      allowedDeviceIds !== null && !query.deviceId
+        ? or(
+            isNull(capacityPredictions.deviceId),
+            ...(allowedDeviceIds.length > 0
+              ? [inArray(capacityPredictions.deviceId, allowedDeviceIds)]
+              : [])
+          )
+        : undefined;
+
+    const predictionWhere = and(
+      eq(capacityPredictions.metricType, metricType),
+      ...(predictionOrgCondition ? [predictionOrgCondition] : []),
+      ...(query.deviceId ? [eq(capacityPredictions.deviceId, query.deviceId)] : []),
+      ...(predictionSiteCondition ? [predictionSiteCondition] : [])
+    );
+
+    const storedPredictions = await db
+      .select({
+        metricName: capacityPredictions.metricName,
+        currentValue: capacityPredictions.currentValue,
+        predictedValue: capacityPredictions.predictedValue,
+        predictionDate: capacityPredictions.predictionDate,
+        growthRate: capacityPredictions.growthRate
+      })
+      .from(capacityPredictions)
+      .where(predictionWhere)
+      .orderBy(capacityPredictions.predictionDate);
+
+    if (storedPredictions.length > 0) {
+      const thresholdOrgCondition =
+        typeof auth?.orgCondition === 'function'
+          ? auth.orgCondition(capacityThresholds.orgId)
+          : auth?.orgId
+            ? eq(capacityThresholds.orgId, auth.orgId)
+            : undefined;
+
+      const thresholdWhere = and(
+        eq(capacityThresholds.metricType, metricType),
+        eq(capacityThresholds.metricName, storedPredictions[0]!.metricName),
+        ...(thresholdOrgCondition ? [thresholdOrgCondition] : [])
+      );
+
+      const thresholdRows = await db
+        .select({
+          warningThreshold: capacityThresholds.warningThreshold,
+          criticalThreshold: capacityThresholds.criticalThreshold
+        })
+        .from(capacityThresholds)
+        .where(thresholdWhere)
+        .limit(1);
+
+      return c.json({
+        currentValue: Number(storedPredictions[0]!.currentValue),
+        predictions: storedPredictions.map((row) => ({
+          timestamp: row.predictionDate instanceof Date ? row.predictionDate.toISOString() : String(row.predictionDate),
+          value: Number(row.predictedValue),
+          trend: row.growthRate === null ? undefined : Number(row.growthRate)
+        })),
+        thresholds: thresholdRows[0]
+          ? {
+              warning:
+                thresholdRows[0].warningThreshold === null
+                  ? undefined
+                  : Number(thresholdRows[0].warningThreshold),
+              critical:
+                thresholdRows[0].criticalThreshold === null
+                  ? undefined
+                  : Number(thresholdRows[0].criticalThreshold)
+            }
+          : undefined
+      });
+    }
+
+    const normalizedRange = query.range.toLowerCase();
+    const rangeDays = normalizedRange === '7d' ? 7 : normalizedRange === '90d' ? 90 : 30;
+    const rangeStart = new Date(Date.now() - rangeDays * 24 * 60 * 60 * 1000);
+
+    const metricsOrgCondition =
+      typeof auth?.orgCondition === 'function'
+        ? auth.orgCondition(devices.orgId)
+        : auth?.orgId
+          ? eq(devices.orgId, auth.orgId)
+          : undefined;
+
+    const rollupsOrgCondition =
+      typeof auth?.orgCondition === 'function'
+        ? auth.orgCondition(metricRollups.orgId)
+        : auth?.orgId
+          ? eq(metricRollups.orgId, auth.orgId)
+          : undefined;
+
+    // device_metrics.deviceId is NOT NULL — constrain the broad (no-deviceId)
+    // query to the in-scope device set when site-restricted, and short-circuit
+    // when none are in scope.
+    if (allowedDeviceIds !== null && !query.deviceId && allowedDeviceIds.length === 0) {
+      return c.json({ currentValue: 0, predictions: [], thresholds: undefined });
+    }
+
+    const rollupsWhere = and(
+      eq(metricRollups.sourceTable, 'device_metrics'),
+      eq(metricRollups.bucketSeconds, 86400),
+      eq(metricRollups.metricName, capacityRollupMetricName(metricType)),
+      gte(metricRollups.bucketStart, rangeStart),
+      sql`${metricRollups.sampleCount} > 0`,
+      sql`${metricRollups.avgValue} IS NOT NULL`,
+      ...(rollupsOrgCondition ? [rollupsOrgCondition] : []),
+      ...(query.deviceId ? [eq(metricRollups.deviceId, query.deviceId)] : []),
+      ...(allowedDeviceIds !== null && !query.deviceId && allowedDeviceIds.length > 0
+        ? [inArray(metricRollups.deviceId, allowedDeviceIds)]
+        : [])
+    );
+
+    const rollupRows = await db
+      .select({
+        timestamp: metricRollups.bucketStart,
+        value: sql<number>`sum(${metricRollups.avgValue} * ${metricRollups.sampleCount}) / nullif(sum(${metricRollups.sampleCount}), 0)`
+      })
+      .from(metricRollups)
+      .where(rollupsWhere)
+      .groupBy(metricRollups.bucketStart)
+      .orderBy(metricRollups.bucketStart);
+
+    const metricColumn =
+      metricType === 'cpu'
+        ? deviceMetrics.cpuPercent
+        : metricType === 'memory'
+          ? deviceMetrics.ramPercent
+          : deviceMetrics.diskPercent;
+
+    const metricsWhere = and(
+      gte(deviceMetrics.timestamp, rangeStart),
+      ...(metricsOrgCondition ? [metricsOrgCondition] : []),
+      ...(query.deviceId ? [eq(deviceMetrics.deviceId, query.deviceId)] : []),
+      ...(allowedDeviceIds !== null && !query.deviceId && allowedDeviceIds.length > 0
+        ? [inArray(deviceMetrics.deviceId, allowedDeviceIds)]
+        : [])
+    );
+
+    const actualRows = rollupRows.length > 0
+      ? rollupRows
+      : await db
+          .select({
+            timestamp: sql<Date>`date_trunc('day', ${deviceMetrics.timestamp})`,
+            value: sql<number>`avg(${metricColumn})`
+          })
+          .from(deviceMetrics)
+          .innerJoin(devices, eq(deviceMetrics.deviceId, devices.id))
+          .where(metricsWhere)
+          .groupBy(sql`date_trunc('day', ${deviceMetrics.timestamp})`)
+          .orderBy(sql`date_trunc('day', ${deviceMetrics.timestamp})`);
+
+    const actuals = actualRows.map((row) => ({
+      timestamp: row.timestamp instanceof Date ? row.timestamp.toISOString() : String(row.timestamp),
+      value: Number(row.value)
+    }));
+
+    const pointCount = actuals.length;
+    const currentValue = pointCount > 0 ? actuals[pointCount - 1]!.value : 0;
+    let slope = 0;
+    let intercept = currentValue;
+
+    if (pointCount >= 2) {
+      let sumX = 0;
+      let sumY = 0;
+      let sumXY = 0;
+      let sumXX = 0;
+
+      for (let i = 0; i < pointCount; i += 1) {
+        const x = i;
+        const y = actuals[i]!.value;
+        sumX += x;
+        sumY += y;
+        sumXY += x * y;
+        sumXX += x * x;
+      }
+
+      const denominator = pointCount * sumXX - sumX * sumX;
+      if (denominator !== 0) {
+        slope = (pointCount * sumXY - sumX * sumY) / denominator;
+        intercept = (sumY - slope * sumX) / pointCount;
+      }
+    } else if (pointCount === 1) {
+      intercept = actuals[0]!.value;
+    }
+
+    const clampPercent = (value: number) => Math.max(0, Math.min(100, value));
+    const actualSeries = actuals.map((point, index) => ({
+      timestamp: point.timestamp,
+      value: point.value,
+      trend: clampPercent(intercept + slope * index)
+    }));
+
+    const baselineDate = pointCount > 0 ? new Date(actuals[pointCount - 1]!.timestamp) : new Date();
+    const forecastSeries = Array.from({ length: 14 }, (_, index) => {
+      const projectedDate = new Date(baselineDate);
+      projectedDate.setUTCDate(projectedDate.getUTCDate() + index + 1);
+      const trend = clampPercent(intercept + slope * (pointCount + index));
+      return {
+        timestamp: projectedDate.toISOString(),
+        value: trend,
+        trend
+      };
+    });
+
+    return c.json({
+      currentValue,
+      predictions: [...actualSeries, ...forecastSeries],
+      thresholds: undefined
+    });
+  }
+);
+
+analyticsRoutes.get(
+  '/sla',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  zValidator('query', listSlaSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+
+    const conditions: ReturnType<typeof eq>[] = [];
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      conditions.push(eq(slaDefinitionsTable.orgId, auth.orgId));
+    } else if (auth.scope === 'partner') {
+      if (query.orgId) {
+        const hasAccess = await ensureOrgAccess(query.orgId, auth);
+        if (!hasAccess) {
+          return c.json({ error: 'Access to this organization denied' }, 403);
+        }
+        conditions.push(eq(slaDefinitionsTable.orgId, query.orgId));
+      } else {
+        const orgIds = await getOrgIdsForAuth(auth);
+        if (!orgIds || orgIds.length === 0) {
+          return c.json({ data: [], pagination: { page, limit, total: 0 } });
+        }
+        conditions.push(inArray(slaDefinitionsTable.orgId, orgIds));
+      }
+    } else if (query.orgId) {
+      conditions.push(eq(slaDefinitionsTable.orgId, query.orgId));
+    }
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (slaScopeNarrowed(slaScopeAuthFor(perms))) {
+      // A narrowed caller cannot be paginated in SQL: visibility depends on
+      // each definition's target_ids, which no index can express. SLA
+      // definitions are few per org, so fetch the org's set, apply the site
+      // gate, then paginate in memory — the total stays honest.
+      const allRows = await db
+        .select()
+        .from(slaDefinitionsTable)
+        .where(whereCondition)
+        .orderBy(desc(slaDefinitionsTable.updatedAt), desc(slaDefinitionsTable.id));
+      const visible = await filterSlaDefinitionsForSiteScope(auth.orgId, perms, allRows);
+      return c.json({
+        data: visible.slice(offset, offset + limit),
+        pagination: { page, limit, total: visible.length }
+      });
+    }
+
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(slaDefinitionsTable)
+      .where(whereCondition);
+    const total = Number(countResult[0]?.count ?? 0);
+
+    const pageData = await db
+      .select()
+      .from(slaDefinitionsTable)
+      .where(whereCondition)
+      .orderBy(desc(slaDefinitionsTable.updatedAt), desc(slaDefinitionsTable.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: pageData,
+      pagination: { page, limit, total }
+    });
+  }
+);
+
+analyticsRoutes.post(
+  '/sla',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsWrite,
+  requireMfa(),
+  zValidator('json', createSlaSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const data = c.req.valid('json');
+
+    let orgId = data.orgId;
+
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      orgId = auth.orgId;
+    } else if (auth.scope === 'partner') {
+      if (!orgId) {
+        const singleOrg = auth.accessibleOrgIds?.[0];
+        if (auth.accessibleOrgIds?.length === 1 && singleOrg) {
+          orgId = singleOrg;
+        } else {
+          return c.json({ error: 'orgId is required when partner has multiple organizations' }, 400);
+        }
+      }
+      const hasAccess = await ensureOrgAccess(orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+    } else if (auth.scope === 'system') {
+      if (!orgId) {
+        return c.json({ error: 'orgId is required for system scope' }, 400);
+      }
+    }
+
+    const [sla] = await db
+      .insert(slaDefinitionsTable)
+      .values({
+        orgId: orgId as string,
+        name: data.name,
+        description: data.description,
+        uptimeTarget: data.uptimeTarget,
+        responseTimeTarget: data.responseTimeTarget,
+        resolutionTimeTarget: data.resolutionTimeTarget,
+        measurementWindow: data.measurementWindow,
+        targetType: data.targetType,
+        targetIds: data.targetIds,
+        excludeMaintenanceWindows: data.excludeMaintenanceWindows,
+        excludeWeekends: data.excludeWeekends,
+        enabled: true
+      })
+      .returning();
+    if (!sla) {
+      return c.json({ error: 'Failed to create SLA definition' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: sla.orgId,
+      action: 'analytics.sla.create',
+      resourceType: 'sla_definition',
+      resourceId: sla.id,
+      resourceName: sla.name
+    });
+
+    return c.json(sla, 201);
+  }
+);
+
+analyticsRoutes.get(
+  '/sla/:id/compliance',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const slaId = c.req.param('id')!;
+    const [sla] = await db
+      .select()
+      .from(slaDefinitionsTable)
+      .where(eq(slaDefinitionsTable.id, slaId))
+      .limit(1);
+
+    if (!sla) {
+      return c.json({ error: 'SLA definition not found' }, 404);
+    }
+
+    const hasAccess = await ensureOrgAccess(sla.orgId, auth);
+    if (!hasAccess) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    // Org access is not site access: a definition targeting sites or devices
+    // this caller cannot reach stays hidden (same gate as GET /analytics/sla).
+    const compliancePerms = c.get('permissions') as UserPermissions | undefined;
+    const visibleSla = await filterSlaDefinitionsForSiteScope(sla.orgId, compliancePerms, [sla]);
+    if (visibleSla.length === 0) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
+
+    const history = await db
+      .select()
+      .from(slaComplianceTable)
+      .where(eq(slaComplianceTable.slaId, slaId))
+      .orderBy(desc(slaComplianceTable.periodEnd))
+      .limit(12);
+
+    const now = new Date();
+    const measurementWindow = sla.measurementWindow ?? 'monthly';
+    const since = new Date(now);
+    if (measurementWindow === 'daily') {
+      since.setDate(since.getDate() - 1);
+    } else if (measurementWindow === 'weekly') {
+      since.setDate(since.getDate() - 7);
+    } else {
+      since.setMonth(since.getMonth() - 1);
+    }
+
+    const [onlineCountResult] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(devices)
+      .where(
+        and(
+          eq(devices.orgId, sla.orgId),
+          eq(devices.isEphemeral, false),
+          eq(devices.status, 'online'),
+          gte(devices.lastSeenAt, since)
+        )
+      );
+
+    const [totalCountResult] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(devices)
+      .where(
+        and(
+          eq(devices.orgId, sla.orgId),
+          eq(devices.isEphemeral, false),
+          ne(devices.status, 'decommissioned')
+        )
+      );
+
+    const onlineCount = Number(onlineCountResult?.count ?? 0);
+    const totalCount = Number(totalCountResult?.count ?? 0);
+    const liveUptime = totalCount > 0 ? (onlineCount / totalCount) * 100 : null;
+
+    return c.json({
+      slaId,
+      name: sla.name,
+      uptimeTarget: sla.uptimeTarget,
+      liveUptime,
+      history
+    });
+  }
+);
+
+// ============================================
+// EXECUTIVE SUMMARY
+// ============================================
+
+analyticsRoutes.get(
+  '/executive-summary',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  zValidator('query', executiveSummarySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const orgCondition =
+      typeof auth?.orgCondition === 'function'
+        ? auth.orgCondition(devices.orgId)
+        : auth?.orgId
+          ? eq(devices.orgId, auth.orgId)
+          : undefined;
+
+    try {
+      // Device counts by status (exclude decommissioned)
+      const statusCondition = and(
+        ne(devices.status, 'decommissioned'),
+        eq(devices.isEphemeral, false),
+        orgCondition,
+      );
+      const statusCounts = await db
+        .select({
+          status: devices.status,
+          count: sql<number>`count(*)`,
+        })
+        .from(devices)
+        .where(statusCondition)
+        .groupBy(devices.status);
+
+      let total = 0;
+      let online = 0;
+      let offline = 0;
+      let pending = 0;
+      for (const row of statusCounts) {
+        const n = Number(row.count);
+        total += n;
+        if (row.status === 'online') online = n;
+        if (row.status === 'offline' || row.status === 'maintenance') offline += n;
+        if (row.status === 'pending') pending = n;
+      }
+
+      // Weekly enrollment trend (last 12 weeks)
+      const twelveWeeksAgo = new Date(Date.now() - 12 * 7 * 24 * 60 * 60 * 1000);
+      const weeklyTrendCondition = and(
+        gte(devices.enrolledAt, twelveWeeksAgo),
+        eq(devices.isEphemeral, false),
+        orgCondition,
+      );
+      const weeklyTrend = await db
+        .select({
+          week: sql<string>`date_trunc('week', ${devices.enrolledAt})`.as('week'),
+          count: sql<number>`count(*)`,
+        })
+        .from(devices)
+        .where(weeklyTrendCondition)
+        .groupBy(sql`date_trunc('week', ${devices.enrolledAt})`)
+        .orderBy(sql`date_trunc('week', ${devices.enrolledAt})`);
+
+      const trendData = weeklyTrend.map((row) => ({
+        timestamp: row.week,
+        value: Number(row.count),
+      }));
+
+      return c.json({
+        data: {
+          periodType: query.periodType ?? 'monthly',
+          devices: { total, online, offline, pending },
+          totalDevices: total,
+          onlineDevices: online,
+          offlineDevices: offline,
+          pendingDevices: pending,
+          trendData,
+          trendLabel: 'Weekly enrollments',
+          highlights: [],
+          metrics: [],
+        },
+      });
+    } catch (err) {
+      // Previously this swallowed every error and returned a fully-zeroed body
+      // as HTTP 200, making a failed dashboard indistinguishable from a genuinely
+      // empty org (no alert, no log). Surface the failure instead (issue #1608).
+      captureException(err, c);
+      console.error('[Analytics] executive-summary failed for org %s:', auth?.orgId ?? 'unknown', err);
+      return c.json({ error: 'Failed to load executive summary' }, 500);
+    }
+  }
+);
+
+// ============================================
+// OS DISTRIBUTION
+// ============================================
+
+analyticsRoutes.get(
+  '/os-distribution',
+  requireScope('organization', 'partner', 'system'),
+  requireAnalyticsRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const orgCondition =
+      typeof auth?.orgCondition === 'function'
+        ? auth.orgCondition(devices.orgId)
+        : auth?.orgId
+          ? eq(devices.orgId, auth.orgId)
+          : undefined;
+
+    try {
+      // Group by osType + osVersion for granularity
+      const osDistributionCondition = and(
+        ne(devices.status, 'decommissioned'),
+        eq(devices.isEphemeral, false),
+        orgCondition,
+      );
+      const rows = await db
+        .select({
+          osType: devices.osType,
+          osVersion: devices.osVersion,
+          count: sql<number>`count(*)`,
+        })
+        .from(devices)
+        .where(osDistributionCondition)
+        .groupBy(devices.osType, devices.osVersion)
+        .orderBy(sql`count(*) desc`);
+
+      if (rows.length > 0) {
+        return c.json(
+          rows.map((r) => ({
+            name: `${r.osType} ${r.osVersion}`.trim(),
+            value: Number(r.count),
+          }))
+        );
+      }
+
+      return c.json([]);
+    } catch (err) {
+      // The success path already returns [] for a genuinely-empty result, so this
+      // catch only ever masked real failures as an empty-but-OK 200 (issue #1608).
+      captureException(err, c);
+      console.error('[Analytics] os-distribution failed for org %s:', auth?.orgId ?? 'unknown', err);
+      return c.json({ error: 'Failed to load OS distribution' }, 500);
+    }
+  }
+);

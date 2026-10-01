@@ -1,0 +1,200 @@
+import { showToast } from '../components/shared/Toast';
+import { extractApiError, isApiFailure } from './apiError';
+import { dispatchTrustDenied, isTrustDenial } from './trustProbation';
+import { i18n } from './i18n';
+
+export class ActionError extends Error {
+  code?: string;
+  status: number;
+  /** Parsed response body, when the failure carried one. Routes that return
+   *  structured detail with their error (e.g. a 409 listing what blocks a
+   *  delete) would otherwise have it thrown away, leaving the UI unable to
+   *  tell the user WHY. Undefined for network failures and 401s. */
+  body?: unknown;
+  constructor(message: string, status: number, code?: string, body?: unknown) {
+    super(message);
+    this.name = 'ActionError';
+    this.status = status;
+    this.code = code;
+    this.body = body;
+  }
+}
+
+export interface RunActionOptions<T> {
+  request: () => Promise<Response>;
+  errorFallback: string;
+  successMessage?: string | ((data: T) => string);
+  parseSuccess?: (data: unknown) => T;
+  /** Maps a machine error token to user-facing copy. Called with `body.code`
+   *  when present, otherwise with `body.error` — routes that only emit a bare
+   *  `{ error: 'some_token' }` (e.g. the approvals decide route's
+   *  `step_up_required`) would otherwise toast the raw token verbatim.
+   *  The second argument is the extracted message; the third is the parsed
+   * response body for structured details such as a minimum agent version. */
+  friendly?: (code: string, message: string, body?: unknown) => string | undefined;
+  onUnauthorized?: () => void;
+  /**
+   * Opt in to treating a 401 as a normal, toastable failure instead of "your
+   * session expired". Required by routes that proxy a *downstream* 401 —
+   * `/mobile/approvals/:id/(approve|deny)` answers 401 for `assertion_failed`
+   * and `reauth_required`, which are WebAuthn-proof rejections, not session
+   * expiry. Without this the failure is swallowed silently (see the 401 branch
+   * below). Default false, so every pre-existing caller is unchanged.
+   */
+  treatUnauthorizedAsError?: boolean;
+}
+
+function isZodValidationFailure(data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false;
+
+  const body = data as Record<string, unknown>;
+
+  // Current shared zValidator contract:
+  // { error: string, details: { formErrors: [], fieldErrors: {} } }
+  const details = body.details;
+  if (details && typeof details === 'object' && !Array.isArray(details)) {
+    const flattened = details as Record<string, unknown>;
+    if (
+      Array.isArray(flattened.formErrors) &&
+      flattened.fieldErrors !== null &&
+      typeof flattened.fieldErrors === 'object' &&
+      !Array.isArray(flattened.fieldErrors)
+    ) {
+      return true;
+    }
+  }
+
+  // Legacy/raw ZodError shapes kept for older deployed APIs.
+  const error = body.error;
+  if (error && typeof error === 'object' && !Array.isArray(error)) {
+    const zodError = error as Record<string, unknown>;
+    if (zodError.name === 'ZodError' || Array.isArray(zodError.issues)) {
+      return true;
+    }
+  }
+
+  return Array.isArray(body.issues);
+}
+
+export async function runAction<T = unknown>(opts: RunActionOptions<T>): Promise<T> {
+  let response: Response;
+  try {
+    response = await opts.request();
+  } catch {
+    showToast({ message: opts.errorFallback, type: 'error' });
+    throw new ActionError(opts.errorFallback, 0);
+  }
+
+  // 401: session expired. Intentionally no error toast — onUnauthorized (a
+  // redirect to /login in the targeted callers) IS the feedback; a toast on
+  // top of a navigation is noise. Spec: 2026-05-15-ws-a-action-feedback-design.md
+  // Caveat: this assumes 401 always means "your session expired". An endpoint
+  // that proxies a *downstream* 401 (e.g. an approve rejected because the
+  // WebAuthn assertion failed) would be silently swallowed here — such callers
+  // must pass `treatUnauthorizedAsError` so the body-based branch below toasts
+  // the real reason.
+  if (response.status === 401 && !opts.treatUnauthorizedAsError) {
+    if (opts.onUnauthorized) opts.onUnauthorized();
+    throw new ActionError('Unauthorized', 401);
+  }
+
+  const data: unknown = await response.json().catch(() => null);
+
+  if (isApiFailure(data, response.status)) {
+    let message = extractApiError(data, opts.errorFallback);
+    const code = (data && typeof data === 'object'
+      ? (data as Record<string, unknown>).code
+      : undefined) as string | undefined;
+    // Fall back to `error` for the friendly lookup only — ActionError.code keeps
+    // its original meaning so existing consumers are unaffected. Routes that
+    // return a machine token in `error` with no `code` (approvals decide:
+    // `step_up_required`) would otherwise toast that token verbatim.
+    const errorToken = (data && typeof data === 'object'
+      ? (data as Record<string, unknown>).error
+      : undefined);
+    const friendlyKey = code ?? (typeof errorToken === 'string' ? errorToken : undefined);
+    // Additive i18n by error code (Phase-3 Task 3): when the API rides a `code`
+    // and we have an `errors:<CODE>` translation loaded, use it as the default
+    // message. Falls through to server prose when the key is absent. Placed
+    // BEFORE the `friendly` hook so a per-call friendly() still overrides it.
+    // i18n-dynamic: code is a runtime value, keyUsage can't scan it statically.
+    if (code && i18n.exists(`errors:${code}`)) {
+      message = i18n.t(/* i18n-dynamic */ `errors:${code}`);
+    }
+    let friendlyApplied = false;
+    if (friendlyKey && opts.friendly) {
+      const friendly = opts.friendly(friendlyKey, message, data);
+      if (friendly) {
+        message = friendly;
+        friendlyApplied = true;
+      }
+    }
+    // Validation envelope (Phase-3 Step 4 of #3859): on a Zod 400 with no `code` and
+    // no per-call friendly(), the message from extractApiError is the specific
+    // field text. Per #1976 that specific text must stay the high-contrast
+    // `message` (the user sees exactly which field failed); the translated
+    // VALIDATION_FAILED headline rides as the low-contrast `detail` second line.
+    // Only when there is no specific field text does the translated headline
+    // become the message itself. Scoped to 400-without-code as agreed on #5692.
+    let detail: string | undefined;
+    if (
+      response.status === 400 &&
+      isZodValidationFailure(data) &&
+      !code &&
+      !friendlyApplied &&
+      i18n.exists('errors:VALIDATION_FAILED')
+    ) {
+      const headline = i18n.t('errors:VALIDATION_FAILED');
+      const specific = message && message !== opts.errorFallback ? message : undefined;
+      if (specific) {
+        message = specific;
+        detail = headline;
+      } else {
+        message = headline;
+      }
+    }
+    if (response.status === 403 && isTrustDenial(data)) {
+      // Best-effort UI handoff: if a mounted TrustProbationBanner picks this
+      // up (it calls preventDefault()), it owns showing the denial and a
+      // generic toast on top would be redundant noise. If nothing handled
+      // it — the banner isn't mounted on this page — fall back to the
+      // normal error toast so the failure is never silent.
+      const handled = dispatchTrustDenied(data);
+      if (!handled) showToast({ message, ...(detail !== undefined ? { detail } : {}), type: 'error' });
+    } else {
+      showToast({ message, ...(detail !== undefined ? { detail } : {}), type: 'error' });
+    }
+    throw new ActionError(message, response.status, code, data);
+  }
+
+  let result: T;
+  try {
+    result = (opts.parseSuccess ? opts.parseSuccess(data) : (data as T));
+  } catch {
+    showToast({ message: opts.errorFallback, type: 'error' });
+    throw new ActionError(opts.errorFallback, response.status);
+  }
+  if (opts.successMessage) {
+    let msg: string | undefined;
+    try {
+      msg = typeof opts.successMessage === 'function' ? opts.successMessage(result) : opts.successMessage;
+    } catch (e) {
+      // The action genuinely succeeded — a bug in the message formatter must
+      // not turn that into total silence (the exact symptom WS-A targets).
+      // Fall back to a generic success toast so the user still gets feedback,
+      // and surface the formatter bug so it's debuggable rather than invisible.
+      console.error('[runAction] successMessage formatter threw; using generic success toast', e);
+      msg = 'Done';
+    }
+    if (msg) showToast({ message: msg, type: 'success' });
+  }
+  return result;
+}
+
+/** Standard catch handler for runAction callers: 401s are handled by the auth
+ *  redirect, other ActionErrors were already toasted by runAction, anything
+ *  else gets the fallback toast. */
+export function handleActionError(err: unknown, fallback: string): void {
+  if (err instanceof ActionError && err.status === 401) return;
+  if (!(err instanceof ActionError)) showToast({ message: fallback, type: 'error' });
+}

@@ -1,0 +1,7 @@
+---
+// Ticketing integration (Zendesk/Freshdesk/ServiceNow) is superseded by the PSA
+// Connections system (Jira/ServiceNow/ConnectWise/Autotask/Freshservice/Zendesk)
+// on the /integrations hub. Keep this route as a permanent alias so existing
+// bookmarks / in-app links land on the PSA tab instead of an orphaned page.
+return Astro.redirect('/integrations#psa', 301);
+---

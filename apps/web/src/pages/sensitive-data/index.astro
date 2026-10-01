@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import SensitiveDataPage from '../../components/sensitiveData/SensitiveDataPage';
+---
+
+<DashboardLayout titleKey="titles.sensitiveData">
+  <SensitiveDataPage client:load />
+</DashboardLayout>

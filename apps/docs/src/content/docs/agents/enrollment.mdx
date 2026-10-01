@@ -1,0 +1,132 @@
+---
+title: Enrollment
+description: How Breeze agent enrollment and authentication works, covering the enrollment flow, brz_ token generation, SHA-256 hashed storage, and validation.
+sidebar:
+  order: 2
+  label: Enrollment
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Enrollment Flow
+
+```
+Agent                                 API Server
+  │                                      │
+  │─── POST /api/v1/agents/enroll ──────►│
+  │    { enrollmentKey, hostname,        │
+  │      osType, architecture,           │
+  │      enrollmentSecret }              │
+  │                                      │
+  │    Validate enrollment secret        │
+  │    Create device record              │
+  │    Generate brz_ token               │
+  │    Hash token (SHA-256) → store      │
+  │    Issue mTLS cert (if configured)   │
+  │                                      │
+  │◄── 201 { authToken, deviceId,   ─────│
+  │         orgId, siteId, mtls? }       │
+  │                                      │
+  │    Store config to disk              │
+  │    Connect WebSocket                 │
+  │                                      │
+  │─── WS /agents/:id/ws ──────────────►│
+  │    Authorization: Bearer brz_...     │
+  │                                      │
+  │◄── { type: "connected" } ────────────│
+  │                                      │
+  │─── { type: "heartbeat", ... } ──────►│
+  │                                      │
+```
+
+### Full Enrollment Response
+
+The `201` response carries more than the `authToken` shown in the diagram above. In full, it is:
+
+```json
+{
+  "agentId": "uuid",
+  "deviceId": "uuid",
+  "authToken": "brz_...",
+  "watchdogAuthToken": "brz_...",
+  "helperAuthToken": "brz_...",
+  "orgId": "uuid",
+  "siteId": "uuid",
+  "backupServerUrl": "https://backup.example.com",
+  "config": { "heartbeatIntervalSeconds": 60, "metricsCollectionIntervalSeconds": 30 },
+  "mtls": { "...": "..." },
+  "manifestTrustKeys": [ "..." ],
+  "manifestKeyDelegations": [ "..." ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `watchdogAuthToken` | Separate `brz_` token for [`breeze-watchdog`](/agents/building/#other-agent-binaries) to authenticate its own restart-monitoring calls. |
+| `helperAuthToken` | Separate token for the [Helper](/agents/helper/) process -- distinct from the agent's own `authToken`. |
+| `backupServerUrl` | Present only when `AGENT_BACKUP_SERVER_URL` is configured server-side; tells `breeze-backup` where to ship vault data. |
+| `manifestTrustKeys` / `manifestKeyDelegations` | The current release-artifact signing trust keyset and any active key delegations, used to verify signed agent updates. See [Sign Your Own Agent Packages](/deploy/sign-your-own-packages/). |
+
+## Token Security
+
+Agent tokens follow the `brz_` prefix convention:
+
+- **Generation**: Cryptographically random, 32-byte hex string with `brz_` prefix
+- **Storage (server)**: Only the SHA-256 hash is stored in the `agentTokenHash` column
+- **Storage (agent)**: The raw token is stored in `secrets.yaml` with `0600` permissions (the main `agent.yaml` config uses `0644` so the Helper can read it)
+- **Validation**: API hashes incoming tokens and compares against stored hash
+- **Same pattern as API keys** (`apiKeyAuth.ts`)
+
+<Aside>
+  The `agentTokenHash` column is nullable to support migration of pre-existing devices. New enrollments always populate the hash.
+</Aside>
+
+## Enrollment Keys
+
+Enrollment keys are created in the dashboard and can be scoped to:
+
+- **Organization** — devices enroll into a specific org
+- **Site** — devices enroll into a specific site within an org
+- **Expiry** — keys expire after a configurable TTL (default: 30 days, via `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES`)
+- **Usage limit** — keys can be limited to a number of uses
+
+## Bulk Enrollment
+
+For deploying agents at scale from a script:
+
+```bash
+# Keep the enrollment secret out of the command line / shell history.
+# BREEZE_AGENT_ENROLLMENT_SECRET is the only environment variable the
+# agent reads — there is no server-URL env var.
+export BREEZE_AGENT_ENROLLMENT_SECRET=your-secret
+
+breeze-agent enroll YOUR_ENROLLMENT_KEY --server https://breeze.yourdomain.com
+```
+
+The enrollment key is a required positional argument, and the server URL must
+come from the `--server` flag (or an existing `agent.yaml` on a pre-staged
+image — see
+[Pre-Staging Without Enrollment](/agents/advanced-install/#pre-staging-without-enrollment)).
+The site is determined by the enrollment key on the server side. The agent
+reads `BREEZE_AGENT_ENROLLMENT_SECRET` from the environment when the
+`--enrollment-secret` flag isn't provided.
+
+For fleet-wide rollout recipes (GPO, Intune, JAMF, Ansible), see the
+[Mass Deployment guide](/migration/mass-deployment/).
+
+## Re-enrollment
+
+If an agent's token is compromised or the device needs to be reassigned:
+
+1. **Revoke the device** in the dashboard (invalidates the token hash)
+2. **Delete the config** on the device:
+   - Linux: `sudo rm /etc/breeze/agent.yaml /etc/breeze/secrets.yaml`
+   - macOS: `sudo rm "/Library/Application Support/Breeze/agent.yaml" "/Library/Application Support/Breeze/secrets.yaml"`
+   - Windows: `Remove-Item C:\ProgramData\Breeze\agent.yaml, C:\ProgramData\Breeze\secrets.yaml`
+3. **Re-enroll**: `sudo breeze-agent enroll YOUR_ENROLLMENT_KEY --server ... --enrollment-secret ...`
+
+### Reusing a hostname for a decommissioned device
+
+When a device row is **decommissioned** in the dashboard, the original device id is retired but the hostname is free to be claimed again. Running `breeze-agent enroll` from a new install on the same hostname creates a fresh device record (new id, new token) rather than failing with a hostname collision. The decommissioned row stays in audit history for compliance — the new device is treated as a distinct asset from day one.
+
+The only exception is if the decommissioned device's token was suspended for a security reason (for example, a cross-tenant access probe). In that case re-enrollment is blocked with a `409 Conflict` until an administrator reviews the previous incident. The response includes the reason so the technician on-site knows to escalate rather than retry.

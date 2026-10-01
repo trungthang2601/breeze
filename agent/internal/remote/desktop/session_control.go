@@ -1,0 +1,643 @@
+package desktop
+
+import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/logging"
+	"github.com/breeze-rmm/agent/internal/sessionbroker"
+)
+
+const (
+	maxInputMessageBytes   = 8 * 1024
+	maxControlMessageBytes = 32 * 1024
+)
+
+// verifySecureDesktopTransition checks whether the session moved to a secure
+// desktop shortly after a SAS request. This is a best-effort verification
+// signal for diagnostics; SendSAS itself is a void API and cannot confirm
+// effect directly.
+func (s *Session) verifySecureDesktopTransition(timeout time.Duration) (supported bool, transitioned bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.mu.RLock()
+		cap := s.capturer
+		s.mu.RUnlock()
+
+		dsn, ok := cap.(DesktopSwitchNotifier)
+		if !ok {
+			return false, false
+		}
+		if dsn.OnSecureDesktop() {
+			return true, true
+		}
+		if time.Now().After(deadline) {
+			return true, false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// sendInputStatus waits for the control data channel to become available and
+// sends an input_status message to the viewer indicating that input injection
+// is unavailable. Called asynchronously from startStreaming.
+func (s *Session) sendInputStatus() {
+	// Wait up to 5 seconds for the control DC to be set by the viewer.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.mu.RLock()
+		dc := s.controlDC
+		active := s.isActive
+		s.mu.RUnlock()
+
+		if !active {
+			return
+		}
+
+		if dc != nil {
+			msg, err := json.Marshal(map[string]any{
+				"type":      "input_status",
+				"available": false,
+				"reason":    "IOHIDSystem unavailable at login window",
+			})
+			if err != nil {
+				slog.Error("Failed to marshal input_status message", "session", s.id, "error", err.Error())
+				return
+			}
+			if err := dc.SendText(string(msg)); err != nil {
+				slog.Warn("Failed to send input_status to viewer", "session", s.id, "error", err.Error())
+			} else {
+				slog.Info("Sent input_status to viewer: input unavailable", "session", s.id)
+			}
+			return
+		}
+
+		if time.Now().After(deadline) {
+			slog.Warn("Control DC not available within timeout, could not send input_status", "session", s.id)
+			return
+		}
+
+		select {
+		case <-s.done:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// recordInputActivity stamps the idle-watchdog clock with the current time.
+// Called ONLY for genuine operator input (mouse/keyboard), never for
+// control-channel traffic — see lastInputUnixNano in session.go for why.
+func (s *Session) recordInputActivity() {
+	s.lastInputUnixNano.Store(time.Now().UnixNano())
+}
+
+// onViewerDataChannelMessage routes an inbound viewer data-channel message by
+// label and applies the idle-watchdog policy in one place. Idle is reset on
+// "input" traffic only: control-channel traffic (e.g. the viewer's automated
+// ~1s viewer_stats heartbeat) is not a signal of operator presence, so letting
+// it reset the idle clock would defeat the idle timeout for any open-but-
+// unattended viewer (finding #1).
+func (s *Session) onViewerDataChannelMessage(label string, data []byte) {
+	switch label {
+	case "input":
+		s.recordInputActivity()
+		s.handleInputMessage(data)
+	case "control":
+		s.handleControlMessage(data)
+	}
+}
+
+// handleInputMessage processes input events from the data channel
+func (s *Session) handleInputMessage(data []byte) {
+	// Drop input events early when the handler cannot inject them (e.g. macOS
+	// login window without IOHIDSystem). The viewer is notified once via
+	// sendInputStatus(); no need to log per-event.
+	if !s.inputHandler.InputAvailable() {
+		return
+	}
+
+	if len(data) > maxInputMessageBytes {
+		slog.Warn("Rejected oversized input event", "session", s.id, "size", len(data))
+		return
+	}
+
+	var event InputEvent
+	if err := json.Unmarshal(data, &event); err != nil {
+		slog.Warn("Failed to parse input event", "session", s.id, "error", err.Error())
+		return
+	}
+
+	// Signal the capture loop that the user is active so it exits idle mode
+	// and polls at full speed. This covers mouse_move, key_down, scroll, etc.
+	s.inputActive.Store(true)
+
+	// On mouse down, signal the capture loop to flush the encoder pipeline so
+	// stale buffered frames are dropped and the click result appears immediately.
+	// NOTE: disabled for now — on AMF this forces an IDR keyframe on the next
+	// frame, which is visibly larger than a P-frame and causes a brief
+	// whole-screen glitch/quality drop every click. The click result still
+	// appears promptly because inputActive above wakes the capture loop.
+	// if event.Type == "mouse_down" {
+	// 	s.clickFlush.Store(true)
+	// }
+
+	if err := s.inputHandler.HandleEvent(event); err != nil {
+		slog.Warn("Failed to handle input event", "session", s.id, "error", err.Error())
+	}
+}
+
+// buildInputCapabilities is the body of the input_capabilities reply.
+//
+// typeText says this agent understands the type_text control message at all.
+// Agents that predate it have no case for the request and no default branch, so
+// they never reply; the viewer reads "no reply" as "not supported" and keeps
+// using per-character key synthesis. That fallback is why an updated viewer
+// talking to an old agent still pastes the way it does today rather than
+// pasting nothing at all.
+func buildInputCapabilities() map[string]any {
+	return map[string]any{
+		"type":     "input_capabilities",
+		"typeText": true,
+	}
+}
+
+// typeTextResult reports a paste that did not fully land. There is no success
+// message: silence means the text was injected.
+//
+// Without this the operator has no way to know. The viewer's progress indicator
+// runs to completion on send, not on delivery, so a paste dropped at the login
+// window or truncated by a failing SendInput would finish looking identical to
+// one that worked — and the operator would go on believing the remote machine
+// holds what their clipboard holds.
+func typeTextResult(reason, detail string) map[string]any {
+	body := map[string]any{
+		"type":   "type_text_result",
+		"ok":     false,
+		"reason": reason,
+	}
+	if detail != "" {
+		body["error"] = detail
+	}
+	return body
+}
+
+// sendControlJSON marshals body and sends it on the control channel if the
+// viewer has attached one. Dropping the message when it has not is correct:
+// every control reply is an answer to something the viewer asked for.
+func (s *Session) sendControlJSON(body map[string]any) {
+	resp, err := json.Marshal(body)
+	if err != nil {
+		slog.Warn("Failed to marshal control message", "session", s.id, "type", body["type"], "error", err.Error())
+		return
+	}
+
+	s.mu.RLock()
+	dc := s.controlDC
+	s.mu.RUnlock()
+	if dc == nil {
+		return
+	}
+	if err := dc.SendText(string(resp)); err != nil {
+		slog.Debug("Failed to send control message", "session", s.id, "type", body["type"], "error", err.Error())
+	}
+}
+
+// handleTypeText injects a literal string on the remote machine — the viewer's
+// "Paste Text" action (issue #4089).
+//
+// Two deliberate departures from the surrounding code:
+//
+//  1. It rides the CONTROL channel, not the input channel. The input channel is
+//     created with maxRetransmits: 0 (apps/viewer/src/lib/webrtc.ts) so a lost
+//     datagram is never retransmitted; that is the right trade for a mouse move
+//     and the wrong one for a paste, where a single dropped message silently
+//     truncates a shell command. The control channel is reliable.
+//  2. It stamps the idle watchdog, which control traffic otherwise must not do
+//     (see onViewerDataChannelMessage). A paste is genuine operator presence,
+//     unlike the viewer's automated viewer_stats heartbeat.
+//
+// The text itself is never logged, and never echoed back to the viewer: a paste
+// can carry a password or a token.
+func (s *Session) handleTypeText(data []byte) {
+	// Same early drop as handleInputMessage — nothing can be injected at the
+	// macOS login window without IOHIDSystem. Unlike the input path, this one
+	// tells the viewer, because a paste that vanishes is not something the
+	// operator can notice on their own.
+	if !s.inputHandler.InputAvailable() {
+		s.sendControlJSON(typeTextResult("input_unavailable", ""))
+		return
+	}
+
+	var msg struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		slog.Warn("Failed to parse type_text message", "session", s.id, "error", err.Error())
+		s.sendControlJSON(typeTextResult("malformed", ""))
+		return
+	}
+	if msg.Text == "" {
+		return
+	}
+
+	s.recordInputActivity()
+	s.inputActive.Store(true)
+
+	if err := InjectText(s.inputHandler, msg.Text); err != nil {
+		// InjectText's messages are content-free by construction (see its doc
+		// comment), so this is safe to log and to return to the viewer.
+		slog.Warn("Text injection incomplete",
+			"session", s.id, "bytes", len(msg.Text), "error", err.Error())
+		s.sendControlJSON(typeTextResult("injection_failed", err.Error()))
+	}
+}
+
+// handleBlockLocalInput engages or releases blocking of the local physical
+// keyboard/mouse on the target for this session (issue #966) and reports the
+// outcome to the viewer via a block_local_input_result control message.
+//
+// Per-session refcount safety: this session adjusts the InputBlockManager's
+// refcount at most once (engage) and releases it at most once (here or in
+// doCleanup), guarded by s.localInputBlocked. Toggling on when already on, or
+// off when already off, is a no-op that still re-reports current status.
+func (s *Session) handleBlockLocalInput(block bool) {
+	var (
+		supported = true
+		ok        = true
+		errMsg    string
+	)
+
+	if block {
+		// Engage only if this session isn't already holding a block.
+		if s.localInputBlocked.Load() {
+			supported = GetInputBlockManager().Supported()
+		} else {
+			sup, err := GetInputBlockManager().Engage()
+			supported = sup
+			if err != nil {
+				ok = false
+				errMsg = err.Error()
+				slog.Warn("Failed to block local input", "session", s.id, "error", errMsg)
+			} else if sup {
+				s.localInputBlocked.Store(true)
+				slog.Info("Local input blocked for session", "session", s.id)
+			} else {
+				slog.Info("Local input blocking not supported on this platform", "session", s.id)
+			}
+		}
+	} else {
+		supported = GetInputBlockManager().Supported()
+		// Release only if this session is currently holding a block.
+		if s.localInputBlocked.CompareAndSwap(true, false) {
+			if err := GetInputBlockManager().Release(); err != nil {
+				ok = false
+				errMsg = err.Error()
+				slog.Warn("Failed to release local-input block", "session", s.id, "error", errMsg)
+			} else {
+				slog.Info("Local input unblocked for session", "session", s.id)
+			}
+		}
+	}
+
+	// blocked reflects the resulting per-session state the viewer should show.
+	blocked := s.localInputBlocked.Load()
+	body := map[string]any{
+		"type":      "block_local_input_result",
+		"supported": supported,
+		"blocked":   blocked,
+		"ok":        ok,
+	}
+	if errMsg != "" {
+		body["error"] = errMsg
+	}
+	resp, err := json.Marshal(body)
+	if err != nil {
+		slog.Warn("Failed to marshal block_local_input_result", "session", s.id, "error", err.Error())
+		return
+	}
+	s.mu.RLock()
+	dc := s.controlDC
+	s.mu.RUnlock()
+	if dc != nil {
+		if err := dc.SendText(string(resp)); err != nil {
+			slog.Debug("Failed to send block_local_input_result", "session", s.id, "error", err.Error())
+		}
+	}
+}
+
+// handleControlMessage processes control messages (bitrate, quality changes)
+func (s *Session) handleControlMessage(data []byte) {
+	if len(data) > maxControlMessageBytes {
+		slog.Warn("Rejected oversized control message", "session", s.id, "size", len(data))
+		return
+	}
+
+	var msg struct {
+		Type  string `json:"type"`
+		Value int    `json:"value"`
+	}
+	if err := json.Unmarshal(data, &msg); err != nil {
+		slog.Warn("Failed to parse control message", "session", s.id, "error", err.Error())
+		return
+	}
+
+	// Absolute ceiling a viewer-requested bitrate may reach. Tracks the 4K
+	// resolution ceiling (and the BREEZE_REMOTE_MAX_BITRATE_BPS override) so a
+	// viewer quality slider can climb to the full 4K rate — the previous hard
+	// 20 Mbps cap silently truncated higher 4K requests (#1410).
+	maxBitrateCap := viewerBitrateHardCap()
+	switch msg.Type {
+	case "set_bitrate":
+		if msg.Value > 0 {
+			// Clamp to the hard cap rather than silently dropping an
+			// above-cap request — silently ignoring higher requests is the
+			// exact truncation #1410 set out to fix. A request below the cap
+			// is honored as-is; one above it is honored at the cap.
+			bitrate := msg.Value
+			if bitrate > maxBitrateCap {
+				slog.Debug("Clamping requested bitrate to hard cap",
+					"session", s.id, "requested", msg.Value, "cap", maxBitrateCap)
+				bitrate = maxBitrateCap
+			}
+			// Update the adaptive controller's ceiling so it ramps up to
+			// the user-chosen max rather than bypassing adaptive entirely.
+			if s.adaptive != nil {
+				s.adaptive.SetMaxBitrate(bitrate)
+			} else {
+				if enc := s.encoder.Load(); enc != nil {
+					if err := enc.SetBitrate(bitrate); err != nil {
+						slog.Warn("Failed to set bitrate", "session", s.id, "bitrate", bitrate, "error", err.Error())
+					}
+				}
+			}
+		} else {
+			slog.Debug("Ignoring non-positive set_bitrate request", "session", s.id, "value", msg.Value)
+		}
+	case "set_fps":
+		if msg.Value > 0 && msg.Value <= maxFrameRate {
+			if s.adaptive != nil {
+				s.adaptive.SetMaxFPS(msg.Value)
+			}
+			s.mu.Lock()
+			s.fps = msg.Value
+			s.mu.Unlock()
+			if enc := s.encoder.Load(); enc != nil {
+				if err := enc.SetFPS(msg.Value); err != nil {
+					slog.Warn("Failed to set fps", "session", s.id, "fps", msg.Value, "error", err.Error())
+				}
+			}
+		}
+	case "request_keyframe":
+		// Viewer window regained focus — force IDR so picture is immediately sharp.
+		if enc := s.encoder.Load(); enc != nil {
+			_ = enc.ForceKeyframe()
+		}
+	case "list_sessions":
+		detector := sessionbroker.NewSessionDetector()
+		detected, err := detector.ListSessions()
+		if err != nil {
+			slog.Warn("Failed to list sessions", "session", s.id, "error", err.Error())
+			return
+		}
+		items := sessionbroker.BuildSessionInfoItems(detected, nil)
+		resp, _ := json.Marshal(map[string]any{
+			"type":     "sessions",
+			"sessions": items,
+		})
+		s.mu.RLock()
+		dc := s.controlDC
+		s.mu.RUnlock()
+		if dc != nil {
+			dc.SendText(string(resp))
+		}
+	case "list_monitors":
+		monitors, err := ListMonitors()
+		if err != nil {
+			slog.Warn("Failed to list monitors", "session", s.id, "error", err.Error())
+			return
+		}
+		resp, _ := json.Marshal(map[string]any{
+			"type":     "monitors",
+			"monitors": monitors,
+		})
+		s.mu.RLock()
+		dc := s.controlDC
+		s.mu.RUnlock()
+		if dc != nil {
+			dc.SendText(string(resp))
+		}
+	case "input_capabilities":
+		s.sendControlJSON(buildInputCapabilities())
+	case "type_text":
+		s.handleTypeText(data)
+	case "toggle_audio":
+		enabled := msg.Value != 0
+		s.audioEnabled.Store(enabled)
+		slog.Info("Audio toggled", "session", s.id, "enabled", enabled)
+	case "set_cursor_stream":
+		enabled := msg.Value != 0
+		s.cursorStreamEnabled.Store(enabled)
+		if !enabled {
+			s.mu.RLock()
+			cdc := s.cursorDC
+			s.mu.RUnlock()
+			if cdc != nil {
+				if err := cdc.SendText(`{"v":0}`); err != nil {
+					slog.Debug("Failed to send cursor hide message", "session", s.id, "error", err.Error())
+				}
+			}
+		}
+		slog.Debug("Cursor stream toggled", "session", s.id, "enabled", enabled)
+	case "send_sas":
+		slog.Info("SAS requested via control channel", "session", s.id)
+		// Try service IPC first (Session 0 context), fall back to direct call.
+		var sasErr error
+		verificationSupported := false
+		verified := false
+		if s.sasHandler != nil {
+			sasErr = s.sasHandler()
+			if sasErr != nil {
+				slog.Warn("SAS via service IPC failed, trying direct InvokeSAS", "session", s.id, "error", sasErr.Error())
+				sasErr = InvokeSAS()
+			}
+		} else {
+			sasErr = InvokeSAS()
+		}
+		if sasErr == nil {
+			verificationSupported, verified = s.verifySecureDesktopTransition(1200 * time.Millisecond)
+			if verificationSupported && !verified {
+				slog.Warn("SAS call succeeded but secure desktop transition not observed", "session", s.id)
+			}
+		}
+		ok := sasErr == nil
+		if sasErr != nil {
+			slog.Warn("SendSAS failed (all paths)", "session", s.id, "error", sasErr.Error())
+		}
+		respBody := map[string]any{
+			"type":                  "sas_result",
+			"ok":                    ok,
+			"verificationSupported": verificationSupported,
+			"verified":              verified,
+		}
+		if sasErr != nil {
+			respBody["error"] = sasErr.Error()
+		} else if verificationSupported && !verified {
+			respBody["warning"] = "SAS request sent but secure-desktop transition not observed"
+		}
+		resp, _ := json.Marshal(respBody)
+		s.mu.RLock()
+		dc := s.controlDC
+		s.mu.RUnlock()
+		if dc != nil {
+			dc.SendText(string(resp))
+		}
+	case "block_local_input":
+		// Toggle blocking of the LOCAL physical keyboard/mouse on the target so
+		// the on-site user and the remote operator stop fighting for control
+		// (issue #966). Value != 0 engages, 0 releases. The block auto-releases
+		// on session end (doCleanup), agent crash (OS-level), and a max-duration
+		// watchdog — see input_block.go.
+		s.handleBlockLocalInput(msg.Value != 0)
+	case "lock_workstation":
+		slog.Info("Lock workstation requested via control channel", "session", s.id)
+		lockErr := LockWorkstation()
+		lockOk := lockErr == nil
+		if lockErr != nil {
+			slog.Warn("LockWorkstation failed", "session", s.id, "error", lockErr.Error())
+		}
+		lockBody := map[string]any{
+			"type": "lock_result",
+			"ok":   lockOk,
+		}
+		if lockErr != nil {
+			lockBody["error"] = lockErr.Error()
+		}
+		lockResp, _ := json.Marshal(lockBody)
+		s.mu.RLock()
+		ldc := s.controlDC
+		s.mu.RUnlock()
+		if ldc != nil {
+			ldc.SendText(string(lockResp))
+		}
+	case "viewer_stats":
+		// Viewer-reported WebRTC stats — log and feed into adaptive bitrate as
+		// a fallback when pion's RTCP RemoteInboundRTPStreamStats are unavailable.
+		var vs struct {
+			Type                 string `json:"type"`
+			RTTMs                int    `json:"rttMs"`
+			JitterMs             int    `json:"jitterMs"`
+			PacketsLost          int    `json:"packetsLost"`
+			PacketsLostDelta     int    `json:"packetsLostDelta"`
+			PacketsReceived      int    `json:"packetsReceived"`
+			PacketsReceivedDelta int    `json:"packetsReceivedDelta"`
+			FramesReceived       int    `json:"framesReceived"`
+			FramesDecoded        int    `json:"framesDecoded"`
+			FramesDropped        int    `json:"framesDropped"`
+			FramesDroppedDelta   int    `json:"framesDroppedDelta"`
+			Kbps                 int    `json:"kbps"`
+			ICELocal             string `json:"iceLocal"`
+			ICERemote            string `json:"iceRemote"`
+		}
+		if err := json.Unmarshal(data, &vs); err == nil {
+			// Compute loss fraction from viewer-reported deltas.
+			var lossFraction float64
+			totalDelta := vs.PacketsLostDelta + vs.PacketsReceivedDelta
+			if totalDelta > 0 && vs.PacketsLostDelta > 0 {
+				lossFraction = float64(vs.PacketsLostDelta) / float64(totalDelta)
+			}
+
+			// Frame drops signal jitter-buffer overload even when packet loss is
+			// zero. Treat dropped frames as a loss signal for the adaptive controller.
+			// Use framesDroppedDelta relative to total frame activity in this interval.
+			// Combine packet loss and frame drops into a single congestion signal
+			// using probability union P(A∪B) = P(A)+P(B)-P(A)·P(B).
+			// Jitter is NOT used as a signal — it's a lagging indicator that
+			// doesn't respond to bitrate reduction, causing death spirals.
+			var effectiveLoss float64 = lossFraction
+			if vs.FramesDroppedDelta > 0 {
+				frameLoss := float64(vs.FramesDroppedDelta) / float64(vs.FramesDroppedDelta+vs.FramesDecoded)
+				if vs.FramesDecoded == 0 {
+					frameLoss = 0.5 // significant but not max
+				}
+				effectiveLoss = effectiveLoss + frameLoss - effectiveLoss*frameLoss
+			}
+
+			slog.Info("Viewer WebRTC stats",
+				"session", s.id,
+				"rttMs", vs.RTTMs,
+				"jitterMs", vs.JitterMs,
+				"pktLost", vs.PacketsLost,
+				"pktLostDelta", vs.PacketsLostDelta,
+				"pktRcvdDelta", vs.PacketsReceivedDelta,
+				"lossFraction", fmt.Sprintf("%.3f", lossFraction),
+				"effectiveLoss", fmt.Sprintf("%.3f", effectiveLoss),
+				"framesRcvd", vs.FramesReceived,
+				"framesDecoded", vs.FramesDecoded,
+				"framesDropped", vs.FramesDropped,
+				"framesDroppedDelta", vs.FramesDroppedDelta,
+				"kbps", vs.Kbps,
+				"iceLocal", vs.ICELocal,
+				"iceRemote", vs.ICERemote,
+				// Session-scoped shipping override — see metricsLogger (#5929).
+				logging.ShipAlways(),
+			)
+
+			// Feed viewer stats into the adaptive bitrate controller.
+			if s.adaptive != nil {
+				rtt := time.Duration(vs.RTTMs) * time.Millisecond
+				s.adaptive.Update(rtt, effectiveLoss)
+			}
+		}
+	case "switch_monitor":
+		if msg.Value < 0 {
+			return
+		}
+		slog.Info("Switching monitor", "session", s.id, "display", msg.Value)
+		cfg := s.captureConfig
+		cfg.DisplayIndex = msg.Value
+		newCap, capErr := NewScreenCapturer(cfg)
+		if capErr != nil {
+			slog.Warn("Failed to create capturer for monitor", "display", msg.Value, "error", capErr.Error())
+			return
+		}
+		// Force a desktop repaint so DXGI has dirty rects for the initial
+		// AcquireNextFrame on the new display. Without this, a completely
+		// static display (no cursor, no animations) produces zero frames.
+		forceDesktopRepaint()
+		// Swap capturer and signal the capture loop to reinitialize.
+		// The old capturer is NOT closed here — the capture loop closes it
+		// after detecting the swap, avoiding a race where Close() is called
+		// while captureAndSendFrameGPU is mid-frame on the old capturer.
+		s.mu.Lock()
+		s.oldCapturers = append(s.oldCapturers, s.capturer)
+		s.capturer = newCap
+		s.displayIndex = msg.Value
+		s.captureConfig = cfg
+		s.mu.Unlock()
+		s.capturerSwapped.Store(true)
+		applyDisplayOffset(s.inputHandler, msg.Value, &s.cursorOffsetX, &s.cursorOffsetY)
+		// Get bounds for viewer notification — encoder dimensions are updated
+		// by the capture loop when it detects capturerSwapped, avoiding a race
+		// with the encoding goroutine.
+		w, h, boundsErr := newCap.GetScreenBounds()
+		if boundsErr != nil {
+			slog.Warn("Failed to get bounds for new monitor", "display", msg.Value, "error", boundsErr.Error())
+		}
+		// Notify viewer of new resolution
+		resp, _ := json.Marshal(map[string]any{
+			"type":   "monitor_switched",
+			"index":  msg.Value,
+			"width":  w,
+			"height": h,
+		})
+		s.mu.RLock()
+		dc := s.controlDC
+		s.mu.RUnlock()
+		if dc != nil {
+			dc.SendText(string(resp))
+		}
+	}
+}

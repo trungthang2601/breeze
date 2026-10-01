@@ -1,0 +1,460 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+import { HTTPException } from 'hono/http-exception';
+
+vi.mock('../../db', () => ({
+  db: {
+    select: vi.fn(),
+    insert: vi.fn(),
+  },
+}));
+
+vi.mock('../../db/schema', () => ({
+  patches: { id: 'patches.id' },
+  patchApprovals: {
+    partnerId: 'patchApprovals.partnerId',
+    ringId: 'patchApprovals.ringId',
+    patchId: 'patchApprovals.patchId',
+    status: 'patchApprovals.status',
+    createdAt: 'patchApprovals.createdAt',
+  },
+}));
+
+// Mirror prod gate semantics:
+// - requireScope: tier gate (always passes in these tests)
+// - requirePermission: RBAC gate — returns 403 when the caller lacks the perm.
+//   The mock grants exactly one permission at a time, so each read/write
+//   allow-path catches a route wired to the wrong permission.
+// - requireMfa: MFA gate — controllable via mfaSatisfied; default pass-through.
+let grantedPermission: 'devices:read' | 'devices:execute' | null = 'devices:execute';
+let mfaSatisfied = true;
+vi.mock('../../middleware/auth', () => ({
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
+    const required = `${resource}:${action}`;
+    // 403 if the caller lacks the exact grant required by the route.
+    if (required !== grantedPermission) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    return next();
+  }),
+  // Mirror the real requireMfa(), which throws HTTPException(403) when MFA is
+  // required. Hono's default error handler renders that as a 403 response.
+  requireMfa: vi.fn(() => async (_c: any, next: any) => {
+    if (!mfaSatisfied) {
+      throw new HTTPException(403, { message: 'MFA required' });
+    }
+    return next();
+  }),
+}));
+
+vi.mock('../../services/permissions', () => ({
+  PERMISSIONS: {
+    DEVICES_READ: { resource: 'devices', action: 'read' },
+    DEVICES_EXECUTE: { resource: 'devices', action: 'execute' },
+  },
+}));
+
+vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: vi.fn() }));
+
+const PARTNER_ID = '11111111-1111-1111-1111-111111111111';
+
+vi.mock('./helpers', () => ({
+  getPagination: vi.fn(() => ({ page: 1, limit: 50, offset: 0 })),
+  resolvePatchApprovalPartnerIdForRing: vi.fn(async () => ({ partnerId: PARTNER_ID })),
+  upsertPatchApproval: vi.fn(async () => undefined),
+  declineAllRingApprovals: vi.fn(async () => ({ ringIds: [null], failedRingIds: [] })),
+}));
+
+import { approvalsRoutes } from './approvals';
+import { db } from '../../db';
+import { writeRouteAudit } from '../../services/auditEvents';
+import { declineAllRingApprovals, resolvePatchApprovalPartnerIdForRing, upsertPatchApproval } from './helpers';
+
+const PATCH_ID = '22222222-2222-4222-8222-222222222222';
+let partnerOrgAccess: 'all' | 'selected' | 'none' = 'all';
+
+function mountApp() {
+  const app = new Hono();
+  app.use('*', async (c, next) => {
+    (c as any).set('auth', {
+      user: { id: 'user-1' },
+      scope: 'partner',
+      partnerId: PARTNER_ID,
+      partnerOrgAccess,
+    });
+    await next();
+  });
+  app.route('/patches', approvalsRoutes);
+  return app;
+}
+
+function mockPatchLookup(found = true) {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        limit: vi.fn().mockResolvedValue(found ? [{ id: PATCH_ID }] : []),
+      }),
+    }),
+  } as never);
+}
+
+describe('patch approvals RBAC gating', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    grantedPermission = 'devices:execute';
+    mfaSatisfied = true;
+    partnerOrgAccess = 'all';
+  });
+
+  describe('without the devices:execute permission', () => {
+    beforeEach(() => {
+      grantedPermission = null;
+    });
+
+    it('rejects POST /patches/bulk-approve with 403', async () => {
+      const res = await mountApp().request('/patches/bulk-approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({ patchIds: [PATCH_ID] }),
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects POST /patches/:id/approve with 403', async () => {
+      const res = await mountApp().request(`/patches/${PATCH_ID}/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects POST /patches/:id/decline with 403', async () => {
+      const res = await mountApp().request(`/patches/${PATCH_ID}/decline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it('rejects POST /patches/:id/defer with 403', async () => {
+      const res = await mountApp().request(`/patches/${PATCH_ID}/defer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({ deferUntil: '2030-01-01T00:00:00.000Z' }),
+      });
+      expect(res.status).toBe(403);
+    });
+  });
+
+  describe('GET /patches/approvals partner-wide read authority', () => {
+    function mockApprovalList() {
+      vi.mocked(db.select)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({
+                limit: vi.fn().mockReturnValue({
+                  offset: vi.fn().mockResolvedValue([{ id: 'approval-1' }]),
+                }),
+              }),
+            }),
+          }),
+        } as never)
+        .mockReturnValueOnce({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([{ count: 1 }]),
+          }),
+        } as never);
+    }
+
+    it.each(['selected', 'none'] as const)(
+      'rejects partner org access %s before partner resolution or database access',
+      async (orgAccess) => {
+        partnerOrgAccess = orgAccess;
+        grantedPermission = 'devices:read';
+
+        const res = await mountApp().request('/patches/approvals', { method: 'GET' });
+
+        expect(res.status).toBe(403);
+        expect(resolvePatchApprovalPartnerIdForRing).not.toHaveBeenCalled();
+        expect(db.select).not.toHaveBeenCalled();
+      },
+    );
+
+    it('rejects a caller without devices:read before database access', async () => {
+      grantedPermission = null;
+
+      const res = await mountApp().request('/patches/approvals', { method: 'GET' });
+
+      expect(res.status).toBe(403);
+      expect(resolvePatchApprovalPartnerIdForRing).not.toHaveBeenCalled();
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    it('allows a full-partner caller with devices:read', async () => {
+      grantedPermission = 'devices:read';
+      mockApprovalList();
+
+      const res = await mountApp().request('/patches/approvals', { method: 'GET' });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        data: [{ id: 'approval-1' }],
+        pagination: { page: 1, limit: 50, total: 1 },
+      });
+    });
+  });
+
+  describe('with the devices:execute permission and full partner org access', () => {
+    it('allows POST /patches/bulk-approve', async () => {
+      const res = await mountApp().request('/patches/bulk-approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({ patchIds: [PATCH_ID] }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(body.approved).toContain(PATCH_ID);
+    });
+
+    it('allows POST /patches/:id/approve', async () => {
+      mockPatchLookup(true);
+      const res = await mountApp().request(`/patches/${PATCH_ID}/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe('approved');
+    });
+
+    it('allows POST /patches/:id/decline', async () => {
+      mockPatchLookup(true);
+      const res = await mountApp().request(`/patches/${PATCH_ID}/decline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe('declined');
+    });
+
+    it('declines every ring approval when allRings is set (#5585)', async () => {
+      mockPatchLookup(true);
+      vi.mocked(declineAllRingApprovals).mockResolvedValueOnce({
+        ringIds: [null, 'ring-a', 'ring-b'],
+        failedRingIds: [],
+      });
+
+      const res = await mountApp().request(`/patches/${PATCH_ID}/decline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({ allRings: true }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        status: 'declined',
+        allRings: true,
+        declinedRingIds: [null, 'ring-a', 'ring-b'],
+        failedRingIds: [],
+        success: true,
+      });
+      expect(body.error).toBeUndefined();
+      expect(declineAllRingApprovals).toHaveBeenCalledWith(PARTNER_ID, PATCH_ID, null, expect.anything());
+      // allRings must go through the dedicated helper, never a single-ring upsert.
+      expect(upsertPatchApproval).not.toHaveBeenCalled();
+      expect(writeRouteAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: 'patch.decline',
+          details: expect.objectContaining({ allRings: true, declinedRingCount: 3, failedRingCount: 0 }),
+        })
+      );
+    });
+
+    // #5585 follow-up: a partial failure must be surfaced as a failure to the
+    // web client, not reported as a clean "declined" — runAction (the web
+    // mutation wrapper) only recognizes an HTTP-200 partial failure via an
+    // explicit `success: false`.
+    it('surfaces a partial allRings failure as success:false with an explanatory error', async () => {
+      mockPatchLookup(true);
+      vi.mocked(declineAllRingApprovals).mockResolvedValueOnce({
+        ringIds: [null, 'ring-a'],
+        failedRingIds: ['ring-b'],
+      });
+
+      const res = await mountApp().request(`/patches/${PATCH_ID}/decline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({ allRings: true }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        declinedRingIds: [null, 'ring-a'],
+        failedRingIds: ['ring-b'],
+        success: false,
+      });
+      expect(typeof body.error).toBe('string');
+      expect(body.error).toContain('1 failed');
+      expect(writeRouteAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          details: expect.objectContaining({ declinedRingCount: 2, failedRingCount: 1 }),
+        })
+      );
+    });
+
+    it('rejects allRings combined with ringId with 400', async () => {
+      const res = await mountApp().request(`/patches/${PATCH_ID}/decline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({ allRings: true, ringId: '33333333-3333-3333-3333-333333333333' }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(declineAllRingApprovals).not.toHaveBeenCalled();
+      expect(upsertPatchApproval).not.toHaveBeenCalled();
+    });
+
+    it('allows POST /patches/:id/defer', async () => {
+      mockPatchLookup(true);
+      const deferUntil = '2030-01-01T00:00:00.000Z';
+      const res = await mountApp().request(`/patches/${PATCH_ID}/defer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({ deferUntil }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ status: 'deferred', deferUntil });
+    });
+  });
+
+  describe.each(['selected', 'none'] as const)('with partner org access %s', (orgAccess) => {
+    beforeEach(() => {
+      partnerOrgAccess = orgAccess;
+    });
+
+    it.each([
+      { path: '/patches/bulk-approve', body: { patchIds: [PATCH_ID] } },
+      { path: `/patches/${PATCH_ID}/approve`, body: {} },
+      { path: `/patches/${PATCH_ID}/decline`, body: {} },
+      { path: `/patches/${PATCH_ID}/defer`, body: { deferUntil: '2030-01-01T00:00:00.000Z' } },
+    ])('rejects POST $path before any database write, lookup, or audit', async ({ path, body }) => {
+      const res = await mountApp().request(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify(body),
+      });
+
+      expect(res.status).toBe(403);
+      expect(resolvePatchApprovalPartnerIdForRing).not.toHaveBeenCalled();
+      expect(upsertPatchApproval).not.toHaveBeenCalled();
+      expect(db.select).not.toHaveBeenCalled();
+      expect(writeRouteAudit).not.toHaveBeenCalled();
+    });
+  });
+
+  // Guards the requireMfa() gate: with the RBAC permission granted but MFA
+  // unsatisfied, the mutating route must still 403. Drops the requireMfa()
+  // line from the route and this test fails.
+  describe('with the permission but MFA unsatisfied', () => {
+    beforeEach(() => {
+      grantedPermission = 'devices:execute';
+      mfaSatisfied = false;
+    });
+
+    it('rejects POST /patches/bulk-approve with 403', async () => {
+      const res = await mountApp().request('/patches/bulk-approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+        body: JSON.stringify({ patchIds: [PATCH_ID] }),
+      });
+      expect(res.status).toBe(403);
+    });
+  });
+});
+
+// #3157 was reported as "can't approve more than 200 patches". The 200 ceiling
+// lived entirely in the web client's single-page fetch — bulkApproveSchema has
+// no max on patchIds and the handler loops the whole array. Pin that here so a
+// `.max(200)` on the schema can't silently re-create the ceiling on the server
+// side after the client fix. (The web now batches at BULK_APPROVE_BATCH_SIZE
+// = 200 ids per request to bound request duration, but that's the client
+// bounding itself — the endpoint must stay able to accept more, and callers
+// like the MCP tools submit unbatched.)
+describe('bulk approve beyond one API page (#3157)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    grantedPermission = 'devices:execute';
+    mfaSatisfied = true;
+    partnerOrgAccess = 'all';
+    vi.mocked(resolvePatchApprovalPartnerIdForRing).mockResolvedValue({ partnerId: PARTNER_ID });
+    vi.mocked(upsertPatchApproval).mockResolvedValue(undefined);
+  });
+
+  // 333 is the reporter's Linux catalog size, and 200 is the API's MAX_PAGE_LIMIT.
+  const manyPatchIds = Array.from(
+    { length: 333 },
+    (_, i) => `22222222-2222-4222-8222-${String(i + 1).padStart(12, '0')}`
+  );
+
+  it('approves all 333 patches in one request', async () => {
+    const res = await mountApp().request('/patches/bulk-approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+      body: JSON.stringify({ patchIds: manyPatchIds }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.approved).toHaveLength(333);
+    expect(body.failed).toHaveLength(0);
+    // Every id was actually written, not just accepted.
+    expect(upsertPatchApproval).toHaveBeenCalledTimes(333);
+    expect(body.approved[332]).toBe(manyPatchIds[332]);
+  });
+
+  it('records the full approved count in the audit entry', async () => {
+    await mountApp().request('/patches/bulk-approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+      body: JSON.stringify({ patchIds: manyPatchIds }),
+    });
+
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'patch.bulk_approve',
+        details: expect.objectContaining({ approvedCount: 333, failedCount: 0 }),
+      })
+    );
+  });
+
+  it('reports the ids that failed rather than aborting the whole batch', async () => {
+    vi.mocked(upsertPatchApproval).mockImplementation(async (values: { patchId: string }) => {
+      if (values.patchId === manyPatchIds[250]) throw new Error('conflict');
+      return undefined;
+    });
+
+    const res = await mountApp().request('/patches/bulk-approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer t' },
+      body: JSON.stringify({ patchIds: manyPatchIds }),
+    });
+
+    const body = await res.json();
+    expect(body.approved).toHaveLength(332);
+    expect(body.failed).toEqual([manyPatchIds[250]]);
+  });
+});

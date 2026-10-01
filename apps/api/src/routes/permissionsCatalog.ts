@@ -1,0 +1,87 @@
+import { Hono } from 'hono';
+import { authMiddleware } from '../middleware/auth';
+import { ASSIGNABLE_PERMISSIONS } from '../services/permissions';
+
+export const permissionsCatalogRoutes = new Hono();
+
+permissionsCatalogRoutes.use('*', authMiddleware);
+
+// Human-friendly labels for resources in the catalog.
+// Kept here (not in the permissions registry itself) because the registry is
+// security-sensitive and labels are UI presentation only.
+const RESOURCE_LABELS: Record<string, string> = {
+  backup: 'Backup & Recovery',
+  devices: 'Devices',
+  agent_rollback: 'Agent Rollback',
+  scripts: 'Scripts',
+  alerts: 'Alerts',
+  tickets: 'Tickets',
+  ticket_mailbox: 'Ticket Mailbox (Microsoft 365)',
+  time_entries: 'Time Entries',
+  billing_profiles: 'Rates & Work Types',
+  users: 'Users',
+  organizations: 'Organizations',
+  connected_apps: 'Connected Applications',
+  sites: 'Sites',
+  automations: 'Automations',
+  remote: 'Remote Access',
+  audit: 'Audit Logs',
+  reports: 'Reports',
+  billing: 'Billing',
+  catalog: 'Product Catalog',
+  quotes: 'Quotes',
+  invoices: 'Invoices',
+  contracts: 'Contracts',
+  documents: 'Organization Documents',
+  agreements: 'Agreements',
+  sso: 'Single Sign-On',
+  topology: 'Network Topology',
+  vulnerabilities: 'Vulnerabilities',
+  ai_sessions: 'AI Sessions',
+  ai_agents: 'AI Agents',
+  approvals: 'Approvals',
+  variables: 'Variables',
+  pam: 'Privileged Access',
+  accounting: 'Accounting',
+  workspace: 'Workspace',
+  // Tool catalog (#5216): registering external MCP tool sources, and calling
+  // the tools they expose from AI surfaces.
+  tool_sources: 'External Tool Sources',
+  external_tools: 'External Tools'
+};
+
+const ACTION_LABELS: Record<string, string> = {
+  read: 'Read',
+  write: 'Write',
+  cross_site_restore: 'Cross-Site Restore',
+  delete: 'Delete',
+  execute: 'Execute',
+  acknowledge: 'Acknowledge',
+  invite: 'Invite',
+  access: 'Access',
+  export: 'Export',
+  manage: 'Manage',
+  manage_billing: 'Manage Billing',
+  send: 'Send',
+  accept: 'Accept',
+  fulfill: 'Fulfill',
+  admin: 'Administer',
+  accept_risk: 'Accept Risk',
+  read_all: 'Read All',
+  decide: 'Decide',
+  create: 'Create',
+  approve: 'Approve',
+  manage_policy: 'Manage policy',
+  credentials: 'Manage Credentials',
+  use: 'Use'
+};
+
+// GET /permissions/catalog - Returns the authoritative list of assignable
+// permissions for the role-permission matrix UI. Read-only.
+permissionsCatalogRoutes.get('/catalog', async (c) => {
+  return c.json({
+    permissions: ASSIGNABLE_PERMISSIONS,
+    resourceLabels: RESOURCE_LABELS,
+    actionLabels: ACTION_LABELS
+  });
+});

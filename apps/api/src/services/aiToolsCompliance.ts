@@ -1,0 +1,844 @@
+/**
+ * AI Software Compliance Tools
+ *
+ * Tools for software compliance policies and automation policy compliance status.
+ * - get_software_compliance (Tier 1): Software policy compliance status
+ * - manage_software_policy (Tier 3): CRUD for software policies
+ * - remediate_software_violation (Tier 3): Queue software remediation
+ * - query_compliance_policies (Tier 1): List automation compliance policies
+ * - get_compliance_status (Tier 1): Device-level compliance for a policy
+ */
+
+import { db } from '../db';
+import {
+  devices,
+  softwareComplianceStatus,
+  softwarePolicies,
+  automationPolicies,
+  automationPolicyCompliance,
+} from '../db/schema';
+import { eq, and, desc, sql, inArray, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
+import { bumpApprovalGeneration } from './approvalGeneration';
+import { scheduleSoftwareComplianceCheck } from '../jobs/softwareComplianceWorker';
+import { scheduleSoftwareRemediation } from '../jobs/softwareRemediationWorker';
+import { evaluateSoftwarePolicyArming, normalizeSoftwarePolicyRules } from './softwarePolicyService';
+import {
+  auditSoftwarePolicyToolEvent,
+  summarizeEnforcementChange,
+  AI_AUTO_INSTALL_REFUSAL_MESSAGE,
+  remediationOptionsArmsAutoInstall,
+} from './aiToolsSoftwarePolicyAudit';
+import { canManagePartnerWidePolicies } from './partnerWideAccess';
+import {
+  deviceScopeCondition,
+  resolveSiteAllowedDeviceIds,
+  runFrozenDeviceIds,
+  SITE_SCOPE_EMPTY_NOTE,
+} from './aiToolsSiteScope';
+
+type AiToolTier = 1 | 2 | 3 | 4;
+
+
+function resolveWritableToolOrgId(
+  auth: AuthContext,
+  inputOrgId?: string
+): { orgId?: string; error?: string } {
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) return { error: 'Organization context required' };
+    if (inputOrgId && inputOrgId !== auth.orgId) {
+      return { error: 'Cannot access another organization' };
+    }
+    return { orgId: auth.orgId };
+  }
+
+  if (inputOrgId) {
+    if (!auth.canAccessOrg(inputOrgId)) {
+      return { error: 'Access denied to this organization' };
+    }
+    return { orgId: inputOrgId };
+  }
+
+  if (auth.orgId) {
+    return { orgId: auth.orgId };
+  }
+
+  if (Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length === 1) {
+    return { orgId: auth.accessibleOrgIds[0] };
+  }
+
+  return { error: 'orgId is required for this operation' };
+}
+
+export function registerComplianceTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+// ============================================
+// get_software_compliance - Tier 1 (auto-execute)
+// ============================================
+
+registerTool({
+  tier: 1,
+  domain: 'patching',
+  searchHint: 'software compliance, unauthorized installations, missing required software and policy violations',
+  deviceArgs: ['deviceIds'],
+  definition: {
+    name: 'get_software_compliance',
+    description: 'Check software compliance status across the fleet. Shows policy violations, unauthorized installations, and missing required software.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        policyId: { type: 'string', description: 'Filter by specific policy ID' },
+        deviceIds: { type: 'array', items: { type: 'string' }, description: 'Filter by device IDs' },
+        status: { type: 'string', enum: ['compliant', 'violation', 'unknown'], description: 'Filter by compliance status' },
+        limit: { type: 'number', description: 'Max results (default 50, max 500)' },
+      },
+    },
+  },
+  handler: async (input, auth) => {
+    const conditions: SQL[] = [];
+    const orgCondition = auth.orgCondition(devices.orgId);
+    if (orgCondition) conditions.push(orgCondition);
+    if (typeof input.policyId === 'string') conditions.push(eq(softwareComplianceStatus.policyId, input.policyId));
+    if (typeof input.status === 'string') conditions.push(eq(softwareComplianceStatus.status, input.status));
+    if (Array.isArray(input.deviceIds) && input.deviceIds.length > 0) {
+      conditions.push(inArray(softwareComplianceStatus.deviceId, input.deviceIds as string[]));
+    }
+
+    // Site axis (app-layer only; RLS does NOT enforce it). softwareComplianceStatus
+    // has no site_id column, so narrow by the in-scope device-id set. A restricted
+    // caller with zero in-scope devices short-circuits to empty results. This
+    // intersects with the optional caller-supplied deviceIds filter above
+    // (most-restrictive wins).
+    if (auth.allowedSiteIds && auth.canAccessSite) {
+      const queryOrgId = auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+      if (!queryOrgId) {
+        return JSON.stringify({ count: 0, compliance: [] });
+      }
+      const allowed = await resolveSiteAllowedDeviceIds(queryOrgId, auth);
+      if (!allowed || allowed.length === 0) {
+        return JSON.stringify({ count: 0, compliance: [], scopeNote: SITE_SCOPE_EMPTY_NOTE });
+      }
+      conditions.push(inArray(softwareComplianceStatus.deviceId, allowed));
+    }
+
+    // Exact-device axis, applied independently of the site axis: a device-LESS
+    // analysis run carries `allowedDeviceIds` with NO `allowedSiteIds`, so the
+    // branch above no-ops for it and the tool read the whole org (#6086).
+    const complianceDeviceCondition = deviceScopeCondition(auth, softwareComplianceStatus.deviceId);
+    if (complianceDeviceCondition) conditions.push(complianceDeviceCondition);
+
+    const limit = Math.min(Math.max(1, Number(input.limit) || 50), 500);
+
+    const rows = await db
+      .select({
+        compliance: {
+          policyId: softwareComplianceStatus.policyId,
+          deviceId: softwareComplianceStatus.deviceId,
+          status: softwareComplianceStatus.status,
+          violations: softwareComplianceStatus.violations,
+          lastChecked: softwareComplianceStatus.lastChecked,
+          remediationStatus: softwareComplianceStatus.remediationStatus,
+        },
+        policy: {
+          id: softwarePolicies.id,
+          name: softwarePolicies.name,
+          mode: softwarePolicies.mode,
+        },
+        device: {
+          id: devices.id,
+          hostname: devices.hostname,
+        },
+      })
+      .from(softwareComplianceStatus)
+      .innerJoin(softwarePolicies, eq(softwareComplianceStatus.policyId, softwarePolicies.id))
+      .innerJoin(devices, eq(softwareComplianceStatus.deviceId, devices.id))
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(softwareComplianceStatus.lastChecked))
+      .limit(limit);
+
+    return JSON.stringify({
+      count: rows.length,
+      compliance: rows.map((row) => ({
+        device: row.device.hostname,
+        policy: row.policy.name,
+        mode: row.policy.mode,
+        status: row.compliance.status,
+        violations: row.compliance.violations ?? [],
+        remediationStatus: row.compliance.remediationStatus ?? 'none',
+        lastChecked: row.compliance.lastChecked,
+      })),
+    });
+  },
+});
+
+// ============================================
+// manage_software_policy - Tier 3 (requires approval)
+// ============================================
+
+registerTool({
+  tier: 3,
+  domain: 'patching',
+  searchHint: 'software allowlist, blocklist and audit policies: create, update, disable, list, get',
+  definition: {
+    name: 'manage_software_policy',
+    description: 'Create, update, disable (soft-delete), list, or fetch software policies (allowlist/blocklist/audit). Actions: create, update, delete, list, get.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'delete', 'list', 'get'], description: 'Action to perform' },
+        policyId: { type: 'string', description: 'Policy ID (for update/delete/get)' },
+        orgId: { type: 'string', description: 'Organization ID (required for create in partner/system scope)' },
+        name: { type: 'string', description: 'Policy name' },
+        description: { type: 'string', description: 'Policy description' },
+        mode: { type: 'string', enum: ['allowlist', 'blocklist', 'audit'], description: 'Policy mode' },
+        software: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              vendor: { type: 'string' },
+              minVersion: { type: 'string' },
+              maxVersion: { type: 'string' },
+              catalogId: { type: 'string' },
+              reason: { type: 'string' },
+            },
+          },
+          description: 'Software rule definitions',
+        },
+        allowUnknown: { type: 'boolean', description: 'Allow unmatched software in allowlist mode' },
+        targetType: { type: 'string', enum: ['organization', 'site', 'device_group', 'devices'], description: 'Target scope' },
+        targetIds: { type: 'array', items: { type: 'string' }, description: 'Target IDs' },
+        priority: { type: 'number', description: 'Policy priority (0-100)' },
+        enforceMode: { type: 'boolean', description: 'Auto-remediate violations' },
+        isActive: { type: 'boolean', description: 'Enable/disable policy' },
+        remediationOptions: { type: 'object', description: "Options: autoUninstall, notifyUser, gracePeriod, cooldownMinutes, maintenanceWindowOnly. autoInstall is forbidden here; arming installs needs a human with MFA." },
+        limit: { type: 'number', description: 'List limit (default 50)' },
+      },
+      required: ['action'],
+    },
+  },
+  handler: async (input, auth) => {
+    const action = input.action as string;
+    // Reads (list/get) are not gated by the site-ceiling — only create/update/delete.
+    if (action !== 'list' && action !== 'get' && !canMutateOrgWideGovernance(auth)) {
+      return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    }
+
+    if (action === 'list') {
+      const conditions: SQL[] = [];
+      // Dual-axis (#2126): org-owned rows the caller can reach OR partner-wide
+      // rows (org_id NULL) owned by the caller's own partner.
+      const orgCondition = auth.orgCondition(softwarePolicies.orgId);
+      if (orgCondition) {
+        conditions.push(
+          auth.scope === 'partner' && auth.partnerId
+            ? sql`(${orgCondition} OR (${softwarePolicies.orgId} IS NULL AND ${softwarePolicies.partnerId} = ${auth.partnerId}))`
+            : orgCondition
+        );
+      }
+      if (typeof input.mode === 'string') conditions.push(eq(softwarePolicies.mode, input.mode as 'allowlist' | 'blocklist' | 'audit'));
+      if (typeof input.isActive === 'boolean') conditions.push(eq(softwarePolicies.isActive, input.isActive));
+
+      const limit = Math.min(Math.max(1, Number(input.limit) || 50), 200);
+      const rows = await db
+        .select()
+        .from(softwarePolicies)
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(softwarePolicies.priority), desc(softwarePolicies.updatedAt))
+        .limit(limit);
+
+      return JSON.stringify({ policies: rows, showing: rows.length });
+    }
+
+    if (action === 'get') {
+      if (!input.policyId) return JSON.stringify({ error: 'policyId is required' });
+      const conditions: SQL[] = [eq(softwarePolicies.id, input.policyId as string)];
+      // Dual-axis (#2126): org-owned rows the caller can reach OR partner-wide
+      // rows (org_id NULL) owned by the caller's own partner.
+      const orgCondition = auth.orgCondition(softwarePolicies.orgId);
+      if (orgCondition) {
+        conditions.push(
+          auth.scope === 'partner' && auth.partnerId
+            ? sql`(${orgCondition} OR (${softwarePolicies.orgId} IS NULL AND ${softwarePolicies.partnerId} = ${auth.partnerId}))`
+            : orgCondition
+        );
+      }
+
+      const [policy] = await db.select().from(softwarePolicies).where(and(...conditions)).limit(1);
+      if (!policy) return JSON.stringify({ error: 'Policy not found or access denied' });
+
+      return JSON.stringify({ policy });
+    }
+
+    if (action === 'create') {
+      if (typeof input.name !== 'string' || typeof input.mode !== 'string') {
+        return JSON.stringify({ error: 'name and mode are required for create' });
+      }
+
+      const orgResolution = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' ? input.orgId : undefined);
+      if (!orgResolution.orgId) return JSON.stringify({ error: orgResolution.error });
+
+      const rules = normalizeSoftwarePolicyRules({
+        software: Array.isArray(input.software) ? input.software : [],
+        allowUnknown: input.allowUnknown === true,
+      });
+      if (rules.software.length === 0) {
+        return JSON.stringify({ error: 'At least one software rule is required' });
+      }
+
+      // Contract-A D4: AI callers may never arm software installation.
+      if (remediationOptionsArmsAutoInstall(input.remediationOptions)) {
+        return JSON.stringify({ error: AI_AUTO_INSTALL_REFUSAL_MESSAGE });
+      }
+
+      const [policy] = await db
+        .insert(softwarePolicies)
+        .values({
+          orgId: orgResolution.orgId,
+          name: input.name as string,
+          description: (input.description as string) ?? null,
+          mode: input.mode as 'allowlist' | 'blocklist' | 'audit',
+          rules,
+          enforceMode: input.enforceMode === true,
+          remediationOptions: (input.remediationOptions as Record<string, unknown>) ?? null,
+          createdBy: auth.user.id,
+        })
+        .returning();
+      if (!policy) {
+        return JSON.stringify({ error: 'Failed to create policy' });
+      }
+
+      let scheduleWarning: string | undefined;
+      try {
+        await scheduleSoftwareComplianceCheck(policy.id);
+      } catch (error) {
+        scheduleWarning = error instanceof Error ? error.message : 'Failed to schedule compliance check';
+        console.error(`[aiTools] Failed to schedule compliance check for policy ${policy.id}:`, error);
+      }
+
+      auditSoftwarePolicyToolEvent(auth, 'manage_software_policy', {
+        orgId: policy.orgId,
+        partnerId: policy.partnerId,
+        policyId: policy.id,
+        policyName: policy.name,
+        policyAuditAction: 'policy_created',
+        auditLogAction: 'software_policy.create',
+        details: {
+          mode: policy.mode,
+          rules: rules.software.length,
+          scheduleWarning,
+          ...summarizeEnforcementChange(input),
+        },
+      });
+
+      return JSON.stringify({ success: true, policyId: policy.id, name: policy.name, ...(scheduleWarning ? { warning: scheduleWarning } : {}) });
+    }
+
+    if (action === 'update') {
+      if (!input.policyId) return JSON.stringify({ error: 'policyId is required' });
+
+      const conditions: SQL[] = [eq(softwarePolicies.id, input.policyId as string)];
+      // Dual-axis (#2126): org-owned rows the caller can reach OR partner-wide
+      // rows (org_id NULL) owned by the caller's own partner.
+      const orgCondition = auth.orgCondition(softwarePolicies.orgId);
+      if (orgCondition) {
+        conditions.push(
+          auth.scope === 'partner' && auth.partnerId
+            ? sql`(${orgCondition} OR (${softwarePolicies.orgId} IS NULL AND ${softwarePolicies.partnerId} = ${auth.partnerId}))`
+            : orgCondition
+        );
+      }
+
+      const [existing] = await db.select().from(softwarePolicies).where(and(...conditions)).limit(1);
+      if (!existing) return JSON.stringify({ error: 'Policy not found or access denied' });
+
+      // Partner-wide templates are administrable only with the partner-wide
+      // capability (same gate as the HTTP route).
+      if (existing.orgId === null && !canManagePartnerWidePolicies(auth)) {
+        return JSON.stringify({ error: 'Modifying a partner-wide software policy requires full partner org access (orgAccess must be "all")' });
+      }
+
+      // Contract-A D4: AI callers may never arm software installation.
+      if (remediationOptionsArmsAutoInstall(input.remediationOptions)) {
+        return JSON.stringify({ error: AI_AUTO_INSTALL_REFUSAL_MESSAGE });
+      }
+
+      const updates: Omit<Partial<typeof softwarePolicies.$inferInsert>, 'approvalGeneration'> & { approvalGeneration?: SQL } = {
+        updatedAt: new Date(),
+        // Site-ceiling gate contract §3: this AI-tool write bypasses
+        // routes/softwarePolicies.ts, so it needs its own bump.
+        approvalGeneration: bumpApprovalGeneration(softwarePolicies.approvalGeneration),
+      };
+      if (typeof input.name === 'string') updates.name = input.name;
+      if (typeof input.description === 'string') updates.description = input.description;
+      if (typeof input.mode === 'string') updates.mode = input.mode as 'allowlist' | 'blocklist' | 'audit';
+      if (typeof input.enforceMode === 'boolean') updates.enforceMode = input.enforceMode;
+      if (typeof input.isActive === 'boolean') updates.isActive = input.isActive;
+      if (input.remediationOptions && typeof input.remediationOptions === 'object') {
+        updates.remediationOptions = input.remediationOptions as Record<string, unknown>;
+      }
+
+      if (Array.isArray(input.software) || input.allowUnknown !== undefined) {
+        const existingRules = (existing.rules ?? {}) as { software?: unknown; allowUnknown?: boolean };
+        const rules = normalizeSoftwarePolicyRules({
+          software: Array.isArray(input.software) ? input.software : existingRules.software,
+          allowUnknown: typeof input.allowUnknown === 'boolean'
+            ? input.allowUnknown
+            : existingRules.allowUnknown === true,
+        });
+        if (rules.software.length === 0) {
+          return JSON.stringify({ error: 'At least one software rule is required' });
+        }
+        updates.rules = rules;
+      }
+
+      const [updated] = await db
+        .update(softwarePolicies)
+        .set(updates)
+        .where(eq(softwarePolicies.id, existing.id))
+        .returning();
+
+      let scheduleWarning: string | undefined;
+      try {
+        await scheduleSoftwareComplianceCheck(existing.id);
+      } catch (error) {
+        scheduleWarning = error instanceof Error ? error.message : 'Failed to schedule compliance check';
+        console.error(`[aiTools] Failed to schedule compliance check for policy ${existing.id}:`, error);
+      }
+
+      // `updates` (not raw `input`) is the set of columns actually written —
+      // `input` also carries routing keys like `action`/`policyId` that were
+      // never persisted, which would make the trail overstate the change.
+      const updatedFields = Object.keys(updates).filter(
+        (field) => field !== 'updatedAt' && field !== 'approvalGeneration'
+      );
+      auditSoftwarePolicyToolEvent(auth, 'manage_software_policy', {
+        orgId: existing.orgId,
+        partnerId: existing.partnerId,
+        policyId: existing.id,
+        policyName: updated?.name ?? existing.name,
+        policyAuditAction: 'policy_updated',
+        auditLogAction: 'software_policy.update',
+        details: {
+          updatedFields,
+          scheduleWarning,
+          ...summarizeEnforcementChange(input),
+        },
+      });
+
+      return JSON.stringify({ success: true, policyId: existing.id, name: updated?.name ?? existing.name, ...(scheduleWarning ? { warning: scheduleWarning } : {}) });
+    }
+
+    if (action === 'delete') {
+      if (!input.policyId) return JSON.stringify({ error: 'policyId is required' });
+
+      const conditions: SQL[] = [eq(softwarePolicies.id, input.policyId as string)];
+      // Dual-axis (#2126): org-owned rows the caller can reach OR partner-wide
+      // rows (org_id NULL) owned by the caller's own partner.
+      const orgCondition = auth.orgCondition(softwarePolicies.orgId);
+      if (orgCondition) {
+        conditions.push(
+          auth.scope === 'partner' && auth.partnerId
+            ? sql`(${orgCondition} OR (${softwarePolicies.orgId} IS NULL AND ${softwarePolicies.partnerId} = ${auth.partnerId}))`
+            : orgCondition
+        );
+      }
+
+      const [existing] = await db.select().from(softwarePolicies).where(and(...conditions)).limit(1);
+      if (!existing) return JSON.stringify({ error: 'Policy not found or access denied' });
+
+      // Same partner-wide administration gate as update.
+      if (existing.orgId === null && !canManagePartnerWidePolicies(auth)) {
+        return JSON.stringify({ error: 'Modifying a partner-wide software policy requires full partner org access (orgAccess must be "all")' });
+      }
+
+      await db.transaction(async (tx) => {
+        await tx
+          .update(softwarePolicies)
+          .set({
+            isActive: false,
+            updatedAt: new Date(),
+            // Site-ceiling gate contract §3: a status flip (soft-delete) is
+            // exactly the kind of edit an in-flight job needs to detect.
+            approvalGeneration: bumpApprovalGeneration(softwarePolicies.approvalGeneration),
+          })
+          .where(eq(softwarePolicies.id, existing.id));
+
+        await tx
+          .delete(softwareComplianceStatus)
+          .where(eq(softwareComplianceStatus.policyId, existing.id));
+      });
+
+      auditSoftwarePolicyToolEvent(auth, 'manage_software_policy', {
+        orgId: existing.orgId,
+        partnerId: existing.partnerId,
+        policyId: existing.id,
+        policyName: existing.name,
+        policyAuditAction: 'policy_deleted',
+        auditLogAction: 'software_policy.delete',
+        details: { name: existing.name },
+      });
+
+      return JSON.stringify({ success: true, message: `Policy "${existing.name}" disabled` });
+    }
+
+    return JSON.stringify({ error: `Unknown action: ${action}` });
+  },
+});
+
+// ============================================
+// remediate_software_violation - Tier 3 (requires approval)
+// ============================================
+
+registerTool({
+  tier: 3,
+  domain: 'patching',
+  searchHint: 'software policy violations, queue uninstall remediation for unauthorized software',
+  deviceArgs: ['deviceIds'],
+  definition: {
+    name: 'remediate_software_violation',
+    description: 'Queue remediation for software policy violations by scheduling uninstall commands for unauthorized software.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        deviceIds: { type: 'array', items: { type: 'string' }, description: 'Devices to remediate' },
+        policyId: { type: 'string', description: 'Policy ID' },
+        autoUninstall: { type: 'boolean', description: 'Whether to queue uninstall commands (default true)' },
+      },
+      required: ['policyId'],
+    },
+  },
+  handler: async (input, auth) => {
+    const policyId = input.policyId as string;
+    const autoUninstall = input.autoUninstall !== false;
+    if (!autoUninstall) {
+      return JSON.stringify({ error: 'autoUninstall=false is not supported for this remediation action' });
+    }
+
+    const conditions: SQL[] = [eq(softwarePolicies.id, policyId)];
+    const orgCondition = auth.orgCondition(softwarePolicies.orgId);
+    if (orgCondition) conditions.push(orgCondition);
+
+    const [policy] = await db.select().from(softwarePolicies).where(and(...conditions)).limit(1);
+    if (!policy) return JSON.stringify({ error: 'Policy not found or access denied' });
+
+    // Arming gate (#3543, incident #3381). This tool used to refuse only
+    // `mode === 'audit'`, so a detect-only policy — enforcement deliberately
+    // left off by its owner — could still have fleet-wide uninstalls queued
+    // through the model. Tier-3 approval is a prompt-time check on the ACTION,
+    // not the policy's own enforcement setting, so it is not a substitute.
+    // Deliberately no override parameter: re-arming is an administrator's
+    // decision made on the policy, not an argument the model can supply.
+    const arming = evaluateSoftwarePolicyArming(policy, 'uninstall');
+    if (!arming.armed) {
+      auditSoftwarePolicyToolEvent(auth, 'remediate_software_violation', {
+        orgId: policy.orgId,
+        partnerId: policy.partnerId,
+        policyId: policy.id,
+        policyName: policy.name,
+        policyAuditAction: 'remediation_denied',
+        auditLogAction: 'software_policy.remediate',
+        result: 'denied',
+        details: {
+          reason: arming.reason,
+          mode: policy.mode,
+          enforceMode: policy.enforceMode,
+          requestedDeviceCount: Array.isArray(input.deviceIds) ? input.deviceIds.length : 0,
+        },
+      });
+      return JSON.stringify({
+        error: `Cannot remediate: ${arming.message}`,
+        reason: arming.reason,
+        policyId: policy.id,
+      });
+    }
+
+    let deviceIds = Array.isArray(input.deviceIds)
+      ? Array.from(new Set((input.deviceIds as string[]).filter((id) => typeof id === 'string' && id.length > 0)))
+      : [];
+
+    if (deviceIds.length === 0) {
+      const complianceConditions: SQL[] = [
+        eq(softwareComplianceStatus.policyId, policy.id),
+        eq(softwareComplianceStatus.status, 'violation'),
+      ];
+      const deviceOrgCondition = auth.orgCondition(devices.orgId);
+      if (deviceOrgCondition) complianceConditions.push(deviceOrgCondition);
+
+      // Site axis (app-layer only; RLS does NOT enforce it). When the caller
+      // supplies no deviceIds, this fallback enumerates ALL violating devices
+      // org-wide and queues remediation (a mutation) against them — a
+      // site-restricted caller must only reach its in-scope device set.
+      // (Caller-supplied deviceIds are already org+site gated centrally via
+      // `deviceArgs` → enforceDeviceArgs.)
+      if (auth.allowedSiteIds && auth.canAccessSite) {
+        const queryOrgId = auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+        if (!queryOrgId) {
+          return JSON.stringify({ message: 'No matching violation rows found for remediation', queued: 0 });
+        }
+        const allowed = await resolveSiteAllowedDeviceIds(queryOrgId, auth);
+        if (!allowed || allowed.length === 0) {
+          return JSON.stringify({
+            message: 'No matching violation rows found for remediation',
+            queued: 0,
+            scopeNote: SITE_SCOPE_EMPTY_NOTE,
+          });
+        }
+        complianceConditions.push(inArray(softwareComplianceStatus.deviceId, allowed));
+      }
+
+      // Exact-device axis, applied independently of the site axis (#6086). This
+      // fan-out QUEUES UNINSTALLS, so a device-less analysis run reaching every
+      // violating device in the org is the worst shape of this bug.
+      const remediationDeviceCondition = deviceScopeCondition(auth, softwareComplianceStatus.deviceId);
+      if (remediationDeviceCondition) complianceConditions.push(remediationDeviceCondition);
+
+      const rows = await db
+        .select({ deviceId: softwareComplianceStatus.deviceId })
+        .from(softwareComplianceStatus)
+        .innerJoin(devices, eq(softwareComplianceStatus.deviceId, devices.id))
+        .where(and(...complianceConditions));
+
+      deviceIds = Array.from(new Set(rows.map((row) => row.deviceId)));
+    }
+
+    if (deviceIds.length === 0) {
+      return JSON.stringify({ message: 'No matching violation rows found for remediation', queued: 0 });
+    }
+
+    let queued: number;
+    try {
+      queued = await scheduleSoftwareRemediation(policy.id, deviceIds);
+    } catch (error) {
+      console.error(`[aiTools] Failed to schedule remediation for policy ${policy.id}:`, error);
+      return JSON.stringify({ error: 'Failed to schedule remediation', policyId: policy.id });
+    }
+
+    auditSoftwarePolicyToolEvent(auth, 'remediate_software_violation', {
+      orgId: policy.orgId,
+      partnerId: policy.partnerId,
+      policyId: policy.id,
+      policyName: policy.name,
+      policyAuditAction: 'remediation_requested',
+      auditLogAction: 'software_policy.remediate',
+      details: {
+        requestedCount: deviceIds.length,
+        queued,
+      },
+    });
+
+    return JSON.stringify({
+      message: `Remediation scheduled for ${queued} device(s)`,
+      policyId: policy.id,
+      queued,
+      deviceIds,
+    });
+  },
+});
+
+// ============================================
+// query_compliance_policies - Tier 1 (auto-execute)
+// ============================================
+
+registerTool({
+  tier: 1,
+  domain: 'security',
+  searchHint: 'compliance policies and enforcement status',
+  definition: {
+    name: 'query_compliance_policies',
+    description: 'List compliance policies and their enforcement status.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        enabled: {
+          type: 'boolean',
+          description: 'Filter by enabled/disabled status',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results (default 25, max 100)',
+        },
+      },
+    },
+  },
+  handler: async (input, auth) => {
+    const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
+
+    const conditions: SQL[] = [];
+    // Dual-axis (#2129): org-owned rows the caller can reach OR partner-wide
+    // rows (org_id NULL) owned by the caller's own partner.
+    const orgCond = auth.orgCondition(automationPolicies.orgId);
+    if (orgCond) {
+      conditions.push(
+        auth.scope === 'partner' && auth.partnerId
+          ? sql`(${orgCond} OR (${automationPolicies.orgId} IS NULL AND ${automationPolicies.partnerId} = ${auth.partnerId}))`
+          : orgCond
+      );
+    }
+
+    if (input.enabled !== undefined) {
+      conditions.push(eq(automationPolicies.enabled, input.enabled as boolean));
+    }
+
+    const policies = await db
+      .select({
+        id: automationPolicies.id,
+        name: automationPolicies.name,
+        description: automationPolicies.description,
+        enabled: automationPolicies.enabled,
+        enforcement: automationPolicies.enforcement,
+        checkIntervalMinutes: automationPolicies.checkIntervalMinutes,
+        lastEvaluatedAt: automationPolicies.lastEvaluatedAt,
+        createdAt: automationPolicies.createdAt,
+      })
+      .from(automationPolicies)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(automationPolicies.createdAt))
+      .limit(limit);
+
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(automationPolicies)
+      .where(conditions.length > 0 ? and(...conditions) : undefined);
+
+    return JSON.stringify({
+      policies,
+      total: Number(countResult[0]?.count ?? 0),
+      showing: policies.length,
+    });
+  },
+});
+
+// ============================================
+// get_compliance_status - Tier 1 (auto-execute)
+// ============================================
+
+registerTool({
+  tier: 1,
+  domain: 'security',
+  searchHint: 'device compliance status for a specific policy',
+  deviceArgs: ['deviceId'],
+  definition: {
+    name: 'get_compliance_status',
+    description: 'Get device-level compliance status for a specific policy.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        policyId: {
+          type: 'string',
+          description: 'Policy UUID (required)',
+        },
+        status: {
+          type: 'string',
+          enum: ['compliant', 'non_compliant', 'pending', 'error'],
+          description: 'Filter by compliance status',
+        },
+        deviceId: {
+          type: 'string',
+          description: 'Filter by device UUID',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results (default 50, max 200)',
+        },
+      },
+      required: ['policyId'],
+    },
+  },
+  handler: async (input, auth) => {
+    const policyId = input.policyId as string;
+    const limit = Math.min(Math.max(1, Number(input.limit) || 50), 200);
+
+    const conditions: SQL[] = [
+      eq(automationPolicyCompliance.policyId, policyId),
+    ];
+
+    // Org scoping via join with devices table
+    const orgCond = auth.orgCondition(devices.orgId);
+    if (orgCond) conditions.push(orgCond);
+
+    if (input.status) {
+      conditions.push(
+        eq(
+          automationPolicyCompliance.status,
+          input.status as typeof automationPolicyCompliance.status.enumValues[number]
+        )
+      );
+    }
+    if (input.deviceId) {
+      conditions.push(eq(automationPolicyCompliance.deviceId, input.deviceId as string));
+    }
+
+    // Site axis (app-layer only; RLS does NOT enforce it). automationPolicyCompliance
+    // has no site_id column, so narrow by the in-scope device-id set. A restricted
+    // caller with zero in-scope devices short-circuits to empty results. This
+    // intersects with the optional deviceId filter above (most-restrictive wins).
+    if (auth.allowedSiteIds && auth.canAccessSite) {
+      const queryOrgId = auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+      if (!queryOrgId) {
+        return JSON.stringify({ records: [], total: 0, showing: 0, breakdown: {} });
+      }
+      const allowed = await resolveSiteAllowedDeviceIds(queryOrgId, auth);
+      if (!allowed || allowed.length === 0) {
+        return JSON.stringify({ records: [], total: 0, showing: 0, breakdown: {}, scopeNote: SITE_SCOPE_EMPTY_NOTE });
+      }
+      conditions.push(inArray(automationPolicyCompliance.deviceId, allowed));
+    }
+
+    // Exact-device axis, applied independently of the site axis (#6086).
+    const automationDeviceCondition = deviceScopeCondition(auth, automationPolicyCompliance.deviceId);
+    if (automationDeviceCondition) conditions.push(automationDeviceCondition);
+
+    const records = await db
+      .select({
+        policyId: automationPolicyCompliance.policyId,
+        deviceId: automationPolicyCompliance.deviceId,
+        status: automationPolicyCompliance.status,
+        details: automationPolicyCompliance.details,
+        lastCheckedAt: automationPolicyCompliance.lastCheckedAt,
+        remediationAttempts: automationPolicyCompliance.remediationAttempts,
+      })
+      .from(automationPolicyCompliance)
+      .innerJoin(devices, eq(automationPolicyCompliance.deviceId, devices.id))
+      .where(and(...conditions))
+      .orderBy(desc(automationPolicyCompliance.lastCheckedAt))
+      .limit(limit);
+
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(automationPolicyCompliance)
+      .innerJoin(devices, eq(automationPolicyCompliance.deviceId, devices.id))
+      .where(and(...conditions));
+
+    // Status breakdown
+    const breakdownResult = await db
+      .select({
+        status: automationPolicyCompliance.status,
+        count: sql<number>`count(*)`,
+      })
+      .from(automationPolicyCompliance)
+      .innerJoin(devices, eq(automationPolicyCompliance.deviceId, devices.id))
+      .where(and(...conditions))
+      .groupBy(automationPolicyCompliance.status);
+
+    const breakdown: Record<string, number> = {};
+    for (const row of breakdownResult) {
+      breakdown[row.status] = Number(row.count);
+    }
+
+    return JSON.stringify({
+      records,
+      total: Number(countResult[0]?.count ?? 0),
+      showing: records.length,
+      breakdown,
+    });
+  },
+});
+
+}

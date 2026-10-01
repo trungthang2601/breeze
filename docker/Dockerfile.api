@@ -1,0 +1,83 @@
+FROM node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS base
+RUN npm install -g pnpm@10.34.5
+
+FROM base AS deps
+WORKDIR /app
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
+COPY patches ./patches
+COPY apps/api/package.json ./apps/api/
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/extension-sdk/package.json ./packages/extension-sdk/
+COPY packages/extension-web-sdk/package.json ./packages/extension-web-sdk/
+COPY packages/extension-testkit/package.json ./packages/extension-testkit/
+COPY ee/workspace/package.json ./ee/workspace/
+RUN pnpm install --frozen-lockfile
+
+FROM base AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/apps/api/node_modules ./apps/api/node_modules
+COPY --from=deps /app/packages/shared/node_modules ./packages/shared/node_modules
+COPY --from=deps /app/packages/extension-sdk/node_modules ./packages/extension-sdk/node_modules
+COPY --from=deps /app/packages/extension-web-sdk/node_modules ./packages/extension-web-sdk/node_modules
+COPY --from=deps /app/packages/extension-testkit/node_modules ./packages/extension-testkit/node_modules
+COPY --from=deps /app/ee/workspace/node_modules ./ee/workspace/node_modules
+COPY . .
+RUN pnpm --filter @breeze/api build
+RUN pnpm --filter @breeze/ext-workspace build:web
+# Create a self-contained deployment (resolves pnpm symlinks).
+# pnpm 10's deploy command requires workspace deps be declared injected.
+# TODO: declare @breeze/shared (and other workspace deps) as injected in
+# apps/api/package.json and drop --legacy. See pnpm v10 release notes.
+RUN pnpm --filter @breeze/api deploy --legacy --prod /deployed
+
+FROM base AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+ARG APP_VERSION=0.2.0
+ENV APP_VERSION=${APP_VERSION}
+
+# CVE-2026-45447: pinned base ships libcrypto3/libssl3 3.5.6; drop once the
+# node:24-alpine digest is refreshed past 3.5.7.
+# CVE-2026-12151: the base image's bundled npm vendors a vulnerable undici; the
+# runtime entrypoint is `node`, not npm, so remove npm/npx from the runner.
+# CVE-2026-14257: this runner is `FROM base`, which installs pnpm globally, and
+# pnpm vendors its own brace-expansion (2.1.2). pnpm is a build-time tool only --
+# nothing in the runtime path shells out to it -- so drop it here too. Overrides
+# in package.json cannot reach a tool's bundled deps, so this is the only lever.
+RUN apk upgrade --no-cache libcrypto3 libssl3 && \
+    rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+            /usr/local/lib/node_modules/pnpm /usr/local/bin/pnpm /usr/local/bin/pnpx
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 hono
+
+# Copy the self-contained deployment (flat node_modules, no symlinks)
+COPY --from=builder --chown=hono:nodejs /deployed/node_modules ./node_modules
+COPY --from=builder --chown=hono:nodejs /deployed/dist ./dist
+COPY --from=builder --chown=hono:nodejs /deployed/package.json ./
+
+# Copy migration files for auto-migrate on startup
+COPY --from=builder --chown=hono:nodejs /app/apps/api/migrations ./migrations
+
+# Document theme assets (vendored OFL font files for proposal/quote PDF
+# rendering — see apps/api/src/services/documentThemes.ts). This runner's
+# WORKDIR is /app with no apps/api subpath (self-contained pnpm deploy), so
+# FONT_DIR's process.cwd()-relative resolution needs ./assets here, not
+# ./apps/api/assets.
+COPY --from=builder --chown=hono:nodejs /app/apps/api/assets ./assets
+
+# Built-in extensions: migrations + prebuilt web assets, resolved at runtime
+# relative to cwd (/app) by builtinExtensions.ts.
+COPY --from=builder --chown=hono:nodejs /app/ee/workspace/migrations ./ee/workspace/migrations
+COPY --from=builder --chown=hono:nodejs /app/ee/workspace/manifest.json ./ee/workspace/manifest.json
+COPY --from=builder --chown=hono:nodejs /app/ee/workspace/dist ./ee/workspace/dist
+
+# The stock image contains AGPL core + built-in ee/ code (compiled into
+# dist/index.cjs plus the runtime assets copied above). There is no
+# third-party extension delivery path: built-ins are the only extensions,
+# and each loads only when its per-deployment enable flag is set.
+USER hono
+
+EXPOSE 3001
+CMD ["node", "dist/index.cjs"]

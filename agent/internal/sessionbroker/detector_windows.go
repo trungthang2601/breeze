@@ -1,0 +1,344 @@
+//go:build windows
+
+package sessionbroker
+
+import (
+	"context"
+	"fmt"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+type windowsDetector struct{}
+
+// NewSessionDetector creates a Windows session detector using WTS API.
+func NewSessionDetector() SessionDetector {
+	return &windowsDetector{}
+}
+
+var (
+	modWtsapi32                   = windows.NewLazySystemDLL("wtsapi32.dll")
+	modKernel32ForWts             = windows.NewLazySystemDLL("kernel32.dll")
+	procWTSEnumerateSessions      = modWtsapi32.NewProc("WTSEnumerateSessionsW")
+	procWTSFreeMemory             = modWtsapi32.NewProc("WTSFreeMemory")
+	procWTSQuerySessionInfo       = modWtsapi32.NewProc("WTSQuerySessionInformationW")
+	procGetActiveConsoleSessionId = modKernel32ForWts.NewProc("WTSGetActiveConsoleSessionId")
+)
+
+const (
+	wtsCurrentServerHandle = 0
+	wtsConnectState        = 4 // WTSInfoClass: WTSConnectState
+	wtsUserName            = 5
+	wtsDomainName          = 7
+	wtsClientProtocolType  = 16
+	wtsSessionInfoEx       = 25 // WTSInfoClass: WTSSessionInfoEx
+
+	wtsDisconnected = 4 // WTS_CONNECTSTATE_CLASS: WTSDisconnected
+)
+
+type wtsSessionInfo struct {
+	SessionID      uint32
+	WinStationName *uint16
+	State          uint32
+}
+
+// wtsInfoExLevel1 mirrors WTSINFOEX_LEVEL1_W from wtsapi32.h. Field order and
+// the explicit padding before LogonTime must match the C layout exactly:
+// 12 bytes of DWORDs + 72 UTF-16 chars (144 bytes) = 156, padded to 160 so the
+// LARGE_INTEGER block is 8-aligned.
+type wtsInfoExLevel1 struct {
+	SessionID               uint32
+	SessionState            int32
+	SessionFlags            int32
+	WinStationName          [33]uint16
+	UserName                [21]uint16
+	DomainName              [18]uint16
+	_                       [4]byte
+	LogonTime               int64
+	ConnectTime             int64
+	DisconnectTime          int64
+	LastInputTime           int64 // FILETIME; 0 = no input recorded
+	CurrentTime             int64
+	IncomingBytes           uint32
+	OutgoingBytes           uint32
+	IncomingFrames          uint32
+	OutgoingFrames          uint32
+	IncomingCompressedBytes uint32
+	OutgoingCompressedBytes uint32
+}
+
+// wtsInfoEx mirrors WTSINFOEXW: a DWORD level then a union whose only level-1
+// member is 8-aligned, so Data sits at offset 8.
+type wtsInfoEx struct {
+	Level uint32
+	_     [4]byte
+	Data  wtsInfoExLevel1
+}
+
+// querySessionLastInput returns the time of last user input for a session via
+// WTSSessionInfoEx. ok=false when the query fails or returns a short/unknown
+// payload. A zero LastInputTime yields the zero time (treated as unknown by
+// idleSince) — this is the documented console-session quirk.
+func (d *windowsDetector) querySessionLastInput(sessionID uint32) (time.Time, bool) {
+	var buf *wtsInfoEx
+	var bytesReturned uint32
+
+	r1, _, _ := procWTSQuerySessionInfo.Call(
+		wtsCurrentServerHandle,
+		uintptr(sessionID),
+		wtsSessionInfoEx,
+		uintptr(unsafe.Pointer(&buf)),
+		uintptr(unsafe.Pointer(&bytesReturned)),
+	)
+	if r1 == 0 || buf == nil {
+		return time.Time{}, false
+	}
+	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(buf)))
+
+	if uintptr(bytesReturned) < unsafe.Sizeof(wtsInfoEx{}) || buf.Level != 1 {
+		return time.Time{}, false
+	}
+	return filetimeToTime(uint64(buf.Data.LastInputTime)), true
+}
+
+func (d *windowsDetector) ListSessions() ([]DetectedSession, error) {
+	var sessionInfo *wtsSessionInfo
+	var count uint32
+
+	r1, _, err := procWTSEnumerateSessions.Call(
+		wtsCurrentServerHandle,
+		0, // reserved
+		1, // version
+		uintptr(unsafe.Pointer(&sessionInfo)),
+		uintptr(unsafe.Pointer(&count)),
+	)
+	if r1 == 0 {
+		return nil, fmt.Errorf("WTSEnumerateSessions: %w", err)
+	}
+	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(sessionInfo)))
+
+	var sessions []DetectedSession
+	size := unsafe.Sizeof(wtsSessionInfo{})
+
+	for i := uint32(0); i < count; i++ {
+		info := (*wtsSessionInfo)(unsafe.Add(unsafe.Pointer(sessionInfo), uintptr(i)*size))
+
+		// Skip listener sessions only
+		if info.State == 6 { // WTSListen
+			continue
+		}
+
+		// Include active (0), connected (1), and disconnected (4) sessions.
+		// Connected (1) = session exists but no user logged in yet (e.g. lock
+		// screen after reboot). The helper runs as SYSTEM and can capture the
+		// Winlogon desktop via OpenInputDesktop, so this is a valid target.
+		if info.State != 0 && info.State != 1 && info.State != 4 && info.SessionID != 0 {
+			continue
+		}
+
+		username := d.querySessionString(info.SessionID, wtsUserName)
+
+		sessionType := "console"
+		if info.SessionID == 0 {
+			sessionType = "services"
+		} else if proto, ok := d.querySessionUint32(info.SessionID, wtsClientProtocolType); ok && proto == 2 {
+			sessionType = "rdp"
+		}
+
+		session := DetectedSession{
+			Username: username,
+			Session:  fmt.Sprintf("%d", info.SessionID),
+			State:    wtsStateString(info.State),
+			Display:  "windows",
+			Type:     sessionType,
+		}
+		if sessionType != "services" {
+			if lastInput, ok := d.querySessionLastInput(info.SessionID); ok {
+				session.IdleFor, session.IdleKnown = idleSince(time.Now(), lastInput)
+			}
+		}
+		var err error
+		session.Session, err = sanitizeDetectedField(session.Session, true)
+		if err != nil {
+			continue
+		}
+		session.Display, err = sanitizeDetectedField(session.Display, true)
+		if err != nil {
+			continue
+		}
+		session.State, err = sanitizeDetectedField(session.State, true)
+		if err != nil {
+			continue
+		}
+		session.Type, err = sanitizeDetectedField(session.Type, true)
+		if err != nil {
+			continue
+		}
+		session.Username, err = sanitizeDetectedField(session.Username, false)
+		if err != nil {
+			continue
+		}
+
+		sessions = append(sessions, session)
+		if len(sessions) >= maxDetectedSessions {
+			break
+		}
+	}
+
+	return sessions, nil
+}
+
+func (d *windowsDetector) WatchSessions(ctx context.Context) <-chan SessionEvent {
+	ch := make(chan SessionEvent, 16)
+
+	go func() {
+		defer close(ch)
+
+		known := make(map[string]DetectedSession)
+		if sessions, err := d.ListSessions(); err == nil {
+			for _, s := range sessions {
+				known[s.Session] = s
+			}
+		}
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				current, err := d.ListSessions()
+				if err != nil {
+					continue
+				}
+
+				currentMap := make(map[string]DetectedSession)
+				for _, s := range current {
+					currentMap[s.Session] = s
+				}
+
+				for id, s := range currentMap {
+					if _, exists := known[id]; !exists {
+						ch <- SessionEvent{
+							Type:     SessionLogin,
+							Username: s.Username,
+							Session:  s.Session,
+							Display:  s.Display,
+						}
+					}
+				}
+
+				for id, s := range known {
+					if _, exists := currentMap[id]; !exists {
+						ch <- SessionEvent{
+							Type:     SessionLogout,
+							Username: s.Username,
+							Session:  s.Session,
+						}
+					}
+				}
+
+				known = currentMap
+			}
+		}
+	}()
+
+	return ch
+}
+
+func (d *windowsDetector) querySessionString(sessionID uint32, infoClass uint32) string {
+	var buf *uint16
+	var bytesReturned uint32
+
+	r1, _, _ := procWTSQuerySessionInfo.Call(
+		wtsCurrentServerHandle,
+		uintptr(sessionID),
+		uintptr(infoClass),
+		uintptr(unsafe.Pointer(&buf)),
+		uintptr(unsafe.Pointer(&bytesReturned)),
+	)
+	if r1 == 0 || buf == nil {
+		return ""
+	}
+	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(buf)))
+
+	return windows.UTF16PtrToString(buf)
+}
+
+func (d *windowsDetector) querySessionUint32(sessionID uint32, infoClass uint32) (uint32, bool) {
+	var buf *uint32
+	var bytesReturned uint32
+
+	r1, _, _ := procWTSQuerySessionInfo.Call(
+		wtsCurrentServerHandle,
+		uintptr(sessionID),
+		uintptr(infoClass),
+		uintptr(unsafe.Pointer(&buf)),
+		uintptr(unsafe.Pointer(&bytesReturned)),
+	)
+	if r1 == 0 || buf == nil {
+		return 0, false
+	}
+	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(buf)))
+
+	return *buf, true
+}
+
+// GetConsoleSessionID returns the Windows session ID attached to the physical
+// console (monitor). Returns "0" if the API call fails. This is the session
+// that remote desktop should prefer for capture and input injection.
+func GetConsoleSessionID() string {
+	ret, _, _ := procGetActiveConsoleSessionId.Call()
+	if ret == 0xFFFFFFFF { // API returns 0xFFFFFFFF on failure
+		return "0"
+	}
+	return fmt.Sprintf("%d", ret)
+}
+
+func wtsStateString(state uint32) string {
+	switch state {
+	case 0:
+		return "active"
+	case 1:
+		return "connected"
+	case 4:
+		return "disconnected"
+	default:
+		return "unknown"
+	}
+}
+
+// IsSessionDisconnected returns true if the Windows session with the given ID
+// is in a disconnected state (no active display). A helper in a disconnected
+// session cannot capture the screen or inject input.
+func IsSessionDisconnected(winSessionID string) bool {
+	id, err := parseWindowsSessionID(winSessionID)
+	if err != nil {
+		log.Warn("IsSessionDisconnected: failed to parse session ID",
+			"winSessionID", winSessionID, "error", err.Error())
+		return false
+	}
+
+	var buf *uint32
+	var bytesReturned uint32
+	r1, _, callErr := procWTSQuerySessionInfo.Call(
+		wtsCurrentServerHandle,
+		uintptr(id),
+		wtsConnectState,
+		uintptr(unsafe.Pointer(&buf)),
+		uintptr(unsafe.Pointer(&bytesReturned)),
+	)
+	if r1 == 0 || buf == nil {
+		log.Warn("WTSQuerySessionInfo failed for disconnect check, assuming active",
+			"winSessionID", winSessionID, "error", callErr.Error())
+		return false
+	}
+	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(buf)))
+
+	state := *buf
+	return state == wtsDisconnected
+}

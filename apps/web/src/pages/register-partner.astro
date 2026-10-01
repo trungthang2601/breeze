@@ -1,0 +1,13 @@
+---
+import AuthLayout from '../layouts/AuthLayout.astro';
+import PartnerRegisterPage from '../components/auth/PartnerRegisterPage';
+
+// Whether registration is open is a runtime decision (ENABLE_REGISTRATION),
+// which a prebuilt static bundle can't read at build time. PartnerRegisterPage
+// gates itself on the runtime /api/v1/config flag and redirects to /login when
+// registration is disabled (#1308).
+---
+
+<AuthLayout titleKey="titles.registerPartner">
+  <PartnerRegisterPage client:load />
+</AuthLayout>

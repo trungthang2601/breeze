@@ -1,0 +1,11 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import ScriptEditPage from '../../components/scripts/ScriptEditPage';
+
+const { id } = Astro.params;
+if (!id) return Astro.redirect('/scripts');
+---
+
+<DashboardLayout titleKey="titles.scriptsDetail">
+  <ScriptEditPage scriptId={id} client:load />
+</DashboardLayout>

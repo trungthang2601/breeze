@@ -1,0 +1,93 @@
+import {
+  pgTable,
+  uuid,
+  varchar,
+  text,
+  timestamp,
+  boolean,
+  jsonb,
+  pgEnum,
+  integer,
+  index
+} from 'drizzle-orm/pg-core';
+import { organizations, partners } from './orgs';
+import { users } from './users';
+import { alertSeverityEnum } from './alerts';
+
+export const maintenanceWindowStatusEnum = pgEnum('maintenance_window_status', [
+  'scheduled',
+  'active',
+  'completed',
+  'cancelled'
+]);
+
+export const maintenanceRecurrenceEnum = pgEnum('maintenance_recurrence', [
+  'once',
+  'daily',
+  'weekly',
+  'monthly',
+  'custom'
+]);
+
+// A maintenance window is owned by EITHER an org (orgId set, partnerId NULL —
+// the original shape) OR a partner (partnerId set, orgId NULL — "partner-wide
+// / all orgs", epic #2135 / #2131). Exactly one axis is set per row; CHECK
+// `maintenance_windows_one_owner_chk` (migration 2026-07-01) enforces it.
+// maintenance_occurrences reach tenancy through the window join.
+export const maintenanceWindows = pgTable('maintenance_windows', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  orgId: uuid('org_id').references(() => organizations.id),
+  partnerId: uuid('partner_id').references(() => partners.id),
+  name: varchar('name', { length: 255 }).notNull(),
+  description: text('description'),
+  startTime: timestamp('start_time').notNull(),
+  endTime: timestamp('end_time').notNull(),
+  timezone: varchar('timezone', { length: 50 }).notNull().default('UTC'),
+  recurrence: maintenanceRecurrenceEnum('recurrence').notNull().default('once'),
+  recurrenceRule: jsonb('recurrence_rule'),
+  targetType: varchar('target_type', { length: 50 }).notNull(),
+  siteIds: uuid('site_ids').array(),
+  groupIds: uuid('group_ids').array(),
+  deviceIds: uuid('device_ids').array(),
+  suppressAlerts: boolean('suppress_alerts').notNull().default(false),
+  suppressPatching: boolean('suppress_patching').notNull().default(false),
+  suppressAutomations: boolean('suppress_automations').notNull().default(false),
+  suppressScripts: boolean('suppress_scripts').notNull().default(false),
+  allowedAlertSeverities: alertSeverityEnum('allowed_alert_severities').array(),
+  allowedActions: jsonb('allowed_actions'),
+  status: maintenanceWindowStatusEnum('status').notNull().default('scheduled'),
+  // DEPRECATED — inert (#3256). Nothing has ever read these four columns: no
+  // worker, scheduler, or agent command consumes them, so a window that claimed
+  // to "notify before 30 minutes" notified nobody. As of #3256 the API no longer
+  // accepts or writes them; the columns are RETAINED on purpose rather than
+  // dropped, because `maintenance_windows` is hand-enumerated column-by-column in
+  // CORE_TENANT_EXPORT_POLICY (services/tenantExportPolicyRegistry.ts) and
+  // dropping them would shift existing partner canonical-export watermarks — the
+  // same reasoning that kept the config-policy twins in #3197.
+  // Do not read these for new behavior. A real notification consumer (#3207)
+  // should introduce its own validated fields rather than resurrect these.
+  notifyBefore: integer('notify_before'),
+  notifyOnStart: boolean('notify_on_start').notNull().default(false),
+  notifyOnEnd: boolean('notify_on_end').notNull().default(false),
+  notificationChannels: jsonb('notification_channels'),
+  createdBy: uuid('created_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  partnerIdx: index('maintenance_windows_partner_id_idx').on(table.partnerId),
+}));
+
+export const maintenanceOccurrences = pgTable('maintenance_occurrences', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  windowId: uuid('window_id').notNull().references(() => maintenanceWindows.id),
+  startTime: timestamp('start_time').notNull(),
+  endTime: timestamp('end_time').notNull(),
+  status: maintenanceWindowStatusEnum('status').notNull().default('scheduled'),
+  overrides: jsonb('overrides'),
+  actualStartTime: timestamp('actual_start_time'),
+  actualEndTime: timestamp('actual_end_time'),
+  suppressedAlerts: boolean('suppressed_alerts').notNull().default(false),
+  suppressedPatches: boolean('suppressed_patches').notNull().default(false),
+  notes: text('notes'),
+  createdAt: timestamp('created_at').defaultNow().notNull()
+});

@@ -1,0 +1,143 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { and, eq, sql, desc } from 'drizzle-orm';
+import { db } from '../db';
+import { patchPolicies } from '../db/schema';
+import { authMiddleware, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { PERMISSIONS } from '../services/permissions';
+
+export const patchPolicyRoutes = new Hono();
+const requirePatchPolicyRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
+
+// ============================================
+// Helper Functions
+// ============================================
+
+function getPagination(query: { page?: string; limit?: string }) {
+  const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(query.limit ?? '50', 10) || 50));
+  return { page, limit, offset: (page - 1) * limit };
+}
+
+async function getPatchPolicyWithPartnerCheck(
+  policyId: string,
+  auth: Pick<AuthContext, 'scope' | 'partnerId'>
+) {
+  const [policy] = await db
+    .select()
+    .from(patchPolicies)
+    .where(and(eq(patchPolicies.id, policyId), eq(patchPolicies.kind, 'legacy')))
+    .limit(1);
+
+  if (!policy) {
+    return null;
+  }
+
+  // Partner-scope check: caller must belong to the same partner
+  if (auth.scope !== 'system' && auth.partnerId !== policy.partnerId) {
+    return null;
+  }
+
+  return policy;
+}
+
+// ============================================
+// Validation Schemas
+// ============================================
+
+const listPatchPoliciesSchema = z.object({
+  page: z.string().optional(),
+  limit: z.string().optional(),
+  orgId: z.string().guid().optional(),
+  enabled: z.enum(['true', 'false']).optional()
+});
+
+// ============================================
+// Routes
+//
+// NOTE: Patch policies are now managed via the Configuration Policy system
+// (configPolicyPatchSettings). These standalone patch policy routes remain
+// for legacy compatibility. New integrations should use
+// POST /configuration-policies/:id/patch-job instead.
+// ============================================
+
+// Apply auth middleware to all routes
+patchPolicyRoutes.use('*', authMiddleware);
+
+// GET /patch-policies - List patch policies for partner
+patchPolicyRoutes.get(
+  '/',
+  requireScope('partner', 'system'),
+  requirePatchPolicyRead,
+  zValidator('query', listPatchPoliciesSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+    const { page, limit, offset } = getPagination(query);
+
+    // Build conditions array
+    const conditions: ReturnType<typeof eq>[] = [];
+
+    // Filter by partner access based on scope
+    if (auth.scope === 'partner') {
+      if (!auth.partnerId) {
+        return c.json({ error: 'Partner context required' }, 403);
+      }
+      conditions.push(eq(patchPolicies.partnerId, auth.partnerId));
+    } else if (auth.scope === 'system' && query.orgId) {
+      // System callers may pass orgId as a hint, but rings are partner-scoped;
+      // there is no org-to-partner translation here — ignore for filtering.
+      // (orgId param is preserved in the schema for backwards compat only.)
+    }
+
+    if (query.enabled !== undefined) {
+      conditions.push(eq(patchPolicies.enabled, query.enabled === 'true'));
+    }
+
+    conditions.push(eq(patchPolicies.kind, 'legacy'));
+
+    const whereCondition = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const countResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(patchPolicies)
+      .where(whereCondition);
+    const total = Number(countResult[0]?.count ?? 0);
+
+    const policies = await db
+      .select()
+      .from(patchPolicies)
+      .where(whereCondition)
+      .orderBy(desc(patchPolicies.updatedAt), desc(patchPolicies.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: policies,
+      pagination: { page, limit, total }
+    });
+  }
+);
+
+// POST, PATCH, DELETE routes have been removed.
+// Patch policies are now managed via the Configuration Policy system.
+// Use /configuration-policies and their feature links instead.
+
+// GET /patch-policies/:id - Get policy details
+patchPolicyRoutes.get(
+  '/:id',
+  requireScope('partner', 'system'),
+  requirePatchPolicyRead,
+  async (c) => {
+    const auth = c.get('auth');
+    const policyId = c.req.param('id')!;
+
+    const policy = await getPatchPolicyWithPartnerCheck(policyId, auth);
+    if (!policy) {
+      return c.json({ error: 'Patch policy not found' }, 404);
+    }
+
+    return c.json(policy);
+  }
+);

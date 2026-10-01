@@ -1,0 +1,131 @@
+import { Hono, type Context, type Next } from 'hono';
+import { zValidator } from '../../lib/validation';
+import { z } from 'zod';
+import { authMiddleware, requireMfa, requireScope, requirePermission } from '../../middleware/auth';
+import { PERMISSIONS } from '../../services/permissions';
+import { partnerBillingSettingsSchema, orgBillingSettingsSchema, orgCurrencyImpactQuerySchema, reportingTotalsQuerySchema } from '@breeze/shared';
+import { updatePartnerBillingSettings, updateOrgBillingSettings } from '../../services/invoiceService';
+import { BillingProfileServiceError } from '../../services/billingProfileService';
+import { getOrgCurrencyImpact } from '../../services/orgCurrencyService';
+import { computeReportingTotal, parseGroupsParam, resolvePartnerReportingCurrency } from '../../services/reportingTotals';
+import { ExchangeRateServiceError } from '../../services/exchangeRateService';
+import { invoiceActorFrom, handleServiceError } from './invoices';
+import {
+  PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+  canManagePartnerWidePolicies,
+} from '../../services/partnerWideAccess';
+import { writeRouteAudit, type AuthContext as AuditAuthContext } from '../../services/auditEvents';
+import { resolveAuditOrgIdForPartner } from '../../services/auditOrgResolver';
+
+// Mounted at the api root (not under the /invoices hub) so the paths read
+// /api/v1/partner/billing-settings and /api/v1/orgs/:orgId/billing-settings.
+// Auth is applied PER-ROUTE (not via `use('*')`): mounted at '/', a wildcard
+// middleware would leak onto sibling/public routes registered later and 401 them
+// (the #1383 regression). authMiddleware leads each route's middleware chain.
+export const invoiceSettingsRoutes = new Hono();
+const scopes = requireScope('partner', 'system');
+const profileWritePerm = requirePermission(PERMISSIONS.BILLING_PROFILES_WRITE.resource, PERMISSIONS.BILLING_PROFILES_WRITE.action);
+const writePerm = requirePermission(PERMISSIONS.INVOICES_WRITE.resource, PERMISSIONS.INVOICES_WRITE.action);
+const requirePartnerWideBillingAdmin = async (c: Context, next: Next) => {
+  if (!canManagePartnerWidePolicies(c.get('auth'))) {
+    return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+  }
+  await next();
+};
+
+invoiceSettingsRoutes.patch('/partner/billing-settings', authMiddleware, scopes, writePerm, requireMfa(), requirePartnerWideBillingAdmin,
+  zValidator('json', partnerBillingSettingsSchema),
+  async (c) => {
+    try {
+      const actor = invoiceActorFrom(c);
+      const body = c.req.valid('json');
+      const updated = await updatePartnerBillingSettings(body, actor);
+      // Sweep paper cut #4: this is a partner-WIDE write with no orgId of its
+      // own, so the generic route-derived audit fallback in index.ts silently
+      // skips it for most partner admins (resolveFallbackOrgId requires an
+      // org-scoped token or exactly one accessibleOrgIds entry — false for
+      // any partner with more than one org). Write the same semantic audit
+      // shape /settings/partner's PATCH uses (writeRouteAudit +
+      // resolveAuditOrgIdForPartner), so a save here is never silent.
+      const auditOrgId = await resolveAuditOrgIdForPartner(actor.partnerId);
+      writeRouteAudit(c as unknown as AuditAuthContext, {
+        orgId: auditOrgId,
+        action: 'partner.billing_settings.update',
+        resourceType: 'partner',
+        resourceId: actor.partnerId,
+        details: { changedFields: Object.keys(body) },
+      });
+      return c.json({ data: updated });
+    }
+    catch (err) { return handleServiceError(c, err); }
+  });
+
+invoiceSettingsRoutes.patch('/orgs/:orgId/billing-settings', authMiddleware, scopes, writePerm,
+  zValidator('param', z.object({ orgId: z.string().guid() })),
+  zValidator('json', orgBillingSettingsSchema),
+  async (c, next) => {
+    if (c.req.valid('json').billingProfileId !== undefined) return profileWritePerm(c, next);
+    await next();
+  },
+  async (c) => {
+    try { return c.json({ data: await updateOrgBillingSettings(c.req.valid('param').orgId, c.req.valid('json'), invoiceActorFrom(c)) }); }
+    catch (err) {
+      if (err instanceof BillingProfileServiceError) {
+        return c.json({ error: err.message, code: err.code }, err.status as 400);
+      }
+      return handleServiceError(c, err);
+    }
+  });
+
+// Multi-currency wave 6 (#3778): ADVISORY, read-only preview of what a currency
+// change would strand. Counts are never blockers and never a promise — rows can
+// be created between this preview and the change (the org SHARE barrier, not
+// this count, is what makes the cutover exact). Same per-route middleware chain
+// as the PATCH above (never `use('*')` — the #1383 regression).
+invoiceSettingsRoutes.get('/orgs/:orgId/billing-settings/currency-impact', authMiddleware, scopes, writePerm,
+  zValidator('param', z.object({ orgId: z.string().guid() })),
+  zValidator('query', orgCurrencyImpactQuerySchema),
+  async (c) => {
+    try {
+      return c.json({ data: await getOrgCurrencyImpact(
+        c.req.valid('param').orgId, c.req.valid('query').currencyCode, invoiceActorFrom(c)) });
+    } catch (err) { return handleServiceError(c, err); }
+  });
+
+// Multi-currency wave 7 (#3779): reporting-only FX totals for the optional
+// "≈ approximate" line beneath per-currency dashboard totals. READ-ONLY and
+// deliberately permission-free — rates are public reference facts (the table's
+// RLS policy is `FOR SELECT USING (true)`), and a timesheet viewer must not
+// need invoice permissions to see an approximate total. Conversion happens
+// HERE, never in the browser, so there is exactly one implementation of
+// reporting money math (spec §8). `to` defaults to the actor's PARTNER
+// currency, resolved server-side, so organization-scoped viewers work without
+// /orgs/partners/me (which is partner-scope only). An unavailable result is
+// DATA, never an HTTP failure: the client then renders segmented totals only.
+// Per-route middleware, never `use('*')` (#1383).
+const readScopes = requireScope('organization', 'partner', 'system');
+
+/** ExchangeRateServiceError carries its own `.status` + `.code`, which the
+ *  invoice-flavoured handleServiceError does not know about — mapping it here
+ *  keeps that shared helper free of FX concerns. */
+function handleReportingError(c: Parameters<typeof handleServiceError>[0], err: unknown): Response {
+  if (err instanceof ExchangeRateServiceError) {
+    return c.json({ error: { code: err.code, message: err.message } }, err.status);
+  }
+  return handleServiceError(c, err);
+}
+
+invoiceSettingsRoutes.get('/billing/reporting-totals', authMiddleware, readScopes,
+  zValidator('query', reportingTotalsQuerySchema),
+  async (c) => {
+    const { groups, to, date } = c.req.valid('query');
+    const auth = c.get('auth');
+    try {
+      const parsed = parseGroupsParam(groups);
+      const target = to ?? (auth.partnerId ? await resolvePartnerReportingCurrency(auth.partnerId) : null);
+      if (!target) {
+        return c.json({ error: { code: 'NO_REPORTING_CURRENCY', message: 'No reporting currency is configured for this partner' } }, 409);
+      }
+      return c.json({ data: await computeReportingTotal(parsed, target, date) });
+    } catch (err) { return handleReportingError(c, err); }
+  });

@@ -1,0 +1,287 @@
+---
+title: Quotes & Proposals
+description: Build priced quotes from your catalog, take a deposit on acceptance, and turn accepted quotes into invoices and recurring contracts in Breeze.
+sidebar:
+  label: "Quotes"
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Quotes turn the products and services in your [Product Catalog](/features/product-catalog/) into a priced proposal you can send to a customer, collect a deposit on, and -- once accepted -- convert into an invoice and recurring contract without re-keying anything. Open **Quotes** from the sidebar to get started.
+
+Quotes are **partner-scoped**: you can quote any of your customer organizations from one place.
+
+Quotes, along with the rest of the Billing section, are only available when the **Service Management** module is enabled for your account; see [Service Management mode](/reference/partner-management/#service-management-mode).
+
+## The Quote Editor
+
+The editor is where you assemble and price a quote. Add lines from the shared **catalog picker** -- start typing to search your catalog by name or SKU -- or add a **manual line** for anything not in the catalog. The running subtotal, tax, and total update live as you edit. A **last-saved** indicator in the header shows when your changes were last persisted.
+
+### Reordering, Bulk Edit, and Undo
+
+- **Drag to reorder** -- every line has a drag handle, so you can rearrange lines within and between pricing sections directly; the **⋯** menu offers the same moves for keyboard use. A sticky **Contents** outline in the side rail lets you jump between sections of a long quote, and pricing sections can be collapsed while you work.
+- **Bulk edit** -- select multiple lines (across sections) with their checkboxes to reveal a bulk action bar: apply a markup, change customer visibility, or delete the selection in one step.
+- **Undo delete** -- deleting a line or a whole section shows an undo toast, so a slip doesn't cost you the work.
+- **Unassigned lines** -- if a quote ends up with lines that don't belong to any pricing section (for example, on some quotes cloned in older versions), they now appear in a dedicated **Unassigned lines** bucket below the document instead of silently counting toward the totals, so you can edit or re-home them.
+
+### Internal Cost Details
+
+Each line's internal cost details (SKU, cost, markup, profit) collapse into a one-line summary; expand a line to edit them. These figures are internal -- the customer never sees them. If any lines are missing a cost, the editor shows a **"N lines missing a cost"** warning that jumps you to the first offender, and the send dialog repeats the notice (without blocking the send).
+
+### Quote Title
+
+Give a quote a **title** (for example, "Server refresh -- Q1" or "New-hire onboarding bundle"). The title appears at the top of the quote and on the PDF the customer sees, so a proposal reads as a named piece of work rather than just a number.
+
+### Line Titles and Descriptions
+
+Each line has a short **title** and an optional longer **description** shown beneath it. When you add a catalog item, both are prefilled from the catalog entry; edit either to tailor the wording for this customer.
+
+### Two-Way Markup
+
+Every line shows **cost**, **markup %**, and **price** together, and the three stay in sync whichever way you work:
+
+- Enter your **cost** and a **markup %**, and Breeze sets the sell **price**.
+- Enter your **cost** and a **price**, and Breeze shows you the resulting **markup %**.
+
+This means you can price to a target margin or to a target price interchangeably, and always see the margin you're giving on each line.
+
+### Auto-fill from Web
+
+Don't have an item in your catalog yet? Type a product name or SKU into a line's **Auto-fill from web** field and Breeze AI drafts the line for you -- name, description, unit of measure, and taxability -- and **prices the line**: it estimates a market cost and applies your **default markup** (set in **Settings → Billing**) to fill in the sell price. The estimate is a starting point; review and adjust the cost and price before you send.
+
+<Aside type="note">
+  The tone Breeze AI uses when drafting names and descriptions follows the **AI product copy style** you set in **Settings → Billing** (see [Product Catalog → AI Auto-fill](/features/product-catalog/#ai-auto-fill)). Leave it blank for the default voice.
+</Aside>
+
+### Line Images
+
+Any line can carry an **image**, so a hardware quote can show the product the customer is buying. A catalog item's [product image](/features/product-catalog/#product-images) flows onto the line automatically; you can also upload an image directly on the line, which takes precedence over the catalog picture for that quote. Images appear on the quote preview, the PDF, and the customer-facing proposal page -- along with each line's name and description, so the proposal the customer opens matches what you built in the editor.
+
+### One-Time and Recurring Pricing
+
+A quote separates **one-time** charges (hardware, project work) from **recurring** charges (monthly or annual services) into distinct pricing tables, each with its own subtotal, so the customer sees "pay once" and "pay every month" as separate figures. Set a line's cadence with its **One-time / Monthly / Annual** control. If you add a line to the wrong table, use the line's **Move to…** action to shift it between the one-time and recurring tables without deleting and re-adding it.
+
+Each pricing table also has a **Show subtotal** option you can turn on or off per table. When enabled, the table's subtotal -- split by recurrence -- appears on both the in-app **Preview** and the **PDF** the customer sees, so you can choose which sections show a running figure.
+
+## Quoting by device set
+
+A **recurring** quote line can price a live device count instead of a fixed number. Turn on **Bill by device set** on a monthly or annual line and pick one of four:
+
+| Device set | Bills |
+|---|---|
+| Per device | Every device on the organization, optionally narrowed to one site |
+| Per device role | Only devices with the roles you choose (servers, workstations, firewalls...), optionally narrowed to one site |
+| Per device group | The members of one device group. Dynamic groups are evaluated live |
+| Per seat | The organization's active users |
+
+The quantity is counted by Breeze, not typed in. The quantity box disappears while a device set is on. Any of the four can also carry an **included quantity**: the line then bills that quantity every period even when the live count is lower, and you choose whether the units above it are billed at a separate rate or just reported for review.
+
+**The number on the quote is an estimate**, and the customer's document labels every such line as an estimated quantity that will be billed at the actual count each billing period. A brand-new customer with nothing enrolled yet quotes at zero, and the document still shows the line and the explanation. That is the point.
+
+Counts refresh when you add the line or edit its device-set or allowance settings, and when you press **Refresh counts** on a draft quote. The read-only estimate can show the current count without changing the quote. Counts deliberately do **not** refresh when the quote is sent or accepted: sending reports which lines have drifted and leaves the numbers alone, so a scheduled send can never reprice a document you already approved.
+
+A device set cannot be added to a one-time line or to a component of a bundle, and the **kind** of device set cannot be changed after the line is created — to switch a line from device roles to a device group, remove it and add it again. What the set contains stays editable: you can change which roles are included, or point the line at a different device group, at any time. A device group that a draft, sent, or viewed quote prices cannot be deleted until that line is removed.
+
+Accepting the quote creates a contract line of the matching type, with the price frozen at what the customer signed. From then on the contract counts for itself every billing period.
+
+### Customer Bill-To ("Prepared for")
+
+Every quote -- including a **draft** -- renders a **Prepared for** block with the customer's name, billing address, and tax id, drawn from the organization's **Billing** settings. This shows on both the in-app **Preview** and the **PDF**, so a draft you're reviewing looks the way the customer will see it. (Previously the block was blank until the quote was sent.)
+
+The displayed name still honors a **bill-to name** override when one is set on the quote.
+
+<Aside type="note">
+  The billing address comes from the organization's Billing settings. Keep those current so quotes address the customer correctly. A per-quote address override is planned as a future enhancement.
+</Aside>
+
+### Inline Editing of Line Items
+
+Quote line items can be edited in place directly in the editor -- you don't need to delete a line and re-add it to correct a detail. Click a field on an existing line to edit it inline:
+
+| Field | Editable inline |
+|-------|----------------|
+| Description | Yes |
+| Quantity | Yes |
+| Unit price | Yes |
+| Taxable | Yes |
+| Recurrence | Yes |
+
+Changes take effect immediately on the quote and are reflected in the live totals without saving and re-opening.
+
+### Searching Distributor Products from a Quote
+
+While editing a quote, the line-item picker includes a **Search distributor** tab (visible only when TD SYNNEX EC Express credentials are configured -- see [Distributor Integrations](/features/integrations/#distributor-integrations)). Enter a TD SYNNEX SKU or manufacturer part number, see live cost, MSRP, and availability, enter your sell price, and click **Import & add**. The product is imported to your catalog and added to the quote as a line item in one step -- without navigating away from the editor.
+
+This is distinct from the [catalog-level import workflow](/features/product-catalog/#importing-from-distributor-catalogs): that builds your standing price list, while the quote-level search pulls a product directly into an open quote.
+
+## Deposits
+
+You can require a customer to pay a **deposit** when they accept a quote, with the rest invoiced afterward. Choose one of two ways to set the deposit amount:
+
+- **Percentage** -- a percent of the quote's total due on acceptance (for example, 30%). The percentage must be greater than 0 and less than 100.
+- **Selected lines** -- flag specific one-time lines as **deposit-eligible**, and the deposit is the total of those lines (including their tax). Catalog **hardware** lines are marked deposit-eligible by default, so "deposit covers the hardware, we bill the labor on completion" is a one-click setup. At least one visible one-time line must be eligible.
+
+When the deposit spans more than one kind of item, the quote shows a **category breakdown** -- how much of the deposit is hardware, software, service, and other -- so the customer can see what they're paying for up front.
+
+### Deposit-First Invoicing
+
+When a customer accepts a quote that has a deposit, Breeze issues the invoice with the **deposit shown as the amount due first**. The customer pays the deposit, and the remaining balance becomes due per the invoice's terms -- so a single invoice carries the whole engagement while collecting the deposit before the balance. See [Invoices → Deposit invoices](/features/invoices/#deposit-invoices) for how this appears on the invoice.
+
+## What Happens on Acceptance
+
+When a customer accepts a quote, Breeze turns it into the documents that bill it:
+
+- **One-time lines** become an **invoice** (with the deposit due first, if one was set). The customer is taken straight to that invoice's own view-and-pay page, and unless you turn it off in **Settings → Billing**, Breeze emails them the invoice with the same link right away.
+- **Recurring lines** become one or more **draft contracts** -- monthly and annual lines split into separate drafts, one billing cadence each -- that you review and activate. See [Recurring Contracts → From an Accepted Quote](/features/contracts/#from-an-accepted-quote).
+
+If the accepted quote contains **Pax8-backed** catalog items, acceptance also **stages a Pax8 order** for those items alongside the invoice and contracts. Acceptance doesn't submit anything to Pax8; you complete the commitment and provisioning details and submit it afterward. See [Distributor Integrations → Complete an order staged from a quote](/features/distributor-integrations/#complete-an-order-staged-from-a-quote).
+
+### Ordering What You Sold
+
+Once a quote is won (accepted or converted), its detail view grows a **To be ordered** procurement breakdown of the SKU-bearing lines — item, SKU, part number, vendor, quantity, and (if you can see margin) unit cost, extended cost, and markup — so you can place vendor orders without re-deriving a purchase order from the pricing tables. Lines are grouped by vendor, with cost totals per group.
+
+- **Mark ordered** — select lines and record the order against them: vendor, order reference, tracking number, expected arrival date, notes, and per-line quantities. Partial quantities are supported, so a line can be split across orders.
+- **Mark received** — record arrivals as they land; lines track **Ordered → Partly received → Received**, and order lines can be cancelled.
+- **Export** — copy the breakdown for a spreadsheet or download it as CSV to hand to a purchasing system.
+
+Vendor cost figures are the quote's own snapshot of each line at the time it was priced, so the breakdown reflects what you sold, not today's catalog price. Pax8-backed lines carry a badge showing their Pax8 order state (staged, ordered, failed, or needs review) alongside the manual tracking.
+
+## Sending and Tracking
+
+<Steps>
+1. Assemble and price the quote in the editor, set a title, and configure a deposit if you want one.
+2. Review the one-time and recurring totals and the deposit summary.
+3. **Send** the quote to the customer for review and acceptance.
+</Steps>
+
+The **Send** dialog accepts an optional **personal message**. When you add one, it renders in the email above the accept link, so you can add a short note to the customer without leaving the quote. Leave it blank to send the standard email.
+
+Partners edit the proposal email under **Settings → Partner → Email templates** (Quote / proposal) -- subject, heading, button label, and HTML body. Merge variables: `{{quote_number}}`, `{{partner_name}}`, `{{total}}`, `{{expiry_date}}`, and `{{accept_url}}`. The **Review & accept** button always uses the server accept link; partners cannot point it somewhere else. A personal message from the send dialog and your email signature still appear around that body. Leave it on the default to keep the built-in wording. This does not change the email card's accent bar or pull colors from the Branding tab.
+
+After you click Send, the quote shows a brief **"Sending in Ns — Undo"** countdown (about 30 seconds) before the email actually leaves. Click **Undo** during that window and nothing is sent — the quote stays a draft and you can keep editing. Once the countdown finishes the email goes out and the quote moves to **Sent**.
+
+<Aside type="caution" title="Who can accept a quote from the customer portal">
+  Accepting or declining a quote from the authenticated [customer portal](/features/portal/) is limited to the **email addresses the quote was sent to**. A portal user whose email was not a recipient of the send can view the quote but cannot act on it.
+
+  This gate applies retroactively: quotes sent **before upgrading to v0.99.0** have no recorded recipients, so nobody can accept or decline them from the portal until you **re-send** them. If a customer reports they can't accept an older outstanding quote, re-send it to record the recipients.
+</Aside>
+
+Preview images support **click-to-zoom**: click an image on the quote preview to open it enlarged, and press **Escape** or click the backdrop to close it. The lightbox is keyboard-reachable.
+
+You can send or delete quotes in bulk from the quote list -- select quotes with the checkboxes to reveal the bulk action bar. Actions run per-item in isolation, so partial success is possible and the bar reports what succeeded and what failed.
+
+### Re-sending and share links
+
+A sent quote can be **re-sent** without rebuilding it — useful when a contact changes, a quote expires unread, or you need to record recipients on an older quote (see the caution above). The quote also shows **who it was sent to and when**, so you can tell at a glance whether the right person actually received it.
+
+**Copy share link** puts the customer-facing link on your clipboard, for when you would rather paste it into an existing email thread or a chat than send from Breeze.
+
+### Declined quotes
+
+A customer can decline from the quote page and leave a short note explaining why. Breeze emails the technician who created the quote (falling back to your billing address), and the quote detail shows a **Declined** banner with the date and the customer's own words -- so the reason lives with the quote instead of in someone's inbox. From there, **Duplicate & revise** builds a follow-up proposal from the declined quote. A quote you decline yourself on the customer's behalf is attributed to your team and sends no email.
+
+### Accepting on Behalf of a Customer
+
+Sometimes a customer accepts over the phone, by email reply, or with a signed purchase order instead of clicking the quote's own accept link. On a quote in **draft**, **sent**, or **viewed** status, use **Accept on behalf** (on the quote's actions) to record that acceptance yourself.
+
+The dialog asks for:
+
+- **Method** -- verbal, email, signed document, purchase order, or other.
+- **Reference** -- required. This is where a reviewer would go to find the customer's agreement (for example, "PO 4471" or a link to the email thread). Because there's no click-through consent trail for an on-behalf acceptance, the reference is what stands in for it if the acceptance is ever disputed.
+- **Signer name** -- who agreed to the quote.
+- **Signer email** -- optional.
+- **Evidence file** -- optional. The signed document or purchase order itself, as a PDF, PNG, or JPEG up to 10 MB. It is uploaded right after the acceptance is recorded; if the upload fails the acceptance still stands and you can attach the file from the quote page.
+
+Accepting on behalf does exactly what a customer clicking Accept does: the quote moves to **converted**, an invoice is issued and numbered immediately at the quote's frozen totals and tax, and any recurring lines become draft contracts (see [What Happens on Acceptance](#what-happens-on-acceptance) above). If your **"email the invoice on quote accept"** setting (**Settings → Billing**) is on, the invoice is emailed to the customer just as it would be for a normal acceptance.
+
+<Aside type="caution">
+  A **draft** quote has never been sent -- no customer email, no public accept link. Accepting it on behalf still freezes and numbers it, but the customer's first sight of it will be the invoice, not the proposal. The dialog repeats this warning before you confirm.
+</Aside>
+
+**Expired** and **declined** quotes cannot be accepted on behalf -- use **Duplicate & revise** to build a follow-up proposal instead.
+
+There is no undo. The resulting invoice can be voided like any other invoice, but the contracts it created and any Pax8 order it staged are not unwound by voiding the invoice.
+
+The quote detail shows the provenance of an on-behalf acceptance: **"Accepted on behalf of &lt;signer&gt; by &lt;tech&gt; on &lt;date&gt; · &lt;method&gt; · &lt;reference&gt;."** The customer's own portal view shows only **"Accepted on your behalf by &lt;provider&gt; on &lt;date&gt;"** -- the method and reference stay internal. Every on-behalf acceptance also writes a `quote.accepted_on_behalf` [audit log](/features/approval-security/) entry recording the tech, method, reference, signer, and resulting invoice number.
+
+Next to that provenance line, **Download evidence** fetches the attached file, and **Attach evidence** (or **Replace evidence**) adds or swaps it -- this works on a converted quote without reopening it. Attaching requires the same `quotes:accept` permission as recording the acceptance; one file is kept per acceptance, and every attach or replace writes a `quote.acceptance_evidence_attached` audit entry with the file's name, type, size, and SHA-256 digest. Evidence files are never shown in the customer portal or on the public quote link, and they are deleted with the organization's other files when the organization is erased.
+
+### Declining on Behalf of a Customer
+
+When a customer turns a quote down by phone, email, or letter instead of using the quote page, use **Decline on behalf** on a **sent** or **viewed** quote to record it. The dialog asks how the customer declined (the same list of methods as Accept on behalf), a required **Reference** pointing to where the decline can be found, and an optional reason in the customer's own words. The quote moves to **declined** and can no longer be accepted; **Duplicate & revise** still builds a follow-up proposal from it.
+
+A draft can't be declined on behalf -- the customer never saw it, so delete it instead. Recording a decline requires the same quote **accept** permission as Accept on behalf. No email is sent, and a `quote.declined_on_behalf` [audit log](/features/approval-security/) entry records the tech, method, reference, and reason.
+
+### Quotes and currency
+
+A quote is priced in the customer organization's billing currency, which it inherits from your partner currency when the organization is created. Retargeting a draft or a clone to an organization that bills in a different currency is refused rather than silently re-pricing the lines -- build the quote in the right organization instead.
+
+## Document themes and content blocks
+
+Quotes and contracts render as branded documents. Under **Settings → Partner → Branding** you choose a **document theme** — fonts, colors, and cover treatment — and every quote, contract, and PDF you generate uses it. Set it once and customer-facing documents stay consistent.
+
+Beyond priced line items, a quote body can contain content blocks that turn it into a full proposal:
+
+| Block | Use it for |
+|---|---|
+| **Rich text** | Scope, assumptions, terms — formatted paragraphs, lists, and headings |
+| **Table** | Comparison grids, schedules, responsibility matrices |
+| **Callout** | Pulling out a caveat, an inclusion, or a deadline |
+| **Contract** | Attaching a template from your [agreement template library](/features/agreements/#contract-templates) for the customer to review as part of the proposal |
+
+Tables and callouts are edited **in place** on the quote itself, so what you see while editing is what the customer receives — no round trip through a PDF to check the result.
+
+<Aside>
+  Rich text is sanitized before it is stored. If you paste markup Breeze does not allow, it tells you what was stripped rather than silently discarding it.
+</Aside>
+
+### Contract blocks
+
+A **Contract** block attaches a document from your [agreement template library](/features/agreements/#contract-templates) to a quote, so the customer reviews (and, by accepting the quote, effectively agrees to) that document alongside the priced lines.
+
+<Steps>
+1. Add a **Contract** block and choose a **template**. Breeze attaches its **latest published version** -- there's no separate version picker, and a template with no published version yet can't be attached.
+2. Optionally give the block a **label** (shown instead of the template's name).
+3. If the template declares any **manual variables**, fill them in -- Breeze won't let you add the block with one left blank.
+</Steps>
+
+The block pins to **whichever published version was latest at attach time** -- it doesn't automatically follow later edits to the template. If a newer version of the same template is published afterward, the block shows an **Update to vN** button so you can re-pin it to that newer version deliberately; nothing changes until you click it.
+
+**Variables** are resolved when the block renders: auto variables (customer name/address, your organization's name, quote number/title, totals, dates) come from the quote automatically; manual variables use whatever you entered when you attached (or last edited) the block. An uploaded-PDF template has no variables -- it's attached as-is.
+
+<Aside type="caution">
+  **Send is blocked while any contract block has an unresolved variable.** If a manual variable is left blank -- for example, after switching a block to a newer template version that added one -- Breeze refuses to send the quote until every declared variable on every contract block has a value. The block editor lists which ones are still missing.
+</Aside>
+
+When the customer **accepts** a quote with contract blocks, Breeze freezes each block's rendered content (an authored template's substituted text, or an uploaded PDF as-is) into a permanent, standalone **contract document** -- the record of exactly what the customer saw and agreed to at that moment, unaffected by any later edits to the template. Executed contract documents can be downloaded as PDF from the **Contracts → Documents** tab, or from the related recurring contract's own detail page if one was linked.
+
+## Cloning a Quote
+
+Reuse the structure and line items of an existing proposal instead of rebuilding it. From a quote's actions, choose **Clone quote** to open a dialog where you pick:
+
+- **Company** -- defaults to the source quote's company. Choose a different one to retarget the clone.
+- **Title** -- prefilled with **Clone of** the source quote's title (or its number). You can edit it or leave it blank for an untitled clone.
+
+The clone is a fresh, editable **draft** with its own new quote number, in the same partner. It does **not** carry over the source quote's acceptance or conversion state -- you get a clean proposal to adjust and send.
+
+If you retarget the clone to a **different company**, Breeze applies that company's billing details and tax rate and clears the site and bill-to override, so the new draft reflects the new customer rather than the original one.
+
+Cloning requires quote **write** permission.
+
+## Changing the Customer on a Draft
+
+While a quote is still a **draft**, you can move it to a different customer without cloning. The editor has a **Customer** selector next to the title; switching it re-resolves the tax rate and clears the site and bill-to override -- unless the same edit supplies new values for them.
+
+**Issued quotes -- ones you've already sent or that have been accepted -- are immutable**, including their customer. To point an issued quote at a different customer, use [Clone quote](#cloning-a-quote) and retarget the clone.
+
+## Permissions
+
+Quote access is governed by role permissions: viewing requires quote read access, creating and editing drafts requires quote write access, and sending requires quote send access. **Accept on behalf** and **Decline on behalf** require the separate quote **accept** permission, which was granted automatically to every role that already held **send** when this action shipped -- revoke it on a role if you want acceptance to be narrower than sending. Financially binding actions are gated accordingly. Assign these through **Settings → Users & Roles**.
+
+## Related
+
+- [Product Catalog](/features/product-catalog/) -- the price list quotes pull from
+- [Invoices](/features/invoices/) -- where an accepted quote's one-time charges land, deposit first
+- [Recurring Contracts](/features/contracts/) -- where an accepted quote's recurring lines become contracts
+- [Agreements → Agreement templates](/features/agreements/#contract-templates) -- manage the document library contract blocks attach
+- [Online Payments](/features/online-payments/) -- let customers pay the deposit and balance by card

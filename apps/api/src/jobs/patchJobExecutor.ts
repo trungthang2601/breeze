@@ -1,0 +1,1451 @@
+/**
+ * Patch Job Executor
+ *
+ * Two BullMQ queues:
+ *   - patch-jobs:        orchestration (pick up job, fan out to devices)
+ *   - patch-job-devices: per-device execution (resolve patches, install, reboot)
+ */
+
+import { Queue, Worker, Job } from 'bullmq';
+import { z } from 'zod';
+import { policyAppRuleSchema } from '@breeze/shared/validators';
+import * as dbModule from '../db';
+import {
+  patchJobs,
+  patchJobResults,
+  patches,
+  patchPolicies,
+  devices,
+  deviceCommands,
+} from '../db/schema';
+import { eq, and, sql, inArray } from 'drizzle-orm';
+import { getBullMQConnection } from '../services/redis';
+import { isReusableState } from '../services/bullmqUtils';
+import {
+  type CategoryRule,
+  type PolicyAppRule,
+  type PolicyAutoApproveConfig,
+  type RingConfig,
+} from '../services/patchApprovalEvaluator';
+// W02 (#5748): the DB-facing resolver moved to patchEligibility.ts; the call
+// below and its behaviour are unchanged (golden-fixture parity test there).
+import { resolveApprovedPatchesForDevice } from '../services/patchEligibility';
+import { dispatchDeviceCommand } from '../services/dispatchDeviceCommand';
+import {
+  deliveryTtlMs,
+  type OfflinePolicy,
+} from '../services/commandOfflinePolicy';
+import {
+  checkAndFinalizeJob,
+  finalizePatchJobDevice,
+  type ApprovedPatchRef,
+  type PatchDeviceTerminal,
+} from '../services/patchJobFinalizer';
+import { captureException } from '../services/sentry';
+import { attachWorkerObservability } from './workerObservability';
+
+// Strict shape for patches.policyAutoApprove as stored in the job JSONB.
+// deferralDays must be a valid non-negative integer when present — a malformed
+// value must NOT be coerced to 0, because that silently removes the deferral
+// safety window. Absent deferralDays is fine and defaults to 0.
+const jobPolicyAutoApproveSchema = z.object({
+  enabled: z.boolean(),
+  severities: z.array(z.string()),
+  deferralDays: z.number().int().min(0).optional(),
+});
+
+// Strict shape for one patches.categoryRules entry as stored in the job JSONB.
+// Matches the evaluator's CategoryRule: severityFilter is the legacy stored
+// alias for autoApproveSeverities (pre-2026-08 snapshots), both read-only here.
+const jobCategoryRuleSchema = z.object({
+  category: z.string().min(1),
+  autoApprove: z.boolean(),
+  autoApproveSeverities: z.array(z.string()).optional(),
+  severityFilter: z.array(z.string()).optional(),
+  deferralDaysOverride: z.number().int().min(0).nullable().optional(),
+});
+
+/**
+ * Parse one stored job-JSONB ring category list (`categories` / `excludeCategories`).
+ * Returns:
+ *  - `undefined` when the field is absent (legacy job → no category filtering),
+ *  - `string[]` (blanks dropped) when the value is a valid array of strings, or
+ *  - `null` when present-but-malformed (a non-array, or an array containing a
+ *    non-string entry).
+ *
+ * A malformed value must NOT be silently coerced to "no filter": dropping a
+ * `categories` allowlist would widen to "install every category" and dropping an
+ * `excludeCategories` denylist would let an excluded category into the install
+ * set — the same widen-past-admin-intent hazard the `sources` handler guards
+ * against. Callers fail closed (skip the device) on `null`. An empty array is
+ * valid and means "no filter" (the schema default), unlike `sources` where an
+ * empty set means "install nothing". (#2117)
+ */
+export function parseJobCategoryList(value: unknown): string[] | null | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return null;
+  if (value.some((v) => typeof v !== 'string')) return null;
+  return (value as string[]).filter((v) => v.length > 0);
+}
+
+const { db } = dbModule;
+const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
+  const withSystem = dbModule.withSystemDbAccessContext;
+  return typeof withSystem === 'function' ? withSystem(fn) : fn();
+};
+
+// ============================================
+// Queue names
+// ============================================
+
+const PATCH_JOB_QUEUE = 'patch-jobs';
+const PATCH_JOB_DEVICE_QUEUE = 'patch-job-devices';
+const PATCH_JOB_RETENTION = {
+  removeOnComplete: { count: 100 },
+  removeOnFail: { count: 200 },
+} as const;
+const PATCH_JOB_COMPLETION_RETENTION = {
+  removeOnComplete: { count: 50 },
+  removeOnFail: { count: 100 },
+} as const;
+
+// ============================================
+// Singleton queues
+// ============================================
+
+let patchJobQueue: Queue | null = null;
+let patchJobDeviceQueue: Queue | null = null;
+
+// NOTE: BullMQ rejects a custom jobId containing ':' (it reserves that for the
+// legacy 3-part repeatable-job form), so these ids use '-' as the separator.
+// A ':' here silently breaks queue.add() — see #1101 (SNMP) for the same bug.
+// patchJobId/deviceId are UUID-shaped (no ':'), so ids stay stable and unique.
+function getPatchJobExecutionId(patchJobId: string): string {
+  return `patch-job-${patchJobId}`;
+}
+
+function getPatchJobDeviceExecutionId(
+  patchJobId: string,
+  deviceId: string
+): string {
+  return `patch-job-device-${patchJobId}-${deviceId}`;
+}
+
+function getPatchJobCompletionId(patchJobId: string): string {
+  return `patch-job-completion-${patchJobId}`;
+}
+
+/**
+ * A stale queue entry that could not be cleared, so re-adding its stable jobId
+ * would be a silent no-op. Named (rather than a bare Error) so it survives
+ * Sentry's scrubber — `scrubEvent` deletes the message but keeps the exception
+ * type. See resolveActiveQueueJob for why this matters.
+ */
+export class StaleQueueJobRemovalError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'StaleQueueJobRemovalError';
+  }
+}
+
+/**
+ * One or more devices of an already-`running` patch job could not be handed to
+ * the per-device queue. Named for the same reason as the class above: Sentry's
+ * `scrubEvent` deletes the message, so the exception type is the only thing
+ * that distinguishes this from every other blank event.
+ */
+export class PatchDeviceDispatchError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'PatchDeviceDispatchError';
+  }
+}
+
+/**
+ * The 35-minute completion check for an already-`running` patch job could not
+ * be scheduled on its stable id (fallback used) or at all (no backstop left).
+ */
+export class PatchCompletionCheckError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'PatchCompletionCheckError';
+  }
+}
+
+/**
+ * Return the reusable queue job for one of `candidateIds`, clearing any
+ * terminal leftover so the caller can re-add on the same stable jobId.
+ *
+ * The clearing is load-bearing, not housekeeping: `queue.add(..., { jobId })` is
+ * a SILENT NO-OP in BullMQ when a job hash with that id already exists — it
+ * returns the existing job and queues nothing. So an "absent" answer from this
+ * helper is a promise that the id is free. Two holes broke that promise:
+ *
+ *   - a `remove()` rejection was swallowed into console.error and the helper
+ *     still answered "absent", handing the caller an add that did nothing while
+ *     reporting success;
+ *   - `getState()` also answers `'unknown'` for a job hash that is in no list,
+ *     which matched neither branch and fell through to the same no-op add.
+ *
+ * Either one strands a `patch_jobs` row in `status='scheduled'` with no queue
+ * job forever: the #1733 reconcile sweep then "recovers" the same row on every
+ * 60s scan, incrementing its counter and emitting one more identical Sentry
+ * event, while nothing actually runs (BREEZE-1A). Failing loudly is the point —
+ * the caller reports a lost run as page-worthy.
+ */
+async function resolveActiveQueueJob(queue: Queue, candidateIds: string[]) {
+  for (const candidateId of candidateIds) {
+    const existing = await queue.getJob(candidateId);
+    if (!existing) continue;
+    const state = await existing.getState();
+    if (isReusableState(state)) {
+      return existing;
+    }
+    try {
+      await existing.remove();
+    } catch (error) {
+      // A terminal job can race back into the queue between getState() and
+      // remove() (BullMQ refuses to remove a locked/active job). That outcome is
+      // correct — reuse it rather than reporting a fault.
+      const recheck = await existing.getState().catch(() => 'unknown');
+      if (isReusableState(recheck)) {
+        return existing;
+      }
+      throw new StaleQueueJobRemovalError(
+        `[PatchJobExecutor] Could not remove stale job ${candidateId} (state=${state}); `
+        + 're-enqueuing this id would be a silent no-op',
+        { cause: error },
+      );
+    }
+  }
+
+  return null;
+}
+
+export function getPatchJobQueue(): Queue {
+  if (!patchJobQueue) {
+    patchJobQueue = new Queue(PATCH_JOB_QUEUE, {
+      connection: getBullMQConnection(),
+    });
+  }
+  return patchJobQueue;
+}
+
+export function getPatchJobDeviceQueue(): Queue {
+  if (!patchJobDeviceQueue) {
+    patchJobDeviceQueue = new Queue(PATCH_JOB_DEVICE_QUEUE, {
+      connection: getBullMQConnection(),
+    });
+  }
+  return patchJobDeviceQueue;
+}
+
+// ============================================
+// Job data types
+// ============================================
+
+interface ExecutePatchJobData {
+  type: 'execute-patch-job';
+  patchJobId: string;
+}
+
+interface ExecutePatchJobDeviceData {
+  type: 'execute-patch-job-device';
+  patchJobId: string;
+  deviceId: string;
+  orgId: string;
+}
+
+interface CheckCompletionData {
+  type: 'check-completion';
+  patchJobId: string;
+}
+
+type PatchJobData = ExecutePatchJobData | CheckCompletionData;
+type PatchJobDeviceData = ExecutePatchJobDeviceData;
+
+// ============================================
+// Enqueue helper (called from POST route and scheduler)
+// ============================================
+
+export async function enqueuePatchJob(patchJobId: string, delayMs?: number): Promise<void> {
+  const queue = getPatchJobQueue();
+  const stableJobId = getPatchJobExecutionId(patchJobId);
+  const existing = await resolveActiveQueueJob(queue, [stableJobId]);
+  if (existing) {
+    return;
+  }
+  await queue.add(
+    'execute-patch-job',
+    { type: 'execute-patch-job', patchJobId } satisfies ExecutePatchJobData,
+    delayMs
+      ? { ...PATCH_JOB_RETENTION, delay: delayMs, jobId: stableJobId }
+      : { ...PATCH_JOB_RETENTION, jobId: stableJobId }
+  );
+}
+
+// ============================================
+// Orphan reconcile sweep (#1733)
+// ============================================
+
+// Grace period after a job's intended run time (scheduledAt) before the
+// reconcile sweep will re-enqueue it. The scheduler enqueues the Redis job
+// immediately after the DB commit, so a row whose run time only just passed is
+// almost certainly mid-enqueue (or its execute-patch-job worker is about to
+// claim it). Waiting a couple of minutes avoids racing the happy path and only
+// acts on jobs that genuinely missed their enqueue (process restart /
+// Redis-connection churn in the create->enqueue gap — the #1733 failure
+// window).
+const RECONCILE_MIN_AGE_MS = 2 * 60 * 1000;
+
+// Upper bound on how far back the sweep looks (relative to scheduledAt). Matches
+// the scheduler's occurrence-idempotency lookback (45 days): a `scheduled` row
+// whose run time is older than this is well past any window we would still want
+// to run, and re-enqueuing it would fire a long-stale patch run. Such rows are
+// stuck for a different reason and should be surfaced/cleaned up rather than
+// silently executed.
+const RECONCILE_MAX_AGE_MS = 45 * 24 * 60 * 60 * 1000;
+
+export interface StaleScheduledJob {
+  id: string;
+  scheduledAt: Date | null;
+}
+
+/**
+ * Recover `patch_jobs` rows that committed with `status='scheduled'` but whose
+ * Redis enqueue was lost (issue #1733). The scheduler inserts the row inside
+ * its DB transaction and enqueues to BullMQ *after* the transaction commits and
+ * outside the DB access context (deliberately, to avoid holding a pooled
+ * connection idle-in-transaction across Redis round-trips — #1105). That gap is
+ * not atomic: a process restart or Redis-connection failure between commit and
+ * enqueue leaves the row with no queue job, and the occurrence-idempotency
+ * guard then prevents the next scan from ever re-creating it.
+ *
+ * This sweep finds `scheduled` rows whose intended run time has passed (plus a
+ * grace window) that have no active execute-patch-job queue entry and
+ * re-enqueues them, preserving any remaining delay. `enqueuePatchJob` is
+ * idempotent on the stable jobId, and `processExecutePatchJob` re-checks
+ * `status='scheduled'` under a conditional UPDATE, so re-enqueuing a job that is
+ * actually fine (or already running) is a safe no-op.
+ *
+ * The window is keyed off `scheduledAt`, NOT `createdAt`: the POST creation
+ * route (`configurationPolicies/patchJobs.ts`) lets an operator schedule a job
+ * for a future `scheduledAt` and enqueues it with a matching BullMQ delay. If we
+ * gated on `createdAt`, a future-scheduled row whose delayed enqueue was lost
+ * would become "stale" 2 minutes after creation and the sweep would re-enqueue
+ * it with no delay — firing the patch run up to 45 days early. `scheduledAt` is
+ * nullable; scheduler rows always set it to the run time, and we COALESCE to
+ * `createdAt` for any legacy/null row so it stays recoverable.
+ *
+ * Split into two phases so the caller can keep the DB read inside its system DB
+ * access context and the Redis round-trips outside it (#1105):
+ *   1. selectStaleScheduledJobIds — DB-only; the scheduled rows past the grace
+ *      window. Runs inside the DB context.
+ *   2. filterOrphanedJobIds — Redis-only; drops ids that already have an active
+ *      queue job. Runs outside the DB context, alongside the enqueue.
+ */
+export async function selectStaleScheduledJobIds(now: Date = new Date()): Promise<StaleScheduledJob[]> {
+  const minAge = new Date(now.getTime() - RECONCILE_MIN_AGE_MS);
+  const maxAge = new Date(now.getTime() - RECONCILE_MAX_AGE_MS);
+
+  // Effective run time = scheduledAt when set, else createdAt (non-null). The
+  // [maxAge, minAge) window over that value only re-enqueues rows whose run time
+  // has actually passed (so we never fire early) but not so long ago that firing
+  // them would run a long-stale patch window. Dates are bound as ISO strings —
+  // postgres.js can't serialize a raw Date param inside a sql template (it must
+  // be a string/Buffer); the repo's other windowed sweeps do the same (see
+  // staleCommandReaper.ts).
+  const effectiveRunTime = sql`COALESCE(${patchJobs.scheduledAt}, ${patchJobs.createdAt})`;
+
+  const candidates = await db
+    .select({ id: patchJobs.id, scheduledAt: patchJobs.scheduledAt })
+    .from(patchJobs)
+    .where(
+      and(
+        eq(patchJobs.status, 'scheduled'),
+        sql`${effectiveRunTime} < ${minAge.toISOString()}`,
+        sql`${effectiveRunTime} >= ${maxAge.toISOString()}`
+      )
+    );
+
+  return candidates.map((row) => ({ id: row.id, scheduledAt: row.scheduledAt }));
+}
+
+/**
+ * Patch job ids already reported as wedged, so the report fires once per
+ * episode rather than once per sweep (BREEZE-1A, second time).
+ *
+ * A wedged id is persistent BY DEFINITION: `resolveActiveQueueJob` threw
+ * precisely because it could not clear the job hash, and nothing else clears
+ * it. The scheduler sweeps every 60s and `selectStaleScheduledJobIds` keeps
+ * selecting the row for RECONCILE_MAX_AGE_MS (45 days), so an undeduplicated
+ * report is up to ~64,800 error-level events for ONE stuck job — all collapsing
+ * into a single issue, because `scrubEvent` deletes the message. That is
+ * exactly the 342-event issue this whole change set exists to stop, rebuilt at
+ * two orders of magnitude.
+ *
+ * Cleared as soon as the id resolves cleanly again (recovered or genuinely
+ * present), which both ends the episode and bounds the set: it only ever holds
+ * ids that are currently wedged.
+ */
+const reportedWedgedJobIds = new Set<string>();
+
+/**
+ * Of the given `scheduled` jobs, return those with no active execute-patch-job
+ * queue entry — i.e. the rows whose enqueue was lost (#1733). Pure Redis reads;
+ * run this outside the DB access context. Carries `scheduledAt` through so the
+ * caller can re-enqueue with the correct remaining delay.
+ */
+export async function filterOrphanedJobIds(jobs: StaleScheduledJob[]): Promise<StaleScheduledJob[]> {
+  if (jobs.length === 0) return [];
+  const queue = getPatchJobQueue();
+  const orphaned: StaleScheduledJob[] = [];
+  for (const job of jobs) {
+    const stableJobId = getPatchJobExecutionId(job.id);
+    let existing: Awaited<ReturnType<typeof resolveActiveQueueJob>>;
+    try {
+      existing = await resolveActiveQueueJob(queue, [stableJobId]);
+    } catch (error) {
+      // One wedged id must not cost every OTHER orphan its recovery for as long
+      // as it stays wedged — a lost patch run staying lost is the hazard this
+      // sweep exists to prevent. Report it and carry on; it is deliberately NOT
+      // reported as orphaned, because re-adding onto an id we could not clear
+      // would be the silent no-op resolveActiveQueueJob just refused to hide.
+      //
+      // Reported ONCE per episode (see reportedWedgedJobIds) — the condition
+      // does not clear itself, so a per-sweep report is pure volume. The
+      // console line still fires every sweep, so the state stays visible in
+      // logs; only the Sentry event is gated.
+      const detail = error instanceof Error ? error.message : error;
+      if (reportedWedgedJobIds.has(job.id)) {
+        console.error(
+          `[PatchJobExecutor] Patch job ${job.id} still wedged (already reported):`,
+          detail,
+        );
+        continue;
+      }
+      reportedWedgedJobIds.add(job.id);
+      console.error(
+        `[PatchJobExecutor] Skipping reconcile of patch job ${job.id}:`,
+        detail,
+      );
+      captureException(
+        error instanceof Error
+          ? error
+          : new StaleQueueJobRemovalError(
+            `[PatchJobExecutor] Skipping reconcile of patch job ${job.id}`,
+          ),
+        undefined,
+        { patch_reconcile_stage: 'wedged' },
+      );
+      continue;
+    }
+    // Resolved cleanly — whatever wedged it is gone, so the next wedge is a new
+    // episode and reports again.
+    reportedWedgedJobIds.delete(job.id);
+    if (!existing) {
+      orphaned.push(job);
+    }
+  }
+  return orphaned;
+}
+
+// ============================================
+// Job orchestration worker
+// ============================================
+
+export function createPatchJobWorker(): Worker<PatchJobData> {
+  return new Worker<PatchJobData>(
+    PATCH_JOB_QUEUE,
+    async (job: Job<PatchJobData>) => {
+      return runWithSystemDbAccess(async () => {
+        switch (job.data.type) {
+          case 'execute-patch-job':
+            return processExecutePatchJob(job.data);
+          case 'check-completion':
+            return processCheckCompletion(job.data);
+        }
+      });
+    },
+    {
+      connection: getBullMQConnection(),
+      concurrency: 5,
+      lockDuration: 300_000,
+      stalledInterval: 60_000,
+      maxStalledCount: 2,
+    }
+  );
+}
+
+async function processExecutePatchJob(data: ExecutePatchJobData): Promise<unknown> {
+  const { patchJobId } = data;
+
+  // Load and verify job
+  const [patchJob] = await db
+    .select()
+    .from(patchJobs)
+    .where(eq(patchJobs.id, patchJobId))
+    .limit(1);
+
+  if (!patchJob) {
+    console.error(`[PatchJobExecutor] Job ${patchJobId} not found`);
+    return { error: 'Job not found' };
+  }
+
+  if (patchJob.status !== 'scheduled') {
+    return { skipped: true, reason: `Job status is ${patchJob.status}` };
+  }
+
+  // Transition to running
+  const claimed = await db
+    .update(patchJobs)
+    .set({ status: 'running', startedAt: new Date() })
+    .where(and(eq(patchJobs.id, patchJobId), eq(patchJobs.status, 'scheduled')))
+    .returning({ id: patchJobs.id });
+
+  if (claimed.length === 0) {
+    return { skipped: true, reason: 'Job was already claimed' };
+  }
+
+  // Extract target device IDs from the JSONB targets field
+  const targets = patchJob.targets as { deviceIds?: string[] };
+  const deviceIds = targets?.deviceIds ?? [];
+
+  if (deviceIds.length === 0) {
+    await db
+      .update(patchJobs)
+      .set({ status: 'completed', completedAt: new Date() })
+      .where(eq(patchJobs.id, patchJobId));
+    return { completed: true, reason: 'No target devices' };
+  }
+
+  // Fan out to per-device queue.
+  //
+  // Every device is dispatched inside its own try/catch, and a failure costs
+  // ONLY that device. This runs AFTER the claim UPDATE above has already
+  // flipped the row to `running`, which makes an escaping throw unrecoverable:
+  // the orchestration queue sets no `attempts` (BullMQ defaults to no retry),
+  // a manual retry re-runs the claim UPDATE against `status='scheduled'` and
+  // matches 0 rows, and the #1733 reconcile sweep only scans `scheduled` rows.
+  // So one rejected Redis call on device 7 of 200 would strand the whole run
+  // in `running` forever, with devices 8-200 never enqueued and no completion
+  // checker — invisible, because the row never fails either.
+  const deviceQueue = getPatchJobDeviceQueue();
+  const dispatchFailures: { deviceId: string; error: unknown }[] = [];
+  for (const deviceId of deviceIds) {
+    const stableJobId = getPatchJobDeviceExecutionId(patchJobId, deviceId);
+    try {
+      const existing = await resolveActiveQueueJob(deviceQueue, [stableJobId]);
+      if (!existing) {
+        await deviceQueue.add(
+          'execute-patch-job-device',
+          {
+            type: 'execute-patch-job-device',
+            patchJobId,
+            deviceId,
+            orgId: patchJob.orgId,
+          } satisfies ExecutePatchJobDeviceData,
+          {
+            ...PATCH_JOB_RETENTION,
+            jobId: stableJobId,
+          }
+        );
+      }
+    } catch (error) {
+      console.error(
+        `[PatchJobExecutor] Failed to dispatch device ${deviceId} of patch job ${patchJobId}:`,
+        error instanceof Error ? error.message : error,
+      );
+      dispatchFailures.push({ deviceId, error });
+    }
+  }
+
+  // Settle the devices we could not dispatch. Without this their
+  // `devicesPending` slots never drain, so the run could only ever be finished
+  // by the 35-minute completion checker — and only if that checker was itself
+  // enqueued. Recording them as failed keeps the counters exact and lets the
+  // normal `devicesPending === 0` finalization close the job out on its own.
+  for (const failure of dispatchFailures) {
+    try {
+      await markDeviceDispatchFailed(patchJobId, failure.deviceId, failure.error);
+    } catch (error) {
+      console.error(
+        `[PatchJobExecutor] Failed to record dispatch failure for device ${failure.deviceId} `
+        + `of patch job ${patchJobId}:`,
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
+  if (dispatchFailures.length > 0) {
+    const message =
+      `[PatchJobExecutor] Patch job ${patchJobId} could not dispatch `
+      + `${dispatchFailures.length} of ${deviceIds.length} device(s); they are recorded as failed`;
+    captureException(
+      new PatchDeviceDispatchError(message, { cause: dispatchFailures[0]?.error }),
+      undefined,
+      { patch_reconcile_stage: 'device_dispatch_failed' },
+    );
+  }
+
+  // Enqueue completion checker (35 min delay). This is the backstop that fails
+  // a run whose devices never report, so losing it is what turns a wedged
+  // dispatch into a row that sits in `running` forever. A wedged stable id
+  // therefore falls back to a fresh, unique id rather than giving up:
+  // processCheckCompletion re-reads the row and no-ops unless it is still
+  // `running`, so a duplicate checker is harmless, while no checker is not.
+  await enqueueCompletionCheck(patchJobId);
+
+  return {
+    dispatched: deviceIds.length - dispatchFailures.length,
+    dispatchFailed: dispatchFailures.length,
+  };
+}
+
+/**
+ * Schedule the 35-minute completion check, tolerating a queue id we cannot
+ * clear. Never throws: it is called after the row is already `running`, where
+ * an escaping error is unrecoverable (see the fan-out comment above).
+ */
+async function enqueueCompletionCheck(patchJobId: string): Promise<void> {
+  const queue = getPatchJobQueue();
+  const completionJobId = getPatchJobCompletionId(patchJobId);
+  const completionOptions = {
+    ...PATCH_JOB_COMPLETION_RETENTION,
+    delay: 35 * 60 * 1000,
+  };
+
+  try {
+    const existingCompletion = await resolveActiveQueueJob(queue, [completionJobId]);
+    if (!existingCompletion) {
+      await queue.add(
+        'check-completion',
+        { type: 'check-completion', patchJobId } satisfies CheckCompletionData,
+        { ...completionOptions, jobId: completionJobId }
+      );
+    }
+    return;
+  } catch (error) {
+    console.error(
+      `[PatchJobExecutor] Could not schedule the completion check for patch job ${patchJobId} `
+      + 'on its stable id; retrying under a unique id:',
+      error instanceof Error ? error.message : error,
+    );
+  }
+
+  // Fallback: the stable id is occupied by something we could not remove, so
+  // re-adding it would be a silent no-op. A unique id is not idempotent, but a
+  // second checker only re-reads the row, and the alternative is a `running`
+  // row that nothing will ever finalize.
+  const fallbackJobId = `${completionJobId}-retry-${Date.now()}`;
+  try {
+    await queue.add(
+      'check-completion',
+      { type: 'check-completion', patchJobId } satisfies CheckCompletionData,
+      { ...completionOptions, jobId: fallbackJobId }
+    );
+    captureException(
+      new PatchCompletionCheckError(
+        `[PatchJobExecutor] Completion check for patch job ${patchJobId} was scheduled under a `
+        + 'fallback id because its stable queue id could not be cleared',
+      ),
+      undefined,
+      { patch_reconcile_stage: 'completion_check_fallback' },
+    );
+  } catch (error) {
+    // Both ids failed — the row will stay `running` with no backstop until an
+    // operator intervenes. Page-worthy, and the only remaining signal.
+    const message =
+      `[PatchJobExecutor] Patch job ${patchJobId} is running with NO completion check scheduled; `
+      + 'it cannot time out on its own';
+    console.error(`${message}:`, error instanceof Error ? error.message : error);
+    captureException(
+      new PatchCompletionCheckError(message, { cause: error }),
+      undefined,
+      { patch_reconcile_stage: 'completion_check_lost' },
+    );
+  }
+}
+
+/**
+ * Record a device we could never hand to the per-device queue as a failed
+ * result, mirroring markDeviceSkipped but counting toward `devicesFailed` —
+ * a device that was never dispatched did not succeed, and calling it "skipped"
+ * (which counts as completed) would let the run finish green.
+ */
+async function markDeviceDispatchFailed(
+  patchJobId: string,
+  deviceId: string,
+  error: unknown,
+): Promise<void> {
+  await db.insert(patchJobResults).values({
+    jobId: patchJobId,
+    deviceId,
+    // NULL = a whole-device summary row; this device never reached a patch.
+    patchId: null,
+    status: 'failed',
+    startedAt: new Date(),
+    completedAt: new Date(),
+    errorMessage: `dispatch_failed: ${error instanceof Error ? error.message : String(error)}`,
+    rebootRequired: false,
+  });
+
+  await db
+    .update(patchJobs)
+    .set({
+      devicesFailed: sql`${patchJobs.devicesFailed} + 1`,
+      devicesPending: sql`${patchJobs.devicesPending} - 1`,
+    })
+    .where(eq(patchJobs.id, patchJobId));
+
+  await checkAndFinalizeJob(patchJobId);
+}
+
+async function processCheckCompletion(data: CheckCompletionData): Promise<unknown> {
+  const { patchJobId } = data;
+
+  const [patchJob] = await db
+    .select()
+    .from(patchJobs)
+    .where(eq(patchJobs.id, patchJobId))
+    .limit(1);
+
+  if (!patchJob || patchJob.status !== 'running') {
+    return { skipped: true };
+  }
+
+  // #5128 W3 — a device whose install is QUEUED for an offline machine is not
+  // late, it is waiting, and its deadline is the command's own `deliver_by`
+  // (days out), not this checker's timeout. Terminalising the job here would
+  // report unfinished patching as finished (OD-9) and orphan the queued rows.
+  const devicesQueued = patchJob.devicesQueued ?? 0;
+
+  if (patchJob.devicesPending === 0) {
+    if (devicesQueued > 0) {
+      console.log(
+        `[PatchJobExecutor] job ${patchJobId} stays running — waiting for ${devicesQueued} queued device(s) to reconnect`
+      );
+      return { waitingForQueuedDevices: devicesQueued };
+    }
+    const finalStatus = patchJob.devicesFailed > 0 ? 'failed' : 'completed';
+    await db
+      .update(patchJobs)
+      .set({ status: finalStatus, completedAt: new Date() })
+      .where(eq(patchJobs.id, patchJobId));
+    return { finalStatus };
+  }
+
+  // Still has pending devices after timeout — force-fail exactly those. Queued
+  // devices are untouched, and the job only terminalises once they resolve too,
+  // so the status flip is skipped while any remain.
+  await db
+    .update(patchJobs)
+    .set({
+      ...(devicesQueued > 0 ? {} : { status: 'failed' as const, completedAt: new Date() }),
+      devicesFailed: sql`${patchJobs.devicesFailed} + ${patchJobs.devicesPending}`,
+      devicesPending: 0,
+    })
+    .where(eq(patchJobs.id, patchJobId));
+
+  return {
+    timedOut: true,
+    pendingAtTimeout: patchJob.devicesPending,
+    ...(devicesQueued > 0 ? { waitingForQueuedDevices: devicesQueued } : {}),
+  };
+}
+
+// ============================================
+// Per-device execution worker
+// ============================================
+
+export function createPatchJobDeviceWorker(): Worker<PatchJobDeviceData> {
+  return new Worker<PatchJobDeviceData>(
+    PATCH_JOB_DEVICE_QUEUE,
+    async (job: Job<PatchJobDeviceData>) => {
+      // NOT wrapped in one runWithSystemDbAccess: processExecuteDevice manages its
+      // own short contexts so the up-to-30-min completion poll never holds a
+      // pooled connection in an open transaction (#1105 conn-hold that starved
+      // the DB pool under concurrency 10 → user-facing 503s).
+      return processExecuteDevice(job.data);
+    },
+    {
+      connection: getBullMQConnection(),
+      concurrency: 10,
+      lockDuration: 300_000,
+      stalledInterval: 60_000,
+      maxStalledCount: 2,
+    }
+  );
+}
+
+type PreparedDeviceExecution = {
+  kind: 'prepared';
+  commandId: string;
+  approvedPatches: Awaited<ReturnType<typeof resolveApprovedPatchesForDevice>>;
+  targets: { deployment?: { rebootPolicy?: string } };
+};
+
+/**
+ * #5128 W3 — the device was offline and the install was persisted with a
+ * `deliver_by` instead. There is nothing to poll for: the device's next
+ * heartbeat claims the row, and whichever door closes it (agent result,
+ * delivery expiry, cancel, supersession) runs the shared finalizer. The BullMQ
+ * task ENDS here rather than sitting on a multi-day poll.
+ */
+type QueuedDeviceExecution = {
+  kind: 'queued';
+  commandId: string;
+  deliverBy: string | null;
+  patchCount: number;
+};
+
+type SkippedDeviceExecution = { kind: 'skipped'; skipped: true; reason: string };
+type FailedDeviceExecution = { kind: 'error'; error: string };
+
+/**
+ * Deliberately discriminated on `kind` rather than probed with `in`: a
+ * `queued` execution ALSO carries a `commandId`, so an `'commandId' in prep`
+ * check that ran first would route an offline device — whose install was handed
+ * to the delivery clock on purpose — into the 30-minute poll and then into a
+ * second recording of the same result.
+ */
+type DeviceExecutionOutcome =
+  | PreparedDeviceExecution
+  | QueuedDeviceExecution
+  | SkippedDeviceExecution
+  | FailedDeviceExecution;
+
+async function processExecuteDevice(data: ExecutePatchJobDeviceData): Promise<unknown> {
+  // Phased so the up-to-30-min completion poll never holds a pooled connection
+  // in an open transaction (#1105 conn-hold). Setup and record each run in their
+  // own SHORT system context; the poll runs OUTSIDE any context.
+  const prep = await runWithSystemDbAccess(() => prepareDeviceExecution(data));
+  switch (prep.kind) {
+    case 'queued':
+    case 'skipped':
+    case 'error':
+      return prep;
+    case 'prepared': {
+      const finalCommand = await pollForPatchCommandResult(prep.commandId);
+      return runWithSystemDbAccess(() => recordDeviceExecution(data, prep, finalCommand));
+    }
+    default:
+      return prep satisfies never;
+  }
+}
+
+/**
+ * The delivery policy for one scheduled install (#5128 §F.4).
+ *
+ * `skip` reproduces the pre-#5128 behaviour exactly: `reject` makes the seam
+ * return `device_offline` and the device is recorded skipped. `queue` bounds the
+ * deadline by the NEXT scheduled occurrence so a device that reconnects after
+ * it installs once, from the fresh approved set, rather than twice.
+ */
+function resolvePatchOfflinePolicy(
+  offlineBehavior: string | undefined,
+  nextOccurrenceAt: Date | null,
+  now: Date,
+): { policy: OfflinePolicy; staleDeadline: boolean } {
+  if (offlineBehavior === 'skip') return { policy: { kind: 'reject' }, staleDeadline: false };
+
+  const ttlMs = deliveryTtlMs('standard');
+  const untilNextOccurrence = nextOccurrenceAt
+    ? nextOccurrenceAt.getTime() - now.getTime()
+    : Number.POSITIVE_INFINITY;
+  const deliverWithinMs = Math.min(ttlMs, untilNextOccurrence);
+
+  // A next occurrence already in the past means the stamp is stale (a policy
+  // edited under a running job). Queueing for a deadline that has passed would
+  // create a row the reaper expires on its very next pass, which is worse than
+  // today's honest skip.
+  //
+  // `staleDeadline` is carried back so the recorded reason can say so. Without
+  // it a `queue`-configured org silently degrades to `skip` and the
+  // `patch_job_results` row is byte-identical to a deliberate skip — the exact
+  // "the fallback hides the real problem" shape support cannot diagnose.
+  if (!Number.isFinite(deliverWithinMs) || deliverWithinMs <= 0) {
+    return { policy: { kind: 'reject' }, staleDeadline: true };
+  }
+  return { policy: { kind: 'queue', deliverWithinMs }, staleDeadline: false };
+}
+
+/** `targets.scheduleNextOccurrenceAt`, stamped by the scheduler, or null. */
+function nextOccurrenceFromTargets(targets: unknown): Date | null {
+  if (!targets || typeof targets !== 'object' || Array.isArray(targets)) return null;
+  const raw = (targets as { scheduleNextOccurrenceAt?: unknown }).scheduleNextOccurrenceAt;
+  if (typeof raw !== 'string' || raw.trim().length === 0) return null;
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+async function prepareDeviceExecution(
+  data: ExecutePatchJobDeviceData,
+): Promise<DeviceExecutionOutcome> {
+  const { patchJobId, deviceId, orgId } = data;
+
+  // Load job to get ring config
+  const [patchJob] = await db
+    .select()
+    .from(patchJobs)
+    .where(eq(patchJobs.id, patchJobId))
+    .limit(1);
+
+  if (!patchJob || patchJob.status !== 'running') {
+    return { kind: 'skipped', skipped: true, reason: 'Job not running' };
+  }
+
+  if (orgId !== patchJob.orgId) {
+    console.warn(
+      `[PatchJobExecutor] Rejected device job ${patchJobId}/${deviceId}: queue org ${orgId} does not match patch job org ${patchJob.orgId}`
+    );
+    return { kind: 'skipped', skipped: true, reason: 'Queued org does not match patch job org' };
+  }
+
+  const targetDeviceIds = Array.isArray((patchJob.targets as { deviceIds?: unknown })?.deviceIds)
+    ? ((patchJob.targets as { deviceIds?: string[] }).deviceIds ?? [])
+    : [];
+  if (!targetDeviceIds.includes(deviceId)) {
+    console.warn(
+      `[PatchJobExecutor] Rejected device job ${patchJobId}/${deviceId}: device is not a target`
+    );
+    return { kind: 'skipped', skipped: true, reason: 'Device is not targeted by patch job' };
+  }
+
+  const [device] = await db
+    .select({ id: devices.id })
+    .from(devices)
+    .where(and(eq(devices.id, deviceId), eq(devices.orgId, patchJob.orgId)))
+    .limit(1);
+
+  if (!device) {
+    console.warn(
+      `[PatchJobExecutor] Rejected device job ${patchJobId}/${deviceId}: device is not in patch job org`
+    );
+    return { kind: 'skipped', skipped: true, reason: 'Device not found in patch job org' };
+  }
+
+  // Extract ring config from job's patches JSONB
+  const patchesConfig = patchJob.patches as {
+    ringId?: string | null;
+    categoryRules?: unknown[];
+    categories?: unknown;
+    excludeCategories?: unknown;
+    autoApprove?: unknown;
+    sources?: unknown;
+    policyAutoApprove?: unknown;
+    apps?: unknown;
+  };
+  const targets = patchJob.targets as {
+    deployment?: { rebootPolicy?: string; offlineBehavior?: string };
+  };
+
+  // Distinguish absent sources (legacy job → no filtering) from
+  // present-but-malformed (shape drift / bad write). Present malformed sources
+  // skip execution rather than widening to no filter.
+  let jobSources: string[] | undefined;
+  let malformedSources = false;
+  if (patchesConfig?.sources !== undefined) {
+    const raw = patchesConfig.sources;
+    const strings = Array.isArray(raw) ? raw.filter((s): s is string => typeof s === 'string') : [];
+    if (!Array.isArray(raw) || strings.length !== raw.length || strings.length === 0) {
+      malformedSources = true;
+      const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.sources; skipping device to avoid widening install scope`;
+      console.warn(`${message}:`, JSON.stringify(raw));
+      captureException(new Error(message));
+    } else {
+      jobSources = strings;
+    }
+  }
+
+  if (malformedSources) {
+    await markDeviceSkipped(patchJobId, deviceId, 'invalid_patch_sources');
+    return { kind: 'skipped', skipped: true, reason: 'Invalid patch source filter' };
+  }
+
+  // Malformed auto-approve config degrades to disabled because silently
+  // ENABLING auto-approval is the dangerous direction.
+  let policyAutoApprove: PolicyAutoApproveConfig | undefined;
+  if (patchesConfig?.policyAutoApprove !== undefined) {
+    const parsed = jobPolicyAutoApproveSchema.safeParse(patchesConfig.policyAutoApprove);
+    if (parsed.success) {
+      policyAutoApprove = {
+        enabled: parsed.data.enabled,
+        severities: parsed.data.severities,
+        deferralDays: parsed.data.deferralDays ?? 0,
+      };
+    } else {
+      const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.policyAutoApprove; treating as disabled`;
+      console.warn(`${message}:`, JSON.stringify(patchesConfig.policyAutoApprove));
+      captureException(new Error(message));
+    }
+  }
+
+  // Malformed-but-identifiable rules coerce to 'block' rather than being
+  // dropped — dropping a block rule would silently widen install scope; only
+  // rules whose identity (source + packageId) is unusable are dropped, loudly.
+  let jobApps: PolicyAppRule[] | undefined;
+  if (patchesConfig?.apps !== undefined) {
+    if (!Array.isArray(patchesConfig.apps)) {
+      const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.apps; ignoring app rules`;
+      console.warn(`${message}:`, JSON.stringify(patchesConfig.apps));
+      captureException(new Error(message));
+    } else {
+      const valid: PolicyAppRule[] = [];
+      for (const entry of patchesConfig.apps) {
+        const parsed = policyAppRuleSchema.safeParse(entry);
+        if (parsed.success) {
+          // Strip displayName and any other extra fields before handing to the evaluator.
+          const { source, packageId, action, pinnedVersion } = parsed.data;
+          if (action === 'pin' && pinnedVersion) {
+            valid.push({ source, packageId, action: 'pin', pinnedVersion });
+          } else {
+            // action === 'block' (pin without pinnedVersion is rejected by the schema).
+            valid.push({ source, packageId, action: 'block' });
+          }
+          continue;
+        }
+
+        const e = entry as { source?: unknown; packageId?: unknown } | null;
+        const identifiable =
+          e !== null &&
+          typeof e === 'object' &&
+          typeof e.source === 'string' &&
+          e.source.length > 0 &&
+          typeof e.packageId === 'string' &&
+          e.packageId.length > 0;
+
+        if (identifiable) {
+          // Fail closed: the admin intended to restrict this app; a malformed
+          // restriction (e.g. pin without a version) becomes an outright block.
+          console.warn(
+            `[PatchJobExecutor] Job ${patchJobId} coercing malformed app rule to block (fail-closed):`,
+            JSON.stringify(entry)
+          );
+          valid.push({
+            source: e.source as string,
+            packageId: e.packageId as string,
+            action: 'block',
+          });
+        } else {
+          const message = `[PatchJobExecutor] Job ${patchJobId} dropping malformed app rule with unusable identity`;
+          console.warn(`${message}:`, JSON.stringify(entry));
+          captureException(new Error(message));
+        }
+      }
+      jobApps = valid;
+    }
+  }
+
+  // Ring category include/exclude filters (#2117). Mirror the sources posture:
+  // absent = legacy job (no filtering); present-but-malformed skips the device
+  // rather than silently dropping the filter, which would widen install scope
+  // past the ring's category intent (an excluded category would flow in, or an
+  // allowlist would collapse to "install everything").
+  let jobCategories: string[] | undefined;
+  let jobExcludeCategories: string[] | undefined;
+  let malformedCategoryFilter = false;
+
+  const parsedCategories = parseJobCategoryList(patchesConfig?.categories);
+  if (parsedCategories === null) {
+    malformedCategoryFilter = true;
+    const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.categories; skipping device to avoid widening install scope past the ring category filter`;
+    console.warn(`${message}:`, JSON.stringify(patchesConfig?.categories));
+    captureException(new Error(message));
+  } else {
+    jobCategories = parsedCategories;
+  }
+
+  const parsedExcludeCategories = parseJobCategoryList(patchesConfig?.excludeCategories);
+  if (parsedExcludeCategories === null) {
+    malformedCategoryFilter = true;
+    const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.excludeCategories; skipping device to avoid widening install scope past the ring category filter`;
+    console.warn(`${message}:`, JSON.stringify(patchesConfig?.excludeCategories));
+    captureException(new Error(message));
+  } else {
+    jobExcludeCategories = parsedExcludeCategories;
+  }
+
+  if (malformedCategoryFilter) {
+    await markDeviceSkipped(patchJobId, deviceId, 'invalid_patch_categories');
+    return { kind: 'skipped', skipped: true, reason: 'Invalid patch category filter' };
+  }
+
+  // Category rules were the one snapshot field cast blind while every sibling
+  // (sources, apps, policyAutoApprove, categories) is validated loudly — and a
+  // matching rule is now TERMINAL in the evaluator, so a malformed entry
+  // silently became a deny. Mirror the apps posture: a rule with a usable
+  // category but bad shape coerces to an explicit deny (fail-closed, matching
+  // what the evaluator's `!rule.autoApprove` would have done — but logged);
+  // a rule with no usable category is dropped, loudly.
+  const jobCategoryRules: CategoryRule[] = [];
+  if (patchesConfig?.categoryRules !== undefined) {
+    if (!Array.isArray(patchesConfig.categoryRules)) {
+      const message = `[PatchJobExecutor] Job ${patchJobId} has malformed patches.categoryRules; ignoring category rules`;
+      console.warn(`${message}:`, JSON.stringify(patchesConfig.categoryRules));
+      captureException(new Error(message));
+    } else {
+      for (const entry of patchesConfig.categoryRules) {
+        const parsed = jobCategoryRuleSchema.safeParse(entry);
+        if (parsed.success) {
+          jobCategoryRules.push(parsed.data);
+          continue;
+        }
+        const e = entry as { category?: unknown } | null;
+        if (e !== null && typeof e === 'object' && typeof e.category === 'string' && e.category.length > 0) {
+          console.warn(
+            `[PatchJobExecutor] Job ${patchJobId} coercing malformed category rule to deny (fail-closed):`,
+            JSON.stringify(entry)
+          );
+          jobCategoryRules.push({ category: e.category, autoApprove: false });
+        } else {
+          const message = `[PatchJobExecutor] Job ${patchJobId} dropping malformed category rule with unusable category`;
+          console.warn(`${message}:`, JSON.stringify(entry));
+          captureException(new Error(message));
+        }
+      }
+    }
+  }
+
+  const ringConfig: RingConfig = {
+    ringId: patchesConfig?.ringId ?? null,
+    categoryRules: jobCategoryRules,
+    autoApprove: patchesConfig?.autoApprove ?? {},
+    deferralDays: 0,
+    categories: jobCategories,
+    excludeCategories: jobExcludeCategories,
+    sources: jobSources,
+    policyAutoApprove,
+    apps: jobApps,
+  };
+
+  // If we have a ringId, load deferralDays and partnerId from the ring.
+  // partnerId is threaded into ringConfig so the evaluator can guard against
+  // cross-partner ring links (a config policy featurePolicyId is unconstrained).
+  if (ringConfig.ringId) {
+    const [ring] = await db
+      .select({ deferralDays: patchPolicies.deferralDays, partnerId: patchPolicies.partnerId })
+      .from(patchPolicies)
+      .where(and(eq(patchPolicies.id, ringConfig.ringId), eq(patchPolicies.kind, 'ring')))
+      .limit(1);
+    if (ring) {
+      ringConfig.deferralDays = ring.deferralDays;
+      ringConfig.ringPartnerId = ring.partnerId;
+    }
+  }
+
+  // 1. Resolve approved patches
+  let approvedPatches;
+  try {
+    approvedPatches = await resolveApprovedPatchesForDevice(deviceId, orgId, ringConfig);
+  } catch (err) {
+    console.error(`[PatchJobExecutor] Failed to resolve patches for device ${deviceId}:`, err instanceof Error ? err.message : err);
+    await markDeviceSkipped(patchJobId, deviceId, 'error_resolving_patches');
+    return { kind: 'error', error: 'Failed to resolve patches' };
+  }
+
+  // 2. No approved patches → skip
+  if (approvedPatches.length === 0) {
+    await markDeviceSkipped(patchJobId, deviceId, 'no_approved_patches');
+    return { kind: 'skipped', skipped: true, reason: 'No approved patches' };
+  }
+
+  // 3. Send install_patches command
+  const patchIds = approvedPatches.map((p) => p.patchId);
+  const patchRecords = await db
+    .select({
+      id: patches.id,
+      source: patches.source,
+      externalId: patches.externalId,
+      title: patches.title,
+    })
+    .from(patches)
+    .where(inArray(patches.id, patchIds));
+
+  // Enqueue through the single dispatch seam so offline devices can wait for delivery.
+  // `patchJobId` is now in the payload: it is what lets a result arriving days
+  // later (or the reaper, or a cancel) find the job this command belongs to.
+  const now = new Date();
+  const offline = resolvePatchOfflinePolicy(
+    targets?.deployment?.offlineBehavior,
+    nextOccurrenceFromTargets(patchJob.targets),
+    now,
+  );
+  if (offline.staleDeadline) {
+    console.warn(
+      `[PatchJobExecutor] job ${patchJobId} device ${deviceId}: targets.scheduleNextOccurrenceAt is in the past; ` +
+        'falling back to skipping an offline device instead of queueing an install that would expire immediately'
+    );
+  }
+  const res = await dispatchDeviceCommand({
+    deviceId,
+    type: 'install_patches',
+    payload: { patchJobId, patchIds, patches: patchRecords },
+    expectedOrgId: patchJob.orgId,
+    offlinePolicy: offline.policy,
+  });
+
+  if (!res.ok) {
+    // An offline device with `offlineBehavior: 'skip'` is still recorded
+    // skipped, with the seam's own code as the reason. A stale-deadline
+    // fallback gets its own reason so it is not mistaken for a configured skip.
+    await markDeviceSkipped(
+      patchJobId,
+      deviceId,
+      offline.staleDeadline && res.code === 'device_offline'
+        ? 'device_offline_deadline_stale'
+        : res.code,
+    );
+    return { kind: 'error', error: res.error };
+  }
+
+  const commandId = res.command?.id;
+  if (!commandId) {
+    await markDeviceSkipped(patchJobId, deviceId, 'command_creation_failed');
+    return { kind: 'error', error: 'Failed to create command' };
+  }
+
+  if (res.delivery === 'queued_offline') {
+    await recordDeviceQueued(patchJobId, deviceId, approvedPatches);
+    return {
+      kind: 'queued',
+      commandId,
+      deliverBy: res.deliverBy ? res.deliverBy.toISOString() : null,
+      patchCount: approvedPatches.length,
+    };
+  }
+
+  return { kind: 'prepared', commandId, approvedPatches, targets };
+}
+
+/**
+ * Moves a device out of `devices_pending` and into `devices_queued`, writing one
+ * `queued` `patch_job_results` row per approved patch.
+ *
+ * The rows are what makes the deferred finalizer possible: approvals are
+ * re-evaluated continuously, so re-resolving them when the result lands days
+ * later could produce a different set than the one the device was actually
+ * handed. They are also the finalizer's idempotency key.
+ *
+ * Deliberately does NOT call `checkAndFinalizeJob`: a queued device leaves the
+ * job non-terminal by construction, and the counters below cannot bring
+ * `devicesPending + devicesQueued` to zero.
+ */
+async function recordDeviceQueued(
+  patchJobId: string,
+  deviceId: string,
+  approvedPatches: Awaited<ReturnType<typeof resolveApprovedPatchesForDevice>>,
+): Promise<void> {
+  // ONE TRANSACTION, deliberately. The `install_patches` row is ALREADY
+  // committed and deliverable by the time this runs, so a partial write here is
+  // unrecoverable: with the counter moved but no rows (or some rows and no
+  // counter), the device's later terminal — the agent's result, the reaper's
+  // expiry — finds a shape the finalizer must treat as "not mine", the outcome
+  // is dropped, and the job never reaches devicesPending = devicesQueued = 0.
+  // All-or-nothing means the worst case is a retryable task failure instead.
+  await db.transaction(async (tx) => {
+    for (const patch of approvedPatches) {
+      await tx.insert(patchJobResults).values({
+        jobId: patchJobId,
+        deviceId,
+        patchId: patch.patchId,
+        status: 'queued',
+        startedAt: null,
+        completedAt: null,
+        rebootRequired: patch.requiresReboot,
+      });
+    }
+
+    await tx
+      .update(patchJobs)
+      .set({
+        devicesPending: sql`${patchJobs.devicesPending} - 1`,
+        devicesQueued: sql`${patchJobs.devicesQueued} + 1`,
+      })
+      .where(eq(patchJobs.id, patchJobId));
+  });
+}
+
+async function pollForPatchCommandResult(commandId: string) {
+  // Poll for the agent's result OUTSIDE any held transaction: each status check
+  // is its own short system context, and the 5s sleeps hold NO pooled connection.
+  // Previously this ran inside ONE open transaction for up to 30 min, starving
+  // the DB pool under worker concurrency 10 (#1105 conn-hold → user 503s).
+  const timeoutMs = 30 * 60 * 1000;
+  const pollInterval = 5000;
+  let elapsed = 0;
+  while (elapsed < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, pollInterval));
+    elapsed += pollInterval;
+
+    const [updated] = await runWithSystemDbAccess(() =>
+      db
+        .select()
+        .from(deviceCommands)
+        .where(eq(deviceCommands.id, commandId))
+        .limit(1),
+    );
+
+    if (!updated) return null;
+    if (updated.status === 'completed' || updated.status === 'failed') {
+      return updated;
+    }
+  }
+  return null;
+}
+
+/**
+ * Thin wrapper over the shared finalizer (#5128 W3). Everything that used to
+ * live here — result parsing, the per-patch `patch_job_results` writes, the
+ * #4228 reboot evaluation and the `patch_jobs` counters — moved to
+ * `services/patchJobFinalizer.ts` so the deferred doors (late agent result,
+ * delivery expiry, cancel, supersession) write exactly the same rows this
+ * synchronous path does. The context is passed in because this path already
+ * holds it and must not re-read the job.
+ */
+async function recordDeviceExecution(
+  data: ExecutePatchJobDeviceData,
+  prep: PreparedDeviceExecution,
+  finalCommand: Awaited<ReturnType<typeof pollForPatchCommandResult>>,
+): Promise<unknown> {
+  // orgId comes off the job payload and processExecuteDevice has already
+  // asserted it matches the patch job's org before we get here, so it is safe to
+  // use as the cross-tenant guard for the reboot dispatch inside the finalizer.
+  const { patchJobId, deviceId, orgId } = data;
+  const { approvedPatches, targets } = prep;
+
+  const commandResult = finalCommand?.result as {
+    stdout?: string;
+    stderr?: string;
+    error?: string;
+    exitCode?: number;
+  } | null;
+
+  // The poll exhausted without the command reaching a terminal state. That is
+  // the same fact the reaper's execution clock reports, so it takes the same
+  // terminal — not a `result` carrying nothing, which would run the agent-result
+  // parsing path and log "no patch installed successfully" for a run whose
+  // result never arrived at all.
+  const terminal: PatchDeviceTerminal = finalCommand
+    ? {
+        kind: 'result',
+        commandResult: {
+          status: finalCommand.status === 'completed' ? 'completed' : 'failed',
+          exitCode: commandResult?.exitCode ?? null,
+          stdout: commandResult?.stdout ?? null,
+          stderr: commandResult?.stderr ?? null,
+          error: commandResult?.error ?? null,
+        },
+      }
+    : { kind: 'timeout', message: 'Command timed out' };
+
+  const { applied } = await finalizePatchJobDevice({
+    patchJobId,
+    deviceId,
+    commandId: prep.commandId,
+    completedAt: new Date(),
+    terminal,
+    source: {
+      kind: 'synchronous',
+      context: {
+        orgId,
+        rebootPolicy: targets?.deployment?.rebootPolicy ?? 'if_required',
+        approvedPatches: approvedPatches.map(
+          (p): ApprovedPatchRef => ({
+            patchId: p.patchId,
+            externalId: p.externalId,
+            requiresReboot: p.requiresReboot,
+          }),
+        ),
+      },
+    },
+  });
+
+  return {
+    deviceId,
+    patchCount: approvedPatches.length,
+    // A device already closed by another door (a cancel, or an expiry that
+    // raced the poll) is reported as not-applied rather than as a success.
+    success: applied && finalCommand?.status === 'completed',
+    applied,
+  };
+}
+
+// ============================================
+// Helpers
+// ============================================
+
+async function markDeviceSkipped(
+  patchJobId: string,
+  deviceId: string,
+  reason: string
+): Promise<void> {
+  // Insert a single summary result for the skipped device. `patch_id` is NULL
+  // because no specific patch was targeted — the nil UUID this used to write
+  // has no `patches` row and raised 23503 on a real database (#5128 W3).
+  await db.insert(patchJobResults).values({
+    jobId: patchJobId,
+    deviceId,
+    patchId: null,
+    status: 'skipped',
+    startedAt: new Date(),
+    completedAt: new Date(),
+    errorMessage: reason,
+    rebootRequired: false,
+  });
+
+  // Update counters — skipped devices count as completed, not failed
+  await db
+    .update(patchJobs)
+    .set({
+      devicesCompleted: sql`${patchJobs.devicesCompleted} + 1`,
+      devicesPending: sql`${patchJobs.devicesPending} - 1`,
+    })
+    .where(eq(patchJobs.id, patchJobId));
+
+  await checkAndFinalizeJob(patchJobId);
+}
+
+// ============================================
+// Worker lifecycle
+// ============================================
+
+let jobWorker: Worker | null = null;
+let deviceWorker: Worker | null = null;
+
+export async function initializePatchJobWorkers(): Promise<void> {
+  jobWorker = createPatchJobWorker();
+  attachWorkerObservability(jobWorker, 'patchJobWorker');
+  deviceWorker = createPatchJobDeviceWorker();
+  attachWorkerObservability(deviceWorker, 'patchJobDeviceWorker');
+  console.log('[PatchJobExecutor] Workers initialized');
+}
+
+export async function shutdownPatchJobWorkers(): Promise<void> {
+  await Promise.all([
+    jobWorker?.close(),
+    deviceWorker?.close(),
+    patchJobQueue?.close(),
+    patchJobDeviceQueue?.close(),
+  ]);
+  jobWorker = null;
+  deviceWorker = null;
+  patchJobQueue = null;
+  patchJobDeviceQueue = null;
+}
+
+/**
+ * Module-level state that the reconcile dedup depends on. Exposed so suites can
+ * start each case from a clean slate — the executor is a process singleton.
+ */
+export const __testOnly = {
+  resetWedgedJobReporting(): void {
+    reportedWedgedJobIds.clear();
+  },
+  /**
+   * The per-device processor, without its BullMQ wrapper — so an integration
+   * test can drive the real prepare → dispatch → record path against real
+   * Postgres without a Redis connection.
+   */
+  processExecuteDevice,
+};

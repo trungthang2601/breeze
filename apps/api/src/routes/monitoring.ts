@@ -1,0 +1,1287 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { optionalQueryBoolean } from '@breeze/shared';
+import { and, desc, eq, gte, inArray, isNotNull, lte, or, sql } from 'drizzle-orm';
+import { authMiddleware, requireMfa, requirePermission, requireScope, withAuthDbAccessContext, type AuthContext as RequestAuthContext } from '../middleware/auth';
+import { db } from '../db';
+import { devices, deviceSoftware, deviceChangeLog, discoveredAssets, networkMonitors, snmpDevices, snmpMetrics, snmpTemplates, snmpAlertThresholds, serviceProcessCheckResults } from '../db/schema';
+import { writeRouteAudit } from '../services/auditEvents';
+import { suggestTemplate, type TemplateSuggestion } from '../services/snmpTemplateSuggest';
+import { loadReachability } from '../services/assetReachabilityLoader';
+import { deriveCollection, type CollectionTemplateEntry } from '../services/snmpCollectionState';
+import { isRedisAvailable } from '../services/redis';
+import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import { encryptSnmpSecret, isMaskedSnmpSecret, maskSnmpSecret } from '../services/snmpSecrets';
+import { enqueueSnmpPoll } from '../jobs/snmpWorker';
+import { captureException } from '../services/sentry';
+
+import {
+  resolveOrgIdForAuth as resolveOrgId,
+  resolveOrgIdForAsset,
+  resolveAssetForMutation as resolveAssetForMonitoringMutation,
+  type AssetAuthContext as AuthContext,
+} from '../services/assetAccessScope';
+
+export const monitoringRoutes = new Hono();
+monitoringRoutes.use('*', authMiddleware);
+const requireMonitoringRead = requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action);
+const requireMonitoringWrite = requirePermission(PERMISSIONS.DEVICES_WRITE.resource, PERMISSIONS.DEVICES_WRITE.action);
+
+function serializeSnmpDevice(device: typeof snmpDevices.$inferSelect) {
+  return {
+    id: device.id,
+    snmpVersion: device.snmpVersion,
+    port: device.port,
+    community: maskSnmpSecret(device.community),
+    username: device.username ?? null,
+    authPassword: maskSnmpSecret(device.authPassword),
+    privPassword: maskSnmpSecret(device.privPassword),
+    templateId: device.templateId,
+    pollingInterval: device.pollingInterval,
+    isActive: device.isActive,
+    lastPolled: device.lastPolled?.toISOString?.() ?? (device.lastPolled ? new Date(device.lastPolled as any).toISOString() : null),
+    lastStatus: device.lastStatus,
+    lastError: device.lastError ?? null,
+    lastErrorAt: device.lastErrorAt?.toISOString() ?? null
+  };
+}
+
+/**
+ * The scan stores `{ sysDescr, sysObjectId, sysName }` in discovered_assets.snmpData
+ * (jsonb, agent-authored) — treat every field as untrusted shape.
+ */
+function readSysObjectId(snmpData: unknown): string | null {
+  if (!snmpData || typeof snmpData !== 'object') return null;
+  const raw = (snmpData as Record<string, unknown>).sysObjectId;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+}
+
+async function validateSnmpTemplateAccess(templateId: string, orgId: string): Promise<boolean> {
+  const [template] = await db
+    .select({ id: snmpTemplates.id })
+    .from(snmpTemplates)
+    .where(and(
+      eq(snmpTemplates.id, templateId),
+      or(eq(snmpTemplates.isBuiltIn, true), eq(snmpTemplates.orgId, orgId))!
+    ))
+    .limit(1);
+
+  return Boolean(template);
+}
+
+async function resolveSiteAllowedAssetIds(orgId: string, perms: UserPermissions | undefined): Promise<string[] | null> {
+  if (!perms?.allowedSiteIds) return null;
+  if (perms.allowedSiteIds.length === 0) return [];
+  const rows = await db
+    .select({ id: discoveredAssets.id })
+    .from(discoveredAssets)
+    .where(and(
+      eq(discoveredAssets.orgId, orgId),
+      inArray(discoveredAssets.siteId, perms.allowedSiteIds)
+    ));
+  return rows.map((row) => row.id);
+}
+
+const listAssetsSchema = z.object({
+  orgId: z.string().guid().optional(),
+  includeUnconfigured: optionalQueryBoolean
+});
+
+monitoringRoutes.get(
+  '/assets',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringRead,
+  zValidator('query', listAssetsSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const query = c.req.valid('query');
+
+    // For partner scope: auto-select the org if there is exactly one accessible org.
+    // For system scope: still requires an explicit orgId.
+    const orgResult = resolveOrgId(auth, query.orgId);
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+    if (!orgId) return c.json({ error: 'Could not determine organization context' }, 400);
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const allowedAssetIds = await resolveSiteAllowedAssetIds(orgId, perms);
+    if (allowedAssetIds && allowedAssetIds.length === 0) {
+      return c.json({ data: [] });
+    }
+
+    // Pull monitoring config for discovered assets in this org.
+    const snmpConditions = [eq(snmpDevices.orgId, orgId), isNotNull(snmpDevices.assetId)];
+    if (allowedAssetIds) snmpConditions.push(inArray(snmpDevices.assetId, allowedAssetIds));
+    const snmpRows = await db
+      .select({
+        id: snmpDevices.id,
+        assetId: snmpDevices.assetId,
+        snmpVersion: snmpDevices.snmpVersion,
+        templateId: snmpDevices.templateId,
+        pollingInterval: snmpDevices.pollingInterval,
+        port: snmpDevices.port,
+        isActive: snmpDevices.isActive,
+        lastPolled: snmpDevices.lastPolled,
+        lastStatus: snmpDevices.lastStatus,
+        lastError: snmpDevices.lastError,
+        lastErrorAt: snmpDevices.lastErrorAt,
+        createdAt: snmpDevices.createdAt
+      })
+      .from(snmpDevices)
+      .where(and(...snmpConditions))
+      .orderBy(desc(snmpDevices.createdAt));
+
+    const snmpByAssetId = new Map<string, typeof snmpRows[number]>();
+    for (const row of snmpRows) {
+      if (!row.assetId) continue;
+      const key = row.assetId;
+      const existing = snmpByAssetId.get(key);
+      if (!existing) {
+        snmpByAssetId.set(key, row);
+        continue;
+      }
+      const existingRank = existing.isActive ? 2 : 1;
+      const nextRank = row.isActive ? 2 : 1;
+      if (nextRank > existingRank) {
+        snmpByAssetId.set(key, row);
+        continue;
+      }
+      if (nextRank === existingRank && row.createdAt > existing.createdAt) {
+        snmpByAssetId.set(key, row);
+      }
+    }
+
+    const networkConditions = [eq(networkMonitors.orgId, orgId), isNotNull(networkMonitors.assetId)];
+    if (allowedAssetIds) networkConditions.push(inArray(networkMonitors.assetId, allowedAssetIds));
+    const networkCounts = await db
+      .select({
+        assetId: networkMonitors.assetId,
+        totalCount: sql<number>`count(*)`,
+        activeCount: sql<number>`sum(case when ${networkMonitors.isActive} then 1 else 0 end)`
+      })
+      .from(networkMonitors)
+      .where(and(...networkConditions))
+      .groupBy(networkMonitors.assetId);
+
+    const networkByAssetId = new Map<string, { totalCount: number; activeCount: number }>();
+    for (const row of networkCounts) {
+      if (!row.assetId) continue;
+      networkByAssetId.set(row.assetId, {
+        totalCount: Number(row.totalCount ?? 0),
+        activeCount: Number(row.activeCount ?? 0)
+      });
+    }
+
+    const configuredAssetIds = new Set<string>([
+      ...snmpByAssetId.keys(),
+      ...networkByAssetId.keys()
+    ]);
+
+    if (!query.includeUnconfigured && configuredAssetIds.size === 0) {
+      return c.json({ data: [] });
+    }
+
+    const assetConditions = [
+      eq(discoveredAssets.orgId, orgId),
+      query.includeUnconfigured ? sql`true` : inArray(discoveredAssets.id, Array.from(configuredAssetIds))
+    ];
+    if (perms?.allowedSiteIds) {
+      assetConditions.push(inArray(discoveredAssets.siteId, perms.allowedSiteIds));
+    }
+
+    const assets = await db
+      .select({
+        id: discoveredAssets.id,
+        orgId: discoveredAssets.orgId,
+        siteId: discoveredAssets.siteId,
+        hostname: discoveredAssets.hostname,
+        ipAddress: discoveredAssets.ipAddress,
+        assetType: discoveredAssets.assetType,
+        approvalStatus: discoveredAssets.approvalStatus,
+        isOnline: discoveredAssets.isOnline,
+        lastSeenAt: discoveredAssets.lastSeenAt,
+        createdAt: discoveredAssets.createdAt,
+        updatedAt: discoveredAssets.updatedAt
+      })
+      .from(discoveredAssets)
+      .where(and(...assetConditions))
+      .orderBy(desc(discoveredAssets.lastSeenAt));
+
+    const reachabilityByAsset = await loadReachability(assets.map((a) => a.id));
+
+    return c.json({
+      data: assets.map((a) => {
+        const snmp = snmpByAssetId.get(a.id);
+        const net = networkByAssetId.get(a.id);
+        const snmpConfigured = Boolean(snmp);
+        const snmpActive = Boolean(snmp?.isActive);
+        const networkConfigured = Boolean(net && net.totalCount > 0);
+        const networkActive = Boolean(net && net.activeCount > 0);
+
+        return {
+          id: a.id,
+          orgId: a.orgId,
+          siteId: a.siteId,
+          hostname: a.hostname,
+          ipAddress: a.ipAddress,
+          assetType: a.assetType,
+          approvalStatus: a.approvalStatus,
+          isOnline: a.isOnline,
+          // W01 (spec §4.4) — `isOnline` is the last scan/controller verdict,
+          // retained for one release; everything new reads `reachability`.
+          reachability: reachabilityByAsset.get(a.id) ?? null,
+          lastSeenAt: a.lastSeenAt?.toISOString() ?? null,
+          createdAt: a.createdAt.toISOString(),
+          updatedAt: a.updatedAt.toISOString(),
+          monitoring: {
+            configured: snmpConfigured || networkConfigured,
+            active: snmpActive || networkActive
+          },
+          snmp: snmpConfigured ? {
+            configured: true,
+            deviceId: snmp!.id,
+            snmpVersion: snmp!.snmpVersion,
+            templateId: snmp!.templateId,
+            pollingInterval: snmp!.pollingInterval,
+            port: snmp!.port,
+            isActive: snmp!.isActive,
+            lastPolled: snmp!.lastPolled?.toISOString?.() ?? (snmp!.lastPolled ? new Date(snmp!.lastPolled as any).toISOString() : null),
+            lastStatus: snmp!.lastStatus ?? null,
+            lastError: snmp!.lastError ?? null,
+            lastErrorAt: snmp!.lastErrorAt?.toISOString() ?? null
+          } : {
+            configured: false,
+            deviceId: null,
+            snmpVersion: null,
+            templateId: null,
+            pollingInterval: null,
+            port: null,
+            isActive: false,
+            lastPolled: null,
+            lastStatus: null,
+            lastError: null,
+            lastErrorAt: null
+          },
+          network: {
+            configured: networkConfigured,
+            totalCount: net?.totalCount ?? 0,
+            activeCount: net?.activeCount ?? 0
+          }
+        };
+      })
+    });
+  }
+);
+
+monitoringRoutes.get(
+  '/assets/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringRead,
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const assetId = c.req.param('id')!;
+
+    const orgResult = await resolveOrgIdForAsset(auth, assetId);
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+    if (!orgId) return c.json({ error: 'Could not determine organization context' }, 400);
+
+    const [asset] = await db
+      .select({ id: discoveredAssets.id, orgId: discoveredAssets.orgId, siteId: discoveredAssets.siteId })
+      .from(discoveredAssets)
+      .where(and(eq(discoveredAssets.id, assetId), eq(discoveredAssets.orgId, orgId)))
+      .limit(1);
+    if (!asset) return c.json({ error: 'Asset not found' }, 404);
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && (typeof asset.siteId !== 'string' || !canAccessSite(perms, asset.siteId))) {
+      // Opaque 404, not 403 — an out-of-ceiling asset must be
+      // indistinguishable from a missing one, or a restricted caller can
+      // fingerprint asset ids in sites they cannot see (#5777, matching the
+      // deployments existence-oracle fix in #5545).
+      return c.json({ error: 'Asset not found' }, 404);
+    }
+
+    // W01 (spec §4.4) — derived once and returned on BOTH exits below. The
+    // `!snmpDevice` early return is the easy one to miss: an asset with network
+    // checks but no SNMP row takes that branch.
+    const reachability = (await loadReachability([assetId])).get(assetId) ?? null;
+
+    const snmpRows = await db.select()
+      .from(snmpDevices)
+      .where(and(eq(snmpDevices.assetId, assetId), eq(snmpDevices.orgId, asset.orgId)))
+      .orderBy(desc(snmpDevices.createdAt))
+      .limit(10);
+
+    const snmpDevice = (() => {
+      if (snmpRows.length === 0) return null;
+      const active = snmpRows.find((row) => row.isActive);
+      return active ?? snmpRows[0];
+    })();
+
+    const [networkMonitorTotal] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(networkMonitors)
+      .where(and(eq(networkMonitors.assetId, assetId), eq(networkMonitors.orgId, asset.orgId)));
+
+    const [networkMonitorActive] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(networkMonitors)
+      .where(and(
+        eq(networkMonitors.assetId, assetId),
+        eq(networkMonitors.orgId, asset.orgId),
+        eq(networkMonitors.isActive, true)
+      ));
+
+    if (!snmpDevice) {
+      return c.json({
+        enabled: Number(networkMonitorActive?.count ?? 0) > 0,
+        snmpDevice: null,
+        networkMonitors: {
+          totalCount: Number(networkMonitorTotal?.count ?? 0),
+          activeCount: Number(networkMonitorActive?.count ?? 0)
+        },
+        reachability,
+        collection: deriveCollection({ templateId: null, templateOids: [], snmpDevice: null, metrics: [] }),
+        recentMetrics: []
+      });
+    }
+
+    // The template's OID list is what `collection` enumerates: an OID the
+    // template never asked for cannot have a collection state.
+    let templateOids: CollectionTemplateEntry[] = [];
+    if (snmpDevice.templateId) {
+      const [template] = await db
+        .select({ oids: snmpTemplates.oids })
+        .from(snmpTemplates)
+        .where(and(
+          eq(snmpTemplates.id, snmpDevice.templateId),
+          or(eq(snmpTemplates.isBuiltIn, true), eq(snmpTemplates.orgId, asset.orgId))!,
+        ))
+        .limit(1);
+      if (template && Array.isArray(template.oids)) templateOids = template.oids as CollectionTemplateEntry[];
+    }
+
+    const metricBaseExpr = sql`coalesce(${snmpMetrics.baseOid}, ${snmpMetrics.oid})`;
+    const metricInstanceExpr = sql`coalesce(${snmpMetrics.instance}, '')`;
+
+    // Newest row per (base_oid, instance) for this device — a REAL
+    // `DISTINCT ON`, not an ORDER BY + LIMIT.
+    //
+    // This was `ORDER BY (base, instance, timestamp DESC) LIMIT 2000` on the
+    // theory that 2,000 rows covers 64 base OIDs at 31 instances each. That
+    // arithmetic is wrong: LIMIT truncates the GLOBAL result after ordering,
+    // not per group. Rows for the alphabetically-first (base_oid, instance)
+    // sort first, so once that ONE series has 2,000 historical rows — ~7 days
+    // at a 5-minute interval, and this same wave raises retention to 30 days —
+    // it consumes the entire budget and every OTHER OID reaches
+    // deriveCollection with zero rows, which then reports 'stale' or
+    // 'never_polled' for OIDs that are collecting perfectly well. That false
+    // claim is exactly what this wave exists to eliminate.
+    //
+    // Pinned by networkDeviceTruth.integration.test.ts against real Postgres:
+    // a mocked `db` cannot reproduce ORDER BY/LIMIT row-selection semantics.
+    // The composite index of §7.5 serves the ORDER BY.
+    const latestMetrics = await db
+      .selectDistinctOn([metricBaseExpr, metricInstanceExpr], {
+        id: snmpMetrics.id,
+        oid: snmpMetrics.oid,
+        baseOid: snmpMetrics.baseOid,
+        instance: snmpMetrics.instance,
+        name: snmpMetrics.name,
+        value: snmpMetrics.value,
+        valueType: snmpMetrics.valueType,
+        error: snmpMetrics.error,
+        timestamp: snmpMetrics.timestamp,
+      })
+      .from(snmpMetrics)
+      .where(eq(snmpMetrics.deviceId, snmpDevice.id))
+      .orderBy(metricBaseExpr, metricInstanceExpr, desc(snmpMetrics.timestamp));
+
+    const collection = deriveCollection({
+      templateId: snmpDevice.templateId,
+      templateOids,
+      snmpDevice: {
+        isActive: snmpDevice.isActive,
+        lastStatus: snmpDevice.lastStatus,
+        lastPolled: snmpDevice.lastPolled,
+        pollingInterval: snmpDevice.pollingInterval,
+        consecutiveFailures: snmpDevice.consecutiveFailures,
+      },
+      metrics: latestMetrics,
+    });
+
+    // Kept for one release — MonitoringAssetsDashboard.tsx still reads it and
+    // W04 deletes that modal. Derived from latestMetrics rather than a second
+    // query, but re-sorted by time first: latestMetrics is ordered by
+    // (base_oid, instance) for the DISTINCT ON above, so a bare slice would
+    // hand the dashboard the alphabetically-first OIDs instead of the device's
+    // actual most recent activity.
+    const recentMetrics = [...latestMetrics]
+      .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
+      .slice(0, 20);
+
+    return c.json({
+      enabled: snmpDevice.isActive || Number(networkMonitorActive?.count ?? 0) > 0,
+      snmpDevice: serializeSnmpDevice(snmpDevice),
+      networkMonitors: {
+        totalCount: Number(networkMonitorTotal?.count ?? 0),
+        activeCount: Number(networkMonitorActive?.count ?? 0)
+      },
+      reachability,
+      collection,
+      recentMetrics: recentMetrics.map((m) => ({
+        id: m.id,
+        oid: m.oid,
+        name: m.name,
+        value: m.value,
+        valueType: m.valueType,
+        timestamp: m.timestamp.toISOString()
+      }))
+    });
+  }
+);
+
+// The armed SNMP threshold alerts for an asset. The only non-deprecated way to
+// read them: /snmp/thresholds/:deviceId is a 410 stub, and the device page has
+// to be able to say what will actually fire. Read-only — thresholds are still
+// created and edited on the SNMP surfaces.
+monitoringRoutes.get(
+  '/assets/:id/thresholds',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringRead,
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const assetId = c.req.param('id')!;
+
+    const orgResult = await resolveOrgIdForAsset(auth, assetId);
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+    if (!orgId) return c.json({ error: 'Could not determine organization context' }, 400);
+
+    const [asset] = await db
+      .select({ id: discoveredAssets.id, orgId: discoveredAssets.orgId, siteId: discoveredAssets.siteId })
+      .from(discoveredAssets)
+      .where(and(eq(discoveredAssets.id, assetId), eq(discoveredAssets.orgId, orgId)))
+      .limit(1);
+    if (!asset) return c.json({ error: 'Asset not found' }, 404);
+
+    // Site scope is an app-layer-only authz axis; RLS does not defend it.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && (typeof asset.siteId !== 'string' || !canAccessSite(perms, asset.siteId))) {
+      // Opaque 404 — see /assets/:id above (#5777).
+      return c.json({ error: 'Asset not found' }, 404);
+    }
+
+    const rows = await db
+      .select({
+        id: snmpAlertThresholds.id,
+        oid: snmpAlertThresholds.oid,
+        operator: snmpAlertThresholds.operator,
+        threshold: snmpAlertThresholds.threshold,
+        severity: snmpAlertThresholds.severity,
+        message: snmpAlertThresholds.message,
+        isActive: snmpAlertThresholds.isActive,
+      })
+      .from(snmpAlertThresholds)
+      .innerJoin(snmpDevices, eq(snmpAlertThresholds.deviceId, snmpDevices.id))
+      .where(and(eq(snmpDevices.assetId, assetId), eq(snmpDevices.orgId, asset.orgId)));
+
+    return c.json({ data: rows });
+  }
+);
+
+const suggestTemplateQuerySchema = z.object({ assetId: z.string().guid() });
+
+monitoringRoutes.get(
+  '/templates/suggest',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringRead,
+  zValidator('query', suggestTemplateQuerySchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const { assetId } = c.req.valid('query');
+
+    const orgResult = await resolveOrgIdForAsset(auth, assetId);
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+    if (!orgId) return c.json({ error: 'Could not determine organization context' }, 400);
+
+    const [asset] = await db
+      .select({
+        id: discoveredAssets.id,
+        orgId: discoveredAssets.orgId,
+        siteId: discoveredAssets.siteId,
+        assetType: discoveredAssets.assetType,
+        snmpData: discoveredAssets.snmpData,
+      })
+      .from(discoveredAssets)
+      .where(and(eq(discoveredAssets.id, assetId), eq(discoveredAssets.orgId, orgId)))
+      .limit(1);
+    if (!asset) return c.json({ error: 'Asset not found' }, 404);
+
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (perms?.allowedSiteIds && (typeof asset.siteId !== 'string' || !canAccessSite(perms, asset.siteId))) {
+      // Opaque 404 — see /assets/:id above (#5777).
+      return c.json({ error: 'Asset not found' }, 404);
+    }
+
+    const sysObjectId = readSysObjectId(asset.snmpData);
+    const suggestion = await suggestTemplate({
+      sysObjectId,
+      assetType: asset.assetType ?? null,
+      orgId: asset.orgId,
+    });
+
+    return c.json({ sysObjectId, assetType: asset.assetType ?? null, suggestion });
+  }
+);
+
+const upsertSnmpSchema = z.object({
+  snmpVersion: z.enum(['v1', 'v2c', 'v3']),
+  community: z.string().optional(),
+  username: z.string().optional(),
+  authProtocol: z.enum(['md5', 'sha', 'sha256']).optional(),
+  authPassword: z.string().optional(),
+  privProtocol: z.enum(['des', 'aes', 'aes256']).optional(),
+  privPassword: z.string().optional(),
+  templateId: z.string().guid().nullable().optional(),
+  pollingInterval: z.number().int().min(30).max(86400).optional(),
+  port: z.number().int().min(1).max(65535).optional()
+}).refine((data) => {
+  if (data.snmpVersion === 'v1' || data.snmpVersion === 'v2c') return Boolean(data.community);
+  if (data.snmpVersion === 'v3') return Boolean(data.username);
+  return true;
+}, { message: 'Community string required for v1/v2c; username required for v3' });
+
+monitoringRoutes.put(
+  '/assets/:id/snmp',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringWrite,
+  requireMfa(),
+  zValidator('json', upsertSnmpSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const assetId = c.req.param('id')!;
+    const body = c.req.valid('json');
+
+    // #6337 — the write runs in its OWN short DB access context and the
+    // immediate-poll enqueue happens strictly AFTER that context commits.
+    // This route is registered in selfManagedDbContextRoutes.ts, so the auth
+    // middleware opens no ambient request transaction: an unawaited
+    // `void enqueueSnmpPoll(...)` still STARTED the bullmq.add synchronously
+    // inside the held context and tripped the #1105 tripwire on every save
+    // (and would fail the request under DB_CONTEXT_TRIPWIRE_STRICT), while
+    // `runOutsideDbContext` would only silence the warning without closing
+    // the outer transaction.
+    const outcome = await withAuthDbAccessContext(c.get('auth') as RequestAuthContext, async () => {
+      const assetResult = await resolveAssetForMonitoringMutation(
+        auth,
+        c.get('permissions') as UserPermissions | undefined,
+        assetId,
+      );
+      if ('error' in assetResult) return c.json({ error: assetResult.error }, assetResult.status);
+      const { asset } = assetResult;
+
+      // #5213: ip_address is nullable now (manual website / DNS-only assets).
+      // snmp_devices.ip_address is varchar NOT NULL, so the old `?? ''` fallback
+      // satisfied the constraint and left the poller aimed at an empty string.
+      if (!asset.ipAddress) {
+        return c.json({ error: 'This asset has no IP address; SNMP polling needs one' }, 400);
+      }
+
+      if (body.templateId && !(await validateSnmpTemplateAccess(body.templateId, asset.orgId))) {
+        return c.json({ error: 'SNMP template not found' }, 404);
+      }
+
+      // `templateId` ABSENT and `templateId: null` are different requests
+      // (spec §8): absent means "choose for me", explicit null means "no
+      // template". zod drops absent optional keys, so the key's presence is the
+      // signal — do not use `?? null`, which conflates the two.
+      const templateIdProvided = Object.prototype.hasOwnProperty.call(body, 'templateId');
+
+      const existingRows = await db.select()
+        .from(snmpDevices)
+        .where(and(eq(snmpDevices.assetId, assetId), eq(snmpDevices.orgId, asset.orgId)))
+        .orderBy(desc(snmpDevices.createdAt))
+        .limit(10);
+
+      const existing = (() => {
+        if (existingRows.length === 0) return null;
+        const active = existingRows.find((row) => row.isActive);
+        return active ?? existingRows[0];
+      })();
+
+      // Apply the suggestion only when the resulting row would otherwise have no
+      // template: on create, or on a row whose template_id is already null (spec
+      // D5 "only on create when no template is given", §8 "templateId omitted
+      // applies it"). Omitting templateId on a row that HAS one now preserves it
+      // rather than silently wiping it.
+      let templateSuggestion: TemplateSuggestion | null = null;
+      let resolvedTemplateId: string | null = templateIdProvided
+        ? (body.templateId ?? null)
+        : (existing?.templateId ?? null);
+      if (!templateIdProvided && !resolvedTemplateId) {
+        templateSuggestion = await suggestTemplate({
+          sysObjectId: readSysObjectId(asset.snmpData),
+          assetType: asset.assetType ?? null,
+          orgId: asset.orgId,
+        });
+        if (templateSuggestion) resolvedTemplateId = templateSuggestion.templateId;
+      }
+
+      const setValues: Record<string, unknown> = {
+        name: asset.hostname ?? (asset.ipAddress as any),
+        ipAddress: asset.ipAddress as any,
+        snmpVersion: body.snmpVersion,
+        pollingInterval: body.pollingInterval ?? 300,
+        port: body.port ?? 161,
+        templateId: resolvedTemplateId,
+        isActive: true
+      };
+      // Only overwrite credential fields when explicitly provided to avoid
+      // wiping stored secrets on partial updates.
+      if (body.community !== undefined) {
+        if (isMaskedSnmpSecret(body.community) && !existing?.community) return c.json({ error: 'Masked community cannot be used without an existing secret' }, 400);
+        setValues.community = isMaskedSnmpSecret(body.community) ? existing?.community ?? null : encryptSnmpSecret(body.community);
+      }
+      else if (!existing) setValues.community = null;
+      if (body.username !== undefined) setValues.username = body.username ?? null;
+      else if (!existing) setValues.username = null;
+      if (body.authProtocol !== undefined) setValues.authProtocol = body.authProtocol ?? null;
+      else if (!existing) setValues.authProtocol = null;
+      if (body.authPassword !== undefined) {
+        if (isMaskedSnmpSecret(body.authPassword) && !existing?.authPassword) return c.json({ error: 'Masked auth password cannot be used without an existing secret' }, 400);
+        setValues.authPassword = isMaskedSnmpSecret(body.authPassword) ? existing?.authPassword ?? null : encryptSnmpSecret(body.authPassword);
+      }
+      else if (!existing) setValues.authPassword = null;
+      if (body.privProtocol !== undefined) setValues.privProtocol = body.privProtocol ?? null;
+      else if (!existing) setValues.privProtocol = null;
+      if (body.privPassword !== undefined) {
+        if (isMaskedSnmpSecret(body.privPassword) && !existing?.privPassword) return c.json({ error: 'Masked privacy password cannot be used without an existing secret' }, 400);
+        setValues.privPassword = isMaskedSnmpSecret(body.privPassword) ? existing?.privPassword ?? null : encryptSnmpSecret(body.privPassword);
+      }
+      else if (!existing) setValues.privPassword = null;
+
+      // Re-arm the poll scheduler on any config change (#3217). A device that
+      // backed off to the one-hour cap because of, say, a wrong community string
+      // must exercise the corrected config on the next tick — otherwise the fix
+      // looks like it did nothing and the device reads 'offline' for an hour.
+      setValues.consecutiveFailures = 0;
+      setValues.lastPollAttemptedAt = null;
+
+      const upserted = await (async () => {
+        if (existing) {
+          const [row] = await db.update(snmpDevices)
+            .set(setValues)
+            .where(eq(snmpDevices.id, existing.id))
+            .returning();
+          return row ?? null;
+        }
+        const [row] = await db.insert(snmpDevices)
+          .values({
+            orgId: asset.orgId,
+            assetId: asset.id,
+            ...setValues
+          } as any)
+          .returning();
+        return row ?? null;
+      })();
+
+      if (!upserted) return c.json({ error: 'Failed to save SNMP monitoring configuration' }, 500);
+
+      // Deactivate any other SNMP device rows for this asset. Failure is
+      // non-fatal since the primary row was already upserted successfully.
+      if (existingRows.length > 1) {
+        try {
+          await db.update(snmpDevices)
+            .set({ isActive: false })
+            .where(and(eq(snmpDevices.assetId, assetId), eq(snmpDevices.orgId, asset.orgId), sql`${snmpDevices.id} <> ${upserted.id}`));
+        } catch (err) {
+          console.error(`[monitoring] Failed to deactivate duplicate SNMP devices for asset=${assetId}, org=${asset.orgId}, kept=${upserted.id}:`, err);
+        }
+      }
+
+      writeRouteAudit(c, {
+        orgId: asset.orgId,
+        action: existing ? 'monitoring.snmp.update' : 'monitoring.snmp.create',
+        resourceType: 'discovered_asset',
+        resourceId: assetId,
+        resourceName: asset.hostname ?? (asset.ipAddress as any) ?? undefined,
+        details: { snmpDeviceId: upserted.id, snmpVersion: upserted.snmpVersion }
+      });
+      return { asset, upserted, existing, templateSuggestion } as const;
+    });
+    if (outcome instanceof Response) return outcome;
+    const { asset, upserted, existing, templateSuggestion } = outcome;
+
+    // #6209 — a template change (or first-time SNMP setup) shouldn't sit
+    // waiting for the scheduler's next due tick (up to a full
+    // pollingInterval, longer under backoff). Enqueue an immediate poll so
+    // the new OID set shows up within seconds. Awaited here because we are
+    // outside any DB context, so the Redis round-trip pins no pooled
+    // connection — but NOT the same safety net as writeRouteAudit, whose
+    // failure path retries with backoff and reports to Sentry on exhaustion
+    // (auditService.ts); a missed immediate poll has no such retry, only this
+    // console.error + captureException, because the worst case is a device
+    // polling on its next scheduled tick instead of immediately — low enough
+    // stakes that logging is enough, but real failures (e.g. Redis
+    // misconfigured) still need to surface somewhere.
+    if (!existing || existing.templateId !== upserted.templateId) {
+      try {
+        await enqueueSnmpPoll(upserted.id, asset.orgId);
+      } catch (err) {
+        console.error(`[monitoring] Failed to enqueue immediate poll for snmp device ${upserted.id}:`, err);
+        captureException(err);
+      }
+    }
+
+    return c.json({
+      success: true,
+      snmpDevice: serializeSnmpDevice(upserted),
+      templateSuggestion: templateSuggestion
+        ? { ...templateSuggestion, applied: upserted.templateId === templateSuggestion.templateId }
+        : null
+    });
+  }
+);
+
+const patchSnmpSchema = z.object({
+  snmpVersion: z.enum(['v1', 'v2c', 'v3']).optional(),
+  community: z.string().optional(),
+  username: z.string().optional(),
+  authProtocol: z.enum(['md5', 'sha', 'sha256']).optional(),
+  authPassword: z.string().optional(),
+  privProtocol: z.enum(['des', 'aes', 'aes256']).optional(),
+  privPassword: z.string().optional(),
+  templateId: z.string().guid().nullable().optional(),
+  pollingInterval: z.number().int().min(30).max(86400).optional(),
+  port: z.number().int().min(1).max(65535).optional(),
+  isActive: z.boolean().optional()
+});
+
+monitoringRoutes.patch(
+  '/assets/:id/snmp',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringWrite,
+  requireMfa(),
+  zValidator('json', patchSnmpSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const assetId = c.req.param('id')!;
+    const body = c.req.valid('json');
+
+    // #6337 — see the PUT handler above: self-managed DB context so the
+    // enqueue below runs after the write commits, outside any held context.
+    const outcome = await withAuthDbAccessContext(c.get('auth') as RequestAuthContext, async () => {
+      const assetResult = await resolveAssetForMonitoringMutation(
+        auth,
+        c.get('permissions') as UserPermissions | undefined,
+        assetId,
+      );
+      if ('error' in assetResult) return c.json({ error: assetResult.error }, assetResult.status);
+      const { asset } = assetResult;
+
+      if (body.templateId && !(await validateSnmpTemplateAccess(body.templateId, asset.orgId))) {
+        return c.json({ error: 'SNMP template not found' }, 404);
+      }
+
+      const [existing] = await db.select()
+        .from(snmpDevices)
+        .where(and(eq(snmpDevices.assetId, assetId), eq(snmpDevices.orgId, asset.orgId)))
+        .orderBy(desc(snmpDevices.isActive), desc(snmpDevices.createdAt))
+        .limit(1);
+      if (!existing) return c.json({ error: 'No SNMP monitoring configuration found for this asset' }, 404);
+
+      const setValues: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(body)) {
+        if (v !== undefined) setValues[k] = v;
+      }
+      if (typeof body.community === 'string') {
+        if (isMaskedSnmpSecret(body.community)) delete setValues.community;
+        else setValues.community = encryptSnmpSecret(body.community);
+      }
+      if (typeof body.authPassword === 'string') {
+        if (isMaskedSnmpSecret(body.authPassword)) delete setValues.authPassword;
+        else setValues.authPassword = encryptSnmpSecret(body.authPassword);
+      }
+      if (typeof body.privPassword === 'string') {
+        if (isMaskedSnmpSecret(body.privPassword)) delete setValues.privPassword;
+        else setValues.privPassword = encryptSnmpSecret(body.privPassword);
+      }
+
+      // Deliberately NOT auto-applying a template suggestion here (#6099
+      // follow-up). PATCH is a partial-edit endpoint: unlike PUT/create, an
+      // absent `templateId` on PATCH does not mean "no explicit choice yet" —
+      // it means "this edit isn't about the template." Every PATCH caller that
+      // omits templateId for an unrelated field (the web form's own explicit
+      // clear followed by, say, an interval change; AI tools; scheduler/
+      // threshold saves; agent paths) must leave templateId exactly as it was,
+      // including staying null after an explicit clear. Auto-apply only
+      // belongs on the one-time "no explicit choice yet" moment, which is PUT.
+      // The web UI already has the suggestion from a separate GET
+      // (`/monitoring/templates/suggest`, W03) and offers "Use suggestion"
+      // from there, so nothing is lost by not echoing it here too.
+      if (Object.keys(setValues).length === 0) return c.json({ error: 'No fields to update' }, 400);
+
+      // Captured before the scheduler fields below are mixed in, so the audit
+      // trail records what the caller actually changed.
+      const changedFields = Object.keys(setValues);
+
+      // Re-arm the poll scheduler on any config change (#3217) — see the upsert
+      // route above. Applied after the empty-body guard so a no-op PATCH still
+      // 400s rather than silently resetting the backoff.
+      setValues.consecutiveFailures = 0;
+      setValues.lastPollAttemptedAt = null;
+
+      const [updated] = await db.update(snmpDevices)
+        .set(setValues)
+        .where(eq(snmpDevices.id, existing.id))
+        .returning();
+      if (!updated) return c.json({ error: 'Failed to update SNMP monitoring configuration' }, 500);
+
+      writeRouteAudit(c, {
+        orgId: asset.orgId,
+        action: 'monitoring.snmp.patch',
+        resourceType: 'discovered_asset',
+        resourceId: assetId,
+        details: { snmpDeviceId: updated.id, changes: changedFields }
+      });
+      return { asset, existing, updated, changedFields } as const;
+    });
+    if (outcome instanceof Response) return outcome;
+    const { asset, existing, updated, changedFields } = outcome;
+
+    // #6209 — see the PUT handler above for the full rationale. Only when
+    // this PATCH actually touched templateId and changed its value.
+    if (changedFields.includes('templateId') && existing.templateId !== updated.templateId) {
+      try {
+        await enqueueSnmpPoll(updated.id, asset.orgId);
+      } catch (err) {
+        console.error(`[monitoring] Failed to enqueue immediate poll for snmp device ${updated.id}:`, err);
+        captureException(err);
+      }
+    }
+
+    return c.json({
+      success: true,
+      snmpDevice: serializeSnmpDevice(updated)
+    });
+  }
+);
+
+monitoringRoutes.delete(
+  '/assets/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringWrite,
+  requireMfa(),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const assetId = c.req.param('id')!;
+    const assetResult = await resolveAssetForMonitoringMutation(
+      auth,
+      c.get('permissions') as UserPermissions | undefined,
+      assetId,
+    );
+    if ('error' in assetResult) return c.json({ error: assetResult.error }, assetResult.status);
+    const { asset } = assetResult;
+
+    const disabledSnmp = await db.update(snmpDevices)
+      .set({ isActive: false })
+      .where(and(eq(snmpDevices.assetId, assetId), eq(snmpDevices.orgId, asset.orgId), eq(snmpDevices.isActive, true)))
+      .returning({ id: snmpDevices.id });
+
+    const disabledNetworkMonitors = await db.update(networkMonitors)
+      .set({ isActive: false, updatedAt: new Date() })
+      .where(and(eq(networkMonitors.assetId, assetId), eq(networkMonitors.orgId, asset.orgId), eq(networkMonitors.isActive, true)))
+      .returning({ id: networkMonitors.id });
+
+    if (disabledSnmp.length === 0 && disabledNetworkMonitors.length === 0) {
+      return c.json({ error: 'No active monitoring found for this asset' }, 404);
+    }
+
+    writeRouteAudit(c, {
+      orgId: asset.orgId,
+      action: 'monitoring.asset.disable',
+      resourceType: 'discovered_asset',
+      resourceId: assetId,
+      details: {
+        disabledSnmpDeviceCount: disabledSnmp.length,
+        disabledNetworkMonitorCount: disabledNetworkMonitors.length,
+        redisAvailable: isRedisAvailable()
+      }
+    });
+
+    return c.json({ success: true });
+  }
+);
+
+// ============================================
+// Known Services Autocomplete
+// ============================================
+
+const knownServicesQuerySchema = z.object({
+  orgId: z.string().guid().optional(),
+  search: z.string().max(255).optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(200),
+});
+
+monitoringRoutes.get(
+  '/known-services',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringRead,
+  zValidator('query', knownServicesQuerySchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const query = c.req.valid('query');
+
+    const orgResult = resolveOrgId(auth, query.orgId);
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+    if (!orgId) return c.json({ error: 'Could not determine organization context' }, 400);
+    const allowedSiteIds = (c.get('permissions') as UserPermissions | undefined)?.allowedSiteIds;
+
+    // An explicitly empty ceiling is deny-all. Return before either source
+    // query so an unavailable/misconfigured database cannot turn deny-all
+    // into an error oracle.
+    if (allowedSiteIds?.length === 0) return c.json({ data: [] });
+
+    // Source 1: Distinct service names from device change log (change tracker
+    // already snapshots all services on every heartbeat cycle)
+    let changeLogNames: { subject: string }[] = [];
+    try {
+      changeLogNames = allowedSiteIds === undefined
+        ? await db
+            .select({ subject: deviceChangeLog.subject })
+            .from(deviceChangeLog)
+            .where(and(eq(deviceChangeLog.orgId, orgId), eq(deviceChangeLog.changeType, 'service')))
+            .groupBy(deviceChangeLog.subject)
+            .limit(1000)
+        : await db
+            .select({ subject: deviceChangeLog.subject })
+            .from(deviceChangeLog)
+            .innerJoin(devices, eq(deviceChangeLog.deviceId, devices.id))
+            .where(and(
+              eq(deviceChangeLog.orgId, orgId),
+              eq(deviceChangeLog.changeType, 'service'),
+              eq(devices.orgId, orgId),
+              inArray(devices.siteId, allowedSiteIds)
+            ))
+            .groupBy(deviceChangeLog.subject)
+            .limit(1000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('does not exist')) {
+        console.error(`[monitoring] Failed to query change log for org ${orgId}:`, err);
+      }
+    }
+
+    // Source 2: Distinct service/process names from monitoring check results
+    let checkNames: { name: string; watchType: string }[] = [];
+    try {
+      const selection = {
+        name: serviceProcessCheckResults.name,
+        watchType: serviceProcessCheckResults.watchType,
+      };
+      checkNames = allowedSiteIds === undefined
+        ? await db
+            .select(selection)
+            .from(serviceProcessCheckResults)
+            .where(eq(serviceProcessCheckResults.orgId, orgId))
+            .groupBy(serviceProcessCheckResults.name, serviceProcessCheckResults.watchType)
+            .limit(500)
+        : await db
+            .select(selection)
+            .from(serviceProcessCheckResults)
+            .innerJoin(devices, eq(serviceProcessCheckResults.deviceId, devices.id))
+            .where(and(
+              eq(serviceProcessCheckResults.orgId, orgId),
+              eq(devices.orgId, orgId),
+              inArray(devices.siteId, allowedSiteIds)
+            ))
+            .groupBy(serviceProcessCheckResults.name, serviceProcessCheckResults.watchType)
+            .limit(500);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('does not exist')) {
+        console.error(`[monitoring] Failed to query check results for org ${orgId}:`, err);
+      }
+    }
+
+    // Normalize service names by stripping per-user/per-device hex suffixes
+    // (e.g. "Agent Activation Runtime_10cb30e4" → "Agent Activation Runtime")
+    const normalizeServiceName = (name: string): string =>
+      name.replace(/_[a-f0-9]{4,}$/i, '');
+
+    // Merge into a deduplicated list (by normalized name)
+    const seen = new Set<string>();
+    const results: { name: string; source: string; watchType: string | null }[] = [];
+
+    for (const row of changeLogNames) {
+      const normalized = normalizeServiceName(row.subject);
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push({ name: normalized, source: 'change_log', watchType: 'service' });
+    }
+
+    for (const row of checkNames) {
+      const normalized = normalizeServiceName(row.name);
+      const key = normalized.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      results.push({ name: normalized, source: 'check_results', watchType: row.watchType });
+    }
+
+    // Filter by search term if provided
+    let filtered = results;
+    if (query.search) {
+      const term = query.search.toLowerCase();
+      filtered = results.filter((r) => r.name.toLowerCase().includes(term));
+    }
+
+    // Sort alphabetically and limit
+    filtered.sort((a, b) => a.name.localeCompare(b.name));
+    if (filtered.length > query.limit) filtered = filtered.slice(0, query.limit);
+
+    return c.json({ data: filtered });
+  }
+);
+
+// ============================================
+// Service & Process Monitoring Endpoints
+// ============================================
+
+const checkResultsQuerySchema = z.object({
+  deviceId: z.string().guid().optional(),
+  watchType: z.enum(['service', 'process']).optional(),
+  name: z.string().max(255).optional(),
+  since: z.coerce.date().optional(),
+  until: z.coerce.date().optional(),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+  orgId: z.string().guid().optional(),
+});
+
+monitoringRoutes.get(
+  '/results',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringRead,
+  zValidator('query', checkResultsQuerySchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const query = c.req.valid('query');
+
+    const orgResult = resolveOrgId(auth, query.orgId);
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+    if (!orgId) return c.json({ error: 'Could not determine organization context' }, 400);
+    const perms = c.get('permissions') as UserPermissions | undefined;
+
+    const conditions = [eq(serviceProcessCheckResults.orgId, orgId)];
+    if (query.deviceId) conditions.push(eq(serviceProcessCheckResults.deviceId, query.deviceId));
+    if (query.watchType) conditions.push(eq(serviceProcessCheckResults.watchType, query.watchType));
+    if (query.name) conditions.push(eq(serviceProcessCheckResults.name, query.name));
+    if (query.since) conditions.push(gte(serviceProcessCheckResults.timestamp, query.since));
+    if (query.until) conditions.push(lte(serviceProcessCheckResults.timestamp, query.until));
+
+    const resultSelect = {
+      id: serviceProcessCheckResults.id,
+      deviceId: serviceProcessCheckResults.deviceId,
+      watchType: serviceProcessCheckResults.watchType,
+      name: serviceProcessCheckResults.name,
+      status: serviceProcessCheckResults.status,
+      cpuPercent: serviceProcessCheckResults.cpuPercent,
+      memoryMb: serviceProcessCheckResults.memoryMb,
+      pid: serviceProcessCheckResults.pid,
+      details: serviceProcessCheckResults.details,
+      autoRestartAttempted: serviceProcessCheckResults.autoRestartAttempted,
+      autoRestartSucceeded: serviceProcessCheckResults.autoRestartSucceeded,
+      timestamp: serviceProcessCheckResults.timestamp,
+    };
+
+    const results = await (async () => {
+      if (!perms?.allowedSiteIds) {
+        return db
+          .select()
+          .from(serviceProcessCheckResults)
+          .where(and(...conditions))
+          .orderBy(desc(serviceProcessCheckResults.timestamp))
+          .limit(query.limit);
+      }
+
+      if (query.deviceId) {
+        const [device] = await db
+          .select({ id: devices.id, siteId: devices.siteId })
+          .from(devices)
+          .where(and(eq(devices.id, query.deviceId), eq(devices.orgId, orgId)))
+          .limit(1);
+        if (!device || typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId)) {
+          return null;
+        }
+      }
+
+      if (perms.allowedSiteIds.length === 0) return [];
+      conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
+      return db
+        .select(resultSelect)
+        .from(serviceProcessCheckResults)
+        .innerJoin(devices, eq(serviceProcessCheckResults.deviceId, devices.id))
+        .where(and(...conditions))
+        .orderBy(desc(serviceProcessCheckResults.timestamp))
+        .limit(query.limit);
+    })();
+
+    if (results === null) {
+      return c.json({ error: 'Device not found or access denied' }, 403);
+    }
+
+    return c.json({
+      data: results.map(r => ({
+        id: r.id,
+        deviceId: r.deviceId,
+        watchType: r.watchType,
+        name: r.name,
+        status: r.status,
+        cpuPercent: r.cpuPercent,
+        memoryMb: r.memoryMb,
+        pid: r.pid,
+        details: r.details,
+        autoRestartAttempted: r.autoRestartAttempted,
+        autoRestartSucceeded: r.autoRestartSucceeded,
+        timestamp: r.timestamp.toISOString(),
+      })),
+    });
+  }
+);
+
+monitoringRoutes.get(
+  '/results/:deviceId/summary',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringRead,
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const deviceId = c.req.param('deviceId')!;
+
+    // Verify device access before querying results
+    const [device] = await db
+      .select({ orgId: devices.orgId, siteId: devices.siteId })
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
+    if (!device) return c.json({ error: 'Device not found' }, 404);
+    if (!auth.canAccessOrg(device.orgId)) return c.json({ error: 'Access denied' }, 403);
+
+    // Site-scope gate: `requireMonitoringRead` populated `permissions` in
+    // context; enforce `allowedSiteIds` since RLS does not defend the site
+    // axis. Mirrors PR #864/#868 (SP2 launch-readiness sweep).
+    {
+      const userPerms = c.get('permissions') as UserPermissions | undefined;
+      if (userPerms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(userPerms, device.siteId))) {
+        // Opaque 404, not 403 — an out-of-ceiling device must be
+        // indistinguishable from a missing one, or a restricted caller can
+        // fingerprint device ids in sites they cannot see (#5777, matching
+        // the deployments existence-oracle fix in #5545).
+        return c.json({ error: 'Device not found' }, 404);
+      }
+    }
+
+    // Get all distinct watch names, then latest result for each
+    const allResults = await db
+      .select()
+      .from(serviceProcessCheckResults)
+      .where(eq(serviceProcessCheckResults.deviceId, deviceId))
+      .orderBy(desc(serviceProcessCheckResults.timestamp))
+      .limit(500);
+
+    // Deduplicate to latest per (watchType, name)
+    const seen = new Set<string>();
+    const latest = allResults.filter(r => {
+      const key = `${r.watchType}:${r.name}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    return c.json({
+      data: latest.map(r => ({
+        id: r.id,
+        deviceId: r.deviceId,
+        watchType: r.watchType,
+        name: r.name,
+        status: r.status,
+        cpuPercent: r.cpuPercent,
+        memoryMb: r.memoryMb,
+        pid: r.pid,
+        details: r.details,
+        autoRestartAttempted: r.autoRestartAttempted,
+        autoRestartSucceeded: r.autoRestartSucceeded,
+        timestamp: r.timestamp.toISOString(),
+      })),
+    });
+  }
+);
+
+monitoringRoutes.get(
+  '/status/:deviceId',
+  requireScope('organization', 'partner', 'system'),
+  requireMonitoringRead,
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const deviceId = c.req.param('deviceId')!;
+
+    // Verify device access before querying results
+    const [device] = await db
+      .select({ orgId: devices.orgId, siteId: devices.siteId })
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
+    if (!device) return c.json({ error: 'Device not found' }, 404);
+    if (!auth.canAccessOrg(device.orgId)) return c.json({ error: 'Access denied' }, 403);
+
+    // Site-scope gate: see /results/:deviceId/summary above for rationale.
+    {
+      const userPerms = c.get('permissions') as UserPermissions | undefined;
+      if (userPerms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(userPerms, device.siteId))) {
+        // Opaque 404 — see /results/:deviceId/summary above (#5777).
+        return c.json({ error: 'Device not found' }, 404);
+      }
+    }
+
+    // Get recent results and deduplicate to latest per (watchType, name)
+    const allResults = await db
+      .select({ watchType: serviceProcessCheckResults.watchType, name: serviceProcessCheckResults.name, status: serviceProcessCheckResults.status })
+      .from(serviceProcessCheckResults)
+      .where(eq(serviceProcessCheckResults.deviceId, deviceId))
+      .orderBy(desc(serviceProcessCheckResults.timestamp))
+      .limit(500);
+
+    const seen = new Set<string>();
+    const latestStatuses: string[] = [];
+    for (const r of allResults) {
+      const key = `${r.watchType}:${r.name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      latestStatuses.push(r.status);
+    }
+
+    const runningCount = latestStatuses.filter(s => s === 'running').length;
+    const notRunningCount = latestStatuses.filter(s => s !== 'running').length;
+    const totalCount = latestStatuses.length;
+
+    let healthStatus = 'healthy';
+    if (totalCount === 0) {
+      healthStatus = 'unknown';
+    } else if (notRunningCount > 0 && runningCount === 0) {
+      healthStatus = 'critical';
+    } else if (notRunningCount > 0) {
+      healthStatus = 'degraded';
+    }
+
+    return c.json({
+      deviceId,
+      healthStatus,
+      runningCount,
+      notRunningCount,
+      totalCount,
+    });
+  }
+);

@@ -1,0 +1,1069 @@
+import { z } from 'zod';
+import { isIP } from 'node:net';
+import { softwareInventoryReportSchema } from '@breeze/shared';
+
+// ============================================
+// Enrollment
+// ============================================
+
+const DEVICE_ROLES = [
+  'workstation', 'server', 'printer', 'router', 'switch',
+  'firewall', 'access_point', 'phone', 'iot', 'camera', 'nas', 'unknown'
+] as const;
+
+// Orthogonal virtualization attribute (issue #1387). Kept in sync with the
+// agent's classify.go virtualizationMarkers and shared VIRTUALIZATION_PLATFORMS.
+// A value outside this set is dropped (heartbeat) / rejected (enroll) rather
+// than persisted, so an unrecognized platform never lands in the column.
+const VIRTUALIZATION_PLATFORMS = [
+  'vmware', 'hyperv', 'virtualbox', 'qemu', 'kvm', 'xen', 'bochs', 'parallels'
+] as const;
+
+const desktopAccessReasonSchema = z.enum([
+  'missing_permission',
+  'missing_entitlement',
+  'helper_not_connected',
+  'virtual_display_unavailable',
+  'unsupported_os',
+  'manual_install',
+  'no_display_session',
+  'wayland_unsupported',
+  'x11_connect_failed',
+  'x11_auth_failed',
+]);
+
+export const enrollSchema = z.object({
+  enrollmentKey: z.string().min(1),
+  enrollmentSecret: z.string().min(1).optional(),
+  hostname: z.string().min(1),
+  osType: z.enum(['windows', 'macos', 'linux']),
+  osVersion: z.string().min(1),
+  architecture: z.string().min(1),
+  agentVersion: z.string().min(1),
+  deviceRole: z.enum(DEVICE_ROLES).optional(),
+  isVirtual: z.boolean().optional(),
+  virtualizationPlatform: z.enum(VIRTUALIZATION_PLATFORMS).optional(),
+  hardwareInfo: z.object({
+    cpuModel: z.string().optional(),
+    cpuCores: z.number().int().optional(),
+    cpuThreads: z.number().int().optional(),
+    ramTotalMb: z.number().int().optional(),
+    diskTotalGb: z.number().int().optional(),
+    serialNumber: z.string().optional(),
+    manufacturer: z.string().optional(),
+    model: z.string().optional(),
+    motherboardManufacturer: z.string().optional(),
+    motherboardProduct: z.string().optional(),
+    motherboardVersion: z.string().optional(),
+    biosVersion: z.string().optional(),
+    gpuModel: z.string().optional()
+  }).optional(),
+  networkInfo: z.array(z.object({
+    name: z.string(),
+    mac: z.string().optional(),
+    ip: z.string().optional(),
+    isPrimary: z.boolean().optional()
+  })).max(100).optional()
+});
+
+// ============================================
+// Heartbeat
+// ============================================
+
+// Tolerant heartbeat schema (Layer A bulletproofing).
+//
+// Optional informational fields are wrapped with `.catch(undefined)` so that
+// a malformed/oversized value drops silently instead of 400-ing the entire
+// heartbeat. Critical fields (status, agentVersion, top-level metrics core,
+// role, etc.) remain strict — those are real assertions about the agent
+// contract.
+//
+// For arrays of optional inner records (currentIPs, changedIPs, removedIPs,
+// interfaceStats), one bad element collapses the whole array via
+// `.catch(undefined)` rather than rejecting the heartbeat. The server keeps
+// treating an absent IP-history update as "no change this beat."
+//
+// History: an earlier helper-window incident saw Windows pseudo-interfaces
+// emit MACs > 17 chars, which (pre-fix) rejected the entire payload and
+// flipped endpoints to "offline" even though the agent was running fine.
+// Tolerance here is the systemic fix for that whole class of bug.
+
+const ipEntrySchema = z.object({
+  interfaceName: z.string().min(1).max(100),
+  ipAddress: z.string().trim().max(45).refine(
+    (value) => {
+      const withoutZone = value.includes('%') ? value.slice(0, Math.max(value.indexOf('%'), 0)) : value;
+      return isIP(withoutZone) !== 0;
+    },
+    { message: 'Invalid IP address format' }
+  ),
+  ipType: z.enum(['ipv4', 'ipv6']).optional().catch(undefined),
+  assignmentType: z.enum(['dhcp', 'static', 'vpn', 'link-local', 'unknown']).optional().catch(undefined),
+  // Standard MAC is 17 chars (XX:XX:XX:XX:XX:XX), but Windows pseudo-
+  // interfaces (ISATAP, Teredo, etc.) report longer EUI-64 / tunnel forms
+  // up to ~53 chars. Accept anything reasonable to avoid rejecting the
+  // whole heartbeat over an informational field.
+  macAddress: z.string().max(64).optional().catch(undefined),
+  subnetMask: z.string().max(45).optional().catch(undefined),
+  gateway: z.string().max(45).optional().catch(undefined),
+  dnsServers: z.array(z.string().max(45)).max(8).optional().catch(undefined)
+});
+
+// v4's z.number().int() rejects integers above 2^53 (Number.MAX_SAFE_INTEGER);
+// the agent's cumulative uint64 counters (byte and packet totals from gopsutil)
+// exceed that on busy/long-uptime hosts (v3 .int() had no magnitude cap, and the
+// DB columns are bigint). Keep v3 semantics — integer-valued, any magnitude — so
+// large counters aren't silently dropped. Fractional values still fail the refine
+// and negatives fail .min(0), so bad input is caught either way.
+const uint64Counter = z.number().min(0).refine(Number.isInteger, 'expected integer');
+
+const agentHealthStateSchema = z.enum(['healthy', 'warning', 'error', 'unknown']);
+const agentHealthComponentSchema = z.object({
+  state: agentHealthStateSchema,
+  reason: z.string().max(512).optional(),
+}).strict();
+const agentHealthComponentsSchema = z.record(
+  z.string().min(1).max(100),
+  agentHealthComponentSchema,
+).superRefine((components, ctx) => {
+  if (Object.keys(components).length > 100) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.too_big,
+      maximum: 100,
+      inclusive: true,
+      origin: 'object',
+      message: 'Too many health components',
+    });
+  }
+});
+
+const agentHealthObservationWireV1Schema = z.object({
+  schemaVersion: z.literal(1),
+  deviceId: z.string().uuid().optional(),
+  agentVersion: z.string().min(1).max(64),
+  overall: agentHealthStateSchema,
+  metricsAvailable: z.boolean().nullable(),
+  components: agentHealthComponentsSchema,
+  observedAt: z.string().datetime({ offset: true }),
+}).strict();
+
+export const heartbeatSchema = z.object({
+  // Version/shape failures are report-local and must not reject the heartbeat.
+  networkContextV1: z.unknown().optional(),
+  networkContextReset: z.unknown().optional(),
+  metrics: z.object({
+    cpuPercent: z.number(),
+    ramPercent: z.number(),
+    ramUsedMb: z.number().int(),
+    diskPercent: z.number(),
+    diskUsedGb: z.number(),
+    diskActivityAvailable: z.boolean().optional().catch(undefined),
+    diskReadBytes: uint64Counter.optional().catch(undefined),
+    diskWriteBytes: uint64Counter.optional().catch(undefined),
+    diskReadBps: z.number().int().min(0).optional().catch(undefined),
+    diskWriteBps: z.number().int().min(0).optional().catch(undefined),
+    diskReadOps: z.number().int().min(0).optional().catch(undefined),
+    diskWriteOps: z.number().int().min(0).optional().catch(undefined),
+    networkInBytes: uint64Counter.optional().catch(undefined),
+    networkOutBytes: uint64Counter.optional().catch(undefined),
+    bandwidthInBps: z.number().int().min(0).optional().catch(undefined),
+    bandwidthOutBps: z.number().int().min(0).optional().catch(undefined),
+    interfaceStats: z.array(z.object({
+      name: z.string().min(1),
+      inBytesPerSec: z.number().int().min(0),
+      outBytesPerSec: z.number().int().min(0),
+      inBytes: uint64Counter,
+      outBytes: uint64Counter,
+      inPackets: uint64Counter,
+      outPackets: uint64Counter,
+      inErrors: uint64Counter,
+      outErrors: uint64Counter,
+      speed: z.number().int().min(0).optional().catch(undefined)
+    })).max(100).optional().catch(undefined),
+    processCount: z.number().int().optional().catch(undefined)
+  }).optional(),
+  metricsAvailable: z.boolean().optional().catch(undefined),
+  // Self-health is independent from reachability. Old maps, malformed values,
+  // and future schema versions are dropped locally so they can never reject
+  // an otherwise valid heartbeat.
+  healthStatus: agentHealthObservationWireV1Schema.optional().catch(undefined),
+  status: z.enum(['ok', 'warning', 'error']),
+  agentVersion: z.string(),
+  helperVersion: z.string().max(20).optional().catch(undefined),
+  // Installed watchdog version, reported by the MAIN agent in its normal
+  // heartbeat (#1802) so devices.watchdog_version stays fresh after a watchdog
+  // recovers to monitoring — previously only watchdog FAILOVER heartbeats wrote
+  // it, leaving the dashboard stale and the server re-sending watchdogUpgradeTo.
+  watchdogVersion: z.string().max(20).optional().catch(undefined),
+  // Installed breeze-backup version, reported by the agent so
+  // devices.backup_version stays fresh (mirrors watchdogVersion above).
+  backupVersion: z.string().max(20).optional().catch(undefined),
+  rollbackComponentVersions: z.record(
+    z.enum(['agent', 'helper', 'user-helper', 'watchdog', 'backup']),
+    z.string().min(1).max(20),
+  ).optional().catch(undefined),
+  // #2288 — the control-plane base URL the agent used for this heartbeat.
+  serverUrl: z.string().max(512).optional().catch(undefined),
+  ipHistoryUpdate: z.object({
+    deviceId: z.string().optional().catch(undefined),
+    currentIPs: z.array(ipEntrySchema).max(100).nullish().catch(undefined),
+    changedIPs: z.array(ipEntrySchema).max(100).nullish().catch(undefined),
+    removedIPs: z.array(ipEntrySchema).max(100).nullish().catch(undefined),
+    detectedAt: z.string().datetime({ offset: true }).optional().catch(undefined)
+  }).optional().catch(undefined),
+  pendingReboot: z.boolean().optional().catch(undefined),
+  // Scheduled-restart status from the agent's RebootManager (#3207 W5).
+  //
+  // THREE-WAY on purpose, and the server persists each case differently:
+  //   absent  -> no news. A pre-#3207 agent omits the key entirely and must
+  //              never wipe the console's view of a live schedule.
+  //   null    -> news: nothing is scheduled any more (cancelled, or the
+  //              restart already fired). Clears the stored columns.
+  //   object  -> the current schedule.
+  // `.nullish()` (not `.optional()`) is what keeps null distinguishable from
+  // absent; the outer `.catch(undefined)` degrades a malformed snapshot to
+  // "no news" rather than 400-ing a heartbeat over an informational field.
+  //
+  // `scheduledAt` is the only REQUIRED member: it is the anchor of the whole
+  // snapshot, so a bad timestamp must invalidate the object rather than store
+  // a restart with no time. Every other member degrades to undefined (stored
+  // NULL) independently.
+  rebootStatus: z.object({
+    scheduledAt: z.string().datetime({ offset: true }),
+    deadline: z.string().datetime({ offset: true }).optional().catch(undefined),
+    // Bounded pattern rather than a hard enum. The agent echoes back whatever
+    // `source` the server put on the schedule_reboot command ('patch_job',
+    // 'maintenance_window', or the agent's own 'manual' default), so an enum
+    // here would silently drop the ENTIRE snapshot the first time a new
+    // server-side producer ships ahead of an API deploy — and it would buy no
+    // provenance anyway, since a compromised agent can claim any allowed
+    // value. The console maps known tokens to localized labels and falls back
+    // to a generic label for anything else, so this is never rendered raw.
+    // Width matches devices.reboot_source varchar(32).
+    source: z.string().regex(/^[a-z0-9_]{1,32}$/).optional().catch(undefined),
+    // Upper bound mirrors MAX_REBOOT_DEFERRALS in services/patchRebootHandler
+    // (10) — inlined rather than imported to keep this schema module free of
+    // the db-touching service graph. The devices CHECK constraints deliberately
+    // enforce only non-negativity, so raising that ceiling later is an API-side
+    // change, not a migration.
+    deferralsUsed: z.number().int().min(0).max(10).optional().catch(undefined),
+    maxDeferrals: z.number().int().min(0).max(10).optional().catch(undefined),
+  }).nullish().catch(undefined),
+  lastUser: z.string().max(255).optional().catch(undefined),
+  uptime: z.number().int().min(0).optional().catch(undefined),
+  deviceRole: z.enum(DEVICE_ROLES).optional().catch(undefined),
+  isVirtual: z.boolean().optional().catch(undefined),
+  virtualizationPlatform: z.enum(VIRTUALIZATION_PLATFORMS).optional().catch(undefined),
+  hostname: z.string().min(1).max(255).optional().catch(undefined),
+  osVersion: z.string().min(1).max(255).optional().catch(undefined),
+  osBuild: z.string().max(255).optional().catch(undefined),
+  tccPermissions: z.object({
+    screenRecording: z.boolean(),
+    accessibility: z.boolean(),
+    fullDiskAccess: z.boolean(),
+    remoteDesktop: z.boolean().nullable().optional().catch(undefined),
+    checkedAt: z.string().datetime({ offset: true }),
+  }).optional().catch(undefined),
+  desktopAccess: z.object({
+    mode: z.enum(['user_session', 'login_window', 'unavailable']),
+    loginUiReachable: z.boolean(),
+    virtualDisplayReady: z.boolean(),
+    reason: desktopAccessReasonSchema.nullable().optional().catch(undefined),
+    remoteDesktopPermission: z.boolean().nullable().optional().catch(undefined),
+    checkedAt: z.string().datetime({ offset: true }),
+  }).optional().catch(undefined),
+  isHeadless: z.boolean().optional().catch(undefined),
+  // Resolved helper spawn mode ("always-on" | "on-demand"), reported once the
+  // agent's lifecycle manager has classified the host as an RD Session Host or
+  // not. An unrecognized value degrades to undefined (.catch) rather than
+  // 400-ing the heartbeat — old/new agent skew must never break check-ins.
+  helperLifecycleMode: z.enum(['always-on', 'on-demand']).optional().catch(undefined),
+  // Current-state power/battery telemetry (#2142). Informational — a bad value
+  // drops the whole battery object (.catch) rather than 400-ing the heartbeat.
+  battery: z.object({
+    present: z.boolean(),
+    percent: z.number().min(0).max(100).optional().catch(undefined),
+    chargingState: z.enum(['charging', 'discharging', 'full', 'not_charging', 'unknown']).optional().catch(undefined),
+    pluggedIn: z.boolean().optional().catch(undefined),
+    timeRemainingMinutes: z.number().int().min(0).optional().catch(undefined),
+    timeToFullMinutes: z.number().int().min(0).optional().catch(undefined),
+  }).optional().catch(undefined),
+  // Agent's own Go runtime memory gauges (#2389). Informational — a bad value
+  // drops the whole object (.catch) rather than 400-ing the heartbeat.
+  // Persisted into device_metrics.custom_metrics so fleet-wide agent memory
+  // leaks are visible without shell access to the device.
+  agentRuntime: z.object({
+    heapAllocBytes: uint64Counter,
+    heapInuseBytes: uint64Counter,
+    heapReleasedBytes: uint64Counter,
+    sysBytes: uint64Counter,
+    numGc: z.number().int().min(0),
+    goroutines: z.number().int().min(0),
+    // Worker-pool wedge gauges (#2400): commands currently executing on the
+    // pool and how many are overdue past their in-flight watchdog tier.
+    // Per-field optional + .catch so agents predating #2400 (which omit
+    // them) don't lose the whole agentRuntime object.
+    commandsInFlight: z.number().int().min(0).optional().catch(undefined),
+    commandsOverdue: z.number().int().min(0).optional().catch(undefined),
+  }).optional().catch(undefined),
+  role: z.enum(['agent', 'watchdog']).optional(),
+  watchdogState: z.string().optional().catch(undefined),
+  // Watchdog-only: 24h restart accounting for the main agent (#799 Layer B).
+  // Optional informational fields, so they tolerate a bad/oversized value
+  // (drop it) rather than 400-ing the whole heartbeat.
+  mainAgentRestartCount24h: z.number().int().min(0).max(10_000).optional().catch(undefined),
+  mainAgentLastRestartAt: z.string().datetime({ offset: true }).optional().catch(undefined),
+  flapDetected: z.boolean().optional().catch(undefined),
+  osType: z.string().optional().catch(undefined),
+  onedriveDeviceState: z.object({
+    signedIn: z.boolean(),
+    oneDriveVersion: z.string().max(64).optional(),
+    filesOnDemandOn: z.boolean(),
+    kfmFolderStates: z.record(z.string(), z.string()).default({}),
+    mountedLibraries: z.array(z.string().max(1024)).default([]),
+    entitledLibraries: z.array(z.string().max(1024)).default([]),
+    // Cap mirrored by the agent (onedrivehelper_windows.go readDeviceState) —
+    // lowering it silently degrades reports from already-shipped agents. The
+    // field-level .catch([]) means a violating value (17+ UPNs, oversized
+    // string, non-array) drops ONLY the UPNs, not the whole device-state block.
+    signedInUpns: z.array(z.string().max(320)).max(16).default([]).catch([]),
+    driftEntries: z.array(z.record(z.string(), z.unknown())).default([]),
+  }).optional().catch(undefined),
+  // Wave 6 Task 4 (security remediation) — outbound-network-policy capability
+  // handshake. Old agents omit this object entirely; a capable agent sends
+  // `{"outboundNetworkPolicyVersion":1}`. Informational — a bad field drops
+  // independently rather than 400-ing the heartbeat, since the route treats
+  // every omitted/unrecognized value as capability zero anyway.
+  securityCapabilities: z.object({
+    outboundNetworkPolicyVersion: z.number().int().optional().catch(undefined),
+    // #3409 PR4 — encrypted secret-env delivery. Same informational contract:
+    // a bad value drops the field rather than 400-ing the heartbeat, since the
+    // route treats anything other than exactly 1 as "not capable" anyway.
+    scriptSecretEnvVersion: z.number().int().optional().catch(undefined),
+    // Device-control capability claims are tolerant informational fields.
+    // Each malformed field drops independently without rejecting the beat.
+    peripheralPolicyProtocolVersion: z.number().int().optional().catch(undefined),
+    rollbackProtocolVersion: z.number().int().optional().catch(undefined),
+    pamLifetimeProtocolVersion: z.number().int().optional().catch(undefined),
+    // Revocation lease (fail-closed desktop session revalidation). Same
+    // tolerant contract: a malformed value drops this field alone, since the
+    // route treats anything other than exactly 1 as "not capable".
+    revocationLeaseProtocolVersion: z.number().int().optional().catch(undefined),
+    desktopFenceProtocolVersion: z.number().int().optional().catch(undefined),
+    pamReconciliation: z.object({
+      unresolvedCount: z.number().int().nonnegative(),
+      quarantinedCount: z.number().int().nonnegative(),
+      awaitingAcknowledgementCount: z.number().int().nonnegative(),
+      receivedObservationPendingCount: z.number().int().nonnegative().optional(),
+      blockingReason: z.enum([
+        'resolver_unavailable',
+        'binding_unresolved',
+        'enqueue_failed',
+        'acknowledgement_unavailable',
+        'quarantined',
+        'outbox_unreadable',
+        'received_observation_transport',
+      ]).refine((value) => value.length <= 64).optional(),
+    }).optional().catch(undefined),
+  }).optional().catch(undefined),
+  // Signed rollback progress is informational and restart-resend safe. A
+  // malformed optional observation must never take the ordinary heartbeat
+  // offline; the server simply withholds an acknowledgement for that value.
+  rollbackObservation: z.object({
+    schemaVersion: z.literal(1),
+    observationId: z.string().regex(/^[a-f0-9]{64}$/),
+    rollbackId: z.string().uuid(),
+    deviceId: z.string().uuid(),
+    phase: z.enum([
+      'received',
+      'downloaded',
+      'verified',
+      'staged',
+      'swapped',
+      'restart_requested',
+      'healthy',
+      'failed',
+      'recovered',
+    ]),
+    currentVersion: z.string().min(1).max(100),
+    componentVersions: z.record(z.string().min(1).max(64), z.string().min(1).max(100)),
+    observedAt: z.string().datetime({ offset: true }),
+    errorCode: z.string().min(1).max(128).regex(/^[a-z0-9_]+$/).optional().catch(undefined),
+  }).optional().catch(undefined),
+  // Migration-banner Task 2 — self-reported install edition + whether the
+  // agent believes it needs to migrate hosted↔self-host. Since #4072 this is
+  // NOT merely informational: a reported edition is the capability signal
+  // that gates update-offer delivery (agentAcceptsServedEdition), and a
+  // value swallowed here makes the agent look silent — which on a hosted
+  // server means offers are withheld from a ≥0.105.0 build. The .catch is
+  // still correct (a future third edition must degrade to "silent", not
+  // 400 the heartbeat), but changes here are offer-load-bearing.
+  agentEdition: z.enum(['hosted', 'self-host']).optional().catch(undefined),
+  migrationRequired: z.boolean().optional().catch(undefined),
+  // Bare-metal recovery W04a: the rebuild engine leaves a marker on the
+  // restored disk; the agent sends it until the server acknowledges the
+  // check-in (recoveryMarkerAck: true in the response), then deletes it.
+  recoveryMarker: z.object({
+    recoveryId: z.string().uuid(),
+    nonce: z.string().regex(/^[0-9a-f]{64}$/),
+  }).optional().catch(undefined),
+});
+
+// ============================================
+// Process Samples
+// ============================================
+
+export const processSampleSchema = z.object({
+  timestamp: z.string().datetime(),
+  processes: z.array(z.object({
+    name: z.string().min(1).max(256),
+    pid: z.number().int().min(0),
+    cpu: z.number().min(0),
+    ramMb: z.number().min(0),
+    diskBps: z.number().min(0).optional(),
+    netBps: z.number().min(0).optional()
+  })).max(16)
+});
+
+// ============================================
+// Commands
+// ============================================
+
+/**
+ * MAX_COMMAND_RESULT_BYTES bounds the `result` field of an agent command
+ * result. It is the TIGHTEST limit anywhere on the agent→server result path —
+ * tighter than the 16 MiB agent IPC frame, the agent's 16 MiB WS read limit and
+ * the `ws` server's 100 MiB default `maxPayload` — so it, not any of those, is
+ * the limit an agent has to bound its payload against.
+ *
+ * That is not obvious from the agent side, and #3001 is what it costs when it
+ * is missed: the backup helper emitted a BackupJob body carrying one
+ * `snapshot.files` entry per backed-up file (~522 B each), the agent put that
+ * body in `result`, and every backup over ~2,000 files was rejected here. The
+ * agent's own tiered degradation was bounding against the 16 MiB IPC frame —
+ * far too loose — so it never fired, nothing logged on either side, and the job
+ * sat `running` until the stale-backup reaper falsely failed a backup that had
+ * in fact succeeded.
+ *
+ * IT EQUALS THE `stdout`/`stderr` CAPS IN THIS SAME SCHEMA, DELIBERATELY. All
+ * three fields ride one message from one authenticated agent, and the old
+ * 1 MiB-vs-5 MB split between them was a cause of #3001 rather than an
+ * incidental detail: the backup forwarder assigns its run body to `result`
+ * instead of `stdout` (agent/internal/heartbeat/heartbeat.go, case
+ * TypeBackupResult), so the payload silently inherited a limit five times
+ * tighter than the one anyone reasoned about. Keeping the three equal removes
+ * the trap. Do not "round" this to 5 * 1024 * 1024 — that would put `result`
+ * 242,880 bytes above `stdout` and re-create a smaller version of the same
+ * mismatch.
+ *
+ * Raising it does NOT replace the agent's degradation machinery, which is still
+ * what guarantees a terminal status: a 100k-file index is ~52 MB and fits no
+ * sane cap. It widens the band in which a snapshot keeps a browsable file index
+ * from ~2,000 files to ~9,500.
+ *
+ * MIRRORED IN GO as `wire.MaxCommandResultBytes`
+ * (agent/internal/wire/limits.go). The two are pinned equal by
+ * `schemas.commandResult.test.ts` here and `TestMaxCommandResultBytesMatchesServerSchema`
+ * there — both assert the literal 5000000 AND cross-parse the other language's
+ * declaration, so raising one alone reddens CI on both sides rather than
+ * silently re-opening #3001.
+ */
+export const MAX_COMMAND_RESULT_BYTES = 5_000_000;
+
+/**
+ * commandResultResultByteLength returns the encoded size the `result` field
+ * will occupy, or null when the value cannot be serialised at all (a cycle, or
+ * a throwing toJSON). Exported so the WS layer can report the measured size in
+ * its rejection log instead of leaving an operator to guess why a result was
+ * refused.
+ */
+export function commandResultResultByteLength(val: unknown): number | null {
+  if (val === undefined || val === null) return 0;
+  try {
+    const encoded = JSON.stringify(val);
+    if (encoded === undefined) return 0;
+    return Buffer.byteLength(encoded, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+export const commandResultSchema = z.object({
+  status: z.enum(['completed', 'failed', 'timeout']),
+  exitCode: z.number().int().optional(),
+  stdout: z.string().max(5_000_000).optional(),
+  stderr: z.string().max(5_000_000).optional(),
+  durationMs: z.number().int().optional(),
+  // RFC3339 timestamp captured by the agent at the moment the command's
+  // primary work began. Optional for back-compat with pre-startedAt agents,
+  // which the server falls back to reconstructing from durationMs.
+  startedAt: z.string().datetime().optional(),
+  error: z.string().max(10_000).optional(),
+  result: z.any().optional().refine(
+    (val) => {
+      const size = commandResultResultByteLength(val);
+      return size !== null && size <= MAX_COMMAND_RESULT_BYTES;
+    },
+    {
+      message:
+        `Command result payload exceeds the ${MAX_COMMAND_RESULT_BYTES}-byte \`result\` limit ` +
+        '(the agent must degrade the payload before sending — see #3001)'
+    }
+  )
+});
+
+// ============================================
+// Security
+// ============================================
+
+export const securityProviderValues = [
+  'windows_defender',
+  'bitdefender',
+  'sophos',
+  'sentinelone',
+  'crowdstrike',
+  'malwarebytes',
+  'eset',
+  'kaspersky',
+  'elastic_defend',
+  'other'
+] as const;
+
+export type SecurityProviderValue = (typeof securityProviderValues)[number];
+
+export const securityStatusIngestSchema = z.object({
+  provider: z.string().optional(),
+  providerVersion: z.string().optional(),
+  definitionsVersion: z.string().optional(),
+  definitionsDate: z.string().optional(),
+  lastScan: z.string().optional(),
+  lastScanType: z.string().optional(),
+  realTimeProtection: z.boolean().optional(),
+  threatCount: z.number().int().min(0).optional(),
+  firewallEnabled: z.boolean().optional(),
+  encryptionStatus: z.string().optional(),
+  encryptionDetails: z.record(z.string(), z.unknown()).optional().refine(
+    (val) => !val || JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ),
+  localAdminSummary: z.record(z.string(), z.unknown()).optional().refine(
+    (val) => !val || JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ),
+  passwordPolicySummary: z.record(z.string(), z.unknown()).optional().refine(
+    (val) => !val || JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ),
+  gatekeeperEnabled: z.boolean().optional(),
+  guardianEnabled: z.boolean().optional(),
+  windowsSecurityCenterAvailable: z.boolean().optional(),
+  avProducts: z.array(
+    z.object({
+      // Bounded because this array is persisted to security_status.av_products.
+      // TRUNCATE, never reject: displayName is raw WMI SecurityCenter2 text, so
+      // a `.max()` here would 400 the ENTIRE security-status submission (and,
+      // via getSecurityStatusFromResult, silently drop it) for one long vendor
+      // name — recurring on every heartbeat until the product name changes.
+      // Sibling collectors truncate agent-side for the same reason.
+      displayName: z.string().transform((v) => v.slice(0, 200)).optional(),
+      provider: z.string().transform((v) => v.slice(0, 100)).optional(),
+      realTimeProtection: z.boolean().optional(),
+      definitionsUpToDate: z.boolean().optional(),
+      productState: z.number().int().optional()
+    })
+  ).max(50).optional()
+});
+
+export type SecurityStatusPayload = z.infer<typeof securityStatusIngestSchema>;
+
+export const recoveryKeysIngestSchema = z.object({
+  source: z.enum(['snapshot', 'rotation']),
+  keys: z.array(z.object({
+    keyType: z.enum(['bitlocker_recovery_password', 'filevault_personal_recovery_key']),
+    volumeMount: z.string().max(100).optional(),
+    protectorId: z.string().max(100).optional(),
+    recoveryKey: z.string().min(8).max(512)
+  })).max(50)
+});
+
+export type RecoveryKeysIngestPayload = z.infer<typeof recoveryKeysIngestSchema>;
+
+export const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export const securityCommandTypes = {
+  collectStatus: 'security_collect_status',
+  scan: 'security_scan',
+  quarantine: 'security_threat_quarantine',
+  remove: 'security_threat_remove',
+  restore: 'security_threat_restore'
+} as const;
+
+export const filesystemAnalysisCommandType = 'filesystem_analysis';
+export const sensitiveDataCommandTypes = {
+  scan: 'sensitive_data_scan',
+  encrypt: 'encrypt_file',
+  secureDelete: 'secure_delete_file',
+  quarantine: 'quarantine_file'
+} as const;
+
+// ============================================
+// Management Posture
+// ============================================
+
+/**
+ * Category keys of the management-posture ingest payload. Single source of
+ * truth — reused by the fleet posture report (services/managementPostureReport)
+ * to validate the `category` query param before it reaches SQL.
+ */
+export const MANAGEMENT_POSTURE_CATEGORIES = [
+  'mdm', 'rmm', 'remoteAccess', 'endpointSecurity',
+  'policyEngine', 'backup', 'identityMfa', 'siem',
+  'dnsFiltering', 'zeroTrustVpn', 'patchManagement',
+] as const;
+
+export type ManagementPostureCategory = (typeof MANAGEMENT_POSTURE_CATEGORIES)[number];
+
+export const managementPostureIngestSchema = z.object({
+  collectedAt: z.string().datetime(),
+  scanDurationMs: z.number().int().nonnegative(),
+  // v4: z.record(enum, …) is exhaustive; agents report only the categories they
+  // detect, so partialRecord preserves the v3 partial-ingest behavior.
+  categories: z.partialRecord(
+    z.enum(MANAGEMENT_POSTURE_CATEGORIES),
+    z.array(z.object({
+      name: z.string(),
+      version: z.string().optional(),
+      status: z.enum(['active', 'installed', 'unknown']),
+      serviceName: z.string().optional(),
+      details: z.record(z.string(), z.unknown()).optional(),
+    }))
+  ),
+  identity: z.object({
+    joinType: z.enum(['hybrid_azure_ad', 'azure_ad', 'on_prem_ad', 'workplace', 'none']),
+    azureAdJoined: z.boolean(),
+    domainJoined: z.boolean(),
+    workplaceJoined: z.boolean(),
+    domainName: z.string().optional(),
+    tenantId: z.string().optional(),
+    mdmUrl: z.string().optional(),
+    source: z.string(),
+  }),
+  errors: z.array(z.string()).max(100).optional(),
+});
+
+// ============================================
+// Inventory
+// ============================================
+
+/** Coerce date strings to valid ISO date (YYYY-MM-DD) or null.
+ *  Accepts ISO-8601 datetime or date-only formats. */
+const warrantyDateSchema = z.string().max(50).optional()
+  .transform((val) => {
+    if (!val) return undefined;
+    const d = new Date(val);
+    if (isNaN(d.getTime())) return undefined;
+    // Return date portion only (YYYY-MM-DD) for Postgres date columns
+    return d.toISOString().slice(0, 10);
+  });
+
+export const agentWarrantyInfoSchema = z.object({
+  source: z.string().min(1).max(50),
+  manufacturer: z.string().min(1).max(100),
+  coverageEndDate: warrantyDateSchema,
+  coverageStartDate: warrantyDateSchema,
+  coverageType: z.string().max(200).optional(),
+  // Coverage kind derived from the macOS NDO label verb: 'subscription'
+  // ("Renews ...") vs 'fixed' ("Expires ..."). Empty/absent when unknown.
+  // Accept '' for back-compat: older agents (and timestamp-only/labelless/
+  // localized/plist-fallback coverage) send an empty string, which a bare
+  // enum rejects with invalid_enum_value → a 400 that silently drops the
+  // ENTIRE warranty-info update. Treat '' as undefined/fixed downstream (#1320).
+  coverageKind: z
+    .enum(['subscription', 'fixed'])
+    .or(z.literal(''))
+    .optional(),
+  deviceName: z.string().max(200).optional(),
+});
+
+export const updateHardwareSchema = z.object({
+  cpuModel: z.string().optional(),
+  cpuCores: z.number().int().optional(),
+  cpuThreads: z.number().int().optional(),
+  ramTotalMb: z.number().int().optional(),
+  diskTotalGb: z.number().int().optional(),
+  serialNumber: z.string().optional(),
+  manufacturer: z.string().optional(),
+  model: z.string().optional(),
+  motherboardManufacturer: z.string().optional(),
+  motherboardProduct: z.string().optional(),
+  motherboardVersion: z.string().optional(),
+  biosVersion: z.string().optional(),
+  gpuModel: z.string().optional()
+});
+
+export const updateSoftwareSchema = softwareInventoryReportSchema;
+
+export const updateDisksSchema = z.object({
+  disks: z.array(z.object({
+    mountPoint: z.string().min(1),
+    device: z.string().optional(),
+    fsType: z.string().optional(),
+    totalGb: z.number(),
+    usedGb: z.number(),
+    freeGb: z.number(),
+    usedPercent: z.number(),
+    health: z.string().optional()
+  })).max(100)
+});
+
+export const updateNetworkSchema = z.object({
+  adapters: z.array(z.object({
+    interfaceName: z.string().min(1),
+    macAddress: z.string().optional(),
+    ipAddress: z.string().optional(),
+    ipType: z.enum(['ipv4', 'ipv6']).optional(),
+    isPrimary: z.boolean().optional()
+  })).max(100),
+  // Active-VPN-client presence (#2139). Optional so older agents that don't
+  // report VPNs still validate. Entries are validated PER-ENTRY in the handler
+  // (against vpnPresenceIngestSchema), not here, so one malformed VPN can't 400
+  // the whole payload and silently discard the valid adapter inventory (#3550).
+  vpns: z.array(z.unknown()).max(50).optional()
+});
+
+// ============================================
+// State
+// ============================================
+
+export const updateRegistryStateSchema = z.object({
+  entries: z.array(z.object({
+    registryPath: z.string().min(1),
+    valueName: z.string().min(1),
+    valueData: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
+    valueType: z.string().optional(),
+    collectedAt: z.string().optional()
+  })).max(5000),
+  replace: z.boolean().optional().default(true)
+});
+
+export const updateConfigStateSchema = z.object({
+  entries: z.array(z.object({
+    filePath: z.string().min(1),
+    configKey: z.string().min(1),
+    configValue: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
+    collectedAt: z.string().optional()
+  })).max(5000),
+  replace: z.boolean().optional().default(true)
+});
+
+// ============================================
+// Sessions
+// ============================================
+
+const sessionTypeSchema = z.enum(['console', 'rdp', 'ssh', 'other']);
+const sessionActivityStateSchema = z.enum(['active', 'idle', 'locked', 'away', 'disconnected']);
+const sessionEventTypeSchema = z.enum(['login', 'logout', 'lock', 'unlock', 'switch']);
+
+// Caller verification (#6354 W01): OS identity evidence behind a session,
+// read by the agent from the logon token / uid. Exactly one of sid (Windows)
+// or uid (Unix) is present. `upn` is only supplied when the OS translated the
+// account to a directory user principal name.
+const sessionPrincipalSchema = z.object({
+  sid: z.string().regex(/^S-\d(?:-\d+)+$/).max(184).optional(),
+  uid: z.number().int().min(0).max(4294967295).optional(),
+  username: z.string().min(1).max(255),
+  upn: z.string().min(1).max(320).optional(),
+}).refine((p) => (p.sid !== undefined) !== (p.uid !== undefined), 'Exactly one SID or UID is required');
+
+export const submitSessionsSchema = z.object({
+  sessions: z.array(z.object({
+    username: z.string().min(1).max(255),
+    sessionType: sessionTypeSchema,
+    sessionId: z.string().max(128).optional(),
+    loginAt: z.string().optional(),
+    idleMinutes: z.number().int().min(0).max(10080).optional(),
+    activityState: sessionActivityStateSchema.optional(),
+    loginPerformanceSeconds: z.number().int().min(0).max(36000).optional(),
+    isActive: z.boolean().optional(),
+    lastActivityAt: z.string().optional(),
+    principal: sessionPrincipalSchema.optional(),
+  })).max(128).default([]),
+  events: z.array(z.object({
+    type: sessionEventTypeSchema,
+    username: z.string().min(1).max(255),
+    sessionType: sessionTypeSchema,
+    sessionId: z.string().max(128).optional(),
+    timestamp: z.string().optional(),
+    activityState: sessionActivityStateSchema.optional(),
+    principal: sessionPrincipalSchema.optional(),
+  })).max(256).nullish(),
+  collectedAt: z.string().optional(),
+});
+
+// ============================================
+// Patches
+// ============================================
+
+const patchSourceSchema = z.enum(['microsoft', 'apple', 'linux', 'third_party', 'custom']);
+
+const pendingPatchSchema = z.object({
+  name: z.string().min(1),
+  version: z.string().optional(),
+  currentVersion: z.string().optional(),
+  packageId: z.string().max(256).optional(),
+  vendor: z.string().max(255).optional(),
+  kbNumber: z.string().optional(),
+  externalId: z.string().optional(),
+  category: z.string().optional(),
+  severity: z.enum(['critical', 'important', 'moderate', 'low', 'unknown']).optional(),
+  size: z.number().int().optional(),
+  requiresRestart: z.boolean().optional(),
+  releaseDate: z.string().optional(),
+  description: z.string().optional(),
+  // Windows install scope the agent discovered this package at (#2727).
+  // Absent for providers with no scope concept — treated as machine-wide.
+  scope: z.enum(['machine', 'user']).optional(),
+  source: patchSourceSchema.default('custom')
+});
+
+const installedPatchSchema = z.object({
+  name: z.string().min(1),
+  version: z.string().optional(),
+  packageId: z.string().max(256).optional(),
+  vendor: z.string().max(255).optional(),
+  kbNumber: z.string().optional(),
+  externalId: z.string().optional(),
+  category: z.string().optional(),
+  source: patchSourceSchema.default('custom'),
+  installedAt: z.string().optional()
+});
+
+export const submitPendingPatchesSchema = z.object({
+  patches: z.array(pendingPatchSchema).max(5000),
+  source: patchSourceSchema.optional(),
+  full: z.boolean().optional().default(false),
+  // Source buckets the full scan actually covered (#2217). When present on a
+  // full upload, only pending rows from these sources are swept to 'missing';
+  // sources whose providers were skipped (e.g. winget without a helper
+  // session) or failed keep their rows. Absent → legacy full sweep. Only read
+  // when full is true; ignored (harmlessly) on targeted/non-full uploads.
+  //
+  // Forward/backward compat: this object MUST stay non-strict. An old API
+  // silently drops this unknown field and falls back to sweep-all (safe
+  // degrade). If this schema is ever hardened to .strict(), a new agent's
+  // coveredSources payload would 400 and patch uploads would stop entirely —
+  // do not do that without a coordinated agent-fleet rollout.
+  coveredSources: z.array(patchSourceSchema).max(10).optional(),
+  // Whether the agent's user-context winget pass actually ran this scan
+  // (#2727). It is a SECOND coverage axis, orthogonal to coveredSources: the
+  // SYSTEM machine-scope pass can succeed (third_party covered) while per-user
+  // apps went unlooked-at because nobody was logged in. Only when this is
+  // explicitly true are user-scope pending rows eligible to be swept to
+  // 'missing' — otherwise the sweep would tombstone rows the scan never saw,
+  // the #2217 failure mode one axis down. Absent (legacy agents, non-Windows,
+  // devices with no winget provider) is treated as "not scanned".
+  userScopeScanned: z.boolean().optional()
+});
+
+export const submitInstalledPatchesSchema = z.object({
+  installed: z.array(installedPatchSchema).max(5000)
+});
+
+export const submitPatchesSchema = z.object({
+  patches: z.array(pendingPatchSchema).max(5000),
+  installed: z.array(installedPatchSchema).max(5000).optional()
+});
+
+// ============================================
+// Connections
+// ============================================
+
+export const submitConnectionsSchema = z.object({
+  connections: z.array(z.object({
+    protocol: z.enum(['tcp', 'tcp6', 'udp', 'udp6']),
+    localAddr: z.string().min(1),
+    localPort: z.number().int().min(0).max(65535),
+    remoteAddr: z.string().optional(),
+    remotePort: z.number().int().min(0).max(65535).optional(),
+    state: z.string().optional(),
+    pid: z.number().int().optional(),
+    processName: z.string().optional()
+  })).max(10000)
+});
+
+// ============================================
+// Agent Diagnostic Logs
+// ============================================
+
+export const agentLogEntrySchema = z.object({
+  timestamp: z.string().datetime(),
+  level: z.enum(['debug', 'info', 'warn', 'error']),
+  component: z.string().max(100),
+  message: z.string(),
+  fields: z.record(z.string(), z.any()).optional().refine(
+    (val) => !val || JSON.stringify(val).length <= 65536,
+    { message: 'Object too large (max 64KB)' }
+  ),
+  agentVersion: z.string().max(50).optional(),
+});
+
+export const agentLogIngestSchema = z.object({
+  logs: z.array(agentLogEntrySchema).max(500),
+});
+
+// ============================================
+// Event Logs
+// ============================================
+
+export const submitEventLogsSchema = z.object({
+  events: z.array(z.object({
+    timestamp: z.string().min(1),
+    level: z.enum(['info', 'warning', 'error', 'critical']),
+    category: z.enum(['security', 'hardware', 'application', 'system']),
+    source: z.string().min(1),
+    eventId: z.string().optional(),
+    // The agent truncates every event message to 500 chars on all collector
+    // paths (eventlogs_{windows,darwin,linux}.go), but that cap is agent-side
+    // only — a compromised or older agent could POST arbitrarily large messages
+    // into device_event_logs, which carries a GIN trigram index (search) that
+    // bloats super-linearly in value size. Re-bound it server-side. 2000 (4x the
+    // agent truncation) leaves headroom for the one un-truncated darwin path
+    // (crash-report synthesized messages, eventlogs_darwin.go) and future
+    // collectors while still hard-bounding the abuse vector. (#2642)
+    message: z.string().min(1).max(2000),
+    details: z.record(z.string(), z.any()).optional().refine(
+      (val) => !val || JSON.stringify(val).length <= 65536,
+      { message: 'Object too large (max 64KB)' }
+    )
+  })).max(5000)
+});
+
+// ============================================
+// Change Tracking
+// ============================================
+
+export const changeTypeValues = [
+  'software',
+  'service',
+  'startup',
+  'network',
+  'scheduled_task',
+  'user_account',
+  'hardware',
+  'os_version'
+] as const;
+
+export const changeActionValues = [
+  'added',
+  'removed',
+  'modified',
+  'updated'
+] as const;
+
+/**
+ * Per-request cap on `submitChangesSchema.changes[]`. Resolved + clamped
+ * once at module-load so a misconfigured env var (NaN, 0, negative,
+ * unbounded) can never propagate into `z.array().max(...)` and either
+ * (a) reject every legitimate ingest, fleet-wide, with a generic 400,
+ * or (b) make the array length effectively unbounded.
+ *
+ * Default 50000 was chosen to fit large Linux package-inventory deltas
+ * under the existing 5 MB body / 10 MB decompressed guards in
+ * `changes.ts:66-77`. The hard ceiling of 200000 is the safety stop
+ * even if an operator sets the env var to something unreasonable —
+ * matches the rationale in #752 review (Todd, 2026-05-19).
+ */
+const CHANGE_INGEST_MAX_ITEMS_DEFAULT = 50000;
+const CHANGE_INGEST_MAX_ITEMS_CEILING = 200000;
+function resolveChangeIngestMaxItems(): number {
+  const raw = process.env.CHANGE_INGEST_MAX_ITEMS;
+  if (!raw) return CHANGE_INGEST_MAX_ITEMS_DEFAULT;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > CHANGE_INGEST_MAX_ITEMS_CEILING) {
+    return CHANGE_INGEST_MAX_ITEMS_DEFAULT;
+  }
+  return parsed;
+}
+export const CHANGE_INGEST_MAX_ITEMS = resolveChangeIngestMaxItems();
+// Re-exported for tests of the resolver. Production code reads
+// CHANGE_INGEST_MAX_ITEMS (the resolved value) directly.
+export const __resolveChangeIngestMaxItemsForTests = resolveChangeIngestMaxItems;
+
+export const submitChangesSchema = z.object({
+  changes: z.array(z.object({
+    timestamp: z.string().datetime({ offset: true }),
+    changeType: z.enum(changeTypeValues),
+    changeAction: z.enum(changeActionValues),
+    subject: z.string().min(1).max(500),
+    beforeValue: z.record(z.string(), z.any()).optional().refine(
+      (value) => !value || JSON.stringify(value).length <= 65535,
+      { message: 'beforeValue too large (max 64KB)' }
+    ),
+    afterValue: z.record(z.string(), z.any()).optional().refine(
+      (value) => !value || JSON.stringify(value).length <= 65535,
+      { message: 'afterValue too large (max 64KB)' }
+    ),
+    details: z.record(z.string(), z.any()).optional().refine(
+      (value) => !value || JSON.stringify(value).length <= 65535,
+      { message: 'details too large (max 64KB)' }
+    ),
+  })).max(CHANGE_INGEST_MAX_ITEMS).default([])
+});
+
+// ============================================
+// Download
+// ============================================
+
+export const VALID_OS = new Set(['linux', 'darwin', 'windows']);
+export const VALID_ARCH = new Set(['amd64', 'arm64']);
+
+// ============================================
+// Policy Probe Types
+// ============================================
+
+export type PolicyRegistryProbeUpdate = {
+  registry_path: string;
+  value_name: string;
+};
+
+export type PolicyConfigProbeUpdate = {
+  file_path: string;
+  config_key: string;
+};
+
+export type PolicyProbeConfigUpdate = {
+  policy_registry_state_probes: PolicyRegistryProbeUpdate[];
+  policy_config_state_probes: PolicyConfigProbeUpdate[];
+};
+
+// ============================================
+// Filesystem Threshold Constants
+// ============================================
+
+export function parseEnvBoundedNumber(raw: string | undefined, fallback: number, min: number, max: number): number {
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  const rounded = Math.round(parsed);
+  if (rounded < min || rounded > max) return fallback;
+  return rounded;
+}
+
+export const filesystemDiskThresholdPercent = parseEnvBoundedNumber(
+  process.env.FILESYSTEM_ANALYSIS_DISK_THRESHOLD,
+  85,
+  50,
+  100
+);
+export const filesystemThresholdCooldownMinutes = parseEnvBoundedNumber(
+  process.env.FILESYSTEM_ANALYSIS_THRESHOLD_COOLDOWN_MINUTES,
+  120,
+  5,
+  1440
+);
+export const filesystemAutoResumeMaxRuns = parseEnvBoundedNumber(
+  process.env.FILESYSTEM_ANALYSIS_AUTO_RESUME_MAX_RUNS,
+  200,
+  1,
+  5000
+);

@@ -1,0 +1,241 @@
+import { useState, useEffect, useCallback } from 'react';
+import { ArrowLeft, Loader2 } from 'lucide-react';
+import ReportBuilder, { type ReportBuilderFormValues } from './ReportBuilder';
+import type { Report, ReportType } from './ReportsList';
+import { fetchWithAuth } from '../../stores/auth';
+import { navigateTo } from '@/lib/navigation';
+import Breadcrumbs from '../layout/Breadcrumbs';
+import { PostureBackupRequiredField } from './PostureReportOptionsForm';
+import {
+  DEFAULT_HARDWARE_LIFECYCLE_OPTIONS,
+  HardwareLifecycleOptionsFields,
+  hardwareLifecycleOptionsFromConfig,
+  type HardwareLifecycleOptions,
+} from './HardwareLifecycleOptionsForm';
+import {
+  DEFAULT_THREAT_DETECTION_OPTIONS,
+  ThreatDetectionOptionsFields,
+  threatDetectionOptionsFromConfig,
+  type ThreatDetectionOptions,
+} from './ThreatDetectionOptionsForm';
+import {
+  DEFAULT_ENDPOINT_MANAGEMENT_OPTIONS,
+  EndpointManagementOptionsFields,
+  endpointManagementOptionsFromConfig,
+  type EndpointManagementOptions,
+} from './EndpointManagementOptionsForm';
+import {
+  DEFAULT_VULNERABILITY_MANAGEMENT_OPTIONS,
+  VulnerabilityManagementOptionsFields,
+  vulnerabilityManagementOptionsFromConfig,
+  type VulnerabilityManagementOptions,
+} from './VulnerabilityManagementOptionsForm';
+import {
+  DEFAULT_IDENTITY_ACCESS_OPTIONS,
+  IdentityAccessOptionsFields,
+  identityAccessOptionsFromConfig,
+  type IdentityAccessOptions,
+} from './IdentityAccessOptionsForm';
+import { useTranslation } from 'react-i18next';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+type ReportEditPageProps = {
+  reportId: string;
+};
+
+export default function ReportEditPage({ reportId }: ReportEditPageProps) {
+  const { t } = useTranslation('reports');
+  const [report, setReport] = useState<Report | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [backupRequired, setBackupRequired] = useState(true);
+  const [lifecycleOptions, setLifecycleOptions] = useState<HardwareLifecycleOptions>(DEFAULT_HARDWARE_LIFECYCLE_OPTIONS);
+  const [threatOptions, setThreatOptions] = useState<ThreatDetectionOptions>(DEFAULT_THREAT_DETECTION_OPTIONS);
+  const [endpointManagementOptions, setEndpointManagementOptions] = useState<EndpointManagementOptions>(DEFAULT_ENDPOINT_MANAGEMENT_OPTIONS);
+  const [vulnerabilityOptions, setVulnerabilityOptions] = useState<VulnerabilityManagementOptions>(DEFAULT_VULNERABILITY_MANAGEMENT_OPTIONS);
+  const [identityOptions, setIdentityOptions] = useState<IdentityAccessOptions>(DEFAULT_IDENTITY_ACCESS_OPTIONS);
+
+  const fetchReport = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(undefined);
+      const response = await fetchWithAuth(`/reports/${reportId}`);
+      if (!response.ok) {
+        throw new Error(t('reports.reportEditPage.errors.fetchReport'));
+      }
+      const data = await response.json() as Report;
+      setReport(data);
+      const config = data.config as Record<string, unknown>;
+      setBackupRequired(config.backupRequired !== false);
+      setLifecycleOptions(hardwareLifecycleOptionsFromConfig(config));
+      setThreatOptions(threatDetectionOptionsFromConfig(config));
+      setEndpointManagementOptions(endpointManagementOptionsFromConfig(config));
+      setVulnerabilityOptions(vulnerabilityManagementOptionsFromConfig(config));
+      setIdentityOptions(identityAccessOptionsFromConfig(config));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('reports.reportEditPage.errors.generic'));
+    } finally {
+      setLoading(false);
+    }
+  }, [reportId, t]);
+
+  useEffect(() => {
+    fetchReport();
+  }, [fetchReport]);
+
+  const handleSubmit = useCallback(async () => {
+    // Report has been updated
+    void navigateTo('/reports');
+  }, []);
+
+  const handleCancel = useCallback(() => {
+    void navigateTo('/reports');
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('reports.reportEditPage.loading')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !report) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-4">
+          <a
+            href="/reports"
+            className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+          >
+            <ArrowLeft className="h-4 w-4" />
+          </a>
+          <h1 className="text-xl font-semibold tracking-tight">{t('reports.reportEditPage.title')}</h1>
+        </div>
+
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+          <p className="text-sm text-destructive">{error || t('reports.reportEditPage.notFound')}</p>
+          <a
+            href="/reports"
+            className="mt-4 inline-block rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+          >
+            {t('reports.reportEditPage.backToReports')}
+          </a>
+        </div>
+      </div>
+    );
+  }
+
+  // Convert report config to form values
+  const config = report.config as Record<string, unknown>;
+  const isPosture = report.type === 'security_compliance_posture';
+  const isLifecycle = report.type === 'hardware_lifecycle';
+  const isThreatDetection = report.type === 'threat_detection_review';
+  const isEndpointManagement = report.type === 'endpoint_management_review';
+  const isVulnerability = report.type === 'vulnerability_management';
+  const isIdentityAccess = report.type === 'identity_access_review';
+  const defaultValues: Partial<ReportBuilderFormValues> = {
+    name: report.name,
+    type: report.type as ReportType,
+    schedule: report.schedule,
+    format: report.format,
+    dateRange: (config.dateRange as ReportBuilderFormValues['dateRange']) || {
+      preset: 'last_30_days'
+    },
+    filters: (config.filters as ReportBuilderFormValues['filters']) || {}
+  };
+
+  return (
+    <div className="space-y-6">
+      <Breadcrumbs items={[
+        { label: t('reports.reportEditPage.reportsBreadcrumb'), href: '/reports' },
+        { label: report.name || t('reports.reportEditPage.title') }
+      ]} />
+      <div className="flex items-center gap-4">
+        <a
+          href="/reports"
+          className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </a>
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">{t('reports.reportEditPage.title')}</h1>
+          <p className="text-muted-foreground">
+            {t('reports.reportEditPage.description', { name: report.name })}
+          </p>
+        </div>
+      </div>
+
+      {isPosture && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <PostureBackupRequiredField
+            backupRequired={backupRequired}
+            onBackupRequiredChange={setBackupRequired}
+          />
+        </div>
+      )}
+
+      {isLifecycle && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <HardwareLifecycleOptionsFields value={lifecycleOptions} onChange={setLifecycleOptions} />
+        </div>
+      )}
+
+      {isThreatDetection && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <ThreatDetectionOptionsFields value={threatOptions} onChange={setThreatOptions} />
+        </div>
+      )}
+
+      {isEndpointManagement && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <EndpointManagementOptionsFields
+            value={endpointManagementOptions}
+            onChange={setEndpointManagementOptions}
+          />
+        </div>
+      )}
+
+      {isVulnerability && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <VulnerabilityManagementOptionsFields value={vulnerabilityOptions} onChange={setVulnerabilityOptions} />
+        </div>
+      )}
+
+      {isIdentityAccess && (
+        <div className="rounded-lg border bg-card p-6 shadow-xs">
+          <IdentityAccessOptionsFields value={identityOptions} onChange={setIdentityOptions} />
+        </div>
+      )}
+
+      <ReportBuilder
+        mode="edit"
+        reportId={reportId}
+        defaultValues={defaultValues}
+        baseConfig={
+          isPosture
+            ? { ...config, backupRequired }
+            : isLifecycle
+              ? { ...config, ...lifecycleOptions }
+              : isThreatDetection
+                ? { ...config, ...threatOptions }
+                : isEndpointManagement
+                  ? { ...config, ...endpointManagementOptions }
+                  : isVulnerability
+                    ? { ...config, ...vulnerabilityOptions }
+                    : isIdentityAccess
+                      ? { ...config, ...identityOptions }
+                      : config
+        }
+        onSubmit={handleSubmit}
+        onCancel={handleCancel}
+      />
+    </div>
+  );
+}

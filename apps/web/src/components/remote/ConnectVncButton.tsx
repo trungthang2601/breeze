@@ -1,0 +1,301 @@
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { Monitor, MonitorOff, ExternalLink, X, Globe } from 'lucide-react';
+import type { RemoteAccessPolicy } from '@breeze/shared';
+import { fetchWithAuth } from '@/stores/auth';
+import { buildRemoteVncPageUrl } from '@/lib/remoteTunnelUrls';
+import { extractApiError } from '@/lib/apiError';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+
+interface Props {
+  deviceId: string;
+  className?: string;
+  compact?: boolean;
+  iconOnly?: boolean;
+  disabled?: boolean;
+  /** When true, shown as primary option (e.g., macOS < 14 login-window fallback) */
+  primary?: boolean;
+  remoteAccessPolicy?: RemoteAccessPolicy | null;
+}
+
+/**
+ * VNC remote desktop via tunnel relay. Creates a TCP tunnel to the device's
+ * VNC server (localhost:5900) and launches the Breeze viewer in VNC mode
+ * or falls back to an in-browser noVNC viewer.
+ */
+export default function ConnectVncButton({
+  deviceId,
+  className = '',
+  compact = false,
+  iconOnly = false,
+  disabled = false,
+  primary = false,
+  remoteAccessPolicy = null,
+}: Props) {
+  const { t } = useTranslation('remote');
+  const [status, setStatus] = useState<'idle' | 'creating' | 'launching' | 'fallback'>('idle');
+  const [error, setError] = useState<string | null>(null);
+  const [tunnelId, setTunnelId] = useState<string | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const autoDismissRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+      if (autoDismissRef.current) clearTimeout(autoDismissRef.current);
+    };
+  }, []);
+
+  const closeTunnel = useCallback((tid: string) => {
+    fetchWithAuth(`/tunnels/${tid}`, { method: 'DELETE' }).catch(() => {});
+  }, []);
+
+  const handleConnect = useCallback(async () => {
+    setStatus('creating');
+    setError(null);
+
+    try {
+      // Create VNC tunnel
+      const tunnelRes = await fetchWithAuth('/tunnels', {
+        method: 'POST',
+        body: JSON.stringify({ deviceId, type: 'vnc' }),
+      });
+
+      if (!tunnelRes.ok) {
+        const err = await tunnelRes.json().catch(() => ({ error: t('connectVncButton.errors.createTunnel') }));
+        throw new Error(err.error || t('connectVncButton.errors.createVncTunnel'));
+      }
+
+      const tunnel = await tunnelRes.json();
+      setTunnelId(tunnel.id);
+
+      const apiUrl = import.meta.env.PUBLIC_API_URL || window.location.origin;
+
+      // Issue a short-lived connect code for the Tauri viewer deep link (keeps JWT out of URL)
+      const codeRes = await fetchWithAuth(`/tunnels/${tunnel.id}/connect-code`, { method: 'POST' });
+      if (!codeRes.ok) {
+        closeTunnel(tunnel.id);
+        throw new Error(t('connectVncButton.errors.issueConnectCode'));
+      }
+      const { code } = await codeRes.json();
+
+      const deepLink = `breeze://vnc?tunnel=${encodeURIComponent(tunnel.id)}` +
+        `&device=${encodeURIComponent(deviceId)}` +
+        `&api=${encodeURIComponent(apiUrl)}` +
+        `&code=${encodeURIComponent(code)}`;
+
+      setStatus('launching');
+
+      // Try to open in Tauri viewer app
+      const a = document.createElement('a');
+      a.href = deepLink;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 100);
+
+      // Poll tunnel status
+      let pollCount = 0;
+      const maxPolls = 5;
+
+      const poll = async () => {
+        pollCount++;
+        try {
+          const res = await fetchWithAuth(`/tunnels/${tunnel.id}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.status === 'active') {
+              setStatus(cur => cur === 'launching' || cur === 'fallback' ? 'idle' : cur);
+              return;
+            }
+            if (data.status === 'failed') {
+              throw new Error(extractApiError(data, t('connectVncButton.errors.tunnelFailed')));
+            }
+          }
+        } catch (e) {
+          if (e instanceof Error && e.message.includes('failed')) {
+            setError(e.message);
+            setStatus('idle');
+            return;
+          }
+        }
+
+        if (pollCount >= maxPolls) {
+          setStatus(cur => cur === 'launching' ? 'fallback' : cur);
+          autoDismissRef.current = setTimeout(() => {
+            setStatus(cur => cur === 'fallback' ? 'idle' : cur);
+          }, 30000);
+          return;
+        }
+
+        pollTimerRef.current = setTimeout(poll, 1500);
+      };
+
+      pollTimerRef.current = setTimeout(poll, 1500);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('connectVncButton.errors.connectionFailed'));
+      setStatus('idle');
+    }
+  }, [deviceId, closeTunnel, t]);
+
+  const handleOpenInBrowser = useCallback(() => {
+    if (tunnelId) {
+      // Open noVNC viewer in a new tab
+      window.open(buildRemoteVncPageUrl(tunnelId), '_blank');
+    }
+    setStatus('idle');
+  }, [tunnelId]);
+
+  const handleDismiss = useCallback(() => {
+    setStatus('idle');
+  }, []);
+
+  const handleDismissAndCleanup = useCallback(() => {
+    if (tunnelId) {
+      closeTunnel(tunnelId);
+      setTunnelId(null);
+    }
+    setStatus('idle');
+  }, [tunnelId, closeTunnel]);
+
+  // Fallback: offer in-browser noVNC viewer
+  const fallbackContent = status === 'fallback' ? (
+    <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm shadow-lg dark:border-blue-800 dark:bg-blue-950">
+      <div className="flex items-start gap-2.5">
+        <Monitor className="mt-0.5 h-4 w-4 shrink-0 text-blue-600 dark:text-blue-400" />
+        <div className="flex-1">
+          <p className="font-medium text-blue-800 dark:text-blue-300">
+            {t('connectVncButton.fallback.title')}
+          </p>
+          <p className="mt-1 text-xs text-blue-700 dark:text-blue-400">
+            {t('connectVncButton.fallback.description')}
+          </p>
+          <div className="mt-2.5 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleOpenInBrowser}
+              className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-700"
+            >
+              <Globe className="h-3.5 w-3.5" />
+              {t('connectVncButton.openInBrowser')}
+            </button>
+            <button
+              type="button"
+              onClick={handleDismissAndCleanup}
+              className="text-xs text-muted-foreground transition hover:text-foreground"
+            >
+              {t('common:actions.cancel')}
+            </button>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleDismiss}
+          className="flex h-5 w-5 items-center justify-center rounded hover:bg-blue-200 dark:hover:bg-blue-800"
+        >
+          <X className="h-3 w-3 text-blue-600 dark:text-blue-400" />
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  const policyDisabled = remoteAccessPolicy?.vncRelay === false;
+  const policyTitle = policyDisabled
+    ? remoteAccessPolicy?.policyName
+      ? t('connectVncButton.policyDisabledNamed', { name: remoteAccessPolicy.policyName })
+      : t('connectVncButton.policyDisabled')
+    : undefined;
+
+  const label = primary ? t('connectVncButton.vncDesktop') : t('connectVncButton.vncRemote');
+  const buttonLabel =
+    error ? t('connectVncButton.errors.connectionFailed') :
+    status === 'creating' ? t('connectVncButton.creatingTunnel') :
+    status === 'launching' ? t('connectVncButton.launching') :
+    label;
+
+  if (policyDisabled) {
+    if (iconOnly) {
+      return (
+        <div className={`relative ${className}`}>
+          <button type="button" disabled title={policyTitle} className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground cursor-not-allowed opacity-50">
+            <MonitorOff className="h-4 w-4" />
+          </button>
+        </div>
+      );
+    }
+    if (compact) {
+      return (
+        <div className="relative">
+          <button type="button" disabled title={policyTitle} className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-muted-foreground cursor-not-allowed opacity-50">
+            <MonitorOff className="h-4 w-4" />
+            {t('connectVncButton.unavailable')}
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div className={`relative ${className}`}>
+        <button type="button" disabled title={policyTitle} className="flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium text-muted-foreground cursor-not-allowed opacity-50">
+          <MonitorOff className="h-4 w-4" />
+          {t('connectVncButton.unavailable')}
+        </button>
+      </div>
+    );
+  }
+
+  if (iconOnly) {
+    return (
+      <div className={`relative ${className}`}>
+        <button
+          type="button"
+          onClick={handleConnect}
+          disabled={disabled || status === 'creating' || status === 'launching'}
+          title={error || label}
+          className={`flex h-8 w-8 items-center justify-center rounded-md transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 ${error ? 'text-red-500' : ''}`}
+        >
+          {status === 'creating' || status === 'launching' ? (
+            <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          ) : (
+            <Monitor className="h-4 w-4" />
+          )}
+        </button>
+        {fallbackContent}
+      </div>
+    );
+  }
+
+  if (compact) {
+    return (
+      <div className="relative">
+        <button
+          type="button"
+          onClick={handleConnect}
+          disabled={disabled || status === 'creating' || status === 'launching'}
+          title={error || undefined}
+          className={`flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 ${error ? 'text-red-500' : ''}`}
+        >
+          <Monitor className="h-4 w-4" />
+          {buttonLabel}
+        </button>
+        {fallbackContent}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`relative ${className}`}>
+      <button
+        type="button"
+        onClick={handleConnect}
+        disabled={disabled || status === 'creating' || status === 'launching'}
+        title={error || undefined}
+        className={`flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${error ? 'border-red-300 bg-red-50 text-red-600 hover:bg-red-100 dark:border-red-800 dark:bg-red-950 dark:text-red-400 dark:hover:bg-red-900' : 'bg-background hover:bg-muted'}`}
+      >
+        <Monitor className="h-4 w-4" />
+        {buttonLabel}
+        {status === 'idle' && !error && <ExternalLink className="w-3.5 h-3.5 opacity-60" />}
+      </button>
+      {fallbackContent}
+    </div>
+  );
+}

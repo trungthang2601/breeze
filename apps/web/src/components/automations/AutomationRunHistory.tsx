@@ -1,0 +1,735 @@
+import { useState, useMemo, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
+import {
+  X,
+  CheckCircle,
+  XCircle,
+  AlertTriangle,
+  Clock,
+  Ban,
+  ChevronDown,
+  ChevronUp,
+  Monitor,
+  Terminal,
+  Calendar,
+  Timer,
+  Square,
+  Info
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { formatDateTime } from '@/lib/dateTimeFormat';
+import { formatNumber } from '@/lib/i18n/format';
+import { hasPermission } from '@/lib/permissions';
+import type { Permission } from '@/stores/auth';
+import { fetchWithAuth } from '@/stores/auth';
+import { runAction, handleActionError } from '@/lib/runAction';
+import { ConfirmDialog } from '@/components/shared/ConfirmDialog';
+import { navigateTo } from '@/lib/navigation';
+
+type ScriptsT = TFunction<'scripts'>;
+
+// #4767 — one action the fan-out could not stop and left running/reporting on
+// its own (execute_command creates no script_executions row; a deployment
+// lives in deployment_results). Rendered so the operator never reads
+// "cancelled" as "everything actually stopped".
+export type UncancellableAction = { actionIndex: number; actionType: string; reason: string };
+
+/**
+ * One `run_script` action's real script output on one device (#3162). Distinct
+ * from `DeviceRunResult.output`, which only carries the automation's own log
+ * lines — this is what the agent actually printed.
+ */
+export type DeviceScriptResult = {
+  executionId: string;
+  scriptId: string;
+  scriptName?: string;
+  status: string;
+  exitCode?: number;
+  stdout?: string;
+  stdoutTruncated?: boolean;
+  stderr?: string;
+  stderrTruncated?: boolean;
+  error?: string;
+};
+
+/**
+ * An execution the agent hasn't reported on yet. Its stdout is legitimately
+ * absent, which must NOT read as "the script printed nothing" — that ambiguity
+ * is the whole reason #3162 was filed.
+ */
+const PENDING_SCRIPT_STATUSES = new Set(['pending', 'queued', 'running']);
+
+export function isScriptResultPending(status: string): boolean {
+  return PENDING_SCRIPT_STATUSES.has(status);
+}
+
+/** How often an expanded run re-checks for script output still in flight. */
+const SCRIPT_RESULT_POLL_MS = 5000;
+
+export type DeviceRunResult = {
+  deviceId: string;
+  deviceName: string;
+  status: 'pending' | 'success' | 'failed' | 'skipped' | 'running' | 'cancelled';
+  startedAt?: string;
+  completedAt?: string;
+  duration?: number;
+  output?: string;
+  error?: string;
+  scriptResults?: DeviceScriptResult[];
+};
+
+/** Lazy loader for a run's per-device detail, fetched on expand (#2023). */
+export type RunDetailLoader = (runId: string) => Promise<{
+  deviceResults: DeviceRunResult[];
+  logs?: string[];
+} | null>;
+
+export type AutomationRun = {
+  id: string;
+  automationId: string;
+  automationName: string;
+  triggeredBy: 'schedule' | 'event' | 'webhook' | 'manual' | 'api';
+  startedAt: string;
+  completedAt?: string;
+  status: 'running' | 'success' | 'failed' | 'partial' | 'cancelled';
+  devicesTotal: number;
+  devicesSuccess: number;
+  devicesFailed: number;
+  devicesSkipped: number;
+  devicesCancelled?: number;
+  deviceResults: DeviceRunResult[];
+  logs?: string[];
+  // #4767 (W05 dependency) — whether this run belongs to an org-owned or a
+  // partner-wide automation. Absent/undefined is treated as 'organization'
+  // (the common case, and the safe default if a not-yet-updated GET response
+  // omits the field): Cancel run stays offered rather than mysteriously
+  // vanishing.
+  ownerScope?: 'organization' | 'partner';
+};
+
+type AutomationRunHistoryProps = {
+  runs: AutomationRun[];
+  isOpen: boolean;
+  onClose: () => void;
+  automationName?: string;
+  timezone?: string;
+  /** When provided, expanding a run lazily fetches its per-device breakdown. */
+  onLoadRunDetail?: RunDetailLoader;
+  // #4767 — UX-only gate mirroring the cancel route's own
+  // requireAutomationWrite (automations:write) — see the requirePermission
+  // call in apps/api/src/routes/automations.ts's POST /runs/:runId/cancel.
+  // NOT scripts:execute, which gates the separate, execution-level cancel
+  // route ExecutionHistory/ExecutionDetails call. Cancel run is HIDDEN,
+  // never merely disabled, without it.
+  permissions?: Permission[];
+  // #4767 — mirrors canManagePartnerWidePolicies(auth) server-side (OD7-A): an
+  // org-scoped operator may still cancel individual executions on their own
+  // devices, but must not stop a run that fans out across sibling tenants.
+  canManagePartnerWide?: boolean;
+  /** Called after a successful cancel so the host page can refresh the run list. */
+  onRunCancelled?: (runId: string) => void;
+};
+
+export type AutomationRunHistoryStatusKey =
+  'running' | 'success' | 'failed' | 'partial' | 'skipped' | 'pending' | 'cancelled';
+
+export const statusConfig: Record<AutomationRunHistoryStatusKey, { label: string; color: string; bgColor: string; icon: typeof CheckCircle }> = {
+  running: {
+    label: 'status.running',
+    color: 'text-blue-600',
+    bgColor: 'bg-blue-500/20 border-blue-500/40',
+    icon: Clock
+  },
+  pending: {
+    label: 'status.pending',
+    color: 'text-gray-500',
+    bgColor: 'bg-gray-500/20 border-gray-500/40',
+    icon: Clock
+  },
+  success: {
+    label: 'status.success',
+    color: 'text-green-600',
+    bgColor: 'bg-green-500/20 border-green-500/40',
+    icon: CheckCircle
+  },
+  failed: {
+    label: 'status.failed',
+    color: 'text-red-600',
+    bgColor: 'bg-red-500/20 border-red-500/40',
+    icon: XCircle
+  },
+  partial: {
+    label: 'status.partial',
+    color: 'text-yellow-600',
+    bgColor: 'bg-yellow-500/20 border-yellow-500/40',
+    icon: AlertTriangle
+  },
+  skipped: {
+    label: 'status.skipped',
+    color: 'text-gray-600',
+    bgColor: 'bg-gray-500/20 border-gray-500/40',
+    icon: Clock
+  },
+  cancelled: {
+    label: 'status.cancelled',
+    color: 'text-muted-foreground',
+    bgColor: 'bg-muted',
+    icon: Ban
+  }
+};
+
+const triggerLabels: Record<string, string> = {
+  schedule: 'triggeredBy.scheduled',
+  event: 'triggeredBy.event',
+  webhook: 'triggeredBy.webhook',
+  manual: 'triggeredBy.manual',
+  api: 'triggeredBy.api'
+};
+
+function formatDate(dateString: string, timezone: string): string {
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) return dateString;
+  return formatDateTime(date, { timeZone: timezone });
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${formatNumber(ms / 1000, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}s`;
+  const mins = Math.floor(ms / 60000);
+  const secs = Math.floor((ms % 60000) / 1000);
+  return `${mins}m ${secs}s`;
+}
+
+function formatRelativeTime(dateString: string, timezone: string, t: ScriptsT): string {
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) return dateString;
+
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / (1000 * 60));
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  if (diffMins < 1) return t('automationRunHistory.relativeTime.justNow');
+  if (diffMins < 60) return t('automationRunHistory.relativeTime.minutesAgo', { count: diffMins });
+  if (diffHours < 24) return t('automationRunHistory.relativeTime.hoursAgo', { count: diffHours });
+  if (diffDays < 7) return t('automationRunHistory.relativeTime.daysAgo', { count: diffDays });
+  return date.toLocaleDateString([], { timeZone: timezone });
+}
+
+/**
+ * One device's row inside an expanded run, with a collapsible block for the
+ * real stdout/stderr of any `run_script` actions the run fired (#3162).
+ */
+function DeviceResultRow({ result, t }: { result: DeviceRunResult; t: ScriptsT }) {
+  const [showScriptOutput, setShowScriptOutput] = useState(false);
+  const DeviceStatusIcon = statusConfig[result.status].icon;
+  const scriptResults = result.scriptResults ?? [];
+
+  return (
+    <div className="rounded-md border bg-background" data-testid="device-result-row">
+      <div className="flex items-center justify-between p-3">
+        <div className="flex items-center gap-3">
+          <Monitor className="h-4 w-4 text-muted-foreground" />
+          <div>
+            <p className="text-sm font-medium">{result.deviceName}</p>
+            {result.error && (
+              <p className="text-xs text-red-600">{result.error}</p>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          {result.duration && (
+            <span className="flex items-center gap-1 text-xs text-muted-foreground">
+              <Timer className="h-3 w-3" />
+              {formatDuration(result.duration)}
+            </span>
+          )}
+          <DeviceStatusIcon
+            className={cn('h-4 w-4', statusConfig[result.status].color)}
+          />
+        </div>
+      </div>
+
+      {scriptResults.length > 0 && (
+        <div className="border-t px-3 py-2">
+          <button
+            type="button"
+            onClick={() => setShowScriptOutput(!showScriptOutput)}
+            className="flex items-center gap-1 text-xs text-primary hover:underline"
+            data-testid="script-output-toggle"
+          >
+            <Terminal className="h-3 w-3" />
+            {showScriptOutput
+              ? t('automationRunHistory.scriptOutput.hide', { count: scriptResults.length })
+              : t('automationRunHistory.scriptOutput.show', { count: scriptResults.length })}
+          </button>
+
+          {showScriptOutput && (
+            <div className="mt-2 space-y-2">
+              {scriptResults.map(script => (
+                <div key={script.executionId} data-testid="script-output-block">
+                  <div className="mb-1 flex items-center gap-2 text-xs text-muted-foreground">
+                    <span className="font-medium text-foreground">
+                      {script.scriptName ?? t('automationRunHistory.scriptOutput.untitled')}
+                    </span>
+                    {script.exitCode != null && (
+                      <span>{t('automationRunHistory.scriptOutput.exitCode', { code: script.exitCode })}</span>
+                    )}
+                  </div>
+                  {isScriptResultPending(script.status) ? (
+                    // Distinct from "no output": the agent simply hasn't
+                    // reported yet. Rendering the empty placeholder here would
+                    // recreate the exact ambiguity #3162 set out to remove.
+                    <p className="text-xs text-muted-foreground" data-testid="script-awaiting">
+                      {t('automationRunHistory.scriptOutput.awaiting')}
+                    </p>
+                  ) : (
+                    <pre
+                      className="max-h-64 overflow-auto rounded-md bg-gray-900 p-3 text-xs font-mono whitespace-pre-wrap text-gray-100"
+                      data-testid="script-stdout"
+                    >
+                      {script.stdout ?? t('automationRunHistory.scriptOutput.empty')}
+                    </pre>
+                  )}
+                  {script.stdoutTruncated && (
+                    <p className="mt-1 text-xs text-muted-foreground" data-testid="script-stdout-truncated">
+                      {t('automationRunHistory.scriptOutput.truncated')}
+                    </p>
+                  )}
+                  {script.stderr && (
+                    <pre
+                      className="mt-1 max-h-40 overflow-auto rounded-md bg-gray-900 p-3 text-xs font-mono whitespace-pre-wrap text-red-300"
+                      data-testid="script-stderr"
+                    >
+                      {`${t('automationRunHistory.scriptOutput.stderr')}\n${script.stderr}`}
+                    </pre>
+                  )}
+                  {script.stderrTruncated && (
+                    <p className="mt-1 text-xs text-muted-foreground" data-testid="script-stderr-truncated">
+                      {t('automationRunHistory.scriptOutput.truncated')}
+                    </p>
+                  )}
+                  {script.error && (
+                    <p className="mt-1 text-xs text-red-600">{script.error}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RunItem({
+  run,
+  timezone,
+  onLoadRunDetail,
+  t,
+  permissions,
+  canManagePartnerWide,
+  onRunCancelled,
+}: {
+  run: AutomationRun;
+  timezone: string;
+  onLoadRunDetail?: RunDetailLoader;
+  t: ScriptsT;
+  permissions?: Permission[];
+  canManagePartnerWide?: boolean;
+  onRunCancelled?: (runId: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
+  const [detail, setDetail] = useState<{ deviceResults: DeviceRunResult[]; logs?: string[] } | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState(false);
+  // Bumped by the script-result poll below to re-run the fetch effect.
+  const [scriptPollTick, setScriptPollTick] = useState(0);
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [uncancellableActions, setUncancellableActions] = useState<UncancellableAction[] | null>(null);
+
+  const isRunning = run.status === 'running';
+  // #4767/#4766 (W05, apps/api/src/routes/automations.ts) — the route this
+  // button calls is gated on requireAutomationWrite (automations:write), NOT
+  // scripts:execute. scripts:execute stays the gate on the SIBLING
+  // execution-level route (POST /scripts/executions/:id/cancel) that
+  // ExecutionHistory/ExecutionDetails call — the two are easy to conflate
+  // but they are different permissions on different routes.
+  const canManageAutomations = hasPermission(permissions, 'automations', 'write');
+  const isPartnerOwned = run.ownerScope === 'partner';
+  const canCancelRun = isRunning && canManageAutomations && (!isPartnerOwned || canManagePartnerWide);
+  const cancelHiddenByPartnerScope = isRunning && canManageAutomations && isPartnerOwned && !canManagePartnerWide;
+
+  const handleConfirmCancelRun = async () => {
+    setCancelling(true);
+    try {
+      // Real shape from apps/api/src/routes/automations.ts's
+      // POST /runs/:runId/cancel (#4766/W05): { success, run: {id, status},
+      // alreadyCancelling, actionsCancelled, executionsStopped,
+      // executionsRequested, executions, uncancellableActions }.
+      // NOTE: `executionsStopped`, NOT `executionsCancelled` — the field
+      // name the API never sends (sweep 2026-09-08 row 18: this previously
+      // read `executionsCancelled`, which is always undefined, so the
+      // pluralised i18n key rendered as its own raw key).
+      const result = await runAction<{
+        executionsStopped: number;
+        uncancellableActions?: UncancellableAction[];
+      }>({
+        request: () => fetchWithAuth(`/automations/runs/${run.id}/cancel`, { method: 'POST' }),
+        errorFallback: t('automationRunHistory.errors.cancelRun'),
+        // `?? 0`: a missing/undefined count must still resolve to the
+        // `_other` plural form via i18next, never leave `count` undefined
+        // (which is how the raw key rendered in the first place).
+        successMessage: (data) => t('automationRunHistory.actions.cancelRunSuccess', { count: data.executionsStopped ?? 0 }),
+        onUnauthorized: () => void navigateTo('/login', { replace: true }),
+      });
+      setUncancellableActions(result.uncancellableActions ?? []);
+      onRunCancelled?.(run.id);
+    } catch (err) {
+      handleActionError(err, t('automationRunHistory.errors.cancelRun'));
+    } finally {
+      setCancelling(false);
+      setConfirmingCancel(false);
+    }
+  };
+
+  // Lazily load the per-device breakdown on first expand, and refresh it while
+  // the run is still in progress (parent polling bumps the counts below, which
+  // re-triggers this effect) so live progress stays current (#2023).
+  useEffect(() => {
+    if (!expanded || !onLoadRunDetail) return;
+    let cancelled = false;
+    setDetailLoading(true);
+    onLoadRunDetail(run.id)
+      .then((result) => {
+        if (cancelled) return;
+        if (result) {
+          setDetail(result);
+          setDetailError(false);
+        } else {
+          // A null result means the fetch failed (not "zero devices"); surface
+          // it so an empty panel isn't mistaken for a successful empty load.
+          setDetailError(true);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Re-fetch when counts change (live progress), the run terminates, or the
+    // script-result poll below ticks.
+  }, [expanded, onLoadRunDetail, run.id, run.status, run.devicesSuccess, run.devicesFailed, scriptPollTick]);
+
+  const deviceResults = detail?.deviceResults ?? run.deviceResults;
+  const logs = detail?.logs ?? run.logs;
+
+  // An automation run goes terminal as soon as its commands are QUEUED — the
+  // agents report their script output seconds to minutes later (#3162). The
+  // parent's run-list poll stops at that point, so without this the first look
+  // at a finished run would freeze on "waiting on agent" until the user
+  // collapsed and re-expanded the row. Keep polling the detail while any
+  // execution is still non-terminal.
+  const hasPendingScripts = deviceResults.some(
+    (result) => result.scriptResults?.some((script) => isScriptResultPending(script.status)),
+  );
+  useEffect(() => {
+    if (!expanded || !onLoadRunDetail || !hasPendingScripts) return;
+    const timer = setInterval(() => setScriptPollTick((tick) => tick + 1), SCRIPT_RESULT_POLL_MS);
+    return () => clearInterval(timer);
+  }, [expanded, onLoadRunDetail, hasPendingScripts]);
+
+  const StatusIcon = statusConfig[run.status].icon;
+  const duration = run.completedAt
+    ? new Date(run.completedAt).getTime() - new Date(run.startedAt).getTime()
+    : null;
+
+  const finishedCount = run.devicesSuccess + run.devicesFailed + run.devicesSkipped;
+  const progressPct = run.devicesTotal > 0
+    ? Math.min(100, Math.round((finishedCount / run.devicesTotal) * 100))
+    : 0;
+
+  return (
+    <div className="rounded-md border">
+      {/* A plain row, not a <button> — Cancel run below nests a real
+          <button>, which native <button>-in-<button> forbids. The toggle
+          itself stays a <button> (just the left content), which is also what
+          existing tests query via `.closest('button')`. */}
+      <div className="flex w-full items-center justify-between p-4 hover:bg-muted/40">
+        <button
+          type="button"
+          onClick={() => setExpanded(!expanded)}
+          className="flex flex-1 items-center gap-3 text-left"
+        >
+          <StatusIcon className={cn('h-5 w-5', statusConfig[run.status].color)} />
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium">{formatRelativeTime(run.startedAt, timezone, t)}</span>
+              <span
+                className={cn(
+                  'inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium',
+                  statusConfig[run.status].bgColor,
+                  statusConfig[run.status].color
+                )}
+              >
+                {t(/* i18n-dynamic */ `automationRunHistory.${statusConfig[run.status].label}`)}
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t(/* i18n-dynamic */ `automationRunHistory.${triggerLabels[run.triggeredBy]}`)} -{' '}
+              {t('automationRunHistory.deviceCount', { count: run.devicesTotal })}
+            </p>
+          </div>
+        </button>
+        <div className="flex items-center gap-4">
+          <div className="text-right text-xs">
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <span className="text-green-600">{t('automationRunHistory.resultCount.passed', { count: run.devicesSuccess })}</span>
+              {run.devicesFailed > 0 && (
+                <span className="text-red-600">{t('automationRunHistory.resultCount.failed', { count: run.devicesFailed })}</span>
+              )}
+              {run.devicesSkipped > 0 && (
+                <span className="text-gray-500">{t('automationRunHistory.resultCount.skipped', { count: run.devicesSkipped })}</span>
+              )}
+              {/* #4767 — rendered separately from failed/succeeded: a
+                  cancelled device is neither, and folding it into either
+                  count would misreport why the run didn't finish. */}
+              {(run.devicesCancelled ?? 0) > 0 && (
+                <span className="text-muted-foreground">
+                  {t('automationRunHistory.resultCount.cancelled', { count: run.devicesCancelled })}
+                </span>
+              )}
+            </div>
+            {duration && (
+              <p className="text-muted-foreground">{t('automationRunHistory.duration', { duration: formatDuration(duration) })}</p>
+            )}
+          </div>
+          {canCancelRun && (
+            <button
+              type="button"
+              data-testid="cancel-run"
+              onClick={(e) => { e.stopPropagation(); setConfirmingCancel(true); }}
+              className="flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium text-destructive transition hover:bg-destructive/10"
+            >
+              <Square className="h-3.5 w-3.5" />
+              {t('automationRunHistory.actions.cancelRun')}
+            </button>
+          )}
+          {cancelHiddenByPartnerScope && (
+            // #4767 review: the full explanation is long (and longer still in
+            // some locales) — it belongs in `title`, not as inline row text,
+            // or it blows out every partner-owned run row.
+            <span
+              data-testid="cancel-run-partner-tooltip"
+              title={t('automationRunHistory.actions.partnerScopeTooltip')}
+              className="flex h-8 w-8 items-center justify-center text-muted-foreground"
+            >
+              <Info className="h-4 w-4" />
+              <span className="sr-only">{t('automationRunHistory.actions.partnerScopeTooltip')}</span>
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => setExpanded(!expanded)}
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+          >
+            {expanded ? (
+              <ChevronUp className="h-4 w-4 text-muted-foreground" />
+            ) : (
+              <ChevronDown className="h-4 w-4 text-muted-foreground" />
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Live progress bar — shown while a run is in progress (#2023). */}
+      {isRunning && run.devicesTotal > 0 && (
+        <div className="px-4 pb-3" data-testid="run-progress">
+          <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              {t('automationRunHistory.progress.finished', { finished: finishedCount, total: run.devicesTotal })}
+            </span>
+            <span>{progressPct}%</span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-blue-500 transition-all"
+              style={{ width: `${progressPct}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {expanded && (
+        <div className="border-t bg-muted/20 p-4">
+          <div className="mb-4 flex items-center justify-between">
+            <h4 className="text-sm font-medium">{t('automationRunHistory.deviceResults.title')}</h4>
+            {logs && logs.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowLogs(!showLogs)}
+                className="flex items-center gap-1 text-xs text-primary hover:underline"
+              >
+                <Terminal className="h-3 w-3" />
+                {showLogs ? t('automationRunHistory.actions.hideLogs') : t('automationRunHistory.actions.viewLogs')}
+              </button>
+            )}
+          </div>
+
+          {showLogs && logs && logs.length > 0 && (
+            <div className="mb-4 rounded-md bg-gray-900 p-3 text-xs font-mono text-gray-100 overflow-x-auto max-h-48 overflow-y-auto">
+              {logs.map((log, i) => (
+                <div key={i} className="whitespace-pre-wrap">
+                  {log}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {detailLoading && deviceResults.length === 0 && (
+            <p className="text-xs text-muted-foreground">{t('automationRunHistory.deviceResults.loading')}</p>
+          )}
+
+          {!detailLoading && deviceResults.length === 0 && detailError && (
+            <p className="text-xs text-red-600">{t('automationRunHistory.deviceResults.error')}</p>
+          )}
+
+          {!detailLoading && deviceResults.length === 0 && !detailError && (
+            <p className="text-xs text-muted-foreground">{t('automationRunHistory.deviceResults.empty')}</p>
+          )}
+
+          <div className="space-y-2">
+            {deviceResults.map(result => (
+              <DeviceResultRow key={result.deviceId} result={result} t={t} />
+            ))}
+          </div>
+
+          <div className="mt-4 flex items-center gap-4 text-xs text-muted-foreground">
+            <div className="flex items-center gap-1">
+              <Calendar className="h-3 w-3" />
+              {t('automationRunHistory.timestamps.started', { date: formatDate(run.startedAt, timezone) })}
+            </div>
+            {run.completedAt && (
+              <div className="flex items-center gap-1">
+                <Calendar className="h-3 w-3" />
+                {t('automationRunHistory.timestamps.completed', { date: formatDate(run.completedAt, timezone) })}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {uncancellableActions && uncancellableActions.length > 0 && (
+        <div className="border-t bg-warning/10 px-4 py-2 text-xs text-warning" data-testid="uncancellable-actions">
+          {t('automationRunHistory.actions.uncancellableActions', { count: uncancellableActions.length })}
+        </div>
+      )}
+
+      {confirmingCancel && (
+        <ConfirmDialog
+          open={true}
+          onClose={() => setConfirmingCancel(false)}
+          onConfirm={() => void handleConfirmCancelRun()}
+          title={t('automationRunHistory.actions.confirmCancelRunTitle')}
+          message={t('automationRunHistory.actions.confirmCancelRunMessage')}
+          variant="warning"
+          confirmLabel={t('automationRunHistory.actions.cancelRun')}
+          confirmTestId="confirm-cancel-run"
+          isLoading={cancelling}
+        />
+      )}
+    </div>
+  );
+}
+
+export default function AutomationRunHistory({
+  runs,
+  isOpen,
+  onClose,
+  automationName,
+  timezone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+  onLoadRunDetail,
+  permissions,
+  canManagePartnerWide,
+  onRunCancelled
+}: AutomationRunHistoryProps) {
+  const { t } = useTranslation('scripts');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+
+  const filteredRuns = useMemo(() => {
+    if (statusFilter === 'all') return runs;
+    return runs.filter(run => run.status === statusFilter);
+  }, [runs, statusFilter]);
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-background/80 px-4 py-8 overflow-y-auto">
+      <div className="w-full max-w-3xl rounded-lg border bg-card shadow-lg">
+        <div className="flex items-center justify-between border-b px-6 py-4">
+          <div>
+            <h2 className="text-lg font-semibold">{t('automationRunHistory.title')}</h2>
+            {automationName && (
+              <p className="text-sm text-muted-foreground">{automationName}</p>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="p-6">
+          <div className="mb-4 flex items-center justify-between">
+            <p className="text-sm text-muted-foreground">
+              {t('automationRunHistory.summary', { shown: filteredRuns.length, total: runs.length })}
+            </p>
+            <select
+              value={statusFilter}
+              onChange={e => setStatusFilter(e.target.value)}
+              className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+            >
+              <option value="all">{t('automationRunHistory.filters.allStatus')}</option>
+              <option value="success">{t('automationRunHistory.status.success')}</option>
+              <option value="failed">{t('automationRunHistory.status.failed')}</option>
+              <option value="partial">{t('automationRunHistory.status.partial')}</option>
+              <option value="running">{t('automationRunHistory.status.running')}</option>
+            </select>
+          </div>
+
+          {filteredRuns.length === 0 ? (
+            <div className="rounded-md border border-dashed p-8 text-center">
+              <Clock className="mx-auto h-8 w-8 text-muted-foreground" />
+              <p className="mt-2 text-sm text-muted-foreground">
+                {t('automationRunHistory.empty')}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {filteredRuns.map(run => (
+                <RunItem
+                  key={run.id}
+                  run={run}
+                  timezone={timezone}
+                  onLoadRunDetail={onLoadRunDetail}
+                  t={t}
+                  permissions={permissions}
+                  canManagePartnerWide={canManagePartnerWide}
+                  onRunCancelled={onRunCancelled}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

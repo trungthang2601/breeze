@@ -1,0 +1,298 @@
+---
+title: Health Endpoints
+description: Built-in health, readiness, and metrics endpoints for Breeze RMM, with load balancer, Docker, and Kubernetes probe setup and troubleshooting.
+sidebar:
+  order: 3
+  label: Health Endpoints
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Breeze exposes health check endpoints that let you verify whether the API and its dependencies are running. Use these with load balancers, container orchestrators, and uptime monitors to detect and respond to outages automatically.
+
+## Available Endpoints
+
+| Endpoint | Purpose | Auth Required |
+|---|---|---|
+| `GET /health` | Basic liveness -- is the API process running? | No |
+| `GET /health/ready` | Full readiness -- database, Redis, and every required queue consumer runnable (alias: `GET /ready`) | No |
+| `GET /ready` | Alias of `/health/ready` (same evaluator, same body) | No |
+| `GET /health/live` | Kubernetes liveness probe (alias for `/health`) | No |
+| `GET /metrics/scrape` | Prometheus-formatted metrics | Bearer token |
+
+## Response Formats
+
+### GET /health
+
+Returns `200 OK` if the API process is alive. This endpoint does not check backend dependencies -- it only confirms the HTTP server is accepting connections.
+
+```json
+{
+  "status": "ok",
+  "version": "0.50.0",
+  "uptime": 86400
+}
+```
+
+| Field | Description |
+|---|---|
+| `status` | Always `"ok"` when the process is running |
+| `version` | Current Breeze API version |
+| `uptime` | Seconds since the process started |
+
+### GET /health/ready (alias: GET /ready)
+
+Returns `200 OK` only when the database and Redis are reachable **and every
+queue consumer this process is required to run is attached and connected**.
+Returns `503 Service Unavailable` otherwise. Both paths are served by the same
+cached evaluator (default 5 s cache, 3 s per-probe timeout; the two are clamped
+so a failure or recovery is visible within 10 s). Both are tunable — see
+[`READINESS_CACHE_TTL_MS` and `READINESS_PROBE_TIMEOUT_MS`](/deploy/environment/#readiness-probe-tuning) —
+though the defaults suit every deployment we know of.
+
+**Healthy response (200):**
+
+```json
+{
+  "ready": true,
+  "db": true,
+  "redis": true,
+  "workers": true,
+  "checkedAt": "2026-09-01T12:00:00.000Z",
+  "consumerSummary": {
+    "required": 113,
+    "runnable": 113,
+    "unavailable": 0,
+    "optionalRunning": 1,
+    "optionalDisabled": 3
+  }
+}
+```
+
+**Degraded response (503):**
+
+```json
+{
+  "ready": false,
+  "db": true,
+  "redis": true,
+  "workers": false,
+  "checkedAt": "2026-09-01T12:00:05.000Z",
+  "consumerSummary": {
+    "required": 113,
+    "runnable": 112,
+    "unavailable": 1,
+    "optionalRunning": 1,
+    "optionalDisabled": 3
+  }
+}
+```
+
+If the evaluator itself fails, the body is `{ "ready": false, "db": null, "redis": null, "workers": null, "checkedAt": "...", "consumerSummary": null, "error": "readiness evaluation failed" }` with status 503 — `null`, not `false`, because the backends may be healthy.
+
+| Field | Description |
+|---|---|
+| `ready` | Overall admission verdict; the status code follows it |
+| `db` / `redis` | Live dependency probes (bounded by the probe timeout) |
+| `workers` | `true` when worker initialization has completed and every required queue consumer is running with a connected Redis client |
+| `checkedAt` | When this verdict was computed (it may be cached for up to the cache TTL) |
+| `consumerSummary` | Aggregate counts only: `required`, `runnable`, `unavailable` (= required − runnable), `optionalRunning`, `optionalDisabled` |
+
+Only aggregate counts are ever exposed. Consumer names, queue names, Redis
+endpoints, transition timestamps, and error messages are internal and never
+appear in this body. The counts depend on the process role (`BREEZE_ROLE`)
+and on feature flags: an `api`-role process counts only the socket-owner
+consumers it starts, a `worker`-role process only the global ones, and
+consumers behind an off feature flag (`EVENT_DISPATCH_MODE`,
+`BREEZE_AI_AGENTS_ENABLED`, `AUDIT_CHAIN_VERIFY_ENABLED`) are counted as
+`optionalDisabled` rather than blocking readiness. The shared abuse-signals
+consumer is required when either abuse signals or partner trust is enabled;
+it is optional only when both are off. The numbers above are illustrative.
+
+The optional `worker` container (Compose profile `worker-split`) serves its
+own `/health/ready` on its `API_PORT`. When its readiness evaluator runs, the
+body has the same fields plus `"role": "worker"`, and a 503 adds a single
+`reason` of `db`, `redis`, or `workers-pending`. Three 503s bypass the
+evaluator and carry only `{ "ready": false, "reason": ... }` with none of the
+other fields: `shutting-down` (the process received SIGTERM),
+`migrations-pending` (schema parity not yet confirmed), and `db` when the
+evaluator itself throws.
+
+<Aside>
+  Use `/health` for liveness probes (restart the container if the process is dead) and `/health/ready` for readiness probes (stop sending traffic until dependencies recover). Do not put `/health/ready` in a Docker Compose `healthcheck:` for a service other containers `depends_on` — Compose turns it into a startup gate. The `worker` container is the one exception, because nothing depends on it. See `docs/operations/health-probes.md` in the repository.
+</Aside>
+
+### GET /metrics/scrape
+
+Prometheus-formatted metrics. Requires the `METRICS_SCRAPE_TOKEN` bearer token set in your environment.
+
+```bash
+curl -H "Authorization: Bearer $METRICS_SCRAPE_TOKEN" \
+  https://breeze.yourdomain.com/metrics/scrape
+```
+
+See [Observability Stack](/monitoring/stack/) for the full list of available metrics.
+
+## Using Health Checks with Load Balancers
+
+Configure your load balancer to probe the health endpoints so unhealthy instances are automatically removed from rotation.
+
+<Tabs>
+  <TabItem label="AWS ALB">
+```
+Target group health check:
+  Protocol: HTTP
+  Path: /health/ready
+  Healthy threshold: 2
+  Unhealthy threshold: 3
+  Timeout: 5 seconds
+  Interval: 30 seconds
+  Success codes: 200
+```
+  </TabItem>
+  <TabItem label="Nginx">
+```nginx
+upstream breeze_api {
+    server api1:3001;
+    server api2:3001;
+}
+
+server {
+    location /api/ {
+        proxy_pass http://breeze_api;
+    }
+}
+
+# Passive health checks happen automatically.
+# For active checks (Nginx Plus), add:
+# health_check uri=/health/ready interval=30s fails=3 passes=2;
+```
+  </TabItem>
+  <TabItem label="HAProxy">
+```
+backend breeze_api
+    option httpchk GET /health/ready
+    http-check expect status 200
+    server api1 api1:3001 check inter 30s fall 3 rise 2
+    server api2 api2:3001 check inter 30s fall 3 rise 2
+```
+  </TabItem>
+</Tabs>
+
+## Docker Health Checks
+
+Every container in the Breeze production stack has a built-in health check. Docker (and Docker Compose) use these to determine container status and trigger restarts.
+
+| Container | Check Command | Interval | Start Period |
+|---|---|---|---|
+| API | `wget http://localhost:3001/health` | 30s | 40s |
+| Worker (profile `worker-split`) | `wget http://localhost:3001/health/ready` | 30s | 60s |
+| Web | `wget http://localhost:4321/` | 30s | 30s |
+| PostgreSQL | `pg_isready` | 10s | 15s |
+| Redis | `redis-cli ping` | 10s | 5s |
+| Prometheus | `wget http://localhost:9090/-/healthy` | 30s | 10s |
+| Grafana | `wget http://localhost:3000/api/health` | 30s | 30s |
+| Alertmanager | `wget http://localhost:9093/-/healthy` | 30s | 10s |
+| Loki | `wget http://localhost:3100/ready` | 30s | 10s |
+
+Check container health status at any time:
+
+```bash
+docker compose ps
+```
+
+Look for `(healthy)`, `(unhealthy)`, or `(health: starting)` in the STATUS column.
+
+## Kubernetes Probes
+
+If you deploy Breeze on Kubernetes, map the health endpoints to pod probes:
+
+```yaml
+containers:
+  - name: breeze-api
+    ports:
+      - containerPort: 3001
+    livenessProbe:
+      httpGet:
+        path: /health/live
+        port: 3001
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      failureThreshold: 3
+    readinessProbe:
+      httpGet:
+        path: /health/ready
+        port: 3001
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    startupProbe:
+      httpGet:
+        path: /health
+        port: 3001
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      failureThreshold: 30
+```
+
+## Key Metrics to Watch
+
+These are the most important indicators of operational health. Monitor them in Grafana or your preferred tool.
+
+| Metric | Healthy Range | What It Means |
+|---|---|---|
+| `/health/ready` status | 200 | All backend dependencies are reachable |
+| `http_request_duration_seconds` P95 | < 2s | API response times are acceptable |
+| `http_requests_total` 5xx rate | < 1% | Very few server errors |
+| `redis_memory_used_bytes` | < 80% of max | Redis has headroom |
+| `pg_stat_activity_count` | < 80% of `max_connections` | Database connection pool is not saturated |
+| `breeze_active_devices` | Matches expected count | Agents are checking in |
+| API `uptime` | Increasing | Process has not restarted unexpectedly |
+
+## Troubleshooting Health Check Failures
+
+### /health returns non-200
+
+The API process is not running or not reachable on port 3001.
+
+<Steps>
+
+1. Check if the container is running: `docker compose ps api`
+2. Check container logs: `docker compose logs api --tail 50`
+3. Verify the port binding: `docker compose port api 3001`
+4. If the process is crash-looping, check for missing environment variables or database connection strings in the logs.
+
+</Steps>
+
+### /health/ready returns 503
+
+One or more backend dependencies are down.
+
+<Steps>
+
+1. Read the `db`, `redis`, and `workers` booleans in the response body. If only `workers` is `false`, `consumerSummary.unavailable` tells you how many required queue consumers are not running; check the API container logs for `[CRITICAL] Failed to initialize <worker>` lines and for Redis disconnects.
+2. If `db` is failing:
+   - Verify PostgreSQL is running: `docker compose ps postgres`
+   - Test the connection manually: `docker compose exec postgres pg_isready`
+   - Check for connection pool exhaustion: look at `pg_stat_activity_count` in Grafana
+3. If `redis` is failing:
+   - Verify Redis is running: `docker compose ps redis`
+   - Test the connection: `docker compose exec redis redis-cli ping`
+   - Check memory usage: `docker compose exec redis redis-cli info memory`
+4. If `workers` is failing: verify Redis is healthy (a consumer that lost its Redis client reports not-ready until it reconnects), then restart the container if a `[CRITICAL] Failed to initialize` line names a worker — initialization failures are permanent for the process lifetime.
+
+</Steps>
+
+### Containers showing (unhealthy)
+
+<Steps>
+
+1. Identify which container is unhealthy: `docker compose ps`
+2. Check container logs: `docker compose logs <container> --tail 100`
+3. If the container keeps restarting, look at the `start_period` -- it may be failing its health check before it finishes starting. Increase the start period in your compose override if needed.
+
+</Steps>
+
+<Aside type="caution">
+  If Redis becomes unreachable, `/health` stays 200 (the process is alive) but `/health/ready` and `/ready` return 503 for as long as Redis is down — no queue consumer can run without it, so the process is deliberately withheld from admission rather than admitted with degraded background work. Features that depend on Redis -- rate limiting, BullMQ job queues, and real-time pub/sub -- recover automatically when Redis returns.
+</Aside>

@@ -1,0 +1,296 @@
+import { describe, it, expect, afterEach } from 'vitest';
+import {
+  submitChangesSchema,
+  CHANGE_INGEST_MAX_ITEMS,
+  __resolveChangeIngestMaxItemsForTests,
+  agentWarrantyInfoSchema,
+  enrollSchema,
+  heartbeatSchema,
+  submitEventLogsSchema,
+} from './schemas';
+
+// Build a minimal valid event-log entry the schema accepts.
+function makeEvent(message: string) {
+  return {
+    timestamp: '2026-05-19T01:00:00.000Z',
+    level: 'info' as const,
+    category: 'system' as const,
+    source: 'test',
+    message,
+  };
+}
+
+// Build a minimal valid change item the schema accepts.
+function makeChange(suffix: number) {
+  return {
+    timestamp: new Date(Date.UTC(2026, 4, 19, 1, 0, suffix % 60)).toISOString(),
+    changeType: 'software',
+    changeAction: 'added',
+    subject: `pkg-${suffix}`,
+  };
+}
+
+describe('CHANGE_INGEST_MAX_ITEMS resolver — env validation', () => {
+  const originalEnv = process.env.CHANGE_INGEST_MAX_ITEMS;
+  afterEach(() => {
+    if (originalEnv === undefined) delete process.env.CHANGE_INGEST_MAX_ITEMS;
+    else process.env.CHANGE_INGEST_MAX_ITEMS = originalEnv;
+  });
+
+  it('defaults to 50000 when the env var is unset', () => {
+    delete process.env.CHANGE_INGEST_MAX_ITEMS;
+    expect(__resolveChangeIngestMaxItemsForTests()).toBe(50000);
+  });
+
+  it('parses a valid positive integer in range', () => {
+    process.env.CHANGE_INGEST_MAX_ITEMS = '75000';
+    expect(__resolveChangeIngestMaxItemsForTests()).toBe(75000);
+  });
+
+  it('falls back to default on a non-numeric value (would otherwise become NaN and reject every ingest)', () => {
+    process.env.CHANGE_INGEST_MAX_ITEMS = 'abc';
+    expect(__resolveChangeIngestMaxItemsForTests()).toBe(50000);
+  });
+
+  it('falls back to default on 0 (would otherwise reject every non-empty ingest)', () => {
+    process.env.CHANGE_INGEST_MAX_ITEMS = '0';
+    expect(__resolveChangeIngestMaxItemsForTests()).toBe(50000);
+  });
+
+  it('falls back to default on a negative integer', () => {
+    process.env.CHANGE_INGEST_MAX_ITEMS = '-5';
+    expect(__resolveChangeIngestMaxItemsForTests()).toBe(50000);
+  });
+
+  it('falls back to default on a value above the safety ceiling (200000)', () => {
+    process.env.CHANGE_INGEST_MAX_ITEMS = '99999999';
+    expect(__resolveChangeIngestMaxItemsForTests()).toBe(50000);
+  });
+
+  it('accepts the safety ceiling exactly', () => {
+    process.env.CHANGE_INGEST_MAX_ITEMS = '200000';
+    expect(__resolveChangeIngestMaxItemsForTests()).toBe(200000);
+  });
+
+  it('falls back to default on an empty string', () => {
+    process.env.CHANGE_INGEST_MAX_ITEMS = '';
+    expect(__resolveChangeIngestMaxItemsForTests()).toBe(50000);
+  });
+});
+
+describe('heartbeatSchema — PAM reconciliation telemetry', () => {
+  const minimal = { status: 'ok' as const, agentVersion: '0.65.15' };
+
+  it('accepts exact bounded reconciliation status', () => {
+    const parsed = heartbeatSchema.safeParse({
+      ...minimal,
+      securityCapabilities: {
+        pamLifetimeProtocolVersion: 2,
+        pamReconciliation: {
+          unresolvedCount: 2,
+          quarantinedCount: 1,
+          awaitingAcknowledgementCount: 3,
+          receivedObservationPendingCount: 1,
+          blockingReason: 'received_observation_transport',
+        },
+      },
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.securityCapabilities?.pamReconciliation).toEqual({
+        unresolvedCount: 2,
+        quarantinedCount: 1,
+        awaitingAcknowledgementCount: 3,
+        receivedObservationPendingCount: 1,
+        blockingReason: 'received_observation_transport',
+      });
+    }
+  });
+
+  it.each([
+    { unresolvedCount: -1, quarantinedCount: 0, awaitingAcknowledgementCount: 0 },
+    { unresolvedCount: 0.5, quarantinedCount: 0, awaitingAcknowledgementCount: 0 },
+    { unresolvedCount: 0, quarantinedCount: 0, awaitingAcknowledgementCount: 0, receivedObservationPendingCount: -1 },
+    { unresolvedCount: 0, quarantinedCount: 0, awaitingAcknowledgementCount: 0, receivedObservationPendingCount: 'one' },
+    { unresolvedCount: 0, quarantinedCount: 0, awaitingAcknowledgementCount: 0, blockingReason: 'unknown_reason' },
+    { unresolvedCount: 0, quarantinedCount: 0, awaitingAcknowledgementCount: 0, blockingReason: 'x'.repeat(65) },
+  ])('drops an invalid reconciliation object without rejecting the heartbeat: %#', (pamReconciliation) => {
+    const parsed = heartbeatSchema.safeParse({
+      ...minimal,
+      securityCapabilities: { pamLifetimeProtocolVersion: 2, pamReconciliation },
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.securityCapabilities?.pamLifetimeProtocolVersion).toBe(2);
+      expect(parsed.data.securityCapabilities?.pamReconciliation).toBeUndefined();
+    }
+  });
+});
+
+describe('submitChangesSchema — array length boundary', () => {
+  it('accepts N=CHANGE_INGEST_MAX_ITEMS items', () => {
+    const changes = Array.from({ length: CHANGE_INGEST_MAX_ITEMS }, (_, i) => makeChange(i));
+    const parsed = submitChangesSchema.safeParse({ changes });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('rejects N=CHANGE_INGEST_MAX_ITEMS + 1 items', () => {
+    const changes = Array.from({ length: CHANGE_INGEST_MAX_ITEMS + 1 }, (_, i) => makeChange(i));
+    const parsed = submitChangesSchema.safeParse({ changes });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('accepts an empty changes array (default)', () => {
+    expect(submitChangesSchema.safeParse({}).success).toBe(true);
+    expect(submitChangesSchema.safeParse({ changes: [] }).success).toBe(true);
+  });
+});
+
+describe('agentWarrantyInfoSchema — coverageKind acceptance', () => {
+  const base = { source: 'agent_plist', manufacturer: 'Apple' };
+
+  it("accepts coverageKind: '' (the value the agent sends for unclassified labels) — must NOT 400 and drop the whole update (#1320)", () => {
+    const parsed = agentWarrantyInfoSchema.safeParse({ ...base, coverageKind: '' });
+    expect(parsed.success).toBe(true);
+    // '' survives validation; upsertAgentWarranty treats it as fixed-term.
+    expect(parsed.success && parsed.data.coverageKind).toBe('');
+  });
+
+  it("accepts coverageKind: 'subscription'", () => {
+    const parsed = agentWarrantyInfoSchema.safeParse({ ...base, coverageKind: 'subscription' });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("accepts coverageKind: 'fixed'", () => {
+    const parsed = agentWarrantyInfoSchema.safeParse({ ...base, coverageKind: 'fixed' });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('accepts an omitted coverageKind', () => {
+    const parsed = agentWarrantyInfoSchema.safeParse({ ...base });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("still rejects an unknown non-empty coverageKind (e.g. 'lease')", () => {
+    const parsed = agentWarrantyInfoSchema.safeParse({ ...base, coverageKind: 'lease' });
+    expect(parsed.success).toBe(false);
+  });
+});
+
+// Issue #1387 — orthogonal virtualization attribute validation.
+describe('virtualization attribute — enrollSchema (strict)', () => {
+  const base = {
+    enrollmentKey: 'k',
+    hostname: 'host-1',
+    osType: 'windows' as const,
+    osVersion: 'Windows 11 Pro',
+    architecture: 'amd64',
+    agentVersion: '0.65.0',
+  };
+
+  it('accepts isVirtual + a known virtualizationPlatform', () => {
+    const parsed = enrollSchema.safeParse({ ...base, isVirtual: true, virtualizationPlatform: 'vmware' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.isVirtual).toBe(true);
+      expect(parsed.data.virtualizationPlatform).toBe('vmware');
+    }
+  });
+
+  it('treats the virtualization fields as optional (absent → undefined)', () => {
+    const parsed = enrollSchema.safeParse(base);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.isVirtual).toBeUndefined();
+      expect(parsed.data.virtualizationPlatform).toBeUndefined();
+    }
+  });
+
+  it('REJECTS an unrecognized platform (strict enroll path)', () => {
+    const parsed = enrollSchema.safeParse({ ...base, isVirtual: true, virtualizationPlatform: 'totally-made-up' });
+    expect(parsed.success).toBe(false);
+  });
+});
+
+describe('virtualization attribute — heartbeatSchema (tolerant)', () => {
+  const base = { status: 'ok' as const, agentVersion: '0.65.0' };
+
+  it('accepts isVirtual + a known virtualizationPlatform', () => {
+    const parsed = heartbeatSchema.safeParse({ ...base, isVirtual: true, virtualizationPlatform: 'hyperv' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.isVirtual).toBe(true);
+      expect(parsed.data.virtualizationPlatform).toBe('hyperv');
+    }
+  });
+
+  it('DROPS an unrecognized platform to undefined (does not reject the heartbeat)', () => {
+    const parsed = heartbeatSchema.safeParse({ ...base, isVirtual: true, virtualizationPlatform: 'totally-made-up' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.isVirtual).toBe(true);
+      expect(parsed.data.virtualizationPlatform).toBeUndefined();
+    }
+  });
+
+  it('drops a non-boolean isVirtual to undefined rather than rejecting', () => {
+    const parsed = heartbeatSchema.safeParse({ ...base, isVirtual: 'yes' as unknown as boolean });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.isVirtual).toBeUndefined();
+    }
+  });
+});
+
+describe('helperLifecycleMode — heartbeatSchema (tolerant)', () => {
+  const base = { status: 'ok' as const, agentVersion: '0.65.0' };
+
+  it('accepts and passes through helperLifecycleMode', () => {
+    const parsed = heartbeatSchema.safeParse({ ...base, helperLifecycleMode: 'on-demand' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.helperLifecycleMode).toBe('on-demand');
+    }
+  });
+
+  it('drops an invalid helperLifecycleMode instead of failing the heartbeat', () => {
+    const parsed = heartbeatSchema.safeParse({ ...base, helperLifecycleMode: 'bogus' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.helperLifecycleMode).toBeUndefined();
+    }
+  });
+});
+
+describe('submitEventLogsSchema — server-side message length cap (#2642)', () => {
+  const MAX = 2000;
+
+  it('accepts a message at the 2000-char cap', () => {
+    const parsed = submitEventLogsSchema.safeParse({
+      events: [makeEvent('a'.repeat(MAX))],
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('rejects a message one char over the cap — an unbounded agent message can no longer reach device_event_logs', () => {
+    const parsed = submitEventLogsSchema.safeParse({
+      events: [makeEvent('a'.repeat(MAX + 1))],
+    });
+    // Mutation guard: this reds if the `.max()` is dropped from `message`.
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects the whole batch when any single event message is oversized', () => {
+    const parsed = submitEventLogsSchema.safeParse({
+      events: [makeEvent('ok'), makeEvent('a'.repeat(MAX + 1)), makeEvent('ok')],
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('still enforces the pre-existing min(1) — an empty message is rejected', () => {
+    const parsed = submitEventLogsSchema.safeParse({
+      events: [makeEvent('')],
+    });
+    expect(parsed.success).toBe(false);
+  });
+});

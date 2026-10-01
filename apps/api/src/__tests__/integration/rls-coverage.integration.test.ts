@@ -1,0 +1,5157 @@
+import { afterAll, describe, it, expect } from 'vitest';
+import { and, eq, inArray, sql } from 'drizzle-orm';
+import { db, withDbAccessContext, withSystemDbAccessContext } from '../../db';
+import { partners, users, organizations, sites, invoices, invoiceLines, invoiceDocuments, contracts, contractLines, contractBillingPeriods, mlFeedbackEvents, unifiCollectors, unifiDeviceTelemetry, unifiClients } from '../../db/schema';
+import { approvalRequests } from '../../db/schema/approvals';
+import {
+  manifestSigningKeys,
+  manifestSigningKeyDelegations,
+} from '../../db/schema/manifestSigningKeys';
+import { partnerAbuseSignals, abuseScriptHosts } from '../../db/schema/abuseSignals';
+import { automations, automationRuns } from '../../db/schema/automations';
+import { configurationPolicies } from '../../db/schema/configurationPolicies';
+import { scripts, scriptExecutionBatches, scriptTags, scriptToTags, scriptVersions } from '../../db/schema/scripts';
+import { unifiIntegrations, unifiDevices } from '../../db/schema/unifi';
+import { oauthRevocationRetries } from '../../db/schema/oauth';
+import {
+  coveredCommands,
+  predicateCoversOrgAxis,
+  predicateCoversParents,
+  type Cmd,
+  type ParentRule,
+  type PolicyRow,
+  type PredicateSlot,
+} from '../../db/rlsPolicyShape';
+
+/**
+ * Contract test: every tenant-scoped public table must have RLS enabled and
+ * must have at least one permissive policy per DML command (SELECT, INSERT,
+ * UPDATE, DELETE) whose predicate references the appropriate access helper.
+ * An ALL-cmd policy counts for all four.
+ *
+ * Five shapes of tenant-scoping are recognised, each with its own assertion:
+ *   1. **org-tenant tables** — tables with an `org_id` column (auto-
+ *      discovered) or where the row's own id is the tenant identifier
+ *      (explicit list). Policies must reference `breeze_has_org_access`.
+ *   2. **partner-tenant tables** — tables where the tenant is a partner:
+ *      `partner_users.partner_id` or the partner row's own id. Policies
+ *      must reference `breeze_has_partner_access`.
+ *   3. **dual-axis tables** — `users` is keyed on BOTH partner_id AND
+ *      org_id (OR'd in the policy), plus a self-read branch. Its four
+ *      DML commands must be covered by policies that reference either
+ *      `breeze_has_org_access` or `breeze_has_partner_access` (or both).
+ *   4. **join-policy tables** — tables with a `device_id` FK but no
+ *      denormalized `org_id`. Their policies join through `devices` via a
+ *      subquery. Policies must contain both `FROM devices` and
+ *      `breeze_has_org_access` in the predicate.
+ *   5. **user-id-scoped tables** — tables scoped to the calling user via
+ *      `breeze_current_user_id()`. Policies must reference
+ *      `breeze_current_user_id` in the predicate.
+ *
+ * All shapes accept per-command policies (new) or a single ALL policy
+ * (legacy migration 0008 shape). The test is semantic, not name-bound.
+ */
+
+// Tables that intentionally do not carry RLS isolation policies.
+// Add deliberately, with a comment.
+const EXEMPT_TABLES: ReadonlySet<string> = new Set<string>([
+  // System-scoped: forced RLS with either no policies or a system-only
+  // policy — in both cases only the system DB context can access the table.
+  // See INTENTIONAL_UNSCOPED below for the documented set (some entries,
+  // like partner_abuse_signals, DO have a tenant column but are
+  // operator-only by design, not tenant-column-less).
+  'manifest_signing_keys',
+  'm365_consent_sessions',
+  'm365_user_consent_sessions',
+  'partner_abuse_signals',
+  'abuse_script_hosts',
+  'abuse_sweep_state',
+  'abuse_endpoint_fingerprints',
+  'ai_kill_state',
+]);
+
+// System-scoped tables: forced RLS with either no permissive policies at all,
+// or a single system-only policy (`USING current_setting('breeze.scope',
+// true) = 'system'`) — in both cases only the system DB context (which sets
+// that GUC) can read/write, never the unprivileged breeze_app role under a
+// tenant-scoped context. Some of these have no tenant column at all
+// (per-deployment infrastructure); others (partner_abuse_signals) DO carry a
+// tenant column (partner_id) but are deliberately operator-only, not
+// tenant-readable, so they're listed here rather than under a tenant shape.
+// The auto-discovery query won't surface these (no org_id column, not in any
+// tenant list), but they are enumerated here for explicit documentation and
+// so that a future "all-tables RLS enabled" audit can assert against this list.
+//
+// NOTE: device_commands is the canonical prior example (agent WS path, system-
+// scoped by design) — see apps/api/src/db/schema/devices.ts.
+const INTENTIONAL_UNSCOPED: ReadonlySet<string> = new Set<string>([
+  'device_commands', // Agent WS path: system-scoped command queue, no tenant isolation needed.
+  'intent_outbox', // Generalized transactional outbox: system-scoped workers-only queue. Its XOR parent FK cascades from either action_intents or pam_actuations (both direct-org, forced RLS). Mirrors device_commands.
+  'manifest_signing_keys', // System-scoped: per-deployment agent-update signing key. Forced RLS, no policies → only system context.
+  'manifest_signing_key_delegations', // System-scoped: signed authorisation to add ONE unseen agent-update signing key (Wave 6 Task 7). No tenant column — per-deployment agent-update infrastructure. Forced RLS, single system-only policy (USING + WITH CHECK) → only system context. No org_id/device_id, so no cascade-list registration applies.
+  'm365_consent_sessions', // OAuth consent state: forced RLS, system-only policies; tenant scopes must never read verifier/nonce material.
+  'm365_user_consent_sessions', // Delegated (user-axis) OAuth consent state. System-only for the same reason as its org-axis sibling: the rows hold a live PKCE code_verifier and nonce. Deliberately NOT user-axis readable — the owning user's own session is still not something their session token should select.
+  'vulnerability_sources', // Global vulnerability-source sync metadata. Forced RLS, no tenant policies → only system context.
+  'vulnerabilities', // Global vulnerability catalog. Forced RLS, no tenant policies → only system context.
+  'software_products', // Global normalized software dimension. Forced RLS, no tenant policies → only system context.
+  'software_vulnerabilities', // Global software-to-vulnerability match facts. Forced RLS, no tenant policies → only system context.
+  'os_vulnerabilities', // Global OS-to-vulnerability match facts. Forced RLS, no tenant policies → only system context.
+  'software_product_resolutions', // Global DisplayName→product resolution cache/log (#2290). Forced RLS, system-only policy → only system context.
+  'third_party_package_catalog', // System-wide curated catalog of third-party packages; writes gated by platform-admin role at the route layer.
+  'llm_provider_catalog', // System-wide curated catalog of vetted LLM endpoints; writes gated by platform-admin role + MFA at the route layer.
+  'llm_provider_catalog_revisions', // System-wide curated catalog of vetted LLM endpoints; writes gated by platform-admin role + MFA at the route layer.
+  'llm_provider_verifications', // System-wide curated catalog of vetted LLM endpoints; writes gated by platform-admin role + MFA at the route layer.
+  'third_party_release_tests', // System-wide release test results; references catalog (unscoped) and is platform-admin-only at the route layer.
+  'supported_currencies', // Global ISO-4217 allowlist (multi-currency spec §4). No tenant axis. Forced RLS: permissive USING (true) SELECT (org-scoped request contexts read it), system-only writes. Mirrors winget_package_index.
+  'exchange_rates', // Global reporting-only FX reference data (multi-currency spec §8). No tenant axis. Forced RLS: permissive USING (true) SELECT (org-scoped request contexts read rates to render an approximate total), system-only writes. Mirrors supported_currencies. Proven by exchangeRates.integration.test.ts.
+  'winget_package_index', // Platform-global mirror of the public microsoft/winget-pkgs manifest tree (no tenant axis, no tenant data). Forced RLS with a permissive `USING (true)` SELECT policy — the /software/package-search route reads it from an ordinary org-scoped request context — plus a system-only FOR ALL policy so only the winget-index-sync worker can write.
+  'partner_abuse_signals', // Operator abuse signals ABOUT partners. Forced RLS, system-only policy — partners must never see their own risk signals.
+  'abuse_script_hosts', // Cross-partner download-host corpus for the script-content abuse detector. Carries partner_id but is deliberately operator-only (mirrors partner_abuse_signals). Forced RLS, system-only policy.
+  'abuse_sweep_state', // Abuse-sweep scan state (incremental execution-scan high-water mark). No tenant column. Forced RLS, system-only policy.
+  'abuse_endpoint_fingerprints', // Cross-partner endpoint-fingerprint corpus for the recidivist-endpoint abuse detector. Carries partner_id but is deliberately operator-only (mirrors abuse_script_hosts). Forced RLS, system-only policy.
+  'ai_kill_state', // Wave 5 Part A (#3827): system-scoped, single-row (id='global'), epoch'd AI-agent kill switch. Mirrors abuse_sweep_state verbatim — no tenant column, forced RLS, single system-only policy. Flipped only via SQL by ops (or a future admin route); no org/partner/user axis applies.
+  'sso_sessions', // Pre-auth SSO CSRF/PKCE transaction store (state/nonce/code_verifier + link binding). No tenant column; written/consumed only by unauthenticated callback + system-context routes. Forced RLS, system-only policy → only system context.
+  'auth_browser_transitions', // Browser/native authentication transition state. Forced RLS, one system-only ALL policy; raw bindings are never stored and tenants cannot read browser-to-account correlation.
+  'sso_token_exchange_grants', // One-time SSO exchange authority. Forced RLS, one system-only ALL policy; only guarded auth lifecycle transactions may consume it.
+  'installed_extensions', // Global runtime-extension operational state (version/trust/lifecycle/enabled). No tenant axis. Forced RLS, system-only policy → only system context.
+  'extension_schema_history', // Global append-only record of the schema-compatibility floor each extension bundle version applied. No tenant axis. Forced RLS, system-only policy → only system context.
+  'email_provider_domain_releases', // Provider-side "delete this domain" outbox (spec 2026-09-17 partner sending domains §3.3). Deliberately carries NO partner_id: cascadeDeletePartner deletes from every table that has one, which would erase the provider handle this table exists to keep across the partner's deletion. No tenant axis. Forced RLS, single system-only policy → only system context. Not in EXEMPT_TABLES: with no org_id and no shape-list entry, no offender scan reaches it.
+]);
+
+// Tables with org_id metadata that are intentionally not generic org-tenant
+// tables. OAuth token rows are user/client secrets; org_id is retained for
+// lifecycle filtering only, and tenant-wide revocation uses system DB context
+// after app-layer authorization.
+const ORG_AXIS_POLICY_EXCLUDED_TABLES: ReadonlySet<string> = new Set<string>([
+  'oauth_authorization_codes',
+  'oauth_grants',
+  'oauth_refresh_tokens',
+  // account_deletion_requests: user-id scoped (Shape 6). The denormalised
+  // org_id is retained for ops/audit attribution only; the RLS policy uses
+  // breeze_current_user_id(), not breeze_has_org_access.
+  'account_deletion_requests',
+  // time_entries: partner-axis (Shape 3). org_id is denormalized from the
+  // parent ticket at write time for filtering only — the RLS axis is
+  // partner_id. Spec §8a / Phase 3 plan: deliberately no org/portal policies.
+  'time_entries',
+  // Partner-axis: org metadata must not hide suspended customers' assignments.
+  'org_billing_profile_assignments',
+  // Huntress credentials and discovered-org mappings are partner-scoped.
+  // org_id is retained only as legacy/mapping metadata and may be NULL for
+  // quarantined Huntress orgs.
+  'huntress_integrations',
+  'huntress_org_mappings',
+  // SentinelOne credentials and discovered-site mappings are partner-scoped.
+  // org_id is retained only as legacy/mapping metadata and may be NULL.
+  's1_integrations',
+  's1_org_mappings',
+  // Pax8 sync tables: partner-axis (Shape 3). The MSP partner owns the Pax8
+  // integration; org_id is denormalized (nullable on mappings/snapshots, for the
+  // resolved customer) for FK joins + filtering only — the RLS axis is partner_id
+  // (breeze_has_partner_access, asserted via PARTNER_TENANT_TABLES). Without these
+  // the org_id column makes auto-discovery treat them as shape-1 org-tenant and
+  // demand breeze_has_org_access they intentionally don't have (#1594 added them
+  // to PARTNER_TENANT_TABLES but missed this set). pax8_integrations /
+  // pax8_product_mappings have no org_id, so they're never auto-discovered here.
+  'pax8_company_mappings',
+  'pax8_subscription_snapshots',
+  'pax8_contract_line_links',
+  // pax8_orders / pax8_order_lines (2026-07-13, ordering): same shape — org_id
+  // is the customer the order is FOR, not the tenancy axis. Ordering is an
+  // MSP-side act; an org-scoped token must never see one.
+  'pax8_orders',
+  'pax8_order_lines',
+  // customer_email_domains (Phase 5): partner-axis (Shape 3) carrying a
+  // denormalized org_id (the routing target). RLS axis is partner_id; the
+  // org_id is for routing + cascade only. Functional cross-partner/cross-org
+  // forge proof: customerEmailDomainsRls.integration.test.ts.
+  'customer_email_domains',
+  // ticket_form_org_links (2026-07-11): FK-child of the dual-axis ticket_forms
+  // parent (Shape 5-adjacent, registered in PARENT_FK_JOIN_POLICY_TABLES
+  // below). Its own org_id column is the ALLOWLISTED org, not the tenancy
+  // axis — the loose `LIKE '%breeze_has_org_access%'` substring match in the
+  // generic org-tenant test would otherwise spuriously "pass" this table
+  // because the FK-join policy text does call breeze_has_org_access(tf.org_id)
+  // (the PARENT's column), just not on this table's own org_id. Excluding it
+  // here keeps that generic check honest; PARENT_FK_JOIN_POLICY_TABLES is the
+  // real assertion for this table's policy shape.
+  'ticket_form_org_links',
+  // backup_provider_customers (#6008 W01): partner-axis (Shape 3) carrying a
+  // denormalized NULLABLE org_id — the MAPPING TARGET, not the tenancy axis.
+  // An unmapped customer has org_id NULL and must stay visible to the partner
+  // admin who has to map it, so breeze_has_org_access(org_id) is the wrong
+  // predicate here. Identical treatment to huntress_org_mappings /
+  // s1_org_mappings. Its sibling backup_provider_devices IS direct-org_id
+  // (Shape 1) and is deliberately NOT excluded — it is auto-discovered and
+  // must carry breeze_has_org_access(org_id) on all four commands.
+  'backup_provider_customers',
+]);
+
+// Tables whose own `id` column is the tenant identifier (no `org_id`).
+const ORG_ID_KEYED_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
+  'organizations',
+]);
+
+// Tables in the partner tenancy axis. Each entry points at the column
+// `breeze_has_partner_access` should be called with. `id` means "the row's
+// own primary key is the partner id" (e.g. partners.id).
+const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, string>([
+  ['partners', 'id'],
+  ['partner_users', 'partner_id'],
+  ['oauth_clients', 'partner_id'],
+  ['oauth_client_partner_grants', 'partner_id'],
+  ['email_verification_tokens', 'partner_id'],
+  ['ticket_categories', 'partner_id'],
+  // work_types (#4615, spec 2026-09-17 §4.2): partner-owned labour label.
+  // Shape 3, flat breeze_has_partner_access(partner_id). No org_id and no
+  // device_id by design (spec §4.1), so this is its ONLY registration list:
+  // not in CORE_ORG_CASCADE_DELETE_ORDER, not in CORE_TENANT_EXPORT_POLICY,
+  // not in orgMergeRegistry, and deliberately NOT in DUAL_AXIS_TENANT_TABLES
+  // or PARTNER_WIDE_SELECT_BRANCH_EXEMPT. Functional forge proof:
+  // workTypesPartnerRls.integration.test.ts.
+  ['work_types', 'partner_id'],
+  ['billing_profiles', 'partner_id'],
+  ['billing_profile_rules', 'partner_id'],
+  ['org_billing_profile_assignments', 'partner_id'],
+  ['ticket_response_templates', 'partner_id'],
+  ['ticket_mailbox_connections', 'partner_id'],
+  ['ticket_mailbox_tenant_ownerships', 'partner_id'],
+  ['ticket_mailbox_consent_sessions', 'partner_id'],
+  ['partner_ticket_sequences', 'partner_id'],
+  ['partner_invoice_sequences', 'partner_id'],
+  ['partner_quote_sequences', 'partner_id'],
+  ['ticket_statuses', 'partner_id'],
+  ['ticket_priority_settings', 'partner_id'],
+  ['time_entries', 'partner_id'],
+  // W06 (#3900): decisions ledger for auto-suggested time entries. Shape 3,
+  // same policy shape as time_entries. No org_id / device_id by design, so it
+  // appears in no other registration list.
+  ['time_suggestion_decisions', 'partner_id'],
+  ['huntress_integrations', 'partner_id'],
+  ['huntress_org_mappings', 'partner_id'],
+  ['pax8_integrations', 'partner_id'],
+  ['pax8_company_mappings', 'partner_id'],
+  ['pax8_subscription_snapshots', 'partner_id'],
+  ['pax8_product_mappings', 'partner_id'],
+  ['pax8_contract_line_links', 'partner_id'],
+  ['pax8_orders', 'partner_id'],
+  ['pax8_order_lines', 'partner_id'],
+  ['stripe_financial_events', 'partner_id'],
+  ['accounting_connections', 'partner_id'],
+  ['accounting_entity_mappings', 'partner_id'],
+  ['network_known_guests', 'partner_id'],
+  ['scripts', 'partner_id'],
+  ['script_categories', 'partner_id'],
+  ['script_tags', 'partner_id'],
+  ['alert_templates', 'partner_id'],
+  // Product catalog (2026-06-14): partner-axis (RLS shape 3), flat
+  // breeze_has_partner_access(partner_id) policies. catalog_bundle_components
+  // denormalizes partner_id (rather than join through the bundle item) to
+  // avoid the #1016 nested-EXISTS bound-param bug. catalog_item_org_pricing
+  // is NOT here — it carries a direct org_id column and is auto-discovered
+  // as an ordinary shape-1 org-tenant table. Since wave 3 (#3775) it also
+  // carries a denormalized partner_id, but ONLY for the composite
+  // same-partner FKs (item_partner_fk / org_partner_fk) — the RLS axis stays
+  // org_id; it is NOT dual-axis and must not be promoted here.
+  // catalog_item_prices (wave 3, #3775) — per-currency price book, composite
+  // FK to catalog_items(id, partner_id). Functional proof:
+  // catalogItemPricesPartnerRls.integration.test.ts.
+  ['catalog_items', 'partner_id'],
+  ['catalog_item_images', 'partner_id'],
+  ['catalog_item_prices', 'partner_id'],
+  ['catalog_bundle_components', 'partner_id'],
+  ['td_synnex_digital_bridge_integrations', 'partner_id'],
+  ['td_synnex_ec_express_integrations', 'partner_id'],
+  // Nightly SFTP P&A file ingest (2026-07-16): partner-axis (Shape 3).
+  // td_synnex_price_availability holds the ingested rows and is written by the
+  // nightly worker under a system context; both carry a flat partner_id.
+  // Functional cross-partner forge proof: tdSynnexSftpRls.integration.test.ts.
+  ['td_synnex_sftp_integrations', 'partner_id'],
+  ['td_synnex_price_availability', 'partner_id'],
+  // Phase 4 email-to-ticket ingest (Shape 3). partner_id is nullable on
+  // ticket_email_inbound (only system scope may write null-partner rows);
+  // NOT NULL on partner_inbound_domains. Policy:
+  //   breeze_current_scope()='system' OR breeze_has_partner_access(partner_id)
+  // Functional cross-partner forge proof: emailInboundRls.integration.test.ts.
+  ['ticket_email_inbound', 'partner_id'],
+  ['partner_inbound_domains', 'partner_id'],
+  // customer_email_domains (Phase 5): sender-domain -> customer-org routing.
+  // Partner-axis + denormalized org_id (also in ORG_AXIS_POLICY_EXCLUDED_TABLES).
+  // Policy: breeze_current_scope()='system' OR breeze_has_partner_access(partner_id).
+  // Functional forge: customerEmailDomainsRls.integration.test.ts.
+  ['customer_email_domains', 'partner_id'],
+  // Stripe payments (2026-06-15): one connected Stripe account per partner
+  // (RLS shape 3, flat breeze_has_partner_access(partner_id)). The sibling
+  // invoice_stripe_payments table carries a direct org_id column and is
+  // auto-discovered as an ordinary shape-1 org-tenant table — not listed here.
+  // Functional cross-partner forge proof: stripe-payments-rls.integration.test.ts.
+  ['stripe_connect_accounts', 'partner_id'],
+  // stripe_connect_credentials (SEC-150): archive of SUPERSEDED partner Stripe
+  // keys so an already-rotated credential can still expire the Checkout sessions
+  // it minted. Same partner-axis shape as its parent (system-scope writes,
+  // partner-scoped reads). No org_id, so no org-cascade / export-policy entry;
+  // cascadeDeletePartner's information_schema partner_id sweep erases it with the
+  // partner. Functional cross-partner forge proof:
+  // stripeConnectCredentialsRls.integration.test.ts.
+  ['stripe_connect_credentials', 'partner_id'],
+  ['partner_llm_configs', 'partner_id'],
+  // authenticator_policies: per-MSP approval-security policy (Shape 3). One row
+  // per partner; policy gates on breeze_has_partner_access(partner_id) with a
+  // system-scope OR branch. Functional forge: authenticatorRls.integration.test.ts.
+  ['authenticator_policies', 'partner_id'],
+  // Update rings + patch approvals (2026-06-21): partner-axis (RLS shape 3).
+  // patch_policies has no org_id column — auto-discovery doesn't reach it.
+  // patch_approvals likewise carries only partner_id (no org_id).
+  // Functional cross-partner forge proof: update-rings-partner-scope.integration.test.ts.
+  ['patch_policies', 'partner_id'],
+  ['patch_approvals', 'partner_id'],
+  // SentinelOne (partner-wide re-key, #1735): credentials + site mappings are
+  // partner-axis (Shape 3). org_id is denormalized/nullable metadata only.
+  // Also listed in ORG_AXIS_POLICY_EXCLUDED_TABLES (dual-list trap).
+  ['s1_integrations', 'partner_id'],
+  ['s1_org_mappings', 'partner_id'],
+  // UniFi Network integration (Phase 1): one integration per partner (MSP
+  // holds the UniFi API key); sync_runs are per-integration, keyed by
+  // partner_id for fast filtering. unifi_site_mappings and unifi_devices
+  // are direct org_id (Shape 1) and are auto-discovered — not listed here.
+  ['unifi_integrations', 'partner_id'],
+  ['unifi_sync_runs', 'partner_id'],
+  // partner_login_branding (#2183): login-page branding for the MSP's own
+  // technician login. Deliberately partner-ONLY (no org axis) — see
+  // 2026-07-03-sso-partner-axis-login-branding.sql. partner_id is the PK.
+  ['partner_login_branding', 'partner_id'],
+  // Partner service principals and independently rotatable keys are both
+  // partner-axis (Shape 3). The key table denormalizes partner_id and also
+  // enforces composite ownership against its principal and rotation lineage.
+  // Functional forge proof: partnerServicePrincipalRls.integration.test.ts.
+  ['partner_service_principals', 'partner_id'],
+  ['partner_service_principal_keys', 'partner_id'],
+  // office_addin_user_bindings (spec 2026-08-15, outlook-tech-addin): MFA-
+  // established Entra identity -> Breeze technician binding for the Office
+  // add-in tech persona. Partner-axis (Shape 3), no org_id column. GRANT
+  // includes DELETE — cascadeDeletePartner's dynamic partner_id sweep issues
+  // hard DELETEs as breeze_app under a system RLS context (no role switch).
+  // Functional cross-partner forge proof: officeAddinBindingsRls.integration.test.ts.
+  ['office_addin_user_bindings', 'partner_id'],
+  // org_merge_events (spec 2026-08-26, org-lifecycle): durable merge record,
+  // survives loser-org erasure (loser_org_id has no FK). Partner-axis (Shape 3),
+  // no org_id column — so no cascade/export registration. GRANT includes DELETE
+  // for cascadeDeletePartner's dynamic partner_id sweep.
+  // Functional cross-partner forge proof: orgMergeEventsRls.integration.test.ts.
+  ['org_merge_events', 'partner_id'],
+  // Backup Provider Integration (#6008 W01): the MSP registers one external
+  // backup vendor connection (Cove) and maps its discovered customers to
+  // Breeze orgs. Both tables are partner-axis (Shape 3), four per-command
+  // breeze_has_partner_access policies each, the customers table additionally
+  // re-checking its parent connection's partner_id in INSERT/UPDATE WITH
+  // CHECK. backup_provider_customers is ALSO in
+  // ORG_AXIS_POLICY_EXCLUDED_TABLES (dual-list trap — it has an org_id column
+  // that is not its tenancy axis). backup_provider_devices and
+  // backup_provider_device_history carry a NOT NULL org_id and are ordinary
+  // Shape 1 tables, auto-discovered — not listed here, and their denormalized
+  // partner_id is deliberately NOT a second RLS read branch.
+  // Functional cross-partner forge proof:
+  // backupProviderRls.integration.test.ts.
+  ['backup_provider_connections', 'partner_id'],
+  ['backup_provider_customers', 'partner_id'],
+  // partner_sending_domains / partner_sender_identities (spec 2026-09-17,
+  // partner sending domains W02): the MSP's custom outbound From domain and
+  // one sender identity per (partner, mail stream). Partner-axis (Shape 3),
+  // deliberately no org_id — the From domain is the MSP's identity, and a
+  // per-org sending domain is the internal-phishing shape (spec §3.1). No
+  // org_id means no cascade / export-policy / org-merge registration;
+  // cascadeDeletePartner's dynamic partner_id sweep erases both, and its
+  // topological order puts identities before domains via the composite FK.
+  // GRANT includes DELETE for that sweep. The sibling outbox
+  // email_provider_domain_releases is INTENTIONAL_UNSCOPED above — it must
+  // never gain a partner_id column.
+  // Functional cross-partner forge proof: partnerSendingDomainsRls.integration.test.ts.
+  ['partner_sending_domains', 'partner_id'],
+  ['partner_sender_identities', 'partner_id'],
+  // partner_sending_daily_stats (spec 2026-09-17 §9.3, partner sending domains
+  // W06): per-partner, per-UTC-day delivery counters written by the Resend
+  // delivery webhook. Partner-axis (Shape 3) like its two siblings above, and
+  // deliberately without a domain_id dimension — the spec's bounce/complaint
+  // thresholds and the auto-suspension kill switch are both per PARTNER. No
+  // org_id means no cascade / export-policy / org-merge registration;
+  // cascadeDeletePartner's dynamic partner_id sweep erases it, and the GRANT
+  // includes DELETE for that sweep.
+  // Functional cross-partner forge proof: partnerSendingDailyStats.integration.test.ts.
+  ['partner_sending_daily_stats', 'partner_id'],
+]);
+
+// Tables whose policies reference both helpers (org OR partner). `users`
+// is the canonical case: a user row is visible if the caller has access
+// to the user's partner OR the user's org OR is the user themselves.
+const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
+  // caller_verification_policies (#6354 W01): org XOR partner via
+  // caller_verification_policies_one_owner_chk; SELECT-only partner-wide branch
+  // cv_policy_partner_select ships in 2026-10-26-170100. Functional forge
+  // proof: callerVerification.integration.test.ts.
+  'caller_verification_policies',
+  'topology_config_templates',
+  'topology_config_template_versions',
+  // network_monitors (#5287 W04): reshaped from org-only to org XOR partner by
+  // 2026-10-16-181300-monitor-coverage-kinds, so one MSP-authored "is the
+  // gateway up" check runs for every org under the partner. CHECK
+  // network_monitors_one_owner_chk enforces exactly one axis; the partner-wide
+  // SELECT branch (network_monitors_partner_wide_select) ships in the same
+  // migration and is load-bearing on the agent path. Functional cross-partner
+  // forge proof: networkMonitorPartnerRls.integration.test.ts.
+  'network_monitors',
+  // monitor_definitions (#5287 W02): a monitor is org-scoped (org_id set) or
+  // partner-wide (partner_id set, org_id NULL — one MSP-authored monitor
+  // deployed across every customer). Created dual-axis from day one in
+  // 2026-10-16-160300-monitor-definitions, with the partner-wide SELECT branch
+  // in the same migration. CHECK monitor_definitions_one_owner_chk enforces
+  // exactly one axis. Functional cross-partner forge proof:
+  // monitorDefinitionsPartnerRls.integration.test.ts.
+  'monitor_definitions',
+  // monitor_conversions / monitor_conversion_outputs (W05c1, alerting
+  // consolidation §Conversion): the ledger of legacy-row → monitor conversions.
+  // Owned on the SAME axis as the converted policy (org-owned policy → org
+  // ledger row; partner-wide policy → partner row), so org XOR partner from day
+  // one in 2026-10-23-110000-monitor-conversions with the partner-wide SELECT
+  // branch in the same migration. CHECK monitor_conversions_one_owner_chk /
+  // monitor_conversion_outputs_one_owner_chk. Functional forge proof:
+  // monitorConversionsPartnerRls.integration.test.ts (Task 18).
+  'monitor_conversions',
+  'monitor_conversion_outputs',
+  // ai_script_policies (AI script authoring W04, #5612): a policy row is
+  // org-scoped (org_id set — the GRANT) or partner-wide (partner_id set,
+  // org_id NULL — the CEILING). Created dual-axis from day one in
+  // 2026-10-16-120200-ai-script-policies. The org_id column means org-tenant
+  // auto-discovery already asserts the breeze_has_org_access branch, so this
+  // entry is what asserts the breeze_has_partner_access (partner-wide)
+  // branch. CHECK ai_script_policies_one_owner_chk enforces exactly one axis.
+  // Functional cross-partner forge proof:
+  // aiScriptPoliciesPartnerRls.integration.test.ts.
+  'ai_script_policies',
+  // deliverable_template_sets / deliverable_template_items (spec #5573 §4.6,
+  // D9): a template set is org-scoped (org_id set) OR partner-wide (partner_id
+  // set, org_id NULL — one service tier applied across every org the MSP
+  // manages). Created dual-axis from day one in
+  // 2026-10-16-110100-deliverable-templates. The org_id column means org-tenant
+  // auto-discovery already asserts the breeze_has_org_access branch, so these
+  // entries are what assert the breeze_has_partner_access (partner-wide)
+  // branch. CHECKs <table>_one_owner_chk enforce exactly one axis. Functional
+  // cross-partner forge proof: deliverableTemplatesPartnerRls.integration.test.ts.
+  'deliverable_template_sets',
+  'deliverable_template_items',
+  // ticket_checklist_templates / ticket_checklist_template_items (spec #5783
+  // §4.2, §4.3): a checklist template is org-scoped (org_id set) OR
+  // partner-wide (partner_id set, org_id NULL — one MSP-authored procedure
+  // every customer inherits). Created dual-axis from day one in
+  // 2026-10-16-191300-ticket-checklist-templates. The org_id column means
+  // org-tenant auto-discovery already asserts the breeze_has_org_access branch,
+  // so these entries are what assert the breeze_has_partner_access
+  // (partner-wide) branch. CHECKs <table>_one_owner_chk enforce exactly one
+  // axis. Functional cross-partner forge proof:
+  // ticketChecklistTemplatesPartnerRls.integration.test.ts.
+  'ticket_checklist_templates',
+  'ticket_checklist_template_items',
+  // tool_sources / tool_source_tools (Tool catalog W01, #5215 / #5216, spec
+  // 2026-09-07 §5): a registration of an external MCP server is org-scoped
+  // (org_id set) OR partner-wide (partner_id set, org_id NULL — one MSP
+  // registration every customer's AI session can reach). Created dual-axis from
+  // day one in 2026-10-16-193500-tool-sources, with both partner-wide SELECT
+  // branches in that same migration, so neither needs a
+  // PARTNER_WIDE_SELECT_BRANCH_EXEMPT entry. tool_source_tools DENORMALISES the
+  // owner from its parent (constraint trigger tool_source_tools_owner_guard_trg
+  // keeps them equal) so the per-session resolver stays one indexed query. The
+  // org_id column means org-tenant auto-discovery already asserts the
+  // breeze_has_org_access branch, so these entries are what assert the
+  // breeze_has_partner_access (partner-wide) branch. CHECKs
+  // <table>_one_owner_chk enforce exactly one axis. Functional cross-partner
+  // forge proof: toolSourcesPartnerRls.integration.test.ts.
+  'tool_sources',
+  'tool_source_tools',
+  'users',
+  'deployment_invites',
+  'access_reviews',
+  // ai_agents (AI operator wave 1): an agent is org-scoped (org_id set) OR
+  // partner-wide (partner_id set, org_id NULL). Created dual-axis from day one
+  // in 2026-09-02-ai-agents. Same blindspot as configuration_policies: the
+  // org_id column means org-tenant auto-discovery already asserts the
+  // breeze_has_org_access branch, so this entry is what asserts the
+  // breeze_has_partner_access (partner-wide) branch. CHECK
+  // ai_agents_one_owner_chk enforces exactly one axis. Functional cross-partner
+  // forge proof: aiAgentsPartnerRls.integration.test.ts.
+  // ai_agent_schedules (Phase 2 wave P2-2, #4189): a schedule is org-scoped
+  // (org_id set, an override of a partner baseline) OR partner-wide
+  // (partner_id set, org_id NULL, the baseline). Created dual-axis from day
+  // one in 2026-09-23-ai-agents-scheduled-sweeps. Same blindspot as
+  // ai_agents above: the org_id column means org-tenant auto-discovery
+  // already asserts the breeze_has_org_access branch, so this entry is what
+  // asserts the breeze_has_partner_access (partner-wide) branch. CHECK
+  // ai_agent_schedules_one_owner_chk enforces exactly one axis. Functional
+  // cross-partner forge proof: aiAgentSchedulesPartnerRls.integration.test.ts.
+  // custom_field_definitions: a field is org-scoped (org_id set) OR
+  // partner-wide (partner_id set, org_id NULL). Shipped org-only in the
+  // baseline; converted to dual-axis in 2026-06-11-i-custom-fields-dual-axis-rls.
+  'custom_field_definitions',
+  // client_ai_prompt_templates: a template is org-scoped (org_id set) OR
+  // partner-wide (partner_id set, org_id NULL). Created dual-axis from day one
+  // in 2026-06-12-b-client-ai-foundation. The org_id column means the generic
+  // org-tenant auto-discovery already picks it up (its policy string contains
+  // breeze_has_org_access), so this entry is the only guard that asserts the
+  // partner-axis (breeze_has_partner_access) branch — the dual-axis blindspot.
+  // A functional breeze_app insert test lives in client-ai-templates-rls.integration.test.ts.
+  // configuration_policies (#1724): a policy is org-scoped (org_id set,
+  // partner_id NULL — the original shape) OR partner-wide (partner_id set,
+  // org_id NULL — "all orgs"). Converted from org-only to dual-axis in
+  // 2026-06-27-config-policies-partner-ownership. Same blindspot as
+  // client_ai_prompt_templates: the org_id column means org-tenant
+  // auto-discovery already asserts the breeze_has_org_access branch, so this
+  // entry is what asserts the breeze_has_partner_access (partner-wide) branch.
+  // A CHECK constraint (configuration_policies_one_owner_chk) enforces exactly
+  // one axis per row. Functional cross-partner forge proof:
+  // configurationPoliciesPartnerRls.integration.test.ts.
+  'configuration_policies',
+  // cis_baselines (#2135): a baseline is org-scoped (org_id set, partner_id
+  // NULL — the original shape) OR partner-wide (partner_id set, org_id NULL —
+  // one CIS benchmark applied across every org the MSP manages). Converted
+  // from org-only to dual-axis in 2026-08-10-cis-baselines-partner-ownership.
+  // Same blindspot as configuration_policies: the org_id column means
+  // org-tenant auto-discovery already asserts the breeze_has_org_access
+  // branch, so this entry is what asserts the breeze_has_partner_access
+  // (partner-wide) branch. A CHECK constraint (cis_baselines_one_owner_chk)
+  // enforces exactly one axis per row. Note the table also carries a
+  // SELECT-only cis_baselines_partner_wide_select policy so org users can READ
+  // their partner's partner-wide rows (the four-command assertion below is
+  // satisfied by cis_baselines_isolation, which covers ALL commands).
+  // Functional cross-partner forge proof:
+  // cisBaselinesPartnerRls.integration.test.ts.
+  'cis_baselines',
+  // software_catalog: a package is org-scoped (org_id set, partner_id NULL — the
+  // baseline shape for custom packages) OR partner-wide (partner_id set, org_id
+  // NULL — built-in EDR integration packages, and user-created partner-wide
+  // custom packages via POST /software/catalog ownerScope:'partner', #2135).
+  // Converted from org-only to
+  // dual-axis in 2026-06-26-a-software-catalog-partner-axis. The org_id column
+  // means org-tenant auto-discovery already asserts the breeze_has_org_access
+  // branch; this entry asserts the breeze_has_partner_access (built-in) branch.
+  // A CHECK constraint (software_catalog_one_owner_chk) enforces exactly one axis.
+  'software_catalog',
+  // software_policies (#2126, epic #2135): a policy is org-scoped (org_id set,
+  // partner_id NULL) OR a partner-wide template (partner_id set, org_id NULL —
+  // "all orgs"). Converted from org-only to dual-axis in
+  // 2026-07-01-software-policies-partner-ownership. Same auto-discovery
+  // blindspot as configuration_policies: this entry asserts the
+  // breeze_has_partner_access branch. CHECK software_policies_one_owner_chk
+  // enforces exactly one axis. Functional cross-partner forge proof:
+  // softwarePoliciesPartnerRls.integration.test.ts.
+  'software_policies',
+  // software_policy_audit (#2126): dual-owned but NOT XOR — a device-level
+  // event under a partner-wide policy carries BOTH the device's org_id and the
+  // policy's partner_id so both admins can see it; CHECK
+  // software_policy_audit_owner_chk requires at least one axis.
+  'software_policy_audit',
+  // software_remediation_requests (#3553): dual-owned like software_policy_audit,
+  // NOT XOR — carries the device's org_id and (for a partner-wide policy) the
+  // policy's partner_id. The org_id column means org-tenant auto-discovery
+  // already asserts the breeze_has_org_access branch; this entry asserts the
+  // breeze_has_partner_access (partner-wide) branch. CHECK
+  // software_remediation_requests_owner_chk requires at least one axis. Functional
+  // cross-partner forge proof: softwareRemediationRequestsRls.integration.test.ts.
+  'software_remediation_requests',
+  // security_policies (#2127, epic #2135): org-scoped OR partner-wide AV/EDR
+  // baseline template. Converted from org-only to dual-axis in
+  // 2026-07-01-security-policies-partner-ownership. CHECK
+  // security_policies_one_owner_chk enforces exactly one axis. Functional
+  // cross-partner forge proof: securityPoliciesPartnerRls.integration.test.ts.
+  'security_policies',
+  // alert_rules (#2128, epic #2135): org-scoped OR partner-wide standalone
+  // alert rule (fired alerts always carry the DEVICE's org — alerts stays
+  // org-only). Converted in 2026-07-01-alert-rules-partner-ownership. CHECK
+  // alert_rules_one_owner_chk enforces exactly one axis. Functional
+  // cross-partner forge proof: alertRulesPartnerRls.integration.test.ts.
+  'alert_rules',
+  // alert_templates (#1357/#1425): org-scoped (org_id set, partner_id NULL) OR
+  // partner-wide (partner_id set, org_id NULL); rows with neither axis set are
+  // global (seeded built-ins, system-created rows). Also listed in
+  // PARTNER_TENANT_TABLES above — that entry asserts the partner-axis policy
+  // coverage; this one asserts the dual-axis shape explicitly so the table is
+  // not read as partner-only. CHECK alert_templates_one_owner_chk (migration
+  // 2026-08-25-alert-templates-one-owner) forbids the both-axes-set row that
+  // let a bare `partner_id = X` read predicate span every org under the
+  // partner (security review 2026-08-16 §1.5). SELECT is additionally widened
+  // to org sessions via the breeze_current_partner_id() catalog branch
+  // (2026-06-13-catalog-partner-read-branch) so org admins can read their
+  // MSP's shared templates read-only. Functional proof:
+  // alert-templates-partner-wide.integration.test.ts.
+  'alert_templates',
+  // automation_policies (#2129, epic #2135): org-scoped OR partner-wide
+  // compliance rule set (the config-policy "compliance" feature). Per-device
+  // results (automation_policy_compliance) stay device-join — each result row
+  // belongs to the device's own org. Converted in
+  // 2026-07-01-automation-policies-partner-ownership. CHECK
+  // automation_policies_one_owner_chk enforces exactly one axis. Functional
+  // cross-partner forge + evaluation fan-out proof:
+  // automationPoliciesPartnerRls.integration.test.ts.
+  'automation_policies',
+  // automation_resource_bindings (S0 Track A): copies the standalone
+  // automation's org XOR partner owner axes. The parent-owner constraint
+  // trigger rejects drift, and automationResourceBindings.integration.test.ts
+  // proves both org and partner forge paths through the real app role.
+  'automation_resource_bindings',
+  // automations (#2133, epic #2135): org-scoped OR partner-wide standalone
+  // automation ("on device.offline run diagnostic script" across all orgs).
+  // automation_runs stays parent-join (its EXISTS policies gained the partner
+  // branch on the automations parent in the same migration); worker-created
+  // child rows (alerts, deployments) always take the DEVICE's org. Converted
+  // in 2026-07-02-automations-partner-ownership. CHECK
+  // automations_one_owner_chk enforces exactly one axis. Functional
+  // cross-partner forge + event-trigger fan-out proof:
+  // automationsPartnerRls.integration.test.ts.
+  'automations',
+  // sensitive_data_policies (#2131, epic #2135): org-scoped OR partner-wide
+  // data-discovery policy. Scans/findings stay org-owned by the scanned
+  // DEVICE's org (the scheduler sources scan org_id from the device).
+  // Converted in 2026-07-01-sensitive-data-policies-partner-ownership. CHECK
+  // sensitive_data_policies_one_owner_chk enforces exactly one axis.
+  // Functional cross-partner forge + scheduler fan-out proof:
+  // sensitiveDataPoliciesPartnerRls.integration.test.ts.
+  'sensitive_data_policies',
+  // peripheral_policies (#2131, epic #2135): org-scoped OR partner-wide
+  // USB/peripheral policy. peripheral_events stay org-owned by the reporting
+  // DEVICE's org. Converted in 2026-07-01-peripheral-policies-partner-
+  // ownership. CHECK peripheral_policies_one_owner_chk enforces exactly one
+  // axis. Functional cross-partner forge + distribution fan-out proof:
+  // peripheralPoliciesPartnerRls.integration.test.ts.
+  'peripheral_policies',
+  // file_egress_policies (Task 2, file-egress DLP): org-scoped OR partner-wide
+  // file-egress monitoring config. file_egress_events stay org-owned by the
+  // reporting DEVICE's org. CHECK file_egress_policies_one_owner_chk enforces
+  // exactly one axis. Ships the real *_partner_wide_select branch (migration
+  // 2026-10-15-140005). Cross-partner forge + fan-out proof:
+  // fileEgressPoliciesPartnerRls.integration.test.ts.
+  'file_egress_policies',
+  // maintenance_windows (#2131, epic #2135): org-scoped OR partner-wide
+  // maintenance window. maintenance_occurrences stay window-join (their
+  // EXISTS policies gained the partner branch in the same migration).
+  // Converted in 2026-07-01-maintenance-windows-partner-ownership. CHECK
+  // maintenance_windows_one_owner_chk enforces exactly one axis. Functional
+  // cross-partner forge + enforcement fan-out proof:
+  // maintenanceWindowsPartnerRls.integration.test.ts.
+  'maintenance_windows',
+  // Alert delivery rails (#2130, epic #2135): org-scoped OR partner-wide
+  // notification channel / routing rule / escalation policy.
+  // alert_notifications stay alert-join (the firing device's org).
+  // Converted in 2026-07-01-notification-rails-partner-ownership. CHECK
+  // *_one_owner_chk enforces exactly one axis per table. Functional
+  // cross-partner forge + dispatcher fan-out proof:
+  // notificationRailsPartnerRls.integration.test.ts.
+  'notification_channels',
+  'notification_routing_rules',
+  'escalation_policies',
+  // sso_providers (#2183): org-axis (org_id set — customer-org SSO, the
+  // original shape) OR partner-axis (partner_id set, org_id NULL — MSP
+  // technician login). Converted in 2026-07-03-sso-partner-axis-login-branding.
+  // Org auto-discovery asserts the org branch; this entry asserts the
+  // breeze_has_partner_access branch. CHECK sso_providers_one_owner_chk
+  // enforces exactly one axis. Functional forge proof:
+  // ssoProvidersPartnerRls.integration.test.ts.
+  'sso_providers',
+  // ticket_forms (spec 2026-07-10): an intake form is org-owned (org_id set,
+  // partner_id NULL) OR a partner-wide form (partner_id set, org_id NULL) —
+  // XOR-enforced by ticket_forms_one_owner_chk. First dual-axis table in the
+  // ticketing domain (ticket_categories / ticket_response_templates are
+  // partner-axis-only).
+  'ticket_forms',
+  // tenant_variables (#3409): a variable is org-owned (org_id set, partner_id
+  // NULL) OR partner-wide (partner_id set, org_id NULL) — XOR-enforced by
+  // tenant_variables_one_owner_chk. Created dual-axis from day one in
+  // 2026-08-11-tenant-variables. Org auto-discovery asserts the org branch;
+  // this entry asserts the breeze_has_partner_access branch of
+  // tenant_variables_isolation. The table carries a SECOND, SELECT-only policy
+  // (tenant_variables_partner_wide_select) widening reads of the caller's own
+  // partner-wide rows to org sessions — additive, and deliberately kept
+  // separate so the all-four-commands assertion still lands on the dual-axis
+  // policy. Functional forge proof:
+  // tenantVariablesPartnerRls.integration.test.ts.
+  'tenant_variables',
+  // backup_profiles (spec 2026-07-13): a backup selection profile ("what to
+  // protect" for a device class) is org-scoped (org_id set, partner_id NULL)
+  // OR partner-wide (partner_id set, org_id NULL — define "Server" once for
+  // all orgs). Created dual-axis from day one in 2026-07-13-backup-profiles.
+  // Org auto-discovery asserts the org branch; this entry asserts the
+  // breeze_has_partner_access branch. CHECK backup_profiles_one_owner_chk
+  // enforces exactly one axis. Destinations (backup_configs) stay org-owned —
+  // credentials. Functional cross-partner forge proof:
+  // backupProfilesPartnerRls.integration.test.ts.
+  'backup_profiles',
+  // config_policy_backup_settings (spec 2026-07-13): mirrors its parent
+  // policy's ownership axis (org XOR partner, denormalized — no EXISTS join
+  // to the parent in RLS). Was org-only NOT NULL until backup became
+  // partner-linkable; converted in 2026-07-13-backup-profiles. CHECK
+  // config_policy_backup_settings_one_owner_chk enforces exactly one axis.
+  'config_policy_backup_settings',
+  // contract_templates (spec 2026-07-16, epic #2135): a contract template is
+  // org-scoped (org_id set, partner_id NULL) OR partner-wide (partner_id set,
+  // org_id NULL — "all orgs"). Created dual-axis from day one in
+  // 2026-07-16-contract-documents.sql, mirroring software_policies. The org_id
+  // column means org-tenant auto-discovery already asserts the
+  // breeze_has_org_access branch; this entry asserts the
+  // breeze_has_partner_access (partner-wide) branch. CHECK
+  // contract_templates_one_owner_chk enforces exactly one axis. Functional
+  // cross-partner forge proof: contractTemplatesPartnerRls.integration.test.ts.
+  'contract_templates',
+  // contract_template_versions (spec 2026-07-16): same dual-axis shape as its
+  // parent contract_templates, but the owner axes are DENORMALIZED onto the
+  // version row rather than reached via an EXISTS join to the template (FK
+  // children get NO RLS coverage for free) — the app layer disallows changing
+  // a template's owner once versions exist, so the denorm cannot drift. CHECK
+  // contract_template_versions_one_owner_chk enforces exactly one axis.
+  // Functional cross-partner forge proof:
+  // contractTemplatesPartnerRls.integration.test.ts.
+  'contract_template_versions',
+  // psa_connections (epic #2135, 2026-08-17): an MSP's PSA is a PARTNER-level
+  // system (its sibling accounting_connections is already partner-axis), so a
+  // connection is partner-wide (partner_id set, org_id NULL) OR org-scoped
+  // (org_id set, partner_id NULL — a customer's own Jira/Zendesk in a
+  // co-managed engagement). Retrofitted from org-only in
+  // 2026-08-17-psa-connections-partner-ownership. The org_id column means
+  // org-tenant auto-discovery already asserts the breeze_has_org_access branch;
+  // this entry asserts the breeze_has_partner_access (partner-wide) branch.
+  // CHECK psa_connections_one_owner_chk enforces exactly one axis. The child
+  // psa_ticket_mappings stays a parent-FK join (registered below) and its
+  // policy gained the partner branch in the same migration. Functional
+  // cross-partner forge proof: psaConnectionsPartnerRls.integration.test.ts.
+  'psa_connections',
+  // #3198 W01: reports is org_id XOR partner_id (reports_one_owner_chk,
+  // 2026-10-27-130100). This entry registers reports for the FORCE-RLS and
+  // four-command dual-axis coverage checks — either helper satisfies those, so
+  // it does NOT prove the breeze_has_partner_access branch (an org-only policy
+  // would still pass). The partner branch is proven only by
+  // reportsPartnerRls.integration.test.ts. Deliberately NOT in
+  // XOR_OWNERSHIP_DUAL_AXIS_TABLES — see the exclusion note there.
+  'reports',
+]);
+
+// Wave 4 of #4673: the subset of DUAL_AXIS_TENANT_TABLES whose ownership
+// shape is org_id XOR partner_id — a config-ish "define once, apply
+// partner-wide" table. Excluded (present above but NOT this XOR shape):
+// `users` (three-way: org OR partner OR self), `deployment_invites`
+// (org_id AND partner_id together via the composite FK
+// deployment_invites_org_partner_fk — a row carries BOTH, not one or the
+// other), and `software_policy_audit` / `software_remediation_requests`
+// (dual-owned, explicitly documented above as NOT XOR). `access_reviews` IS
+// included below even though it has no DB-level CHECK: its own migration
+// (2026-05-29-access-reviews-dual-axis-rls.sql) documents the axes as
+// "mutually exclusive, so no composite FK applies", and it is app-enforced
+// only. As of #3257 W02 it is the LAST such example — the two tables this
+// comment used to group it with are both DB-enforced and were verified
+// against pg_constraint on a live database:
+//   - client_ai_prompt_templates_scope_check CHECK (num_nonnulls(org_id,
+//     partner_id) = 1), shipped 2026-06-12-b, never dropped. (This half of
+//     the comment was wrong before this wave touched it.)
+//   - custom_field_definitions_one_owner_chk, added by
+//     2026-10-10-100300 (#3257 W02).
+// Membership in this set has never depended on having a CHECK — it only
+// drives the partner-wide SELECT-branch assertions below — so nothing else
+// changes. If access_reviews ever gains a CHECK, this note has no examples
+// left and should be deleted rather than patched.
+//
+// … and `reports` (#3198 W01): org XOR partner by CHECK, but NOT a config
+// table — a partner-owned report is a partner-PRIVATE cross-org aggregate
+// (money, utilisation), and spec §2 forbids org-scope sessions from reading
+// it. The partner-wide SELECT branch this set asserts would grant exactly that
+// read, so reports must never carry one. Its partner branch is proven
+// functionally by reportsPartnerRls.integration.test.ts instead.
+const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
+  'caller_verification_policies',
+  'topology_config_templates',
+  'topology_config_template_versions',
+  // monitor_definitions_one_owner_chk ((org_id IS NULL) <> (partner_id IS
+  // NULL)), 2026-10-16-160300 (#5287 W02). Its partner-wide SELECT branch
+  // (monitor_definitions_partner_wide_select) ships in the same migration, so
+  // it needs no PARTNER_WIDE_SELECT_BRANCH_EXEMPT entry.
+  'monitor_definitions',
+  // monitor_conversions_one_owner_chk / monitor_conversion_outputs_one_owner_chk,
+  // 2026-10-23-110000 (W05c1). Partner-wide SELECT branch ships in the same file.
+  'monitor_conversions',
+  'monitor_conversion_outputs',
+  // ai_script_policies_one_owner_chk, 2026-10-16-120200 (#5612 W04).
+  'ai_script_policies',
+  // deliverable_template_sets_one_owner_chk / deliverable_template_items_one_owner_chk
+  // ((org_id IS NULL) <> (partner_id IS NULL)), 2026-10-16-100500.
+  'deliverable_template_sets',
+  'deliverable_template_items',
+  // ticket_checklist_templates_one_owner_chk /
+  // ticket_checklist_template_items_one_owner_chk
+  // ((org_id IS NULL) <> (partner_id IS NULL)), 2026-10-16-191300. Both
+  // partner-wide SELECT branches ship in that same migration, so neither needs
+  // a PARTNER_WIDE_SELECT_BRANCH_EXEMPT entry.
+  'ticket_checklist_templates',
+  'ticket_checklist_template_items',
+  // tool_sources_one_owner_chk / tool_source_tools_one_owner_chk
+  // ((org_id IS NULL) <> (partner_id IS NULL)), 2026-10-16-193500 (#5216).
+  // Both partner-wide SELECT branches ship in that same migration, so neither
+  // needs a PARTNER_WIDE_SELECT_BRANCH_EXEMPT entry.
+  'tool_sources',
+  'tool_source_tools',
+  'access_reviews',
+  'custom_field_definitions',
+  'configuration_policies',
+  'cis_baselines',
+  'software_catalog',
+  'software_policies',
+  'security_policies',
+  'alert_rules',
+  'alert_templates',
+  'automation_policies',
+  'automation_resource_bindings',
+  'automations',
+  'sensitive_data_policies',
+  'peripheral_policies',
+  'file_egress_policies',
+  'maintenance_windows',
+  'notification_channels',
+  'notification_routing_rules',
+  'escalation_policies',
+  'sso_providers',
+  'ticket_forms',
+  'tenant_variables',
+  'backup_profiles',
+  'config_policy_backup_settings',
+  'contract_templates',
+  'contract_template_versions',
+  'psa_connections',
+]);
+
+// Every XOR_OWNERSHIP_DUAL_AXIS_TABLES entry is expected to carry a FOR
+// SELECT (or FOR ALL) policy that ORs in `breeze_current_partner_id()` — the
+// read branch (#4673) that lets an ORG-scoped session see its own partner's
+// partner-wide rows for this feature without the app-layer #1105 escalation
+// (CLAUDE.md "Partner-Wide First" step 3, superseded by this branch). Three
+// tables predate the convention (cis_baselines, alert_templates,
+// tenant_variables); Wave 1 of #4673 added it to the configuration_policies
+// chain (configuration_policies, backup_profiles,
+// config_policy_backup_settings). Every other entry below is a REAL,
+// already-shipped gap, not a design choice — filed as one follow-up issue per
+// table against #4673 (see PR body for the list). This map is a ratchet:
+// shrink it as each gap is closed; never add a table here to make an
+// unrelated red pass, and never add one for a table that doesn't actually
+// need the branch (add it to XOR_OWNERSHIP_DUAL_AXIS_TABLES's exclusion
+// comment instead, with rationale). Shrink-only is ENFORCED by the ceiling +
+// frozen name set directly below — the same pattern this file already uses
+// for UNREVIEWED_RLS_CLASSIFICATION_DEBT, added there after an independent
+// review found "documented shrink-only, nothing enforces it" let a future
+// author add an entry and go green.
+//
+// EMPTY as of #4944. custom_field_definitions was the last entry; its branch
+// shipped in 2026-10-13-110000-custom-field-definitions-partner-wide-select.sql
+// and the functional proof lives in
+// customFieldDefinitionsPartnerRls.integration.test.ts. With the ceiling now 0
+// this map cannot legally gain another entry: a NEW dual-axis table without the
+// branch must ship the branch in the same migration that creates the table
+// (CLAUDE.md, Partner-Wide First step 1), not take an exemption here.
+const PARTNER_WIDE_SELECT_BRANCH_EXEMPT: ReadonlyMap<string, string> = new Map<string, string>([]);
+
+// Enforced shrink-only ratchet for PARTNER_WIDE_SELECT_BRANCH_EXEMPT (mirrors
+// UNREVIEWED_RLS_CLASSIFICATION_DEBT's guard above). Fixed at the 2026-09-05
+// review (Wave 4 of #4673). LOWER the ceiling and remove the name from the
+// frozen set when a table's follow-up issue lands and it leaves the map;
+// NEVER raise the ceiling or add a name to the frozen set — a table new to
+// XOR_OWNERSHIP_DUAL_AXIS_TABLES that lacks the branch must get its own filed
+// follow-up issue, not a free ride into an already-frozen exemption. Both
+// constants are asserted by 'the partner-wide SELECT branch exemption map
+// only shrinks' below.
+const PARTNER_WIDE_SELECT_BRANCH_EXEMPT_CEILING = 0;
+const PARTNER_WIDE_SELECT_BRANCH_EXEMPT_FROZEN_NAMES: ReadonlySet<string> = new Set<string>([]);
+
+// Tables that carry a `device_id` FK but no denormalized `org_id`. Their
+// RLS policies join through `devices` to reach the org boundary.
+// Policies must contain both `FROM devices` and `breeze_has_org_access`
+// in the qual or with_check predicate (Phase 5 migration).
+const DEVICE_ID_JOIN_POLICY_TABLES: ReadonlySet<string> = new Set<string>([
+  'automation_policy_compliance',
+  'deployment_devices',
+  'deployment_results',
+  'patch_job_results',
+  'patch_rollbacks',
+]);
+
+// Tables that reach their tenant through a PARENT FK (no device_id, no
+// denormalized org_id). Their RLS policies join through the named parent
+// table(s) to the org boundary. Each entry maps the child table to the
+// parent table name(s) its policy predicate must reference; the policy must
+// contain both `FROM <parent>` and `breeze_has_org_access` in the qual or
+// with_check (migration 2026-05-30-fk-child-tables-rls.sql).
+//
+// This is the generalization of the Phase 5 device-join shape: same EXISTS
+// structure, but the join target is the row's actual parent rather than
+// `devices`. A child table keyed by a parent FK is the single most common way
+// a tenant table escapes the org_id-column auto-discovery above and ships with
+// NO rls — keep this list authoritative so the contract test catches the next
+// one. automation_runs lists BOTH parents because config-policy-driven runs
+// leave automation_id NULL and reach their org via config_policy_id instead.
+const PARENT_FK_JOIN_POLICY_TABLES: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>([
+  ['automation_runs', ['automations', 'configuration_policies']],
+  // #5289: a monitor ATTACHMENT has no org_id — it reaches its tenant through
+  // config_policy_feature_links -> configuration_policies, the same join the
+  // other config_policy_* child tables use.
+  ['config_policy_monitors', ['configuration_policies']],
+  ['ai_messages', ['ai_sessions']],
+  ['ai_tool_executions', ['ai_sessions']],
+  // NOTE: script_execution_batches is NOT here — it carries a denormalized
+  // org_id column (2026-05-31 migration) and is auto-discovered as an ordinary
+  // org-tenant table, because a nested-RLS join through its nullable-org parent
+  // `scripts` could not satisfy the system-script INSERT under bound parameters.
+  ['software_versions', ['software_catalog']],
+  ['software_install_methods', ['software_catalog']],
+  // alert_correlations has TWO not-null FKs into `alerts` (parent_alert_id,
+  // child_alert_id). Because both parents are the SAME table, the all-of
+  // parent rule below cannot express "check both endpoints" — that half of the
+  // contract lives in PARENT_FK_REQUIRED_FK_COLUMNS instead (#5607).
+  ['alert_correlations', ['alerts']],
+  ['alert_notifications', ['alerts']],
+  // 2026-06-13-b backstop: seven more child tables that shipped with NO rls and
+  // reach their tenant only through a parent FK. role_permissions' parent
+  // `roles` is dual-axis (org_id/partner_id) — its policy ORs in
+  // breeze_has_partner_access + a system-role carve-out, but still references
+  // breeze_has_org_access and joins through `roles`, so this assertion holds.
+  ['webhook_deliveries', ['webhooks']],
+  ['network_monitor_alert_rules', ['network_monitors']],
+  // network_monitor_results was HERE until #5287 W04: it now carries its own
+  // denormalized org_id (the parent can be partner-wide, which made the join
+  // blind), so it is auto-discovered as an ordinary Shape 1 org-tenant table.
+  ['role_permissions', ['roles']],
+  ['plugin_logs', ['plugin_installations']],
+  ['report_runs', ['reports']],
+  // #4248 W03: per-recipient narrative delivery. Declared parent is `reports`,
+  // NOT `report_runs` -- the strict per-command assertion below runs
+  // predicateCoversParent, which needs breeze_has_org_access(<alias>.org_id) on
+  // the DECLARED parent's alias, and report_runs has no org_id. The policy
+  // therefore reaches `reports` through a scalar subquery, exactly like the
+  // config_policy_* children do (2026-06-23-sec-review-1-fk-child-rls-backstop.sql).
+  // Its ONLY registration: the FK is ON DELETE CASCADE, so the existing
+  // report_runs pre-clear in tenantCascade.ts removes deliveries for free.
+  ['report_run_deliveries', ['reports']],
+  ['maintenance_occurrences', ['maintenance_windows']],
+  // 2026-06-23 security-review #1 backstop: five tenant child tables that
+  // shipped with NO rls and reach their org only through a parent FK. The three
+  // config_policy_* children reach the org via a 2–3 hop chain expressed as
+  // scalar subqueries, so the org-bearing parent in their EXISTS `FROM` is
+  // configuration_policies. See 2026-06-23-sec-review-1-fk-child-rls-backstop.sql.
+  ['config_policy_sensitive_data_settings', ['configuration_policies']],
+  ['config_policy_monitoring_settings', ['configuration_policies']],
+  ['config_policy_monitoring_watches', ['configuration_policies']],
+  ['config_policy_remote_access_settings', ['configuration_policies']],
+  ['config_policy_feature_links', ['configuration_policies']],
+  ['config_policy_assignments', ['configuration_policies']],
+  ['config_policy_alert_rules', ['configuration_policies']],
+  ['config_policy_automations', ['configuration_policies']],
+  ['config_policy_compliance_rules', ['configuration_policies']],
+  ['config_policy_patch_settings', ['configuration_policies']],
+  ['config_policy_maintenance_settings', ['configuration_policies']],
+  ['config_policy_event_log_settings', ['configuration_policies']],
+  ['dashboard_widgets', ['analytics_dashboards']],
+  ['backup_snapshot_files', ['backup_snapshots']],
+  ['backup_snapshot_origins', ['backup_snapshots']],
+  // psa_ticket_mappings already shipped a correct single-table-join policy
+  // (2026-04-11-bucket-c-dead-cleanup-rls.sql) but had no org_id column and was
+  // never allowlisted, so the contract test couldn't see it. Register it so a
+  // future regression that drops/weakens the policy is caught.
+  // 2026-08-17 (epic #2135): the four per-command policies were collapsed into
+  // one `psa_ticket_mappings_isolation` and the join predicate gained the
+  // parent's partner branch. A plain breeze_has_org_access(pc.org_id) join is
+  // now WRONG — the parent's org_id is NULL for every partner-owned
+  // connection, which would make those mappings invisible AND unwritable.
+  // Same hazard ticket_form_org_links documents below.
+  ['psa_ticket_mappings', ['psa_connections']],
+  // ticket_form_org_links (2026-07-11): org allowlist for partner-wide
+  // ticket_forms. Its policy joins through ticket_forms and OR's in the
+  // parent's dual-axis predicate (org OR partner OR system) — a plain
+  // breeze_has_org_access(parent.org_id) join would be WRONG because the
+  // parent's org_id is NULL for the partner-wide forms this table scopes.
+  ['ticket_form_org_links', ['ticket_forms']],
+  // RMM-QA-220: script_versions (script content history) and script_to_tags
+  // (script↔tag join) shipped in the baseline with NO rls and reach their
+  // tenant only through scripts (dual-axis, nullable org_id, is_system) and
+  // script_tags (dual-axis). See apps/api/migrations/2026-10-01-100000-script-children-rls.sql.
+  // script_to_tags additionally carries a per-command both-parents overlay
+  // (PARENT_FK_REQUIRED_PARENTS_PER_COMMAND below).
+  ['script_versions', ['scripts']],
+  ['script_to_tags', ['scripts', 'script_tags']],
+]);
+
+// Tables scoped to the calling user via breeze_current_user_id().
+// Policies must reference `breeze_current_user_id` in the predicate
+// (Phase 6 migration).
+const USER_ID_SCOPED_TABLES: ReadonlySet<string> = new Set<string>([
+  // m365_connections: dual-owned by construction — org_id XOR user_id, enforced by
+  // m365_connections_owner_check. The org-axis half is auto-discovered via org_id; this
+  // entry pins the user-axis half, which is the shape the communications-delegated profile
+  // uses and which nothing else in this file would otherwise assert.
+  //
+  // Worth stating plainly: neither this contract nor the cascade suite can SEE a
+  // user-owned row here — auto-discovery keys on org_id, and a user-axis row has none. So
+  // this registration proves the policy mentions breeze_current_user_id and nothing more.
+  // The actual cross-user isolation proof is behavioural, in
+  // m365ConnectionsRls.integration.test.ts. Do not read a green run here as coverage of
+  // the user axis.
+  'm365_connections',
+  // Dual-axis as of 2026-09-04 (wave 2, #3823): user_id AND org access, where
+  // the four baseline policies were org-only with no user predicate at all.
+  // Auto-discovery keys on org_id and so only ever proved the org half; this
+  // entry pins the user half. As with m365_connections, a green run here proves
+  // the policy MENTIONS breeze_current_user_id and nothing more — the
+  // behavioural proof that one org member cannot read another's notifications
+  // is userNotificationsRls.integration.test.ts.
+  'user_notifications',
+  'user_sso_identities',
+  'push_notifications',
+  'mobile_devices',
+  // ticket_push_preferences: W07 (#3901) per-user ticket push preferences.
+  // Pure Shape 6 — user_id PK, no org/partner axis. Behavioural proof is
+  // ticketPushPreferencesRls.integration.test.ts; this entry only pins that
+  // the policy references breeze_current_user_id.
+  'ticket_push_preferences',
+  // ticket_comments: Shape 6 on the author axis, PLUS an extra permissive
+  // SELECT policy (breeze_ticket_parent_select, 2026-06-10-a migration)
+  // that ORs in visibility when the parent ticket is org-accessible —
+  // portal-authored rows (portal_user_id set, user_id NULL) would
+  // otherwise be invisible to org/partner technicians. The EXISTS join
+  // through tickets is #1016-safe: tickets.org_id is NOT NULL and the
+  // tickets policy has no OR branches.
+  'ticket_comments',
+  'access_review_items',
+  'oauth_authorization_codes',
+  'oauth_grants',
+  'oauth_refresh_tokens',
+  // oauth_sessions: account_id (= users.id) is nullable for anonymous
+  // pre-login Sessions. Policy matches the user-scope-OR-system-scope
+  // pattern of oauth_authorization_codes; the coverage test only checks
+  // that breeze_current_user_id is referenced.
+  'oauth_sessions',
+  // oauth_interactions: short-lived OAuth interaction records. Pre-login
+  // interactions have no accountId; once login happens the policy gates
+  // access by (payload->session->accountId)::uuid = breeze_current_user_id().
+  // System-scope bypass covers the adapter writes (runOutsideDbContext).
+  'oauth_interactions',
+  // approval_requests: MCP step-up approval records, scoped to the requesting
+  // user via breeze_current_user_id(). Shape 6 policy, plus an
+  // `OR breeze_current_scope() = 'system'` branch (migration
+  // 2026-05-16-approval-shape6-system-bypass.sql) so the BullMQ expiry
+  // reaper can transition rows under system scope.
+  'approval_requests',
+  // account_deletion_requests: user-initiated deletion queue records, scoped
+  // to the requesting user via breeze_current_user_id(). Shape 6 policy with
+  // the same system-scope OR branch so the account-deletion admin queue
+  // (runWithSystemDbAccess) can read/process the queue.
+  'account_deletion_requests',
+  // refresh_token_families: OAuth 2.1 refresh-token chain records, scoped to
+  // the token owner via breeze_current_user_id(). System-initiated revocation
+  // (reuse detection in /auth/refresh) uses withSystemDbAccessContext.
+  'refresh_token_families',
+  // user_passkeys: WebAuthn passkey credentials, scoped to the owning user
+  // via breeze_current_user_id(), with an OR breeze_current_scope() = 'system'
+  // branch for system-scope access (Shape 6).
+  'user_passkeys',
+  // authenticator_devices: Breeze Authenticator approver device keys, scoped to
+  // the owning user via breeze_current_user_id(), with an
+  // OR breeze_current_scope() = 'system' branch (Shape 6). Mirrors user_passkeys.
+  'authenticator_devices',
+  // oauth_revocation_retries: durable retry work for OAuth grant/JTI markers.
+  // Request paths are limited to the exact user owner; the explicit system
+  // branch lets the bounded retry worker drain work for every user.
+  'oauth_revocation_retries',
+]);
+
+// Platform bookkeeping tables that hold no tenant data and are not a tenancy
+// shape. Adding here requires the same justification as INTENTIONAL_UNSCOPED
+// (a plan-doc entry per CLAUDE.md "Intentionally system-scoped").
+const PLATFORM_INFRASTRUCTURE_TABLES: ReadonlySet<string> = new Set<string>([
+  'breeze_migrations', // autoMigrate's applied-migration ledger (filename + checksum). No tenant data. See apps/api/src/db/autoMigrate.ts MIGRATION_TABLE.
+  'breeze_version_history', // #6605: API versions this deployment has booted (version, first_seen_at), written at boot over the migration connection; breeze_app is SELECT-only. Plan doc: docs/superpowers/plans/platform-ci/2026-09-22-upgrade-preflight-6605.md.
+]);
+
+// Tables that carry NO tenancy classification in this catalog (most also
+// have no row-level security at all; two carry policies but sit in no
+// allowlist) and were NOT reviewed by RMM-QA-220. Inclusion is a TRACKING FACT, not a
+// security review, and not a blessing: each name is a candidate finding
+// handed to QA. The bucket is shrink-only — an entry may leave ONLY by moving
+// the table into a real bucket (a shape allowlist, INTENTIONAL_UNSCOPED with
+// a plan-doc entry, or PLATFORM_INFRASTRUCTURE_TABLES). A stale name (table
+// dropped) fails the test so the list cannot rot. Shrink-only is ENFORCED by
+// the ceiling + frozen name set directly below.
+const UNREVIEWED_RLS_CLASSIFICATION_DEBT: ReadonlyMap<string, string> = new Map<string, string>([
+  // Surfaced by RMM-QA-220's exhaustive classification (2026-09). Candidate
+  // findings handed to QA — NOT reviewed, NOT blessed. Descriptions are the
+  // column / catalog facts that a reviewer needs, nothing more.
+  ['device_software', 'device_id-keyed inventory rows, no RLS; candidate shape 5 (device-join) or denormalised org_id.'],
+  ['mobile_sessions', 'user_id / refresh-token session rows, no RLS; candidate shape 6 (breeze_current_user_id). Deferred in 2026-04-11-bucket-c-dead-cleanup-rls.sql.'],
+  ['software_compliance_status', 'device_id + policy_id rows, no RLS; candidate shape 5 (device-join).'],
+  ['agent_versions', 'Global agent release reference data, no RLS; candidate INTENTIONAL_UNSCOPED after review.'],
+  ['cis_check_catalog', 'Global CIS benchmark check catalog; RLS OFF, so its 3 system-only write policies are inert; candidate INTENTIONAL_UNSCOPED after review.'],
+  ['patches', 'Global patch reference data, no RLS; candidate INTENTIONAL_UNSCOPED after review.'],
+  ['permissions', 'Global permission catalog, no RLS; candidate INTENTIONAL_UNSCOPED after review.'],
+  ['plugin_catalog', 'Global plugin catalog, no RLS; candidate INTENTIONAL_UNSCOPED after review.'],
+  ['script_templates', 'Global script template library, no RLS; candidate INTENTIONAL_UNSCOPED after review.'],
+  // The two below DO have RLS enabled + forced with four policies each but
+  // appear in no allowlist, so no per-shape assertion in this file checks them.
+  ['sessions', 'user_id + token_hash session rows; RLS on/forced, policies user_id = breeze_current_user_id() OR system scope; in no allowlist — candidate USER_ID_SCOPED_TABLES after review.'],
+  ['snmp_alert_thresholds', 'device_id -> snmp_devices rows; RLS on/forced, join-through-snmp_devices policies (2026-04-11-bucket-c-dead-cleanup-rls.sql); in no allowlist — candidate PARENT_FK_JOIN_POLICY_TABLES (snmp_devices) after review.'],
+]);
+
+// Enforced shrink-only ratchet for the bucket above (independent-review
+// finding on RMM-QA-220: "documented shrink-only, nothing enforces it"). The
+// ceiling and the frozen name set were fixed at the 2026-09-01 review. LOWER
+// the ceiling when a table leaves the bucket; NEVER raise it, and NEVER add a
+// name to the frozen set — a table that is new to this catalog must be
+// classified into a real bucket (see the D5 failure message), not parked
+// here. Both constants are asserted by 'the unreviewed classification debt
+// bucket only shrinks' below.
+const UNREVIEWED_RLS_CLASSIFICATION_DEBT_CEILING = 11;
+const UNREVIEWED_RLS_CLASSIFICATION_DEBT_FROZEN_NAMES: ReadonlySet<string> = new Set<string>([
+  'device_software',
+  'mobile_sessions',
+  'software_compliance_status',
+  'agent_versions',
+  'cis_check_catalog',
+  'patches',
+  'permissions',
+  'plugin_catalog',
+  'script_templates',
+  'sessions',
+  'snmp_alert_thresholds',
+]);
+
+// Per-command parent requirements that are STRICTER than PARENT_FK_JOIN_
+// POLICY_TABLES' default "helper on any one declared parent alias". Keyed by
+// table, then command, then predicate slot. A slot that is absent falls back
+// to the default any-of rule over the table's declared parents.
+//
+// script_to_tags (RMM-QA-220, advisor quorum §9 point 6): a link is readable
+// only when BOTH the script and the tag are visible, insertable only when the
+// script is writable AND the tag is visible, re-pointable (UPDATE WITH CHECK)
+// under the same both-parent rule, but unlinkable (UPDATE USING / DELETE) on
+// script write authority alone — tag visibility must not confer unlink rights
+// on another org's script.
+type PerCommandParentRules = Readonly<Partial<Record<Cmd, Readonly<Partial<Record<PredicateSlot, ParentRule>>>>>>;
+// Explicit type arguments on `new Map` keep the 'all-of' / 'any-of' string
+// literals narrow inside the nested object literals (otherwise TS widens them
+// to `string` and the assignment to ParentRule fails).
+const PARENT_FK_REQUIRED_PARENTS_PER_COMMAND: ReadonlyMap<string, PerCommandParentRules> = new Map<string, PerCommandParentRules>([
+  [
+    'script_to_tags',
+    {
+      SELECT: { qual: { kind: 'all-of', parents: ['scripts', 'script_tags'] } },
+      INSERT: { with_check: { kind: 'all-of', parents: ['scripts', 'script_tags'] } },
+      UPDATE: {
+        qual: { kind: 'any-of', parents: ['scripts'] },
+        with_check: { kind: 'all-of', parents: ['scripts', 'script_tags'] },
+      },
+      DELETE: { qual: { kind: 'any-of', parents: ['scripts'] } },
+    },
+  ],
+]);
+
+// Child tables that reach their tenant through MORE THAN ONE FK column into
+// the SAME parent table. PARENT_FK_REQUIRED_PARENTS_PER_COMMAND's 'all-of'
+// rule keys on parent TABLE names, so it is blind to this shape: listing
+// `['alerts', 'alerts']` proves nothing. This map pins the FK COLUMNS that
+// must appear in the slot Postgres evaluates, for every required command.
+//
+// alert_correlations (#5607): the 2026-05-30 parent-FK migration joined
+// `alerts` on parent_alert_id only, so an edge whose parent is org A's and
+// whose child is org B's was DB-visible (and insertable) under an org-A token.
+// 2026-10-16-170100-alert-correlations-child-org-rls.sql ANDs the same EXISTS
+// on child_alert_id. Both columns are NOT NULL, so the conjunction cannot go
+// three-valued.
+//
+// Scope limit, stated plainly: this is a co-presence check on column NAMES in
+// the evaluated predicate. It catches a column dropped from a slot entirely,
+// which is the regression this class has actually shipped. It does NOT parse
+// boolean structure, so it cannot tell `EXISTS(parent) AND EXISTS(child)` from
+// `EXISTS(parent) OR EXISTS(child)` — and the OR form is a full reopening of
+// the leak that mentions both columns. A green run here is therefore NOT proof
+// of isolation. The proof is behavioural, in
+// alertCorrelationsChildRls.integration.test.ts, which does discriminate the
+// OR form on the SELECT policy — the load-bearing one, since Postgres enforces
+// it on the rows an UPDATE/DELETE reads and writes too. See that file's header
+// for the measurement.
+const PARENT_FK_REQUIRED_FK_COLUMNS: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>([
+  ['alert_correlations', ['parent_alert_id', 'child_alert_id']],
+]);
+
+async function loadPublicPolicies(): Promise<Map<string, PolicyRow[]>> {
+  const rows = (await db.execute(sql`
+    SELECT tablename, policyname, cmd, permissive, qual, with_check
+    FROM pg_policies
+    WHERE schemaname = 'public'
+    ORDER BY tablename, policyname;
+  `)) as unknown as Array<PolicyRow & { tablename: string }>;
+  const byTable = new Map<string, PolicyRow[]>();
+  for (const r of rows) {
+    const list = byTable.get(r.tablename) ?? [];
+    list.push({ policyname: r.policyname, cmd: r.cmd, permissive: r.permissive, qual: r.qual, with_check: r.with_check });
+    byTable.set(r.tablename, list);
+  }
+  return byTable;
+}
+
+/** relname -> relrowsecurity for every public base table (r/p). Absent name = table missing. */
+async function loadRlsState(): Promise<Map<string, boolean>> {
+  const rows = (await db.execute(sql`
+    SELECT c.relname AS table_name, c.relrowsecurity AS rls_on
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p');
+  `)) as unknown as Array<{ table_name: string; rls_on: boolean }>;
+  return new Map(rows.map((r) => [r.table_name, r.rls_on]));
+}
+
+const REQUIRED_CMDS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
+
+/**
+ * Parent-FK children that are APPEND-ONLY by design and therefore carry only
+ * SELECT + INSERT policies. With no policy for a command, FORCE ROW LEVEL
+ * SECURITY denies it for every role including the owner — that absence is the
+ * control, so demanding four commands here would demand the bug back.
+ *
+ * script_versions (2026-10-16-100000-script-versions-immutable.sql): a version
+ * row is the immutable definition of an execution (spec §4.1). It is never
+ * updated, and it dies only through `script_id ... ON DELETE CASCADE`, which
+ * Postgres runs with force-RLS disabled.
+ *
+ * Adding a table here requires the absence of UPDATE/DELETE policies to be
+ * PROVEN behaviourally, not merely declared — see
+ * scriptVersionsImmutable.integration.test.ts.
+ */
+const APPEND_ONLY_PARENT_FK_TABLES: ReadonlySet<string> = new Set<string>(['script_versions']);
+
+/** Commands a parent-FK child must cover, given whether it is append-only. */
+function requiredCmdsFor(table: string): readonly Cmd[] {
+  return APPEND_ONLY_PARENT_FK_TABLES.has(table)
+    ? (['SELECT', 'INSERT'] as const)
+    : REQUIRED_CMDS;
+}
+
+interface TableRow {
+  table_name: string;
+  rls_on: boolean;
+  covered_cmds: string[] | null;
+}
+
+function offendersFrom(rows: TableRow[]): Array<{ table: string; rls_on: boolean; missing_cmds: string[] }> {
+  return rows
+    .filter((r) => !EXEMPT_TABLES.has(r.table_name))
+    .map((r) => {
+      const covered = new Set<string>(r.covered_cmds ?? []);
+      const missing = REQUIRED_CMDS.filter((cmd) => !covered.has(cmd));
+      return { table: r.table_name, rls_on: r.rls_on, missing_cmds: missing };
+    })
+    .filter((r) => !r.rls_on || r.missing_cmds.length > 0);
+}
+
+describe('RLS coverage contract', () => {
+  it('oauth_clients shared rows are visible only to system scope or granted partners', async () => {
+    const rows = (await db.execute(sql`
+      SELECT
+        policyname,
+        cmd,
+        COALESCE(qual, '') AS qual,
+        COALESCE(with_check, '') AS with_check
+      FROM pg_policies
+      WHERE schemaname = 'public'
+        AND tablename = 'oauth_clients'
+      ORDER BY policyname;
+    `)) as unknown as Array<{
+      policyname: string;
+      cmd: string;
+      qual: string;
+      with_check: string;
+    }>;
+
+    const combined = rows.map((row) => `${row.qual}\n${row.with_check}`).join('\n');
+    const selectPolicy = rows.find((row) => row.policyname === 'oauth_clients_select_access');
+    const writePolicies = rows.filter((row) =>
+      [
+        'oauth_clients_insert_access',
+        'oauth_clients_update_access',
+        'oauth_clients_delete_access',
+      ].includes(row.policyname)
+    );
+
+    expect(selectPolicy?.qual).toContain('breeze_current_scope() = \'system\'');
+    expect(selectPolicy?.qual).toContain('oauth_client_partner_grants');
+    expect(selectPolicy?.qual).toContain('breeze_has_partner_access(g.partner_id)');
+    expect(combined).not.toContain('partner_id IS NULL');
+    expect(writePolicies).toHaveLength(3);
+    for (const policy of writePolicies) {
+      expect(`${policy.qual}\n${policy.with_check}`).not.toContain('partner_id IS NULL');
+    }
+  });
+
+  it('OAuth token-row policies do not grant generic org-axis access', async () => {
+    const rows = (await db.execute(sql`
+      SELECT
+        tablename,
+        policyname,
+        COALESCE(qual, '') AS qual,
+        COALESCE(with_check, '') AS with_check
+      FROM pg_policies
+      WHERE schemaname = 'public'
+        AND tablename = ANY(ARRAY[
+          'oauth_authorization_codes',
+          'oauth_grants',
+          'oauth_refresh_tokens'
+        ]::text[])
+      ORDER BY tablename, policyname;
+    `)) as unknown as Array<{
+      tablename: string;
+      policyname: string;
+      qual: string;
+      with_check: string;
+    }>;
+
+    expect(rows.map((row) => row.tablename).sort()).toEqual([
+      'oauth_authorization_codes',
+      'oauth_grants',
+      'oauth_refresh_tokens',
+    ]);
+
+    for (const row of rows) {
+      const predicate = `${row.qual}\n${row.with_check}`;
+      expect(predicate).toContain('breeze_current_scope() = \'system\'');
+      expect(predicate).not.toContain('breeze_has_org_access');
+    }
+
+    const authCodes = rows.find((row) => row.tablename === 'oauth_authorization_codes');
+    const grants = rows.find((row) => row.tablename === 'oauth_grants');
+    const refreshTokens = rows.find((row) => row.tablename === 'oauth_refresh_tokens');
+
+    expect(`${authCodes?.qual}\n${authCodes?.with_check}`).toContain('user_id = breeze_current_user_id()');
+    expect(`${grants?.qual}\n${grants?.with_check}`).toContain('account_id = breeze_current_user_id()');
+    expect(`${refreshTokens?.qual}\n${refreshTokens?.with_check}`).toContain('user_id = breeze_current_user_id()');
+  });
+
+  it('sso_sessions is forced-RLS and reachable only from system scope', async () => {
+    const [cls] = (await db.execute(sql`
+      SELECT c.relrowsecurity AS rls_on, c.relforcerowsecurity AS force_on
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relname = 'sso_sessions';
+    `)) as unknown as Array<{ rls_on: boolean; force_on: boolean }>;
+
+    expect(cls?.rls_on).toBe(true);
+    expect(cls?.force_on).toBe(true);
+
+    const policies = (await db.execute(sql`
+      SELECT policyname, cmd, COALESCE(qual, '') AS qual, COALESCE(with_check, '') AS with_check
+      FROM pg_policies
+      WHERE schemaname = 'public' AND tablename = 'sso_sessions'
+      ORDER BY policyname;
+    `)) as unknown as Array<{ policyname: string; cmd: string; qual: string; with_check: string }>;
+
+    // Exactly one ALL-command system-only policy. sso_sessions is a pre-auth
+    // CSRF/PKCE transaction store with no tenant column — no tenant axis may
+    // read or write it, only withSystemDbAccessContext.
+    expect(policies).toHaveLength(1);
+    expect(policies[0]?.policyname).toBe('sso_sessions_system_only');
+    expect(policies[0]?.cmd).toBe('ALL');
+    const predicate = `${policies[0]?.qual}\n${policies[0]?.with_check}`;
+    expect(predicate).toContain("current_setting('breeze.scope'");
+    expect(predicate).not.toContain('breeze_has_org_access');
+    expect(predicate).not.toContain('breeze_has_partner_access');
+  });
+
+  it('sso_sessions carries the provider-version and link-binding columns', async () => {
+    const cols = (await db.execute(sql`
+      SELECT column_name, is_nullable, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'sso_sessions'
+        AND column_name IN ('provider_version', 'initiating_auth_epoch', 'initiating_mfa_epoch', 'initiating_session_id')
+      ORDER BY column_name;
+    `)) as unknown as Array<{ column_name: string; is_nullable: string; data_type: string }>;
+
+    expect(cols.map((c) => c.column_name)).toEqual([
+      'initiating_auth_epoch', 'initiating_mfa_epoch', 'initiating_session_id', 'provider_version',
+    ]);
+    // All nullable: login sessions have no initiating user; provider_version is
+    // NULL only for pre-deploy in-flight rows (which the callback rejects).
+    for (const c of cols) expect(c.is_nullable).toBe('YES');
+
+    const [pv] = (await db.execute(sql`
+      SELECT is_nullable, column_default
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'sso_providers' AND column_name = 'config_version';
+    `)) as unknown as Array<{ is_nullable: string; column_default: string }>;
+    expect(pv?.is_nullable).toBe('NO');
+    expect(pv?.column_default).toContain('1');
+
+    const [drcb] = (await db.execute(sql`
+      SELECT is_nullable, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'sso_providers' AND column_name = 'default_role_configured_by';
+    `)) as unknown as Array<{ is_nullable: string; data_type: string }>;
+    expect(drcb?.is_nullable).toBe('YES');
+    expect(drcb?.data_type).toBe('uuid');
+  });
+
+  it('every tenant-scoped public table has FORCE ROW LEVEL SECURITY enabled', async () => {
+    const explicitTables = Array.from(new Set([
+      ...ORG_ID_KEYED_TENANT_TABLES,
+      ...PARTNER_TENANT_TABLES.keys(),
+      ...DUAL_AXIS_TENANT_TABLES,
+      ...DEVICE_ID_JOIN_POLICY_TABLES,
+      ...PARENT_FK_JOIN_POLICY_TABLES.keys(),
+      ...USER_ID_SCOPED_TABLES,
+    ]));
+
+    const rows = (await db.execute(sql`
+      WITH org_id_tables AS (
+        SELECT DISTINCT c.relname, c.relforcerowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN information_schema.columns col
+          ON col.table_schema = n.nspname AND col.table_name = c.relname
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND col.column_name = 'org_id'
+      ),
+      explicit_tables AS (
+        SELECT c.relname, c.relforcerowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY(${sql.raw(
+            `ARRAY[${explicitTables.map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      ),
+      tenant_tables AS (
+        SELECT * FROM org_id_tables
+        UNION
+        SELECT * FROM explicit_tables
+      )
+      SELECT relname AS table_name, relforcerowsecurity AS force_rls_on
+      FROM tenant_tables
+      ORDER BY relname;
+    `)) as unknown as Array<{ table_name: string; force_rls_on: boolean }>;
+
+    const offenders = rows
+      .filter((row) => !EXEMPT_TABLES.has(row.table_name))
+      .filter((row) => !row.force_rls_on)
+      .map((row) => row.table_name);
+    const returnedTables = new Set(rows.map((row) => row.table_name));
+    const missingExplicitTables = explicitTables.filter(
+      (table) => !EXEMPT_TABLES.has(table) && !returnedTables.has(table),
+    );
+
+    expect(
+      [...offenders, ...missingExplicitTables],
+      `Tenant-scoped tables missing from the database or missing FORCE ROW LEVEL SECURITY:\n${JSON.stringify([...offenders, ...missingExplicitTables], null, 2)}\n\n` +
+        `Fix: add an idempotent migration that runs ALTER TABLE ... FORCE ROW LEVEL SECURITY for each offender.`
+    ).toEqual([]);
+  });
+
+  // RMM-QA-220: every assertion above enumerates ONE shape at a time, so a
+  // tenant child that is in no allowlist and has no org_id column (the exact
+  // way script_versions / script_to_tags shipped) is invisible to all of them.
+  // This test enumerates every public base table and demands a classification.
+  it('every public base table is classified by exactly one tenancy bucket', async () => {
+    // relkind 'r' (ordinary) + 'p' (partitioned parent, e.g. metric_rollups);
+    // NOT relispartition — metric_rollups partitions are created at runtime
+    // by breeze_ensure_metric_rollup_partition and would make this
+    // non-deterministic. The partitioned parent is classified once.
+    const rows = (await db.execute(sql`
+      SELECT
+        c.relname AS table_name,
+        EXISTS (
+          SELECT 1 FROM information_schema.columns col
+          WHERE col.table_schema = n.nspname AND col.table_name = c.relname AND col.column_name = 'org_id'
+        ) AS has_org_id
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND c.relkind IN ('r', 'p')
+        AND NOT c.relispartition
+      ORDER BY c.relname;
+    `)) as unknown as Array<{ table_name: string; has_org_id: boolean }>;
+
+    const existing = new Map(rows.map((r) => [r.table_name, r.has_org_id]));
+    const shapeLists: ReadonlyArray<{ has(name: string): boolean }> = [
+      ORG_ID_KEYED_TENANT_TABLES,
+      PARTNER_TENANT_TABLES,
+      DUAL_AXIS_TENANT_TABLES,
+      DEVICE_ID_JOIN_POLICY_TABLES,
+      PARENT_FK_JOIN_POLICY_TABLES,
+      USER_ID_SCOPED_TABLES,
+      INTENTIONAL_UNSCOPED,
+      EXEMPT_TABLES,
+    ];
+    const classifiedByShape = (name: string): boolean =>
+      (existing.get(name) ?? false) || shapeLists.some((list) => list.has(name));
+
+    const unclassified = rows
+      .map((r) => r.table_name)
+      .filter((name) => !classifiedByShape(name))
+      .filter((name) => !PLATFORM_INFRASTRUCTURE_TABLES.has(name))
+      .filter((name) => !UNREVIEWED_RLS_CLASSIFICATION_DEBT.has(name));
+
+    const bucketNames = [...PLATFORM_INFRASTRUCTURE_TABLES, ...UNREVIEWED_RLS_CLASSIFICATION_DEBT.keys()];
+    // Shrink-only ratchet: a name that no longer exists must be removed.
+    const stale = bucketNames.filter((name) => !existing.has(name));
+    // Buckets 3 and 4 are disjoint from every shape list and from each other.
+    const overlapping = [
+      ...bucketNames.filter((name) => existing.has(name) && classifiedByShape(name)),
+      ...[...PLATFORM_INFRASTRUCTURE_TABLES].filter((name) => UNREVIEWED_RLS_CLASSIFICATION_DEBT.has(name)),
+    ];
+
+    expect(
+      { unclassified, stale, overlapping },
+      `Every public base table must be classified. Unclassified tables have neither an org_id column nor an ` +
+        `entry in any shape allowlist (ORG_ID_KEYED / PARTNER / DUAL_AXIS / DEVICE_ID_JOIN / PARENT_FK_JOIN / ` +
+        `USER_ID_SCOPED), INTENTIONAL_UNSCOPED, EXEMPT_TABLES or PLATFORM_INFRASTRUCTURE_TABLES. ` +
+        `Fix: pick a shape (CLAUDE.md "Six tenancy shapes"), add policies in a migration, and register the table. ` +
+        `UNREVIEWED_RLS_CLASSIFICATION_DEBT is frozen (shrink-only, enforced) and is NOT a valid destination for a ` +
+        `new table. 'stale' names no longer exist and must be removed; 'overlapping' names are in a ` +
+        `debt/infrastructure bucket AND a real bucket — remove them from the debt bucket.\n` +
+        JSON.stringify({ unclassified, stale, overlapping }, null, 2)
+    ).toEqual({ unclassified: [], stale: [], overlapping: [] });
+  });
+
+  // RMM-QA-220 review finding: the debt bucket was documented shrink-only but
+  // nothing enforced it, so a future author facing `unclassified: [x]` could
+  // add one Map entry and go green — the same silent-omission class this
+  // contract exists to close. No database needed: this is a pure ratchet on
+  // the two constants above.
+  it('the unreviewed classification debt bucket only shrinks', () => {
+    const names = [...UNREVIEWED_RLS_CLASSIFICATION_DEBT.keys()];
+    const added = names.filter((name) => !UNREVIEWED_RLS_CLASSIFICATION_DEBT_FROZEN_NAMES.has(name));
+    expect(
+      { added, size: names.length, ceiling: UNREVIEWED_RLS_CLASSIFICATION_DEBT_CEILING },
+      `UNREVIEWED_RLS_CLASSIFICATION_DEBT is shrink-only. Names not in the frozen 2026-09-01 set: ` +
+        `${JSON.stringify(added)}. A table new to this catalog must be classified into a real bucket ` +
+        `(a shape allowlist, INTENTIONAL_UNSCOPED with a plan-doc entry, or PLATFORM_INFRASTRUCTURE_TABLES) — ` +
+        `never parked here. When a table leaves the bucket, remove it from both the Map and the frozen set ` +
+        `and LOWER the ceiling; never raise it.`
+    ).toEqual({ added: [], size: names.length, ceiling: UNREVIEWED_RLS_CLASSIFICATION_DEBT_CEILING });
+    expect(names.length).toBeLessThanOrEqual(UNREVIEWED_RLS_CLASSIFICATION_DEBT_CEILING);
+    // The frozen set must not outgrow the ceiling either (guards against
+    // "add the name to both places" without touching the number).
+    expect(UNREVIEWED_RLS_CLASSIFICATION_DEBT_FROZEN_NAMES.size).toBeLessThanOrEqual(
+      UNREVIEWED_RLS_CLASSIFICATION_DEBT_CEILING
+    );
+  });
+
+  it('deployment_invites has a database invariant tying org_id to partner_id', async () => {
+    const rows = (await db.execute(sql`
+      SELECT
+        c.conname,
+        c.contype,
+        src.relname AS source_table,
+        target.relname AS target_table,
+        pg_get_constraintdef(c.oid) AS definition
+      FROM pg_constraint c
+      JOIN pg_class src ON src.oid = c.conrelid
+      JOIN pg_class target ON target.oid = c.confrelid
+      JOIN pg_namespace n ON n.oid = src.relnamespace
+      WHERE n.nspname = 'public'
+        AND src.relname = 'deployment_invites'
+        AND c.conname = 'deployment_invites_org_partner_fk';
+    `)) as unknown as Array<{
+      conname: string;
+      contype: string;
+      source_table: string;
+      target_table: string;
+      definition: string;
+    }>;
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.contype).toBe('f');
+    expect(rows[0]?.target_table).toBe('organizations');
+    expect(rows[0]?.definition).toContain('FOREIGN KEY (org_id, partner_id)');
+    expect(rows[0]?.definition).toContain('REFERENCES organizations(id, partner_id)');
+  });
+
+  // Issue #750: device-child tables denormalize devices.org_id for the
+  // RLS hot path. If that copy is not kept in sync on an org move, the
+  // stale child row fails the UPDATE policy's USING expression on the
+  // agent inventory upserts. The 2026-05-18 migration installs a
+  // SECURITY DEFINER cascade trigger on devices + a backfill. Guard both
+  // the structural invariant (trigger present, definer-rights, covers
+  // every device-child table) and the data invariant (zero drift).
+  it('device.org_id changes cascade to every device-child table (no stale org_id drift) [#750]', async () => {
+    const trigger = (await db.execute(sql`
+      SELECT
+        t.tgname,
+        t.tgenabled,
+        p.prosecdef,
+        pg_get_triggerdef(t.oid) AS def
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_proc p ON p.oid = t.tgfoid
+      WHERE n.nspname = 'public'
+        AND c.relname = 'devices'
+        AND t.tgname = 'breeze_cascade_device_org_id'
+        AND NOT t.tgisinternal;
+    `)) as unknown as Array<{
+      tgname: string;
+      tgenabled: string;
+      prosecdef: boolean;
+      def: string;
+    }>;
+
+    expect(
+      trigger,
+      'Missing breeze_cascade_device_org_id trigger on devices — org moves will leave stale org_id on device-child tables and break agent inventory upserts (#750). Re-apply migration 2026-05-18-device-child-orgid-cascade.sql.'
+    ).toHaveLength(1);
+    // SECURITY DEFINER: the cascade must run RLS-exempt or it cannot
+    // rewrite the stale child rows it exists to fix.
+    expect(trigger[0]?.prosecdef).toBe(true);
+    // Enabled in "origin/local" mode (fires on normal writes), not disabled.
+    expect(trigger[0]?.tgenabled).toBe('O');
+    expect(trigger[0]?.def).toContain('UPDATE OF org_id');
+    expect(trigger[0]?.def).toContain('FOR EACH ROW');
+
+    // The discovery helper must resolve every table that denormalizes a
+    // uuid org_id alongside a uuid device_id — that is exactly the set
+    // the cascade and backfill iterate. A new such table is auto-covered.
+    const discovered = (await db.execute(sql`
+      SELECT count(*)::int AS n FROM public.breeze_device_child_orgid_tables();
+    `)) as unknown as Array<{ n: number }>;
+    expect(discovered[0]?.n ?? 0).toBeGreaterThan(0);
+
+    // Data invariant: no device-child row may carry an org_id that
+    // disagrees with its device. Read under system scope so RLS doesn't
+    // hide cross-org rows from the audit.
+    const drift = await withSystemDbAccessContext(async () => {
+      const tables = (await db.execute(sql`
+        SELECT public.breeze_device_child_orgid_tables() AS t;
+      `)) as unknown as Array<{ t: string }>;
+
+      const offenders: Array<{ table_name: string; n: number }> = [];
+      for (const { t } of tables) {
+        const [row] = (await db.execute(sql`
+          SELECT count(*)::int AS n
+          FROM ${sql.identifier(t)} c
+          JOIN public.devices d ON d.id = c.device_id
+          WHERE c.org_id IS DISTINCT FROM d.org_id;
+        `)) as unknown as Array<{ n: number }>;
+        const n = row?.n ?? 0;
+        if (n > 0) offenders.push({ table_name: t, n });
+      }
+      return offenders;
+    });
+
+    expect(
+      drift,
+      `device-child tables with org_id drift vs devices.org_id (#750 regression — cascade trigger not keeping these in sync):\n${JSON.stringify(drift, null, 2)}`
+    ).toEqual([]);
+  });
+
+  it('every org-tenant public table has RLS on and all four DML commands covered by breeze_has_org_access', async () => {
+    const idKeyedList = Array.from(ORG_ID_KEYED_TENANT_TABLES);
+
+    const rows = (await db.execute(sql`
+      WITH org_id_tables AS (
+        SELECT c.oid, c.relname, c.relrowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN information_schema.columns col
+          ON col.table_schema = n.nspname AND col.table_name = c.relname
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND col.column_name = 'org_id'
+          AND c.relname <> ALL(${sql.raw(
+            `ARRAY[${Array.from(ORG_AXIS_POLICY_EXCLUDED_TABLES).map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      ),
+      id_keyed_tables AS (
+        SELECT c.oid, c.relname, c.relrowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY(${sql.raw(
+            `ARRAY[${idKeyedList.map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      ),
+      tenant_tables AS (
+        SELECT * FROM org_id_tables
+        UNION
+        SELECT * FROM id_keyed_tables
+      ),
+      covering_policies AS (
+        SELECT
+          p.tablename,
+          CASE WHEN p.cmd = 'ALL' THEN cmd_name ELSE p.cmd END AS cmd
+        FROM pg_policies p
+        CROSS JOIN UNNEST(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS cmd_name
+        WHERE p.schemaname = 'public'
+          AND p.permissive = 'PERMISSIVE'
+          AND (
+            COALESCE(p.qual, '') LIKE '%breeze_has_org_access%'
+            OR COALESCE(p.with_check, '') LIKE '%breeze_has_org_access%'
+          )
+          AND (p.cmd = 'ALL' OR p.cmd = cmd_name)
+      )
+      SELECT
+        t.relname AS table_name,
+        t.relrowsecurity AS rls_on,
+        ARRAY(
+          SELECT DISTINCT cp.cmd
+          FROM covering_policies cp
+          WHERE cp.tablename = t.relname
+          ORDER BY cp.cmd
+        ) AS covered_cmds
+      FROM tenant_tables t
+      ORDER BY t.relname;
+    `)) as unknown as TableRow[];
+
+    const offenders = offendersFrom(rows);
+
+    expect(
+      offenders,
+      `Org-tenant tables missing RLS coverage:\n${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: add a migration that enables RLS and installs policies covering SELECT, INSERT, UPDATE, and DELETE. ` +
+        `Use breeze_has_org_access(org_id) — or breeze_has_org_access(id) for id-keyed tenant tables — in the policy ` +
+        `predicate. See 2026-04-11-rewrite-backup-rls-policies.sql for the per-command shape and ` +
+        `2026-04-11-organizations-rls.sql for the id-keyed shape.`
+    ).toEqual([]);
+  });
+
+  // RMM-QA-220 (D6b): command-specific version of the org-axis assertion
+  // above, over the SAME table set (org_id tables minus
+  // ORG_AXIS_POLICY_EXCLUDED_TABLES, plus ORG_ID_KEYED_TENANT_TABLES, minus
+  // EXEMPT_TABLES via offendersFrom's filter). Requires
+  // breeze_has_org_access([<table>.]org_id) — or ([<table>.]id) for id-keyed
+  // tables — in USING for SELECT/DELETE, WITH CHECK for INSERT, both for UPDATE.
+  it('every org-tenant public table has command-specific USING/WITH CHECK coverage by breeze_has_org_access on its own org_id', async () => {
+    const idKeyedList = Array.from(ORG_ID_KEYED_TENANT_TABLES);
+    const rows = (await db.execute(sql`
+      WITH org_id_tables AS (
+        SELECT DISTINCT c.relname, c.relrowsecurity, false AS id_keyed
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN information_schema.columns col
+          ON col.table_schema = n.nspname AND col.table_name = c.relname
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND col.column_name = 'org_id'
+          AND c.relname <> ALL(${sql.raw(
+            `ARRAY[${Array.from(ORG_AXIS_POLICY_EXCLUDED_TABLES).map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      ),
+      id_keyed_tables AS (
+        SELECT c.relname, c.relrowsecurity, true AS id_keyed
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY(${sql.raw(
+            `ARRAY[${idKeyedList.map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      )
+      SELECT relname AS table_name, relrowsecurity AS rls_on, id_keyed FROM org_id_tables
+      UNION ALL
+      SELECT relname AS table_name, relrowsecurity AS rls_on, id_keyed FROM id_keyed_tables
+      ORDER BY 1;
+    `)) as unknown as Array<{ table_name: string; rls_on: boolean; id_keyed: boolean }>;
+
+    const policiesByTable = await loadPublicPolicies();
+    const tableRows: TableRow[] = rows.map((r) => {
+      const covered = coveredCommands(policiesByTable.get(r.table_name) ?? [], (pred) =>
+        predicateCoversOrgAxis(pred, r.table_name, r.id_keyed),
+      );
+      return { table_name: r.table_name, rls_on: r.rls_on, covered_cmds: [...covered] };
+    });
+    const offenders = offendersFrom(tableRows);
+
+    expect(
+      offenders,
+      `Org-tenant tables whose policies do not call breeze_has_org_access on the table's own org_id (or id) in the ` +
+        `slot Postgres evaluates for each command:\n${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: USING for SELECT/DELETE, WITH CHECK for INSERT, both for UPDATE; the argument must be this table's ` +
+        `org_id (id for ORG_ID_KEYED_TENANT_TABLES). A table whose tenancy axis is NOT its org_id column belongs in ` +
+        `ORG_AXIS_POLICY_EXCLUDED_TABLES with a comment (see ticket_form_org_links). Matcher: src/db/rlsPolicyShape.ts.`
+    ).toEqual([]);
+  });
+
+  it('every partner-tenant public table has RLS on and all four DML commands covered by breeze_has_partner_access', async () => {
+    const partnerTables = Array.from(PARTNER_TENANT_TABLES.keys());
+
+    const rows = (await db.execute(sql`
+      WITH tenant_tables AS (
+        SELECT c.oid, c.relname, c.relrowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY(${sql.raw(
+            `ARRAY[${partnerTables.map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      ),
+      covering_policies AS (
+        SELECT
+          p.tablename,
+          CASE WHEN p.cmd = 'ALL' THEN cmd_name ELSE p.cmd END AS cmd
+        FROM pg_policies p
+        CROSS JOIN UNNEST(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS cmd_name
+        WHERE p.schemaname = 'public'
+          AND p.permissive = 'PERMISSIVE'
+          AND (
+            COALESCE(p.qual, '') LIKE '%breeze_has_partner_access%'
+            OR COALESCE(p.with_check, '') LIKE '%breeze_has_partner_access%'
+          )
+          AND (p.cmd = 'ALL' OR p.cmd = cmd_name)
+      )
+      SELECT
+        t.relname AS table_name,
+        t.relrowsecurity AS rls_on,
+        ARRAY(
+          SELECT DISTINCT cp.cmd
+          FROM covering_policies cp
+          WHERE cp.tablename = t.relname
+          ORDER BY cp.cmd
+        ) AS covered_cmds
+      FROM tenant_tables t
+      ORDER BY t.relname;
+    `)) as unknown as TableRow[];
+
+    const returnedTables = new Set(rows.map((row) => row.table_name));
+    const missingTables = partnerTables
+      .filter((table) => !returnedTables.has(table))
+      .map((table) => ({ table, rls_on: false, missing_cmds: [...REQUIRED_CMDS] }));
+    const offenders = [...offendersFrom(rows), ...missingTables];
+
+    expect(
+      offenders,
+      `Partner-tenant tables missing RLS coverage:\n${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: add a migration that enables RLS and installs policies covering SELECT, INSERT, UPDATE, and DELETE. ` +
+        `Use breeze_has_partner_access(id) or breeze_has_partner_access(partner_id) in the policy predicate. ` +
+        `See 2026-04-11-partners-rls.sql for the template.`
+    ).toEqual([]);
+  });
+
+  it('every dual-axis tenant table has RLS on and all four DML commands covered by breeze_has_org_access or breeze_has_partner_access', async () => {
+    const dualTables = Array.from(DUAL_AXIS_TENANT_TABLES);
+
+    const rows = (await db.execute(sql`
+      WITH tenant_tables AS (
+        SELECT c.oid, c.relname, c.relrowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY(${sql.raw(
+            `ARRAY[${dualTables.map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      ),
+      covering_policies AS (
+        SELECT
+          p.tablename,
+          CASE WHEN p.cmd = 'ALL' THEN cmd_name ELSE p.cmd END AS cmd
+        FROM pg_policies p
+        CROSS JOIN UNNEST(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS cmd_name
+        WHERE p.schemaname = 'public'
+          AND p.permissive = 'PERMISSIVE'
+          AND (
+            COALESCE(p.qual, '') LIKE '%breeze_has_org_access%'
+            OR COALESCE(p.qual, '') LIKE '%breeze_has_partner_access%'
+            OR COALESCE(p.with_check, '') LIKE '%breeze_has_org_access%'
+            OR COALESCE(p.with_check, '') LIKE '%breeze_has_partner_access%'
+          )
+          AND (p.cmd = 'ALL' OR p.cmd = cmd_name)
+      )
+      SELECT
+        t.relname AS table_name,
+        t.relrowsecurity AS rls_on,
+        ARRAY(
+          SELECT DISTINCT cp.cmd
+          FROM covering_policies cp
+          WHERE cp.tablename = t.relname
+          ORDER BY cp.cmd
+        ) AS covered_cmds
+      FROM tenant_tables t
+      ORDER BY t.relname;
+    `)) as unknown as TableRow[];
+
+    const offenders = offendersFrom(rows);
+
+    expect(
+      offenders,
+      `Dual-axis tenant tables missing RLS coverage:\n${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: each DML command must be covered by a policy referencing at least one of ` +
+        `breeze_has_org_access or breeze_has_partner_access. See 2026-04-11-users-rls.sql ` +
+        `for the users table template (the canonical dual-axis case with a self-read branch).`
+    ).toEqual([]);
+  });
+
+  // Wave 4 of #4673: makes the NEXT partner-wide table's missing read branch
+  // fail loud instead of shipping the same org-token blindness #2468 (the
+  // design issue behind this epic) documents — see CLAUDE.md "Partner-Wide
+  // First" step 3. Deliberately independent of the assertion
+  // above: a table can pass "all four DML commands covered" via
+  // breeze_has_partner_access alone and still be blind to an ORG-scoped
+  // session reading its own partner's partner-wide rows, which is exactly
+  // the gap breeze_current_partner_id() closes.
+  it('every org_id-XOR-partner_id dual-axis table has a breeze_current_partner_id() partner-wide SELECT branch', async () => {
+    const tables = Array.from(XOR_OWNERSHIP_DUAL_AXIS_TABLES).filter(
+      (t) => !PARTNER_WIDE_SELECT_BRANCH_EXEMPT.has(t),
+    );
+    // Floor guard: if every XOR table were ever moved into the exempt map,
+    // `tables` would degenerate to [] and the assertion below would pass
+    // vacuously (zero rows checked). At least the six tables Wave 1 and its
+    // precedents already covered must remain provably checked here.
+    expect(tables.length).toBeGreaterThan(0);
+
+    const rows = (await db.execute(sql`
+      SELECT DISTINCT p.tablename AS table_name
+      FROM pg_policies p
+      WHERE p.schemaname = 'public'
+        AND p.permissive = 'PERMISSIVE'
+        AND (p.cmd = 'SELECT' OR p.cmd = 'ALL')
+        AND COALESCE(p.qual, '') LIKE '%breeze_current_partner_id%'
+        AND p.tablename = ANY(${sql.raw(
+          `ARRAY[${tables.map((t) => `'${t}'`).join(',')}]::text[]`,
+        )});
+    `)) as unknown as Array<{ table_name: string }>;
+
+    const covered = new Set(rows.map((r) => r.table_name));
+    const offenders = tables.filter((t) => !covered.has(t));
+
+    expect(
+      offenders,
+      `These org_id-XOR-partner_id dual-axis tables have no FOR SELECT (or FOR ALL) policy ` +
+        `referencing breeze_current_partner_id(), so an org-scoped session cannot see its own ` +
+        `partner's partner-wide rows for this feature without the #1105 escalation pattern ` +
+        `(CLAUDE.md "Partner-Wide First" step 3):\n${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: add a migration creating a FOR SELECT policy (name it <table>_partner_wide_select) ` +
+        `\`USING (org_id IS NULL AND partner_id = public.breeze_current_partner_id())\` — see ` +
+        `2026-10-05-110000-config-policy-partner-wide-select.sql for the template. If this is a ` +
+        `deliberate, reviewed exception rather than a gap, add it to ` +
+        `PARTNER_WIDE_SELECT_BRANCH_EXEMPT with a reason instead of silencing this failure.`
+    ).toEqual([]);
+  });
+
+  // Independent-review finding on this PR: an allowlist documented
+  // "shrink-only" with nothing enforcing it is the exact silent-omission
+  // class UNREVIEWED_RLS_CLASSIFICATION_DEBT's ratchet exists to close — so
+  // PARTNER_WIDE_SELECT_BRANCH_EXEMPT gets the same guard. No database
+  // needed: this is a pure ratchet on the two constants above.
+  it('the partner-wide SELECT branch exemption map only shrinks', () => {
+    const names = [...PARTNER_WIDE_SELECT_BRANCH_EXEMPT.keys()];
+    const added = names.filter((name) => !PARTNER_WIDE_SELECT_BRANCH_EXEMPT_FROZEN_NAMES.has(name));
+    expect(
+      { added, size: names.length, ceiling: PARTNER_WIDE_SELECT_BRANCH_EXEMPT_CEILING },
+      `PARTNER_WIDE_SELECT_BRANCH_EXEMPT is shrink-only. Names not in the frozen 2026-09-05 set: ` +
+        `${JSON.stringify(added)}. A table new to XOR_OWNERSHIP_DUAL_AXIS_TABLES that lacks the ` +
+        `breeze_current_partner_id() branch needs its own filed follow-up issue (see the PR that ` +
+        `introduced this file for the pattern), never a silent addition here. When a table's ` +
+        `follow-up lands, remove it from both the Map and the frozen set and LOWER the ceiling; ` +
+        `never raise it.`
+    ).toEqual({ added: [], size: names.length, ceiling: PARTNER_WIDE_SELECT_BRANCH_EXEMPT_CEILING });
+    expect(names.length).toBeLessThanOrEqual(PARTNER_WIDE_SELECT_BRANCH_EXEMPT_CEILING);
+    // The frozen set must not outgrow the ceiling either (guards against
+    // "add the name to both places" without touching the number).
+    expect(PARTNER_WIDE_SELECT_BRANCH_EXEMPT_FROZEN_NAMES.size).toBeLessThanOrEqual(
+      PARTNER_WIDE_SELECT_BRANCH_EXEMPT_CEILING
+    );
+    // Every exempt entry must actually be one of the tables this contract
+    // covers — an entry for a table not in XOR_OWNERSHIP_DUAL_AXIS_TABLES
+    // (e.g. a typo, or a table since reclassified) would silently exempt
+    // nothing while looking like real coverage.
+    const orphaned = names.filter((name) => !XOR_OWNERSHIP_DUAL_AXIS_TABLES.has(name));
+    expect(
+      orphaned,
+      `These PARTNER_WIDE_SELECT_BRANCH_EXEMPT keys are not in XOR_OWNERSHIP_DUAL_AXIS_TABLES, so ` +
+        `they exempt nothing real: ${JSON.stringify(orphaned)}. Fix the table name or remove the entry.`
+    ).toEqual([]);
+  });
+
+  it('every Phase 5 join-policy table has RLS on and all four DML commands covered by a device-join policy', async () => {
+    const joinTables = Array.from(DEVICE_ID_JOIN_POLICY_TABLES);
+
+    const rows = (await db.execute(sql`
+      WITH tenant_tables AS (
+        SELECT c.oid, c.relname, c.relrowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY(${sql.raw(
+            `ARRAY[${joinTables.map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      ),
+      covering_policies AS (
+        SELECT
+          p.tablename,
+          CASE WHEN p.cmd = 'ALL' THEN cmd_name ELSE p.cmd END AS cmd
+        FROM pg_policies p
+        CROSS JOIN UNNEST(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS cmd_name
+        WHERE p.schemaname = 'public'
+          AND p.permissive = 'PERMISSIVE'
+          AND (
+            COALESCE(p.qual, '') LIKE '%FROM devices%'
+            OR COALESCE(p.with_check, '') LIKE '%FROM devices%'
+          )
+          AND (
+            COALESCE(p.qual, '') LIKE '%breeze_has_org_access%'
+            OR COALESCE(p.with_check, '') LIKE '%breeze_has_org_access%'
+          )
+          AND (p.cmd = 'ALL' OR p.cmd = cmd_name)
+      )
+      SELECT
+        t.relname AS table_name,
+        t.relrowsecurity AS rls_on,
+        ARRAY(
+          SELECT DISTINCT cp.cmd
+          FROM covering_policies cp
+          WHERE cp.tablename = t.relname
+          ORDER BY cp.cmd
+        ) AS covered_cmds
+      FROM tenant_tables t
+      ORDER BY t.relname;
+    `)) as unknown as TableRow[];
+
+    const offenders = offendersFrom(rows);
+
+    expect(
+      offenders,
+      `Phase 5 join-policy tables missing RLS coverage:\n${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: add a migration that enables RLS and installs policies covering SELECT, INSERT, UPDATE, and DELETE. ` +
+        `Each policy predicate must join through devices and call breeze_has_org_access, e.g.: ` +
+        `EXISTS (SELECT 1 FROM devices d WHERE d.id = device_id AND breeze_has_org_access(d.org_id)). ` +
+        `See the Phase 5 migration for the canonical shape.`
+    ).toEqual([]);
+  });
+
+  it('every parent-FK join-policy table has RLS on and all four DML commands covered by a parent-join org-access policy', async () => {
+    const offenders: Array<{ table: string; rls_on: boolean; missing_cmds: string[] }> = [];
+
+    for (const [table, parents] of PARENT_FK_JOIN_POLICY_TABLES) {
+      // A covering policy must (a) reach the org via breeze_has_org_access and
+      // (b) actually join through one of the declared parent tables — so a
+      // policy that referenced breeze_has_org_access without the correct join
+      // (or vice versa) does NOT count. parents is a small fixed allowlist, so
+      // sql.raw interpolation here is safe (no user input).
+      const parentRef = parents
+        .map(
+          (p) =>
+            `(COALESCE(pp.qual, '') LIKE '%FROM ${p}%' OR COALESCE(pp.with_check, '') LIKE '%FROM ${p}%')`,
+        )
+        .join(' OR ');
+
+      const rows = (await db.execute(sql`
+        WITH t AS (
+          SELECT c.relname, c.relrowsecurity
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = ${table}
+        ),
+        covering_policies AS (
+          SELECT DISTINCT
+            CASE WHEN pp.cmd = 'ALL' THEN cmd_name ELSE pp.cmd END AS cmd
+          FROM pg_policies pp
+          CROSS JOIN UNNEST(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS cmd_name
+          WHERE pp.schemaname = 'public'
+            AND pp.tablename = ${table}
+            AND pp.permissive = 'PERMISSIVE'
+            AND (
+              COALESCE(pp.qual, '') LIKE '%breeze_has_org_access%'
+              OR COALESCE(pp.with_check, '') LIKE '%breeze_has_org_access%'
+            )
+            AND (${sql.raw(parentRef)})
+            AND (pp.cmd = 'ALL' OR pp.cmd = cmd_name)
+        )
+        SELECT
+          t.relname AS table_name,
+          t.relrowsecurity AS rls_on,
+          ARRAY(SELECT cmd FROM covering_policies ORDER BY cmd) AS covered_cmds
+        FROM t;
+      `)) as unknown as TableRow[];
+
+      const row = rows[0];
+      const covered = new Set<string>(row?.covered_cmds ?? []);
+      const missing = requiredCmdsFor(table).filter((cmd) => !covered.has(cmd));
+      if (!row || !row.rls_on || missing.length > 0) {
+        offenders.push({ table, rls_on: Boolean(row?.rls_on), missing_cmds: missing });
+      }
+      // An append-only table must have NO update/delete policy at all. If one
+      // reappears, the exemption is stale and must be removed, not honoured.
+      if (APPEND_ONLY_PARENT_FK_TABLES.has(table)) {
+        const surplus = ['UPDATE', 'DELETE'].filter((cmd) => covered.has(cmd));
+        if (surplus.length > 0) {
+          offenders.push({ table, rls_on: Boolean(row?.rls_on), missing_cmds: surplus.map((c) => `unexpected:${c}`) });
+        }
+      }
+    }
+
+    expect(
+      offenders,
+      `Parent-FK join-policy tables missing RLS coverage:\n${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: add an idempotent migration that runs ENABLE + FORCE ROW LEVEL SECURITY and installs ` +
+        `SELECT/INSERT/UPDATE/DELETE policies whose predicate joins through the table's parent and calls ` +
+        `breeze_has_org_access(parent.org_id), e.g.: ` +
+        `EXISTS (SELECT 1 FROM automations a WHERE a.id = automation_runs.automation_id AND breeze_has_org_access(a.org_id)). ` +
+        `See 2026-05-30-fk-child-tables-rls.sql for the canonical shape and the PARENT_FK_JOIN_POLICY_TABLES allowlist.`
+    ).toEqual([]);
+  });
+
+  // RMM-QA-220 (D6a): command-specific version of the assertion above. The
+  // legacy check accepts a helper NAME anywhere in qual OR with_check plus
+  // `LIKE '%FROM parent%'`; this one requires, per command, the helper on the
+  // declared parent's alias in the slot Postgres actually evaluates
+  // (SELECT/DELETE: USING; INSERT: WITH CHECK; UPDATE: both). Either
+  // breeze_has_org_access(<alias>.org_id) or breeze_has_partner_access(
+  // <alias>.partner_id) counts, so dual-axis parents fit. Tables in
+  // PARENT_FK_REQUIRED_PARENTS_PER_COMMAND must satisfy their overlay.
+  it('every parent-FK join-policy table has command-specific USING/WITH CHECK coverage on the declared parent alias', async () => {
+    const policiesByTable = await loadPublicPolicies();
+    const rlsState = await loadRlsState();
+    const offenders: Array<{ table: string; rls_on: boolean; missing_cmds: string[] }> = [];
+
+    for (const [table, parents] of PARENT_FK_JOIN_POLICY_TABLES) {
+      const overlay = PARENT_FK_REQUIRED_PARENTS_PER_COMMAND.get(table);
+      const covered = coveredCommands(policiesByTable.get(table) ?? [], (pred, cmd, slot) => {
+        const rule: ParentRule = overlay?.[cmd]?.[slot] ?? { kind: 'any-of', parents };
+        return predicateCoversParents(pred, rule);
+      });
+      const missing = requiredCmdsFor(table).filter((cmd) => !covered.has(cmd));
+      const rlsOn = rlsState.get(table) ?? false;
+      if (!rlsOn || missing.length > 0) offenders.push({ table, rls_on: rlsOn, missing_cmds: missing });
+    }
+
+    expect(
+      offenders,
+      `Parent-FK join-policy tables whose policies do not guard each command in the slot Postgres evaluates:\n` +
+        `${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: SELECT/DELETE need the parent-alias helper in USING, INSERT in WITH CHECK, UPDATE in BOTH. ` +
+        `Tables listed in PARENT_FK_REQUIRED_PARENTS_PER_COMMAND must satisfy every parent in their all-of rules. ` +
+        `Shape reference: 2026-05-30-fk-child-tables-rls.sql; matcher: src/db/rlsPolicyShape.ts.`
+    ).toEqual([]);
+  });
+
+  // #5607: the two assertions above are blind to a child table with several FK
+  // columns into the SAME parent — they only ever prove the policy joins
+  // `alerts` once. Require every declared FK column to appear in the evaluated
+  // slot so a half predicate (parent checked, child not) cannot come back.
+  it('every multi-FK child table guards each declared FK column in the slot Postgres evaluates', async () => {
+    const policiesByTable = await loadPublicPolicies();
+    const offenders: Array<{ table: string; missing_cmds: string[] }> = [];
+
+    for (const [table, columns] of PARENT_FK_REQUIRED_FK_COLUMNS) {
+      const covered = coveredCommands(policiesByTable.get(table) ?? [], (pred) => {
+        if (!pred) return false;
+        const text = pred.toLowerCase();
+        return columns.every((col) => text.includes(col.toLowerCase()));
+      });
+      const missing = requiredCmdsFor(table).filter((cmd) => !covered.has(cmd));
+      if (missing.length > 0) offenders.push({ table, missing_cmds: missing });
+    }
+
+    expect(
+      offenders,
+      `Multi-FK child tables whose policies do not reference every tenant-bearing FK column:\n` +
+        `${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: AND one EXISTS-through-the-parent branch per FK column, in USING for SELECT/DELETE, ` +
+        `WITH CHECK for INSERT, and BOTH for UPDATE — e.g. ` +
+        `EXISTS (SELECT 1 FROM alerts p WHERE p.id = alert_correlations.parent_alert_id AND breeze_has_org_access(p.org_id)) ` +
+        `AND EXISTS (SELECT 1 FROM alerts c WHERE c.id = alert_correlations.child_alert_id AND breeze_has_org_access(c.org_id)). ` +
+        `Shape reference: 2026-10-16-170100-alert-correlations-child-org-rls.sql.`
+    ).toEqual([]);
+  });
+
+  it('every Phase 6 user-id-scoped table has RLS on and all four DML commands covered by a breeze_current_user_id policy', async () => {
+    const userTables = Array.from(USER_ID_SCOPED_TABLES);
+
+    const rows = (await db.execute(sql`
+      WITH tenant_tables AS (
+        SELECT c.oid, c.relname, c.relrowsecurity
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY(${sql.raw(
+            `ARRAY[${userTables.map((t) => `'${t}'`).join(',')}]::text[]`,
+          )})
+      ),
+      covering_policies AS (
+        SELECT
+          p.tablename,
+          CASE WHEN p.cmd = 'ALL' THEN cmd_name ELSE p.cmd END AS cmd
+        FROM pg_policies p
+        CROSS JOIN UNNEST(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS cmd_name
+        WHERE p.schemaname = 'public'
+          AND p.permissive = 'PERMISSIVE'
+          AND (
+            COALESCE(p.qual, '') LIKE '%breeze_current_user_id%'
+            OR COALESCE(p.with_check, '') LIKE '%breeze_current_user_id%'
+          )
+          AND (p.cmd = 'ALL' OR p.cmd = cmd_name)
+      )
+      SELECT
+        t.relname AS table_name,
+        t.relrowsecurity AS rls_on,
+        ARRAY(
+          SELECT DISTINCT cp.cmd
+          FROM covering_policies cp
+          WHERE cp.tablename = t.relname
+          ORDER BY cp.cmd
+        ) AS covered_cmds
+      FROM tenant_tables t
+      ORDER BY t.relname;
+    `)) as unknown as TableRow[];
+
+    const offenders = offendersFrom(rows);
+
+    expect(
+      offenders,
+      `Phase 6 user-id-scoped tables missing RLS coverage:\n${JSON.stringify(offenders, null, 2)}\n\n` +
+        `Fix: add a migration that enables RLS and installs policies covering SELECT, INSERT, UPDATE, and DELETE. ` +
+        `Each policy predicate must reference breeze_current_user_id(), e.g.: ` +
+        `user_id = breeze_current_user_id(). ` +
+        `See the Phase 6 migration for the canonical shape.`
+    ).toEqual([]);
+  });
+});
+
+// ===========================================================================
+// oauth_revocation_retries — Shape 6 forge and worker-context enforcement
+//
+// Durable retry rows carry revocation marker identifiers and therefore must
+// never be visible or forgeable across users. The system branch is intentional:
+// the retry worker must process due rows without impersonating each owner.
+// ===========================================================================
+describe('oauth_revocation_retries RLS — user ownership and system worker access (Shape 6)', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const partnerSlug = `rls-oauth-retries-partner-${runSuffix}`;
+  const userAEmail = `rls-oauth-retries-a-${runSuffix}@example.test`;
+  const userBEmail = `rls-oauth-retries-b-${runSuffix}@example.test`;
+
+  let partnerId: string;
+  let userAId: string;
+  let userBId: string;
+  const retryIds = new Set<string>();
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db
+        .insert(partners)
+        .values({
+          name: `RLS OAuth Retries Partner ${runSuffix}`,
+          slug: partnerSlug,
+          type: 'msp',
+          plan: 'pro',
+          status: 'active',
+        })
+        .returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for OAuth retry RLS test');
+      partnerId = partner.id;
+
+      const [a, b] = await db
+        .insert(users)
+        .values([
+          {
+            partnerId: partner.id,
+            email: userAEmail,
+            name: 'RLS OAuth Retry User A',
+            status: 'active',
+          },
+          {
+            partnerId: partner.id,
+            email: userBEmail,
+            name: 'RLS OAuth Retry User B',
+            status: 'active',
+          },
+        ])
+        .returning({ id: users.id });
+      if (!a || !b) throw new Error('failed to seed users for OAuth retry RLS test');
+      userAId = a.id;
+      userBId = b.id;
+    });
+  }
+
+  function userContext(userId: string) {
+    return {
+      scope: 'organization' as const,
+      orgId: null,
+      accessibleOrgIds: [],
+      accessiblePartnerIds: [],
+      userId,
+    };
+  }
+
+  async function seedRetry(userId: string, markerId: string): Promise<string> {
+    const [row] = await withSystemDbAccessContext(async () =>
+      db
+        .insert(oauthRevocationRetries)
+        .values({
+          userId,
+          markerType: 'grant',
+          markerId,
+          expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+          nextAttemptAt: new Date(),
+          lastErrorCode: 'redis_unavailable',
+        })
+        .returning({ id: oauthRevocationRetries.id }),
+    );
+    if (!row) throw new Error('failed to seed OAuth revocation retry');
+    retryIds.add(row.id);
+    return row.id;
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      for (const id of retryIds) {
+        await db.delete(oauthRevocationRetries).where(eq(oauthRevocationRetries.id, id));
+      }
+      if (userAId) await db.delete(users).where(eq(users.id, userAId));
+      if (userBId) await db.delete(users).where(eq(users.id, userBId));
+      if (partnerId) await db.delete(partners).where(eq(partners.id, partnerId));
+    });
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)('permits own-user CRUD', async () => {
+    await ensureFixtures();
+
+    const [inserted] = await withDbAccessContext(userContext(userAId), async () =>
+      db
+        .insert(oauthRevocationRetries)
+        .values({
+          userId: userAId,
+          markerType: 'jti',
+          markerId: `own-${runSuffix}`,
+          expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+          nextAttemptAt: new Date(),
+          lastErrorCode: 'redis_write_failed',
+        })
+        .returning({ id: oauthRevocationRetries.id }),
+    );
+    expect(inserted).toBeDefined();
+    retryIds.add(inserted!.id);
+
+    const visible = await withDbAccessContext(userContext(userAId), async () =>
+      db
+        .select({ id: oauthRevocationRetries.id })
+        .from(oauthRevocationRetries)
+        .where(eq(oauthRevocationRetries.id, inserted!.id)),
+    );
+    expect(visible).toEqual([{ id: inserted!.id }]);
+
+    const updated = await withDbAccessContext(userContext(userAId), async () =>
+      db
+        .update(oauthRevocationRetries)
+        .set({ attempts: 2 })
+        .where(eq(oauthRevocationRetries.id, inserted!.id))
+        .returning({ attempts: oauthRevocationRetries.attempts }),
+    );
+    expect(updated).toEqual([{ attempts: 2 }]);
+
+    const deleted = await withDbAccessContext(userContext(userAId), async () =>
+      db
+        .delete(oauthRevocationRetries)
+        .where(eq(oauthRevocationRetries.id, inserted!.id))
+        .returning({ id: oauthRevocationRetries.id }),
+    );
+    expect(deleted).toEqual([{ id: inserted!.id }]);
+    retryIds.delete(inserted!.id);
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'denies cross-user SELECT, UPDATE, DELETE, and forged INSERT without mutation',
+    async () => {
+      await ensureFixtures();
+      const retryId = await seedRetry(userAId, `cross-user-${runSuffix}`);
+
+      const visible = await withDbAccessContext(userContext(userBId), async () =>
+        db
+          .select({ id: oauthRevocationRetries.id })
+          .from(oauthRevocationRetries)
+          .where(eq(oauthRevocationRetries.id, retryId)),
+      );
+      expect(visible).toEqual([]);
+
+      const updated = await withDbAccessContext(userContext(userBId), async () =>
+        db
+          .update(oauthRevocationRetries)
+          .set({ attempts: 99 })
+          .where(eq(oauthRevocationRetries.id, retryId))
+          .returning({ id: oauthRevocationRetries.id }),
+      );
+      expect(updated).toEqual([]);
+
+      const deleted = await withDbAccessContext(userContext(userBId), async () =>
+        db
+          .delete(oauthRevocationRetries)
+          .where(eq(oauthRevocationRetries.id, retryId))
+          .returning({ id: oauthRevocationRetries.id }),
+      );
+      expect(deleted).toEqual([]);
+
+      let caught: unknown;
+      try {
+        await withDbAccessContext(userContext(userBId), async () =>
+          db.insert(oauthRevocationRetries).values({
+            userId: userAId,
+            markerType: 'grant',
+            markerId: `forged-${runSuffix}`,
+            expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+            nextAttemptAt: new Date(),
+            lastErrorCode: 'redis_unavailable',
+          }),
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      expect(cause?.cause?.message ?? cause?.message ?? '').toMatch(
+        /row-level security|permission denied/i,
+      );
+
+      const unchanged = await withSystemDbAccessContext(async () =>
+        db
+          .select({ attempts: oauthRevocationRetries.attempts })
+          .from(oauthRevocationRetries)
+          .where(eq(oauthRevocationRetries.id, retryId)),
+      );
+      expect(unchanged).toEqual([{ attempts: 0 }]);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)('permits explicit system-context CRUD for the retry worker', async () => {
+    await ensureFixtures();
+
+    const [inserted] = await withSystemDbAccessContext(async () =>
+      db
+        .insert(oauthRevocationRetries)
+        .values({
+          userId: userBId,
+          markerType: 'grant',
+          markerId: `system-${runSuffix}`,
+          expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+          nextAttemptAt: new Date(),
+          lastErrorCode: 'redis_unavailable',
+        })
+        .returning({ id: oauthRevocationRetries.id }),
+    );
+    expect(inserted).toBeDefined();
+    retryIds.add(inserted!.id);
+
+    const visible = await withSystemDbAccessContext(async () =>
+      db
+        .select({ id: oauthRevocationRetries.id })
+        .from(oauthRevocationRetries)
+        .where(eq(oauthRevocationRetries.id, inserted!.id)),
+    );
+    expect(visible).toEqual([{ id: inserted!.id }]);
+
+    const updated = await withSystemDbAccessContext(async () =>
+      db
+        .update(oauthRevocationRetries)
+        .set({ completedAt: new Date() })
+        .where(eq(oauthRevocationRetries.id, inserted!.id))
+        .returning({ id: oauthRevocationRetries.id }),
+    );
+    expect(updated).toEqual([{ id: inserted!.id }]);
+
+    const deleted = await withSystemDbAccessContext(async () =>
+      db
+        .delete(oauthRevocationRetries)
+        .where(eq(oauthRevocationRetries.id, inserted!.id))
+        .returning({ id: oauthRevocationRetries.id }),
+    );
+    expect(deleted).toEqual([{ id: inserted!.id }]);
+    retryIds.delete(inserted!.id);
+  });
+});
+
+// ===========================================================================
+// approval_requests — Shape 6 forge test
+//
+// The pg_catalog inspection above only checks that a policy referencing
+// breeze_current_user_id() exists for each DML command. It does NOT prove
+// Postgres actually rejects a cross-user write — a refactor that replaces
+// the canonical user_id = breeze_current_user_id() predicate with a
+// permissive `true` would still pass the catalog check but silently let
+// any user act on any approval row.
+//
+// This block forges cross-user reads/writes against a real DB connection
+// (as `breeze_app`, the unprivileged role) and asserts Postgres enforces
+// the Shape 6 policy in practice. It is purposefully self-contained so it
+// can run under vitest.config.rls-coverage.ts (which deliberately does NOT
+// load setup.ts and thus has no per-test TRUNCATE) — fixtures are seeded
+// via withSystemDbAccessContext and torn down by id in an afterAll.
+// ===========================================================================
+describe('approval_requests RLS — cross-user forge enforcement (Shape 6)', () => {
+  // Stable suffix so re-runs against a long-lived DB don't collide on
+  // users.email (UNIQUE) but tests within a single run share the fixture.
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const partnerSlug = `rls-approvals-partner-${runSuffix}`;
+  const userAEmail = `rls-approvals-a-${runSuffix}@example.test`;
+  const userBEmail = `rls-approvals-b-${runSuffix}@example.test`;
+
+  let partnerId: string;
+  let userAId: string;
+  let userBId: string;
+  let approvalAId: string | null = null;
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db
+        .insert(partners)
+        .values({
+          name: `RLS Approvals Partner ${runSuffix}`,
+          slug: partnerSlug,
+          type: 'msp',
+          plan: 'pro',
+          status: 'active',
+        })
+        .returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for approvals RLS forge test');
+      partnerId = partner.id;
+
+      const [a, b] = await db
+        .insert(users)
+        .values([
+          {
+            partnerId: partner.id,
+            email: userAEmail,
+            name: 'RLS Approvals User A',
+            status: 'active',
+          },
+          {
+            partnerId: partner.id,
+            email: userBEmail,
+            name: 'RLS Approvals User B',
+            status: 'active',
+          },
+        ])
+        .returning({ id: users.id });
+      if (!a || !b) throw new Error('failed to seed users for approvals RLS forge test');
+      userAId = a.id;
+      userBId = b.id;
+    });
+  }
+
+  afterAll(async () => {
+    // approval_requests now has a system-scope OR branch (migration
+    // 2026-05-16-approval-shape6-system-bypass.sql), so system context can
+    // tear the row down directly alongside the users/partners fixtures.
+    await withSystemDbAccessContext(async () => {
+      if (approvalAId) {
+        await db.delete(approvalRequests).where(eq(approvalRequests.id, approvalAId!));
+      }
+      if (userAId) await db.delete(users).where(eq(users.id, userAId));
+      if (userBId) await db.delete(users).where(eq(users.id, userBId));
+      if (partnerId) await db.delete(partners).where(eq(partners.id, partnerId));
+    });
+  });
+
+  // Build a per-user DbAccessContext. Shape 6 only needs `userId`;
+  // scope='organization' with empty accessibleOrgIds keeps the caller's
+  // org/partner reach to none so no other policy accidentally green-lights
+  // the row.
+  function userContext(userId: string) {
+    return {
+      scope: 'organization' as const,
+      orgId: null,
+      accessibleOrgIds: [],
+      accessiblePartnerIds: [],
+      userId,
+    };
+  }
+
+  it('user A can INSERT and SELECT their own approval_request row', async () => {
+    await ensureFixtures();
+
+    const inserted = await withDbAccessContext(userContext(userAId), async () =>
+      db
+        .insert(approvalRequests)
+        .values({
+          userId: userAId,
+          requestingClientLabel: 'rls-forge-client',
+          actionLabel: 'forge.test',
+          actionToolName: 'forge.test',
+          riskTier: 'low',
+          riskSummary: 'rls forge test seed',
+          expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+        })
+        .returning({ id: approvalRequests.id })
+    );
+
+    expect(inserted).toHaveLength(1);
+    approvalAId = inserted[0]!.id;
+
+    const visibleToA = await withDbAccessContext(userContext(userAId), async () =>
+      db
+        .select({ id: approvalRequests.id })
+        .from(approvalRequests)
+        .where(eq(approvalRequests.id, approvalAId!))
+    );
+    expect(visibleToA.map((r) => r.id)).toEqual([approvalAId]);
+  });
+
+  it('user B SELECT cannot see user A\'s row (RLS hides it via USING)', async () => {
+    await ensureFixtures();
+    if (!approvalAId) throw new Error('seed test must run first');
+
+    const visibleToB = await withDbAccessContext(userContext(userBId), async () =>
+      db
+        .select({ id: approvalRequests.id })
+        .from(approvalRequests)
+        .where(eq(approvalRequests.id, approvalAId!))
+    );
+    expect(visibleToB).toEqual([]);
+  });
+
+  it('user B UPDATE on user A\'s row affects 0 rows (USING filters the WHERE)', async () => {
+    await ensureFixtures();
+    if (!approvalAId) throw new Error('seed test must run first');
+
+    // The policy USING clause filters the row out before WITH CHECK runs,
+    // so this is a no-op rather than an RLS violation. The status remains
+    // 'pending' regardless.
+    const updated = await withDbAccessContext(userContext(userBId), async () =>
+      db
+        .update(approvalRequests)
+        .set({ status: 'approved', decidedAt: new Date() })
+        .where(eq(approvalRequests.id, approvalAId!))
+        .returning({ id: approvalRequests.id })
+    );
+    expect(updated).toEqual([]);
+
+    // Read back as user A (the row's owner) to confirm it is genuinely
+    // untouched. Reading as the owner is a deliberately stronger assertion
+    // than a system-scope read: it proves the row is intact from the user
+    // whose tenancy axis governs it, not merely visible to the privileged
+    // system context (which the policy now also permits).
+    const actual = await withDbAccessContext(userContext(userAId), async () =>
+      db
+        .select({ id: approvalRequests.id, status: approvalRequests.status })
+        .from(approvalRequests)
+        .where(eq(approvalRequests.id, approvalAId!))
+    );
+    expect(actual).toHaveLength(1);
+    expect(actual[0]!.status).toBe('pending');
+  });
+
+  it('user B INSERT with user_id=A is rejected by WITH CHECK', async () => {
+    await ensureFixtures();
+
+    let caught: unknown;
+    try {
+      await withDbAccessContext(userContext(userBId), async () =>
+        db.insert(approvalRequests).values({
+          userId: userAId, // forging user A's id while in user B's context
+          requestingClientLabel: 'rls-forge-client',
+          actionLabel: 'forge.test.crossuser',
+          actionToolName: 'forge.test',
+          riskTier: 'low',
+          riskSummary: 'rls forge test cross-user insert',
+          expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+        })
+      );
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeDefined();
+    const cause = (caught as { cause?: { message?: string }; message?: string } | undefined);
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(
+      /new row violates row-level security policy for table "approval_requests"/
+    );
+  });
+});
+
+// ===========================================================================
+// manifest_signing_keys RLS lockout (#639)
+//
+// The catalog test above only proves `manifest_signing_keys` is in
+// INTENTIONAL_UNSCOPED as documentation. It does NOT prove Postgres rejects
+// a tenant-scoped (non-system) caller's INSERT/SELECT. This block forges
+// both as `breeze_app` running under a normal tenant context and asserts
+// the table is locked down by FORCE ROW LEVEL SECURITY with no permissive
+// policies; the system-scope branch confirms the write path that
+// ensureActiveSigningKey relies on still works.
+// ===========================================================================
+describe('manifest_signing_keys RLS — system-only enforcement (#639)', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const insertedKeyIds: string[] = [];
+
+  // Build a tenant-scoped DbAccessContext that grants no orgs / no partners.
+  // Under this context, breeze_app should be unable to touch
+  // manifest_signing_keys — the table has ENABLE + FORCE RLS and no
+  // permissive policies, so only the system context branch (which bypasses
+  // RLS via runOutsideDbContext + withSystemDbAccessContext) can read/write.
+  const tenantCtx = {
+    scope: 'organization' as const,
+    orgId: null,
+    accessibleOrgIds: [],
+    accessiblePartnerIds: [],
+    userId: null,
+  };
+
+  afterAll(async () => {
+    if (insertedKeyIds.length === 0) return;
+    await withSystemDbAccessContext(async () => {
+      for (const keyId of insertedKeyIds) {
+        await db
+          .delete(manifestSigningKeys)
+          .where(eq(manifestSigningKeys.keyId, keyId));
+      }
+    });
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'INSERT as breeze_app under a tenant context is rejected by RLS',
+    async () => {
+      let caught: unknown;
+      try {
+        await withDbAccessContext(tenantCtx, async () =>
+          db.insert(manifestSigningKeys).values({
+            keyId: `rls-forge-deny-${runSuffix}`,
+            publicKeyB64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+            privateKeyEnc: 'enc:v1:forge',
+            status: 'active',
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeDefined();
+      const cause = caught as
+        | { cause?: { message?: string }; message?: string }
+        | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      // Two acceptable rejection surfaces: a row-level-security policy
+      // denial (USING/WITH CHECK on a permissive policy) or a permission
+      // denied on the relation (no policy = no access by default once
+      // FORCE RLS is on for the table's owner-equivalents too).
+      expect(message).toMatch(
+        /row-level security|permission denied|new row violates row-level security/i,
+      );
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'SELECT as breeze_app under a tenant context returns zero rows',
+    async () => {
+      // Seed a row via system context so there's something to fail to see.
+      const seededKeyId = `rls-forge-seed-${runSuffix}`;
+      await withSystemDbAccessContext(async () => {
+        await db.insert(manifestSigningKeys).values({
+          keyId: seededKeyId,
+          publicKeyB64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+          privateKeyEnc: 'enc:v1:forge',
+          // Visibility is independent of lifecycle status. Use a retired row
+          // so this suite remains isolated when a preceding signing/rollback
+          // suite has legitimately created the deployment's one active key.
+          status: 'retired',
+          retiredAt: new Date(),
+        });
+      });
+      insertedKeyIds.push(seededKeyId);
+
+      // Now read under a tenant context. RLS with no permissive policy
+      // means the SELECT returns 0 rows OR Postgres throws permission
+      // denied — assert either outcome explicitly.
+      let rows: unknown[] = [];
+      let err: unknown = null;
+      try {
+        rows = await withDbAccessContext(tenantCtx, async () =>
+          db
+            .select({ keyId: manifestSigningKeys.keyId })
+            .from(manifestSigningKeys),
+        );
+      } catch (e) {
+        err = e;
+      }
+
+      if (err) {
+        const cause = err as
+          | { cause?: { message?: string }; message?: string };
+        const message = cause?.cause?.message ?? cause?.message ?? '';
+        expect(message).toMatch(/permission denied|row-level security/i);
+      } else {
+        expect(rows).toEqual([]);
+      }
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'INSERT under system context succeeds',
+    async () => {
+      const keyId = `rls-forge-system-${runSuffix}`;
+      const result = await withSystemDbAccessContext(async () => {
+        return db
+          .insert(manifestSigningKeys)
+          .values({
+            keyId,
+            publicKeyB64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+            privateKeyEnc: 'enc:v1:forge',
+            status: 'retired',
+          })
+          .returning({ keyId: manifestSigningKeys.keyId });
+      });
+      expect(result).toHaveLength(1);
+      expect(result[0]!.keyId).toBe(keyId);
+      insertedKeyIds.push(keyId);
+    },
+  );
+});
+
+// ===========================================================================
+// manifest_signing_key_delegations RLS — system-only enforcement (Wave 6 T7)
+//
+// A row in this table AUTHORISES an agent to add a previously unseen manifest
+// signing key to its frozen trust set. Signature verification is the primary
+// defence (a forger needs the current signing private key), but the table must
+// still be unreachable from any tenant context: a tenant-writable delegation
+// table would let a partner-scoped token stage trust changes for the whole
+// deployment, and a tenant-readable one leaks the rotation schedule.
+//
+// The catalog test above only proves the table is in INTENTIONAL_UNSCOPED as
+// documentation. This block forges INSERT and SELECT as `breeze_app` under a
+// tenant context and asserts Postgres rejects both, then confirms the
+// system-context read/write/update path the service and rotation CLI rely on
+// still works. UPDATE is covered specifically because `activate` stamps
+// activated_at — if the WITH CHECK arm were missing or laxer than the USING
+// arm, a tenant context could mutate an existing delegation in place.
+// ===========================================================================
+describe('manifest_signing_key_delegations RLS — system-only enforcement (Wave 6 Task 7)', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const insertedEpochs: number[] = [];
+  // Epoch is UNIQUE deployment-wide, so derive a high, run-unique base rather
+  // than a fixed literal — otherwise a re-run collides with its own leftovers.
+  const epochBase = 900_000_000 + Math.floor(Math.random() * 1_000_000);
+
+  const tenantCtx = {
+    scope: 'organization' as const,
+    orgId: null,
+    accessibleOrgIds: [],
+    accessiblePartnerIds: [],
+    userId: null,
+  };
+
+  function delegationValues(epoch: number) {
+    return {
+      epoch,
+      oldKeyId: `rls-forge-old-${runSuffix}`,
+      newKeyId: `rls-forge-new-${runSuffix}`,
+      newPublicKeyB64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+      notBefore: new Date('2026-08-06T00:00:00Z'),
+      notAfter: new Date('2026-09-05T00:00:00Z'),
+      signatureB64: 'Zm9yZ2Vk',
+    };
+  }
+
+  afterAll(async () => {
+    if (insertedEpochs.length === 0) return;
+    await withSystemDbAccessContext(async () => {
+      for (const epoch of insertedEpochs) {
+        await db
+          .delete(manifestSigningKeyDelegations)
+          .where(eq(manifestSigningKeyDelegations.epoch, epoch));
+      }
+    });
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'has RLS enabled AND forced with exactly one system-only policy whose USING and WITH CHECK both require breeze.scope=system',
+    async () => {
+      const [rls] = (await db.execute(sql`
+        SELECT relrowsecurity AS enabled, relforcerowsecurity AS forced
+        FROM pg_class
+        WHERE relname = 'manifest_signing_key_delegations'
+      `)) as unknown as Array<{ enabled: boolean; forced: boolean }>;
+
+      expect(rls?.enabled).toBe(true);
+      expect(rls?.forced).toBe(true);
+
+      const policies = (await db.execute(sql`
+        SELECT policyname, qual, with_check
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename = 'manifest_signing_key_delegations'
+      `)) as unknown as Array<{
+        policyname: string;
+        qual: string | null;
+        with_check: string | null;
+      }>;
+
+      expect(policies).toHaveLength(1);
+      expect(policies[0]!.policyname).toBe(
+        'manifest_signing_key_delegations_system_only',
+      );
+      // BOTH arms. A USING-only policy would let a tenant context INSERT a
+      // delegation it cannot read back — i.e. forge one blind.
+      expect(policies[0]!.qual).toMatch(/breeze\.scope/);
+      expect(policies[0]!.qual).toMatch(/'system'/);
+      expect(policies[0]!.with_check).toMatch(/breeze\.scope/);
+      expect(policies[0]!.with_check).toMatch(/'system'/);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'INSERT as breeze_app under a tenant context is rejected by RLS',
+    async () => {
+      let caught: unknown;
+      try {
+        await withDbAccessContext(tenantCtx, async () =>
+          db
+            .insert(manifestSigningKeyDelegations)
+            .values(delegationValues(epochBase + 1)),
+        );
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeDefined();
+      const cause = caught as
+        | { cause?: { message?: string }; message?: string }
+        | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(
+        /row-level security|permission denied|new row violates row-level security/i,
+      );
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'SELECT as breeze_app under a tenant context returns zero rows',
+    async () => {
+      const epoch = epochBase + 2;
+      await withSystemDbAccessContext(async () => {
+        await db
+          .insert(manifestSigningKeyDelegations)
+          .values(delegationValues(epoch));
+      });
+      insertedEpochs.push(epoch);
+
+      let rows: unknown[] = [];
+      let err: unknown = null;
+      try {
+        rows = await withDbAccessContext(tenantCtx, async () =>
+          db
+            .select({ epoch: manifestSigningKeyDelegations.epoch })
+            .from(manifestSigningKeyDelegations),
+        );
+      } catch (e) {
+        err = e;
+      }
+
+      if (err) {
+        const cause = err as { cause?: { message?: string }; message?: string };
+        const message = cause?.cause?.message ?? cause?.message ?? '';
+        expect(message).toMatch(/permission denied|row-level security/i);
+      } else {
+        expect(rows).toEqual([]);
+      }
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'UPDATE as breeze_app under a tenant context affects zero rows (activation cannot be forged)',
+    async () => {
+      const epoch = epochBase + 3;
+      await withSystemDbAccessContext(async () => {
+        await db
+          .insert(manifestSigningKeyDelegations)
+          .values(delegationValues(epoch));
+      });
+      insertedEpochs.push(epoch);
+
+      try {
+        await withDbAccessContext(tenantCtx, async () =>
+          db
+            .update(manifestSigningKeyDelegations)
+            .set({ activatedAt: new Date() })
+            .where(eq(manifestSigningKeyDelegations.epoch, epoch)),
+        );
+      } catch {
+        // permission denied is an equally acceptable rejection surface.
+      }
+
+      // Whatever the surface, the row must be untouched.
+      const [row] = await withSystemDbAccessContext(async () =>
+        db
+          .select({ activatedAt: manifestSigningKeyDelegations.activatedAt })
+          .from(manifestSigningKeyDelegations)
+          .where(eq(manifestSigningKeyDelegations.epoch, epoch)),
+      );
+      expect(row?.activatedAt).toBeNull();
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'INSERT, SELECT and UPDATE under system context succeed (the prepare/activate path)',
+    async () => {
+      const epoch = epochBase + 4;
+
+      const inserted = await withSystemDbAccessContext(async () =>
+        db
+          .insert(manifestSigningKeyDelegations)
+          .values(delegationValues(epoch))
+          .returning({ epoch: manifestSigningKeyDelegations.epoch }),
+      );
+      expect(inserted).toHaveLength(1);
+      insertedEpochs.push(epoch);
+
+      const activatedAt = new Date('2026-08-07T00:00:00Z');
+      await withSystemDbAccessContext(async () =>
+        db
+          .update(manifestSigningKeyDelegations)
+          .set({ activatedAt })
+          .where(eq(manifestSigningKeyDelegations.epoch, epoch)),
+      );
+
+      const [row] = await withSystemDbAccessContext(async () =>
+        db
+          .select({
+            epoch: manifestSigningKeyDelegations.epoch,
+            activatedAt: manifestSigningKeyDelegations.activatedAt,
+          })
+          .from(manifestSigningKeyDelegations)
+          .where(eq(manifestSigningKeyDelegations.epoch, epoch)),
+      );
+      expect(row?.epoch).toBe(epoch);
+      expect(row?.activatedAt?.toISOString()).toBe(activatedAt.toISOString());
+    },
+  );
+
+  // Drizzle wraps pg errors: the thrown error's own `.message` is only
+  // "Failed query: insert into ...". The constraint name lives on `.cause`.
+  // Same unwrapping every other forge block in this file uses.
+  async function captureDbError(run: () => Promise<unknown>): Promise<string> {
+    let caught: unknown;
+    try {
+      await run();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeDefined();
+    const cause = caught as
+      | { cause?: { message?: string }; message?: string }
+      | undefined;
+    return cause?.cause?.message ?? cause?.message ?? '';
+  }
+
+  // Split from the inverted-window case deliberately: as one test, the first
+  // rejection short-circuits the rest of the body and the second constraint
+  // is never actually exercised.
+  it.runIf(!!process.env.DATABASE_URL)(
+    'rejects a duplicate epoch (storage-layer replay guard)',
+    async () => {
+      const epoch = epochBase + 5;
+      await withSystemDbAccessContext(async () =>
+        db
+          .insert(manifestSigningKeyDelegations)
+          .values(delegationValues(epoch)),
+      );
+      insertedEpochs.push(epoch);
+
+      const message = await captureDbError(() =>
+        withSystemDbAccessContext(async () =>
+          db
+            .insert(manifestSigningKeyDelegations)
+            .values(delegationValues(epoch)),
+        ),
+      );
+      expect(message).toMatch(/duplicate key|unique/i);
+      expect(message).toMatch(/manifest_signing_key_delegations_epoch/i);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'rejects an inverted validity window (window_chk)',
+    async () => {
+      const message = await captureDbError(() =>
+        withSystemDbAccessContext(async () =>
+          db.insert(manifestSigningKeyDelegations).values({
+            ...delegationValues(epochBase + 6),
+            notBefore: new Date('2026-09-05T00:00:00Z'),
+            notAfter: new Date('2026-08-06T00:00:00Z'),
+          }),
+        ),
+      );
+      expect(message).toMatch(
+        /manifest_signing_key_delegations_window_chk|check constraint/i,
+      );
+    },
+  );
+});
+
+// ===========================================================================
+// partner_abuse_signals RLS lockout
+//
+// The catalog test above only proves partner_abuse_signals is in
+// INTENTIONAL_UNSCOPED as documentation. It does NOT prove Postgres rejects
+// a tenant-scoped (non-system) caller's INSERT/SELECT. This block forges
+// both as `breeze_app`, including the specific threat this table exists to
+// prevent: a partner reading abuse signals about ITSELF via a partner-scoped
+// context whose accessiblePartnerIds includes the row's own partner_id. The
+// system-scope branch confirms the abuse-signals sweep write path
+// (services/abuseSignals/persistence.ts) still works.
+// ===========================================================================
+describe('partner_abuse_signals RLS — system-only enforcement', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const partnerSlug = `rls-abuse-signals-partner-${runSuffix}`;
+
+  let partnerId: string;
+  const insertedSignalIds: string[] = [];
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db
+        .insert(partners)
+        .values({
+          name: `RLS Abuse Signals Partner ${runSuffix}`,
+          slug: partnerSlug,
+          type: 'msp',
+          plan: 'pro',
+          status: 'active',
+        })
+        .returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for abuse-signals RLS forge test');
+      partnerId = partner.id;
+    });
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      for (const id of insertedSignalIds) {
+        await db.delete(partnerAbuseSignals).where(eq(partnerAbuseSignals.id, id));
+      }
+      if (partnerId) await db.delete(partners).where(eq(partners.id, partnerId));
+    });
+  });
+
+  // Build a tenant-scoped (partner) DbAccessContext. Under this context,
+  // breeze_app should be unable to touch partner_abuse_signals — the table
+  // has ENABLE + FORCE RLS and a single system-only policy
+  // (`partner_abuse_signals_system_only`, `USING current_setting
+  // ('breeze.scope', true) = 'system'`), so only a caller whose session has
+  // that GUC set to 'system' can read/write. `withSystemDbAccessContext`
+  // does NOT bypass RLS — it still runs as the unprivileged `breeze_app`
+  // role; it sets `breeze.scope = 'system'`, which is exactly what this
+  // policy checks.
+  function partnerContext(accessiblePartnerId: string) {
+    return {
+      scope: 'partner' as const,
+      orgId: null,
+      accessibleOrgIds: [],
+      accessiblePartnerIds: [accessiblePartnerId],
+      userId: null,
+    };
+  }
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'INSERT as breeze_app under a tenant (partner-scoped) context is rejected by RLS',
+    async () => {
+      await ensureFixtures();
+
+      let caught: unknown;
+      try {
+        await withDbAccessContext(partnerContext(partnerId), async () =>
+          db.insert(partnerAbuseSignals).values({
+            partnerId,
+            signalKey: `rls-forge-deny-${runSuffix}`,
+            severity: 'watch',
+            score: 1,
+            evidence: {},
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeDefined();
+      const cause = caught as
+        | { cause?: { message?: string }; message?: string }
+        | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(/row-level security|permission denied/i);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    "SELECT under a partner context matching the row's own partner_id returns zero rows",
+    async () => {
+      await ensureFixtures();
+
+      // Seed a row via system context so there's something the partner
+      // should fail to see — the specific threat this table exists to
+      // prevent: a partner reading abuse signals about itself.
+      const seededSignalKey = `rls-forge-seed-${runSuffix}`;
+      const seeded = await withSystemDbAccessContext(async () => {
+        return db
+          .insert(partnerAbuseSignals)
+          .values({
+            partnerId,
+            signalKey: seededSignalKey,
+            severity: 'alert',
+            score: 5,
+            evidence: { note: 'rls forge seed' },
+          })
+          .returning({ id: partnerAbuseSignals.id });
+      });
+      expect(seeded).toHaveLength(1);
+      insertedSignalIds.push(seeded[0]!.id);
+
+      // Now read under a partner context whose accessiblePartnerIds
+      // includes this exact partner — RLS with no permissive policy means
+      // the SELECT returns 0 rows OR Postgres throws permission denied.
+      let rows: unknown[] = [];
+      let err: unknown = null;
+      try {
+        rows = await withDbAccessContext(partnerContext(partnerId), async () =>
+          db
+            .select({ id: partnerAbuseSignals.id })
+            .from(partnerAbuseSignals)
+            .where(eq(partnerAbuseSignals.partnerId, partnerId)),
+        );
+      } catch (e) {
+        err = e;
+      }
+
+      if (err) {
+        const cause = err as
+          | { cause?: { message?: string }; message?: string };
+        const message = cause?.cause?.message ?? cause?.message ?? '';
+        expect(message).toMatch(/permission denied|row-level security/i);
+      } else {
+        expect(rows).toEqual([]);
+      }
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'withSystemDbAccessContext INSERT + SELECT round-trips successfully',
+    async () => {
+      await ensureFixtures();
+
+      const signalKey = `rls-forge-system-${runSuffix}`;
+      const result = await withSystemDbAccessContext(async () => {
+        return db
+          .insert(partnerAbuseSignals)
+          .values({
+            partnerId,
+            signalKey,
+            severity: 'info',
+            score: 0.5,
+            evidence: { note: 'system round-trip' },
+          })
+          .returning({ id: partnerAbuseSignals.id, signalKey: partnerAbuseSignals.signalKey });
+      });
+      expect(result).toHaveLength(1);
+      expect(result[0]!.signalKey).toBe(signalKey);
+      insertedSignalIds.push(result[0]!.id);
+
+      const readBack = await withSystemDbAccessContext(async () => {
+        return db
+          .select({ id: partnerAbuseSignals.id })
+          .from(partnerAbuseSignals)
+          .where(eq(partnerAbuseSignals.id, result[0]!.id));
+      });
+      expect(readBack).toHaveLength(1);
+    },
+  );
+});
+
+// ===========================================================================
+// abuse_script_hosts RLS lockout
+//
+// Mirrors the partner_abuse_signals block above: the catalog test only proves
+// abuse_script_hosts is in INTENTIONAL_UNSCOPED as documentation. This block
+// forges as `breeze_app` the specific threat this table exists to prevent —
+// a partner reading the cross-partner download-host corpus (which would
+// reveal what the operator correlates on), including its OWN rows via a
+// partner-scoped context. The system-scope branch confirms the script-content
+// scan write path (services/abuseSignals/scriptContent.ts) still works.
+// ===========================================================================
+describe('abuse_script_hosts RLS — system-only enforcement', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const partnerSlug = `rls-abuse-hosts-partner-${runSuffix}`;
+
+  let partnerId: string;
+  const insertedHostIds: string[] = [];
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db
+        .insert(partners)
+        .values({
+          name: `RLS Abuse Hosts Partner ${runSuffix}`,
+          slug: partnerSlug,
+          type: 'msp',
+          plan: 'pro',
+          status: 'active',
+        })
+        .returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for abuse-script-hosts RLS forge test');
+      partnerId = partner.id;
+    });
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      for (const id of insertedHostIds) {
+        await db.delete(abuseScriptHosts).where(eq(abuseScriptHosts.id, id));
+      }
+      if (partnerId) await db.delete(partners).where(eq(partners.id, partnerId));
+    });
+  });
+
+  function partnerContext(accessiblePartnerId: string) {
+    return {
+      scope: 'partner' as const,
+      orgId: null,
+      accessibleOrgIds: [],
+      accessiblePartnerIds: [accessiblePartnerId],
+      userId: null,
+    };
+  }
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'INSERT as breeze_app under a tenant (partner-scoped) context is rejected by RLS',
+    async () => {
+      await ensureFixtures();
+
+      let caught: unknown;
+      try {
+        await withDbAccessContext(partnerContext(partnerId), async () =>
+          db.insert(abuseScriptHosts).values({
+            partnerId,
+            host: `rls-forge-deny-${runSuffix}.invalid`,
+            source: 'script',
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeDefined();
+      const cause = caught as
+        | { cause?: { message?: string }; message?: string }
+        | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(/row-level security|permission denied/i);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    "SELECT under a partner context matching the row's own partner_id returns zero rows",
+    async () => {
+      await ensureFixtures();
+
+      const seededHost = `rls-forge-seed-${runSuffix}.invalid`;
+      const seeded = await withSystemDbAccessContext(async () => {
+        return db
+          .insert(abuseScriptHosts)
+          .values({ partnerId, host: seededHost, source: 'execution' })
+          .returning({ id: abuseScriptHosts.id });
+      });
+      expect(seeded).toHaveLength(1);
+      insertedHostIds.push(seeded[0]!.id);
+
+      let rows: unknown[] = [];
+      let err: unknown = null;
+      try {
+        rows = await withDbAccessContext(partnerContext(partnerId), async () =>
+          db
+            .select({ id: abuseScriptHosts.id })
+            .from(abuseScriptHosts)
+            .where(eq(abuseScriptHosts.partnerId, partnerId)),
+        );
+      } catch (e) {
+        err = e;
+      }
+
+      if (err) {
+        const cause = err as
+          | { cause?: { message?: string }; message?: string };
+        const message = cause?.cause?.message ?? cause?.message ?? '';
+        expect(message).toMatch(/permission denied|row-level security/i);
+      } else {
+        expect(rows).toEqual([]);
+      }
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'withSystemDbAccessContext INSERT + SELECT round-trips successfully',
+    async () => {
+      await ensureFixtures();
+
+      const host = `rls-forge-system-${runSuffix}.invalid`;
+      const result = await withSystemDbAccessContext(async () => {
+        return db
+          .insert(abuseScriptHosts)
+          .values({ partnerId, host, source: 'script' })
+          .returning({ id: abuseScriptHosts.id, host: abuseScriptHosts.host });
+      });
+      expect(result).toHaveLength(1);
+      expect(result[0]!.host).toBe(host);
+      insertedHostIds.push(result[0]!.id);
+
+      const readBack = await withSystemDbAccessContext(async () => {
+        return db
+          .select({ id: abuseScriptHosts.id })
+          .from(abuseScriptHosts)
+          .where(eq(abuseScriptHosts.id, result[0]!.id));
+      });
+      expect(readBack).toHaveLength(1);
+    },
+  );
+});
+
+// ===========================================================================
+// automation_runs — parent-FK join-policy forge test (Shape 7, findings F2/F3)
+//
+// The pg_catalog assertion above only proves a parent-join policy exists per
+// DML command. It does NOT prove Postgres actually hides another tenant's run.
+// automation_runs WAS the F2/F3 finding: no org_id, no RLS, and the
+// config-policy branch of GET /automations/runs/:runId returned the row with
+// no org check. This block forges cross-org reads/writes as `breeze_app` (the
+// unprivileged role) under real tenant contexts and asserts the new
+// EXISTS-join policy is enforced in practice — the durable backstop behind the
+// app-layer canAccessOrg fix in routes/automations.ts. Self-contained so it
+// runs under vitest.config.rls-coverage.ts (no setup.ts / no TRUNCATE):
+// fixtures are seeded via withSystemDbAccessContext and torn down by id.
+// ===========================================================================
+describe('automation_runs RLS — cross-org forge enforcement (Shape 7)', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  let partnerId: string;
+  let orgAId: string;
+  let orgBId: string;
+  let automationAId: string;
+  let runAId: string | null = null;
+  // Config-policy-driven run: automation_id is NULL, org reached via
+  // config_policy_id -> configuration_policies.org_id (the F2/F3 leak path).
+  let configPolicyAId: string;
+  let configRunAId: string | null = null;
+
+  // Org-scoped context granting access to exactly one org and nothing else,
+  // so no other policy can accidentally green-light a cross-org row.
+  function orgContext(orgId: string) {
+    return {
+      scope: 'organization' as const,
+      orgId,
+      accessibleOrgIds: [orgId],
+      accessiblePartnerIds: [],
+      userId: null,
+    };
+  }
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db
+        .insert(partners)
+        .values({
+          name: `RLS AutoRuns Partner ${runSuffix}`,
+          slug: `rls-autoruns-${runSuffix}`,
+          type: 'msp',
+          plan: 'pro',
+          status: 'active',
+        })
+        .returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for automation_runs forge');
+      partnerId = partner.id;
+
+      const [orgA, orgB] = await db
+        .insert(organizations)
+        .values([
+          { currencyCode: 'USD', partnerId: partner.id, name: 'RLS AutoRuns Org A', slug: `rls-autoruns-a-${runSuffix}` },
+          { currencyCode: 'USD', partnerId: partner.id, name: 'RLS AutoRuns Org B', slug: `rls-autoruns-b-${runSuffix}` },
+        ])
+        .returning({ id: organizations.id });
+      if (!orgA || !orgB) throw new Error('failed to seed orgs for automation_runs forge');
+      orgAId = orgA.id;
+      orgBId = orgB.id;
+
+      const [automationA] = await db
+        .insert(automations)
+        .values({
+          orgId: orgA.id,
+          name: 'Org A automation',
+          trigger: { type: 'manual' },
+          actions: [],
+        })
+        .returning({ id: automations.id });
+      if (!automationA) throw new Error('failed to seed automation for automation_runs forge');
+      automationAId = automationA.id;
+
+      const [runA] = await db
+        .insert(automationRuns)
+        .values({
+          automationId: automationA.id,
+          triggeredBy: 'rls-forge-test',
+          status: 'completed',
+        })
+        .returning({ id: automationRuns.id });
+      if (!runA) throw new Error('failed to seed automation_run for forge');
+      runAId = runA.id;
+
+      // Config-policy-driven run flavor (automation_id NULL): reaches its org
+      // only via config_policy_id -> configuration_policies.org_id.
+      const [policyA] = await db
+        .insert(configurationPolicies)
+        .values({ orgId: orgA.id, name: 'Org A config policy' })
+        .returning({ id: configurationPolicies.id });
+      if (!policyA) throw new Error('failed to seed configuration_policy for forge');
+      configPolicyAId = policyA.id;
+
+      const [configRunA] = await db
+        .insert(automationRuns)
+        .values({
+          configPolicyId: policyA.id, // automationId intentionally left NULL
+          configItemName: 'Org A config item',
+          triggeredBy: 'rls-forge-test',
+          status: 'completed',
+        })
+        .returning({ id: automationRuns.id });
+      if (!configRunA) throw new Error('failed to seed config-policy automation_run for forge');
+      configRunAId = configRunA.id;
+    });
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      // Delete runs by automation_id (not just the seeded runAId) so a stray
+      // run from a forged INSERT — which exists only when RLS is NOT yet
+      // enforcing, i.e. a failing pre-migration run — can't block the parent
+      // automation delete via FK.
+      if (automationAId) {
+        await db.delete(automationRuns).where(eq(automationRuns.automationId, automationAId));
+      }
+      if (automationAId) await db.delete(automations).where(eq(automations.id, automationAId));
+      // Config-policy runs (automation_id NULL) aren't caught by the automationId
+      // delete above; clear them + the policy before deleting the org (FK order).
+      if (configPolicyAId) {
+        await db.delete(automationRuns).where(eq(automationRuns.configPolicyId, configPolicyAId));
+        await db.delete(configurationPolicies).where(eq(configurationPolicies.id, configPolicyAId));
+      }
+      if (orgAId) await db.delete(organizations).where(eq(organizations.id, orgAId));
+      if (orgBId) await db.delete(organizations).where(eq(organizations.id, orgBId));
+      if (partnerId) await db.delete(partners).where(eq(partners.id, partnerId));
+    });
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'org A (owner) can SELECT its own automation_run via the parent-join policy',
+    async () => {
+      await ensureFixtures();
+      const rows = await withDbAccessContext(orgContext(orgAId), async () =>
+        db
+          .select({ id: automationRuns.id })
+          .from(automationRuns)
+          .where(eq(automationRuns.id, runAId!)),
+      );
+      expect(rows.map((r) => r.id)).toEqual([runAId]);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    "org B cannot SELECT org A's automation_run (RLS hides it — the F2/F3 leak)",
+    async () => {
+      await ensureFixtures();
+      if (!runAId) throw new Error('seed test must run first');
+      const rows = await withDbAccessContext(orgContext(orgBId), async () =>
+        db
+          .select({ id: automationRuns.id })
+          .from(automationRuns)
+          .where(eq(automationRuns.id, runAId!)),
+      );
+      expect(rows).toEqual([]);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    "org B INSERT referencing org A's automation is rejected by WITH CHECK",
+    async () => {
+      await ensureFixtures();
+      let caught: unknown;
+      try {
+        await withDbAccessContext(orgContext(orgBId), async () =>
+          db.insert(automationRuns).values({
+            automationId: automationAId, // forging a run under another tenant's automation
+            triggeredBy: 'rls-forge-test-crossorg',
+            status: 'running',
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(
+        /new row violates row-level security policy for table "automation_runs"/,
+      );
+    },
+  );
+
+  // --- config-policy-driven runs (automation_id NULL) — the F2/F3 branch ---
+  it.runIf(!!process.env.DATABASE_URL)(
+    'org A can SELECT its config-policy automation_run (config_policy_id reach)',
+    async () => {
+      await ensureFixtures();
+      const rows = await withDbAccessContext(orgContext(orgAId), async () =>
+        db
+          .select({ id: automationRuns.id })
+          .from(automationRuns)
+          .where(eq(automationRuns.id, configRunAId!)),
+      );
+      expect(rows.map((r) => r.id)).toEqual([configRunAId]);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    "org B cannot SELECT org A's config-policy automation_run (RLS hides it)",
+    async () => {
+      await ensureFixtures();
+      if (!configRunAId) throw new Error('seed test must run first');
+      const rows = await withDbAccessContext(orgContext(orgBId), async () =>
+        db
+          .select({ id: automationRuns.id })
+          .from(automationRuns)
+          .where(eq(automationRuns.id, configRunAId!)),
+      );
+      expect(rows).toEqual([]);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    "org B INSERT referencing org A's config policy is rejected by WITH CHECK",
+    async () => {
+      await ensureFixtures();
+      let caught: unknown;
+      try {
+        await withDbAccessContext(orgContext(orgBId), async () =>
+          db.insert(automationRuns).values({
+            configPolicyId: configPolicyAId, // forging a run under another tenant's config policy
+            configItemName: 'forged',
+            triggeredBy: 'rls-forge-test-crossorg-cp',
+            status: 'running',
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(
+        /new row violates row-level security policy for table "automation_runs"/,
+      );
+    },
+  );
+});
+
+// ===========================================================================
+// script_execution_batches RLS — denormalized org_id (2026-05-31 review fix)
+//
+// Batches carry a denormalized org_id (the executing org), so the policy is a
+// direct breeze_has_org_access(org_id) — no nested-RLS join through the
+// nullable-org `scripts` parent. This forge proves the two things the nested
+// `is_system` join FAILED at under the production driver's bound-parameter
+// INSERTs: (a) a tenant CAN insert a batch for a SYSTEM script under tenant
+// context (org_id = its own org), and (b) cross-org isolation holds — org B
+// cannot read org A's batch, and a forged cross-org INSERT is rejected.
+// ===========================================================================
+describe('script_execution_batches RLS — denormalized org_id', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  let partnerId: string;
+  let orgAId: string;
+  let orgBId: string;
+  let systemScriptId: string;
+  let batchAId: string | null = null;
+
+  function orgContext(orgId: string) {
+    return {
+      scope: 'organization' as const,
+      orgId,
+      accessibleOrgIds: [orgId],
+      accessiblePartnerIds: [],
+      userId: null,
+    };
+  }
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db
+        .insert(partners)
+        .values({
+          name: `RLS Batches Partner ${runSuffix}`,
+          slug: `rls-batches-${runSuffix}`,
+          type: 'msp',
+          plan: 'pro',
+          status: 'active',
+        })
+        .returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for batches forge');
+      partnerId = partner.id;
+
+      const [orgA, orgB] = await db
+        .insert(organizations)
+        .values([
+          { currencyCode: 'USD', partnerId: partner.id, name: 'RLS Batches Org A', slug: `rls-batches-a-${runSuffix}` },
+          { currencyCode: 'USD', partnerId: partner.id, name: 'RLS Batches Org B', slug: `rls-batches-b-${runSuffix}` },
+        ])
+        .returning({ id: organizations.id });
+      if (!orgA || !orgB) throw new Error('failed to seed orgs for batches forge');
+      orgAId = orgA.id;
+      orgBId = orgB.id;
+
+      // A SYSTEM script (org_id NULL, is_system) — the case the nested-RLS join
+      // could not handle. With denormalization the batch (not the script) holds
+      // the executing org.
+      const [systemScript] = await db
+        .insert(scripts)
+        .values({
+          orgId: null,
+          isSystem: true,
+          name: 'System script',
+          osTypes: ['windows'],
+          language: 'powershell',
+          content: 'echo sys',
+        })
+        .returning({ id: scripts.id });
+      if (!systemScript) throw new Error('failed to seed system script for batches forge');
+      systemScriptId = systemScript.id;
+    });
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      if (systemScriptId) await db.delete(scriptExecutionBatches).where(eq(scriptExecutionBatches.scriptId, systemScriptId));
+      if (systemScriptId) await db.delete(scripts).where(eq(scripts.id, systemScriptId));
+      if (orgAId) await db.delete(organizations).where(eq(organizations.id, orgAId));
+      if (orgBId) await db.delete(organizations).where(eq(organizations.id, orgBId));
+      if (partnerId) await db.delete(partners).where(eq(partners.id, partnerId));
+    });
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'org A CAN INSERT a batch for a system script under tenant context (denormalized org_id; bound-parameter INSERT now works)',
+    async () => {
+      await ensureFixtures();
+      const inserted = await withDbAccessContext(orgContext(orgAId), async () =>
+        db
+          .insert(scriptExecutionBatches)
+          .values({ scriptId: systemScriptId, orgId: orgAId, devicesTargeted: 2, status: 'pending' })
+          .returning({ id: scriptExecutionBatches.id }),
+      );
+      expect(inserted).toHaveLength(1);
+      batchAId = inserted[0]!.id;
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    "org A SELECTs its own batch; org B cannot (cross-org isolation)",
+    async () => {
+      await ensureFixtures();
+      if (!batchAId) throw new Error('insert test must run first');
+      const a = await withDbAccessContext(orgContext(orgAId), async () =>
+        db.select({ id: scriptExecutionBatches.id }).from(scriptExecutionBatches).where(eq(scriptExecutionBatches.id, batchAId!)),
+      );
+      expect(a.map((r) => r.id)).toEqual([batchAId]);
+      const b = await withDbAccessContext(orgContext(orgBId), async () =>
+        db.select({ id: scriptExecutionBatches.id }).from(scriptExecutionBatches).where(eq(scriptExecutionBatches.id, batchAId!)),
+      );
+      expect(b).toEqual([]);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    "org B INSERT with org_id = org A is rejected by WITH CHECK",
+    async () => {
+      await ensureFixtures();
+      let caught: unknown;
+      try {
+        await withDbAccessContext(orgContext(orgBId), async () =>
+          db.insert(scriptExecutionBatches).values({ scriptId: systemScriptId, orgId: orgAId, devicesTargeted: 2, status: 'pending' }),
+        );
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(/new row violates row-level security policy for table "script_execution_batches"/);
+    },
+  );
+});
+
+// ===========================================================================
+// scripts RLS — partner-wide cross-partner forge enforcement (dual-axis)
+//
+// The pg_catalog assertion for the PARTNER_TENANT_TABLES list proves that
+// a policy referencing breeze_has_partner_access exists per DML command.
+// It does NOT prove Postgres actually rejects a cross-partner write — a
+// missing second axis (the custom_field_definitions blind spot) would pass
+// the catalog check but silently let partner B act on partner A's partner-
+// wide scripts. This block forges cross-partner reads/writes as `breeze_app`
+// under real partner contexts and asserts the dual-axis policy is enforced
+// in practice. Self-contained (no setup.ts / no TRUNCATE): fixtures seeded
+// via withSystemDbAccessContext and torn down by id in an afterAll.
+// ===========================================================================
+describe('scripts RLS — partner-wide cross-partner forge enforcement (dual-axis)', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let partnerAId: string;
+  let partnerBId: string;
+  // An organization owned by partner A. Used to prove that an ORGANIZATION-
+  // scope user (accessiblePartnerIds === []) can still READ partner A's
+  // partner-wide scripts via the read-only own-partner branch
+  // (breeze_current_partner_id), without gaining write access.
+  let orgInPartnerAId: string;
+  let scriptAId: string | null = null;
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerAId) return;
+    await withSystemDbAccessContext(async () => {
+      const seeded = await db.insert(partners).values([
+        { name: `RLS Scripts A ${runSuffix}`, slug: `rls-scripts-a-${runSuffix}`, type: 'msp', plan: 'pro', status: 'active' },
+        { name: `RLS Scripts B ${runSuffix}`, slug: `rls-scripts-b-${runSuffix}`, type: 'msp', plan: 'pro', status: 'active' },
+      ]).returning({ id: partners.id });
+      partnerAId = seeded[0]!.id;
+      partnerBId = seeded[1]!.id;
+
+      const [org] = await db.insert(organizations).values({
+        currencyCode: 'USD',
+        partnerId: partnerAId,
+        name: `RLS Scripts Org ${runSuffix}`,
+        slug: `rls-scripts-org-${runSuffix}`,
+      }).returning({ id: organizations.id });
+      orgInPartnerAId = org!.id;
+    });
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      if (scriptAId) await db.delete(scripts).where(eq(scripts.id, scriptAId!));
+      if (orgInPartnerAId) await db.delete(organizations).where(eq(organizations.id, orgInPartnerAId));
+      if (partnerAId) await db.delete(partners).where(eq(partners.id, partnerAId));
+      if (partnerBId) await db.delete(partners).where(eq(partners.id, partnerBId));
+    });
+  });
+
+  function partnerContext(partnerId: string) {
+    return { scope: 'partner' as const, orgId: null, accessibleOrgIds: [], accessiblePartnerIds: [partnerId], userId: null };
+  }
+
+  // ORGANIZATION-scope context: accessiblePartnerIds is [] (no partner-axis
+  // WRITE/admin), but currentPartnerId = the caller's OWN partner so the
+  // read-only own-partner branch of the SELECT policy applies.
+  function orgContext(orgId: string, ownPartnerId: string | null) {
+    return {
+      scope: 'organization' as const,
+      orgId,
+      accessibleOrgIds: [orgId],
+      accessiblePartnerIds: [],
+      currentPartnerId: ownPartnerId,
+      userId: null,
+    };
+  }
+
+  it('partner A can INSERT and SELECT a partner-wide (org_id NULL) script', async () => {
+    await ensureFixtures();
+    const inserted = await withDbAccessContext(partnerContext(partnerAId), async () =>
+      db.insert(scripts).values({
+        orgId: null, partnerId: partnerAId, name: `forge-${runSuffix}`,
+        osTypes: ['windows'], language: 'powershell', content: 'echo hi',
+      }).returning({ id: scripts.id })
+    );
+    expect(inserted).toHaveLength(1);
+    scriptAId = inserted[0]!.id;
+
+    const visibleToA = await withDbAccessContext(partnerContext(partnerAId), async () =>
+      db.select({ id: scripts.id }).from(scripts).where(eq(scripts.id, scriptAId!))
+    );
+    expect(visibleToA.map((r) => r.id)).toEqual([scriptAId]);
+  });
+
+  it('partner B cannot SELECT partner A\'s partner-wide script', async () => {
+    await ensureFixtures();
+    if (!scriptAId) throw new Error('seed test must run first');
+    const visibleToB = await withDbAccessContext(partnerContext(partnerBId), async () =>
+      db.select({ id: scripts.id }).from(scripts).where(eq(scripts.id, scriptAId!))
+    );
+    expect(visibleToB).toEqual([]);
+  });
+
+  it('partner B INSERT forging partner A\'s partner_id is rejected by WITH CHECK', async () => {
+    await ensureFixtures();
+    let caught: unknown;
+    try {
+      await withDbAccessContext(partnerContext(partnerBId), async () =>
+        db.insert(scripts).values({
+          orgId: null, partnerId: partnerAId, name: `forge-x-${runSuffix}`,
+          osTypes: ['windows'], language: 'powershell', content: 'echo x',
+        })
+      );
+    } catch (err) { caught = err; }
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/new row violates row-level security policy for table "scripts"/);
+  });
+
+  // --- read-only own-partner branch: an ORGANIZATION-scope user (no partner-
+  // axis write access) can SEE + EXECUTE its MSP's partner-wide scripts but
+  // cannot edit them, and a different partner's org user still cannot see them.
+  it('org user in partner A CAN SELECT partner A\'s partner-wide script (read branch)', async () => {
+    await ensureFixtures();
+    if (!scriptAId) throw new Error('seed test must run first');
+    const visible = await withDbAccessContext(orgContext(orgInPartnerAId, partnerAId), async () =>
+      db.select({ id: scripts.id }).from(scripts).where(eq(scripts.id, scriptAId!))
+    );
+    expect(visible.map((r) => r.id)).toEqual([scriptAId]);
+  });
+
+  it('org user in partner A UPDATE on the partner-wide script affects 0 rows (write policy unchanged)', async () => {
+    await ensureFixtures();
+    if (!scriptAId) throw new Error('seed test must run first');
+    // USING on the UPDATE policy does NOT include the read branch, so the row
+    // is invisible to the write path and the UPDATE matches nothing.
+    const updated = await withDbAccessContext(orgContext(orgInPartnerAId, partnerAId), async () =>
+      db.update(scripts).set({ name: `edited-by-org-${runSuffix}` }).where(eq(scripts.id, scriptAId!)).returning({ id: scripts.id })
+    );
+    expect(updated).toEqual([]);
+
+    // And the row is untouched.
+    const after = await withDbAccessContext(partnerContext(partnerAId), async () =>
+      db.select({ name: scripts.name }).from(scripts).where(eq(scripts.id, scriptAId!))
+    );
+    expect(after[0]?.name).toBe(`forge-${runSuffix}`);
+  });
+
+  it('org user in partner A forging a partner-wide INSERT is rejected by WITH CHECK (write policy unchanged)', async () => {
+    await ensureFixtures();
+    let caught: unknown;
+    try {
+      await withDbAccessContext(orgContext(orgInPartnerAId, partnerAId), async () =>
+        db.insert(scripts).values({
+          orgId: null, partnerId: partnerAId, name: `org-forge-${runSuffix}`,
+          osTypes: ['windows'], language: 'powershell', content: 'echo org',
+        })
+      );
+    } catch (err) { caught = err; }
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/new row violates row-level security policy for table "scripts"/);
+  });
+
+  it('org user whose own partner is B CANNOT SELECT partner A\'s partner-wide script (cross-partner isolation)', async () => {
+    await ensureFixtures();
+    if (!scriptAId) throw new Error('seed test must run first');
+    // Same org row, but currentPartnerId points at partner B — the read branch
+    // (org_id IS NULL AND partner_id = current_partner_id) does not match.
+    const visible = await withDbAccessContext(orgContext(orgInPartnerAId, partnerBId), async () =>
+      db.select({ id: scripts.id }).from(scripts).where(eq(scripts.id, scriptAId!))
+    );
+    expect(visible).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// invoices — shape 1 (direct/denormalized org_id) forge test
+// ---------------------------------------------------------------------------
+// invoices, invoice_lines, invoice_payments all carry a direct org_id column
+// and are auto-discovered by the coverage scan above. This block forges a
+// cross-org INSERT and SELECT as `breeze_app` (the unprivileged role) to prove
+// the WITH CHECK / USING predicates actually contain a hostile write/read.
+describe('invoices RLS forge (shape 1, org-axis)', () => {
+  const runSuffix = Math.random().toString(36).slice(2, 8);
+  let partnerId = '';
+  let orgAId = '';
+  let orgBId = '';
+
+  function orgContext(orgId: string) {
+    return { scope: 'organization' as const, orgId, accessibleOrgIds: [orgId], accessiblePartnerIds: [], userId: null };
+  }
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db.insert(partners).values({
+        name: `RLS Invoices Partner ${runSuffix}`, slug: `rls-invoices-${runSuffix}`,
+        type: 'msp', plan: 'pro', status: 'active'
+      }).returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for invoices forge');
+      partnerId = partner.id;
+      const [orgA, orgB] = await db.insert(organizations).values([
+        { currencyCode: 'USD', partnerId: partner.id, name: 'RLS Invoices Org A', slug: `rls-inv-a-${runSuffix}` },
+        { currencyCode: 'USD', partnerId: partner.id, name: 'RLS Invoices Org B', slug: `rls-inv-b-${runSuffix}` }
+      ]).returning({ id: organizations.id });
+      if (!orgA || !orgB) throw new Error('failed to seed orgs for invoices forge');
+      orgAId = orgA.id; orgBId = orgB.id;
+    });
+  }
+
+  it.runIf(!!process.env.DATABASE_URL)('org B INSERT with org A org_id is rejected by WITH CHECK', async () => {
+    await ensureFixtures();
+    let caught: unknown;
+    try {
+      await withDbAccessContext(orgContext(orgBId), async () =>
+        db.insert(invoices).values({ partnerId, orgId: orgAId, status: 'draft', currencyCode: 'USD' })
+      );
+    } catch (err) { caught = err; }
+    expect(caught).toBeDefined();
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/new row violates row-level security policy for table "invoices"/);
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)("org B cannot SELECT org A's invoice", async () => {
+    await ensureFixtures();
+    let createdId = '';
+    await withSystemDbAccessContext(async () => {
+      const [inv] = await db.insert(invoices).values({ partnerId, orgId: orgAId, status: 'draft', currencyCode: 'USD' }).returning({ id: invoices.id });
+      createdId = inv!.id;
+    });
+    const visible = await withDbAccessContext(orgContext(orgBId), async () =>
+      db.select({ id: invoices.id }).from(invoices).where(eq(invoices.id, createdId))
+    );
+    expect(visible).toHaveLength(0);
+  });
+
+  // Defense-in-depth: the composite FK invoice_lines(invoice_id, org_id) →
+  // invoices(id, org_id) must reject a line whose denormalized org_id disagrees
+  // with its parent invoice's org_id. Run in SYSTEM context so RLS is bypassed
+  // and the FK is unambiguously what rejects the write.
+  it.runIf(!!process.env.DATABASE_URL)('invoice line with mismatched org_id is rejected by the composite FK', async () => {
+    await ensureFixtures();
+    // Create the parent invoice (orgA) in its own system-context transaction so
+    // it is committed before we attempt the forged line.
+    let invoiceId = '';
+    await withSystemDbAccessContext(async () => {
+      const [inv] = await db.insert(invoices).values({ partnerId, orgId: orgAId, status: 'draft', currencyCode: 'USD' }).returning({ id: invoices.id });
+      invoiceId = inv!.id;
+    });
+    // The FK violation aborts the surrounding transaction, so postgres.js may
+    // surface the error at commit time — catch around the whole context call.
+    let caught: unknown;
+    try {
+      await withSystemDbAccessContext(async () =>
+        // invoice belongs to orgA, but we forge a line claiming orgB.
+        db.insert(invoiceLines).values({
+          invoiceId, orgId: orgBId, sourceType: 'manual',
+          description: 'forged mismatched-org line', quantity: '1', unitPrice: '0'
+        })
+      );
+    } catch (err) { caught = err; }
+    expect(caught).toBeDefined();
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/violates foreign key constraint|invoice_lines_invoice_org_fkey/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// contracts, contract_lines, contract_billing_periods — shape 1 (direct org_id)
+// ---------------------------------------------------------------------------
+// All three tables carry a direct org_id column and are auto-discovered by the
+// coverage scan above. This block forges cross-org INSERTs and SELECTs as
+// `breeze_app` (the unprivileged role) to prove the WITH CHECK / USING
+// predicates actually reject hostile writes/reads. Self-contained: fixtures
+// are seeded via withSystemDbAccessContext (no setup.ts TRUNCATE here).
+describe('contracts RLS forge (shape 1, org-axis)', () => {
+  const runSuffix = Math.random().toString(36).slice(2, 8);
+  let partnerId = '';
+  let orgAId = '';
+  let orgBId = '';
+  // Org-A contract seeded for line/period cross-org attempts.
+  let contractAId = '';
+
+  function orgContext(orgId: string) {
+    return { scope: 'organization' as const, orgId, accessibleOrgIds: [orgId], accessiblePartnerIds: [], userId: null };
+  }
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db.insert(partners).values({
+        name: `RLS Contracts Partner ${runSuffix}`, slug: `rls-contracts-${runSuffix}`,
+        type: 'msp', plan: 'pro', status: 'active'
+      }).returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for contracts forge');
+      partnerId = partner.id;
+      const [orgA, orgB] = await db.insert(organizations).values([
+        { currencyCode: 'USD', partnerId: partner.id, name: 'RLS Contracts Org A', slug: `rls-ctr-a-${runSuffix}` },
+        { currencyCode: 'USD', partnerId: partner.id, name: 'RLS Contracts Org B', slug: `rls-ctr-b-${runSuffix}` }
+      ]).returning({ id: organizations.id });
+      if (!orgA || !orgB) throw new Error('failed to seed orgs for contracts forge');
+      orgAId = orgA.id; orgBId = orgB.id;
+      // Seed an org-A contract so we can hang line/period cross-org attempts on it.
+      const [c] = await db.insert(contracts).values({
+        partnerId: partner.id, orgId: orgAId, name: 'forge-seed',
+        intervalMonths: 1, startDate: '2026-07-01', currencyCode: 'USD'
+      }).returning({ id: contracts.id });
+      if (!c) throw new Error('failed to seed contract for contracts forge');
+      contractAId = c.id;
+    });
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      if (contractAId) await db.delete(contracts).where(eq(contracts.id, contractAId));
+      if (orgAId) await db.delete(organizations).where(eq(organizations.id, orgAId));
+      if (orgBId) await db.delete(organizations).where(eq(organizations.id, orgBId));
+      if (partnerId) await db.delete(partners).where(eq(partners.id, partnerId));
+    });
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)('org B INSERT with org A org_id is rejected by WITH CHECK (contracts)', async () => {
+    await ensureFixtures();
+    let caught: unknown;
+    try {
+      await withDbAccessContext(orgContext(orgBId), async () =>
+        db.insert(contracts).values({
+          partnerId, orgId: orgAId, name: 'forge-crossorg',
+          intervalMonths: 1, startDate: '2026-07-01', currencyCode: 'USD'
+        })
+      );
+    } catch (err) { caught = err; }
+    expect(caught).toBeDefined();
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/new row violates row-level security policy for table "contracts"/);
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)("org B cannot SELECT org A's contract", async () => {
+    await ensureFixtures();
+    const visible = await withDbAccessContext(orgContext(orgBId), async () =>
+      db.select({ id: contracts.id }).from(contracts).where(eq(contracts.id, contractAId))
+    );
+    expect(visible).toHaveLength(0);
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)('org B INSERT with org A org_id is rejected by WITH CHECK (contract_lines)', async () => {
+    await ensureFixtures();
+    let caught: unknown;
+    try {
+      await withDbAccessContext(orgContext(orgBId), async () =>
+        db.insert(contractLines).values({
+          contractId: contractAId, orgId: orgAId,
+          lineType: 'flat', description: 'forge-crossorg', unitPrice: '0'
+        })
+      );
+    } catch (err) { caught = err; }
+    expect(caught).toBeDefined();
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/new row violates row-level security policy for table "contract_lines"/);
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)('org B INSERT with org A org_id is rejected by WITH CHECK (contract_billing_periods)', async () => {
+    await ensureFixtures();
+    let caught: unknown;
+    try {
+      await withDbAccessContext(orgContext(orgBId), async () =>
+        db.insert(contractBillingPeriods).values({
+          contractId: contractAId, orgId: orgAId,
+          periodStart: '2026-07-01', periodEnd: '2026-08-01'
+        })
+      );
+    } catch (err) { caught = err; }
+    expect(caught).toBeDefined();
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/new row violates row-level security policy for table "contract_billing_periods"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// invoice_documents — shape 1 (direct/denormalized org_id) forge test (Phase 5)
+// ---------------------------------------------------------------------------
+// invoice_documents carries a direct org_id column (denormalized RLS axis) and
+// is auto-discovered by the coverage scan above. This block forges a cross-org
+// INSERT and SELECT as `breeze_app` to prove the policies contain a hostile
+// write/read, mirroring the invoices forge.
+describe('invoice_documents RLS forge (shape 1, org-axis)', () => {
+  const runSuffix = Math.random().toString(36).slice(2, 8);
+  let partnerId = '';
+  let orgAId = '';
+  let orgBId = '';
+  let invoiceAId = '';
+
+  function orgContext(orgId: string) {
+    return { scope: 'organization' as const, orgId, accessibleOrgIds: [orgId], accessiblePartnerIds: [], userId: null };
+  }
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db.insert(partners).values({
+        name: `RLS InvDocs Partner ${runSuffix}`, slug: `rls-invdocs-${runSuffix}`,
+        type: 'msp', plan: 'pro', status: 'active'
+      }).returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for invoice_documents forge');
+      partnerId = partner.id;
+      const [orgA, orgB] = await db.insert(organizations).values([
+        { currencyCode: 'USD', partnerId: partner.id, name: 'RLS InvDocs Org A', slug: `rls-invdocs-a-${runSuffix}` },
+        { currencyCode: 'USD', partnerId: partner.id, name: 'RLS InvDocs Org B', slug: `rls-invdocs-b-${runSuffix}` }
+      ]).returning({ id: organizations.id });
+      if (!orgA || !orgB) throw new Error('failed to seed orgs for invoice_documents forge');
+      orgAId = orgA.id; orgBId = orgB.id;
+      const [inv] = await db.insert(invoices).values({ partnerId, orgId: orgAId, status: 'draft', currencyCode: 'USD' }).returning({ id: invoices.id });
+      invoiceAId = inv!.id;
+    });
+  }
+
+  it.runIf(!!process.env.DATABASE_URL)("org B cannot INSERT a document for org A's invoice", async () => {
+    await ensureFixtures();
+    let caught: unknown;
+    try {
+      await withDbAccessContext(orgContext(orgBId), async () =>
+        db.insert(invoiceDocuments).values({
+          invoiceId: invoiceAId, orgId: orgAId, pdf: Buffer.from('%PDF-forged'), sha256: 'a'.repeat(64)
+        })
+      );
+    } catch (err) { caught = err; }
+    expect(caught).toBeDefined();
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/new row violates row-level security policy for table "invoice_documents"/);
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)("org B cannot SELECT org A's invoice document", async () => {
+    await ensureFixtures();
+    let createdId = '';
+    await withSystemDbAccessContext(async () => {
+      const [doc] = await db.insert(invoiceDocuments).values({
+        invoiceId: invoiceAId, orgId: orgAId, pdf: Buffer.from('%PDF-stored'), sha256: 'b'.repeat(64)
+      }).returning({ id: invoiceDocuments.id });
+      createdId = doc!.id;
+    });
+    const visible = await withDbAccessContext(orgContext(orgBId), async () =>
+      db.select({ id: invoiceDocuments.id }).from(invoiceDocuments).where(eq(invoiceDocuments.id, createdId))
+    );
+    expect(visible).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ml_feedback_events — shape 1 (direct org_id) forge test
+// ---------------------------------------------------------------------------
+// ml_feedback_events is the canonical append-only ML label table. It carries a
+// direct org_id and is auto-discovered by the coverage scan above; this block
+// proves hostile cross-org INSERT/SELECT attempts are blocked under breeze_app.
+describe('ml_feedback_events RLS forge (shape 1, org-axis)', () => {
+  const runSuffix = Math.random().toString(36).slice(2, 8);
+  let partnerId = '';
+  let orgAId = '';
+  let orgBId = '';
+
+  function orgContext(orgId: string) {
+    return { scope: 'organization' as const, orgId, accessibleOrgIds: [orgId], accessiblePartnerIds: [], userId: null };
+  }
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db.insert(partners).values({
+        name: `RLS ML Feedback Partner ${runSuffix}`, slug: `rls-ml-feedback-${runSuffix}`,
+        type: 'msp', plan: 'pro', status: 'active'
+      }).returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for ml_feedback_events forge');
+      partnerId = partner.id;
+      const [orgA, orgB] = await db.insert(organizations).values([
+        { currencyCode: 'USD', partnerId: partner.id, name: 'RLS ML Feedback Org A', slug: `rls-ml-feedback-a-${runSuffix}` },
+        { currencyCode: 'USD', partnerId: partner.id, name: 'RLS ML Feedback Org B', slug: `rls-ml-feedback-b-${runSuffix}` }
+      ]).returning({ id: organizations.id });
+      if (!orgA || !orgB) throw new Error('failed to seed orgs for ml_feedback_events forge');
+      orgAId = orgA.id; orgBId = orgB.id;
+    });
+  }
+
+  it.runIf(!!process.env.DATABASE_URL)('org B INSERT with org A org_id is rejected by WITH CHECK', async () => {
+    await ensureFixtures();
+    let caught: unknown;
+    try {
+      await withDbAccessContext(orgContext(orgBId), async () =>
+        db.insert(mlFeedbackEvents).values({
+          orgId: orgAId,
+          sourceType: 'alert',
+          sourceId: `alert-${runSuffix}`,
+          eventType: 'alert.acknowledged',
+          outcome: 'acknowledged',
+          metadata: {},
+          occurredAt: new Date('2026-06-18T12:00:00.000Z'),
+        })
+      );
+    } catch (err) { caught = err; }
+    expect(caught).toBeDefined();
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message).toMatch(/new row violates row-level security policy for table "ml_feedback_events"/);
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)("org B cannot SELECT org A's feedback event", async () => {
+    await ensureFixtures();
+    let createdId = '';
+    await withSystemDbAccessContext(async () => {
+      const [event] = await db.insert(mlFeedbackEvents).values({
+        orgId: orgAId,
+        sourceType: 'alert',
+        sourceId: `alert-visible-${runSuffix}`,
+        eventType: 'alert.resolved',
+        outcome: 'resolved',
+        metadata: {},
+        occurredAt: new Date('2026-06-18T12:01:00.000Z'),
+      }).returning({ id: mlFeedbackEvents.id });
+      createdId = event!.id;
+    });
+    const visible = await withDbAccessContext(orgContext(orgBId), async () =>
+      db.select({ id: mlFeedbackEvents.id }).from(mlFeedbackEvents).where(eq(mlFeedbackEvents.id, createdId))
+    );
+    expect(visible).toHaveLength(0);
+  });
+});
+
+// ===========================================================================
+// unifi_integrations — partner-axis forge test (Shape 3)
+//
+// unifi_integrations is partner-scoped: each MSP partner holds its own UniFi
+// API credential. The policy uses breeze_has_partner_access(partner_id).
+// This block proves Postgres rejects a cross-partner INSERT under breeze_app:
+// partner B's context cannot forge a row with partner_id = partner A.
+// Self-contained (no TRUNCATE dependency): fixtures seeded via
+// withSystemDbAccessContext and torn down in afterAll.
+// ===========================================================================
+describe('unifi_integrations RLS — cross-partner forge enforcement (Shape 3)', () => {
+  const runSuffix = Math.random().toString(36).slice(2, 8);
+
+  let partnerAId = '';
+  let partnerBId = '';
+
+  // Partner-scoped context: grants access to exactly one partner and no orgs,
+  // so no other policy can accidentally green-light the forged row.
+  function partnerContext(partnerId: string) {
+    return {
+      scope: 'partner' as const,
+      orgId: null,
+      accessibleOrgIds: [],
+      accessiblePartnerIds: [partnerId],
+      userId: null,
+    };
+  }
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerAId) return;
+    await withSystemDbAccessContext(async () => {
+      const [a, b] = await db
+        .insert(partners)
+        .values([
+          {
+            name: `RLS UniFi Partner A ${runSuffix}`,
+            slug: `rls-unifi-a-${runSuffix}`,
+            type: 'msp',
+            plan: 'pro',
+            status: 'active',
+          },
+          {
+            name: `RLS UniFi Partner B ${runSuffix}`,
+            slug: `rls-unifi-b-${runSuffix}`,
+            type: 'msp',
+            plan: 'pro',
+            status: 'active',
+          },
+        ])
+        .returning({ id: partners.id });
+      if (!a || !b) throw new Error('failed to seed partners for unifi_integrations forge test');
+      partnerAId = a.id;
+      partnerBId = b.id;
+    });
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      if (partnerAId) {
+        await db.delete(unifiIntegrations).where(eq(unifiIntegrations.partnerId, partnerAId));
+        await db.delete(partners).where(eq(partners.id, partnerAId));
+      }
+      if (partnerBId) {
+        await db.delete(unifiIntegrations).where(eq(unifiIntegrations.partnerId, partnerBId));
+        await db.delete(partners).where(eq(partners.id, partnerBId));
+      }
+    });
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'partner B INSERT into unifi_integrations with partner_id=A is rejected by RLS',
+    async () => {
+      await ensureFixtures();
+      let caught: unknown;
+      try {
+        await withDbAccessContext(partnerContext(partnerBId), async () =>
+          db.insert(unifiIntegrations).values({
+            partnerId: partnerAId, // forging partner A while in partner B's context
+            apiKeyEncrypted: 'rls-forge-not-a-real-key',
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(/row-level security/i);
+    },
+  );
+});
+
+// ===========================================================================
+// unifi_devices — org-axis forge test (Shape 1)
+//
+// unifi_devices carries a direct org_id column (Shape 1, auto-discovered).
+// Its policy uses breeze_has_org_access(org_id). This block proves Postgres
+// rejects a cross-org INSERT under breeze_app: org B's context cannot forge
+// a row with org_id = org A. The RLS WITH CHECK on org_id fires before FK
+// evaluation, so referenced integration/mapping/site ids need not exist.
+// Self-contained: fixtures seeded via withSystemDbAccessContext, torn down
+// in afterAll.
+// ===========================================================================
+describe('unifi_devices RLS — cross-org forge enforcement (Shape 1)', () => {
+  const runSuffix = Math.random().toString(36).slice(2, 8);
+
+  let partnerId = '';
+  let orgAId = '';
+  let orgBId = '';
+  let orgASiteId = '';
+
+  function orgContext(orgId: string) {
+    return {
+      scope: 'organization' as const,
+      orgId,
+      accessibleOrgIds: [orgId],
+      accessiblePartnerIds: [],
+      userId: null,
+    };
+  }
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerId) return;
+    await withSystemDbAccessContext(async () => {
+      const [partner] = await db
+        .insert(partners)
+        .values({
+          name: `RLS UniFi Devices Partner ${runSuffix}`,
+          slug: `rls-unifi-dev-${runSuffix}`,
+          type: 'msp',
+          plan: 'pro',
+          status: 'active',
+        })
+        .returning({ id: partners.id });
+      if (!partner) throw new Error('failed to seed partner for unifi_devices forge test');
+      partnerId = partner.id;
+
+      const [orgA, orgB] = await db
+        .insert(organizations)
+        .values([
+          { currencyCode: 'USD', partnerId: partner.id, name: 'RLS UniFi Devices Org A', slug: `rls-unifi-dev-a-${runSuffix}` },
+          { currencyCode: 'USD', partnerId: partner.id, name: 'RLS UniFi Devices Org B', slug: `rls-unifi-dev-b-${runSuffix}` },
+        ])
+        .returning({ id: organizations.id });
+      if (!orgA || !orgB) throw new Error('failed to seed orgs for unifi_devices forge test');
+      orgAId = orgA.id;
+      orgBId = orgB.id;
+
+      const [siteA] = await db
+        .insert(sites)
+        .values({ orgId: orgA.id, name: 'RLS UniFi Devices Site A' })
+        .returning({ id: sites.id });
+      if (!siteA) throw new Error('failed to seed org A site for unifi_devices forge test');
+      orgASiteId = siteA.id;
+    });
+  }
+
+  afterAll(async () => {
+    await withSystemDbAccessContext(async () => {
+      if (orgASiteId) await db.delete(sites).where(eq(sites.id, orgASiteId));
+      if (orgAId) await db.delete(organizations).where(eq(organizations.id, orgAId));
+      if (orgBId) await db.delete(organizations).where(eq(organizations.id, orgBId));
+      if (partnerId) await db.delete(partners).where(eq(partners.id, partnerId));
+    });
+  });
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'org B INSERT into unifi_devices with org_id=A is rejected by RLS',
+    async () => {
+      await ensureFixtures();
+      // Phantom UUIDs: RLS WITH CHECK on org_id fires before FK evaluation,
+      // so these do not need to reference real rows.
+      const phantomId = '00000000-0000-0000-0000-000000000001';
+      let caught: unknown;
+      try {
+        await withDbAccessContext(orgContext(orgBId), async () =>
+          db.insert(unifiDevices).values({
+            orgId: orgAId, // forging org A while in org B's context
+            siteId: phantomId,
+            integrationId: phantomId,
+            mappingId: phantomId,
+            unifiDeviceId: 'forge-device',
+            raw: {},
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(/row-level security/i);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'org B INSERT into unifi_collectors with org_id=A is rejected by RLS',
+    async () => {
+      await ensureFixtures();
+      const phantomId = '00000000-0000-0000-0000-000000000001';
+      let caught: unknown;
+      try {
+        await withDbAccessContext(orgContext(orgBId), async () =>
+          db.insert(unifiCollectors).values({
+            integrationId: phantomId,
+            orgId: orgAId, // forging org A while in org B's context
+            siteId: orgASiteId,
+            unifiHostId: 'forge-host',
+            collectorDeviceId: phantomId,
+            controllerUrl: 'https://10.0.0.1',
+            localApiKeyEncrypted: 'rls-forge-not-a-real-key',
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(/row-level security/i);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'org B INSERT into unifi_device_telemetry with org_id=A is rejected by RLS',
+    async () => {
+      await ensureFixtures();
+      const phantomId = '00000000-0000-0000-0000-000000000001';
+      let caught: unknown;
+      try {
+        await withDbAccessContext(orgContext(orgBId), async () =>
+          db.insert(unifiDeviceTelemetry).values({
+            collectorId: phantomId,
+            orgId: orgAId,
+            siteId: orgASiteId,
+            unifiDeviceId: 'forge-dev',
+            raw: {},
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(/row-level security/i);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'org B INSERT into unifi_clients with org_id=A is rejected by RLS',
+    async () => {
+      await ensureFixtures();
+      const phantomId = '00000000-0000-0000-0000-000000000001';
+      let caught: unknown;
+      try {
+        await withDbAccessContext(orgContext(orgBId), async () =>
+          db.insert(unifiClients).values({
+            collectorId: phantomId,
+            orgId: orgAId,
+            siteId: orgASiteId,
+            mac: 'aa:bb:cc:00:11:22',
+            raw: {},
+          }),
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+      const message = cause?.cause?.message ?? cause?.message ?? '';
+      expect(message).toMatch(/row-level security/i);
+    },
+  );
+});
+
+// ===========================================================================
+// device_mtls_certificates — direct-org auto-discovery assertion (Shape 1)
+//
+// Wave 5 Task 1 (security remediation): device_mtls_certificates carries a
+// direct org_id column and the four standard breeze_has_org_access policies.
+// It is auto-discovered by the org-tenant coverage scan above ("every
+// org-tenant public table has RLS on and all four DML commands covered") —
+// this block asserts that discovery explicitly for this one table and proves
+// it was NOT added to any shape 2-6 allowlist. Full cross-tenant forge
+// coverage (same-org insert/select/update/delete, forged cross-org insert)
+// lives in the dedicated device-mtls-certificates-rls.integration.test.ts
+// suite.
+// ===========================================================================
+describe('device_mtls_certificates RLS — direct-org auto-discovery (Shape 1)', () => {
+  it('is discovered as a direct org_id tenant table, not listed in any non-direct allowlist', () => {
+    expect(ORG_ID_KEYED_TENANT_TABLES.has('device_mtls_certificates')).toBe(false);
+    expect(PARTNER_TENANT_TABLES.has('device_mtls_certificates')).toBe(false);
+    expect(ORG_AXIS_POLICY_EXCLUDED_TABLES.has('device_mtls_certificates')).toBe(false);
+    expect(EXEMPT_TABLES.has('device_mtls_certificates')).toBe(false);
+    expect(INTENTIONAL_UNSCOPED.has('device_mtls_certificates')).toBe(false);
+  });
+
+  it('has RLS enabled and forced, with all four DML commands covered by breeze_has_org_access', async () => {
+    const rows = (await db.execute(sql`
+      SELECT
+        c.relname AS table_name,
+        c.relrowsecurity AS rls_on,
+        c.relforcerowsecurity AS rls_forced,
+        ARRAY(
+          SELECT DISTINCT CASE WHEN p.cmd = 'ALL' THEN cmd_name ELSE p.cmd END
+          FROM pg_policies p
+          CROSS JOIN UNNEST(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS cmd_name
+          WHERE p.schemaname = 'public'
+            AND p.tablename = c.relname
+            AND p.permissive = 'PERMISSIVE'
+            AND (
+              COALESCE(p.qual, '') LIKE '%breeze_has_org_access%'
+              OR COALESCE(p.with_check, '') LIKE '%breeze_has_org_access%'
+            )
+            AND (p.cmd = 'ALL' OR p.cmd = cmd_name)
+          ORDER BY 1
+        ) AS covered_cmds
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN information_schema.columns col
+        ON col.table_schema = n.nspname AND col.table_name = c.relname
+      WHERE n.nspname = 'public'
+        AND c.relkind = 'r'
+        AND c.relname = 'device_mtls_certificates'
+        AND col.column_name = 'org_id';
+    `)) as unknown as Array<{
+      table_name: string;
+      rls_on: boolean;
+      rls_forced: boolean;
+      covered_cmds: string[];
+    }>;
+
+    // A non-empty result also proves device_mtls_certificates has an org_id
+    // column, which is exactly what makes the generic discovery query above
+    // pick it up as a direct-org (Shape 1) table.
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.rls_on).toBe(true);
+    expect(rows[0]?.rls_forced).toBe(true);
+    expect(rows[0]?.covered_cmds.slice().sort()).toEqual(['DELETE', 'INSERT', 'SELECT', 'UPDATE']);
+  });
+});
+
+describe('fleet evidence RLS — direct-org auto-discovery (Shape 1)', () => {
+  it.each([
+    'agent_health_observations',
+    'automation_action_results',
+    'device_agent_health_latest',
+    'device_software_inventory_state',
+    'software_inventory_observations',
+  ])(
+    '%s is direct-org and has forced four-command policy coverage',
+    async (tableName) => {
+      expect(ORG_ID_KEYED_TENANT_TABLES.has(tableName)).toBe(false);
+      expect(PARTNER_TENANT_TABLES.has(tableName)).toBe(false);
+      expect(ORG_AXIS_POLICY_EXCLUDED_TABLES.has(tableName)).toBe(false);
+      expect(EXEMPT_TABLES.has(tableName)).toBe(false);
+      expect(INTENTIONAL_UNSCOPED.has(tableName)).toBe(false);
+
+      const rows = (await db.execute(sql`
+        SELECT c.relrowsecurity AS rls_on, c.relforcerowsecurity AS rls_forced,
+               ARRAY(
+                 SELECT DISTINCT p.cmd
+                 FROM pg_policies p
+                 WHERE p.schemaname = 'public'
+                   AND p.tablename = ${tableName}
+                   AND (
+                     COALESCE(p.qual, '') LIKE '%breeze_has_org_access%'
+                     OR COALESCE(p.with_check, '') LIKE '%breeze_has_org_access%'
+                   )
+                 ORDER BY 1
+               ) AS covered_cmds
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN information_schema.columns col
+          ON col.table_schema = n.nspname AND col.table_name = c.relname
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ${tableName}
+          AND col.column_name = 'org_id'
+      `)) as unknown as Array<{
+        rls_on: boolean;
+        rls_forced: boolean;
+        covered_cmds: string[];
+      }>;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.rls_on).toBe(true);
+      expect(rows[0]?.rls_forced).toBe(true);
+      expect(rows[0]?.covered_cmds).toEqual(['DELETE', 'INSERT', 'SELECT', 'UPDATE']);
+    },
+  );
+});
+
+/**
+ * m365 communications-delegated (user axis) — structural enforcement.
+ *
+ * These assertions exist because the allowlist registrations above are DOCUMENTATION, not
+ * coverage. Verified by removing each entry and re-running: the suite still passes.
+ * `m365_user_consent_sessions` has no `org_id`, so auto-discovery never surfaces it, and
+ * `m365_connections`' user-axis rows are equally invisible to a contract that keys on
+ * `org_id`. The design says as much (§3.4) — "those contracts cannot serve as the proof the
+ * design claims".
+ *
+ * So rather than leave an inert entry that reads like a guarantee, the properties are
+ * asserted directly against pg_catalog here. Behavioural cross-user proof is separate and
+ * lives in m365ConnectionsRls.integration.test.ts.
+ */
+describe('m365 communications-delegated RLS — structural enforcement', () => {
+  it.runIf(!!process.env.DATABASE_URL)(
+    'm365_user_consent_sessions has RLS enabled AND forced',
+    async () => {
+      // FORCE matters specifically: without it the table owner bypasses every policy, and
+      // migrations run as the owner.
+      const rows = (await db.execute(sql`
+        SELECT c.relrowsecurity AS rls_on, c.relforcerowsecurity AS force_on
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'm365_user_consent_sessions';
+      `)) as unknown as Array<{ rls_on: boolean; force_on: boolean }>;
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.rls_on).toBe(true);
+      expect(rows[0]?.force_on).toBe(true);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'every m365_user_consent_sessions policy is system-only, for all four commands',
+    async () => {
+      // The rows hold a live PKCE code_verifier and nonce — material for completing
+      // someone's sign-in. No tenant scope has any business reading them, including the
+      // owning user's own session token.
+      const rows = (await db.execute(sql`
+        SELECT policyname, cmd, COALESCE(qual, '') AS qual, COALESCE(with_check, '') AS with_check
+        FROM pg_policies
+        WHERE schemaname = 'public' AND tablename = 'm365_user_consent_sessions'
+        ORDER BY policyname;
+      `)) as unknown as Array<{ policyname: string; cmd: string; qual: string; with_check: string }>;
+
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.map((r) => r.cmd).sort()).toEqual(['DELETE', 'INSERT', 'SELECT', 'UPDATE']);
+
+      for (const row of rows) {
+        const predicate = `${row.qual} ${row.with_check}`;
+        expect(predicate).toMatch(/breeze_current_scope\(\)\s*=\s*'system'/);
+        // No tenant escape hatch may be ORed in later without this failing.
+        expect(predicate).not.toMatch(/breeze_has_org_access|breeze_has_partner_access|breeze_current_user_id/);
+      }
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'm365_connections policies carry the user-axis branch on all four commands',
+    async () => {
+      // The user axis is how a delegated (communications) connection is owned: org_id is
+      // NULL and user_id is set. If this branch is ever dropped, every delegated connection
+      // becomes invisible to its own owner and the org branch alone would not restore it.
+      const rows = (await db.execute(sql`
+        SELECT policyname, cmd, COALESCE(qual, '') AS qual, COALESCE(with_check, '') AS with_check
+        FROM pg_policies
+        WHERE schemaname = 'public' AND tablename = 'm365_connections'
+        ORDER BY policyname;
+      `)) as unknown as Array<{ policyname: string; cmd: string; qual: string; with_check: string }>;
+
+      expect(rows.map((r) => r.cmd).sort()).toEqual(['DELETE', 'INSERT', 'SELECT', 'UPDATE']);
+      for (const row of rows) {
+        expect(`${row.qual} ${row.with_check}`).toMatch(/breeze_current_user_id\(\)/);
+      }
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'a delegated connection cannot be active without a pinned identity',
+    async () => {
+      // The credential-location constraint proves a credential exists; this one proves we
+      // know whose mailbox it opens. Without it §5.2's binding check compares against NULL
+      // and passes vacuously.
+      const rows = (await db.execute(sql`
+        SELECT pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conrelid = 'm365_connections'::regclass
+          AND conname = 'm365_connections_delegated_identity_check';
+      `)) as unknown as Array<{ def: string }>;
+
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.def).toMatch(/delegated_user_object_id IS NOT NULL/);
+      expect(rows[0]?.def).toMatch(/tenant_id IS NOT NULL/);
+    },
+  );
+
+  it.runIf(!!process.env.DATABASE_URL)(
+    'the credential-location relaxation is confined to delegated, non-terminal rows',
+    async () => {
+      // The relaxation must not become a way to park a certificate profile with no
+      // credential, nor to leave a delegated row credential-less once it is active.
+      const rows = (await db.execute(sql`
+        SELECT pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conrelid = 'm365_connections'::regclass
+          AND conname = 'm365_connections_credential_location_check';
+      `)) as unknown as Array<{ def: string }>;
+
+      expect(rows).toHaveLength(1);
+      const def = rows[0]?.def ?? '';
+      expect(def).toMatch(/auth_mode\)?::text = 'delegated'::text/);
+      expect(def).toMatch(/pending-consent/);
+      expect(def).toMatch(/verifying/);
+      // Terminal states must NOT appear in the relaxed branch.
+      expect(def).not.toMatch(/'active'::text\s*\]?\)?\s*\)?\s*AND vault_ref IS NULL/);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// script_versions / script_to_tags — parent-join forge test (RMM-QA-220)
+// ---------------------------------------------------------------------------
+// Both tables reach their tenant only through `scripts` (dual-axis, nullable
+// org_id, is_system) and `script_tags` (dual-axis). Migration under test:
+// apps/api/migrations/2026-10-01-100000-script-children-rls.sql. Runs as `breeze_app` under real
+// contexts, modelled on the scripts partner-wide block above: self-contained
+// fixtures seeded under system scope, cleanup by id in afterAll.
+//
+// Actors: org A1 (partner A), org B1 (partner B), org A1 with a MIS-SET own
+// partner (B), partner A, partner B. Rows marked "positive" pass on main too —
+// they guard against an over-tight policy; every negative row is RED on main.
+describe('script_versions / script_to_tags RLS — parent-join forge enforcement (Org A/B, Partner A/B)', () => {
+  const runSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // Execution-definition columns are NOT NULL since
+  // 2026-10-16-100000-script-versions-immutable.sql; the values are irrelevant
+  // to the RLS forge, only their presence.
+  const versionDef = {
+    language: 'powershell' as const,
+    timeoutSeconds: 300,
+    runAs: 'system' as const,
+    parameters: null,
+    contentDigest: 'f'.repeat(64),
+    origin: 'human' as const,
+  };
+  let partnerAId: string;
+  let partnerBId: string;
+  let orgA1Id: string;
+  let orgB1Id: string;
+  let sA1Id: string; // org A1 script
+  let sB1Id: string; // org B1 script
+  let sPAId: string; // partner-wide script of partner A (org_id NULL)
+  let sSysId: string; // system script (is_system, org NULL, partner NULL)
+  let tA1Id: string; // org A1 tag
+  let tB1Id: string; // org B1 tag
+  let tPAId: string; // partner-wide tag of partner A
+  let vSysId: string; // seeded version on sSys
+  let vPAId: string; // seeded version on sPA
+  let vA1Id: string | null = null; // version org A1 creates in the positive test
+
+  async function ensureFixtures(): Promise<void> {
+    if (partnerAId) return;
+    await withSystemDbAccessContext(async () => {
+      const seededPartners = await db.insert(partners).values([
+        { name: `RLS ScriptChildren A ${runSuffix}`, slug: `rls-sc-a-${runSuffix}`, type: 'msp', plan: 'pro', status: 'active' },
+        { name: `RLS ScriptChildren B ${runSuffix}`, slug: `rls-sc-b-${runSuffix}`, type: 'msp', plan: 'pro', status: 'active' },
+      ]).returning({ id: partners.id });
+      partnerAId = seededPartners[0]!.id;
+      partnerBId = seededPartners[1]!.id;
+
+      const seededOrgs = await db.insert(organizations).values([
+        { currencyCode: 'USD', partnerId: partnerAId, name: `RLS SC Org A1 ${runSuffix}`, slug: `rls-sc-org-a1-${runSuffix}` },
+        { currencyCode: 'USD', partnerId: partnerBId, name: `RLS SC Org B1 ${runSuffix}`, slug: `rls-sc-org-b1-${runSuffix}` },
+      ]).returning({ id: organizations.id });
+      orgA1Id = seededOrgs[0]!.id;
+      orgB1Id = seededOrgs[1]!.id;
+
+      const base = { osTypes: ['windows'], language: 'powershell' as const, content: 'echo seed' };
+      const seededScripts = await db.insert(scripts).values([
+        { ...base, orgId: orgA1Id, partnerId: partnerAId, name: `sc-sA1-${runSuffix}` },
+        { ...base, orgId: orgB1Id, partnerId: partnerBId, name: `sc-sB1-${runSuffix}` },
+        { ...base, orgId: null, partnerId: partnerAId, name: `sc-sPA-${runSuffix}` },
+        { ...base, orgId: null, partnerId: null, isSystem: true, name: `sc-sSys-${runSuffix}` },
+      ]).returning({ id: scripts.id });
+      sA1Id = seededScripts[0]!.id;
+      sB1Id = seededScripts[1]!.id;
+      sPAId = seededScripts[2]!.id;
+      sSysId = seededScripts[3]!.id;
+
+      const seededTags = await db.insert(scriptTags).values([
+        { orgId: orgA1Id, partnerId: partnerAId, name: `tA1-${runSuffix}` },
+        { orgId: orgB1Id, partnerId: partnerBId, name: `tB1-${runSuffix}` },
+        { orgId: null, partnerId: partnerAId, name: `tPA-${runSuffix}` },
+      ]).returning({ id: scriptTags.id });
+      tA1Id = seededTags[0]!.id;
+      tB1Id = seededTags[1]!.id;
+      tPAId = seededTags[2]!.id;
+
+      // created_by is nullable (0001-baseline.sql:5216) — no users rows needed.
+      const seededVersions = await db.insert(scriptVersions).values([
+        { ...versionDef, scriptId: sSysId, version: 1, content: 'echo sys-v1', changelog: 'seed', createdBy: null },
+        { ...versionDef, scriptId: sPAId, version: 1, content: 'echo pa-v1', changelog: 'seed', createdBy: null },
+      ]).returning({ id: scriptVersions.id });
+      vSysId = seededVersions[0]!.id;
+      vPAId = seededVersions[1]!.id;
+    });
+  }
+
+  afterAll(async () => {
+    if (!partnerAId) return;
+    await withSystemDbAccessContext(async () => {
+      const scriptIds = [sA1Id, sB1Id, sPAId, sSysId];
+      // script_versions rows are append-only as of
+      // 2026-10-16-100000-script-versions-immutable.sql — there is no DELETE
+      // policy, so an explicit delete matches zero rows even under system
+      // scope. The `delete(scripts)` below reaps them through
+      // script_versions_script_id_scripts_id_fk ON DELETE CASCADE.
+      await db.delete(scriptToTags).where(inArray(scriptToTags.scriptId, scriptIds));
+      await db.delete(scripts).where(inArray(scripts.id, scriptIds));
+      await db.delete(scriptTags).where(inArray(scriptTags.id, [tA1Id, tB1Id, tPAId]));
+      await db.delete(organizations).where(inArray(organizations.id, [orgA1Id, orgB1Id]));
+      await db.delete(partners).where(inArray(partners.id, [partnerAId, partnerBId]));
+    });
+  });
+
+  function partnerContext(partnerId: string) {
+    return { scope: 'partner' as const, orgId: null, accessibleOrgIds: [], accessiblePartnerIds: [partnerId], userId: null, currentPartnerId: partnerId };
+  }
+
+  // ORGANIZATION scope: no partner-axis write access (accessiblePartnerIds []),
+  // currentPartnerId = the caller's own partner so the read-only own-partner
+  // branch of the parents' SELECT policies applies.
+  function orgContext(orgId: string, ownPartnerId: string | null) {
+    return { scope: 'organization' as const, orgId, accessibleOrgIds: [orgId], accessiblePartnerIds: [], currentPartnerId: ownPartnerId, userId: null };
+  }
+
+  async function expectRlsViolation(table: 'script_versions' | 'script_to_tags', fn: () => Promise<unknown>): Promise<void> {
+    let caught: unknown;
+    try {
+      await fn();
+    } catch (err) {
+      caught = err;
+    }
+    const cause = caught as { cause?: { message?: string }; message?: string } | undefined;
+    const message = cause?.cause?.message ?? cause?.message ?? '';
+    expect(message, `expected an RLS violation on ${table}; got: ${message || '<no error>'}`).toMatch(
+      new RegExp(`new row violates row-level security policy for table "${table}"`),
+    );
+  }
+
+  const versionsOf = (scriptId: string) =>
+    db.select({ id: scriptVersions.id }).from(scriptVersions).where(eq(scriptVersions.scriptId, scriptId));
+  const linksOf = (scriptId: string) =>
+    db.select({ tagId: scriptToTags.tagId }).from(scriptToTags).where(eq(scriptToTags.scriptId, scriptId));
+
+  // 1 (positive)
+  it('org A1 can INSERT and SELECT a version of its own script', async () => {
+    await ensureFixtures();
+    const inserted = await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () =>
+      db.insert(scriptVersions).values({ ...versionDef, scriptId: sA1Id, version: 1, content: 'echo a1-v1', changelog: 'org A1', createdBy: null }).returning({ id: scriptVersions.id })
+    );
+    expect(inserted).toHaveLength(1);
+    vA1Id = inserted[0]!.id;
+    const visible = await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () => versionsOf(sA1Id));
+    expect(visible.map((r) => r.id)).toEqual([vA1Id]);
+  });
+
+  // 2 (positive)
+  it('org A1 can INSERT and SELECT a link between its own script and its own tag', async () => {
+    await ensureFixtures();
+    await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () =>
+      db.insert(scriptToTags).values({ scriptId: sA1Id, tagId: tA1Id })
+    );
+    const visible = await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () => linksOf(sA1Id));
+    expect(visible.map((r) => r.tagId)).toEqual([tA1Id]);
+  });
+
+  // 3
+  it("org B1 cannot SELECT org A1's versions or links", async () => {
+    await ensureFixtures();
+    const versions = await withDbAccessContext(orgContext(orgB1Id, partnerBId), async () => versionsOf(sA1Id));
+    const links = await withDbAccessContext(orgContext(orgB1Id, partnerBId), async () => linksOf(sA1Id));
+    expect(versions).toEqual([]);
+    expect(links).toEqual([]);
+  });
+
+  // 4
+  it("org B1 INSERT of a version onto org A1's script is rejected by WITH CHECK", async () => {
+    await ensureFixtures();
+    await expectRlsViolation('script_versions', () =>
+      withDbAccessContext(orgContext(orgB1Id, partnerBId), async () =>
+        db.insert(scriptVersions).values({ ...versionDef, scriptId: sA1Id, version: 9, content: 'forged', changelog: null, createdBy: null })
+      )
+    );
+  });
+
+  // 5
+  it('org B1 cannot pair (own script, A tag) nor (A script, own tag)', async () => {
+    await ensureFixtures();
+    await expectRlsViolation('script_to_tags', () =>
+      withDbAccessContext(orgContext(orgB1Id, partnerBId), async () => db.insert(scriptToTags).values({ scriptId: sB1Id, tagId: tA1Id }))
+    );
+    await expectRlsViolation('script_to_tags', () =>
+      withDbAccessContext(orgContext(orgB1Id, partnerBId), async () => db.insert(scriptToTags).values({ scriptId: sA1Id, tagId: tB1Id }))
+    );
+  });
+
+  // 6
+  it("org B1 UPDATE/DELETE on org A1's version and DELETE on its link affect 0 rows and leave the rows intact", async () => {
+    await ensureFixtures();
+    if (!vA1Id) throw new Error('positive test must run first');
+    const updated = await withDbAccessContext(orgContext(orgB1Id, partnerBId), async () =>
+      db.update(scriptVersions).set({ changelog: 'tampered' }).where(eq(scriptVersions.id, vA1Id!)).returning({ id: scriptVersions.id })
+    );
+    const deletedVersions = await withDbAccessContext(orgContext(orgB1Id, partnerBId), async () =>
+      db.delete(scriptVersions).where(eq(scriptVersions.id, vA1Id!)).returning({ id: scriptVersions.id })
+    );
+    const deletedLinks = await withDbAccessContext(orgContext(orgB1Id, partnerBId), async () =>
+      db.delete(scriptToTags).where(and(eq(scriptToTags.scriptId, sA1Id), eq(scriptToTags.tagId, tA1Id))).returning({ tagId: scriptToTags.tagId })
+    );
+    expect(updated).toEqual([]);
+    expect(deletedVersions).toEqual([]);
+    expect(deletedLinks).toEqual([]);
+
+    const intact = await withSystemDbAccessContext(async () =>
+      db.select({ changelog: scriptVersions.changelog }).from(scriptVersions).where(eq(scriptVersions.id, vA1Id!))
+    );
+    expect(intact).toEqual([{ changelog: 'org A1' }]);
+    const linkIntact = await withSystemDbAccessContext(async () => linksOf(sA1Id));
+    expect(linkIntact.map((r) => r.tagId)).toEqual([tA1Id]);
+  });
+
+  // 7
+  it("partner B cannot SELECT org A1's version and cannot INSERT a version onto partner A's partner-wide script", async () => {
+    await ensureFixtures();
+    const visible = await withDbAccessContext(partnerContext(partnerBId), async () => versionsOf(sA1Id));
+    expect(visible).toEqual([]);
+    await expectRlsViolation('script_versions', () =>
+      withDbAccessContext(partnerContext(partnerBId), async () =>
+        db.insert(scriptVersions).values({ ...versionDef, scriptId: sPAId, version: 9, content: 'forged', changelog: null, createdBy: null })
+      )
+    );
+  });
+
+  // 8 (positive)
+  it('partner A can INSERT a version and a link on its own partner-wide script', async () => {
+    await ensureFixtures();
+    const inserted = await withDbAccessContext(partnerContext(partnerAId), async () =>
+      db.insert(scriptVersions).values({ ...versionDef, scriptId: sPAId, version: 2, content: 'echo pa-v2', changelog: 'partner A', createdBy: null }).returning({ id: scriptVersions.id })
+    );
+    expect(inserted).toHaveLength(1);
+    await withDbAccessContext(partnerContext(partnerAId), async () => db.insert(scriptToTags).values({ scriptId: sPAId, tagId: tPAId }));
+    const links = await withDbAccessContext(partnerContext(partnerAId), async () => linksOf(sPAId));
+    expect(links.map((r) => r.tagId)).toEqual([tPAId]);
+  });
+
+  // 9
+  it("org A1 can SELECT its MSP's partner-wide version (read branch) but cannot INSERT one", async () => {
+    await ensureFixtures();
+    const visible = await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () =>
+      db.select({ id: scriptVersions.id }).from(scriptVersions).where(eq(scriptVersions.id, vPAId))
+    );
+    expect(visible.map((r) => r.id)).toEqual([vPAId]);
+    await expectRlsViolation('script_versions', () =>
+      withDbAccessContext(orgContext(orgA1Id, partnerAId), async () =>
+        db.insert(scriptVersions).values({ ...versionDef, scriptId: sPAId, version: 9, content: 'forged', changelog: null, createdBy: null })
+      )
+    );
+  });
+
+  // 10
+  it("org A1 whose own partner is mis-set to B CANNOT SELECT partner A's partner-wide version", async () => {
+    await ensureFixtures();
+    const visible = await withDbAccessContext(orgContext(orgA1Id, partnerBId), async () =>
+      db.select({ id: scriptVersions.id }).from(scriptVersions).where(eq(scriptVersions.id, vPAId))
+    );
+    expect(visible).toEqual([]);
+  });
+
+  // 11 (positive)
+  it("org A1 can link its own script to its MSP's partner-wide tag (tag read branch)", async () => {
+    await ensureFixtures();
+    await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () => db.insert(scriptToTags).values({ scriptId: sA1Id, tagId: tPAId }));
+    const links = await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () => linksOf(sA1Id));
+    expect(links.map((r) => r.tagId).sort()).toEqual([tA1Id, tPAId].sort());
+  });
+
+  // 12
+  it("org B1 cannot link its own script to partner A's partner-wide tag", async () => {
+    await ensureFixtures();
+    await expectRlsViolation('script_to_tags', () =>
+      withDbAccessContext(orgContext(orgB1Id, partnerBId), async () => db.insert(scriptToTags).values({ scriptId: sB1Id, tagId: tPAId }))
+    );
+  });
+
+  // 13 (positive, bound parameter through the extended protocol)
+  it("org A1 can SELECT a system script's version by bound script_id (is_system read branch)", async () => {
+    await ensureFixtures();
+    const visible = await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () => versionsOf(sSysId));
+    expect(visible.map((r) => r.id)).toEqual([vSysId]);
+  });
+
+  // 14
+  it('neither org A1 nor partner A can INSERT a version onto a system script (no is_system in any write predicate)', async () => {
+    await ensureFixtures();
+    await expectRlsViolation('script_versions', () =>
+      withDbAccessContext(orgContext(orgA1Id, partnerAId), async () =>
+        db.insert(scriptVersions).values({ ...versionDef, scriptId: sSysId, version: 9, content: 'forged', changelog: null, createdBy: null })
+      )
+    );
+    await expectRlsViolation('script_versions', () =>
+      withDbAccessContext(partnerContext(partnerAId), async () =>
+        db.insert(scriptVersions).values({ ...versionDef, scriptId: sSysId, version: 9, content: 'forged', changelog: null, createdBy: null })
+      )
+    );
+  });
+
+  // 16 — runs BEFORE 15 because 15 deletes the (sA1, tA1) link this test re-points.
+  it('org A1 UPDATE re-pointing its own link at org B1\'s tag is rejected by the UPDATE WITH CHECK tag leg', async () => {
+    await ensureFixtures();
+    await expectRlsViolation('script_to_tags', () =>
+      withDbAccessContext(orgContext(orgA1Id, partnerAId), async () =>
+        db.update(scriptToTags).set({ tagId: tB1Id }).where(and(eq(scriptToTags.scriptId, sA1Id), eq(scriptToTags.tagId, tA1Id)))
+      )
+    );
+    const intact = await withSystemDbAccessContext(async () => linksOf(sA1Id));
+    expect(intact.map((r) => r.tagId).sort()).toEqual([tA1Id, tPAId].sort());
+  });
+
+  // 15
+  it("org A1 can DELETE its own link but DELETE on the partner-wide link affects 0 rows (unlink needs script WRITE)", async () => {
+    await ensureFixtures();
+    const own = await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () =>
+      db.delete(scriptToTags).where(and(eq(scriptToTags.scriptId, sA1Id), eq(scriptToTags.tagId, tA1Id))).returning({ tagId: scriptToTags.tagId })
+    );
+    expect(own.map((r) => r.tagId)).toEqual([tA1Id]);
+    const partnerWide = await withDbAccessContext(orgContext(orgA1Id, partnerAId), async () =>
+      db.delete(scriptToTags).where(and(eq(scriptToTags.scriptId, sPAId), eq(scriptToTags.tagId, tPAId))).returning({ tagId: scriptToTags.tagId })
+    );
+    expect(partnerWide).toEqual([]);
+    const intact = await withSystemDbAccessContext(async () => linksOf(sPAId));
+    expect(intact.map((r) => r.tagId)).toEqual([tPAId]);
+  });
+});

@@ -1,0 +1,986 @@
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { createHash } from 'crypto';
+import {
+  getAllowedOrigins,
+  hashRecoveryCode,
+  userRequiresSetup,
+  parsePendingMfa,
+  evaluatePendingMfa,
+  evaluatePendingMfaMethod,
+  getClientIP,
+  getClientRateLimitKey,
+  isRequestConnectionSecure,
+  buildRefreshTokenCookie,
+  buildCsrfTokenCookie,
+  buildClearRefreshTokenCookie,
+  buildAuthBindingCookie,
+  buildClearAuthBindingCookie,
+  setRefreshTokenCookie,
+  installAuthorizedUserSessionCookies,
+  clearRefreshTokenCookie,
+  validateCookieCsrfRequest,
+  validateStrictCookieCsrfRequest,
+  _resetAuthCookieWarnStateForTests,
+  type PendingMfaRecord,
+  genericAuthError,
+} from './helpers';
+import type { AuthorizedUserSession } from '../../services/userSession';
+import type { RequestLike } from '../../services/auditEvents';
+import type { Context } from 'hono';
+
+import { ERROR_CODES } from '@breeze/shared';
+// Mirrors the canonical shim in services/clientIp.test.ts.
+function makeContext(headers: Record<string, string | undefined>, remoteAddress?: string): RequestLike {
+  const normalized: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (v !== undefined) normalized[k.toLowerCase()] = v;
+  }
+  return {
+    req: {
+      header: (name: string) => normalized[name.toLowerCase()],
+    },
+    ...(remoteAddress
+      ? { env: { incoming: { socket: { remoteAddress } } } }
+      : {}),
+  } as RequestLike;
+}
+
+function makeCsrfContext(
+  headers: Record<string, string>,
+  opts: { url?: string } = {},
+): Context {
+  const normalized = Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]),
+  );
+  return {
+    req: {
+      header: (name: string) => normalized[name.toLowerCase()],
+      // Default to an internal hop URL so nothing matches a browser origin by accident.
+      url: opts.url ?? 'http://api:3001/api/v1/auth/refresh',
+    },
+  } as unknown as Context;
+}
+
+describe('terminal strict cookie CSRF boundary', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalOrigins = process.env.CORS_ALLOWED_ORIGINS;
+
+  beforeEach(() => {
+    process.env.NODE_ENV = 'production';
+    process.env.CORS_ALLOWED_ORIGINS = 'https://breeze.example.com';
+  });
+
+  afterEach(() => {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalOrigins === undefined) delete process.env.CORS_ALLOWED_ORIGINS;
+    else process.env.CORS_ALLOWED_ORIGINS = originalOrigins;
+  });
+
+  it('keeps the non-browser sentinel compatibility behavior non-terminal only', () => {
+    const c = makeCsrfContext({ 'x-breeze-csrf': '1' });
+    expect(validateCookieCsrfRequest(c)).toBeNull();
+    expect(validateStrictCookieCsrfRequest(c)).not.toBeNull();
+  });
+
+  it('rejects sentinel cookie/header equality despite valid Origin and fetch-site', () => {
+    const c = makeCsrfContext({
+      cookie: 'breeze_csrf_token=1',
+      'x-breeze-csrf': '1',
+      origin: 'https://breeze.example.com',
+      'sec-fetch-site': 'same-origin',
+    });
+    expect(validateStrictCookieCsrfRequest(c)).toBe('Invalid CSRF token');
+  });
+
+  it.each([
+    [{ cookie: 'breeze_csrf_token=csrf', 'x-breeze-csrf': 'different', origin: 'https://breeze.example.com', 'sec-fetch-site': 'same-origin' }, 'Invalid CSRF token'],
+    [{ cookie: 'breeze_csrf_token=csrf', 'x-breeze-csrf': 'csrf', 'sec-fetch-site': 'same-origin' }, 'Missing request origin'],
+    [{ cookie: 'breeze_csrf_token=csrf', 'x-breeze-csrf': 'csrf', origin: 'https://evil.example', 'sec-fetch-site': 'same-site' }, 'Invalid request origin'],
+    [{ cookie: 'breeze_csrf_token=csrf', 'x-breeze-csrf': 'csrf', origin: 'https://breeze.example.com', 'sec-fetch-site': 'cross-site' }, 'Cross-site request blocked'],
+  ])('rejects malformed strict terminal request %#', (headers, expected) => {
+    expect(validateStrictCookieCsrfRequest(makeCsrfContext(headers))).toBe(expected);
+  });
+
+  it('accepts only matching non-sentinel tokens from an allowed browser origin', () => {
+    const c = makeCsrfContext({
+      cookie: 'breeze_csrf_token=csrf',
+      'x-breeze-csrf': 'csrf',
+      origin: 'https://breeze.example.com',
+      'sec-fetch-site': 'same-site',
+    });
+    expect(validateStrictCookieCsrfRequest(c)).toBeNull();
+  });
+
+  // Self-hosters reach the bundled Caddy through an SSH tunnel / LAN name that
+  // is not the configured origin (quickstart: https://localhost:8443 while
+  // CORS_ALLOWED_ORIGINS=https://localhost). Every such request is same-origin —
+  // browser and API share one origin behind Caddy — so it must not be treated
+  // as CSRF. Proof is either the browser's own Sec-Fetch-Site: same-origin or
+  // Origin equalling the request's effective scheme + Host.
+  describe('same-origin requests outside CORS_ALLOWED_ORIGINS', () => {
+    const tokens = { cookie: 'breeze_csrf_token=csrf', 'x-breeze-csrf': 'csrf' };
+
+    it('accepts the tunnel origin when the browser asserts Sec-Fetch-Site: same-origin (strict + non-strict)', () => {
+      const c = makeCsrfContext({ ...tokens, origin: 'https://localhost:8443', 'sec-fetch-site': 'same-origin' });
+      expect(validateStrictCookieCsrfRequest(c)).toBeNull();
+      expect(validateCookieCsrfRequest(c)).toBeNull();
+    });
+
+    it('accepts the tunnel origin when it equals the request scheme + Host and no fetch metadata is present', () => {
+      const c = makeCsrfContext(
+        { ...tokens, origin: 'https://localhost:8443', host: 'localhost:8443' },
+        { url: 'https://localhost:8443/api/v1/auth/refresh' },
+      );
+      expect(validateStrictCookieCsrfRequest(c)).toBeNull();
+      expect(validateCookieCsrfRequest(c)).toBeNull();
+    });
+
+    it('still rejects a foreign origin that matches neither the allowlist nor the request host', () => {
+      const c = makeCsrfContext(
+        { ...tokens, origin: 'https://evil.example', 'sec-fetch-site': 'same-site', host: 'localhost:8443' },
+        { url: 'https://localhost:8443/api/v1/auth/refresh' },
+      );
+      expect(validateStrictCookieCsrfRequest(c)).toBe('Invalid request origin');
+      expect(validateCookieCsrfRequest(c)).toBe('Invalid request origin');
+    });
+
+    it('rejects Origin: null even with Sec-Fetch-Site: same-origin', () => {
+      const c = makeCsrfContext({ ...tokens, origin: 'null', 'sec-fetch-site': 'same-origin', host: 'localhost:8443' });
+      expect(validateStrictCookieCsrfRequest(c)).toBe('Invalid request origin');
+      expect(validateCookieCsrfRequest(c)).toBe('Invalid request origin');
+    });
+  });
+});
+
+describe('getAllowedOrigins (G5 — dev-origin gating)', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  const originalCorsOrigins = process.env.CORS_ALLOWED_ORIGINS;
+  const originalIncludeFlag = process.env.CORS_INCLUDE_DEFAULT_ORIGINS;
+
+  beforeEach(() => {
+    delete process.env.CORS_ALLOWED_ORIGINS;
+    delete process.env.CORS_INCLUDE_DEFAULT_ORIGINS;
+  });
+
+  afterEach(() => {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    if (originalCorsOrigins === undefined) delete process.env.CORS_ALLOWED_ORIGINS;
+    else process.env.CORS_ALLOWED_ORIGINS = originalCorsOrigins;
+    if (originalIncludeFlag === undefined) delete process.env.CORS_INCLUDE_DEFAULT_ORIGINS;
+    else process.env.CORS_INCLUDE_DEFAULT_ORIGINS = originalIncludeFlag;
+  });
+
+  it('includes localhost dev origins in development', () => {
+    process.env.NODE_ENV = 'development';
+    const origins = getAllowedOrigins();
+    expect(origins.has('http://localhost:4321')).toBe(true);
+    expect(origins.has('http://127.0.0.1:4321')).toBe(true);
+  });
+
+  it('does NOT include localhost dev origins in production', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.CORS_ALLOWED_ORIGINS = 'https://app.example.com';
+
+    const origins = getAllowedOrigins();
+
+    expect(origins.has('http://localhost:4321')).toBe(false);
+    expect(origins.has('http://127.0.0.1:4321')).toBe(false);
+    expect(origins.has('http://localhost:1420')).toBe(false);
+    expect(origins.has('https://app.example.com')).toBe(true);
+  });
+
+  it('allows explicit opt-in via CORS_INCLUDE_DEFAULT_ORIGINS=true in production', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.CORS_INCLUDE_DEFAULT_ORIGINS = 'true';
+    process.env.CORS_ALLOWED_ORIGINS = 'https://app.example.com';
+
+    const origins = getAllowedOrigins();
+
+    expect(origins.has('http://localhost:4321')).toBe(true);
+    expect(origins.has('https://app.example.com')).toBe(true);
+  });
+});
+
+describe('userRequiresSetup', () => {
+  it('requires setup for the legacy development bootstrap admin until setup is completed', () => {
+    expect(
+      userRequiresSetup({
+        email: 'admin@breeze.local',
+        setupCompletedAt: null,
+      }),
+    ).toBe(true);
+  });
+
+  it('requires setup for operator-provided bootstrap admins marked during seed', () => {
+    expect(
+      userRequiresSetup({
+        email: 'owner@example.test',
+        setupCompletedAt: null,
+        preferences: { bootstrapSetupRequired: true },
+      }),
+    ).toBe(true);
+  });
+
+  it('does not send normal invited or provisioned users through bootstrap setup', () => {
+    expect(
+      userRequiresSetup({
+        email: 'tech@example.test',
+        setupCompletedAt: null,
+      }),
+    ).toBe(false);
+  });
+
+  it('does not require setup once completed', () => {
+    expect(
+      userRequiresSetup({
+        email: 'owner@example.test',
+        setupCompletedAt: new Date(),
+        preferences: { bootstrapSetupRequired: true },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('MFA recovery code peppering', () => {
+  const originalEnv = {
+    NODE_ENV: process.env.NODE_ENV,
+    MFA_RECOVERY_CODE_PEPPER: process.env.MFA_RECOVERY_CODE_PEPPER,
+    APP_ENCRYPTION_KEY: process.env.APP_ENCRYPTION_KEY,
+    SECRET_ENCRYPTION_KEY: process.env.SECRET_ENCRYPTION_KEY,
+    JWT_SECRET: process.env.JWT_SECRET,
+  };
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  it('uses only MFA_RECOVERY_CODE_PEPPER for recovery code hashes', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.MFA_RECOVERY_CODE_PEPPER = 'dedicated-recovery-pepper-32-chars';
+    process.env.APP_ENCRYPTION_KEY = 'app-key-must-not-be-used';
+    process.env.SECRET_ENCRYPTION_KEY = 'secret-key-must-not-be-used';
+    process.env.JWT_SECRET = 'jwt-key-must-not-be-used';
+
+    expect(hashRecoveryCode('abcd-1234')).toMatch(/^scrypt\$v1\$[a-f0-9]{64}$/);
+  });
+
+  it('does not fall back to app, secret, or JWT keys when the pepper is missing', () => {
+    process.env.NODE_ENV = 'production';
+    delete process.env.MFA_RECOVERY_CODE_PEPPER;
+    process.env.APP_ENCRYPTION_KEY = 'app-key-must-not-be-used';
+    process.env.SECRET_ENCRYPTION_KEY = 'secret-key-must-not-be-used';
+    process.env.JWT_SECRET = 'jwt-key-must-not-be-used';
+
+    expect(() => hashRecoveryCode('abcd-1234')).toThrow('MFA_RECOVERY_CODE_PEPPER');
+  });
+});
+
+// SR2-06: the pending MFA record now carries an epoch/status binding so every
+// completion path can detect a factor/status change that happened during the
+// 5-minute MFA window and reject rather than mint stale assurance.
+describe('parsePendingMfa (SR2-06 strict parse)', () => {
+  const fullRecord: PendingMfaRecord = {
+    userId: 'user-1',
+    mfaMethod: 'totp',
+    passkeyAvailable: false,
+    recoveryAvailable: true,
+    authEpoch: 3,
+    mfaEpoch: 5,
+    transitionId: '11111111-1111-4111-8111-111111111111',
+    browserGeneration: 3,
+    statusExpectation: 'active',
+    allowedMethods: { totp: true, sms: false, passkey: true },
+    expiresAt: Date.now() + 300_000,
+  };
+
+  it('round-trips a full JSON record', () => {
+    expect(parsePendingMfa(JSON.stringify(fullRecord))).toEqual(fullRecord);
+  });
+
+  it('returns null for the legacy bare-userId string form', () => {
+    expect(parsePendingMfa('user-1')).toBeNull();
+  });
+
+  it('returns null for JSON missing authEpoch (pre-SR2-06 record)', () => {
+    const { authEpoch, ...rest } = fullRecord;
+    expect(parsePendingMfa(JSON.stringify(rest))).toBeNull();
+  });
+
+  it('returns null for JSON missing mfaEpoch', () => {
+    const { mfaEpoch, ...rest } = fullRecord;
+    expect(parsePendingMfa(JSON.stringify(rest))).toBeNull();
+  });
+
+  it('returns null for JSON missing the durable browser transition identity', () => {
+    const { transitionId, ...withoutTransition } = fullRecord;
+    const { browserGeneration, ...withoutGeneration } = fullRecord;
+    expect(parsePendingMfa(JSON.stringify(withoutTransition))).toBeNull();
+    expect(parsePendingMfa(JSON.stringify(withoutGeneration))).toBeNull();
+  });
+
+  it('returns null for JSON missing allowedMethods', () => {
+    const { allowedMethods, ...rest } = fullRecord;
+    expect(parsePendingMfa(JSON.stringify(rest))).toBeNull();
+  });
+
+  it('returns null for an invalid mfaMethod value', () => {
+    expect(parsePendingMfa(JSON.stringify({ ...fullRecord, mfaMethod: 'sms-code' }))).toBeNull();
+  });
+
+  it('returns null for malformed (non-JSON) input', () => {
+    expect(parsePendingMfa('{not json')).toBeNull();
+  });
+
+  it.each([
+    ['totp', { sms: false, passkey: true }],
+    ['sms', { totp: true, passkey: true }],
+    ['passkey', { totp: true, sms: false }],
+  ])('returns null when allowedMethods.%s is missing', (_name, allowedMethods) => {
+    expect(parsePendingMfa(JSON.stringify({ ...fullRecord, allowedMethods }))).toBeNull();
+  });
+
+  it.each([
+    ['totp', 'true'],
+    ['sms', 1],
+    ['passkey', null],
+  ])('returns null when allowedMethods.%s is not boolean', (name, value) => {
+    expect(parsePendingMfa(JSON.stringify({
+      ...fullRecord,
+      allowedMethods: { ...fullRecord.allowedMethods, [name]: value },
+    }))).toBeNull();
+  });
+
+  it.each([
+    ['passkeyAvailable', undefined],
+    ['passkeyAvailable', 'false'],
+    ['recoveryAvailable', undefined],
+    ['recoveryAvailable', 0],
+  ])('returns null when %s is missing or not boolean', (field, value) => {
+    const record = { ...fullRecord, [field]: value };
+    if (value === undefined) delete record[field as keyof typeof record];
+    expect(parsePendingMfa(JSON.stringify(record))).toBeNull();
+  });
+
+  it.each([
+    ['authEpoch', -1],
+    ['mfaEpoch', 1.5],
+    ['browserGeneration', Number.NaN],
+    ['expiresAt', Date.now() - 1],
+  ])('returns null for invalid or expired %s', (field, value) => {
+    expect(parsePendingMfa(JSON.stringify({ ...fullRecord, [field]: value }))).toBeNull();
+  });
+});
+
+describe('evaluatePendingMfa (SR2-06)', () => {
+  const record: PendingMfaRecord = {
+    userId: 'user-1',
+    mfaMethod: 'totp',
+    passkeyAvailable: false,
+    recoveryAvailable: true,
+    authEpoch: 3,
+    mfaEpoch: 5,
+    transitionId: '11111111-1111-4111-8111-111111111111',
+    browserGeneration: 3,
+    statusExpectation: 'active',
+    allowedMethods: { totp: true, sms: true, passkey: true },
+    expiresAt: Date.now() + 300_000,
+  };
+
+  it('returns ok:true when live epochs and status match the pending record', () => {
+    expect(evaluatePendingMfa(record, { status: 'active', authEpoch: 3, mfaEpoch: 5 })).toEqual({ ok: true });
+  });
+
+  it('returns epoch_mismatch when the live mfaEpoch has advanced past the pending record', () => {
+    expect(evaluatePendingMfa(record, { status: 'active', authEpoch: 3, mfaEpoch: 6 })).toEqual({
+      ok: false,
+      reason: 'epoch_mismatch',
+    });
+  });
+
+  it('returns epoch_mismatch when the live authEpoch has advanced past the pending record', () => {
+    expect(evaluatePendingMfa(record, { status: 'active', authEpoch: 4, mfaEpoch: 5 })).toEqual({
+      ok: false,
+      reason: 'epoch_mismatch',
+    });
+  });
+
+  it('returns status_changed when the live status is no longer active', () => {
+    expect(evaluatePendingMfa(record, { status: 'suspended', authEpoch: 3, mfaEpoch: 5 })).toEqual({
+      ok: false,
+      reason: 'status_changed',
+    });
+  });
+
+  it('returns status_changed when the live status differs from the recorded expectation', () => {
+    const pendingCapturedInactive: PendingMfaRecord = { ...record, statusExpectation: 'invited' };
+    // live.status is forced to 'active' here specifically to isolate the
+    // statusExpectation-mismatch branch from the "not active" branch above.
+    expect(evaluatePendingMfa(pendingCapturedInactive, { status: 'active', authEpoch: 3, mfaEpoch: 5 })).toEqual({
+      ok: false,
+      reason: 'status_changed',
+    });
+  });
+
+  it('returns expired when expiresAt is in the past', () => {
+    const expiredRecord: PendingMfaRecord = { ...record, expiresAt: Date.now() - 1 };
+    expect(evaluatePendingMfa(expiredRecord, { status: 'active', authEpoch: 3, mfaEpoch: 5 })).toEqual({
+      ok: false,
+      reason: 'expired',
+    });
+  });
+});
+
+describe('evaluatePendingMfaMethod (#3853)', () => {
+  const pending: PendingMfaRecord = {
+    userId: 'user-1',
+    mfaMethod: 'totp',
+    passkeyAvailable: false,
+    recoveryAvailable: true,
+    authEpoch: 3,
+    mfaEpoch: 5,
+    transitionId: '11111111-1111-4111-8111-111111111111',
+    browserGeneration: 3,
+    statusExpectation: 'active',
+    allowedMethods: { totp: true, sms: true, passkey: false },
+    expiresAt: Date.now() + 300_000,
+  };
+  const enrolled = {
+    mfaSecret: 'encrypted-secret',
+    mfaMethod: 'sms' as const,
+    phoneNumber: '+15550000001',
+  };
+  const liveAllowed = { totp: true, sms: true, passkey: true };
+
+  it.each(['totp', 'sms', 'recovery'] as const)('authorizes an allowed and enrolled %s switch', (method) => {
+    expect(evaluatePendingMfaMethod(pending, method, enrolled, liveAllowed)).toEqual({ ok: true });
+  });
+
+  it('rejects a method the pending challenge never authorized without making the challenge terminal', () => {
+    expect(evaluatePendingMfaMethod(
+      { ...pending, allowedMethods: { ...pending.allowedMethods, sms: false } },
+      'sms',
+      enrolled,
+      liveAllowed,
+    )).toEqual({ ok: false, reason: 'pending_method_not_allowed', terminal: false });
+  });
+
+  it.each([
+    ['totp', { ...enrolled, mfaSecret: null }],
+    ['sms', { ...enrolled, mfaMethod: 'totp' as const }],
+    ['sms', { ...enrolled, phoneNumber: null }],
+  ] as const)('rejects %s when the live account is not enrolled in that factor', (method, user) => {
+    expect(evaluatePendingMfaMethod(pending, method, user, liveAllowed)).toEqual({
+      ok: false,
+      reason: 'factor_not_enrolled',
+      terminal: false,
+    });
+  });
+
+  it('rejects recovery when the pending record had no recovery code', () => {
+    expect(evaluatePendingMfaMethod(
+      { ...pending, recoveryAvailable: false },
+      'recovery',
+      enrolled,
+      liveAllowed,
+    )).toEqual({ ok: false, reason: 'recovery_not_available', terminal: false });
+  });
+
+  it('marks live policy drift terminal so the caller consumes the pending challenge', () => {
+    expect(evaluatePendingMfaMethod(
+      pending,
+      'totp',
+      enrolled,
+      { ...liveAllowed, totp: false },
+    )).toEqual({ ok: false, reason: 'live_policy_disallowed', terminal: true });
+  });
+});
+
+describe('getClientRateLimitKey — spoof-proof per-IP key (SR2-16)', () => {
+  const origTrust = process.env.TRUST_PROXY_HEADERS;
+  beforeEach(() => { process.env.TRUST_PROXY_HEADERS = 'false'; }); // untrusted / no proxy trust
+  afterEach(() => { if (origTrust === undefined) delete process.env.TRUST_PROXY_HEADERS; else process.env.TRUST_PROXY_HEADERS = origTrust; delete process.env.TRUST_CF_CONNECTING_IP; });
+
+  it('reports the direct socket peer to authentication audit callers, never a forwarded claim', () => {
+    expect(getClientIP(
+      makeContext({ 'x-forwarded-for': '203.0.113.9' }, '198.51.100.77'),
+    )).toBe('198.51.100.77');
+  });
+
+  it('keys on the SOCKET peer, so a rotating spoofed X-Forwarded-For from the same peer yields the SAME key (cannot evade the per-IP limit)', () => {
+    // GUARD-BITE: RED today — the fingerprint hashes x-forwarded-for, so the two
+    // keys differ and an attacker mints a fresh bucket per request.
+    const a = getClientRateLimitKey(makeContext({ 'x-forwarded-for': '1.2.3.4' }, '198.51.100.77'));
+    const b = getClientRateLimitKey(makeContext({ 'x-forwarded-for': '5.6.7.8' }, '198.51.100.77'));
+    expect(a).toBe('socket:198.51.100.77');
+    expect(b).toBe('socket:198.51.100.77');
+    expect(a).toBe(b);
+  });
+
+  it('never includes spoofable IP headers in the fingerprint fallback (no socket, no trusted IP)', () => {
+    const withHdr = getClientRateLimitKey(makeContext({ 'x-forwarded-for': '9.9.9.9', 'user-agent': 'UA' }));
+    const noHdr = getClientRateLimitKey(makeContext({ 'user-agent': 'UA' }));
+    expect(withHdr.startsWith('fp:')).toBe(true);
+    expect(withHdr).toBe(noHdr); // x-forwarded-for must NOT change the fingerprint
+  });
+
+  it('prefers the trusted client IP when proxy trust is properly configured', () => {
+    process.env.TRUST_PROXY_HEADERS = 'true';
+    process.env.TRUSTED_PROXY_CIDRS = '198.51.100.77/32';
+    process.env.TRUST_CF_CONNECTING_IP = 'true';
+    const key = getClientRateLimitKey(makeContext({ 'cf-connecting-ip': '203.0.113.5' }, '198.51.100.77'));
+    expect(key).toBe('ip:203.0.113.5');
+    delete process.env.TRUSTED_PROXY_CIDRS;
+  });
+});
+
+// Build a minimal Hono-ish Context for the auth-cookie helpers: a request with
+// header lookup + url, a socket peer (X-Forwarded-Proto is only honored when
+// the TCP peer passes the TRUSTED_PROXY_CIDRS gate), and a `header()` sink
+// that records appended Set-Cookie values so we can assert on the exact cookie
+// strings emitted. Peer defaults to the stock compose Caddy IP; pass
+// `remoteAddress: null` to simulate a context with no socket info.
+const TRUSTED_PROXY_IP = '172.31.0.10';
+
+function makeCookieContext(opts: {
+  forwardedProto?: string;
+  url?: string;
+  host?: string;
+  remoteAddress?: string | null;
+}): {
+  c: Context;
+  setCookies: string[];
+} {
+  const setCookies: string[] = [];
+  const headers: Record<string, string> = {};
+  if (opts.forwardedProto !== undefined) headers['x-forwarded-proto'] = opts.forwardedProto;
+  if (opts.host !== undefined) headers['host'] = opts.host;
+  const remoteAddress = opts.remoteAddress === null ? undefined : (opts.remoteAddress ?? TRUSTED_PROXY_IP);
+  const c = {
+    req: {
+      header: (name: string) => headers[name.toLowerCase()],
+      url: opts.url ?? 'http://api:3001/api/v1/auth/refresh',
+    },
+    header: (name: string, value: string) => {
+      if (name.toLowerCase() === 'set-cookie') setCookies.push(value);
+    },
+    ...(remoteAddress ? { env: { incoming: { socket: { remoteAddress } } } } : {}),
+  } as unknown as Context;
+  return { c, setCookies };
+}
+
+// The production-mode suites need the proxy-trust gate open (in production the
+// gate defaults CLOSED), mirroring the out-of-the-box compose config: Caddy's
+// static IP in TRUSTED_PROXY_CIDRS.
+function enableProxyTrust(): void {
+  process.env.TRUST_PROXY_HEADERS = 'true';
+  process.env.TRUSTED_PROXY_CIDRS = `${TRUSTED_PROXY_IP}/32`;
+}
+
+function disableProxyTrustEnv(): void {
+  delete process.env.TRUST_PROXY_HEADERS;
+  delete process.env.TRUSTED_PROXY_CIDRS;
+}
+
+describe('isRequestConnectionSecure (#1618 — Secure flag tracks real transport)', () => {
+  // These tests assert on the untrusted-proxy-peer behavior (no remoteAddress
+  // is set, so the trusted-CIDR check must resolve via the dev-mode empty-list
+  // fallback), which a gitignored repo-root .env for local dev silently
+  // overrides via dotenv injection at test-run time: .env.example ships both
+  // TRUST_PROXY_HEADERS=true and a non-empty TRUSTED_PROXY_CIDRS, either of
+  // which alone is enough to change these results. CI has no .env file so it
+  // never sees this; pin both vars explicitly so the suite is deterministic
+  // regardless of the machine's ambient environment.
+  beforeEach(() => {
+    vi.stubEnv('TRUST_PROXY_HEADERS', 'true');
+    vi.stubEnv('TRUSTED_PROXY_CIDRS', '');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('true when X-Forwarded-Proto is https (Caddy behind TLS)', () => {
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'https' }).c)).toBe(true);
+  });
+
+  it('false when X-Forwarded-Proto is http (browser reached the site over HTTP)', () => {
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'http' }).c)).toBe(false);
+  });
+
+  it('treats a malformed X-Forwarded-Proto value from a trusted proxy as insecure (TRANSPORT-001)', () => {
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'httpz' }).c)).toBe(false);
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'quic' }).c)).toBe(false);
+  });
+
+  it('uses the first (client-facing) hop of a proxy chain', () => {
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'https, http' }).c)).toBe(true);
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'http, https' }).c)).toBe(false);
+  });
+
+  it('normalizes header casing and whitespace (real proxies send mixed case)', () => {
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'HTTPS' }).c)).toBe(true);
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'Https' }).c)).toBe(true);
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: ' https , http' }).c)).toBe(true);
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'HTTP' }).c)).toBe(false);
+  });
+
+  it('treats an https:// request URL as a positive signal when no X-Forwarded-Proto is present (direct-to-API TLS)', () => {
+    expect(isRequestConnectionSecure(makeCookieContext({ url: 'https://api.example.com/x' }).c)).toBe(true);
+  });
+
+  it('does NOT downgrade on an ambiguous http:// internal hop with no X-Forwarded-Proto — falls back to NODE_ENV', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    try {
+      // In the standard topology c.req.url is the internal Caddy->API hop (http),
+      // which must not force non-Secure on a genuinely HTTPS deployment whose
+      // proxy stripped the header.
+      process.env.NODE_ENV = 'production';
+      expect(isRequestConnectionSecure(makeCookieContext({ url: 'http://api:3001/x' }).c)).toBe(true);
+      process.env.NODE_ENV = 'development';
+      expect(isRequestConnectionSecure(makeCookieContext({ url: 'http://api:3001/x' }).c)).toBe(false);
+    } finally {
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+
+  it('a malformed request URL is just another ambiguous case — falls back to NODE_ENV', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = 'production';
+      expect(isRequestConnectionSecure(makeCookieContext({ url: 'not a url' }).c)).toBe(true);
+    } finally {
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+});
+
+describe('isRequestConnectionSecure — proxy-trust gate on X-Forwarded-Proto', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  beforeEach(() => {
+    process.env.NODE_ENV = 'production';
+    enableProxyTrust();
+  });
+  afterEach(() => {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    disableProxyTrustEnv();
+  });
+
+  it('honors a downgrade (http) only from a trusted proxy peer', () => {
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'http', remoteAddress: TRUSTED_PROXY_IP }).c)).toBe(false);
+  });
+
+  it('IGNORES X-Forwarded-Proto from an untrusted peer — an arbitrary client cannot strip Secure', () => {
+    const untrusted = makeCookieContext({ forwardedProto: 'http', remoteAddress: '203.0.113.9' });
+    // Header dropped -> ambiguous -> NODE_ENV=production default (Secure).
+    expect(isRequestConnectionSecure(untrusted.c)).toBe(true);
+  });
+
+  it('IGNORES X-Forwarded-Proto entirely when TRUST_PROXY_HEADERS is off', () => {
+    process.env.TRUST_PROXY_HEADERS = 'false';
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'http', remoteAddress: TRUSTED_PROXY_IP }).c)).toBe(true);
+  });
+
+  it('a context with no socket info fails the gate closed in production', () => {
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'http', remoteAddress: null }).c)).toBe(true);
+  });
+});
+
+describe('auth cookie Secure flag (#1618 regression)', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  beforeEach(() => {
+    enableProxyTrust();
+  });
+  afterEach(() => {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    disableProxyTrustEnv();
+    delete process.env.AUTH_COOKIE_FORCE_SECURE;
+    delete process.env.AUTH_COOKIE_SAME_SITE;
+  });
+
+  it('REGRESSION: production served over HTTP issues NON-Secure cookies so the browser keeps them', () => {
+    process.env.NODE_ENV = 'production';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'http' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    expect(setCookies).toHaveLength(2);
+    const [refresh, csrf] = setCookies;
+    expect(refresh).toContain('breeze_refresh_token=');
+    expect(refresh).not.toContain('Secure');
+    expect(csrf).not.toContain('Secure');
+    // Attributes that must survive regardless of transport.
+    expect(refresh).toContain('HttpOnly');
+    expect(refresh).toContain('SameSite=Lax');
+  });
+
+  it('installs refresh authority only from the branded guarded-session boundary', () => {
+    process.env.NODE_ENV = 'production';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'https' });
+    const issued = {
+      refreshToken: 'guarded.refresh.jwt',
+    } as AuthorizedUserSession;
+
+    installAuthorizedUserSessionCookies(c, issued);
+
+    expect(setCookies[0]).toContain('breeze_refresh_token=guarded.refresh.jwt');
+    expect(setCookies[1]).toContain('breeze_csrf_token=');
+  });
+
+  it('production served over HTTPS still issues Secure cookies', () => {
+    process.env.NODE_ENV = 'production';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'https' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    expect(setCookies[0]).toContain('; Secure');
+    expect(setCookies[1]).toContain('; Secure');
+  });
+
+  it('AUTH_COOKIE_FORCE_SECURE overrides an http transport (paranoid setups)', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.AUTH_COOKIE_FORCE_SECURE = 'true';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'http' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    expect(setCookies[0]).toContain('; Secure');
+    expect(setCookies[1]).toContain('; Secure');
+  });
+
+  it('SameSite=None forces Secure regardless of transport (browsers reject SameSite=None without it)', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.AUTH_COOKIE_SAME_SITE = 'None';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'http' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    expect(setCookies[0]).toContain('SameSite=None; Secure');
+    expect(setCookies[1]).toContain('SameSite=None; Secure');
+  });
+
+  it('clear cookies mirror the set-cookie Secure flag for the same transport', () => {
+    process.env.NODE_ENV = 'production';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'http' });
+    clearRefreshTokenCookie(c);
+    expect(setCookies).toHaveLength(2);
+    expect(setCookies[0]).toContain('Max-Age=0');
+    expect(setCookies[0]).not.toContain('Secure'); // an http clear must NOT be Secure or the browser ignores it
+    expect(setCookies[1]).not.toContain('Secure');
+  });
+
+  it('clear cookies carry Secure over an https transport', () => {
+    process.env.NODE_ENV = 'production';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'https' });
+    clearRefreshTokenCookie(c);
+    expect(setCookies[0]).toContain('Max-Age=0');
+    expect(setCookies[0]).toContain('; Secure');
+    expect(setCookies[1]).toContain('; Secure');
+  });
+
+  it('build* functions require an explicit transport — no silent NODE_ENV fallback', () => {
+    process.env.NODE_ENV = 'production';
+    expect(buildRefreshTokenCookie('t', true)).toContain('; Secure');
+    expect(buildRefreshTokenCookie('t', false)).not.toContain('Secure');
+    expect(buildCsrfTokenCookie('t', true)).toContain('; Secure');
+    expect(buildCsrfTokenCookie('t', false)).not.toContain('Secure');
+    expect(buildClearRefreshTokenCookie(true)).toContain('; Secure');
+    expect(buildClearRefreshTokenCookie(false)).not.toContain('Secure');
+    expect(buildAuthBindingCookie('binding', true)).toContain('; Secure');
+    expect(buildAuthBindingCookie('binding', false)).not.toContain('Secure');
+    expect(buildClearAuthBindingCookie(true)).toContain('; Secure');
+    expect(buildClearAuthBindingCookie(false)).not.toContain('Secure');
+  });
+
+  it('keeps the dedicated binding host-only, HttpOnly, path-wide, and separate from CSRF', () => {
+    const cookie = buildAuthBindingCookie('binding-value', true);
+    expect(cookie).toContain('breeze_auth_binding=binding-value');
+    expect(cookie).toContain('Path=/');
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('SameSite=Lax');
+    expect(cookie).not.toContain('Domain=');
+    expect(cookie).not.toContain('breeze_csrf_token');
+
+    const cleared = buildClearAuthBindingCookie(true);
+    expect(cleared).toContain('breeze_auth_binding=;');
+    expect(cleared).toContain('Max-Age=0');
+  });
+});
+
+// Both names are now threaded through Compose as `VAR: ${VAR:-}` (#3239), so an
+// operator who sets only the GENERIC name still has the AUTH_-prefixed one
+// present in the container — as an empty string. These pin that '' means
+// "unconfigured" and falls through, which `??` did not do.
+describe('auth cookie AUTH_COOKIE_* vs generic COOKIE_* precedence (#3239)', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  beforeEach(() => {
+    enableProxyTrust();
+    process.env.NODE_ENV = 'production';
+  });
+  afterEach(() => {
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    disableProxyTrustEnv();
+    delete process.env.AUTH_COOKIE_FORCE_SECURE;
+    delete process.env.AUTH_COOKIE_SAME_SITE;
+    delete process.env.COOKIE_FORCE_SECURE;
+    delete process.env.COOKIE_SAME_SITE;
+  });
+
+  it('an EMPTY AUTH_COOKIE_SAME_SITE does not shadow COOKIE_SAME_SITE (compose sends "" for an unset knob)', () => {
+    process.env.AUTH_COOKIE_SAME_SITE = '';
+    process.env.COOKIE_SAME_SITE = 'None';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'http' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    // With `??` this silently fell back to the Lax default and dropped Secure.
+    expect(setCookies[0]).toContain('SameSite=None; Secure');
+    expect(setCookies[1]).toContain('SameSite=None; Secure');
+  });
+
+  it('an EMPTY AUTH_COOKIE_FORCE_SECURE does not shadow COOKIE_FORCE_SECURE', () => {
+    process.env.AUTH_COOKIE_FORCE_SECURE = '';
+    process.env.COOKIE_FORCE_SECURE = 'true';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'http' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    expect(setCookies[0]).toContain('; Secure');
+    expect(setCookies[1]).toContain('; Secure');
+  });
+
+  it('a whitespace-only override is also treated as unconfigured', () => {
+    process.env.AUTH_COOKIE_SAME_SITE = '   ';
+    process.env.COOKIE_SAME_SITE = 'Strict';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'https' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    expect(setCookies[0]).toContain('SameSite=Strict');
+  });
+
+  it('a CONFIGURED AUTH_COOKIE_* override still wins over the generic name', () => {
+    process.env.AUTH_COOKIE_SAME_SITE = 'Strict';
+    process.env.COOKIE_SAME_SITE = 'None';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'https' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    expect(setCookies[0]).toContain('SameSite=Strict');
+    expect(setCookies[0]).not.toContain('SameSite=None');
+  });
+
+  it('both empty falls all the way through to the Lax default', () => {
+    process.env.AUTH_COOKIE_SAME_SITE = '';
+    process.env.COOKIE_SAME_SITE = '';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'https' });
+    setRefreshTokenCookie(c, 'refresh.jwt.value');
+    expect(setCookies[0]).toContain('SameSite=Lax');
+  });
+});
+
+describe('auth cookie transport warnings (#1618 diagnostics)', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetAuthCookieWarnStateForTests();
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    enableProxyTrust();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    warnSpy.mockRestore();
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
+    disableProxyTrustEnv();
+    delete process.env.AUTH_COOKIE_FORCE_SECURE;
+    delete process.env.AUTH_COOKIE_SAME_SITE;
+  });
+
+  function allWarnings(): string {
+    return warnSpy.mock.calls.map((call: unknown[]) => String(call[0])).join('\n');
+  }
+
+  it('warns (throttled) when production issues non-Secure cookies over HTTP, with host + observed proto', () => {
+    process.env.NODE_ENV = 'production';
+    setRefreshTokenCookie(makeCookieContext({ forwardedProto: 'http', host: 'rmm.example.com' }).c, 't');
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(allWarnings()).toContain('NON-Secure auth cookies');
+    expect(allWarnings()).toContain('rmm.example.com');
+    expect(allWarnings()).toContain('"http"');
+    // The old text suggested AUTH_COOKIE_FORCE_SECURE as a remedy — that traps
+    // operators into silently broken logins; it must stay gone.
+    expect(allWarnings()).not.toContain('AUTH_COOKIE_FORCE_SECURE');
+
+    // Suppressed inside the throttle window…
+    setRefreshTokenCookie(makeCookieContext({ forwardedProto: 'http' }).c, 't');
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    // …and fires again after it.
+    vi.advanceTimersByTime(10 * 60 * 1000 + 1);
+    setRefreshTokenCookie(makeCookieContext({ forwardedProto: 'http' }).c, 't');
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('stays quiet for dev-over-http (the normal local flow)', () => {
+    process.env.NODE_ENV = 'development';
+    setRefreshTokenCookie(makeCookieContext({ forwardedProto: 'http' }).c, 't');
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('stays quiet for production-over-https', () => {
+    process.env.NODE_ENV = 'production';
+    setRefreshTokenCookie(makeCookieContext({ forwardedProto: 'https' }).c, 't');
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('warns that login WILL break when AUTH_COOKIE_FORCE_SECURE forces Secure onto an http transport', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.AUTH_COOKIE_FORCE_SECURE = 'true';
+    const { c, setCookies } = makeCookieContext({ forwardedProto: 'http' });
+    setRefreshTokenCookie(c, 't');
+    expect(setCookies[0]).toContain('; Secure'); // cookie really is forced Secure
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(allWarnings()).toContain('WILL silently discard');
+    expect(allWarnings()).toContain('AUTH_COOKIE_FORCE_SECURE');
+  });
+
+  it('warns with the SameSite=None cause when SameSite=None forces Secure onto an http transport', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.AUTH_COOKIE_SAME_SITE = 'None';
+    setRefreshTokenCookie(makeCookieContext({ forwardedProto: 'http' }).c, 't');
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(allWarnings()).toContain('AUTH_COOKIE_SAME_SITE=None');
+    expect(allWarnings()).toContain('WILL silently discard');
+  });
+
+  it('breadcrumbs the blind NODE_ENV fallback in production when no X-Forwarded-Proto is present', () => {
+    process.env.NODE_ENV = 'production';
+    expect(isRequestConnectionSecure(makeCookieContext({}).c)).toBe(true);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(allWarnings()).toContain('Cannot determine');
+    expect(allWarnings()).toContain('no `X-Forwarded-Proto` header was present');
+  });
+
+  it('breadcrumbs an IGNORED X-Forwarded-Proto from an untrusted peer in production', () => {
+    process.env.NODE_ENV = 'production';
+    expect(isRequestConnectionSecure(makeCookieContext({ forwardedProto: 'http', remoteAddress: '203.0.113.9' }).c)).toBe(true);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(allWarnings()).toContain('IGNORED');
+    expect(allWarnings()).toContain('not a trusted proxy');
+  });
+
+  it('the ambiguous-fallback breadcrumb stays quiet outside production', () => {
+    process.env.NODE_ENV = 'development';
+    expect(isRequestConnectionSecure(makeCookieContext({}).c)).toBe(false);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('genericAuthError', () => {
+  it('returns the generic prose with INVALID_CREDENTIALS so every caller (login, sso) emits the code', () => {
+    expect(genericAuthError()).toEqual({
+      error: 'Invalid email or password',
+      code: ERROR_CODES.INVALID_CREDENTIALS,
+    });
+  });
+
+  it('exposes no discriminator field beyond error and code', () => {
+    expect(Object.keys(genericAuthError()).sort()).toEqual(['code', 'error']);
+  });
+});

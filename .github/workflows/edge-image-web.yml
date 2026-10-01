@@ -1,0 +1,76 @@
+# Publishes a standalone Web image on demand, mirroring edge-image-api.yml's
+# gate-free pattern. release.yml's build-docker-web job is hard-gated behind
+# release-integrity-gate (all macOS/Windows signing must succeed), which this
+# fork cannot satisfy without LanternOps' code-signing secrets — so a tagged
+# release here never reaches the docker-push jobs at all. This workflow exists
+# to publish just the web image for self-host use without touching that gate.
+name: Edge Web Image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  publish-edge:
+    name: Publish edge Web image
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/web
+          tags: |
+            type=raw,value=edge
+            type=sha,format=long,prefix=sha-
+
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PUBLIC_APP_VERSION=${{ github.ref_name }}
+            PUBLIC_AGENT_DOWNLOAD_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1
+            PUBLIC_AGENT_TRUST_CERT_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1/kreslab-codesign-public.cer
+            PUBLIC_AGENT_USER_HELPER_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1/breeze-user-helper-windows-amd64.exe
+            PUBLIC_AGENT_WATCHDOG_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1/breeze-watchdog-windows-amd64.exe
+            PUBLIC_AGENT_LINUX_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1/breeze-agent-linux-amd64
+            PUBLIC_AGENT_OPENH264_URL=https://github.com/justkiddo-21/breeze/releases/download/kreslab-agent-signed-v1/libopenh264-2.4.1-linux64.7.so
+          cache-from: type=gha,scope=edge-web
+          cache-to: type=gha,scope=edge-web,mode=max
+
+      # Scan the exact pushed manifest for HIGH/CRITICAL CVEs. This edge image
+      # is deployed to self-host production, so it gets the same blocking Trivy
+      # gate as the other published images (dockerfileImageScanCoverage.test.ts).
+      - name: Scan pushed edge Web image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/web@${{ steps.build.outputs.digest }}
+          severity: 'HIGH,CRITICAL'
+          format: 'table'
+          exit-code: '1'

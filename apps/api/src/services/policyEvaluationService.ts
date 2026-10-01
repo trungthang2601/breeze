@@ -1,0 +1,2157 @@
+import { and, eq, inArray, isNotNull, isNull, ne, or, sql, type SQL } from 'drizzle-orm';
+import { db } from '../db';
+import {
+  automationPolicies,
+  automationPolicyCompliance,
+  automationRuns,
+  automations,
+  configPolicyComplianceRules,
+  deviceConfigState,
+  deviceDisks,
+  deviceGroupMemberships,
+  deviceRegistryState,
+  deviceSoftware,
+  devices,
+  organizations,
+  softwareInventory,
+} from '../db/schema';
+import { publishEvent } from './eventBus';
+import {
+  resolveComplianceRulesForDevice,
+  scanDueComplianceChecks,
+} from './featureConfigResolver';
+import { isManagedAutomation } from './aiAgents/managedAutomation';
+import { canReadPartnerWideRows, type PartnerWideReadAuth } from './partnerWideAccess';
+
+export type EvaluationStatus = 'compliant' | 'non_compliant' | 'error';
+
+type PolicyRow = typeof automationPolicies.$inferSelect;
+
+type TargetDevice = {
+  id: string;
+  // The device's own org — for an org-owned policy this equals policy.orgId;
+  // for a partner-wide policy (#2129) it varies per device and is what child
+  // rows, events, and remediation lookups must be scoped to.
+  orgId: string;
+  hostname: string;
+  osType: string;
+  osVersion: string;
+};
+
+export type PolicyEvaluationResult = {
+  deviceId: string;
+  hostname: string;
+  status: EvaluationStatus;
+  previousStatus: string | null;
+  remediationRunId?: string | null;
+};
+
+export type PolicyEvaluationResponse = {
+  message: string;
+  policyId: string;
+  devicesEvaluated: number;
+  results: PolicyEvaluationResult[];
+  summary: {
+    compliant: number;
+    non_compliant: number;
+  };
+  evaluatedAt: string;
+};
+
+type EvaluatePolicyOptions = {
+  source?: string;
+  requestRemediation?: boolean;
+  /**
+   * Identity of the requesting caller when evaluatePolicy runs inside a
+   * request (POST /policies/:id/evaluate). Partner-wide remediation
+   * automations (org_id NULL) are reachable only for system scope or the
+   * owning partner's own partner-scoped token; an org token carries a
+   * partnerId, and the partner-wide SELECT branch on `automations` makes those
+   * rows readable from an org RLS context as well, so the app-layer gate IS
+   * the access check (#4952).
+   *
+   * Omitted on the background/worker path (policyEvaluationWorker), which is
+   * genuinely system-scoped.
+   */
+  auth?: PartnerWideReadAuth | null;
+};
+
+type TargetConfig = {
+  targetType?: string;
+  targetIds?: string[];
+  deviceIds?: string[];
+  siteIds?: string[];
+  groupIds?: string[];
+  tags?: string[];
+};
+
+type ParsedRule = {
+  type: string;
+  raw: Record<string, unknown>;
+};
+
+type ParsedRulesResult = {
+  rules: ParsedRule[];
+  inputHadArray: boolean;
+  inputLength: number;
+  invalidCount: number;
+};
+
+type InstalledSoftwareRecord = {
+  name: string;
+  version: string | null;
+};
+
+type DiskRecord = {
+  mountPoint: string;
+  device: string | null;
+  freeGb: number;
+};
+
+type RegistryStateRecord = {
+  registryPath: string;
+  valueName: string;
+  valueData: string | null;
+  valueType: string | null;
+};
+
+type ConfigStateRecord = {
+  filePath: string;
+  configKey: string;
+  configValue: string | null;
+};
+
+type RuleEvaluationDetail = {
+  ruleType: string;
+  passed: boolean;
+  message: string;
+  data?: Record<string, unknown>;
+};
+
+type DeviceEvaluationContext = {
+  device: TargetDevice;
+  software: InstalledSoftwareRecord[];
+  disks: DiskRecord[];
+  registryState: RegistryStateRecord[];
+  configState: ConfigStateRecord[];
+};
+
+type DeviceRuleEvaluation = {
+  passed: boolean;
+  details: RuleEvaluationDetail[];
+};
+
+type VersionOperator = 'any' | 'exact' | 'minimum' | 'maximum';
+
+// ─── Compliance-row upserts (#4122) ─────────────────────────────────────────
+//
+// Both compliance shapes used to be written with a non-atomic select-then-
+// insert against a table that had no uniqueness at all, so two concurrent
+// evaluations of the same policy each saw "no row" and each inserted. The
+// duplicates then fed `policyAlertBridge`'s reconcile guard and the next
+// evaluation's own read, which picked an arbitrary one of them.
+//
+// Migration 2026-09-29-100000 adds the two PARTIAL unique indexes these
+// builders arbitrate on. Postgres only infers a partial index as an ON CONFLICT
+// arbiter when the statement's inference predicate implies the index predicate,
+// so each `targetWhere` below must stay byte-for-byte equivalent to its index's
+// `WHERE`. Getting it wrong is loud, not silent: `42P10 there is no unique or
+// exclusion constraint matching the ON CONFLICT specification`.
+//
+// `remediationAttempts` is deliberately absent from every SET list — it is a
+// counter owned by the remediation path and a re-evaluation must not reset it.
+// This matches the UPDATE these upserts replace.
+//
+// Both builders are exported so `policyEvaluationService.upsertSql.test.ts` can
+// assert the COMPILED SQL. A call-shape assertion against a mocked `db` would
+// stay green with the wrong conflict target, which is the whole bug class here.
+
+type ComplianceUpsertDetails = Record<string, unknown>;
+
+export function buildPolicyComplianceUpsert(input: {
+  policyId: string;
+  deviceId: string;
+  status: EvaluationStatus;
+  details: ComplianceUpsertDetails;
+  checkedAt: Date;
+}) {
+  const mutable = {
+    status: input.status,
+    details: input.details,
+    lastCheckedAt: input.checkedAt,
+    updatedAt: input.checkedAt,
+  };
+  return db
+    .insert(automationPolicyCompliance)
+    .values({
+      policyId: input.policyId,
+      deviceId: input.deviceId,
+      ...mutable,
+    })
+    .onConflictDoUpdate({
+      // Mirrors `apc_policy_device_uq`.
+      target: [automationPolicyCompliance.policyId, automationPolicyCompliance.deviceId],
+      targetWhere: isNotNull(automationPolicyCompliance.policyId),
+      set: mutable,
+    });
+}
+
+export function buildConfigPolicyComplianceUpsert(input: {
+  configPolicyId: string;
+  configItemName: string;
+  deviceId: string;
+  status: 'compliant' | 'non_compliant' | 'error';
+  details: ComplianceUpsertDetails;
+  checkedAt: Date;
+}) {
+  const mutable = {
+    status: input.status,
+    details: input.details,
+    lastCheckedAt: input.checkedAt,
+    updatedAt: input.checkedAt,
+  };
+  return db
+    .insert(automationPolicyCompliance)
+    .values({
+      // Explicitly NULL: this row lives on the config-policy axis, and a
+      // non-null policy_id here would also land it in `apc_policy_device_uq`.
+      policyId: null,
+      configPolicyId: input.configPolicyId,
+      configItemName: input.configItemName,
+      deviceId: input.deviceId,
+      ...mutable,
+    })
+    .onConflictDoUpdate({
+      // Mirrors `apc_config_policy_item_device_uq`.
+      target: [
+        automationPolicyCompliance.configPolicyId,
+        automationPolicyCompliance.configItemName,
+        automationPolicyCompliance.deviceId,
+      ],
+      targetWhere: and(
+        isNotNull(automationPolicyCompliance.configPolicyId),
+        isNotNull(automationPolicyCompliance.configItemName),
+      ),
+      set: mutable,
+    });
+}
+
+export type RuleEvaluationDebugInput = {
+  device: {
+    osType: string;
+    osVersion: string;
+  };
+  software?: Array<{
+    name: string;
+    version: string | null;
+  }>;
+  disks?: Array<{
+    mountPoint: string;
+    device: string | null;
+    freeGb: number;
+  }>;
+  registryState?: Array<{
+    registryPath: string;
+    valueName: string;
+    valueData: string | null;
+    valueType: string | null;
+  }>;
+  configState?: Array<{
+    filePath: string;
+    configKey: string;
+    configValue: string | null;
+  }>;
+};
+
+export type RuleEvaluationDebugOutput = {
+  passed: boolean;
+  details: Array<{
+    ruleType: string;
+    passed: boolean;
+    message: string;
+    data?: Record<string, unknown>;
+  }>;
+};
+
+function sanitizeUuidList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
+}
+
+function normalizeTargetConfig(targets: unknown): TargetConfig {
+  if (!targets || typeof targets !== 'object') {
+    return {};
+  }
+
+  const raw = targets as Record<string, unknown>;
+  const targetType = typeof raw.targetType === 'string' ? raw.targetType : undefined;
+  const targetIds = sanitizeUuidList(raw.targetIds);
+  const deviceIds = sanitizeUuidList(raw.deviceIds);
+  const siteIds = sanitizeUuidList(raw.siteIds);
+  const groupIds = sanitizeUuidList(raw.groupIds);
+  const tags = sanitizeUuidList(raw.tags);
+
+  return {
+    targetType,
+    targetIds,
+    deviceIds: deviceIds.length > 0 ? deviceIds : targetType === 'devices' ? targetIds : [],
+    siteIds: siteIds.length > 0 ? siteIds : targetType === 'sites' ? targetIds : [],
+    groupIds: groupIds.length > 0 ? groupIds : targetType === 'groups' ? targetIds : [],
+    tags: tags.length > 0 ? tags : targetType === 'tags' ? targetIds : [],
+  };
+}
+
+function parsePolicyRules(rules: unknown): ParsedRulesResult {
+  if (!Array.isArray(rules)) {
+    return {
+      rules: [],
+      inputHadArray: false,
+      inputLength: 0,
+      invalidCount: 0,
+    };
+  }
+
+  const parsedRules: ParsedRule[] = [];
+  let invalidCount = 0;
+
+  for (const rule of rules) {
+    if (!rule || typeof rule !== 'object') {
+      invalidCount += 1;
+      continue;
+    }
+
+    const typedRule = rule as Record<string, unknown>;
+    const typeValue = typeof typedRule.type === 'string'
+      ? typedRule.type
+      : typeof typedRule.name === 'string'
+        ? typedRule.name
+        : null;
+
+    const type = typeValue?.trim();
+    if (!type) {
+      invalidCount += 1;
+      continue;
+    }
+
+    parsedRules.push({ type, raw: typedRule });
+  }
+
+  return {
+    rules: parsedRules,
+    inputHadArray: true,
+    inputLength: rules.length,
+    invalidCount,
+  };
+}
+
+function readString(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function readNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function normalizeComparable(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function normalizeRegistryPath(path: string): string {
+  return path.trim().replace(/[\\/]+/g, '\\').toLowerCase();
+}
+
+function normalizeConfigPath(path: string): string {
+  return path.trim().replace(/\/+/g, '/').toLowerCase();
+}
+
+function softwareNameMatches(installedName: string, expectedName: string): boolean {
+  const installed = normalizeComparable(installedName);
+  const expected = normalizeComparable(expectedName);
+
+  return installed === expected || installed.includes(expected) || expected.includes(installed);
+}
+
+function compareVersionTokens(left: string, right: string): number {
+  const leftIsNumeric = /^\d+$/.test(left);
+  const rightIsNumeric = /^\d+$/.test(right);
+
+  if (leftIsNumeric && rightIsNumeric) {
+    const leftNumber = Number.parseInt(left, 10);
+    const rightNumber = Number.parseInt(right, 10);
+    if (leftNumber > rightNumber) return 1;
+    if (leftNumber < rightNumber) return -1;
+    return 0;
+  }
+
+  return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function compareVersions(leftVersion: string, rightVersion: string): number {
+  const leftTokens = leftVersion.split(/[^0-9a-zA-Z]+/).filter((token) => token.length > 0);
+  const rightTokens = rightVersion.split(/[^0-9a-zA-Z]+/).filter((token) => token.length > 0);
+  const maxLength = Math.max(leftTokens.length, rightTokens.length);
+
+  for (let index = 0; index < maxLength; index += 1) {
+    const leftToken = leftTokens[index] ?? '0';
+    const rightToken = rightTokens[index] ?? '0';
+    const tokenComparison = compareVersionTokens(leftToken, rightToken);
+
+    if (tokenComparison > 0) {
+      return 1;
+    }
+    if (tokenComparison < 0) {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+function matchesVersionRequirement(
+  installedVersion: string | null,
+  requiredVersion: string | null,
+  operator: VersionOperator
+): boolean {
+  if (operator === 'any') {
+    return true;
+  }
+
+  if (!requiredVersion || !installedVersion) {
+    return false;
+  }
+
+  const comparison = compareVersions(installedVersion, requiredVersion);
+
+  if (operator === 'exact') {
+    return comparison === 0;
+  }
+  if (operator === 'minimum') {
+    return comparison >= 0;
+  }
+  if (operator === 'maximum') {
+    return comparison <= 0;
+  }
+  return false;
+}
+
+export function __compareVersions(leftVersion: string, rightVersion: string): number {
+  return compareVersions(leftVersion, rightVersion);
+}
+
+export function __matchesVersionRequirement(
+  installedVersion: string | null,
+  requiredVersion: string | null,
+  operator: 'any' | 'exact' | 'minimum' | 'maximum'
+): boolean {
+  return matchesVersionRequirement(installedVersion, requiredVersion, operator);
+}
+
+function evaluateRequiredSoftwareRule(
+  rule: ParsedRule,
+  context: DeviceEvaluationContext
+): RuleEvaluationDetail {
+  const softwareName = readString(rule.raw.softwareName);
+  if (!softwareName) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: 'Required software rule is missing softwareName.',
+    };
+  }
+
+  const matchingSoftware = context.software.filter((entry) =>
+    softwareNameMatches(entry.name, softwareName)
+  );
+
+  if (matchingSoftware.length === 0) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: `Required software "${softwareName}" is not installed.`,
+    };
+  }
+
+  const operatorValue = readString(rule.raw.versionOperator)?.toLowerCase();
+  const versionOperator: VersionOperator = operatorValue === 'exact' || operatorValue === 'eq'
+    ? 'exact'
+    : operatorValue === 'minimum' || operatorValue === 'gte' || operatorValue === 'gt'
+      ? 'minimum'
+      : operatorValue === 'maximum' || operatorValue === 'lte'
+        ? 'maximum'
+        : 'any';
+
+  const requiredVersion = readString(rule.raw.softwareVersion);
+  if (versionOperator !== 'any' && !requiredVersion) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: `Version operator "${versionOperator}" requires softwareVersion.`,
+      data: { softwareName },
+    };
+  }
+
+  const matchingByVersion = matchingSoftware.filter((entry) =>
+    matchesVersionRequirement(entry.version, requiredVersion, versionOperator)
+  );
+
+  if (matchingByVersion.length === 0) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: `Installed versions for "${softwareName}" do not satisfy ${versionOperator} ${requiredVersion ?? ''}.`,
+      data: {
+        softwareName,
+        installedVersions: matchingSoftware.map((entry) => entry.version ?? 'unknown'),
+        requiredVersion,
+        versionOperator,
+      },
+    };
+  }
+
+  return {
+    ruleType: rule.type,
+    passed: true,
+    message: `Required software "${softwareName}" is installed.`,
+  };
+}
+
+function evaluateProhibitedSoftwareRule(
+  rule: ParsedRule,
+  context: DeviceEvaluationContext
+): RuleEvaluationDetail {
+  const softwareName = readString(rule.raw.prohibitedName ?? rule.raw.softwareName);
+  if (!softwareName) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: 'Prohibited software rule is missing prohibitedName.',
+    };
+  }
+
+  const matchingSoftware = context.software.filter((entry) =>
+    softwareNameMatches(entry.name, softwareName)
+  );
+
+  if (matchingSoftware.length === 0) {
+    return {
+      ruleType: rule.type,
+      passed: true,
+      message: `Prohibited software "${softwareName}" is not installed.`,
+    };
+  }
+
+  return {
+    ruleType: rule.type,
+    passed: false,
+    message: `Prohibited software "${softwareName}" is installed.`,
+    data: {
+      installedVersions: matchingSoftware.map((entry) => entry.version ?? 'unknown'),
+    },
+  };
+}
+
+function diskMatchesPath(disk: DiskRecord, path: string): boolean {
+  const normalizedPath = normalizeComparable(path);
+  const mountPoint = normalizeComparable(disk.mountPoint);
+  const devicePath = disk.device ? normalizeComparable(disk.device) : '';
+
+  return mountPoint === normalizedPath
+    || mountPoint.includes(normalizedPath)
+    || normalizedPath.includes(mountPoint)
+    || (devicePath.length > 0 && (
+      devicePath === normalizedPath
+      || devicePath.includes(normalizedPath)
+      || normalizedPath.includes(devicePath)
+    ));
+}
+
+function evaluateDiskSpaceRule(
+  rule: ParsedRule,
+  context: DeviceEvaluationContext
+): RuleEvaluationDetail {
+  const minimumFreeGb = readNumber(rule.raw.minGb ?? rule.raw.diskSpaceGB);
+  if (minimumFreeGb === null) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: 'Disk space rule is missing minGb.',
+    };
+  }
+
+  const diskPath = readString(rule.raw.diskPath);
+  const candidateDisks = diskPath
+    ? context.disks.filter((disk) => diskMatchesPath(disk, diskPath))
+    : context.disks;
+
+  if (candidateDisks.length === 0) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: diskPath
+        ? `No disk metrics found for path "${diskPath}".`
+        : 'No disk metrics found for this device.',
+    };
+  }
+
+  const failingDisks = candidateDisks.filter((disk) => disk.freeGb < minimumFreeGb);
+  if (failingDisks.length > 0) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: `${failingDisks.length} disk(s) below minimum free space of ${minimumFreeGb}GB.`,
+      data: {
+        minimumFreeGb,
+        failingDisks: failingDisks.map((disk) => ({
+          mountPoint: disk.mountPoint,
+          freeGb: disk.freeGb,
+        })),
+      },
+    };
+  }
+
+  return {
+    ruleType: rule.type,
+    passed: true,
+    message: `Disk free space meets minimum of ${minimumFreeGb}GB.`,
+  };
+}
+
+function evaluateOsVersionRule(
+  rule: ParsedRule,
+  context: DeviceEvaluationContext
+): RuleEvaluationDetail {
+  const requiredOsType = readString(rule.raw.osType)?.toLowerCase() ?? 'any';
+  const requiredMinVersion = readString(rule.raw.minOsVersion ?? rule.raw.osMinVersion);
+  const currentOsType = context.device.osType.toLowerCase();
+
+  if (requiredOsType !== 'any' && currentOsType !== requiredOsType) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: `Device OS type ${context.device.osType} does not match required ${requiredOsType}.`,
+    };
+  }
+
+  if (requiredMinVersion) {
+    const comparison = compareVersions(context.device.osVersion, requiredMinVersion);
+    if (comparison < 0) {
+      return {
+        ruleType: rule.type,
+        passed: false,
+        message: `Device OS version ${context.device.osVersion} is below required ${requiredMinVersion}.`,
+      };
+    }
+  }
+
+  return {
+    ruleType: rule.type,
+    passed: true,
+    message: 'OS version requirement satisfied.',
+  };
+}
+
+function evaluateRegistryCheckRule(
+  rule: ParsedRule,
+  context: DeviceEvaluationContext
+): RuleEvaluationDetail {
+  const registryPath = readString(rule.raw.registryPath);
+  const valueName = readString(rule.raw.registryValueName);
+  const expectedValue = readString(rule.raw.registryExpectedValue);
+
+  if (!registryPath || !valueName) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: 'Registry rule requires registryPath and registryValueName.',
+    };
+  }
+
+  if (context.device.osType.toLowerCase() !== 'windows') {
+    return {
+      ruleType: rule.type,
+      passed: true,
+      message: 'Registry rule not applicable to non-Windows device.',
+    };
+  }
+
+  const normalizedPath = normalizeRegistryPath(registryPath);
+  const normalizedValueName = normalizeComparable(valueName);
+  const matched = context.registryState.find((entry) =>
+    normalizeRegistryPath(entry.registryPath) === normalizedPath
+    && normalizeComparable(entry.valueName) === normalizedValueName
+  );
+
+  if (!matched) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: `Registry value not found: ${registryPath}\\${valueName}.`,
+    };
+  }
+
+  if (expectedValue !== null) {
+    const actualValue = matched.valueData ?? '';
+    if (normalizeComparable(actualValue) !== normalizeComparable(expectedValue)) {
+      return {
+        ruleType: rule.type,
+        passed: false,
+        message: `Registry value mismatch for ${registryPath}\\${valueName}.`,
+        data: {
+          expectedValue,
+          actualValue,
+          valueType: matched.valueType,
+        },
+      };
+    }
+  }
+
+  return {
+    ruleType: rule.type,
+    passed: true,
+    message: `Registry value matches for ${registryPath}\\${valueName}.`,
+  };
+}
+
+function evaluateConfigCheckRule(
+  rule: ParsedRule,
+  context: DeviceEvaluationContext
+): RuleEvaluationDetail {
+  const filePath = readString(rule.raw.configFilePath);
+  const configKey = readString(rule.raw.configKey);
+  const expectedValue = readString(rule.raw.configExpectedValue);
+
+  if (!filePath || !configKey) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: 'Config rule requires configFilePath and configKey.',
+    };
+  }
+
+  const normalizedFilePath = normalizeConfigPath(filePath);
+  const normalizedConfigKey = normalizeComparable(configKey);
+  const matched = context.configState.find((entry) =>
+    normalizeConfigPath(entry.filePath) === normalizedFilePath
+    && normalizeComparable(entry.configKey) === normalizedConfigKey
+  );
+
+  if (!matched) {
+    return {
+      ruleType: rule.type,
+      passed: false,
+      message: `Config key not found: ${filePath} -> ${configKey}.`,
+    };
+  }
+
+  if (expectedValue !== null) {
+    const actualValue = matched.configValue ?? '';
+    if (normalizeComparable(actualValue) !== normalizeComparable(expectedValue)) {
+      return {
+        ruleType: rule.type,
+        passed: false,
+        message: `Config value mismatch for ${filePath} -> ${configKey}.`,
+        data: {
+          expectedValue,
+          actualValue,
+        },
+      };
+    }
+  }
+
+  return {
+    ruleType: rule.type,
+    passed: true,
+    message: `Config value matches for ${filePath} -> ${configKey}.`,
+  };
+}
+
+function evaluateUnsupportedRule(
+  rule: ParsedRule,
+  reason: string
+): RuleEvaluationDetail {
+  return {
+    ruleType: rule.type,
+    passed: false,
+    message: reason,
+  };
+}
+
+function evaluateRule(
+  rule: ParsedRule,
+  context: DeviceEvaluationContext
+): RuleEvaluationDetail {
+  switch (rule.type) {
+    case 'required_software':
+      return evaluateRequiredSoftwareRule(rule, context);
+    case 'prohibited_software':
+      return evaluateProhibitedSoftwareRule(rule, context);
+    case 'disk_space_minimum':
+      return evaluateDiskSpaceRule(rule, context);
+    case 'os_version':
+      return evaluateOsVersionRule(rule, context);
+    case 'registry_check':
+      return evaluateRegistryCheckRule(rule, context);
+    case 'config_check':
+      return evaluateConfigCheckRule(rule, context);
+    default:
+      return evaluateUnsupportedRule(
+        rule,
+        `Unsupported policy rule type "${rule.type}".`
+      );
+  }
+}
+
+function evaluateDeviceRules(
+  parsedRules: ParsedRulesResult,
+  context: DeviceEvaluationContext
+): DeviceRuleEvaluation {
+  if (!parsedRules.inputHadArray) {
+    return {
+      passed: false,
+      details: [{
+        ruleType: 'policy_rules',
+        passed: false,
+        message: 'Policy rules payload is invalid: expected an array.',
+      }],
+    };
+  }
+
+  if (parsedRules.inputLength === 0) {
+    return {
+      passed: false,
+      details: [{
+        ruleType: 'policy_rules',
+        passed: false,
+        message: 'Policy has no rules to evaluate.',
+      }],
+    };
+  }
+
+  const details = parsedRules.rules.map((rule) => evaluateRule(rule, context));
+  if (parsedRules.invalidCount > 0) {
+    details.push({
+      ruleType: 'policy_rules',
+      passed: false,
+      message: `Policy contains ${parsedRules.invalidCount} invalid rule(s).`,
+      data: {
+        invalidRuleCount: parsedRules.invalidCount,
+        totalRules: parsedRules.inputLength,
+      },
+    });
+  }
+
+  const passed = parsedRules.invalidCount === 0
+    && parsedRules.rules.length > 0
+    && details.every((detail) => detail.passed);
+
+  return { passed, details };
+}
+
+export function __evaluateRulesForDevice(
+  rules: unknown,
+  input: RuleEvaluationDebugInput
+): RuleEvaluationDebugOutput {
+  const parsedRules = parsePolicyRules(rules);
+  const evaluation = evaluateDeviceRules(parsedRules, {
+    device: {
+      id: 'debug-device',
+      orgId: 'debug-org',
+      hostname: 'debug-host',
+      osType: input.device.osType,
+      osVersion: input.device.osVersion,
+    },
+    software: input.software ?? [],
+    disks: input.disks ?? [],
+    registryState: input.registryState ?? [],
+    configState: input.configState ?? [],
+  });
+
+  return {
+    passed: evaluation.passed,
+    details: evaluation.details,
+  };
+}
+
+function dedupeTargetDevices(rows: TargetDevice[]): TargetDevice[] {
+  const byId = new Map<string, TargetDevice>();
+  for (const row of rows) {
+    byId.set(row.id, row);
+  }
+  return Array.from(byId.values());
+}
+
+function buildDiskMap(rows: Array<{
+  deviceId: string;
+  mountPoint: string;
+  device: string | null;
+  freeGb: number;
+}>): Map<string, DiskRecord[]> {
+  const disksByDevice = new Map<string, DiskRecord[]>();
+  for (const row of rows) {
+    const disks = disksByDevice.get(row.deviceId) ?? [];
+    disks.push({
+      mountPoint: row.mountPoint,
+      device: row.device,
+      freeGb: row.freeGb,
+    });
+    disksByDevice.set(row.deviceId, disks);
+  }
+  return disksByDevice;
+}
+
+function buildSoftwareMap(rows: Array<{
+  deviceId: string;
+  name: string;
+  version: string | null;
+}>): Map<string, InstalledSoftwareRecord[]> {
+  const softwareByDevice = new Map<string, InstalledSoftwareRecord[]>();
+  const softwareKeysByDevice = new Map<string, Set<string>>();
+
+  for (const row of rows) {
+    const name = readString(row.name);
+    if (!name) {
+      continue;
+    }
+
+    const version = readString(row.version) ?? null;
+    const dedupeKey = `${normalizeComparable(name)}:${normalizeComparable(version ?? 'unknown')}`;
+    const existingKeys = softwareKeysByDevice.get(row.deviceId) ?? new Set<string>();
+    if (existingKeys.has(dedupeKey)) {
+      continue;
+    }
+
+    const software = softwareByDevice.get(row.deviceId) ?? [];
+    software.push({ name, version });
+    softwareByDevice.set(row.deviceId, software);
+
+    existingKeys.add(dedupeKey);
+    softwareKeysByDevice.set(row.deviceId, existingKeys);
+  }
+
+  return softwareByDevice;
+}
+
+function buildRegistryStateMap(rows: Array<{
+  deviceId: string;
+  registryPath: string;
+  valueName: string;
+  valueData: string | null;
+  valueType: string | null;
+}>): Map<string, RegistryStateRecord[]> {
+  const registryByDevice = new Map<string, RegistryStateRecord[]>();
+  for (const row of rows) {
+    const state = registryByDevice.get(row.deviceId) ?? [];
+    state.push({
+      registryPath: row.registryPath,
+      valueName: row.valueName,
+      valueData: row.valueData,
+      valueType: row.valueType,
+    });
+    registryByDevice.set(row.deviceId, state);
+  }
+  return registryByDevice;
+}
+
+function buildConfigStateMap(rows: Array<{
+  deviceId: string;
+  filePath: string;
+  configKey: string;
+  configValue: string | null;
+}>): Map<string, ConfigStateRecord[]> {
+  const configByDevice = new Map<string, ConfigStateRecord[]>();
+  for (const row of rows) {
+    const state = configByDevice.get(row.deviceId) ?? [];
+    state.push({
+      filePath: row.filePath,
+      configKey: row.configKey,
+      configValue: row.configValue,
+    });
+    configByDevice.set(row.deviceId, state);
+  }
+  return configByDevice;
+}
+
+function extractRemediationAutomationId(rules: unknown): string | null {
+  if (!Array.isArray(rules)) {
+    return null;
+  }
+
+  for (const rule of rules) {
+    if (!rule || typeof rule !== 'object') {
+      continue;
+    }
+
+    const typedRule = rule as Record<string, unknown>;
+
+    if (typeof typedRule.remediationAutomationId === 'string') {
+      return typedRule.remediationAutomationId;
+    }
+
+    const remediation = typedRule.remediation;
+    if (remediation && typeof remediation === 'object') {
+      const remediationConfig = remediation as Record<string, unknown>;
+      if (typeof remediationConfig.automationId === 'string') {
+        return remediationConfig.automationId;
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractScriptIdFromAction(action: unknown): string | null {
+  if (!action || typeof action !== 'object') {
+    return null;
+  }
+
+  const typedAction = action as Record<string, unknown>;
+  const directScriptId = typedAction.scriptId;
+  if (typeof directScriptId === 'string' && directScriptId.length > 0) {
+    return directScriptId;
+  }
+
+  const snakeScriptId = typedAction.script_id;
+  if (typeof snakeScriptId === 'string' && snakeScriptId.length > 0) {
+    return snakeScriptId;
+  }
+
+  return null;
+}
+
+export async function resolvePolicyRemediationAutomationId(
+  policy: PolicyRow,
+  auth?: PartnerWideReadAuth | null
+): Promise<string | null> {
+  return resolvePolicyRemediationAutomationIdForOrg(policy, policy.orgId, auth);
+}
+
+/**
+ * Automations reachable from a device org (#2133): the org's own automations
+ * OR partner-wide automations (org_id NULL) owned by the org's partner. A
+ * plain eq(orgId, ...) silently never matches partner-wide rows — evaluation
+ * runs under a system DB context, so RLS is not the filter here.
+ *
+ * The partner-wide arm must therefore carry the CALLER's own visibility when
+ * this runs inside a request (POST /policies/:id/evaluate). An org token
+ * carries a partnerId, and automations' partner-wide SELECT branch makes those
+ * rows readable from an org context too, so nothing below this gate stops an
+ * org caller from remediating with another tenant's partner-wide automation
+ * (#4952). `auth` absent = the system/worker path, which is genuinely
+ * system-scoped.
+ */
+async function automationOwnershipConditionForOrg(
+  orgId: string,
+  auth?: PartnerWideReadAuth | null
+): Promise<SQL> {
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+
+  if (!org?.partnerId || !canReadPartnerWideRows(auth, org.partnerId)) {
+    return eq(automations.orgId, orgId);
+  }
+
+  return or(
+    eq(automations.orgId, orgId),
+    and(isNull(automations.orgId), eq(automations.partnerId, org.partnerId))
+  ) as SQL;
+}
+
+/**
+ * Script-based remediation matching is anchored to a specific org: the
+ * device's own automations plus partner-wide automations of the org's partner
+ * (#2133). For an org-owned policy the anchor is policy.orgId; for a
+ * partner-wide policy (#2129) evaluatePolicy resolves per DEVICE org.
+ */
+export async function resolvePolicyRemediationAutomationIdForOrg(
+  policy: PolicyRow,
+  orgId: string | null,
+  auth?: PartnerWideReadAuth | null
+): Promise<string | null> {
+  const explicitAutomationId = extractRemediationAutomationId(policy.rules);
+  if (explicitAutomationId) {
+    return explicitAutomationId;
+  }
+
+  if (!policy.remediationScriptId || !orgId) {
+    return null;
+  }
+
+  const candidates = await db
+    .select({
+      id: automations.id,
+      actions: automations.actions,
+      orgId: automations.orgId,
+      partnerId: automations.partnerId,
+    })
+    .from(automations)
+    .where(
+      and(
+        await automationOwnershipConditionForOrg(orgId, auth),
+        eq(automations.enabled, true),
+        isNull(automations.retiredAt)
+      )
+    );
+
+  for (const candidate of candidates) {
+    // Defense in depth on each loaded row (#4952) — see
+    // automationOwnershipConditionForOrg.
+    if (candidate.orgId === null && !canReadPartnerWideRows(auth, candidate.partnerId)) {
+      continue;
+    }
+    if (!Array.isArray(candidate.actions)) {
+      continue;
+    }
+
+    for (const action of candidate.actions) {
+      const scriptId = extractScriptIdFromAction(action);
+      if (scriptId === policy.remediationScriptId) {
+        return candidate.id;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Ownership → device-scope condition. An org-owned policy targets devices in
+ * its own org; a partner-wide policy (orgId NULL, #2129) fans out to every
+ * device in every org under the owning partner. Returns null when the owner
+ * resolves to no orgs — i.e. zero target devices.
+ */
+async function policyDeviceScopeCondition(policy: PolicyRow): Promise<SQL | null> {
+  // Ephemeral Quick Support devices live in the partner's hidden 'quick_support'
+  // org, so both the org-owned and the partner-wide fan-out below would otherwise
+  // pick them up. Policies must never target a transient support session. Folded
+  // in here so every branch of resolveTargetDevices() inherits it.
+  const notEphemeral = eq(devices.isEphemeral, false);
+
+  if (policy.orgId) {
+    return and(eq(devices.orgId, policy.orgId), notEphemeral)!;
+  }
+
+  if (!policy.partnerId) {
+    // The one-owner CHECK makes this unreachable; guard against bad legacy data.
+    return null;
+  }
+
+  const orgRows = await db
+    .select({ id: organizations.id })
+    .from(organizations)
+    .where(and(eq(organizations.partnerId, policy.partnerId), ne(organizations.type, 'quick_support')));
+
+  if (orgRows.length === 0) {
+    return null;
+  }
+
+  return and(inArray(devices.orgId, orgRows.map((row) => row.id)), notEphemeral)!;
+}
+
+const TARGET_DEVICE_COLUMNS = {
+  id: devices.id,
+  orgId: devices.orgId,
+  hostname: devices.hostname,
+  osType: devices.osType,
+  osVersion: devices.osVersion,
+};
+
+async function resolveTargetDevices(policy: PolicyRow): Promise<TargetDevice[]> {
+  const targets = normalizeTargetConfig(policy.targets);
+  const scopeCondition = await policyDeviceScopeCondition(policy);
+
+  if (!scopeCondition) {
+    return [];
+  }
+
+  if (targets.deviceIds && targets.deviceIds.length > 0) {
+    return db
+      .select(TARGET_DEVICE_COLUMNS)
+      .from(devices)
+      .where(
+        and(
+          scopeCondition,
+          inArray(devices.id, targets.deviceIds)
+        )
+      );
+  }
+
+  if (targets.siteIds && targets.siteIds.length > 0) {
+    return db
+      .select(TARGET_DEVICE_COLUMNS)
+      .from(devices)
+      .where(
+        and(
+          scopeCondition,
+          inArray(devices.siteId, targets.siteIds)
+        )
+      );
+  }
+
+  if (targets.groupIds && targets.groupIds.length > 0) {
+    return db
+      .select(TARGET_DEVICE_COLUMNS)
+      .from(devices)
+      .innerJoin(deviceGroupMemberships, eq(deviceGroupMemberships.deviceId, devices.id))
+      .where(
+        and(
+          scopeCondition,
+          inArray(deviceGroupMemberships.groupId, targets.groupIds)
+        )
+      );
+  }
+
+  if (targets.tags && targets.tags.length > 0) {
+    return db
+      .select(TARGET_DEVICE_COLUMNS)
+      .from(devices)
+      .where(
+        and(
+          scopeCondition,
+          sql<boolean>`${devices.tags} && ${targets.tags}`
+        )
+      );
+  }
+
+  return db
+    .select(TARGET_DEVICE_COLUMNS)
+    .from(devices)
+    .where(scopeCondition);
+}
+
+async function triggerRemediationAutomation(
+  policy: PolicyRow,
+  device: TargetDevice,
+  status: EvaluationStatus,
+  remediationAutomationId: string | null,
+  auth?: PartnerWideReadAuth | null
+): Promise<string | null> {
+  if (status !== 'non_compliant' || !remediationAutomationId) {
+    return null;
+  }
+
+  // Anchor the lookup to the DEVICE's org (plus its partner's partner-wide
+  // automations, #2133). For an org-owned policy that equals policy.orgId
+  // (resolveTargetDevices filters by it); for a partner-wide policy it is the
+  // only org that makes sense.
+  const [automation] = await db
+    .select()
+    .from(automations)
+    .where(
+      and(
+        eq(automations.id, remediationAutomationId),
+        isNull(automations.retiredAt),
+        await automationOwnershipConditionForOrg(device.orgId, auth)
+      )
+    )
+    .limit(1);
+
+  // Both policy-remediation paths run per evaluated device, so a policy pointed
+  // at the managed row would create one agent run per device in the fleet.
+  if (!automation || !automation.enabled || isManagedAutomation(automation)) return null;
+
+  // Defense in depth on the loaded row (#4952): re-assert the caller's
+  // partner-wide visibility even though the ownership condition above already
+  // dropped the partner-wide arm for callers that lack it.
+  if (automation.orgId === null && !canReadPartnerWideRows(auth, automation.partnerId)) return null;
+
+  const [run] = await db
+    .insert(automationRuns)
+    .values({
+      automationId: automation.id,
+      triggeredBy: `policy:${policy.id}`,
+      status: 'running',
+      devicesTargeted: 1,
+      devicesSucceeded: 0,
+      devicesFailed: 0,
+      logs: [
+        {
+          timestamp: new Date().toISOString(),
+          level: 'info',
+          message: `Triggered by policy ${policy.name} for device ${device.hostname}`,
+          policyId: policy.id,
+          deviceId: device.id,
+        },
+      ],
+    })
+    .returning();
+
+  if (!run) {
+    return null;
+  }
+
+  await db
+    .update(automations)
+    .set({
+      runCount: sql`${automations.runCount} + 1`,
+      lastRunAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .where(eq(automations.id, automation.id));
+
+  // Dispatch through the real automation runtime, the same shape
+  // `automationWorker` uses after inserting a run (:448, :490).
+  // `executeAutomationRun` READS this row rather than creating one, so the
+  // insert above is exactly what it wants and no row shape changes.
+  //
+  // Queued rather than awaited: policy evaluation runs inside a fleet sweep,
+  // and blocking it on script execution would make the sweep's duration a
+  // function of remediation work. `enqueueAutomationRun` falls back to inline
+  // execution when Redis is absent, and its stable `automation-run-<id>` job
+  // id stops a re-entrant sweep double-dispatching the same run.
+  // Dynamically imported so this service does not pull the BullMQ worker graph
+  // in at module load — same pattern as drExecutionService.ts:300.
+  const { enqueueAutomationRun } = await import('../jobs/automationWorker');
+  await enqueueAutomationRun(run.id, [device.id]);
+
+  return run.id;
+}
+
+async function publishPolicyEvents(
+  policy: PolicyRow,
+  device: TargetDevice,
+  status: EvaluationStatus,
+  previousStatus: string | null,
+  remediationRunId: string | null,
+  source: string
+): Promise<void> {
+  const basePayload = {
+    policyId: policy.id,
+    policyName: policy.name,
+    deviceId: device.id,
+    hostname: device.hostname,
+    status,
+    previousStatus,
+    enforcement: policy.enforcement,
+    remediationRunId,
+    evaluatedAt: new Date().toISOString(),
+  };
+
+  const publishSafely = async (eventType: 'policy.evaluated' | 'policy.violation' | 'policy.compliant' | 'policy.remediation.triggered') => {
+    try {
+      // Events are per-device, so they carry the DEVICE's org — identical to
+      // policy.orgId for org-owned policies, and the only correct org for
+      // partner-wide ones (policy.orgId is NULL there, #2129). Downstream
+      // consumers (policyAlertBridge) create org-scoped rows from this.
+      await publishEvent(eventType, device.orgId, basePayload, source);
+    } catch (error) {
+      console.error(`[PolicyEvaluation] Failed to publish ${eventType}:`, error);
+    }
+  };
+
+  await publishSafely('policy.evaluated');
+
+  if (status === 'non_compliant') {
+    await publishSafely('policy.violation');
+    if (remediationRunId) {
+      await publishSafely('policy.remediation.triggered');
+    }
+  } else {
+    await publishSafely('policy.compliant');
+  }
+}
+
+export async function evaluatePolicy(
+  policy: PolicyRow,
+  options: EvaluatePolicyOptions = {}
+): Promise<PolicyEvaluationResponse> {
+  const source = options.source ?? 'policy-evaluation-service';
+  const requestRemediation = options.requestRemediation ?? true;
+  const wantsRemediation = requestRemediation && policy.enforcement === 'enforce';
+
+  // Remediation automations are anchored per DEVICE org (org-owned rows plus
+  // the org's partner's partner-wide rows, #2133), so a partner-wide policy
+  // resolves them per DEVICE org (memoized); an org-owned policy hits the
+  // cache with a single key — its own org — preserving resolve-once behavior.
+  const remediationIdByOrg = new Map<string, string | null>();
+  const remediationAutomationIdForOrg = async (deviceOrgId: string): Promise<string | null> => {
+    if (!wantsRemediation) {
+      return null;
+    }
+    if (!remediationIdByOrg.has(deviceOrgId)) {
+      remediationIdByOrg.set(
+        deviceOrgId,
+        await resolvePolicyRemediationAutomationIdForOrg(policy, deviceOrgId, options.auth)
+      );
+    }
+    return remediationIdByOrg.get(deviceOrgId) ?? null;
+  };
+
+  const targetDevices = dedupeTargetDevices(await resolveTargetDevices(policy));
+  const targetDeviceIds = targetDevices.map((device) => device.id);
+  const parsedRules = parsePolicyRules(policy.rules);
+  const ruleKeys = parsedRules.rules.map((rule) => rule.type);
+
+  let existingComplianceRows: Array<typeof automationPolicyCompliance.$inferSelect> = [];
+  let diskRows: Array<{
+    deviceId: string;
+    mountPoint: string;
+    device: string | null;
+    freeGb: number;
+  }> = [];
+  let softwareRows: Array<{
+    deviceId: string;
+    name: string;
+    version: string | null;
+  }> = [];
+  let registryRows: Array<{
+    deviceId: string;
+    registryPath: string;
+    valueName: string;
+    valueData: string | null;
+    valueType: string | null;
+  }> = [];
+  let configRows: Array<{
+    deviceId: string;
+    filePath: string;
+    configKey: string;
+    configValue: string | null;
+  }> = [];
+
+  if (targetDeviceIds.length > 0) {
+    const [
+      existingRows,
+      disks,
+      installedSoftwareRows,
+      inventoryRows,
+      registryStateRows,
+      configStateRows
+    ] = await Promise.all([
+      db
+        .select()
+        .from(automationPolicyCompliance)
+        .where(
+          and(
+            eq(automationPolicyCompliance.policyId, policy.id),
+            inArray(automationPolicyCompliance.deviceId, targetDeviceIds)
+          )
+        ),
+      db
+        .select({
+          deviceId: deviceDisks.deviceId,
+          mountPoint: deviceDisks.mountPoint,
+          device: deviceDisks.device,
+          freeGb: deviceDisks.freeGb,
+        })
+        .from(deviceDisks)
+        .where(inArray(deviceDisks.deviceId, targetDeviceIds)),
+      db
+        .select({
+          deviceId: deviceSoftware.deviceId,
+          name: deviceSoftware.name,
+          version: deviceSoftware.version,
+        })
+        .from(deviceSoftware)
+        .where(inArray(deviceSoftware.deviceId, targetDeviceIds)),
+      db
+        .select({
+          deviceId: softwareInventory.deviceId,
+          name: softwareInventory.name,
+          version: softwareInventory.version,
+        })
+        .from(softwareInventory)
+        .where(inArray(softwareInventory.deviceId, targetDeviceIds)),
+      db
+        .select({
+          deviceId: deviceRegistryState.deviceId,
+          registryPath: deviceRegistryState.registryPath,
+          valueName: deviceRegistryState.valueName,
+          valueData: deviceRegistryState.valueData,
+          valueType: deviceRegistryState.valueType,
+        })
+        .from(deviceRegistryState)
+        .where(inArray(deviceRegistryState.deviceId, targetDeviceIds)),
+      db
+        .select({
+          deviceId: deviceConfigState.deviceId,
+          filePath: deviceConfigState.filePath,
+          configKey: deviceConfigState.configKey,
+          configValue: deviceConfigState.configValue,
+        })
+        .from(deviceConfigState)
+        .where(inArray(deviceConfigState.deviceId, targetDeviceIds)),
+    ]);
+
+    existingComplianceRows = existingRows;
+    diskRows = disks;
+    softwareRows = [...installedSoftwareRows, ...inventoryRows];
+    registryRows = registryStateRows;
+    configRows = configStateRows;
+  }
+
+  const evaluationResults: PolicyEvaluationResult[] = [];
+  const existingByDeviceId = new Map<string, typeof automationPolicyCompliance.$inferSelect>();
+  for (const row of existingComplianceRows) {
+    existingByDeviceId.set(row.deviceId, row);
+  }
+
+  const disksByDevice = buildDiskMap(diskRows);
+  const softwareByDevice = buildSoftwareMap(softwareRows);
+  const registryStateByDevice = buildRegistryStateMap(registryRows);
+  const configStateByDevice = buildConfigStateMap(configRows);
+
+  for (const device of targetDevices) {
+    const existing = existingByDeviceId.get(device.id);
+    const evaluation = evaluateDeviceRules(parsedRules, {
+      device,
+      software: softwareByDevice.get(device.id) ?? [],
+      disks: disksByDevice.get(device.id) ?? [],
+      registryState: registryStateByDevice.get(device.id) ?? [],
+      configState: configStateByDevice.get(device.id) ?? [],
+    });
+    const checkedAt = new Date();
+    const status: EvaluationStatus = evaluation.passed ? 'compliant' : 'non_compliant';
+    const details = {
+      evaluatedAt: checkedAt.toISOString(),
+      rules: ruleKeys,
+      passed: evaluation.passed,
+      ruleResults: evaluation.details,
+      source,
+    };
+
+    // The `existing` read above still supplies `previousStatus` for the event
+    // payloads below, but it no longer decides insert-vs-update: a concurrent
+    // evaluation may have inserted the row between that SELECT and here, and
+    // only the ON CONFLICT arbiter closes that window (#4122).
+    await buildPolicyComplianceUpsert({
+      policyId: policy.id,
+      deviceId: device.id,
+      status,
+      details,
+      checkedAt,
+    });
+
+    const remediationRunId = requestRemediation
+      ? await triggerRemediationAutomation(
+          policy,
+          device,
+          status,
+          await remediationAutomationIdForOrg(device.orgId),
+          options.auth
+        )
+      : null;
+
+    evaluationResults.push({
+      deviceId: device.id,
+      hostname: device.hostname,
+      status,
+      previousStatus: existing?.status ?? null,
+      remediationRunId,
+    });
+
+    await publishPolicyEvents(
+      policy,
+      device,
+      status,
+      existing?.status ?? null,
+      remediationRunId,
+      source
+    );
+  }
+
+  await db
+    .update(automationPolicies)
+    .set({
+      lastEvaluatedAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .where(eq(automationPolicies.id, policy.id));
+
+  return {
+    message: 'Policy evaluation completed',
+    policyId: policy.id,
+    devicesEvaluated: targetDevices.length,
+    results: evaluationResults,
+    summary: {
+      compliant: evaluationResults.filter((result) => result.status === 'compliant').length,
+      non_compliant: evaluationResults.filter((result) => result.status === 'non_compliant').length,
+    },
+    evaluatedAt: new Date().toISOString(),
+  };
+}
+
+// ============================================
+// Config Policy Compliance Evaluation
+// ============================================
+
+export type ConfigPolicyEvaluationResult = {
+  deviceId: string;
+  complianceRuleId: string;
+  complianceRuleName: string;
+  status: EvaluationStatus;
+  enforcementLevel: string;
+  remediationTriggered: boolean;
+};
+
+type EvaluateConfigPolicyComplianceOptions = {
+  ruleIds?: string[];
+};
+
+export function __isComplianceCheckDue(
+  lastCheckedAt: Date | null | undefined,
+  checkIntervalMinutes: number,
+  nowMs = Date.now()
+): boolean {
+  if (!lastCheckedAt) {
+    return true;
+  }
+
+  const lastCheckedAtMs = lastCheckedAt.getTime();
+  if (Number.isNaN(lastCheckedAtMs)) {
+    return true;
+  }
+
+  const safeIntervalMinutes = Number.isFinite(checkIntervalMinutes)
+    ? Math.max(1, Math.floor(checkIntervalMinutes))
+    : 60;
+  const intervalMs = safeIntervalMinutes * 60 * 1000;
+
+  return nowMs - lastCheckedAtMs >= intervalMs;
+}
+
+/**
+ * Evaluates a single config policy compliance rule against a device's telemetry context.
+ * Parses the `rules` JSONB field (same structure as automationPolicies.rules)
+ * and delegates to the existing rule evaluators.
+ *
+ * Returns a compliance status of 'compliant', 'non_compliant', or 'error'.
+ */
+export function evaluateConfigPolicyComplianceRule(
+  complianceRule: typeof configPolicyComplianceRules.$inferSelect,
+  _deviceId: string,
+  context: DeviceEvaluationContext
+): { status: 'compliant' | 'non_compliant' | 'error'; details: RuleEvaluationDetail[] } {
+  try {
+    const parsedRules = parsePolicyRules(complianceRule.rules);
+    const evaluation = evaluateDeviceRules(parsedRules, context);
+    const status: 'compliant' | 'non_compliant' = evaluation.passed ? 'compliant' : 'non_compliant';
+    return { status, details: evaluation.details };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown evaluation error';
+    return {
+      status: 'error',
+      details: [{
+        ruleType: 'evaluation_error',
+        passed: false,
+        message: `Failed to evaluate compliance rule "${complianceRule.name}": ${message}`,
+      }],
+    };
+  }
+}
+
+/**
+ * Evaluates all winning configuration-policy compliance rules for a single device.
+ * Calls resolveComplianceRulesForDevice to get applicable rules, evaluates each via
+ * evaluateConfigPolicyComplianceRule, and upserts results into automationPolicyCompliance
+ * with policyId: null, configPolicyId: rule.featureLinkId, configItemName: rule.name.
+ *
+ * If enforcement is 'enforce' and non-compliant, queues remediation if remediationScriptId is set.
+ */
+export async function evaluateDeviceComplianceFromConfigPolicy(
+  deviceId: string,
+  options: EvaluateConfigPolicyComplianceOptions = {}
+): Promise<ConfigPolicyEvaluationResult[]> {
+  const resolvedRules = await resolveComplianceRulesForDevice(deviceId);
+  if (resolvedRules.length === 0) {
+    return [];
+  }
+
+  const selectedRuleIds = Array.isArray(options.ruleIds) && options.ruleIds.length > 0
+    ? new Set(options.ruleIds)
+    : null;
+  const complianceRules = selectedRuleIds
+    ? resolvedRules.filter((rule) => selectedRuleIds.has(rule.id))
+    : resolvedRules;
+
+  if (complianceRules.length === 0) {
+    return [];
+  }
+
+  // Load the device (with orgId for event publishing)
+  const [device] = await db
+    .select({
+      id: devices.id,
+      hostname: devices.hostname,
+      osType: devices.osType,
+      osVersion: devices.osVersion,
+      orgId: devices.orgId,
+    })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) {
+    return [];
+  }
+
+  const deviceOrgId = device.orgId;
+
+  // Load device context data
+  const [
+    diskRows,
+    installedSoftwareRows,
+    inventoryRows,
+    registryStateRows,
+    configStateRows,
+  ] = await Promise.all([
+    db
+      .select({
+        deviceId: deviceDisks.deviceId,
+        mountPoint: deviceDisks.mountPoint,
+        device: deviceDisks.device,
+        freeGb: deviceDisks.freeGb,
+      })
+      .from(deviceDisks)
+      .where(eq(deviceDisks.deviceId, deviceId)),
+    db
+      .select({
+        deviceId: deviceSoftware.deviceId,
+        name: deviceSoftware.name,
+        version: deviceSoftware.version,
+      })
+      .from(deviceSoftware)
+      .where(eq(deviceSoftware.deviceId, deviceId)),
+    db
+      .select({
+        deviceId: softwareInventory.deviceId,
+        name: softwareInventory.name,
+        version: softwareInventory.version,
+      })
+      .from(softwareInventory)
+      .where(eq(softwareInventory.deviceId, deviceId)),
+    db
+      .select({
+        deviceId: deviceRegistryState.deviceId,
+        registryPath: deviceRegistryState.registryPath,
+        valueName: deviceRegistryState.valueName,
+        valueData: deviceRegistryState.valueData,
+        valueType: deviceRegistryState.valueType,
+      })
+      .from(deviceRegistryState)
+      .where(eq(deviceRegistryState.deviceId, deviceId)),
+    db
+      .select({
+        deviceId: deviceConfigState.deviceId,
+        filePath: deviceConfigState.filePath,
+        configKey: deviceConfigState.configKey,
+        configValue: deviceConfigState.configValue,
+      })
+      .from(deviceConfigState)
+      .where(eq(deviceConfigState.deviceId, deviceId)),
+  ]);
+
+  const softwareRows = [...installedSoftwareRows, ...inventoryRows];
+
+  const targetDevice: TargetDevice = {
+    id: device.id,
+    orgId: device.orgId,
+    hostname: device.hostname,
+    osType: device.osType,
+    osVersion: device.osVersion,
+  };
+
+  const context: DeviceEvaluationContext = {
+    device: targetDevice,
+    software: buildSoftwareMap(softwareRows).get(deviceId) ?? [],
+    disks: buildDiskMap(diskRows).get(deviceId) ?? [],
+    registryState: buildRegistryStateMap(registryStateRows).get(deviceId) ?? [],
+    configState: buildConfigStateMap(configStateRows).get(deviceId) ?? [],
+  };
+
+  const results: ConfigPolicyEvaluationResult[] = [];
+
+  for (const complianceRule of complianceRules) {
+    const { status, details: ruleDetails } = evaluateConfigPolicyComplianceRule(
+      complianceRule,
+      deviceId,
+      context
+    );
+
+    const ruleKeys = parsePolicyRules(complianceRule.rules).rules.map((rule) => rule.type);
+
+    const checkedAt = new Date();
+    const evaluationDetails = {
+      evaluatedAt: checkedAt.toISOString(),
+      rules: ruleKeys,
+      passed: status === 'compliant',
+      ruleResults: ruleDetails,
+      source: 'config-policy-compliance',
+      enforcementLevel: complianceRule.enforcementLevel,
+    };
+
+    // Atomic upsert keyed by (configPolicyId=featureLinkId, configItemName,
+    // deviceId). This replaced a select-then-insert whose read/write gap let
+    // two concurrent evaluations both insert for the same key (#4122).
+    await buildConfigPolicyComplianceUpsert({
+      configPolicyId: complianceRule.featureLinkId,
+      configItemName: complianceRule.name,
+      deviceId,
+      status,
+      details: evaluationDetails,
+      checkedAt,
+    });
+
+    // Trigger remediation if enforcement is 'enforce'
+    let remediationTriggered = false;
+    if (status === 'non_compliant' && complianceRule.enforcementLevel === 'enforce') {
+      // Check per-rule remediation for individually failed rules (from rules JSONB)
+      // ruleDetails indices correspond to valid rules (parsePolicyRules skips invalid ones),
+      // so we track a separate detailIdx that only advances for valid rules.
+      const rulesArray = Array.isArray(complianceRule.rules) ? complianceRule.rules as Record<string, unknown>[] : [];
+      let detailIdx = 0;
+      for (let i = 0; i < rulesArray.length; i++) {
+        const r = rulesArray[i];
+        // Skip rules that parsePolicyRules would filter out (null, non-object, no type)
+        if (!r || typeof r !== 'object') continue;
+        const ruleType = typeof r.type === 'string' ? r.type : typeof r.name === 'string' ? r.name : null;
+        if (!ruleType?.trim()) continue;
+
+        const rem = r.remediation as Record<string, unknown> | undefined;
+        // Only remediate rules that actually failed evaluation and have remediation configured
+        const detail = ruleDetails[detailIdx++];
+        if (!rem || rem.type === 'none') continue;
+        if (!detail || detail.passed) continue;
+
+        if (rem.type === 'script' && typeof rem.scriptId === 'string') {
+          // Bridge: pass scriptId via legacy field until triggerConfigPolicyRemediation is refactored
+          const tempRule = { ...complianceRule, remediationScriptId: rem.scriptId };
+          const triggered = await triggerConfigPolicyRemediation(tempRule, targetDevice);
+          if (triggered) remediationTriggered = true;
+        } else if (rem.type === 'software_deploy' && typeof rem.catalogId === 'string') {
+          console.warn(`[ConfigPolicyCompliance] Software deploy remediation for rule="${complianceRule.name}" catalogId=${rem.catalogId} on device=${targetDevice.id} — not yet implemented`);
+        }
+      }
+
+      // Fallback: check legacy remediationScriptId on the rule set
+      if (!remediationTriggered && complianceRule.remediationScriptId) {
+        remediationTriggered = await triggerConfigPolicyRemediation(complianceRule, targetDevice);
+      }
+    }
+
+    results.push({
+      deviceId,
+      complianceRuleId: complianceRule.id,
+      complianceRuleName: complianceRule.name,
+      status,
+      enforcementLevel: complianceRule.enforcementLevel,
+      remediationTriggered,
+    });
+
+    // Publish events for config policy compliance
+    try {
+      const eventPayload = {
+        configPolicyComplianceRuleId: complianceRule.id,
+        configPolicyComplianceRuleName: complianceRule.name,
+        configPolicyId: complianceRule.featureLinkId,
+        deviceId: device.id,
+        hostname: device.hostname,
+        status,
+        enforcementLevel: complianceRule.enforcementLevel,
+        evaluatedAt: new Date().toISOString(),
+      };
+
+      await publishEvent('policy.evaluated', deviceOrgId, eventPayload, 'config-policy-compliance');
+
+      if (status === 'non_compliant') {
+        await publishEvent('policy.violation', deviceOrgId, eventPayload, 'config-policy-compliance');
+      } else {
+        await publishEvent('policy.compliant', deviceOrgId, eventPayload, 'config-policy-compliance');
+      }
+    } catch (error) {
+      console.error('[ConfigPolicyCompliance] Failed to publish event:', error);
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Triggers a remediation automation for a config policy compliance rule.
+ * Finds an enabled automation whose actions reference the compliance rule's remediationScriptId.
+ */
+async function triggerConfigPolicyRemediation(
+  complianceRule: typeof configPolicyComplianceRules.$inferSelect,
+  device: TargetDevice
+): Promise<boolean> {
+  if (!complianceRule.remediationScriptId) {
+    return false;
+  }
+
+  // Find the device's orgId so we can search for automations in the correct org
+  const [deviceRow] = await db
+    .select({ orgId: devices.orgId })
+    .from(devices)
+    .where(eq(devices.id, device.id))
+    .limit(1);
+
+  if (!deviceRow) {
+    return false;
+  }
+
+  // Find an automation that uses the remediation script — the device org's
+  // own automations plus its partner's partner-wide ones (#2133). No `auth`
+  // argument: this path is only reachable from scanAndEvaluateConfigPolicyCompliance
+  // on the background worker, which is genuinely system-scoped. If a request
+  // route ever calls it, thread the caller's auth through (#4952).
+  const deviceOrgAutomationCondition = await automationOwnershipConditionForOrg(deviceRow.orgId);
+  const candidates = await db
+    .select({ id: automations.id, actions: automations.actions })
+    .from(automations)
+    .where(
+      and(
+        deviceOrgAutomationCondition,
+        eq(automations.enabled, true),
+        isNull(automations.retiredAt)
+      )
+    );
+
+  let automationId: string | null = null;
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate.actions)) {
+      continue;
+    }
+    for (const action of candidate.actions) {
+      if (!action || typeof action !== 'object') continue;
+      const typedAction = action as Record<string, unknown>;
+      const scriptId = typeof typedAction.scriptId === 'string'
+        ? typedAction.scriptId
+        : typeof typedAction.script_id === 'string'
+          ? typedAction.script_id
+          : null;
+      if (scriptId === complianceRule.remediationScriptId) {
+        automationId = candidate.id;
+        break;
+      }
+    }
+    if (automationId) break;
+  }
+
+  if (!automationId) {
+    return false;
+  }
+
+  const [automation] = await db
+    .select()
+    .from(automations)
+    .where(
+      and(
+        eq(automations.id, automationId),
+        isNull(automations.retiredAt),
+        deviceOrgAutomationCondition
+      )
+    )
+    .limit(1);
+
+  if (!automation || !automation.enabled || isManagedAutomation(automation)) return false;
+
+  const [run] = await db
+    .insert(automationRuns)
+    .values({
+      automationId: automation.id,
+      configPolicyId: complianceRule.featureLinkId,
+      configItemName: complianceRule.name,
+      triggeredBy: `config-policy-compliance:${complianceRule.id}`,
+      status: 'running',
+      devicesTargeted: 1,
+      devicesSucceeded: 0,
+      devicesFailed: 0,
+      logs: [
+        {
+          timestamp: new Date().toISOString(),
+          level: 'info',
+          message: `Triggered by config policy compliance rule "${complianceRule.name}" for device ${device.hostname}`,
+          complianceRuleId: complianceRule.id,
+          deviceId: device.id,
+        },
+      ],
+    })
+    .returning();
+
+  if (!run) {
+    return false;
+  }
+
+  await db
+    .update(automations)
+    .set({
+      runCount: sql`${automations.runCount} + 1`,
+      lastRunAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .where(eq(automations.id, automation.id));
+
+  // Dispatch for real — see the note in triggerRemediationAutomation. The
+  // returned boolean means DISPATCHED, not finished; the run row carries the
+  // outcome once the runtime has executed it.
+  // Dynamically imported so this service does not pull the BullMQ worker graph
+  // in at module load — same pattern as drExecutionService.ts:300.
+  const { enqueueAutomationRun } = await import('../jobs/automationWorker');
+  await enqueueAutomationRun(run.id, [device.id]);
+
+  return true;
+}
+
+/**
+ * Resolves assignment targets to actual device IDs.
+ * Maps level + targetId to an array of device IDs.
+ */
+async function resolveDevicesForAssignmentTarget(
+  level: string,
+  targetId: string
+): Promise<string[]> {
+  switch (level) {
+    case 'device': {
+      return [targetId];
+    }
+    case 'device_group': {
+      const rows = await db
+        .select({ deviceId: deviceGroupMemberships.deviceId })
+        .from(deviceGroupMemberships)
+        .where(eq(deviceGroupMemberships.groupId, targetId));
+      return rows.map((r) => r.deviceId);
+    }
+    // Every fan-out below excludes ephemeral Quick Support devices — they live in
+    // the partner's hidden 'quick_support' org and must never receive assignments.
+    case 'site': {
+      const rows = await db
+        .select({ id: devices.id })
+        .from(devices)
+        .where(and(eq(devices.siteId, targetId), eq(devices.isEphemeral, false)));
+      return rows.map((r) => r.id);
+    }
+    case 'organization': {
+      const rows = await db
+        .select({ id: devices.id })
+        .from(devices)
+        .where(and(eq(devices.orgId, targetId), eq(devices.isEphemeral, false)));
+      return rows.map((r) => r.id);
+    }
+    case 'partner': {
+      // Find all orgs under this partner, then all devices in those orgs
+      const orgRows = await db
+        .select({ id: organizations.id })
+        .from(organizations)
+        .where(and(eq(organizations.partnerId, targetId), ne(organizations.type, 'quick_support')));
+      const orgIds = orgRows.map((r) => r.id);
+      if (orgIds.length === 0) return [];
+
+      const deviceRows = await db
+        .select({ id: devices.id })
+        .from(devices)
+        .where(and(inArray(devices.orgId, orgIds), eq(devices.isEphemeral, false)));
+      return deviceRows.map((r) => r.id);
+    }
+    default: {
+      console.warn(`[PolicyEvaluation] Unknown assignment level: ${level}`);
+      return [];
+    }
+  }
+}
+
+/**
+ * Background worker function: scans all due config-policy compliance checks
+ * and evaluates them for their target devices.
+ */
+export async function scanAndEvaluateConfigPolicyCompliance(): Promise<{
+  rulesScanned: number;
+  devicesEvaluated: number;
+  results: ConfigPolicyEvaluationResult[];
+}> {
+  const dueChecks = await scanDueComplianceChecks();
+  if (dueChecks.length === 0) {
+    return { rulesScanned: 0, devicesEvaluated: 0, results: [] };
+  }
+
+  const nowMs = Date.now();
+  const dueRuleIdsByDeviceId = new Map<string, Set<string>>();
+
+  for (const check of dueChecks) {
+    const deviceIds = await resolveDevicesForAssignmentTarget(
+      check.assignmentLevel,
+      check.assignmentTargetId
+    );
+    if (deviceIds.length === 0) {
+      continue;
+    }
+
+    const existingRows = await db
+      .select({
+        deviceId: automationPolicyCompliance.deviceId,
+        lastCheckedAt: automationPolicyCompliance.lastCheckedAt,
+      })
+      .from(automationPolicyCompliance)
+      .where(
+        and(
+          isNull(automationPolicyCompliance.policyId),
+          eq(automationPolicyCompliance.configPolicyId, check.complianceRule.featureLinkId),
+          eq(automationPolicyCompliance.configItemName, check.complianceRule.name),
+          inArray(automationPolicyCompliance.deviceId, deviceIds)
+        )
+      );
+
+    const lastCheckedByDeviceId = new Map<string, Date | null>();
+    for (const row of existingRows) {
+      lastCheckedByDeviceId.set(row.deviceId, row.lastCheckedAt ?? null);
+    }
+
+    for (const deviceId of deviceIds) {
+      const isDue = __isComplianceCheckDue(
+        lastCheckedByDeviceId.get(deviceId),
+        check.complianceRule.checkIntervalMinutes,
+        nowMs
+      );
+      if (!isDue) {
+        continue;
+      }
+
+      const dueRuleIds = dueRuleIdsByDeviceId.get(deviceId) ?? new Set<string>();
+      dueRuleIds.add(check.complianceRule.id);
+      dueRuleIdsByDeviceId.set(deviceId, dueRuleIds);
+    }
+  }
+
+  const allDeviceIds = Array.from(dueRuleIdsByDeviceId.keys());
+  const allResults: ConfigPolicyEvaluationResult[] = [];
+
+  for (const deviceId of allDeviceIds) {
+    try {
+      const dueRuleIds = Array.from(dueRuleIdsByDeviceId.get(deviceId) ?? []);
+      const deviceResults = await evaluateDeviceComplianceFromConfigPolicy(deviceId, { ruleIds: dueRuleIds });
+      allResults.push(...deviceResults);
+    } catch (error) {
+      console.error(`[ConfigPolicyCompliance] Failed to evaluate device ${deviceId}:`, error);
+    }
+  }
+
+  return {
+    rulesScanned: dueChecks.length,
+    devicesEvaluated: allDeviceIds.length,
+    results: allResults,
+  };
+}
+
+// Test-only aliases for the remediation dispatch paths (#3413). Exported
+// rather than renamed so the internal call sites stay untouched; same
+// convention as __evaluateRulesForDevice above.
+export const __triggerRemediationAutomation = triggerRemediationAutomation;
+export const __triggerConfigPolicyRemediation = triggerConfigPolicyRemediation;

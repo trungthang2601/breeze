@@ -1,0 +1,95 @@
+// QuickAddChips — spec 4.4. Horizontal scroll row of one-click chips that
+// each toggle a single canonical FilterCondition in the active filter. When
+// the condition is present the chip is marked active (check icon,
+// aria-pressed) and clicking again removes it.
+import type { FilterCondition, FilterConditionGroup } from '@breeze/shared';
+import { Check } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+export interface QuickAddChip {
+  id: string;
+  label: string;
+  translationKey: `quickAddChips.chips.${string}`;
+  condition: FilterCondition;
+}
+
+// POC LOCAL chip set per Billy's 2026-05-27 feedback. Toggle behavior:
+// click once to add, click again to remove.
+export const QUICK_ADD_CHIPS: QuickAddChip[] = [
+  { id: 'online', label: 'Online', translationKey: 'quickAddChips.chips.online', condition: { field: 'status', operator: 'equals', value: 'online' } },
+  { id: 'offline', label: 'Offline', translationKey: 'quickAddChips.chips.offline', condition: { field: 'status', operator: 'equals', value: 'offline' } },
+  { id: 'servers', label: 'Servers', translationKey: 'quickAddChips.chips.servers', condition: { field: 'deviceRole', operator: 'equals', value: 'server' } },
+  { id: 'needsPatches', label: 'Needs patches', translationKey: 'quickAddChips.chips.needsPatches', condition: { field: 'patches.pending', operator: 'equals', value: 'yes' } },
+  { id: 'critical', label: 'Critical', translationKey: 'quickAddChips.chips.critical', condition: { field: 'alerts.critical', operator: 'equals', value: 'yes' } },
+  { id: 'rebootNeeded', label: 'Reboot needed', translationKey: 'quickAddChips.chips.rebootNeeded', condition: { field: 'system.rebootRequired', operator: 'equals', value: 'yes' } },
+  { id: 'notSeen7d', label: 'Not seen 7d', translationKey: 'quickAddChips.chips.notSeen7d', condition: { field: 'daysSinceLastSeen', operator: 'greaterThan', value: 7 } },
+  { id: 'lowDisk', label: 'Low disk', translationKey: 'quickAddChips.chips.lowDisk', condition: { field: 'metrics.diskPercent', operator: 'greaterThan', value: 90 } },
+  { id: 'untagged', label: 'Untagged', translationKey: 'quickAddChips.chips.untagged', condition: { field: 'tags', operator: 'isEmpty', value: '' } }
+];
+
+function chipMatches(c: FilterCondition, target: FilterCondition): boolean {
+  return c.field === target.field
+    && c.operator === target.operator
+    && JSON.stringify(c.value) === JSON.stringify(target.value);
+}
+
+function isAdded(group: FilterConditionGroup | null, target: FilterCondition): boolean {
+  if (!group) return false;
+  for (const c of group.conditions) {
+    if ('conditions' in c) continue;
+    if (chipMatches(c, target)) return true;
+  }
+  return false;
+}
+
+export interface QuickAddChipsProps {
+  value: FilterConditionGroup | null;
+  onChange: (next: FilterConditionGroup) => void;
+}
+
+export function QuickAddChips({ value, onChange }: QuickAddChipsProps) {
+  const { t } = useTranslation('devices');
+  const handleToggle = (chip: QuickAddChip) => {
+    const base = value ?? { operator: 'AND' as const, conditions: [] };
+    if (isAdded(base, chip.condition)) {
+      const next = base.conditions.filter(c =>
+        'conditions' in c || !chipMatches(c, chip.condition)
+      );
+      onChange({ operator: 'AND', conditions: next });
+    } else {
+      onChange({ operator: 'AND', conditions: [...base.conditions, chip.condition] });
+    }
+  };
+  return (
+    <div
+      data-testid="quick-add-chips"
+      className="flex items-center gap-2 overflow-x-auto pb-1"
+      role="toolbar"
+      aria-label={t('quickAddChips.ariaLabel')}
+    >
+      {/* Leading label so this strip reads as one-click toggles, distinct from
+          the "+ Add filter" builder below it. The chips toggle a filter on/off
+          (Check when active), so they deliberately drop the "+" glyph — "+"
+          means *create* elsewhere on this page (Add filter / Add Device). */}
+      <span className="shrink-0 text-xs font-medium text-muted-foreground">{t('quickAddChips.label')}</span>
+      {QUICK_ADD_CHIPS.map(chip => {
+        const added = isAdded(value, chip.condition);
+        return (
+          <button
+            type="button"
+            key={chip.id}
+            data-testid={`quick-add-${chip.id}`}
+            aria-pressed={added}
+            onClick={() => handleToggle(chip)}
+            className={`inline-flex min-h-6 shrink-0 items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors ${
+              added ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'hover:bg-muted'
+            }`}
+          >
+            {added && <Check className="h-3 w-3" />}
+            {t(/* i18n-dynamic */ chip.translationKey)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}

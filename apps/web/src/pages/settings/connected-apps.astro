@@ -1,0 +1,21 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import ConnectedAppsList from '../../components/settings/ConnectedAppsList';
+import McpUrlCard from '../../components/shared/McpUrlCard';
+import { tServer } from '../../lib/i18n/server';
+
+const locale = Astro.locals.locale;
+---
+
+<DashboardLayout titleKey="titles.settingsConnectedApps">
+  <div class="mx-auto w-full max-w-4xl space-y-6">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">{tServer(locale, 'settingsConnectedAppsPage.heading')}</h1>
+      <p class="mt-1 text-sm text-muted-foreground">
+        {tServer(locale, 'settingsConnectedAppsPage.description')}
+      </p>
+    </div>
+    <McpUrlCard client:only="react" />
+    <ConnectedAppsList client:only="react" />
+  </div>
+</DashboardLayout>

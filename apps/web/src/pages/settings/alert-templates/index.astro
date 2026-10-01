@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../../layouts/DashboardLayout.astro';
+import AlertTemplateList from '../../../components/alerts/AlertTemplateList';
+---
+
+<DashboardLayout titleKey="titles.settingsAlertTemplates">
+  <AlertTemplateList client:load />
+</DashboardLayout>

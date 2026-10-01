@@ -1,0 +1,597 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// -------------------------------------------------------------------
+// Mocks — must be declared before any import that triggers the modules
+// -------------------------------------------------------------------
+
+vi.mock('../db', () => ({
+  runOutsideDbContext: vi.fn((fn: () => unknown) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  db: {
+    select: vi.fn(),
+    update: vi.fn(),
+    insert: vi.fn()
+  },
+  // remoteDesktopStartIntent.ts (real impl, not mocked in this file) throws
+  // unless this reports an open db access context.
+  hasDbAccessContext: vi.fn(() => true)
+}));
+
+vi.mock('../db/schema', () => ({
+  remoteSessions: {
+    id: 'remoteSessions.id',
+    deviceId: 'remoteSessions.deviceId',
+    status: 'remoteSessions.status',
+    desktopStartGeneration: 'remoteSessions.desktopStartGeneration',
+    terminalGeneration: 'remoteSessions.terminalGeneration',
+    terminationPhase: 'remoteSessions.terminationPhase',
+  },
+  devices: { id: 'devices.id' },
+  users: { id: 'users.id', status: 'users.status' },
+  patchPolicies: {},
+  alertRules: {},
+  backupConfigs: {},
+  securityPolicies: {},
+  automationPolicies: {},
+  maintenanceWindows: {},
+  softwarePolicies: {},
+  sensitiveDataPolicies: {},
+  peripheralPolicies: {}
+}));
+
+vi.mock('../services/remoteSessionAuth', () => ({
+  consumeWsTicket: vi.fn(),
+  consumeDesktopConnectCode: vi.fn(),
+  getViewerAccessTokenExpirySeconds: vi.fn(() => 900)
+}));
+
+vi.mock('../services/jwt', () => ({
+  createAccessToken: vi.fn(async () => 'mock-access-token-xyz')
+}));
+
+vi.mock('../services/viewerTokenRevocation', () => ({
+  isViewerJtiRevoked: vi.fn(async () => false),
+  isViewerSessionRevoked: vi.fn(async () => false),
+  revokeViewerSession: vi.fn(async () => undefined),
+}));
+
+vi.mock('./agentWs', () => ({
+  sendCommandToAgent: vi.fn(() => true),
+  isAgentConnected: vi.fn(() => true)
+}));
+
+vi.mock('../services/remoteAccessPolicy', () => ({
+  checkRemoteAccess: vi.fn().mockResolvedValue({ allowed: true }),
+  resolveRemoteAccessForDevice: vi.fn().mockResolvedValue({
+    settings: { webrtcDesktop: true, vncRelay: true, remoteTools: true, enableProxy: true, defaultAllowedPorts: [], autoEnableProxy: false, maxConcurrentTunnels: 5, idleTimeoutMinutes: 5, maxSessionDurationHours: 8 },
+    policyName: null,
+    policyId: null,
+  }),
+}));
+
+vi.mock('../services/redis', () => ({
+  getRedis: vi.fn(() => ({})),
+}));
+
+vi.mock('../services/rate-limit', () => ({
+  rateLimiter: vi.fn(async () => ({
+    allowed: true,
+    remaining: 9,
+    resetAt: new Date(Date.now() + 60_000),
+  })),
+}));
+
+vi.mock('./remote/helpers', () => ({
+  logSessionAudit: vi.fn(async () => undefined),
+  getIceServers: vi.fn(() => []),
+}));
+
+vi.mock('../services/clientIp', () => ({
+  getTrustedClientIp: vi.fn(() => '127.0.0.1'),
+}));
+
+vi.mock('../services/remoteRevocationLease', () => ({
+  AGENT_UPGRADE_REQUIRED_CODE: 'agent_upgrade_required',
+  AGENT_UPGRADE_REQUIRED_MESSAGE: 'agent update required',
+  prepareRevocationLeaseForStart: vi.fn(async () => ({
+    ok: true,
+    lease: {
+      token: 'lease-token',
+      expiresAt: 1_000_060_000,
+      hardDeadline: 1_000_600_000,
+      renewEverySec: 25,
+      graceSec: 90,
+    },
+  })),
+  renewRevocationLease: vi.fn(async () => ({
+    status: 'renewed',
+    expiresAt: 1_000_060_000,
+    hardDeadline: 1_000_600_000,
+    renewEverySec: 25,
+    graceSec: 90,
+  })),
+}));
+
+// -------------------------------------------------------------------
+// Imports (after mocks)
+// -------------------------------------------------------------------
+import { db } from '../db';
+import { consumeWsTicket, consumeDesktopConnectCode, getViewerAccessTokenExpirySeconds } from '../services/remoteSessionAuth';
+import { createAccessToken } from '../services/jwt';
+import { sendCommandToAgent, isAgentConnected } from './agentWs';
+import {
+  handleDesktopFrame,
+  registerDesktopFrameCallback,
+  unregisterDesktopFrameCallback,
+  createDesktopWsRoutes,
+  isDesktopSessionOwnedByAgent,
+  getActiveDesktopSessionCount,
+  __resetDesktopWsForTest,
+} from './desktopWs';
+
+// -------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------
+
+const SESSION_ID = 'session-desktop-001';
+const DEVICE_ID = 'device-xyz';
+const AGENT_ID = 'agent-xyz';
+let leaseGeneration = 0;
+const testSharedLeases = {
+  acquire: vi.fn(async (kind: 'desktop', sessionId: string) => ({
+    ok: true as const,
+    claim: {
+      kind,
+      sessionId,
+      connectionId: '33333333-3333-4333-8333-333333333333',
+      generation: ++leaseGeneration,
+      instanceId: '44444444-4444-4444-8444-444444444444',
+      leaseToken: '55555555-5555-4555-8555-555555555555',
+      ownerValue: `owner-${leaseGeneration}`,
+      safeForwardingUntilMonotonicMs: Number.MAX_SAFE_INTEGER,
+    },
+  })),
+  renew: vi.fn(async (claim: any) => claim),
+  beginClose: vi.fn(async () => ({ ok: true as const, ownership: 'still_owner' as const })),
+  release: vi.fn(async () => true),
+  writeDesktopFinalizationIntent: vi.fn(async () => 'written' as const),
+  releaseDesktopFinalizationIntent: vi.fn(async () => true),
+};
+
+// Use a unique user ID per successful onOpen to avoid the in-memory
+// rate limiter (10 connections per user per 60s) blocking later tests.
+let userIdCounter = 0;
+function nextUserId(): string {
+  return `user-desk-${++userIdCounter}`;
+}
+
+function wsMock() {
+  return {
+    send: vi.fn(),
+    close: vi.fn()
+  };
+}
+
+function mockSelectChain(result: unknown) {
+  return {
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        limit: vi.fn().mockResolvedValue(result)
+      }),
+      innerJoin: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue(result)
+        })
+      })
+    })
+  } as any;
+}
+
+function mockUpdateNoReturn() {
+  return {
+    set: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([{ id: SESSION_ID, generation: 1n }]),
+      }),
+    })
+  } as any;
+}
+
+// select().from().where().limit().for('update') — the row-locked read
+// commitDesktopStreamStartIntent issues (SEC-038 W02, real impl in
+// remoteDesktopStartIntent.ts, not mocked in this file).
+function mockSelectLimitForChain(result: unknown) {
+  return {
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        limit: vi.fn().mockReturnValue({
+          for: vi.fn().mockResolvedValue(result)
+        })
+      })
+    })
+  } as any;
+}
+
+/**
+ * Capture the WS handler factory returned by createDesktopWsRoutes.
+ */
+function captureWsHandlers(sessionId: string, ticket?: string) {
+  let capturedFactory: any;
+
+  const upgradeWebSocket = vi.fn((factory: any) => {
+    capturedFactory = factory;
+    return (_c: any, _next: any) => {};
+  });
+
+  createDesktopWsRoutes(upgradeWebSocket, { sharedLeases: testSharedLeases as any });
+
+  const fakeContext = {
+    req: {
+      param: vi.fn((key: string) => (key === 'id' ? sessionId : undefined)),
+      query: vi.fn((key: string) => (key === 'ticket' ? ticket : undefined)),
+      header: vi.fn(() => undefined)
+    }
+  };
+
+  return capturedFactory(fakeContext);
+}
+
+/**
+ * Set up database + auth mocks so that onOpen succeeds.
+ * Uses a unique user ID each time to avoid the in-memory rate limiter.
+ */
+function setupSuccessfulValidation() {
+  const userId = nextUserId();
+
+  const ticketRecord = {
+    ok: true as const,
+    sessionId: SESSION_ID,
+    sessionType: 'desktop' as const,
+    userId,
+    expiresAt: Date.now() + 60_000
+  };
+
+  vi.mocked(consumeWsTicket).mockResolvedValue(ticketRecord);
+
+  const user = { id: userId, status: 'active' };
+  const session = {
+    id: SESSION_ID,
+    type: 'desktop',
+    userId,
+    status: 'pending',
+    deviceId: DEVICE_ID
+  };
+  const device = {
+    id: DEVICE_ID,
+    agentId: AGENT_ID,
+    hostname: 'test-host',
+    osType: 'windows',
+    status: 'online',
+    orgId: 'org-test-1'
+  };
+
+  vi.mocked(db.select)
+    .mockReturnValueOnce(mockSelectChain([user]))
+    .mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        innerJoin: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ session, device }])
+          })
+        })
+      })
+    } as any)
+    // commitDesktopStreamStartIntent: row-locked read (SEC-038 W02)
+    .mockReturnValueOnce(mockSelectLimitForChain([{
+      status: session.status,
+      terminationPhase: 'none',
+      generation: 0n
+    }]))
+    // assertDesktopStartIntentCurrent: pre-send re-read
+    .mockReturnValueOnce(mockSelectChain([{ terminationPhase: 'none', generation: 1n }]));
+
+  vi.mocked(isAgentConnected).mockReturnValue(true);
+  vi.mocked(sendCommandToAgent).mockReturnValue(true);
+  vi.mocked(db.update).mockReturnValue(mockUpdateNoReturn() as any);
+
+  return { userId };
+}
+
+/**
+ * Build the Hono app with the desktop WS routes mounted (for HTTP endpoint tests)
+ */
+function buildApp() {
+  const upgradeWebSocket = vi.fn((_factory: any) => {
+    return (_c: any, _next: any) => {};
+  });
+  return createDesktopWsRoutes(upgradeWebSocket);
+}
+
+// -------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------
+
+
+describe('desktopWs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetDesktopWsForTest();
+  });
+
+  // ==========================================
+  // WebSocket handler — onMessage
+  // ==========================================
+
+  describe('onMessage', () => {
+    let handlers: any;
+    let ws: ReturnType<typeof wsMock>;
+
+    beforeEach(async () => {
+      setupSuccessfulValidation();
+
+      handlers = captureWsHandlers(SESSION_ID, 'valid-ticket');
+      ws = wsMock();
+
+      await handlers.onOpen({}, ws);
+      ws.send.mockClear();
+      vi.mocked(sendCommandToAgent).mockClear();
+    });
+
+    it('sends SESSION_NOT_FOUND for messages on non-existent session', async () => {
+      const freshHandlers = captureWsHandlers('nonexistent-session', undefined);
+      const freshWs = wsMock();
+
+      await freshHandlers.onMessage(
+        { data: JSON.stringify({ type: 'ping' }) },
+        freshWs
+      );
+
+      expect(freshWs.send).toHaveBeenCalledWith(
+        expect.stringContaining('"SESSION_NOT_FOUND"')
+      );
+    });
+
+    it('relays input events to the agent', async () => {
+      const event = {
+        type: 'mousemove',
+        x: 100,
+        y: 200
+      };
+
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'input', event }) },
+        ws
+      );
+
+      expect(sendCommandToAgent).toHaveBeenCalledWith(
+        AGENT_ID,
+        expect.objectContaining({
+          type: 'desktop_input',
+          payload: expect.objectContaining({
+            sessionId: SESSION_ID,
+            event
+          })
+        })
+      );
+    });
+
+    it('does not let a foreign socket relay input for the owned session', async () => {
+      const foreignWs = wsMock();
+
+      await handlers.onMessage(
+        {
+          data: JSON.stringify({
+            type: 'input',
+            event: { type: 'mousemove', x: 100, y: 200 },
+          }),
+        },
+        foreignWs,
+      );
+
+      expect(sendCommandToAgent).not.toHaveBeenCalled();
+      expect(foreignWs.send).not.toHaveBeenCalled();
+    });
+
+    it('relays keyboard input events', async () => {
+      const event = {
+        type: 'keydown',
+        key: 'a',
+        code: 'KeyA',
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false }
+      };
+
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'input', event }) },
+        ws
+      );
+
+      expect(sendCommandToAgent).toHaveBeenCalledWith(
+        AGENT_ID,
+        expect.objectContaining({
+          type: 'desktop_input',
+          payload: expect.objectContaining({
+            event: expect.objectContaining({ key: 'a', code: 'KeyA' })
+          })
+        })
+      );
+    });
+
+    it('relays mouse click events', async () => {
+      const event = {
+        type: 'mousedown',
+        x: 50,
+        y: 75,
+        button: 0
+      };
+
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'input', event }) },
+        ws
+      );
+
+      expect(sendCommandToAgent).toHaveBeenCalledWith(
+        AGENT_ID,
+        expect.objectContaining({
+          type: 'desktop_input'
+        })
+      );
+    });
+
+    it('relays wheel events', async () => {
+      const event = {
+        type: 'wheel',
+        x: 500,
+        y: 300,
+        deltaY: -120
+      };
+
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'input', event }) },
+        ws
+      );
+
+      expect(sendCommandToAgent).toHaveBeenCalledWith(
+        AGENT_ID,
+        expect.objectContaining({
+          type: 'desktop_input',
+          payload: expect.objectContaining({
+            event: expect.objectContaining({ type: 'wheel', deltaY: -120 })
+          })
+        })
+      );
+    });
+
+    it('sends AGENT_DISCONNECTED when agent drops during input', async () => {
+      vi.mocked(sendCommandToAgent).mockReturnValue(false);
+
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'input', event: { type: 'mousemove', x: 1, y: 1 } }) },
+        ws
+      );
+
+      expect(ws.send).toHaveBeenCalledWith(
+        expect.stringContaining('"AGENT_DISCONNECTED"')
+      );
+    });
+
+    it('relays config messages to the agent', async () => {
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'config', quality: 80, maxFps: 30 }) },
+        ws
+      );
+
+      expect(sendCommandToAgent).toHaveBeenCalledWith(
+        AGENT_ID,
+        expect.objectContaining({
+          type: 'desktop_config',
+          payload: expect.objectContaining({
+            sessionId: SESSION_ID,
+            quality: 80,
+            maxFps: 30
+          })
+        })
+      );
+    });
+
+    it('relays config with scaleFactor', async () => {
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'config', scaleFactor: 0.5 }) },
+        ws
+      );
+
+      expect(sendCommandToAgent).toHaveBeenCalledWith(
+        AGENT_ID,
+        expect.objectContaining({
+          type: 'desktop_config',
+          payload: expect.objectContaining({
+            scaleFactor: 0.5
+          })
+        })
+      );
+    });
+
+    it('sends AGENT_DISCONNECTED when agent drops during config', async () => {
+      vi.mocked(sendCommandToAgent).mockReturnValue(false);
+
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'config', quality: 50 }) },
+        ws
+      );
+
+      expect(ws.send).toHaveBeenCalledWith(
+        expect.stringContaining('"AGENT_DISCONNECTED"')
+      );
+    });
+
+    it('responds to client-initiated ping with pong', async () => {
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'ping' }) },
+        ws
+      );
+
+      expect(ws.send).toHaveBeenCalledWith(
+        expect.stringContaining('"pong"')
+      );
+    });
+
+    it('handles pong messages by updating lastPongAt', async () => {
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'pong' }) },
+        ws
+      );
+
+      // Should not send any response — just update internal state
+      expect(ws.send).not.toHaveBeenCalled();
+    });
+
+    it('silently drops invalid messages (bad schema)', async () => {
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'bogus_type' }) },
+        ws
+      );
+
+      expect(ws.send).not.toHaveBeenCalled();
+    });
+
+    it('sends MESSAGE_ERROR for malformed JSON', async () => {
+      await handlers.onMessage(
+        { data: '{not json' },
+        ws
+      );
+
+      expect(ws.send).toHaveBeenCalledWith(
+        expect.stringContaining('"MESSAGE_ERROR"')
+      );
+    });
+
+    it('handles binary message data via toString()', async () => {
+      const buffer = Buffer.from(JSON.stringify({ type: 'ping' }));
+
+      await handlers.onMessage(
+        { data: buffer },
+        ws
+      );
+
+      expect(ws.send).toHaveBeenCalledWith(
+        expect.stringContaining('"pong"')
+      );
+    });
+
+    it('validates input event fields via Zod (rejects oversized key)', async () => {
+      const event = {
+        type: 'keydown',
+        key: 'a'.repeat(100) // exceeds max(50)
+      };
+
+      await handlers.onMessage(
+        { data: JSON.stringify({ type: 'input', event }) },
+        ws
+      );
+
+      // Invalid message is silently dropped
+      expect(sendCommandToAgent).not.toHaveBeenCalled();
+    });
+  });
+
+});

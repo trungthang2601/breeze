@@ -1,0 +1,70 @@
+---
+import PortalLayout from '../../layouts/PortalLayout.astro';
+import { redirectToPortalHomeAfterDisabled } from '../../lib/visibilityGate';
+import { redirectToLoginAfter401 } from '../../lib/session';
+import TicketList from '../../components/portal/TicketList';
+import { SupportUsagePanel } from '../../components/portal/SupportUsagePanel';
+import { PageHeader } from '../../components/portal/ui';
+import { portalApi } from '../../lib/api';
+import { buildServerApiConfig } from '../../lib/server';
+import { decideTicketsPage } from '../../lib/ticketsPage';
+
+const config = buildServerApiConfig(Astro.request);
+const [response, usageResponse] = await Promise.all([
+  portalApi.getTickets({ page: 1, limit: 100 }, config),
+  portalApi.getSupportUsage(undefined, config),
+]);
+
+if (response.statusCode === 401 || usageResponse.statusCode === 401) {
+  // Dead session: clear the stale cookie and come back here after sign-in.
+  return redirectToLoginAfter401(Astro);
+}
+
+const { ticketsDisabled, usageStrictlyDisabled, redirectHome } =
+  decideTicketsPage(response, usageResponse);
+
+if (redirectHome) {
+  return redirectToPortalHomeAfterDisabled(Astro);
+}
+
+// SupportUsagePanel renders nothing without data or an error to report; only
+// open the spaced section when there is actually something in it, so the page
+// does not trail a block of empty margin under the ledger foot.
+const showSupportUsage =
+  !usageStrictlyDisabled &&
+  (usageResponse.data !== undefined || usageResponse.error !== undefined);
+---
+
+<PortalLayout title="Support">
+  {
+    ticketsDisabled ? (
+      <div data-testid="portal-tickets-disabled-notice">
+        {/* The page opens the way every other page opens — the serif title from
+            PageHeader, not a hand-rolled h1 on its own scale. */}
+        <PageHeader title="Support" lede="Tell us what you need — we'll take it from there." />
+        <section class="border-y border-border/70 py-8">
+          <p class="text-sm text-muted-foreground">
+            Your IT team hasn't opened request submission in the portal. They're still a
+            message away — their contact details are on every page.
+          </p>
+        </section>
+      </div>
+    ) : (
+      <TicketList
+        tickets={response.data ?? []}
+        error={response.error}
+        enableSupportUsage={usageResponse.data !== undefined}
+      />
+    )
+  }
+  {
+    showSupportUsage && (
+      <section class="mt-12">
+        <SupportUsagePanel
+          usage={usageResponse.data ?? null}
+          error={usageResponse.error}
+        />
+      </section>
+    )
+  }
+</PortalLayout>

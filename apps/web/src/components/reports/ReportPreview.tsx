@@ -1,0 +1,770 @@
+import { useState, useEffect, useMemo } from 'react';
+import {
+  Download,
+  RefreshCw,
+  ChevronLeft,
+  ChevronRight,
+  Table,
+  BarChart3,
+  Loader2,
+  FileText
+} from 'lucide-react';
+import { cn, widthPercentClass } from '@/lib/utils';
+import { formatDateTime } from '@/lib/dateTimeFormat';
+import type { ReportType } from './ReportsList';
+import { useTranslation } from 'react-i18next';
+
+type PreviewMode = 'table' | 'chart';
+
+type ReportData = {
+  type: ReportType;
+  format: string;
+  generatedAt: string;
+  data: {
+    rows?: Record<string, unknown>[];
+    rowCount?: number;
+    summary?: Record<string, unknown>;
+    // For alerts summary
+    bySeverity?: Record<string, number>;
+    byStatus?: Record<string, number>;
+    byDay?: { date: string; count: number }[];
+    topRules?: { ruleId: string; ruleName: string; count: number }[];
+    // For compliance
+    overview?: Record<string, unknown>;
+    byOsType?: { osType: string; count: number }[];
+    agentVersions?: { version: string; count: number }[];
+    issues?: { type: string; severity: string; count: number; message: string }[];
+    // For metrics
+    averages?: Record<string, number>;
+    topCpu?: { deviceId: string; hostname: string; value: number }[];
+    topRam?: { deviceId: string; hostname: string; value: number }[];
+    topDisk?: { deviceId: string; hostname: string; value: number }[];
+  };
+};
+
+type ReportPreviewProps = {
+  data?: ReportData;
+  loading?: boolean;
+  error?: string;
+  onRefresh?: () => void;
+  onExport?: (format: 'csv' | 'pdf' | 'excel') => void;
+  timezone?: string;
+};
+
+const getBrowserTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+export default function ReportPreview({
+  data,
+  loading,
+  error,
+  onRefresh,
+  onExport,
+  timezone
+}: ReportPreviewProps) {
+  const { t } = useTranslation('reports');
+  const effectiveTimezone = timezone || getBrowserTimezone();
+  const [previewMode, setPreviewMode] = useState<PreviewMode>('table');
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize] = useState(25);
+
+  // Reset page when data changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [data]);
+
+  // Extract rows from data
+  const rows = useMemo(() => {
+    if (!data?.data) return [];
+    return data.data.rows || [];
+  }, [data]);
+
+  // Get columns from first row
+  const columns = useMemo(() => {
+    const firstRow = rows[0];
+    if (!firstRow) return [];
+    return Object.keys(firstRow);
+  }, [rows]);
+
+  // Paginated rows
+  const paginatedRows = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return rows.slice(start, start + pageSize);
+  }, [rows, currentPage, pageSize]);
+
+  const totalPages = Math.ceil(rows.length / pageSize);
+
+  // Format cell value for display
+  const formatCellValue = (value: unknown): string => {
+    if (value === null || value === undefined) return '-';
+    if (typeof value === 'boolean') return value ? t('reports.reportPreview.values.yes') : t('reports.reportPreview.values.no');
+    if (value instanceof Date) return formatDateTime(value, { timeZone: effectiveTimezone });
+    if (typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}/)) {
+      return formatDateTime(value, { timeZone: effectiveTimezone });
+    }
+    if (Array.isArray(value)) return value.join(', ');
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+  };
+
+  // Format column header
+  const formatColumnHeader = (column: string): string => {
+    return column
+      .replace(/([A-Z])/g, ' $1')
+      .replace(/_/g, ' ')
+      .replace(/^./, str => str.toUpperCase())
+      .trim();
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="text-center">
+          <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto" />
+          <p className="mt-4 text-sm text-muted-foreground">{t('reports.reportPreview.generating')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
+        <p className="text-sm text-destructive">{error}</p>
+        {onRefresh && (
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="mt-4 inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
+          >
+            <RefreshCw className="h-4 w-4" />
+            {t('reports.reportPreview.tryAgain')}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  if (!data) {
+    return (
+      <div className="rounded-lg border border-dashed p-12 text-center">
+        <FileText className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+        <h3 className="text-lg font-medium">{t('reports.reportPreview.emptyTitle')}</h3>
+        <p className="text-sm text-muted-foreground mt-1">
+          {t('reports.reportPreview.emptyDescription')}
+        </p>
+      </div>
+    );
+  }
+
+  const hasChartData =
+    data.type === 'alert_summary' ||
+    data.type === 'compliance' ||
+    data.type === 'performance' ||
+    data.type === 'executive_summary';
+
+  return (
+    <div className="space-y-4">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-lg font-semibold">{t(/* i18n-dynamic */ `reports.reportPreview.reportTypes.${data.type}`)/* i18n-dynamic */}</h3>
+          <p className="text-sm text-muted-foreground">
+            {data.data.rowCount !== undefined
+              ? t('reports.reportPreview.generatedWithRecords', {
+                date: formatDateTime(data.generatedAt, { timeZone: effectiveTimezone }),
+                count: data.data.rowCount
+              })
+              : t('reports.reportPreview.generated', {
+                date: formatDateTime(data.generatedAt, { timeZone: effectiveTimezone })
+              })}
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* View Mode Toggle */}
+          {hasChartData && (
+            <div className="flex rounded-md border">
+              <button
+                type="button"
+                onClick={() => setPreviewMode('table')}
+                className={cn(
+                  'flex items-center gap-1 px-3 py-1.5 text-sm transition',
+                  previewMode === 'table'
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-muted'
+                )}
+              >
+                <Table className="h-4 w-4" />
+                {t('reports.reportPreview.viewModes.table')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setPreviewMode('chart')}
+                className={cn(
+                  'flex items-center gap-1 px-3 py-1.5 text-sm transition',
+                  previewMode === 'chart'
+                    ? 'bg-primary text-primary-foreground'
+                    : 'hover:bg-muted'
+                )}
+              >
+                <BarChart3 className="h-4 w-4" />
+                {t('reports.reportPreview.viewModes.chart')}
+              </button>
+            </div>
+          )}
+
+          {/* Export Buttons */}
+          {onExport && (
+            <div className="flex rounded-md border">
+              <button
+                type="button"
+                onClick={() => onExport('csv')}
+                className="flex items-center gap-1 px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                <Download className="h-4 w-4" />
+                {t('reports.reportPreview.formats.csv')}
+              </button>
+              <button
+                type="button"
+                onClick={() => onExport('excel')}
+                className="border-l px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                {t('reports.reportPreview.formats.excel')}
+              </button>
+              <button
+                type="button"
+                onClick={() => onExport('pdf')}
+                className="border-l px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                {t('reports.reportPreview.formats.pdf')}
+              </button>
+            </div>
+          )}
+
+          {onRefresh && (
+            <button
+              type="button"
+              onClick={onRefresh}
+              className="flex h-9 w-9 items-center justify-center rounded-md border hover:bg-muted"
+              title={t('reports.reportPreview.refresh')}
+            >
+              <RefreshCw className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Hardware Lifecycle: band counts + the staged plan, instead of the
+          generic summary cards (its summary carries nested rows/arrays). */}
+      {data.type === 'hardware_lifecycle' && data.data.summary && previewMode === 'table' && (() => {
+        const s = data.data.summary as {
+          computers?: { total?: number; byReplacement?: Record<string, number> };
+          otherEquipmentCount?: number;
+          recommendations?: string[];
+        };
+        const bands = s.computers?.byReplacement ?? {};
+        const tiles: { key: string; value: number; tone: string }[] = [
+          { key: 'onTrack', value: bands.supported ?? 0, tone: 'text-success' },
+          { key: 'dueSoon', value: bands.due_soon ?? 0, tone: 'text-warning' },
+          { key: 'replaceNow', value: bands.replace ?? 0, tone: 'text-destructive' },
+          { key: 'unknownAge', value: bands.unknown ?? 0, tone: 'text-muted-foreground' },
+          { key: 'otherEquipment', value: s.otherEquipmentCount ?? 0, tone: '' },
+        ];
+        return (
+          <div className="space-y-4" data-testid="lifecycle-summary">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+              {tiles.map((tile) => (
+                <div key={tile.key} className="rounded-lg border bg-card p-4">
+                  <p className="text-sm text-muted-foreground">{t(/* i18n-dynamic */ `reports.reportPreview.lifecycle.${tile.key}`)}</p>
+                  <p className={cn('text-2xl font-bold mt-1', tile.tone)}>{tile.value}</p>
+                </div>
+              ))}
+            </div>
+            {Array.isArray(s.recommendations) && s.recommendations.length > 0 && (
+              <div className="rounded-lg border bg-card p-4">
+                <h4 className="text-sm font-semibold mb-3">{t('reports.reportPreview.lifecycle.recommendations')}</h4>
+                <ul className="space-y-2 text-sm">
+                  {s.recommendations.map((line, i) => (
+                    <li key={i} className="flex gap-2"><span className="text-primary">›</span><span>{line}</span></li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Threat Detection Review (#5784 W02): coverage first, then the counts,
+          with an unmeasured value rendered as N/A rather than a zero. Its
+          summary carries nested objects, so the generic cards are suppressed
+          below in the same way the lifecycle branch suppresses them. */}
+      {data.type === 'threat_detection_review' && data.data.summary && previewMode === 'table' && (() => {
+        const s = data.data.summary as {
+          coverage?: { note?: string; coveredFrom?: string | null; coveredTo?: string | null; sourceStatus?: string; carriedInIncluded?: boolean };
+          incidents?: {
+            opened?: number | null; resolved?: number | null;
+            meanResolveHours?: number | null; carriedIn?: number | null;
+          };
+          agentCoverage?: { huntressAgents?: number | null; breezeDevices?: number | null; devicesWithoutAgent?: number | null };
+          dataGaps?: string[];
+        };
+        const na = t('reports.reportPreview.threatDetection.notMeasured');
+        const show = (v: number | null | undefined) => (v === null || v === undefined ? na : String(v));
+        const tiles: { key: string; value: string; unmeasured: boolean }[] = [
+          { key: 'opened', value: show(s.incidents?.opened), unmeasured: s.incidents?.opened == null },
+          { key: 'resolved', value: show(s.incidents?.resolved), unmeasured: s.incidents?.resolved == null },
+          // A carried-in section the report was set NOT to look at is a config
+          // choice, not a measurement gap — showing it as N/A beside genuinely
+          // unmeasured values would make the two indistinguishable. Drop the
+          // tile instead. (Absent flag = legacy snapshot = included.)
+          ...(s.coverage?.carriedInIncluded === false
+            ? []
+            : [{ key: 'carriedIn', value: show(s.incidents?.carriedIn), unmeasured: s.incidents?.carriedIn == null }]),
+          { key: 'agents', value: show(s.agentCoverage?.huntressAgents), unmeasured: s.agentCoverage?.huntressAgents == null },
+          // Breeze's OWN fleet count, which is measured even when the detection
+          // source was never connected — the same tile the PDF prints, so the
+          // preview and the delivered artifact cannot disagree.
+          { key: 'breezeDevices', value: show(s.agentCoverage?.breezeDevices), unmeasured: s.agentCoverage?.breezeDevices == null },
+          { key: 'devicesWithoutAgent', value: show(s.agentCoverage?.devicesWithoutAgent), unmeasured: s.agentCoverage?.devicesWithoutAgent == null },
+        ];
+        const gaps = Array.isArray(s.dataGaps) ? s.dataGaps.filter(Boolean) : [];
+        return (
+          <div className="space-y-4" data-testid="threat-detection-summary">
+            {gaps.length > 0 && (
+              <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-4" data-testid="threat-detection-coverage-note">
+                <h4 className="text-sm font-semibold mb-1">{t('reports.reportPreview.threatDetection.coverage')}</h4>
+                <ul className="space-y-1 text-sm">
+                  {gaps.map((line, i) => (<li key={i}>{line}</li>))}
+                </ul>
+              </div>
+            )}
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+              {tiles.map((tile) => (
+                <div key={tile.key} className="rounded-lg border bg-card p-4">
+                  <p className="text-sm text-muted-foreground">{t(/* i18n-dynamic */ `reports.reportPreview.threatDetection.${tile.key}`)}</p>
+                  <p className={cn('text-2xl font-bold mt-1', tile.unmeasured && 'text-muted-foreground')}>{tile.value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Endpoint Management Review (#5784 W03): enrolment and compliance tiles
+          instead of the generic summary cards (its summary carries nested
+          objects/arrays). An unmeasured count renders as "N/A", never 0 — the
+          same rule the PDF and the generator follow. */}
+      {data.type === 'endpoint_management_review' && data.data.summary && previewMode === 'table' && (() => {
+        const s = data.data.summary as {
+          enrolment?: {
+            intuneDevices?: number | null;
+            breezeDevices?: number | null;
+            breezeWithoutIntune?: number | null;
+            intuneWithoutBreezeLink?: number | null;
+          };
+          compliance?: { byState?: Record<string, number> | null };
+          staleEnrolments?: { count?: number | null };
+          dataGaps?: string[];
+          historyCaveat?: string;
+        };
+        const byState = s.compliance?.byState ?? null;
+        const tiles: { key: string; value: number | null | undefined; tone: string }[] = [
+          { key: 'intuneDevices', value: s.enrolment?.intuneDevices, tone: '' },
+          { key: 'breezeWithoutIntune', value: s.enrolment?.breezeWithoutIntune, tone: 'text-warning' },
+          { key: 'intuneWithoutBreezeLink', value: s.enrolment?.intuneWithoutBreezeLink, tone: 'text-muted-foreground' },
+          { key: 'noncompliant', value: byState ? byState.noncompliant ?? 0 : null, tone: 'text-destructive' },
+          { key: 'staleEnrolments', value: s.staleEnrolments?.count, tone: 'text-warning' },
+        ];
+        return (
+          <div className="space-y-4" data-testid="endpoint-management-summary">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+              {tiles.map((tile) => (
+                <div key={tile.key} className="rounded-lg border bg-card p-4">
+                  <p className="text-sm text-muted-foreground">{t(/* i18n-dynamic */ `reports.reportPreview.endpointManagement.${tile.key}`)}</p>
+                  <p className={cn('text-2xl font-bold mt-1', typeof tile.value === 'number' ? tile.tone : 'text-muted-foreground')}>
+                    {typeof tile.value === 'number'
+                      ? tile.value
+                      : t('reports.reportPreview.endpointManagement.notMeasured')}
+                  </p>
+                </div>
+              ))}
+            </div>
+            {Array.isArray(s.dataGaps) && s.dataGaps.length > 0 && (
+              <div className="rounded-lg border bg-card p-4" data-testid="endpoint-management-data-gaps">
+                <h4 className="text-sm font-semibold mb-3">{t('reports.reportPreview.endpointManagement.dataGaps')}</h4>
+                <ul className="space-y-2 text-sm">
+                  {s.dataGaps.map((line, i) => (
+                    <li key={i} className="flex gap-2"><span className="text-warning">›</span><span>{line}</span></li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {s.historyCaveat && (
+              <p className="text-xs text-muted-foreground" data-testid="endpoint-management-history-caveat">
+                {s.historyCaveat}
+              </p>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Vulnerability Management (#5784 W04): severity tiles with actively
+          exploited (KEV) and high-EPSS as their OWN tiles — never folded into
+          severity — plus the exceptions count. `null` renders "N/A", never 0:
+          unmeasured and zero are different sentences. */}
+      {data.type === 'vulnerability_management' && data.data.summary && previewMode === 'table' && (() => {
+        const s = data.data.summary as {
+          open?: {
+            critical?: number | null; high?: number | null;
+            knownExploited?: number | null; highEpss?: number | null;
+          };
+          exceptions?: Array<{ expiringNextPeriod?: boolean }> | null;
+          feedNote?: string;
+        };
+        const show = (value: number | null | undefined) =>
+          value === null || value === undefined ? t('reports.reportPreview.vulnerabilityManagement.notMeasured') : String(value);
+        const tiles: { key: string; value: string; tone: string }[] = [
+          { key: 'critical', value: show(s.open?.critical), tone: 'text-destructive' },
+          { key: 'high', value: show(s.open?.high), tone: 'text-warning' },
+          { key: 'knownExploited', value: show(s.open?.knownExploited), tone: 'text-destructive' },
+          { key: 'highEpss', value: show(s.open?.highEpss), tone: 'text-warning' },
+          {
+            key: 'expiringExceptions',
+            value: s.exceptions === null || s.exceptions === undefined
+              ? t('reports.reportPreview.vulnerabilityManagement.notMeasured')
+              : String(s.exceptions.filter((row) => row.expiringNextPeriod).length),
+            tone: '',
+          },
+        ];
+        return (
+          <div className="space-y-4" data-testid="vulnerability-management-summary">
+            {s.feedNote ? (
+              <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+                {s.feedNote}
+              </div>
+            ) : null}
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+              {tiles.map((tile) => (
+                <div key={tile.key} className="rounded-lg border bg-card p-4">
+                  <p className="text-sm text-muted-foreground">{t(/* i18n-dynamic */ `reports.reportPreview.vulnerabilityManagement.${tile.key}`)}</p>
+                  <p className={cn('text-2xl font-bold mt-1', tile.tone)}>{tile.value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Identity & Access Review (#5784 W06): coverage first, then the counts.
+          Every unmeasured value renders as N/A rather than a zero — an
+          unlicensed tenant, a `hidden` risk field and a NULL MFA state are all
+          gaps in what Microsoft released, not findings about the customer. Its
+          summary carries nested objects, so the generic cards are suppressed
+          below the same way the branches above suppress them. */}
+      {data.type === 'identity_access_review' && data.data.summary && previewMode === 'table' && (() => {
+        const s = data.data.summary as {
+          coverage?: { note?: string; coveredFrom?: string | null; coveredTo?: string | null; unlicensed?: boolean };
+          identity?: {
+            usersTotal?: number | null; admins?: number | null;
+            mfaRegistered?: number | null; mfaUnknown?: number | null;
+            adminsWithoutMfa?: number | null; adminsMfaUnknown?: number | null;
+          };
+          signins?: {
+            total?: number | null; distinctUsers?: number | null; failures?: number | null;
+          };
+          dormant?: { rows?: unknown[] } | null;
+          dataGaps?: string[];
+        };
+        const na = t('reports.reportPreview.identityAccess.notMeasured');
+        const show = (v: number | null | undefined) => (v === null || v === undefined ? na : String(v));
+        const tiles: { key: string; value: string; unmeasured: boolean }[] = [
+          { key: 'signins', value: show(s.signins?.total), unmeasured: s.signins?.total == null },
+          { key: 'distinctUsers', value: show(s.signins?.distinctUsers), unmeasured: s.signins?.distinctUsers == null },
+          { key: 'failures', value: show(s.signins?.failures), unmeasured: s.signins?.failures == null },
+          { key: 'admins', value: show(s.identity?.admins), unmeasured: s.identity?.admins == null },
+          { key: 'adminsWithoutMfa', value: show(s.identity?.adminsWithoutMfa), unmeasured: s.identity?.adminsWithoutMfa == null },
+          // Counted separately and NEVER folded into "without MFA": a NULL is
+          // a gap in what Microsoft reported, not an absent registration.
+          { key: 'mfaUnknown', value: show(s.identity?.mfaUnknown), unmeasured: s.identity?.mfaUnknown == null },
+          {
+            key: 'dormant',
+            value: s.dormant ? String(s.dormant.rows?.length ?? 0) : na,
+            unmeasured: !s.dormant,
+          },
+        ];
+        const gaps = Array.isArray(s.dataGaps) ? s.dataGaps.filter(Boolean) : [];
+        return (
+          <div className="space-y-4" data-testid="identity-access-summary">
+            {gaps.length > 0 && (
+              <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-4" data-testid="identity-access-coverage-note">
+                <h4 className="text-sm font-semibold mb-1">{t('reports.reportPreview.identityAccess.coverage')}</h4>
+                <ul className="space-y-1 text-sm">
+                  {gaps.map((line, i) => (<li key={i}>{line}</li>))}
+                </ul>
+              </div>
+            )}
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              {tiles.map((tile) => (
+                <div key={tile.key} className="rounded-lg border bg-card p-4">
+                  <p className="text-sm text-muted-foreground">{t(/* i18n-dynamic */ `reports.reportPreview.identityAccess.${tile.key}`)}</p>
+                  <p className={cn('text-2xl font-bold mt-1', tile.unmeasured && 'text-muted-foreground')}>{tile.value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Summary Cards */}
+      {data.type !== 'hardware_lifecycle' && data.type !== 'threat_detection_review' && data.type !== 'endpoint_management_review' && data.type !== 'vulnerability_management' && data.type !== 'identity_access_review' && data.data.summary && previewMode === 'table' && (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {Object.entries(data.data.summary).map(([key, value]) => (
+            <div key={key} className="rounded-lg border bg-card p-4">
+              <p className="text-sm text-muted-foreground">{formatColumnHeader(key)}</p>
+              <p className="text-2xl font-bold mt-1">
+                {typeof value === 'number' && key.toLowerCase().includes('rate')
+                  ? `${value}%`
+                  : formatCellValue(value)}
+              </p>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Table View */}
+      {previewMode === 'table' && rows.length > 0 && (
+        <>
+          <div className="rounded-lg border bg-card shadow-xs overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="border-b bg-muted/50">
+                  <tr>
+                    {columns.map(column => (
+                      <th
+                        key={column}
+                        className="px-4 py-3 text-left text-sm font-medium text-muted-foreground whitespace-nowrap"
+                      >
+                        {formatColumnHeader(column)}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {paginatedRows.map((row, index) => (
+                    <tr key={index} className="hover:bg-muted/30">
+                      {columns.map(column => (
+                        <td
+                          key={column}
+                          className="px-4 py-3 text-sm whitespace-nowrap max-w-xs truncate"
+                          title={formatCellValue(row[column])}
+                        >
+                          {formatCellValue(row[column])}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-muted-foreground">
+                {t('reports.reportPreview.pagination.showing', {
+                  start: (currentPage - 1) * pageSize + 1,
+                  end: Math.min(currentPage * pageSize, rows.length),
+                  total: rows.length
+                })}
+              </p>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  className="flex h-8 w-8 items-center justify-center rounded-md border hover:bg-muted disabled:opacity-50"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <span className="px-3 text-sm">
+                  {t('reports.reportPreview.pagination.page', { current: currentPage, total: totalPages })}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  className="flex h-8 w-8 items-center justify-center rounded-md border hover:bg-muted disabled:opacity-50"
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Chart View */}
+      {previewMode === 'chart' && hasChartData && (
+        <div className="space-y-6">
+          {/* Alert Summary Charts */}
+          {data.type === 'alert_summary' && (
+            <>
+              {/* Severity Distribution */}
+              {data.data.bySeverity && (
+                <div className="rounded-lg border bg-card p-4">
+                  <h4 className="text-sm font-semibold mb-4">{t('reports.reportPreview.charts.alertsBySeverity')}</h4>
+                  <div className="space-y-2">
+                    {Object.entries(data.data.bySeverity).map(([severity, count]) => {
+                      const total = Object.values(data.data.bySeverity!).reduce((a, b) => a + b, 0);
+                      const percentage = total > 0 ? (count / total) * 100 : 0;
+                      return (
+                        <div key={severity} className="flex items-center gap-3">
+                          <span className="w-20 text-sm capitalize">{severity}</span>
+                          <div className="flex-1 h-4 bg-muted rounded-full overflow-hidden">
+                            <div
+                              className={cn(
+                                'h-full rounded-full',
+                                severity === 'critical' && 'bg-destructive',
+                                severity === 'high' && 'bg-warning',
+                                severity === 'medium' && 'bg-warning/60',
+                                severity === 'low' && 'bg-info',
+                                severity === 'info' && 'bg-muted-foreground',
+                                widthPercentClass(percentage)
+                              )}
+                            />
+                          </div>
+                          <span className="w-12 text-sm text-right">{count}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Top Alert Rules */}
+              {data.data.topRules && data.data.topRules.length > 0 && (
+                <div className="rounded-lg border bg-card p-4">
+                  <h4 className="text-sm font-semibold mb-4">{t('reports.reportPreview.charts.topAlertingRules')}</h4>
+                  <div className="space-y-2">
+                    {data.data.topRules.map((rule, index) => (
+                      <div key={rule.ruleId} className="flex items-center gap-3">
+                        <span className="w-6 text-sm text-muted-foreground">{index + 1}.</span>
+                        <span className="flex-1 text-sm truncate">{rule.ruleName}</span>
+                        <span className="text-sm font-medium">{rule.count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Compliance Charts */}
+          {data.type === 'compliance' && (
+            <>
+              {data.data.overview && (
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  <div className="rounded-lg border bg-card p-4 text-center">
+                    <p className="text-sm text-muted-foreground">{t('reports.reportPreview.charts.complianceScore')}</p>
+                    <p className="text-3xl font-bold text-primary mt-1">
+                      {String((data.data.overview as Record<string, unknown>).complianceScore)}%
+                    </p>
+                  </div>
+                  <div className="rounded-lg border bg-card p-4 text-center">
+                    <p className="text-sm text-muted-foreground">{t('reports.reportPreview.charts.totalDevices')}</p>
+                    <p className="text-3xl font-bold mt-1">
+                      {String((data.data.overview as Record<string, unknown>).totalDevices)}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border bg-card p-4 text-center">
+                    <p className="text-sm text-muted-foreground">{t('reports.reportPreview.charts.online')}</p>
+                    <p className="text-3xl font-bold text-success mt-1">
+                      {String((data.data.overview as Record<string, unknown>).onlineDevices)}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border bg-card p-4 text-center">
+                    <p className="text-sm text-muted-foreground">{t('reports.reportPreview.charts.offline')}</p>
+                    <p className="text-3xl font-bold text-destructive mt-1">
+                      {String((data.data.overview as Record<string, unknown>).offlineDevices)}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {data.data.issues && data.data.issues.length > 0 && (
+                <div className="rounded-lg border bg-card p-4">
+                  <h4 className="text-sm font-semibold mb-4">{t('reports.reportPreview.charts.complianceIssues')}</h4>
+                  <div className="space-y-3">
+                    {data.data.issues.map((issue, index) => (
+                      <div
+                        key={index}
+                        className={cn(
+                          'flex items-start gap-3 rounded-md border p-3',
+                          issue.severity === 'warning' && 'border-warning/40 bg-warning/10',
+                          issue.severity === 'info' && 'border-info/40 bg-info/10'
+                        )}
+                      >
+                        <span className="text-sm font-medium">{issue.count}</span>
+                        <span className="text-sm">{issue.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Performance Charts */}
+          {data.type === 'performance' && (
+            <>
+              {data.data.averages && (
+                <div className="grid gap-4 sm:grid-cols-3">
+                  <div className="rounded-lg border bg-card p-4 text-center">
+                    <p className="text-sm text-muted-foreground">{t('reports.reportPreview.charts.avgCpu')}</p>
+                    <p className="text-3xl font-bold mt-1">{data.data.averages.cpu}%</p>
+                  </div>
+                  <div className="rounded-lg border bg-card p-4 text-center">
+                    <p className="text-sm text-muted-foreground">{t('reports.reportPreview.charts.avgMemory')}</p>
+                    <p className="text-3xl font-bold mt-1">{data.data.averages.ram}%</p>
+                  </div>
+                  <div className="rounded-lg border bg-card p-4 text-center">
+                    <p className="text-sm text-muted-foreground">{t('reports.reportPreview.charts.avgDisk')}</p>
+                    <p className="text-3xl font-bold mt-1">{data.data.averages.disk}%</p>
+                  </div>
+                </div>
+              )}
+
+              {data.data.topCpu && data.data.topCpu.length > 0 && (
+                <div className="rounded-lg border bg-card p-4">
+                  <h4 className="text-sm font-semibold mb-4">{t('reports.reportPreview.charts.topCpuConsumers')}</h4>
+                  <div className="space-y-2">
+                    {data.data.topCpu.slice(0, 5).map((device, index) => (
+                      <div key={device.deviceId} className="flex items-center gap-3">
+                        <span className="w-6 text-sm text-muted-foreground">{index + 1}.</span>
+                        <span className="flex-1 text-sm truncate">{device.hostname}</span>
+                        <div className="w-24 h-2 bg-muted rounded-full overflow-hidden">
+                          <div
+                            className={cn('h-full rounded-full bg-primary', widthPercentClass(device.value))}
+                          />
+                        </div>
+                        <span className="w-12 text-sm text-right">{device.value}%</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Empty State */}
+      {rows.length === 0 && previewMode === 'table' && (
+        <div className="rounded-lg border border-dashed p-12 text-center">
+          <p className="text-sm text-muted-foreground">{t('reports.reportPreview.noDataMatches')}</p>
+        </div>
+      )}
+    </div>
+  );
+}

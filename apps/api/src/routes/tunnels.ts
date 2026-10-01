@@ -1,0 +1,1853 @@
+import { Hono, type Context } from 'hono';
+import { randomUUID } from 'node:crypto';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { and, eq, desc, inArray, isNull, lt, or } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { tunnelSessions, tunnelAllowlists, devices, users, remoteSessions, sites, auditLogs, discoveredAssets } from '../db/schema';
+import { captureException } from '../services/sentry';
+import { isPgUniqueViolation } from '../utils/pgErrors';
+import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
+import { sendCommandToAgent, isAgentConnected } from './agentWs';
+import { checkRemoteAccess } from '../services/remoteAccessPolicy';
+import { HTTP_TUNNEL_MAX_SESSION_HOURS } from './tunnelHttp';
+import { createWsTicket, createVncConnectCode, consumeVncConnectCode, getViewerAccessTokenExpirySeconds, HTTP_TICKET_TTL_MS } from '../services/remoteSessionAuth';
+import {
+  createViewerAccessToken,
+  createViewerDescendantAccessToken,
+  verifyViewerAccessToken,
+  type ViewerTokenPayload,
+} from '../services/jwt';
+import { getTrustedClientIp, rateLimitIpKey } from '../services/clientIp';
+import { getActiveAllowlistPatterns, tunnelAllowlistRuleAppliesToSite } from '../services/tunnelAllowlist';
+import { getRedis } from '../services/redis';
+import { rateLimiter } from '../services/rate-limit';
+import { isViewerJtiRevoked, isViewerSessionRevoked, revokeViewerSession } from '../services/viewerTokenRevocation';
+import type { AuthContext } from '../middleware/auth';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
+import { createRemoteSession, RemoteSessionDeniedError } from '../services/remoteSessionCreate';
+import { evaluateCapability, partnerIdForDevice, trustDenyBody, unresolvedPartnerDecision } from '../services/partnerTrust';
+import { partnerTrustMode } from '../config/partnerTrustMode';
+import { authorizeRemoteSessionContinuation } from '../services/remoteWsAuthorization';
+import { teardownDisconnectedSessions } from '../services/remoteSessionTeardown';
+import {
+  terminalIntentSet,
+  terminalSessionReturning,
+  toTerminalSessionRow,
+  type TerminalSessionRow,
+} from '../services/remoteDesktopTerminalIntent';
+
+export const tunnelRoutes = new Hono();
+
+// Apply auth middleware to all tunnel routes
+tunnelRoutes.use('*', authMiddleware);
+
+// --- Schemas ---
+
+const idParamSchema = z.object({ id: z.string().guid() });
+const listQuerySchema = z.object({ siteId: z.string().guid().optional().nullable() });
+const allowlistIdParamSchema = idParamSchema;
+const CONNECTABLE_TUNNEL_STATUSES = ['pending', 'connecting', 'active'] as const;
+const VNC_EXCHANGE_RATE_LIMIT = 20;
+const VNC_EXCHANGE_RATE_WINDOW_SECONDS = 60;
+const TUNNEL_CONTINUATION_PERMISSIONS = [PERMISSIONS.REMOTE_ACCESS, PERMISSIONS.DEVICES_EXECUTE];
+
+async function authorizeTunnelContinuation(sessionId: string, userId: string) {
+  return authorizeRemoteSessionContinuation(
+    { sessionId, sessionType: 'tunnel', userId },
+    TUNNEL_CONTINUATION_PERMISSIONS,
+  );
+}
+
+function liveAuthorizationResponse(c: Context, denial: { status: 403 | 404 | 429 | 503; reason: string }) {
+  return c.json({ error: 'Remote session access denied', reason: denial.reason }, denial.status);
+}
+
+// Proxy tunnels get no agent-side reaper once `tunnel_open` is skipped for them
+// (see POST /tunnels below) — GET /tunnels lazily expires stale rows on every
+// read instead. 10 minutes comfortably exceeds the 300s cookie TTL + the
+// activity-bump throttle slack, so a live session is never flipped early.
+const PROXY_IDLE_EXPIRY_MS = 10 * 60 * 1000;
+
+// Absolute session cap (design spec A.3-3), shared with tunnelHttp.ts (which
+// owns the canonical export). tunnelHttp.ts enforces this per-request on the
+// proxied path (writes the row terminal + 410s mid-session); this route
+// enforces it at ticket-mint time so a caller can't refresh past a dead
+// session with a fresh ticket.
+const HTTP_TUNNEL_MAX_SESSION_MS = HTTP_TUNNEL_MAX_SESSION_HOURS * 60 * 60 * 1000;
+
+async function tunnelTicketTrustDenyBody(deviceId: string, userId: string) {
+  if (partnerTrustMode() === 'off') return null;
+
+  const partnerId = await partnerIdForDevice(deviceId);
+  const decision = partnerId
+    ? await evaluateCapability('remote_control', {
+      partnerId,
+      deviceId,
+      userId,
+      detail: { stage: 'ticket', kind: 'tunnel' },
+    })
+    : await unresolvedPartnerDecision('remote_control');
+  if (decision.allow) return null;
+
+  return trustDenyBody({
+    allow: false,
+    code: decision.code,
+    capability: 'remote_control',
+    reason: decision.reason,
+  }, false);
+}
+
+const createTunnelSchema = z.discriminatedUnion('type', [
+  z.object({ deviceId: z.string().guid(), type: z.literal('vnc') }),
+  z.object({
+    deviceId: z.string().guid(),
+    type: z.literal('proxy'),
+    targetHost: z.string().max(255),
+    targetPort: z.number().int().min(1).max(65535),
+    scheme: z.enum(['http', 'https']).optional(),
+    skipTlsVerify: z.boolean().optional(),
+  }),
+]);
+
+const allowlistRuleSchema = z.object({
+  direction: z.enum(['destination', 'source']),
+  pattern: z.string().min(1).max(255),
+  description: z.string().max(500).optional(),
+  siteId: z.string().guid().optional(),
+  source: z.enum(['manual', 'discovery', 'policy']).optional(),
+  discoveredAssetId: z.string().guid().optional(),
+});
+
+const updateAllowlistSchema = z.object({
+  pattern: z.string().min(1).max(255).optional(),
+  description: z.string().max(500).optional(),
+  enabled: z.boolean().optional(),
+});
+
+const proxyConnectSchema = z.object({
+  deviceId: z.string().guid(),
+  discoveredAssetId: z.string().guid(),
+  port: z.number().int().min(1).max(65535),
+  scheme: z.enum(['http', 'https']),
+  skipTlsVerify: z.boolean(),
+});
+
+// --- Helpers ---
+
+// Resolve the org a request acts on, from auth scope + an optional `?orgId=`.
+// Partner/system callers carry no JWT org claim — the web client passes the
+// selected org as a query param (see fetchWithAuth's auto-injection).
+//
+// Adapted from the resolveOrgId helpers in discovery.ts / monitors.ts, minus
+// their `requireForNonOrg` mode and permissive system-scope fall-through: these
+// routes always require a single resolvable org, so any unresolvable caller
+// (system or multi-org partner without `?orgId=`) gets a hard 400 and no
+// success branch can return a null org. Not kept in lockstep with those copies.
+function resolveOrgId(
+  auth: { scope: string; orgId: string | null; canAccessOrg: (orgId: string) => boolean; accessibleOrgIds: string[] | null },
+  requestedOrgId?: string,
+) {
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) return { error: 'Organization context required', status: 403 } as const;
+    if (requestedOrgId && requestedOrgId !== auth.orgId) return { error: 'Access to this organization denied', status: 403 } as const;
+    return { orgId: auth.orgId } as const;
+  }
+  if (requestedOrgId) {
+    if (!auth.canAccessOrg(requestedOrgId)) return { error: 'Access to this organization denied', status: 403 } as const;
+    return { orgId: requestedOrgId } as const;
+  }
+  if (auth.scope === 'partner') {
+    const accessibleOrgIds = auth.accessibleOrgIds ?? [];
+    if (accessibleOrgIds.length === 1) return { orgId: accessibleOrgIds[0]! } as const;
+    return { error: 'orgId is required when partner has multiple organizations', status: 400 } as const;
+  }
+  return { error: 'orgId is required', status: 400 } as const;
+}
+
+// Hardcoded blocked CIDRs (mirrors agent-side allowlist.go)
+const BLOCKED_CIDRS = [
+  { cidr: '127.0.0.0/8', reason: 'localhost' },
+  { cidr: '169.254.0.0/16', reason: 'link-local / cloud metadata (SSRF prevention)' },
+];
+
+function ipInCidr(ip: string, cidr: string): boolean {
+  const [network, bits] = cidr.split('/');
+  const mask = ~(0xFFFFFFFF >>> parseInt(bits!, 10));
+  const ipNum = ipToInt(ip);
+  const netNum = ipToInt(network!);
+  if (ipNum === null || netNum === null) return false;
+  return (ipNum & mask) === (netNum & mask);
+}
+
+function ipToInt(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let result = 0;
+  for (const part of parts) {
+    const n = parseInt(part, 10);
+    if (isNaN(n) || n < 0 || n > 255) return null;
+    result = (result << 8) | n;
+  }
+  return result >>> 0; // unsigned
+}
+
+function isTargetBlocked(host: string, port: number, isVNC: boolean): { blocked: boolean; reason?: string } {
+  if (host === '0.0.0.0' || host === '::') {
+    return { blocked: true, reason: 'Wildcard bind address' };
+  }
+
+  for (const { cidr, reason } of BLOCKED_CIDRS) {
+    if (ipInCidr(host, cidr)) {
+      // VNC exception: allow 127.0.0.1:5900 only
+      if (isVNC && cidr === '127.0.0.0/8' && host === '127.0.0.1' && port === 5900) {
+        continue;
+      }
+      return { blocked: true, reason };
+    }
+  }
+
+  return { blocked: false };
+}
+
+async function isTargetAllowed(host: string, port: number, orgId: string, bridgeSiteId: string | null): Promise<boolean> {
+  const rules = await db
+    .select()
+    .from(tunnelAllowlists)
+    .where(and(
+      eq(tunnelAllowlists.orgId, orgId),
+      eq(tunnelAllowlists.direction, 'destination'),
+      eq(tunnelAllowlists.enabled, true),
+    ));
+
+  if (rules.length === 0) return false; // Default deny
+
+  for (const rule of rules) {
+    if (!tunnelAllowlistRuleAppliesToSite(rule.siteId ?? null, bridgeSiteId)) continue;
+    const parts = rule.pattern.split(':');
+    if (parts.length !== 2) continue;
+    const [cidr, portRange] = parts;
+
+    if (!ipInCidr(host, cidr!)) continue;
+
+    if (portRange === '*') return true;
+    if (portRange!.includes('-')) {
+      const [min, max] = portRange!.split('-').map(Number);
+      if (port >= min! && port <= max!) return true;
+    } else {
+      if (port === parseInt(portRange!, 10)) return true;
+    }
+  }
+
+  return false;
+}
+
+async function isSourceIpAllowed(sourceIp: string, orgId: string, bridgeSiteId: string | null): Promise<boolean> {
+  const rules = await db
+    .select()
+    .from(tunnelAllowlists)
+    .where(and(
+      eq(tunnelAllowlists.orgId, orgId),
+      eq(tunnelAllowlists.direction, 'source'),
+      eq(tunnelAllowlists.enabled, true),
+    ));
+
+  const effectiveRules = rules.filter((rule) =>
+    tunnelAllowlistRuleAppliesToSite(rule.siteId ?? null, bridgeSiteId)
+  );
+
+  // No source rules effective for this bridge site = no restriction.
+  if (effectiveRules.length === 0) return true;
+
+  for (const rule of effectiveRules) {
+    if (ipInCidr(sourceIp, rule.pattern)) return true;
+  }
+
+  return false;
+}
+
+function getClientIp(c: any): string {
+  return getTrustedClientIp(c, '127.0.0.1');
+}
+
+/**
+ * Insert a tunnel_allowlists row and return it, or return `undefined` when the
+ * (org_id, direction, pattern, COALESCE(site_id)) unique index already holds an
+ * identical rule.
+ *
+ * The insert runs in a NESTED transaction (postgres.js SAVEPOINT) on purpose.
+ * Every request handler already sits inside one `withDbAccessContext`
+ * transaction, and a 23505 raised directly on that transaction aborts it even
+ * when caught: every follow-up statement then fails with 25P02 ("current
+ * transaction is aborted") and the handler's friendly 409 / re-select
+ * surfaces as a raw 500 at commit. That is exactly what broke every repeat
+ * "Connect" on a discovered printer in production on 2026-09-15. The
+ * savepoint contains the violation so the outer transaction stays usable
+ * (proof: dbSavepointErrorIsolation.integration.test.ts). Callers must issue
+ * the insert through `tx`, not the ambient `db` proxy, or the statement lands
+ * on the outer transaction again.
+ */
+async function insertAllowlistRuleUnlessDuplicate(
+  values: typeof tunnelAllowlists.$inferInsert,
+): Promise<typeof tunnelAllowlists.$inferSelect | undefined> {
+  try {
+    return await db.transaction(async (tx) => {
+      const [row] = await tx.insert(tunnelAllowlists).values(values).returning();
+      return row;
+    });
+  } catch (err) {
+    if (isPgUniqueViolation(err)) return undefined;
+    throw err;
+  }
+}
+
+async function getDeviceForTunnel(c: Context, deviceId: string, auth: AuthContext) {
+  const [device] = await db
+    .select()
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) return null;
+  if (!auth.canAccessOrg(device.orgId)) return null;
+
+  const permissions = c.get('permissions') as UserPermissions | undefined;
+  if (permissions?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(permissions, device.siteId))) {
+    return 'SITE_ACCESS_DENIED' as const;
+  }
+
+  return device;
+}
+
+// Site-scope is an app-layer-only authz axis (`permissions.allowedSiteIds`); RLS
+// does NOT defend it. Org-scope callers are already limited to their own tunnels
+// by the userId filter, but PARTNER-scope callers with `allowedSiteIds` set would
+// otherwise see/read every org tunnel session regardless of site. These helpers
+// resolve device sites so the list can be narrowed and the detail can 403.
+async function resolveSiteAllowedDeviceIds(orgIds: string[], perms: UserPermissions | undefined): Promise<string[] | null> {
+  if (!perms?.allowedSiteIds) return null;
+  if (orgIds.length === 0) return [];
+  const orgDevices = await db
+    .select({ id: devices.id, siteId: devices.siteId })
+    .from(devices)
+    .where(orgIds.length === 1 ? eq(devices.orgId, orgIds[0]!) : inArray(devices.orgId, orgIds));
+  return orgDevices.filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId)).map((d) => d.id);
+}
+
+async function isTunnelDeviceSiteDenied(deviceId: string, perms: UserPermissions | undefined): Promise<boolean> {
+  if (!perms?.allowedSiteIds) return false;
+  const [device] = await db
+    .select({ siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+  return !device || typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId);
+}
+
+// Confirm a siteId belongs to the resolved org before it is stored on an
+// allowlist rule. Mirrors the site-belongs-to-org checks in networkBaselines.ts
+// / groups.ts. RLS does NOT defend the site axis, so an unchecked body.siteId
+// could otherwise scope (or mask) a rule against an arbitrary site uuid.
+async function siteBelongsToOrg(siteId: string, orgId: string): Promise<boolean> {
+  const [site] = await db
+    .select({ id: sites.id })
+    .from(sites)
+    .where(and(eq(sites.id, siteId), eq(sites.orgId, orgId)))
+    .limit(1);
+  return !!site;
+}
+
+function canManageAllowlistAtSite(perms: UserPermissions | undefined, siteId: string | null): boolean {
+  if (!perms?.allowedSiteIds) return true;
+  return siteId !== null && canAccessSite(perms, siteId);
+}
+
+// Write an audit_logs row for a mutating tunnel action. Mirrors the
+// logSessionAudit helper in remote/helpers.ts:
+//   1. Runs OUTSIDE the caller's request transaction (runOutsideDbContext →
+//      withSystemDbAccessContext) so an audit-write failure can't abort and
+//      silently roll back the caller's real work, and so RLS is satisfied on
+//      paths (viewer-token downgrade) that establish no DB context of their own.
+//   2. Failures escalate to Sentry (captureException) rather than being
+//      swallowed to stdout, and never break the primary operation.
+async function logTunnelAudit(
+  action: string,
+  resourceType: 'tunnel_session' | 'tunnel_allowlist',
+  resourceId: string,
+  actorId: string,
+  orgId: string,
+  details: Record<string, unknown>,
+  ipAddress?: string,
+) {
+  try {
+    await runOutsideDbContext(() =>
+      withSystemDbAccessContext(async () => {
+        await db.insert(auditLogs).values({
+          orgId,
+          actorType: 'user',
+          actorId,
+          action,
+          resourceType,
+          resourceId,
+          details,
+          ipAddress,
+          result: 'success',
+        });
+      })
+    );
+  } catch (error) {
+    console.error('Failed to log tunnel audit:', error);
+    captureException(error);
+  }
+}
+
+// --- Routes ---
+
+// POST /tunnels — Create a new tunnel session
+tunnelRoutes.post(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requirePermission(PERMISSIONS.REMOTE_ACCESS.resource, PERMISSIONS.REMOTE_ACCESS.action),
+  requireMfa(),
+  zValidator('json', createTunnelSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const body = c.req.valid('json');
+    const sourceIp = getClientIp(c);
+
+    const device = await getDeviceForTunnel(c, body.deviceId, auth);
+    if (device === 'SITE_ACCESS_DENIED') {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if (!device) {
+      return c.json({ error: 'Device not found or access denied' }, 404);
+    }
+
+    if (device.status !== 'online') {
+      return c.json({ error: 'Device is not online' }, 400);
+    }
+
+    if (!device.agentId || !isAgentConnected(device.agentId)) {
+      return c.json({ error: 'Agent is not connected' }, 400);
+    }
+
+    // Remote access policy enforcement
+    const tunnelCapability = body.type === 'vnc' ? 'vncRelay' as const : 'proxy' as const;
+    const policyCheck = await checkRemoteAccess(body.deviceId, tunnelCapability);
+    if (!policyCheck.allowed) {
+      return c.json({
+        error: policyCheck.reason,
+        code: 'REMOTE_ACCESS_POLICY_DENIED',
+        capability: tunnelCapability,
+        policyName: policyCheck.policyName,
+      }, 403);
+    }
+
+    const isVNC = body.type === 'vnc';
+    const targetHost = isVNC ? '127.0.0.1' : body.targetHost;
+    const targetPort = isVNC ? 5900 : body.targetPort;
+
+    // Resolve scheme (explicit, else infer from port) and normalize the skip
+    // flag: it is only meaningful for https — forced false otherwise.
+    const scheme = isVNC
+      ? null
+      : (body.scheme ?? (targetPort === 443 ? 'https' : 'http'));
+    const skipTlsVerify =
+      !isVNC && scheme === 'https' ? (body.skipTlsVerify ?? false) : false;
+
+    // Source IP check
+    if (!(await isSourceIpAllowed(sourceIp, device.orgId, device.siteId ?? null))) {
+      return c.json({ error: 'Source IP not permitted' }, 403);
+    }
+
+    // Destination check (skip for VNC — always localhost:5900)
+    if (!isVNC) {
+      const blockResult = isTargetBlocked(targetHost, targetPort, false);
+      if (blockResult.blocked) {
+        return c.json({ error: `Target blocked: ${blockResult.reason}` }, 403);
+      }
+
+      if (!(await isTargetAllowed(targetHost, targetPort, device.orgId, device.siteId ?? null))) {
+        return c.json({ error: 'Target not permitted by allowlist. Add a destination rule first.' }, 403);
+      }
+    }
+
+    // Create session record
+    let session: typeof tunnelSessions.$inferSelect;
+    try {
+      session = await createRemoteSession('tunnel', {
+        deviceId: device.id,
+        userId: auth.user.id,
+        orgId: device.orgId,
+        type: body.type,
+        status: 'pending',
+        targetHost,
+        targetPort,
+        scheme,
+        skipTlsVerify,
+        sourceIp: sourceIp,
+      });
+    } catch (e) {
+      if (e instanceof RemoteSessionDeniedError) {
+        return c.json(trustDenyBody({ allow: false, code: e.code, capability: 'remote_control', reason: e.reason }, false), 403);
+      }
+      throw e;
+    }
+
+    // Send tunnel_open command to agent — skipped for proxy tunnels. The raw
+    // TCP socket it opens is unused on the HTTP-proxy path (tunnelHttp.ts
+    // dispatches its own per-request http_request commands), and the agent's
+    // 5-minute idle reap on that socket was one of two independent mechanisms
+    // that killed proxy sessions early (the other was the cookie TTL, now
+    // owned by tunnelHttp.ts's sliding refresh + 12h absolute cap).
+    if (body.type !== 'proxy') {
+      const allowlistPatterns = isVNC ? [] : await getActiveAllowlistPatterns(device.orgId, device.siteId ?? null);
+      const sent = sendCommandToAgent(device.agentId!, {
+        id: `tun-open-${session!.id}`,
+        type: 'tunnel_open',
+        payload: {
+          tunnelId: session!.id,
+          targetHost,
+          targetPort,
+          tunnelType: body.type,
+          allowlistRules: allowlistPatterns,
+        },
+      });
+      if (!sent) {
+        await db.update(tunnelSessions)
+          .set({ status: 'failed', errorMessage: 'Agent disconnected before tunnel could be opened', endedAt: new Date() })
+          .where(eq(tunnelSessions.id, session!.id));
+        return c.json({ error: 'Agent disconnected before tunnel could be opened' }, 503);
+      }
+    }
+
+    await logTunnelAudit(
+      'tunnel.open',
+      'tunnel_session',
+      session!.id,
+      auth.user.id,
+      device.orgId,
+      { deviceId: device.id, type: body.type, targetHost, targetPort, scheme, skipTlsVerify },
+      sourceIp,
+    );
+
+    return c.json(session, 201);
+  }
+);
+
+// POST /tunnels/proxy-connect — idempotent "Connect" for a discovered asset's
+// open port (design spec Architecture C). Folds the old two-step "Enable Proxy
+// Access" + "Connect" flow into one op: ensure a single-port destination
+// allowlist rule for the asset:port exists (insert-if-absent against the
+// Task-1 unique index on tunnel_allowlists), then create the proxy tunnel
+// session exactly as POST /tunnels does for type:'proxy'. Response is
+// `{tunnel}` only — no ticket; ProxyTunnelPage always mints its own on load,
+// so bundling one here would be one-time capability material minted for
+// nothing.
+tunnelRoutes.post(
+  '/proxy-connect',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requirePermission(PERMISSIONS.REMOTE_ACCESS.resource, PERMISSIONS.REMOTE_ACCESS.action),
+  requireMfa(),
+  zValidator('json', proxyConnectSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const body = c.req.valid('json');
+    const sourceIp = getClientIp(c);
+
+    const device = await getDeviceForTunnel(c, body.deviceId, auth);
+    if (device === 'SITE_ACCESS_DENIED') {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if (!device) {
+      return c.json({ error: 'Device not found or access denied' }, 404);
+    }
+
+    if (device.status !== 'online') {
+      return c.json({ error: 'Device is not online' }, 400);
+    }
+
+    if (!device.agentId || !isAgentConnected(device.agentId)) {
+      return c.json({ error: 'Agent is not connected' }, 400);
+    }
+
+    // Remote access policy enforcement (mirrors POST /tunnels).
+    const policyCheck = await checkRemoteAccess(body.deviceId, 'proxy');
+    if (!policyCheck.allowed) {
+      return c.json({
+        error: policyCheck.reason,
+        code: 'REMOTE_ACCESS_POLICY_DENIED',
+        capability: 'proxy',
+        policyName: policyCheck.policyName,
+      }, 403);
+    }
+
+    // Resolve the discovered asset, org-checked against the bridge device's
+    // org (the same boundary getDeviceForTunnel already enforced above).
+    const [asset] = await db
+      .select()
+      .from(discoveredAssets)
+      .where(and(eq(discoveredAssets.id, body.discoveredAssetId), eq(discoveredAssets.orgId, device.orgId)))
+      .limit(1);
+    if (!asset) {
+      return c.json({ error: 'Discovered asset not found or access denied' }, 404);
+    }
+
+    if (!canManageAllowlistAtSite(perms, asset.siteId ?? null)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+    if ((asset.siteId ?? null) !== (device.siteId ?? null)) {
+      return c.json({ error: 'Discovered asset is not at the bridge device site' }, 403);
+    }
+
+    // #5213: ip_address is nullable now (manual website / DNS-only assets).
+    // String(null) is the literal "null", which would sail past isTargetBlocked
+    // below and reach the agent as a garbage target rather than failing loudly.
+    if (!asset.ipAddress) {
+      return c.json({ error: 'This asset has no IP address; a tunnel needs one' }, 400);
+    }
+    const ip = String(asset.ipAddress);
+    const siteId = asset.siteId;
+
+    // Source IP + blocked-CIDR checks mirror POST /tunnels' non-VNC path.
+    if (!(await isSourceIpAllowed(sourceIp, device.orgId, device.siteId ?? null))) {
+      return c.json({ error: 'Source IP not permitted' }, 403);
+    }
+
+    const blockResult = isTargetBlocked(ip, body.port, false);
+    if (blockResult.blocked) {
+      return c.json({ error: `Target blocked: ${blockResult.reason}` }, 403);
+    }
+
+    // Ensure a single-port destination rule for this asset:port. Look the rule
+    // up first — a repeat Connect (the common case) must not raise at all —
+    // then insert inside a savepoint so a concurrent first-Connect losing the
+    // race is contained instead of aborting the request transaction, and
+    // re-select the winner's row by the same key (index: org_id, direction,
+    // pattern, COALESCE(site_id, nil) — exactly one match). Sidesteps fighting
+    // Drizzle's .onConflict API against an expression index.
+    const pattern = `${ip}/32:${body.port}`;
+    const ruleKey = and(
+      eq(tunnelAllowlists.orgId, device.orgId),
+      eq(tunnelAllowlists.direction, 'destination'),
+      eq(tunnelAllowlists.pattern, pattern),
+      siteId ? eq(tunnelAllowlists.siteId, siteId) : isNull(tunnelAllowlists.siteId),
+    );
+    const findRule = async () => {
+      const [existing] = await db.select().from(tunnelAllowlists).where(ruleKey).limit(1);
+      return existing;
+    };
+
+    let rule = await findRule();
+    let ruleCreated = false;
+    if (!rule) {
+      rule = await insertAllowlistRuleUnlessDuplicate({
+        orgId: device.orgId,
+        siteId: siteId || null,
+        direction: 'destination',
+        pattern,
+        source: 'discovery',
+        discoveredAssetId: asset.id,
+        createdBy: auth.user.id,
+      });
+      ruleCreated = rule !== undefined;
+      if (!rule) rule = await findRule();
+    }
+
+    if (!rule) {
+      // Unreachable in practice — a unique-violation guarantees a matching row
+      // under the same key. Guard against a null deref if it somehow isn't.
+      return c.json({ error: 'Failed to resolve allowlist rule' }, 500);
+    }
+
+    // An admin explicitly disabled this target — Connect must never silently
+    // re-enable it.
+    if (!rule.enabled) {
+      return c.json({
+        error: 'This target has been disabled by an administrator',
+        code: 'PROXY_TARGET_DISABLED',
+      }, 403);
+    }
+
+    if (ruleCreated) {
+      await logTunnelAudit(
+        'tunnel.allowlist.create',
+        'tunnel_allowlist',
+        rule.id,
+        auth.user.id,
+        device.orgId,
+        { direction: 'destination', pattern, siteId: siteId || null, discoveredAssetId: asset.id, via: 'proxy_connect' },
+        sourceIp,
+      );
+    }
+
+    // skipTlsVerify is only meaningful for https (mirrors POST /tunnels).
+    const skipTlsVerify = body.scheme === 'https' ? body.skipTlsVerify : false;
+
+    // Create session record — same row shape as the proxy branch of
+    // POST /tunnels. tunnel_open is never sent for type:'proxy' (see above):
+    // the raw TCP socket it opens is unused on the HTTP-proxy path.
+    let session: typeof tunnelSessions.$inferSelect;
+    try {
+      session = await createRemoteSession('tunnel', {
+        deviceId: device.id,
+        userId: auth.user.id,
+        orgId: device.orgId,
+        type: 'proxy',
+        status: 'pending',
+        targetHost: ip,
+        targetPort: body.port,
+        scheme: body.scheme,
+        skipTlsVerify,
+        sourceIp,
+      });
+    } catch (e) {
+      if (e instanceof RemoteSessionDeniedError) {
+        return c.json(trustDenyBody({ allow: false, code: e.code, capability: 'remote_control', reason: e.reason }, false), 403);
+      }
+      throw e;
+    }
+
+    await logTunnelAudit(
+      'tunnel.open',
+      'tunnel_session',
+      session!.id,
+      auth.user.id,
+      device.orgId,
+      {
+        deviceId: device.id,
+        type: 'proxy',
+        targetHost: ip,
+        targetPort: body.port,
+        scheme: body.scheme,
+        skipTlsVerify,
+        via: 'proxy_connect',
+        discoveredAssetId: asset.id,
+      },
+      sourceIp,
+    );
+
+    return c.json({ tunnel: session }, 201);
+  }
+);
+
+// GET /tunnels — List tunnels (org-scoped users see only their own)
+tunnelRoutes.get(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` (only requirePermission sets it, not authMiddleware/
+  // requireScope) so the site narrowing below is live. DEVICES_READ is granted to
+  // every device-viewing role, so this adds no lockout.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const status = c.req.query('status');
+
+    const conditions: ReturnType<typeof eq>[] = [];
+    if (auth.orgId) {
+      conditions.push(eq(tunnelSessions.orgId, auth.orgId));
+    }
+    // Org-scope users can only see their own tunnels.
+    // Partner/system admins can see all tunnels in the org.
+    if (auth.scope === 'organization') {
+      conditions.push(eq(tunnelSessions.userId, auth.user.id));
+    }
+    // Site-scope (app-layer-only authz axis) narrowing. The userId filter above
+    // already bounds org-scope callers, but partner-scope callers with
+    // `allowedSiteIds` set would otherwise see every org tunnel session.
+    if (perms?.allowedSiteIds) {
+      const orgPool = auth.orgId ? [auth.orgId] : (auth.accessibleOrgIds ?? []);
+      const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgPool, perms);
+      if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
+        return c.json([]);
+      }
+      conditions.push(inArray(tunnelSessions.deviceId, allowedDeviceIds));
+    }
+    // Lazy expiry: flip stale proxy rows to `disconnected` before reading.
+    // Scoped to the SAME caller-visibility conditions built above (org/user/
+    // site — never broadened) and deliberately NOT the `?status=` filter below
+    // (that only narrows what's returned, it must not narrow what gets swept).
+    // With `tunnel_open` skipped for proxy tunnels (see POST /tunnels), nothing
+    // else ever reaps these rows:
+    //   (a) `active` rows idle >10min past their last bumped `lastActivityAt`;
+    //   (b) abandoned `pending` rows >10min old that never got a
+    //       `lastActivityAt` at all (the ticket->cookie exchange never
+    //       happened, so without this they'd stay "connectable" forever).
+    const now = new Date();
+    const staleCutoff = new Date(now.getTime() - PROXY_IDLE_EXPIRY_MS);
+    await db
+      .update(tunnelSessions)
+      .set({ status: 'disconnected', endedAt: now })
+      .where(and(
+        ...conditions,
+        eq(tunnelSessions.type, 'proxy'),
+        or(
+          and(eq(tunnelSessions.status, 'active'), lt(tunnelSessions.lastActivityAt, staleCutoff)),
+          and(
+            eq(tunnelSessions.status, 'pending'),
+            lt(tunnelSessions.createdAt, staleCutoff),
+            isNull(tunnelSessions.lastActivityAt),
+          ),
+        )!,
+      ));
+
+    if (status) {
+      const validStatuses = ['pending', 'connecting', 'active', 'disconnected', 'failed'] as const;
+      if (validStatuses.includes(status as any)) {
+        conditions.push(eq(tunnelSessions.status, status as any));
+      }
+    }
+
+    // Join `devices` for the bridge device's siteId — tunnel_sessions has no
+    // siteId column of its own (OrgRemoteAccessSettings groups rows by site).
+    const rows = await db
+      .select({ session: tunnelSessions, siteId: devices.siteId })
+      .from(tunnelSessions)
+      .leftJoin(devices, eq(tunnelSessions.deviceId, devices.id))
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(desc(tunnelSessions.createdAt))
+      .limit(100);
+
+    // Server-computed idle time, never raw timestamps: the client must not
+    // diff a server timestamp against its own clock (clock-skew review finding).
+    const result = rows.map(({ session, siteId }) => {
+      const lastActive = session.lastActivityAt ?? session.createdAt;
+      const idleSeconds = Math.max(0, Math.floor((now.getTime() - new Date(lastActive).getTime()) / 1000));
+      return { ...session, siteId: siteId ?? null, idleSeconds };
+    });
+
+    return c.json(result);
+  }
+);
+
+// --- Allowlist routes (must come BEFORE /:id routes for route matching) ---
+
+// GET /tunnels/allowlist — List allowlist rules for the org
+tunnelRoutes.get(
+  '/allowlist',
+  requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` so the site narrowing below is live (only
+  // requirePermission sets it). DEVICES_READ is granted to every device-viewing role.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('query', listQuerySchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const orgResult = resolveOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+
+    const { siteId } = c.req.valid('query');
+    const conditions: ReturnType<typeof eq>[] = [eq(tunnelAllowlists.orgId, orgId)];
+    if (siteId) {
+      if (perms?.allowedSiteIds && !canAccessSite(perms, siteId)) {
+        return c.json({ error: 'Access to this site denied' }, 403);
+      }
+      conditions.push(eq(tunnelAllowlists.siteId, siteId));
+    } else if (perms?.allowedSiteIds) {
+      conditions.push(or(
+        isNull(tunnelAllowlists.siteId),
+        inArray(tunnelAllowlists.siteId, perms.allowedSiteIds)
+      )! as ReturnType<typeof eq>);
+    }
+
+    const rules = await db
+      .select()
+      .from(tunnelAllowlists)
+      .where(and(...conditions))
+      .orderBy(desc(tunnelAllowlists.createdAt));
+
+    return c.json(rules);
+  }
+);
+
+// POST /tunnels/allowlist — Add an allowlist rule
+tunnelRoutes.post(
+  '/allowlist',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requireMfa(),
+  zValidator('json', allowlistRuleSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const orgResult = resolveOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+
+    const body = c.req.valid('json');
+
+    if (!canManageAllowlistAtSite(perms, body.siteId ?? null)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    // A body.siteId is an arbitrary uuid until proven to belong to the resolved
+    // org — RLS does not defend the site axis. Reject cross-org site ids.
+    if (body.siteId && !(await siteBelongsToOrg(body.siteId, orgId))) {
+      return c.json({ error: 'Site not found for this organization' }, 404);
+    }
+
+    // The expression unique index on (orgId, direction, pattern, siteId)
+    // raises 23505 on a duplicate rule — map it to a clear 409 instead of
+    // letting it bubble as a raw 500. The insert is savepointed so the caught
+    // violation cannot abort the request transaction (see the helper).
+    const rule = await insertAllowlistRuleUnlessDuplicate({
+      orgId,
+      siteId: body.siteId || null,
+      direction: body.direction,
+      pattern: body.pattern,
+      description: body.description || null,
+      source: body.source || 'manual',
+      discoveredAssetId: body.discoveredAssetId || null,
+      createdBy: auth.user.id,
+    });
+    if (!rule) {
+      return c.json({ error: 'An identical allowlist rule already exists for this organization' }, 409);
+    }
+
+    await logTunnelAudit(
+      'tunnel.allowlist.create',
+      'tunnel_allowlist',
+      rule.id,
+      auth.user.id,
+      orgId,
+      { direction: body.direction, pattern: body.pattern, siteId: body.siteId || null },
+      getClientIp(c),
+    );
+
+    return c.json(rule, 201);
+  }
+);
+
+// PUT /tunnels/allowlist/:id — Update a rule
+tunnelRoutes.put(
+  '/allowlist/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requireMfa(),
+  zValidator('param', allowlistIdParamSchema),
+  zValidator('json', updateAllowlistSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const { id } = c.req.valid('param');
+    const orgResult = resolveOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+
+    const body = c.req.valid('json');
+
+    const [existing] = await db
+      .select()
+      .from(tunnelAllowlists)
+      .where(and(eq(tunnelAllowlists.id, id), eq(tunnelAllowlists.orgId, orgId)))
+      .limit(1);
+
+    if (!existing) {
+      return c.json({ error: 'Rule not found' }, 404);
+    }
+    if (!canManageAllowlistAtSite(perms, existing.siteId ?? null)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    const updates: Record<string, any> = { updatedAt: new Date() };
+    if (body.pattern !== undefined) updates.pattern = body.pattern;
+    if (body.description !== undefined) updates.description = body.description;
+    if (body.enabled !== undefined) updates.enabled = body.enabled;
+
+    const [updated] = await db
+      .update(tunnelAllowlists)
+      .set(updates)
+      .where(and(eq(tunnelAllowlists.id, id), eq(tunnelAllowlists.orgId, orgId)))
+      .returning();
+
+    await logTunnelAudit(
+      'tunnel.allowlist.update',
+      'tunnel_allowlist',
+      id,
+      auth.user.id,
+      orgId,
+      {
+        direction: existing.direction,
+        siteId: existing.siteId,
+        before: { pattern: existing.pattern, description: existing.description, enabled: existing.enabled },
+        after: { pattern: updated?.pattern, description: updated?.description, enabled: updated?.enabled },
+      },
+      getClientIp(c),
+    );
+
+    return c.json(updated);
+  }
+);
+
+// DELETE /tunnels/allowlist/:id — Remove a rule
+tunnelRoutes.delete(
+  '/allowlist/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requireMfa(),
+  zValidator('param', allowlistIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const { id } = c.req.valid('param');
+    const orgResult = resolveOrgId(auth, c.req.query('orgId'));
+    if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
+    const orgId = orgResult.orgId;
+
+    const [existing] = await db
+      .select()
+      .from(tunnelAllowlists)
+      .where(and(eq(tunnelAllowlists.id, id), eq(tunnelAllowlists.orgId, orgId)))
+      .limit(1);
+
+    if (!existing) {
+      return c.json({ error: 'Rule not found' }, 404);
+    }
+    if (!canManageAllowlistAtSite(perms, existing.siteId ?? null)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    await db
+      .delete(tunnelAllowlists)
+      .where(and(eq(tunnelAllowlists.id, id), eq(tunnelAllowlists.orgId, orgId)));
+
+    await logTunnelAudit(
+      'tunnel.allowlist.delete',
+      'tunnel_allowlist',
+      id,
+      auth.user.id,
+      orgId,
+      { direction: existing.direction, pattern: existing.pattern, siteId: existing.siteId },
+      getClientIp(c),
+    );
+
+    return c.json({ deleted: true });
+  }
+);
+
+// --- Parameterized tunnel routes ---
+
+// GET /tunnels/:id — Get tunnel details (ownership enforced)
+tunnelRoutes.get(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  // Populates `permissions` so the site-scope re-enforcement below is live (a
+  // site-restricted org user must not read a colleague's tunnel to an out-of-site
+  // device). DEVICES_READ is granted to every device-viewing role.
+  requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action),
+  zValidator('param', idParamSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const { id } = c.req.valid('param');
+
+    const conditions = [eq(tunnelSessions.id, id)];
+    if (auth.orgId) {
+      conditions.push(eq(tunnelSessions.orgId, auth.orgId));
+    }
+    if (auth.scope === 'organization') {
+      conditions.push(eq(tunnelSessions.userId, auth.user.id));
+    }
+
+    const [session] = await db
+      .select()
+      .from(tunnelSessions)
+      .where(and(...conditions))
+      .limit(1);
+
+    if (!session) {
+      return c.json({ error: 'Tunnel session not found' }, 404);
+    }
+
+    // Lazy expiry on read (mirrors GET /tunnels — see PROXY_IDLE_EXPIRY_MS
+    // above): with `tunnel_open` skipped for proxy tunnels, ProxyTunnelPage's
+    // 5s poll of THIS route is the only thing that ever observes a stale row,
+    // so it must do the same flip the list route does rather than serve a
+    // row that reads "active"/"pending" forever.
+    const now = new Date();
+    if (session.type === 'proxy') {
+      const staleCutoff = new Date(now.getTime() - PROXY_IDLE_EXPIRY_MS);
+      const isStaleActive =
+        session.status === 'active' &&
+        session.lastActivityAt != null &&
+        new Date(session.lastActivityAt) < staleCutoff;
+      const isAbandonedPending =
+        session.status === 'pending' &&
+        session.lastActivityAt == null &&
+        new Date(session.createdAt) < staleCutoff;
+      if (isStaleActive || isAbandonedPending) {
+        await db
+          .update(tunnelSessions)
+          .set({ status: 'disconnected', endedAt: now })
+          .where(eq(tunnelSessions.id, session.id));
+        session.status = 'disconnected';
+        session.endedAt = now;
+      }
+    }
+
+    // Site-scope (app-layer-only) re-enforcement: deny when the session's device
+    // sits outside the caller's allowed sites. Fail closed on null siteId.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (await isTunnelDeviceSiteDenied(session.deviceId, perms)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    // Server-computed idle time, never raw timestamps (same rule as GET
+    // /tunnels — the client must not diff a server timestamp against its own
+    // clock).
+    const lastActive = session.lastActivityAt ?? session.createdAt;
+    const idleSeconds = Math.max(0, Math.floor((now.getTime() - new Date(lastActive).getTime()) / 1000));
+
+    return c.json({ ...session, idleSeconds });
+  }
+);
+
+// DELETE /tunnels/:id — Close a tunnel (ownership enforced)
+tunnelRoutes.delete(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  zValidator('param', idParamSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const { id } = c.req.valid('param');
+
+    const conditions = [eq(tunnelSessions.id, id)];
+    if (auth.orgId) {
+      conditions.push(eq(tunnelSessions.orgId, auth.orgId));
+    }
+    if (auth.scope === 'organization') {
+      conditions.push(eq(tunnelSessions.userId, auth.user.id));
+    }
+
+    const [session] = await db
+      .select()
+      .from(tunnelSessions)
+      .where(and(...conditions))
+      .limit(1);
+
+    if (!session) {
+      return c.json({ error: 'Tunnel session not found' }, 404);
+    }
+
+    // Get device to find agent
+    const [device] = await db
+      .select()
+      .from(devices)
+      .where(eq(devices.id, session.deviceId))
+      .limit(1);
+
+    if (device?.agentId && isAgentConnected(device.agentId)) {
+      sendCommandToAgent(device.agentId, {
+        id: `tun-close-${Date.now()}`,
+        type: 'tunnel_close',
+        payload: { tunnelId: id },
+      });
+    }
+
+    await db
+      .update(tunnelSessions)
+      .set({ status: 'disconnected', endedAt: new Date() })
+      .where(eq(tunnelSessions.id, id));
+
+    // Revoke any viewer JWTs minted for this tunnel. The service logs if Redis
+    // is unavailable; the check path (requireViewerToken) fails closed.
+    await revokeViewerSession(id);
+
+    await logTunnelAudit(
+      'tunnel.close',
+      'tunnel_session',
+      id,
+      auth.user.id,
+      session.orgId,
+      // Record the CLOSED session's owner so a partner/system teardown of
+      // someone else's tunnel is attributable to both actor and owner.
+      { deviceId: session.deviceId, type: session.type, sessionUserId: session.userId },
+      getClientIp(c),
+    );
+
+    return c.json({ closed: true });
+  }
+);
+
+// POST /tunnels/:id/ws-ticket — Issue a one-time WebSocket ticket
+tunnelRoutes.post(
+  '/:id/ws-ticket',
+  requireScope('organization', 'partner', 'system'),
+  requireMfa(),
+  zValidator('param', idParamSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const { id } = c.req.valid('param');
+
+    const conditions = [eq(tunnelSessions.id, id)];
+    if (auth.orgId) {
+      conditions.push(eq(tunnelSessions.orgId, auth.orgId));
+    }
+
+    const [session] = await db
+      .select()
+      .from(tunnelSessions)
+      .where(and(...conditions))
+      .limit(1);
+
+    if (!session) {
+      return c.json({ error: 'Tunnel session not found' }, 404);
+    }
+
+    if (session.userId !== auth.user.id) {
+      return c.json({ error: 'Not the session owner' }, 403);
+    }
+
+    if (!CONNECTABLE_TUNNEL_STATUSES.includes(session.status as (typeof CONNECTABLE_TUNNEL_STATUSES)[number])) {
+      return c.json({
+        error: 'Cannot mint WebSocket ticket for tunnel in current state',
+        status: session.status,
+      }, 400);
+    }
+
+    const liveAuthority = await authorizeTunnelContinuation(id, auth.user.id);
+    if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+
+    const trustDenial = await tunnelTicketTrustDenyBody(session.deviceId, auth.user.id);
+    if (trustDenial) return c.json(trustDenial, 403);
+
+    const ticket = await createWsTicket({
+      sessionId: id,
+      sessionType: 'tunnel',
+      userId: auth.user.id,
+      mfaSatisfied: true,
+      // Task 16: bind to issuer's trusted IP + UA.
+      ip: getTrustedClientIp(c),
+      userAgent: c.req.header('user-agent') ?? '',
+    });
+
+    await logTunnelAudit(
+      'tunnel.ws_ticket.mint',
+      'tunnel_session',
+      id,
+      auth.user.id,
+      session.orgId,
+      { deviceId: session.deviceId, type: session.type },
+      getClientIp(c),
+    );
+
+    return c.json({ ticket });
+  }
+);
+
+// POST /tunnels/:id/http-ticket — Issue a one-time HTTP proxy ticket (5-min TTL for proxy page load)
+tunnelRoutes.post(
+  '/:id/http-ticket',
+  requireScope('organization', 'partner', 'system'),
+  requireMfa(),
+  zValidator('param', idParamSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const { id } = c.req.valid('param');
+
+    const conditions = [eq(tunnelSessions.id, id)];
+    if (auth.orgId) {
+      conditions.push(eq(tunnelSessions.orgId, auth.orgId));
+    }
+
+    const [session] = await db
+      .select()
+      .from(tunnelSessions)
+      .where(and(...conditions))
+      .limit(1);
+
+    if (!session) {
+      return c.json({ error: 'Tunnel session not found' }, 404);
+    }
+
+    if (session.userId !== auth.user.id) {
+      return c.json({ error: 'Not the session owner' }, 403);
+    }
+
+    // Absolute 12h cap (spec A.3-3) — reject minting a fresh ticket for a
+    // session past its lifetime even if its status still reads connectable.
+    // tunnelHttp.ts enforces the same cap per-request on the proxied path and
+    // writes the row terminal there; this is the mint-time backstop.
+    if (Date.now() - new Date(session.createdAt).getTime() > HTTP_TUNNEL_MAX_SESSION_MS) {
+      return c.json({ error: 'session_expired' }, 410);
+    }
+
+    if (!CONNECTABLE_TUNNEL_STATUSES.includes(session.status as (typeof CONNECTABLE_TUNNEL_STATUSES)[number])) {
+      return c.json({
+        error: 'Cannot mint HTTP ticket for tunnel in current state',
+        status: session.status,
+      }, 400);
+    }
+
+    const liveAuthority = await authorizeTunnelContinuation(id, auth.user.id);
+    if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+
+    const trustDenial = await tunnelTicketTrustDenyBody(session.deviceId, auth.user.id);
+    if (trustDenial) return c.json(trustDenial, 403);
+
+    const ticket = await createWsTicket({
+      sessionId: id,
+      sessionType: 'tunnel-http',
+      userId: auth.user.id,
+      mfaSatisfied: true,
+      ip: getTrustedClientIp(c),
+      userAgent: c.req.header('user-agent') ?? '',
+      ttlMs: HTTP_TICKET_TTL_MS,
+    });
+
+    await logTunnelAudit(
+      'tunnel.http_ticket.mint',
+      'tunnel_session',
+      id,
+      auth.user.id,
+      session.orgId,
+      { deviceId: session.deviceId, type: session.type },
+      getClientIp(c),
+    );
+
+    return c.json({ ticket });
+  }
+);
+
+// POST /tunnels/:id/connect-code — Issue a short-lived VNC connect code (keeps JWT out of deep links)
+tunnelRoutes.post(
+  '/:id/connect-code',
+  requireScope('organization', 'partner', 'system'),
+  requireMfa(),
+  zValidator('param', idParamSchema),
+  async (c) => {
+    const auth = c.get('auth') as AuthContext;
+    const { id } = c.req.valid('param');
+
+    const conditions = [eq(tunnelSessions.id, id)];
+    if (auth.orgId) {
+      conditions.push(eq(tunnelSessions.orgId, auth.orgId));
+    }
+    if (auth.scope === 'organization') {
+      conditions.push(eq(tunnelSessions.userId, auth.user.id));
+    }
+
+    const [session] = await db
+      .select()
+      .from(tunnelSessions)
+      .where(and(...conditions))
+      .limit(1);
+
+    if (!session) {
+      return c.json({ error: 'Tunnel session not found' }, 404);
+    }
+
+    if (session.type !== 'vnc') {
+      return c.json({ error: 'Connect code only supported for VNC tunnels' }, 400);
+    }
+
+    if (session.userId !== auth.user.id) {
+      return c.json({ error: 'Not the session owner' }, 403);
+    }
+
+    if (!CONNECTABLE_TUNNEL_STATUSES.includes(session.status as (typeof CONNECTABLE_TUNNEL_STATUSES)[number])) {
+      return c.json({
+        error: 'Cannot mint VNC connect code for tunnel in current state',
+        status: session.status,
+      }, 400);
+    }
+
+    const liveAuthority = await authorizeTunnelContinuation(id, auth.user.id);
+    if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+
+    const trustDenial = await tunnelTicketTrustDenyBody(session.deviceId, auth.user.id);
+    if (trustDenial) return c.json(trustDenial, 403);
+
+    try {
+      const result = await createVncConnectCode({
+        tunnelId: session.id,
+        deviceId: session.deviceId,
+        orgId: session.orgId,
+        userId: auth.user.id,
+        email: auth.user.email,
+      });
+      await logTunnelAudit(
+        'tunnel.connect_code.mint',
+        'tunnel_session',
+        session.id,
+        auth.user.id,
+        session.orgId,
+        { deviceId: session.deviceId, type: session.type },
+        getClientIp(c),
+      );
+      return c.json(result);
+    } catch (err) {
+      console.error('[tunnels] Failed to create VNC connect code:', err instanceof Error ? err.message : err);
+      return c.json({ error: 'Unable to create VNC connect code. Please try again later.' }, 503);
+    }
+  }
+);
+
+// --- VNC exchange route (no auth — the code IS the auth) ---
+
+export const vncExchangeRoutes = new Hono();
+
+const vncExchangeSchema = z.object({
+  code: z.string().min(1),
+});
+
+// POST /vnc-exchange/:code — Redeem a short-lived VNC connect code for credentials + tunnel info.
+// No bearer auth: the one-time code proves identity. Fail-closed per-IP rate limit applied in-handler.
+vncExchangeRoutes.post(
+  '/:code',
+  async (c) => {
+    const ip = getTrustedClientIp(c, 'unknown');
+    const rate = await rateLimiter(
+      getRedis(),
+      `vnc-exchange:${rateLimitIpKey(ip)}`,
+      VNC_EXCHANGE_RATE_LIMIT,
+      VNC_EXCHANGE_RATE_WINDOW_SECONDS,
+    );
+    if (!rate.allowed) {
+      c.header('Retry-After', String(Math.ceil((rate.resetAt.getTime() - Date.now()) / 1000)));
+      return c.json({ error: 'Too Many Requests' }, 429);
+    }
+
+    const code = c.req.param('code')!;
+
+    const record = await consumeVncConnectCode(code);
+    if (!record) {
+      return c.json({ error: 'Invalid or expired VNC connect code' }, 404);
+    }
+
+    // Fetch tunnel info and build ws-ticket in system context (no RLS context from bearer token).
+    const result = await withSystemDbAccessContext(async () => {
+      const [session] = await db
+        .select()
+        .from(tunnelSessions)
+        .where(eq(tunnelSessions.id, record.tunnelId))
+        .limit(1);
+      return session;
+    });
+
+    if (!result) {
+      return c.json({ error: 'Tunnel session not found' }, 404);
+    }
+
+    if (result.userId !== record.userId) {
+      // Ownership mismatch — should never happen if code was minted correctly
+      return c.json({ error: 'Invalid or expired VNC connect code' }, 404);
+    }
+
+    if (result.type !== 'vnc') {
+      return c.json({ error: 'VNC connect code is not bound to a VNC tunnel' }, 400);
+    }
+
+    if (!CONNECTABLE_TUNNEL_STATUSES.includes(result.status as (typeof CONNECTABLE_TUNNEL_STATUSES)[number])) {
+      return c.json({
+        error: 'Tunnel session is not available for connection',
+        status: result.status,
+      }, 400);
+    }
+
+
+    const liveAuthority = await authorizeTunnelContinuation(record.tunnelId, record.userId);
+    if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+
+    // Build the WebSocket URL from the canonical external base URL. Using
+    // c.req.url would yield an internal http://api:3001 in Caddy-fronted
+    // deployments; honoring X-Forwarded-Proto doesn't help when Caddy itself
+    // sits behind Cloudflare (Caddy overwrites the forwarded header with its
+    // own http view). PUBLIC_APP_URL / DASHBOARD_URL is the source of truth.
+    const publicBase = (process.env.PUBLIC_APP_URL || process.env.DASHBOARD_URL || '').replace(/\/$/, '');
+    const baseUrl = publicBase ? new URL(publicBase) : new URL(c.req.url);
+    const wsProtocol = baseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsTicketResult = await createWsTicket({
+      sessionId: record.tunnelId,
+      sessionType: 'tunnel',
+      userId: record.userId,
+      mfaSatisfied: true,
+      // Task 16: bind to the exchanging viewer's IP + UA — they will
+      // open the WS within seconds from the same browser.
+      ip: getTrustedClientIp(c),
+      userAgent: c.req.header('user-agent') ?? '',
+    });
+    const wsUrl = `${wsProtocol}//${baseUrl.host}/api/v1/tunnel-ws/${record.tunnelId}/ws?ticket=${wsTicketResult.ticket}`;
+
+    const accessToken = await createViewerAccessToken({
+      sub: record.userId,
+      email: record.email,
+      sessionId: record.tunnelId,
+      mfaSatisfied: true,
+    });
+
+    // No bearer auth on this route — the one-time code IS the auth. Attribute
+    // the redemption to the code-bound owner (record.userId) so the event is
+    // traceable even without a JWT actor. logTunnelAudit already runs in system
+    // DB context (this path establishes none of its own).
+    await logTunnelAudit(
+      'tunnel.vnc_exchange.redeem',
+      'tunnel_session',
+      record.tunnelId,
+      record.userId,
+      result.orgId,
+      { deviceId: record.deviceId, type: result.type },
+      getTrustedClientIp(c, 'unknown'),
+    );
+
+    return c.json({
+      accessToken,
+      expiresInSeconds: getViewerAccessTokenExpirySeconds(),
+      tunnelId: record.tunnelId,
+      wsUrl,
+      deviceId: record.deviceId,
+    });
+  }
+);
+
+// --- Viewer-token endpoints (used by the Breeze Viewer after vnc-exchange) ---
+//
+// The viewer receives a `purpose: 'viewer'` JWT scoped to a specific tunnel
+// sessionId. It can't use the regular authMiddleware (which requires a full
+// user access token), so this router verifies viewer tokens directly and
+// enforces that the token is bound to the tunnelId being queried.
+
+export const vncViewerRoutes = new Hono();
+
+async function requireViewerToken(
+  c: Context,
+  options: {
+    requireAssuredTransition?: boolean;
+  } = {},
+): Promise<ViewerTokenPayload | Response> {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Missing or invalid authorization header' }, 401);
+  }
+  const token = authHeader.slice(7);
+  const payload = await verifyViewerAccessToken(token);
+  if (!payload || !payload.jti) {
+    return c.json({ error: 'Invalid or expired token' }, 401);
+  }
+  if (options.requireAssuredTransition && payload.mfaSatisfied !== true) {
+    return c.json({ error: 'legacy_viewer_transition_forbidden' }, 403);
+  }
+  // Check jti-level revocation (belt — individual token invalidation)
+  if (await isViewerJtiRevoked(payload.jti)) {
+    return c.json({ error: 'Token revoked' }, 401);
+  }
+  // Check session-level revocation (suspenders — stamped on tunnel close).
+  // isViewerSessionRevoked fails closed on Redis unavailability, symmetric
+  // with the jti check above.
+  if (await isViewerSessionRevoked(payload.sessionId)) {
+    return c.json({ error: 'Session closed' }, 401);
+  }
+  return payload;
+}
+
+// GET /vnc-viewer/desktop-access
+// Returns the bound device's desktopAccess mode + last_user. Used by the
+// viewer's 5s poll to detect login-window → user_session transitions so it
+// can auto-hand off from VNC to WebRTC once a user logs in.
+vncViewerRoutes.get('/desktop-access', async (c) => {
+  const result = await requireViewerToken(c);
+  if (result instanceof Response) return result;
+
+  const liveAuthority = await authorizeTunnelContinuation(result.sessionId, result.sub);
+  if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+
+  const device = await withSystemDbAccessContext(async () => {
+    const [row] = await db
+      .select({
+        desktopAccess: devices.desktopAccess,
+        lastUser: devices.lastUser,
+      })
+      .from(tunnelSessions)
+      .innerJoin(devices, eq(tunnelSessions.deviceId, devices.id))
+      .where(eq(tunnelSessions.id, result.sessionId))
+      .limit(1);
+    return row ?? null;
+  });
+
+  if (!device) {
+    return c.json({ error: 'Tunnel session not found' }, 404);
+  }
+
+  return c.json({
+    desktopAccess: device.desktopAccess,
+    lastUser: device.lastUser,
+  });
+});
+
+// POST /vnc-viewer/upgrade-to-webrtc
+// Called by the viewer when the poll above reports user_session and we want
+// to hand off from VNC to WebRTC. Creates a new `remote_sessions` row (type
+// 'desktop') for the tunnel-bound device and issues a fresh viewer access
+// token scoped to the new desktop sessionId. The viewer then uses that
+// sessionId + token to drive the standard `/desktop-ws/:sessionId/viewer/*`
+// endpoints for ICE, offer, ws-ticket, etc.
+vncViewerRoutes.post('/upgrade-to-webrtc', async (c) => {
+  const transitionSessionId = randomUUID();
+  const auth = await requireViewerToken(c, {
+    requireAssuredTransition: true,
+  });
+  if (auth instanceof Response) return auth;
+
+  const liveAuthority = await authorizeTunnelContinuation(auth.sessionId, auth.sub);
+  if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+  let accessToken: string;
+  try {
+    accessToken = await createViewerDescendantAccessToken(auth, {
+      sessionId: transitionSessionId,
+    });
+  } catch {
+    return c.json({ error: 'Invalid or expired token' }, 401);
+  }
+
+  const bound = await withSystemDbAccessContext(async () => {
+    const [row] = await db
+      .select({
+        tunnelUserId: tunnelSessions.userId,
+        tunnelOrgId: tunnelSessions.orgId,
+        deviceId: tunnelSessions.deviceId,
+        tunnelType: tunnelSessions.type,
+        tunnelStatus: tunnelSessions.status,
+        deviceStatus: devices.status,
+        agentId: devices.agentId,
+        userEmail: users.email,
+      })
+      .from(tunnelSessions)
+      .innerJoin(devices, eq(tunnelSessions.deviceId, devices.id))
+      .innerJoin(users, eq(tunnelSessions.userId, users.id))
+      .where(eq(tunnelSessions.id, auth.sessionId))
+      .limit(1);
+    return row ?? null;
+  });
+
+  if (!bound) {
+    return c.json({ error: 'Tunnel session not found' }, 404);
+  }
+  if (bound.tunnelType !== 'vnc') {
+    return c.json({ error: 'Viewer token is not bound to a VNC tunnel' }, 400);
+  }
+  if (!CONNECTABLE_TUNNEL_STATUSES.includes(bound.tunnelStatus as (typeof CONNECTABLE_TUNNEL_STATUSES)[number])) {
+    return c.json({
+      error: 'Tunnel session is not available for upgrade',
+      status: bound.tunnelStatus,
+    }, 400);
+  }
+  if (bound.deviceStatus !== 'online') {
+    return c.json({ error: 'Device is not online' }, 400);
+  }
+
+  const policyCheck = await checkRemoteAccess(bound.deviceId, 'webrtcDesktop');
+  if (!policyCheck.allowed) {
+    return c.json({ error: policyCheck.reason ?? 'WebRTC desktop access is disabled by policy' }, 403);
+  }
+
+  // Reuse the same pattern as /sessions: terminate stragglers first, insert
+  // new pending row via the partner-trust-gated service, return its id.
+  let session: typeof remoteSessions.$inferSelect;
+  let stragglers: TerminalSessionRow[] = [];
+  try {
+    ({ session, stragglers } = await withSystemDbAccessContext(async () => {
+      // Through the terminal-intent contract (SEC-038 W03), returning the rows
+      // so each straggler's stop can name its terminal generation. The stop
+      // itself is dispatched AFTER this context commits — the relay's ack wait
+      // must not pin this connection idle-in-transaction.
+      const swept = (await db
+        .update(remoteSessions)
+        .set(terminalIntentSet({ status: 'disconnected', endedAt: new Date() }, 'pending'))
+        .where(
+          and(
+            eq(remoteSessions.deviceId, bound.deviceId),
+            eq(remoteSessions.type, 'desktop'),
+            inArray(remoteSessions.status, ['pending', 'connecting', 'active'])
+          )
+        )
+        .returning(terminalSessionReturning())).map(toTerminalSessionRow);
+      const created = await createRemoteSession('remote', {
+        id: transitionSessionId,
+        deviceId: bound.deviceId,
+        orgId: bound.tunnelOrgId,
+        userId: bound.tunnelUserId,
+        type: 'desktop',
+      });
+      return { session: created as typeof remoteSessions.$inferSelect, stragglers: swept };
+    }));
+  } catch (e) {
+    if (e instanceof RemoteSessionDeniedError) {
+      return c.json(trustDenyBody({ allow: false, code: e.code, capability: 'remote_control', reason: e.reason }, false), 403);
+    }
+    throw e;
+  }
+
+  if (!session) {
+    return c.json({ error: 'Failed to create desktop session' }, 500);
+  }
+
+  // Same as POST /remote/sessions: a straggler may still be a live WebRTC
+  // stream, so revoke its viewer token and push the generation-bound stop.
+  await teardownDisconnectedSessions(stragglers);
+
+  // Viewer-token auth — no JWT actor. Attribute the upgrade to the tunnel-bound
+  // owner (the user who opened the originating VNC tunnel) so the credential
+  // mint is traceable. logTunnelAudit runs in its own system DB context.
+  await logTunnelAudit(
+    'tunnel.upgrade_webrtc',
+    'tunnel_session',
+    transitionSessionId,
+    bound.tunnelUserId,
+    bound.tunnelOrgId,
+    { deviceId: bound.deviceId, type: 'desktop', fromTunnelId: auth.sessionId },
+    getClientIp(c),
+  );
+
+  return c.json({
+    sessionId: transitionSessionId,
+    accessToken,
+    expiresInSeconds: getViewerAccessTokenExpirySeconds(),
+  });
+});
+
+// POST /vnc-viewer/downgrade-to-vnc
+// Inverse of upgrade-to-webrtc. Called when the viewer is on WebRTC and
+// receives a `desktop_state: 'loginwindow'` broadcast (user locked/logged
+// out) and wants to fall back to VNC. The viewer token is desktop-scoped
+// (sessionId = remote_sessions.id); we use it to look up the device, spin
+// up a fresh VNC tunnel, issue a ws-ticket, and hand back a new viewer
+// token scoped to the tunnel id. Mirrors POST /tunnels but for viewer-token
+// auth (which can't hit the user-JWT-gated route).
+vncViewerRoutes.post('/downgrade-to-vnc', async (c) => {
+  const transitionTunnelId = randomUUID();
+  const auth = await requireViewerToken(c, {
+    requireAssuredTransition: true,
+  });
+  if (auth instanceof Response) return auth;
+
+  const liveAuthority = await authorizeRemoteSessionContinuation(
+    { sessionId: auth.sessionId, sessionType: 'desktop', userId: auth.sub },
+    TUNNEL_CONTINUATION_PERMISSIONS,
+  );
+  if (!liveAuthority.ok) return liveAuthorizationResponse(c, liveAuthority);
+  let accessToken: string;
+  try {
+    accessToken = await createViewerDescendantAccessToken(auth, {
+      sessionId: transitionTunnelId,
+    });
+  } catch {
+    return c.json({ error: 'Invalid or expired token' }, 401);
+  }
+
+  const bound = await withSystemDbAccessContext(async () => {
+    const [row] = await db
+      .select({
+        userId: remoteSessions.userId,
+        orgId: remoteSessions.orgId,
+        deviceId: remoteSessions.deviceId,
+        deviceStatus: devices.status,
+        agentId: devices.agentId,
+        userEmail: users.email,
+      })
+      .from(remoteSessions)
+      .innerJoin(devices, eq(remoteSessions.deviceId, devices.id))
+      .innerJoin(users, eq(remoteSessions.userId, users.id))
+      .where(eq(remoteSessions.id, auth.sessionId))
+      .limit(1);
+    return row ?? null;
+  });
+
+  if (!bound) {
+    return c.json({ error: 'Desktop session not found' }, 404);
+  }
+  if (bound.deviceStatus !== 'online') {
+    return c.json({ error: 'Device is not online' }, 400);
+  }
+  if (!bound.agentId || !isAgentConnected(bound.agentId)) {
+    return c.json({ error: 'Agent is not connected' }, 400);
+  }
+
+  const policyCheck = await checkRemoteAccess(bound.deviceId, 'vncRelay');
+  if (!policyCheck.allowed) {
+    return c.json({ error: policyCheck.reason ?? 'VNC relay is disabled by policy' }, 403);
+  }
+
+  // Insert the tunnel session row, then kick the agent off.
+  const tunnel = await withSystemDbAccessContext(() => createRemoteSession('tunnel', {
+    id: transitionTunnelId,
+    deviceId: bound.deviceId,
+    userId: bound.userId,
+    orgId: bound.orgId,
+    type: 'vnc',
+    status: 'pending',
+    targetHost: '127.0.0.1',
+    targetPort: 5900,
+    sourceIp: getClientIp(c),
+  })).catch((e: unknown) => {
+    if (e instanceof RemoteSessionDeniedError) return e;
+    throw e;
+  });
+
+  if (tunnel instanceof RemoteSessionDeniedError) {
+    return c.json(trustDenyBody({ allow: false, code: tunnel.code, capability: 'remote_control', reason: tunnel.reason }, false), 403);
+  }
+
+  if (!tunnel) {
+    return c.json({ error: 'Failed to create tunnel' }, 500);
+  }
+
+  const sent = sendCommandToAgent(bound.agentId, {
+    id: `tun-open-${transitionTunnelId}`,
+    type: 'tunnel_open',
+    payload: {
+      tunnelId: transitionTunnelId,
+      targetHost: '127.0.0.1',
+      targetPort: 5900,
+      tunnelType: 'vnc',
+      allowlistRules: [],
+    },
+  });
+  if (!sent) {
+    await withSystemDbAccessContext(() =>
+      db.update(tunnelSessions)
+        .set({ status: 'failed', errorMessage: 'Agent disconnected before tunnel could be opened', endedAt: new Date() })
+        .where(eq(tunnelSessions.id, transitionTunnelId))
+    );
+    return c.json({ error: 'Agent disconnected before tunnel could be opened' }, 503);
+  }
+
+  // Build the ws-ticket + wsUrl the same way /vnc-exchange does. Ticket TTL
+  // is short (60s) — the viewer connects immediately after this call.
+  const ticket = await createWsTicket({
+    sessionId: transitionTunnelId,
+    sessionType: 'tunnel',
+    userId: bound.userId,
+    mfaSatisfied: true,
+    // Task 16: bind to the requester's IP + UA.
+    ip: getTrustedClientIp(c),
+    userAgent: c.req.header('user-agent') ?? '',
+  });
+  const publicBase = (process.env.PUBLIC_APP_URL || process.env.DASHBOARD_URL || '').replace(/\/$/, '');
+  const baseUrl = publicBase ? new URL(publicBase) : new URL(c.req.url);
+  const wsProtocol = baseUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsProtocol}//${baseUrl.host}/api/v1/tunnel-ws/${transitionTunnelId}/ws?ticket=${ticket.ticket}`;
+  // This path creates a brand-new tunnel session under viewer-token auth (no
+  // JWT actor), mirroring POST /tunnels — so emit the same tunnel.open audit,
+  // attributed to the session-bound owner. Without this the downgrade opens a
+  // tunnel with no audit trail at all.
+  await logTunnelAudit(
+    'tunnel.open',
+    'tunnel_session',
+    transitionTunnelId,
+    bound.userId,
+    bound.orgId,
+    { deviceId: bound.deviceId, type: 'vnc', via: 'downgrade_vnc', fromSessionId: auth.sessionId },
+    getClientIp(c),
+  );
+
+  return c.json({
+    tunnelId: transitionTunnelId,
+    wsUrl,
+    accessToken,
+    expiresInSeconds: getViewerAccessTokenExpirySeconds(),
+  });
+});

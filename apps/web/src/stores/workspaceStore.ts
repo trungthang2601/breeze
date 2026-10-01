@@ -1,0 +1,714 @@
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+import type { AiPageContext, AiStreamEvent, AiApprovalMode, AiTicketDraft, CreateTicketFromChatInput } from '@breeze/shared';
+import { fetchWithAuth } from './auth';
+import { extractApiError } from '@/lib/apiError';
+import { runAction } from '@/lib/runAction';
+import { showToast } from '../components/shared/Toast';
+import {
+  processStreamEvent,
+  mapMessagesFromApi,
+  type AiMessage,
+  type PendingApproval,
+  type PendingPlan,
+  type ActivePlan,
+  type ChatRunState,
+} from './processStreamEvent';
+
+const MAX_TABS = 5;
+
+export interface TabState {
+  id: string;
+  sessionId: string | null;
+  title: string;
+  /**
+   * True once the user has explicitly renamed this tab (vs. the "New Chat"
+   * placeholder or a server auto-generated title). Gates two things: whether
+   * a `title_updated` SSE event from the backend's first-message auto-title
+   * is allowed to overwrite it, and whether the title is sent along when the
+   * session is first created so it survives past that auto-title step.
+   */
+  isTitleCustom: boolean;
+  contextLabel: string | null;
+  pageContext: AiPageContext | null;
+  messages: AiMessage[];
+  /** Analysis runs launched from this tab's conversation, keyed by run id (W05). */
+  chatRuns: Record<string, ChatRunState>;
+  isStreaming: boolean;
+  isLoading: boolean;
+  error: string | null;
+  pendingApproval: PendingApproval | null;
+  pendingPlan: PendingPlan | null;
+  activePlan: ActivePlan | null;
+  approvalMode: AiApprovalMode;
+  isPaused: boolean;
+  isInterrupting: boolean;
+  isFlagged: boolean;
+  unreadCount: number;
+  hasApprovalPending: boolean;
+}
+
+function createEmptyTab(title?: string): TabState {
+  return {
+    id: crypto.randomUUID(),
+    sessionId: null,
+    title: title ?? 'New Chat',
+    isTitleCustom: false,
+    contextLabel: null,
+    pageContext: null,
+    messages: [],
+    chatRuns: {},
+    isStreaming: false,
+    isLoading: false,
+    error: null,
+    pendingApproval: null,
+    pendingPlan: null,
+    activePlan: null,
+    approvalMode: 'per_step',
+    isPaused: false,
+    isInterrupting: false,
+    isFlagged: false,
+    unreadCount: 0,
+    hasApprovalPending: false,
+  };
+}
+
+interface WorkspaceState {
+  tabs: TabState[];
+  activeTabId: string | null;
+  _readers: Map<string, ReadableStreamDefaultReader<Uint8Array>>;
+
+  // Tab lifecycle
+  createTab: (title?: string, context?: AiPageContext) => void;
+  closeTab: (tabId: string) => void;
+  switchTab: (tabId: string) => void;
+  /**
+   * Renames a tab. Updates local state immediately; if the tab already has a
+   * backing session, persists the rename via PATCH /ai/sessions/:id and rolls
+   * the local title back if that call fails. A tab with no session yet stays
+   * local-only — the title is sent along when the session is created (see
+   * sendMessage) so it isn't lost.
+   */
+  renameTab: (tabId: string, title: string) => Promise<void>;
+
+  // Chat actions (tab-scoped)
+  sendMessage: (tabId: string, content: string) => Promise<void>;
+  approveExecution: (tabId: string, executionId: string, approved: boolean) => Promise<void>;
+  /**
+   * An inline intent decide (Touch ID self-approve) already POSTed to the
+   * approvals decide API and the SSE stream carries the actual outcome —
+   * this only drops the now-stale card. Never call it as a substitute for
+   * approveExecution: it talks to no endpoint.
+   */
+  clearPendingApproval: (tabId: string) => void;
+  approvePlan: (tabId: string, approved: boolean) => Promise<void>;
+  abortPlan: (tabId: string) => Promise<void>;
+  pauseAi: (tabId: string, paused: boolean) => Promise<void>;
+  interruptResponse: (tabId: string) => Promise<void>;
+  flagSession: (tabId: string, reason?: string) => Promise<void>;
+  draftTicketFromChat: (tabId: string) => Promise<AiTicketDraft>;
+  saveTicketFromChat: (tabId: string, payload: CreateTicketFromChatInput) => Promise<{ ticketNumber: string; resolved: boolean; timeLogged: boolean; timeLogError?: string }>;
+  unflagSession: (tabId: string) => Promise<void>;
+  clearError: (tabId: string) => void;
+
+  // Notifications
+  markTabRead: (tabId: string) => void;
+
+  // Lifecycle
+  restoreWorkspace: () => Promise<void>;
+  cleanupAllStreams: () => void;
+}
+
+type PersistedWorkspace = {
+  tabs: Array<{ id: string; sessionId: string | null; title: string; isTitleCustom: boolean; contextLabel: string | null; pageContext: AiPageContext | null }>;
+  activeTabId: string | null;
+};
+
+export const useWorkspaceStore = create<WorkspaceState>()(
+  persist(
+    (set, get) => {
+      const updateTab = (tabId: string, patch: Partial<TabState>) =>
+        set((s) => ({
+          tabs: s.tabs.map((t) => (t.id === tabId ? { ...t, ...patch } : t)),
+        }));
+
+      const getTab = (tabId: string) => get().tabs.find((t) => t.id === tabId);
+
+      return {
+        tabs: [],
+        activeTabId: null,
+        _readers: new Map(),
+
+        createTab: (title?: string, context?: AiPageContext) => {
+          const { tabs } = get();
+          if (tabs.length >= MAX_TABS) return;
+          const tab = createEmptyTab(title);
+          if (context) {
+            tab.pageContext = context;
+            tab.contextLabel = context.type === 'device' ? context.hostname
+              : context.type === 'alert' ? context.title
+              : context.type === 'dashboard' ? (context.orgName ?? 'Dashboard')
+              : context.type === 'custom' ? context.label
+              : null;
+          }
+          set((s) => ({
+            tabs: [...s.tabs, tab],
+            activeTabId: tab.id,
+          }));
+        },
+
+        closeTab: (tabId: string) => {
+          const { _readers, tabs, activeTabId } = get();
+          const tab = tabs.find((t) => t.id === tabId);
+          if (!tab) return;
+
+          // Cancel any active stream
+          const reader = _readers.get(tab.sessionId ?? '');
+          if (reader) {
+            reader.cancel().catch(() => {});
+            _readers.delete(tab.sessionId ?? '');
+          }
+
+          const remaining = tabs.filter((t) => t.id !== tabId);
+          let newActiveId: string | null = null;
+          if (remaining.length > 0) {
+            if (activeTabId === tabId) {
+              const idx = tabs.findIndex((t) => t.id === tabId);
+              newActiveId = remaining[Math.min(idx, remaining.length - 1)]?.id ?? null;
+            } else {
+              newActiveId = activeTabId;
+            }
+          }
+
+          set({ tabs: remaining, activeTabId: newActiveId });
+        },
+
+        switchTab: (tabId: string) => {
+          set({ activeTabId: tabId });
+          // Clear unread when switching to tab
+          updateTab(tabId, { unreadCount: 0, hasApprovalPending: false });
+        },
+
+        renameTab: async (tabId: string, title: string) => {
+          const trimmed = title.trim();
+          if (!trimmed) return;
+
+          const tab = getTab(tabId);
+          if (!tab) return;
+          if (trimmed === tab.title && tab.isTitleCustom) return;
+
+          const previousTitle = tab.title;
+          const previousIsTitleCustom = tab.isTitleCustom;
+          updateTab(tabId, { title: trimmed, isTitleCustom: true });
+
+          if (!tab.sessionId) return;
+
+          // Only roll back if THIS call's title is still the tab's current
+          // title. Two renames can be in flight at once (fire-and-forget from
+          // the UI, no in-flight guard) and their PATCH responses can arrive
+          // out of order — without this check, an older call's failure could
+          // stomp a newer, already-successful rename.
+          const rollbackIfStillCurrent = (patch: Partial<TabState>) => {
+            if (getTab(tabId)?.title === trimmed) {
+              updateTab(tabId, { title: previousTitle, isTitleCustom: previousIsTitleCustom, ...patch });
+            }
+          };
+
+          try {
+            const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ title: trimmed }),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              rollbackIfStillCurrent({ error: extractApiError(data, 'Failed to rename chat') });
+            }
+          } catch (err) {
+            console.error('[Workspace] Rename failed:', err);
+            rollbackIfStillCurrent({ error: 'Failed to rename chat' });
+          }
+        },
+
+        sendMessage: async (tabId: string, content: string) => {
+          const trimmed = content.trim();
+          if (!trimmed) return;
+
+          const tab = getTab(tabId);
+          if (!tab || tab.isStreaming || tab.isLoading) return;
+
+          // Create session lazily if needed
+          let sessionId = tab.sessionId;
+          if (!sessionId) {
+            updateTab(tabId, { isLoading: true, error: null });
+            // Snapshot the title sent with session creation. renameTab() is a
+            // no-op against the API while sessionId is still null (there's no
+            // session yet to PATCH), so a rename that lands *during* this
+            // await would otherwise be silently dropped — the tab shows the
+            // new title locally, but the backend record it's about to create
+            // never carries it, and nothing ever revisits it. Compare against
+            // the tab's title once a sessionId exists below and PATCH if it
+            // has since diverged.
+            const titleAtCreation = tab.isTitleCustom ? tab.title : undefined;
+            try {
+              const res = await fetchWithAuth('/ai/sessions', {
+                method: 'POST',
+                body: JSON.stringify({
+                  pageContext: tab.pageContext ?? undefined,
+                  // Carry a user-set title through to the new session so the
+                  // server's first-message auto-title (gated on `!title`)
+                  // never clobbers a rename made before the first message.
+                  title: titleAtCreation,
+                }),
+              });
+              if (!res.ok) {
+                const data = await res.json().catch(() => null);
+                throw new Error(extractApiError(data, 'Failed to create session'));
+              }
+              const data = await res.json();
+              sessionId = data.id;
+              updateTab(tabId, { sessionId, isLoading: false });
+
+              const latestTab = getTab(tabId);
+              if (latestTab?.isTitleCustom && latestTab.title !== titleAtCreation) {
+                fetchWithAuth(`/ai/sessions/${sessionId}`, {
+                  method: 'PATCH',
+                  body: JSON.stringify({ title: latestTab.title }),
+                }).catch((err) => console.error('[Workspace] Failed to sync title after session creation:', err));
+              }
+            } catch (err) {
+              updateTab(tabId, {
+                error: err instanceof Error ? err.message : 'Failed to create session',
+                isLoading: false,
+              });
+              return;
+            }
+          }
+
+          if (!sessionId) return;
+
+          const userMsgId = crypto.randomUUID();
+          const userMsg: AiMessage = {
+            id: userMsgId,
+            role: 'user',
+            content: trimmed,
+            createdAt: new Date(),
+          };
+
+          updateTab(tabId, {
+            messages: [...(getTab(tabId)?.messages ?? []), userMsg],
+            isStreaming: true,
+            error: null,
+            pendingApproval: null,
+          });
+
+          try {
+            const currentTab = getTab(tabId);
+            const res = await fetchWithAuth(`/ai/sessions/${sessionId}/messages`, {
+              method: 'POST',
+              body: JSON.stringify({ content: trimmed, pageContext: currentTab?.pageContext ?? undefined }),
+            });
+
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              if (res.status === 409) {
+                set((s) => ({
+                  tabs: s.tabs.map((t) =>
+                    t.id === tabId
+                      ? { ...t, messages: t.messages.filter((m) => m.id !== userMsgId), error: extractApiError(data, 'Another response is still in progress.') }
+                      : t
+                  ),
+                }));
+                return;
+              }
+              throw new Error(extractApiError(data, 'Failed to send message'));
+            }
+
+            const reader = res.body?.getReader();
+            if (!reader) throw new Error('No response body');
+
+            // Store reader for interrupt/cleanup
+            get()._readers.set(sessionId, reader);
+
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let currentAssistantId: string | null = null;
+
+            // Create tab-scoped setter/getter that route updates to the correct tab
+            const tabSet = (fn: (s: TabState) => Partial<TabState>) => {
+              set((state) => ({
+                tabs: state.tabs.map((t) => {
+                  if (t.id !== tabId) return t;
+                  return { ...t, ...fn(t) };
+                }),
+              }));
+
+              // Increment unread if this tab is in the background
+              const { activeTabId } = get();
+              if (activeTabId !== tabId) {
+                // Check if the update added a message_start or approval
+                const updatedTab = getTab(tabId);
+                if (updatedTab) {
+                  // We'll handle notification tracking in the event processing below
+                }
+              }
+            };
+
+            const tabGet = (): TabState => {
+              return getTab(tabId) ?? createEmptyTab();
+            };
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() ?? '';
+
+              for (const line of lines) {
+                if (line.startsWith('data:')) {
+                  const jsonStr = line.slice(5).trim();
+                  if (!jsonStr) continue;
+
+                  try {
+                    const event = JSON.parse(jsonStr) as AiStreamEvent;
+
+                    // Track notifications for background tabs
+                    const { activeTabId: currentActive } = get();
+                    const isBackground = currentActive !== tabId;
+
+                    if (isBackground) {
+                      if (event.type === 'message_start') {
+                        const t = getTab(tabId);
+                        if (t) updateTab(tabId, { unreadCount: t.unreadCount + 1 });
+                      }
+                      if (event.type === 'approval_required' || event.type === 'plan_approval_required') {
+                        updateTab(tabId, { hasApprovalPending: true });
+                      }
+                    }
+
+                    // Update title from title_updated events — but never
+                    // stomp on a title the user explicitly set (guards a race
+                    // where the rename lands after the auto-title generation
+                    // already started server-side).
+                    if (event.type === 'title_updated') {
+                      const currentTab = getTab(tabId);
+                      if (!currentTab?.isTitleCustom) {
+                        updateTab(tabId, { title: event.title });
+                      }
+                    }
+
+                    currentAssistantId = processStreamEvent(
+                      event,
+                      tabSet as (fn: (s: any) => Partial<any>) => void,
+                      tabGet as () => any,
+                      currentAssistantId
+                    );
+                  } catch (parseErr) {
+                    console.error('[Workspace] Failed to parse SSE event:', jsonStr.slice(0, 200), parseErr);
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            updateTab(tabId, {
+              error: err instanceof Error ? err.message : 'Failed to send message',
+              isStreaming: false,
+            });
+          } finally {
+            const t = getTab(tabId);
+            if (t?.isStreaming) {
+              updateTab(tabId, { isStreaming: false });
+            }
+            if (sessionId) {
+              get()._readers.delete(sessionId);
+            }
+          }
+        },
+
+        approveExecution: async (tabId: string, executionId: string, approved: boolean) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) return;
+
+          try {
+            const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}/approve/${executionId}`, {
+              method: 'POST',
+              body: JSON.stringify({ approved }),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              updateTab(tabId, { error: extractApiError(data, 'Failed to process approval. It may have timed out.') });
+              return;
+            }
+            updateTab(tabId, { pendingApproval: null, hasApprovalPending: false });
+          } catch (err) {
+            console.error('[Workspace] Approval failed:', err);
+            updateTab(tabId, { error: 'Failed to process approval' });
+          }
+        },
+
+        clearPendingApproval: (tabId: string) => {
+          updateTab(tabId, { pendingApproval: null, hasApprovalPending: false });
+        },
+
+        approvePlan: async (tabId: string, approved: boolean) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) return;
+
+          try {
+            const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}/approve-plan`, {
+              method: 'POST',
+              body: JSON.stringify({ approved }),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              updateTab(tabId, { error: extractApiError(data, 'Failed to process plan approval') });
+              return;
+            }
+            if (approved && tab.pendingPlan) {
+              updateTab(tabId, {
+                pendingPlan: null,
+                hasApprovalPending: false,
+                activePlan: {
+                  planId: tab.pendingPlan.planId,
+                  steps: tab.pendingPlan.steps,
+                  currentStepIndex: 0,
+                  status: 'executing',
+                },
+              });
+            } else {
+              updateTab(tabId, { pendingPlan: null, hasApprovalPending: false });
+            }
+          } catch (err) {
+            console.error('[Workspace] Plan approval failed:', err);
+            updateTab(tabId, { error: 'Failed to process plan approval' });
+          }
+        },
+
+        abortPlan: async (tabId: string) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) return;
+
+          try {
+            const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}/abort-plan`, {
+              method: 'POST',
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              updateTab(tabId, { error: extractApiError(data, 'Failed to abort plan') });
+              return;
+            }
+            updateTab(tabId, { activePlan: null });
+          } catch (err) {
+            console.error('[Workspace] Plan abort failed:', err);
+            updateTab(tabId, { error: 'Failed to abort plan' });
+          }
+        },
+
+        pauseAi: async (tabId: string, paused: boolean) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) return;
+
+          try {
+            const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}/pause`, {
+              method: 'POST',
+              body: JSON.stringify({ paused }),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              updateTab(tabId, { error: extractApiError(data, 'Failed to pause AI') });
+              return;
+            }
+            updateTab(tabId, { isPaused: paused });
+          } catch (err) {
+            console.error('[Workspace] Pause failed:', err);
+            updateTab(tabId, { error: 'Failed to pause AI' });
+          }
+        },
+
+        interruptResponse: async (tabId: string) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) return;
+
+          updateTab(tabId, { isInterrupting: true });
+          try {
+            const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}/interrupt`, { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || data.interrupted === false) {
+              updateTab(tabId, { error: data.reason || 'Could not interrupt the response' });
+            }
+          } catch (err) {
+            console.error('[Workspace] Interrupt failed:', err);
+            updateTab(tabId, { error: 'Failed to interrupt the response' });
+          } finally {
+            updateTab(tabId, { isInterrupting: false });
+          }
+        },
+
+        flagSession: async (tabId: string, reason?: string) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) return;
+
+          try {
+            const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}/flag`, {
+              method: 'POST',
+              body: JSON.stringify({ reason }),
+            });
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              updateTab(tabId, { error: extractApiError(data, 'Failed to flag session') });
+              return;
+            }
+            updateTab(tabId, { isFlagged: true });
+          } catch (err) {
+            console.error('[Workspace] Flag failed:', err);
+            updateTab(tabId, { error: 'Failed to flag session' });
+          }
+        },
+
+        draftTicketFromChat: async (tabId) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) throw new Error('No active session');
+          const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}/ticket-draft`, { method: 'POST' });
+          if (!res.ok) {
+            const data = await res.json().catch(() => null);
+            throw new Error(extractApiError(data, 'Could not draft a ticket from this conversation'));
+          }
+          const body = await res.json();
+          return body.data as AiTicketDraft;
+        },
+
+        saveTicketFromChat: async (tabId, payload) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) throw new Error('No active session');
+          const sessionId = tab.sessionId;
+          const requestedResolve = payload.status === 'resolved';
+          const requestedTime = payload.timeMinutes > 0;
+          const result = await runAction<{ ticketNumber: string; resolved: boolean; timeLogged: boolean; timeLogError?: string }>({
+            request: () => fetchWithAuth(`/ai/sessions/${sessionId}/ticket`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(payload),
+            }),
+            errorFallback: 'Could not create the ticket.',
+            parseSuccess: (data) => {
+              const d = data as { data?: { internalNumber?: string | null; ticketNumber?: string }; resolved?: boolean; timeLogged?: boolean; timeLogError?: string };
+              return {
+                ticketNumber: d.data?.internalNumber ?? d.data?.ticketNumber ?? '',
+                resolved: !!d.resolved,
+                timeLogged: !!d.timeLogged,
+                ...(d.timeLogError ? { timeLogError: d.timeLogError } : {}),
+              };
+            },
+            successMessage: (r) => `Ticket ${r.ticketNumber} created${r.resolved ? ' and resolved' : ''}`,
+          });
+          // Partial-success warnings: only when the user asked for something that didn't happen.
+          if (requestedResolve && !result.resolved) {
+            showToast({ type: 'warning', message: 'Ticket created, but it could not be resolved automatically — please resolve it manually.' });
+          }
+          if (requestedTime && !result.timeLogged) {
+            showToast({ type: 'warning', message: `Ticket created, but the time entry could not be logged.${result.timeLogError ? ` ${result.timeLogError}` : ''}` });
+          }
+          return result;
+        },
+
+        unflagSession: async (tabId: string) => {
+          const tab = getTab(tabId);
+          if (!tab?.sessionId) return;
+
+          try {
+            const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}/flag`, { method: 'DELETE' });
+            if (!res.ok) {
+              const data = await res.json().catch(() => null);
+              updateTab(tabId, { error: extractApiError(data, 'Failed to unflag session') });
+              return;
+            }
+            updateTab(tabId, { isFlagged: false });
+          } catch (err) {
+            console.error('[Workspace] Unflag failed:', err);
+            updateTab(tabId, { error: 'Failed to unflag session' });
+          }
+        },
+
+        clearError: (tabId: string) => {
+          updateTab(tabId, { error: null });
+        },
+
+        markTabRead: (tabId: string) => {
+          updateTab(tabId, { unreadCount: 0, hasApprovalPending: false });
+        },
+
+        restoreWorkspace: async () => {
+          const { tabs } = get();
+          const tabsWithSessions = tabs.filter((t) => t.sessionId);
+          if (tabsWithSessions.length === 0) return;
+
+          await Promise.all(
+            tabsWithSessions.map(async (tab) => {
+              if (!tab.sessionId) return;
+              try {
+                const res = await fetchWithAuth(`/ai/sessions/${tab.sessionId}`);
+                if (!res.ok) {
+                  if (res.status === 404) {
+                    updateTab(tab.id, { sessionId: null, messages: [] });
+                  }
+                  return;
+                }
+                const data = await res.json();
+                if (data.session?.status !== 'active') {
+                  updateTab(tab.id, { sessionId: null, messages: [] });
+                  return;
+                }
+                const messages = mapMessagesFromApi(data.messages || []);
+                updateTab(tab.id, {
+                  messages,
+                  isFlagged: !!data.session.flaggedAt,
+                });
+              } catch (err) {
+                console.error(`[Workspace] Failed to restore tab ${tab.id}:`, err);
+              }
+            })
+          );
+        },
+
+        cleanupAllStreams: () => {
+          const { _readers } = get();
+          for (const reader of _readers.values()) {
+            reader.cancel().catch(() => {});
+          }
+          _readers.clear();
+        },
+      };
+    },
+    {
+      name: 'breeze-workspace',
+      partialize: (state): PersistedWorkspace => ({
+        tabs: state.tabs.map((t) => ({
+          id: t.id,
+          sessionId: t.sessionId,
+          title: t.title,
+          isTitleCustom: t.isTitleCustom,
+          contextLabel: t.contextLabel,
+          pageContext: t.pageContext,
+        })),
+        activeTabId: state.activeTabId,
+      }),
+      merge: (persisted, current) => {
+        const data = persisted as PersistedWorkspace | undefined;
+        if (!data?.tabs) return current;
+        return {
+          ...current,
+          activeTabId: data.activeTabId,
+          tabs: data.tabs.map((t) => ({
+            ...createEmptyTab(t.title),
+            id: t.id,
+            sessionId: t.sessionId,
+            isTitleCustom: t.isTitleCustom ?? false,
+            contextLabel: t.contextLabel,
+            pageContext: t.pageContext,
+          })),
+        };
+      },
+    }
+  )
+);

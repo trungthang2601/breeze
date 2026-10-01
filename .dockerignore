@@ -1,0 +1,96 @@
+# Git
+.git
+.gitignore
+# Private extension clones must not leak git history/remotes into images.
+extensions/*/.git
+
+# Dependencies (rebuilt in container)
+node_modules
+**/node_modules
+
+# Build outputs (rebuilt in container)
+dist
+**/dist
+.astro
+**/.astro
+
+# Development files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment files (secrets)
+.env*
+**/.env*
+*.env
+*.env.*
+**/*.env
+**/*.env.*
+!.env.example
+!.env.*.example
+!*.env.example
+!*.env.*.example
+!**/.env.example
+!**/.env.*.example
+!**/*.env.example
+!**/*.env.*.example
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage
+.nyc_output
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.docker
+
+# Documentation
+docs
+*.md
+!README.md
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.circleci
+
+# Turbo cache
+.turbo
+
+# Claude/AI
+.claude
+
+# Apps not needed in Docker (API + web + portal only)
+apps/helper
+apps/viewer
+apps/mobile
+apps/docs
+apps/agent
+
+# Go agent (not needed in Docker)
+agent
+
+# Testing & tooling
+e2e-tests
+load-tests
+backups
+monitoring
+scripts
+internal
+
+# Misc
+*.tgz
+*.tar.gz

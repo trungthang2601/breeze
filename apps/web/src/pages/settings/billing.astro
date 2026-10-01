@@ -1,0 +1,19 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import PartnerBillingSettingsPage from '../../components/billing/PartnerBillingSettingsPage';
+import { tServer } from '../../lib/i18n/server';
+
+const locale = Astro.locals.locale;
+---
+
+<DashboardLayout titleKey="titles.settingsBilling">
+  <div class="space-y-6">
+    <div>
+      <h1 class="text-xl font-semibold">{tServer(locale, 'settingsBillingPage.heading')}</h1>
+      <p class="mt-1 text-sm text-muted-foreground">
+        {tServer(locale, 'settingsBillingPage.description')}
+      </p>
+    </div>
+    <PartnerBillingSettingsPage client:load />
+  </div>
+</DashboardLayout>

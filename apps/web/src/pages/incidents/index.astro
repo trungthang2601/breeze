@@ -1,0 +1,8 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import IncidentsPage from '../../components/incidents/IncidentsPage';
+---
+
+<DashboardLayout titleKey="titles.incidents">
+  <IncidentsPage client:load />
+</DashboardLayout>

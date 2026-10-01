@@ -1,0 +1,1190 @@
+import { useState, useCallback, useEffect, useMemo } from 'react';
+import {
+  FolderClosed,
+  FolderOpen,
+  ChevronRight,
+  ChevronDown,
+  Search,
+  RefreshCw,
+  Plus,
+  Trash2,
+  Edit3,
+  Loader2,
+  X,
+  AlertCircle,
+  Database,
+  Type,
+  Hash,
+  Binary,
+  List,
+  FileText,
+  Copy,
+  Save
+} from 'lucide-react';
+import { cn, paddingLeftPxClass } from '@/lib/utils';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export type RegistryValueType =
+  | 'REG_SZ'
+  | 'REG_DWORD'
+  | 'REG_BINARY'
+  | 'REG_MULTI_SZ'
+  | 'REG_EXPAND_SZ'
+  | 'REG_QWORD';
+
+export type RegistryValue = {
+  name: string;
+  type: RegistryValueType;
+  data: string | number | string[] | Uint8Array;
+};
+
+export type RegistryKey = {
+  name: string;
+  path: string;
+  hasChildren: boolean;
+};
+
+export type RegistryHive = {
+  name: string;
+  shortName: string;
+  path: string;
+};
+
+export type RegistryEditorProps = {
+  deviceId: string;
+  deviceName?: string;
+  initialPath?: string;
+  onNavigate?: (hive: string, path: string) => void;
+  onGetKeys?: (hive: string, path: string) => Promise<RegistryKey[]>;
+  onGetValues?: (hive: string, path: string) => Promise<RegistryValue[]>;
+  onSetValue?: (hive: string, path: string, name: string, type: RegistryValueType, data: unknown) => Promise<void>;
+  onDeleteValue?: (hive: string, path: string, name: string) => Promise<void>;
+  onCreateKey?: (hive: string, path: string) => Promise<void>;
+  onDeleteKey?: (hive: string, path: string) => Promise<void>;
+  className?: string;
+};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const REGISTRY_HIVES: RegistryHive[] = [
+  { name: 'HKEY_LOCAL_MACHINE', shortName: 'HKLM', path: 'HKEY_LOCAL_MACHINE' },
+  { name: 'HKEY_CURRENT_USER', shortName: 'HKCU', path: 'HKEY_CURRENT_USER' },
+  { name: 'HKEY_CLASSES_ROOT', shortName: 'HKCR', path: 'HKEY_CLASSES_ROOT' },
+  { name: 'HKEY_USERS', shortName: 'HKU', path: 'HKEY_USERS' },
+  { name: 'HKEY_CURRENT_CONFIG', shortName: 'HKCC', path: 'HKEY_CURRENT_CONFIG' },
+];
+
+const VALUE_TYPE_CONFIG: Record<RegistryValueType, { icon: typeof Type; color: string; label: string }> = {
+  REG_SZ: { icon: Type, color: 'text-blue-500', label: 'String' },
+  REG_EXPAND_SZ: { icon: FileText, color: 'text-cyan-500', label: 'Expandable String' },
+  REG_DWORD: { icon: Hash, color: 'text-green-500', label: 'DWORD (32-bit)' },
+  REG_QWORD: { icon: Hash, color: 'text-emerald-500', label: 'QWORD (64-bit)' },
+  REG_BINARY: { icon: Binary, color: 'text-purple-500', label: 'Binary' },
+  REG_MULTI_SZ: { icon: List, color: 'text-orange-500', label: 'Multi-String' },
+};
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+function formatBinaryData(data: Uint8Array | number[]): string {
+  const bytes = data instanceof Uint8Array ? Array.from(data) : data;
+  return bytes.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+}
+
+function parseBinaryData(hex: string): Uint8Array {
+  const cleaned = hex.replace(/\s+/g, '');
+  const bytes: number[] = [];
+  for (let i = 0; i < cleaned.length; i += 2) {
+    bytes.push(parseInt(cleaned.substr(i, 2), 16));
+  }
+  return new Uint8Array(bytes);
+}
+
+function formatValueData(value: RegistryValue): string {
+  if (value.type === 'REG_BINARY') {
+    const bytes = value.data as Uint8Array | number[];
+    return formatBinaryData(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  }
+  if (value.type === 'REG_MULTI_SZ') {
+    return (value.data as string[]).join(', ');
+  }
+  if (value.type === 'REG_DWORD' || value.type === 'REG_QWORD') {
+    const num = value.data as number;
+    const padLen = value.type === 'REG_DWORD' ? 8 : 16;
+    return '0x' + num.toString(16).padStart(padLen, '0').toUpperCase() + ' (' + num + ')';
+  }
+  return String(value.data);
+}
+
+// ============================================================================
+// Tree Node Component
+// ============================================================================
+
+type TreeNodeProps = {
+  hive?: RegistryHive;
+  keyData?: RegistryKey;
+  level: number;
+  expandedKeys: Set<string>;
+  selectedPath: string;
+  loadingPath: string | null;
+  keyCache: Record<string, RegistryKey[]>;
+  onToggle: (path: string) => void;
+  onSelect: (hive: string, path: string) => void;
+  currentHive: string;
+};
+
+function TreeNode({
+  hive,
+  keyData,
+  level,
+  expandedKeys,
+  selectedPath,
+  loadingPath,
+  keyCache,
+  onToggle,
+  onSelect,
+  currentHive,
+}: TreeNodeProps) {
+  const path = hive ? hive.path : keyData?.path || '';
+  const name = hive ? hive.name : keyData?.name || '';
+  const fullPath = hive ? hive.path : currentHive + '\\' + path;
+  const hasChildren = hive ? true : keyData?.hasChildren ?? false;
+  const isExpanded = expandedKeys.has(fullPath);
+  const isSelected = selectedPath === fullPath;
+  const isLoading = loadingPath === fullPath;
+  const children = keyCache[fullPath] || [];
+
+  const handleToggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    onToggle(fullPath);
+  };
+
+  const handleSelect = () => {
+    const hiveName = hive ? hive.path : currentHive;
+    const keyPath = hive ? '' : path;
+    onSelect(hiveName, keyPath);
+  };
+
+  return (
+    <div>
+      <div
+        className={cn(
+          'flex items-center gap-1 py-1 px-2 cursor-pointer hover:bg-muted/60 rounded-sm text-sm',
+          isSelected && 'bg-primary/10 text-primary',
+          paddingLeftPxClass(level * 16 + 8)
+        )}
+        onClick={handleSelect}
+      >
+        {hasChildren ? (
+          <button
+            type="button"
+            onClick={handleToggle}
+            className="flex h-4 w-4 items-center justify-center hover:bg-muted rounded"
+          >
+            {isLoading ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : isExpanded ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+          </button>
+        ) : (
+          <span className="w-4" />
+        )}
+        {isExpanded ? (
+          <FolderOpen className="h-4 w-4 text-yellow-500" />
+        ) : (
+          <FolderClosed className="h-4 w-4 text-yellow-500" />
+        )}
+        <span className="truncate">{name}</span>
+        {hive && (
+          <span className="text-xs text-muted-foreground ml-1">({hive.shortName})</span>
+        )}
+      </div>
+      {isExpanded && children.length > 0 && (
+        <div>
+          {children.map((child) => (
+            <TreeNode
+              key={child.path}
+              keyData={child}
+              level={level + 1}
+              expandedKeys={expandedKeys}
+              selectedPath={selectedPath}
+              loadingPath={loadingPath}
+              keyCache={keyCache}
+              onToggle={onToggle}
+              onSelect={onSelect}
+              currentHive={currentHive}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// Value Editor Modal
+// ============================================================================
+
+type ValueEditorModalProps = {
+  isOpen: boolean;
+  isNew: boolean;
+  value: RegistryValue | null;
+  onClose: () => void;
+  onSave: (name: string, type: RegistryValueType, data: unknown) => void;
+};
+
+function ValueEditorModal({ isOpen, isNew, value, onClose, onSave }: ValueEditorModalProps) {
+  const { t } = useTranslation('remote');
+  const [name, setName] = useState(value?.name || '');
+  const [type, setType] = useState<RegistryValueType>(value?.type || 'REG_SZ');
+  const [stringValue, setStringValue] = useState('');
+  const [numberValue, setNumberValue] = useState('0');
+  const [isHex, setIsHex] = useState(true);
+  const [binaryValue, setBinaryValue] = useState('');
+  const [multiValue, setMultiValue] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (value) {
+      setName(value.name);
+      setType(value.type);
+
+      if (value.type === 'REG_SZ' || value.type === 'REG_EXPAND_SZ') {
+        setStringValue(String(value.data));
+      } else if (value.type === 'REG_DWORD' || value.type === 'REG_QWORD') {
+        const num = value.data as number;
+        setNumberValue(isHex ? num.toString(16) : num.toString());
+      } else if (value.type === 'REG_BINARY') {
+        setBinaryValue(formatBinaryData(value.data as Uint8Array));
+      } else if (value.type === 'REG_MULTI_SZ') {
+        setMultiValue((value.data as string[]).join('\n'));
+      }
+    } else {
+      setName('');
+      setType('REG_SZ');
+      setStringValue('');
+      setNumberValue('0');
+      setBinaryValue('');
+      setMultiValue('');
+    }
+    setError(null);
+  }, [value, isOpen]);
+
+  const handleSave = () => {
+    if (!name.trim() && isNew) {
+      setError(t('registryEditor.errors.valueNameRequired'));
+      return;
+    }
+
+    let data: unknown;
+    try {
+      switch (type) {
+        case 'REG_SZ':
+        case 'REG_EXPAND_SZ':
+          data = stringValue;
+          break;
+        case 'REG_DWORD':
+        case 'REG_QWORD':
+          data = isHex ? parseInt(numberValue, 16) : parseInt(numberValue, 10);
+          if (isNaN(data as number)) {
+            setError(t('registryEditor.errors.invalidNumber'));
+            return;
+          }
+          break;
+        case 'REG_BINARY':
+          data = parseBinaryData(binaryValue);
+          break;
+        case 'REG_MULTI_SZ':
+          data = multiValue.split('\n').filter(line => line.length > 0);
+          break;
+      }
+      onSave(name, type, data);
+    } catch (e) {
+      setError(t('registryEditor.errors.invalidFormat'));
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="bg-background border rounded-lg shadow-lg w-full max-w-lg mx-4">
+        <div className="flex items-center justify-between px-4 py-3 border-b">
+          <h3 className="text-sm font-semibold">
+            {isNew ? t('registryEditor.newValue') : t('registryEditor.editValue')}
+          </h3>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-4">
+          {error && (
+            <div className="flex items-center gap-2 text-sm text-red-500 bg-red-50 dark:bg-red-900/20 p-2 rounded">
+              <AlertCircle className="h-4 w-4" />
+              {error}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('registryEditor.valueName')}</label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={!isNew && value?.name === '(Default)'}
+              className="w-full px-3 py-2 border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/50 disabled:opacity-50"
+              placeholder={t('registryEditor.enterValueName')}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('common:labels.type')}</label>
+            <select
+              value={type}
+              onChange={(e) => setType(e.target.value as RegistryValueType)}
+              disabled={!isNew}
+              className="w-full px-3 py-2 border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/50 disabled:opacity-50"
+            >
+              {Object.entries(VALUE_TYPE_CONFIG).map(([key, config]) => (
+                <option key={key} value={key}>{key} - {config.label}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('registryEditor.valueData')}</label>
+
+            {(type === 'REG_SZ' || type === 'REG_EXPAND_SZ') && (
+              <input
+                type="text"
+                value={stringValue}
+                onChange={(e) => setStringValue(e.target.value)}
+                className="w-full px-3 py-2 border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+                placeholder={t('registryEditor.enterStringValue')}
+              />
+            )}
+
+            {(type === 'REG_DWORD' || type === 'REG_QWORD') && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-4">
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="radio"
+                      checked={isHex}
+                      onChange={() => {
+                        const num = isHex ? parseInt(numberValue, 16) : parseInt(numberValue, 10);
+                        setIsHex(true);
+                        setNumberValue(num.toString(16));
+                      }}
+                    />
+                    {t('registryEditor.hexadecimal')}
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="radio"
+                      checked={!isHex}
+                      onChange={() => {
+                        const num = isHex ? parseInt(numberValue, 16) : parseInt(numberValue, 10);
+                        setIsHex(false);
+                        setNumberValue(num.toString(10));
+                      }}
+                    />
+                    {t('registryEditor.decimal')}
+                  </label>
+                </div>
+                <input
+                  type="text"
+                  value={numberValue}
+                  onChange={(e) => setNumberValue(e.target.value)}
+                  className="w-full px-3 py-2 border rounded-md bg-background font-mono focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+                  placeholder={isHex ? t('registryEditor.enterHexValue') : t('registryEditor.enterDecimalValue')}
+                />
+              </div>
+            )}
+
+            {type === 'REG_BINARY' && (
+              <textarea
+                value={binaryValue}
+                onChange={(e) => setBinaryValue(e.target.value)}
+                className="w-full px-3 py-2 border rounded-md bg-background font-mono text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50 h-32"
+                placeholder={t('registryEditor.enterHexBytes')}
+              />
+            )}
+
+            {type === 'REG_MULTI_SZ' && (
+              <textarea
+                value={multiValue}
+                onChange={(e) => setMultiValue(e.target.value)}
+                className="w-full px-3 py-2 border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/50 h-32"
+                placeholder={t('registryEditor.enterStrings')}
+              />
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t bg-muted/20">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-sm font-medium rounded-md hover:bg-muted"
+          >
+            {t('common:actions.cancel')}
+          </button>
+          <button
+            type="button"
+            onClick={handleSave}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90"
+          >
+            <Save className="h-4 w-4" />
+            {t('common:actions.save')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Create Key Modal
+// ============================================================================
+
+type CreateKeyModalProps = {
+  isOpen: boolean;
+  parentPath: string;
+  onClose: () => void;
+  onCreate: (name: string) => void;
+};
+
+function CreateKeyModal({ isOpen, parentPath, onClose, onCreate }: CreateKeyModalProps) {
+  const { t } = useTranslation('remote');
+  const [name, setName] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setName('');
+    setError(null);
+  }, [isOpen]);
+
+  const handleCreate = () => {
+    if (!name.trim()) {
+      setError(t('registryEditor.errors.keyNameRequired'));
+      return;
+    }
+    if (name.includes('\\')) {
+      setError(t('registryEditor.errors.keyNameBackslash'));
+      return;
+    }
+    onCreate(name);
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="bg-background border rounded-lg shadow-lg w-full max-w-md mx-4">
+        <div className="flex items-center justify-between px-4 py-3 border-b">
+          <h3 className="text-sm font-semibold">{t('registryEditor.newKey')}</h3>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-4">
+          {error && (
+            <div className="flex items-center gap-2 text-sm text-red-500 bg-red-50 dark:bg-red-900/20 p-2 rounded">
+              <AlertCircle className="h-4 w-4" />
+              {error}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('registryEditor.parentPath')}</label>
+            <div className="px-3 py-2 bg-muted rounded-md text-sm font-mono truncate">
+              {parentPath || t('registryEditor.root')}
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('registryEditor.keyName')}</label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="w-full px-3 py-2 border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+              placeholder={t('registryEditor.enterKeyName')}
+              autoFocus
+              onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
+            />
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t bg-muted/20">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-sm font-medium rounded-md hover:bg-muted"
+          >
+            {t('common:actions.cancel')}
+          </button>
+          <button
+            type="button"
+            onClick={handleCreate}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90"
+          >
+            <Plus className="h-4 w-4" />
+            {t('common:actions.create')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Confirm Delete Modal
+// ============================================================================
+
+type ConfirmDeleteModalProps = {
+  isOpen: boolean;
+  title: string;
+  message: string;
+  onClose: () => void;
+  onConfirm: () => void;
+};
+
+function ConfirmDeleteModal({ isOpen, title, message, onClose, onConfirm }: ConfirmDeleteModalProps) {
+  const { t } = useTranslation('remote');
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="bg-background border rounded-lg shadow-lg w-full max-w-md mx-4">
+        <div className="flex items-center justify-between px-4 py-3 border-b">
+          <h3 className="font-semibold text-red-600">{title}</h3>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="p-4">
+          <p className="text-sm text-muted-foreground">{message}</p>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 px-4 py-3 border-t bg-muted/20">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-sm font-medium rounded-md hover:bg-muted"
+          >
+            {t('common:actions.cancel')}
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-red-600 text-white rounded-md hover:bg-red-700"
+          >
+            <Trash2 className="h-4 w-4" />
+            {t('common:actions.delete')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Main Component
+// ============================================================================
+
+export default function RegistryEditor({
+  deviceId,
+  deviceName,
+  initialPath,
+  onNavigate,
+  onGetKeys,
+  onGetValues,
+  onSetValue,
+  onDeleteValue,
+  onCreateKey,
+  onDeleteKey,
+  className,
+}: RegistryEditorProps) {
+  const { t } = useTranslation('remote');
+  // State
+  const [currentHive, setCurrentHive] = useState<string>('HKEY_LOCAL_MACHINE');
+  const [currentPath, setCurrentPath] = useState<string>('');
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
+  const [keyCache, setKeyCache] = useState<Record<string, RegistryKey[]>>({});
+  const [values, setValues] = useState<RegistryValue[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadingPath, setLoadingPath] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [sortBy, setSortBy] = useState<'name' | 'type' | 'data'>('name');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+
+  // Modal states
+  const [editingValue, setEditingValue] = useState<RegistryValue | null>(null);
+  const [isNewValue, setIsNewValue] = useState(false);
+  const [showValueEditor, setShowValueEditor] = useState(false);
+  const [showCreateKey, setShowCreateKey] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{ type: 'key' | 'value'; name: string } | null>(null);
+
+  // Computed
+  const fullPath = currentPath ? currentHive + '\\' + currentPath : currentHive;
+
+  const pathSegments = useMemo(() => {
+    const segments = [{ name: currentHive, path: '' }];
+    if (currentPath) {
+      const parts = currentPath.split('\\');
+      let accumulated = '';
+      for (const part of parts) {
+        accumulated = accumulated ? accumulated + '\\' + part : part;
+        segments.push({ name: part, path: accumulated });
+      }
+    }
+    return segments;
+  }, [currentHive, currentPath]);
+
+  const filteredValues = useMemo(() => {
+    let result = values;
+    if (searchQuery) {
+      const query = searchQuery.toLowerCase();
+      result = result.filter(
+        v => v.name.toLowerCase().includes(query) ||
+             formatValueData(v).toLowerCase().includes(query)
+      );
+    }
+    return result.sort((a, b) => {
+      let cmp = 0;
+      if (sortBy === 'name') {
+        cmp = a.name.localeCompare(b.name);
+      } else if (sortBy === 'type') {
+        cmp = a.type.localeCompare(b.type);
+      } else {
+        cmp = formatValueData(a).localeCompare(formatValueData(b));
+      }
+      return sortOrder === 'asc' ? cmp : -cmp;
+    });
+  }, [values, searchQuery, sortBy, sortOrder]);
+
+  // Load keys for a path
+  const loadKeys = useCallback(async (hive: string, path: string): Promise<RegistryKey[]> => {
+    const cacheKey = path ? hive + '\\' + path : hive;
+    if (keyCache[cacheKey]) {
+      return keyCache[cacheKey];
+    }
+
+    setLoadingPath(cacheKey);
+    try {
+      if (!onGetKeys) {
+        throw new Error(t('registryEditor.errors.keyProvider'));
+      }
+      const keys = await onGetKeys(hive, path);
+      setKeyCache(prev => ({ ...prev, [cacheKey]: keys }));
+      setLoadError(null);
+      return keys;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('registryEditor.errors.loadKeys');
+      setLoadError(t('registryEditor.errors.loadKeysDetail', { message }));
+      console.error('Failed to load registry keys:', error);
+      return [];
+    } finally {
+      setLoadingPath(null);
+    }
+  }, [keyCache, onGetKeys, t]);
+
+  // Load values for current path
+  const loadValues = useCallback(async () => {
+    setLoading(true);
+    try {
+      if (!onGetValues) {
+        throw new Error(t('registryEditor.errors.valueProvider'));
+      }
+      const vals = await onGetValues(currentHive, currentPath);
+      setValues(vals);
+      setLoadError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('registryEditor.errors.loadValues');
+      setLoadError(t('registryEditor.errors.loadValuesDetail', { message }));
+      console.error('Failed to load values:', error);
+      setValues([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [currentHive, currentPath, onGetValues, t]);
+
+  // Load values when path changes
+  useEffect(() => {
+    loadValues();
+    onNavigate?.(currentHive, currentPath);
+  }, [currentHive, currentPath, loadValues, onNavigate]);
+
+  // Handle initial path
+  useEffect(() => {
+    if (initialPath) {
+      const parts = initialPath.split('\\');
+      if (parts.length > 0) {
+        const hive = REGISTRY_HIVES.find(h => h.path === parts[0] || h.shortName === parts[0]);
+        if (hive) {
+          setCurrentHive(hive.path);
+          setCurrentPath(parts.slice(1).join('\\'));
+        }
+      }
+    }
+  }, [initialPath]);
+
+  // Toggle tree node
+  const handleToggle = useCallback(async (path: string) => {
+    const isExpanded = expandedKeys.has(path);
+    if (isExpanded) {
+      setExpandedKeys(prev => {
+        const next = new Set(prev);
+        next.delete(path);
+        return next;
+      });
+    } else {
+      const parts = path.split('\\');
+      const hive = parts[0];
+      const keyPath = parts.slice(1).join('\\');
+      await loadKeys(hive, keyPath);
+      setExpandedKeys(prev => new Set([...prev, path]));
+    }
+  }, [expandedKeys, loadKeys]);
+
+  // Select a key
+  const handleSelect = useCallback((hive: string, path: string) => {
+    setCurrentHive(hive);
+    setCurrentPath(path);
+  }, []);
+
+  // Navigate to breadcrumb segment
+  const handleBreadcrumbClick = (index: number) => {
+    if (index === 0) {
+      setCurrentPath('');
+    } else {
+      const newPath = pathSegments.slice(1, index + 1).map(s => s.name).join('\\');
+      setCurrentPath(newPath);
+    }
+  };
+
+  // Toggle sort
+  const toggleSort = (column: 'name' | 'type' | 'data') => {
+    if (sortBy === column) {
+      setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortBy(column);
+      setSortOrder('asc');
+    }
+  };
+
+  // Value operations
+  const handleEditValue = (value: RegistryValue) => {
+    setEditingValue(value);
+    setIsNewValue(false);
+    setShowValueEditor(true);
+  };
+
+  const handleNewValue = () => {
+    setEditingValue(null);
+    setIsNewValue(true);
+    setShowValueEditor(true);
+  };
+
+  const handleSaveValue = async (name: string, type: RegistryValueType, data: unknown) => {
+    try {
+      if (onSetValue) {
+        await onSetValue(currentHive, currentPath, name, type, data);
+      }
+      setLoadError(null);
+      setShowValueEditor(false);
+      loadValues();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('registryEditor.errors.saveValue');
+      setLoadError(t('registryEditor.errors.saveValueDetail', { message }));
+      console.error('Failed to save value:', error);
+    }
+  };
+
+  const handleDeleteValue = async () => {
+    if (!deleteTarget || deleteTarget.type !== 'value') return;
+    try {
+      if (onDeleteValue) {
+        await onDeleteValue(currentHive, currentPath, deleteTarget.name);
+      }
+      setLoadError(null);
+      setDeleteTarget(null);
+      loadValues();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('registryEditor.errors.deleteValue');
+      setLoadError(t('registryEditor.errors.deleteValueDetail', { message }));
+      console.error('Failed to delete value:', error);
+    }
+  };
+
+  // Key operations
+  const handleCreateKey = async (name: string) => {
+    try {
+      const newPath = currentPath ? currentPath + '\\' + name : name;
+      if (onCreateKey) {
+        await onCreateKey(currentHive, newPath);
+      }
+      setLoadError(null);
+      setShowCreateKey(false);
+      // Clear cache to refresh
+      const cacheKey = currentPath ? currentHive + '\\' + currentPath : currentHive;
+      setKeyCache(prev => {
+        const next = { ...prev };
+        delete next[cacheKey];
+        return next;
+      });
+      // Expand parent
+      setExpandedKeys(prev => new Set([...prev, fullPath]));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('registryEditor.errors.createKey');
+      setLoadError(t('registryEditor.errors.createKeyDetail', { message }));
+      console.error('Failed to create key:', error);
+    }
+  };
+
+  const handleDeleteKey = async () => {
+    if (!deleteTarget || deleteTarget.type !== 'key') return;
+    try {
+      if (onDeleteKey) {
+        await onDeleteKey(currentHive, currentPath);
+      }
+      setLoadError(null);
+      setDeleteTarget(null);
+      // Navigate to parent
+      const parentPath = currentPath.split('\\').slice(0, -1).join('\\');
+      const cacheKey = parentPath ? currentHive + '\\' + parentPath : currentHive;
+      setKeyCache(prev => {
+        const next = { ...prev };
+        delete next[cacheKey];
+        return next;
+      });
+      setCurrentPath(parentPath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : t('registryEditor.errors.deleteKey');
+      setLoadError(t('registryEditor.errors.deleteKeyDetail', { message }));
+      console.error('Failed to delete key:', error);
+    }
+  };
+
+  // Copy path to clipboard
+  const copyPath = () => {
+    navigator.clipboard.writeText(fullPath);
+  };
+
+  return (
+    <div className={cn('flex flex-col h-full bg-background border rounded-lg overflow-hidden', className)}>
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b bg-muted/20">
+        <div className="flex items-center gap-3">
+          <Database className="h-5 w-5 text-primary" />
+          <div>
+            <h2 className="font-semibold">{t('registryEditor.title')}</h2>
+            {deviceName && (
+              <p className="text-xs text-muted-foreground">{deviceName}</p>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => loadValues()}
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+            title={t('common:actions.refresh')}
+          >
+            <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
+          </button>
+        </div>
+      </div>
+
+      {/* Address Bar */}
+      <div className="flex items-center gap-2 px-4 py-2 border-b bg-muted/10">
+        <div className="flex items-center gap-1 flex-1 min-w-0 overflow-x-auto">
+          {pathSegments.map((segment, index) => (
+            <div key={segment.path} className="flex items-center">
+              {index > 0 && <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />}
+              <button
+                type="button"
+                onClick={() => handleBreadcrumbClick(index)}
+                className={cn(
+                  'px-2 py-1 text-sm rounded hover:bg-muted whitespace-nowrap',
+                  index === pathSegments.length - 1 && 'font-medium'
+                )}
+              >
+                {segment.name}
+              </button>
+            </div>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={copyPath}
+          className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-muted shrink-0"
+          title={t('registryEditor.copyPath')}
+        >
+          <Copy className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex flex-1 min-h-0">
+        {/* Tree View (30%) */}
+        <div className="u-w-pct-30 border-r overflow-auto">
+          <div className="py-2">
+            {REGISTRY_HIVES.map((hive) => (
+              <TreeNode
+                key={hive.path}
+                hive={hive}
+                level={0}
+                expandedKeys={expandedKeys}
+                selectedPath={fullPath}
+                loadingPath={loadingPath}
+                keyCache={keyCache}
+                onToggle={handleToggle}
+                onSelect={handleSelect}
+                currentHive={hive.path}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Values Panel (70%) */}
+        <div className="flex-1 flex flex-col min-w-0">
+          {/* Values Toolbar */}
+          <div className="flex items-center gap-2 px-4 py-2 border-b bg-muted/10">
+            <div className="relative flex-1 max-w-xs">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-9 pr-3 py-1.5 text-sm border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/50"
+                placeholder={t('registryEditor.searchPlaceholder')}
+              />
+            </div>
+            <div className="flex items-center gap-1 ml-auto">
+              <button
+                type="button"
+                onClick={handleNewValue}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md hover:bg-muted"
+                title={t('registryEditor.newValue')}
+              >
+                <Plus className="h-4 w-4" />
+                {t('registryEditor.value')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowCreateKey(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md hover:bg-muted"
+                title={t('registryEditor.newKey')}
+              >
+                <Plus className="h-4 w-4" />
+                {t('registryEditor.key')}
+              </button>
+              {currentPath && (
+                <button
+                  type="button"
+                  onClick={() => setDeleteTarget({ type: 'key', name: currentPath.split('\\').pop() || '' })}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-red-600 rounded-md hover:bg-red-50 dark:hover:bg-red-900/20"
+                  title={t('registryEditor.deleteKey')}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {loadError && (
+            <div className="mx-4 mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <div className="flex items-center justify-between gap-3">
+                <span>{loadError}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void loadValues();
+                  }}
+                  className="shrink-0 rounded-md border border-destructive/40 px-2 py-1 text-xs font-medium hover:bg-destructive/10"
+                >
+                  {t('common:actions.retry')}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Values Table */}
+          <div className="flex-1 overflow-auto">
+            <table className="min-w-full divide-y">
+              <thead className="bg-muted/40 sticky top-0">
+                <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  <th className="px-4 py-3 w-8" />
+                  <th
+                    className="px-4 py-3 cursor-pointer hover:text-foreground"
+                    onClick={() => toggleSort('name')}
+                  >
+                    {t('common:labels.name')}
+                    {sortBy === 'name' && (
+                      <span className="ml-1">{sortOrder === 'asc' ? '\u2191' : '\u2193'}</span>
+                    )}
+                  </th>
+                  <th
+                    className="px-4 py-3 cursor-pointer hover:text-foreground w-32"
+                    onClick={() => toggleSort('type')}
+                  >
+                    {t('common:labels.type')}
+                    {sortBy === 'type' && (
+                      <span className="ml-1">{sortOrder === 'asc' ? '\u2191' : '\u2193'}</span>
+                    )}
+                  </th>
+                  <th
+                    className="px-4 py-3 cursor-pointer hover:text-foreground"
+                    onClick={() => toggleSort('data')}
+                  >
+                    {t('registryEditor.data')}
+                    {sortBy === 'data' && (
+                      <span className="ml-1">{sortOrder === 'asc' ? '\u2191' : '\u2193'}</span>
+                    )}
+                  </th>
+                  <th className="px-4 py-3 w-24" />
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {loading ? (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-8 text-center">
+                      <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
+                    </td>
+                  </tr>
+                ) : filteredValues.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                      {searchQuery ? t('registryEditor.noMatchingValues') : t('registryEditor.noValues')}
+                    </td>
+                  </tr>
+                ) : (
+                  filteredValues.map((value) => {
+                    const typeConfig = VALUE_TYPE_CONFIG[value.type];
+                    const TypeIcon = typeConfig.icon;
+
+                    return (
+                      <tr
+                        key={value.name}
+                        className="transition hover:bg-muted/40 cursor-pointer"
+                        onDoubleClick={() => handleEditValue(value)}
+                      >
+                        <td className="px-4 py-2">
+                          <TypeIcon className={cn('h-4 w-4', typeConfig.color)} />
+                        </td>
+                        <td className="px-4 py-2 text-sm font-medium">
+                          {value.name === '(Default)' ? (
+                            <span className="text-muted-foreground italic">{value.name}</span>
+                          ) : (
+                            value.name
+                          )}
+                        </td>
+                        <td className="px-4 py-2">
+                          <span className={cn(
+                            'inline-flex items-center px-2 py-0.5 rounded text-xs font-medium',
+                            'bg-muted text-muted-foreground'
+                          )}>
+                            {value.type}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-sm text-muted-foreground font-mono truncate max-w-md">
+                          {formatValueData(value) || t('registryEditor.valueNotSet')}
+                        </td>
+                        <td className="px-4 py-2">
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => handleEditValue(value)}
+                              className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-muted"
+                              title={t('common:actions.edit')}
+                            >
+                              <Edit3 className="h-3.5 w-3.5" />
+                            </button>
+                            {value.name !== '(Default)' && (
+                              <button
+                                type="button"
+                                onClick={() => setDeleteTarget({ type: 'value', name: value.name })}
+                                className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-muted text-red-500"
+                                title={t('common:actions.delete')}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Status Bar */}
+          <div className="flex items-center justify-between px-4 py-2 border-t bg-muted/10 text-xs text-muted-foreground">
+            <span>{t('registryEditor.valueCount', { count: filteredValues.length })}</span>
+            <span>{t('registryEditor.device', { id: deviceId })}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Modals */}
+      <ValueEditorModal
+        isOpen={showValueEditor}
+        isNew={isNewValue}
+        value={editingValue}
+        onClose={() => setShowValueEditor(false)}
+        onSave={handleSaveValue}
+      />
+
+      <CreateKeyModal
+        isOpen={showCreateKey}
+        parentPath={fullPath}
+        onClose={() => setShowCreateKey(false)}
+        onCreate={handleCreateKey}
+      />
+
+      <ConfirmDeleteModal
+        isOpen={deleteTarget !== null}
+        title={deleteTarget?.type === 'key' ? t('registryEditor.deleteKey') : t('registryEditor.deleteValue')}
+        message={
+          deleteTarget?.type === 'key'
+            ? t('registryEditor.deleteKeyConfirm', { name: deleteTarget.name })
+            : t('registryEditor.deleteValueConfirm', { name: deleteTarget?.name || '' })
+        }
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={deleteTarget?.type === 'key' ? handleDeleteKey : handleDeleteValue}
+      />
+    </div>
+  );
+}

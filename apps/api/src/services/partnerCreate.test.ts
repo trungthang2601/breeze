@@ -1,0 +1,382 @@
+const { ensureDefaultProfile } = vi.hoisted(() => ({ ensureDefaultProfile: vi.fn(async () => ({ id: 'default-profile' })) }));
+vi.mock('./billingProfileService', () => ({ ensureDefaultProfile }));
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// In-memory capture of all insert calls performed against the transaction.
+// Each entry is { table: <schema table sentinel>, values }.
+type InsertCall = { table: unknown; values: Record<string, unknown> };
+let insertCalls: InsertCall[] = [];
+
+const dbTestState = vi.hoisted(() => ({ lastTransaction: null as unknown }));
+
+// Fake schema sentinels — good enough for `is this the right table?` asserts.
+vi.mock('../db/schema', () => ({
+  partners: { __t: 'partners', id: 'partners.id', slug: 'partners.slug', name: 'partners.name', mcpOrigin: 'partners.mcpOrigin', createdAt: 'partners.createdAt' },
+  users: { __t: 'users', id: 'users.id', email: 'users.email' },
+  roles: { __t: 'roles', id: 'roles.id', name: 'roles.name', isSystem: 'roles.isSystem', partnerId: 'roles.partnerId' },
+  partnerUsers: { __t: 'partner_users', partnerId: 'partner_users.partnerId', userId: 'partner_users.userId' },
+  rolePermissions: { __t: 'role_permissions', roleId: 'role_permissions.roleId', permissionId: 'role_permissions.permissionId' },
+  organizations: { __t: 'organizations', id: 'organizations.id' },
+  sites: { __t: 'sites', id: 'sites.id' },
+  ticketStatuses: { __t: 'ticket_statuses' },
+}));
+
+// ticketConfigService reads ticketStatusEnum from portal.ts directly.
+// Spread the real module and override only the enum this suite reads: other
+// schema modules (db/schema/tickets, and through it the deliverable tables)
+// import real pgEnum builders from here at module-eval time, so a
+// replace-everything mock breaks them.
+vi.mock('../db/schema/portal', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../db/schema/portal')>()),
+  ticketStatusEnum: { enumValues: ['new', 'open', 'pending', 'on_hold', 'resolved', 'closed'] },
+}));
+
+// Build a per-table counter so returning ids are distinguishable.
+const idFor = (table: any): string => {
+  const t = table?.__t ?? 'unknown';
+  return `${t}-id`;
+};
+
+vi.mock('./monitors/builtInMonitors', () => ({
+  ensureBuiltInMonitorsForPartner: vi.fn(async () => ({ provisioned: true, monitorIds: [] })),
+  ensureBuiltInMonitorsForAllPartners: vi.fn(async () => ({ provisioned: 0, skipped: 0, failed: 0 })),
+}));
+vi.mock('../db', () => {
+  const makeTx = () => {
+    // Chainable insert mock that records the values and returns a
+    // synthetic id when `.returning()` is called.
+    const tx: any = {};
+
+    tx.insert = vi.fn((table: unknown) => {
+      const chain: any = {};
+      chain.values = vi.fn((vals: Record<string, unknown>) => {
+        insertCalls.push({ table, values: vals });
+        chain.returning = vi.fn(async (_cols?: unknown) => [{
+          id: idFor(table),
+          ...((table as any)?.__t === 'partners' ? { currencyCode: 'CAD' } : {}),
+        }]);
+        // Plain awaited insert (no returning) should also resolve.
+        chain.then = (resolve: any) => resolve(undefined);
+        return chain;
+      });
+      return chain;
+    });
+
+    // select chain used for:
+    //   1. slug uniqueness check — return [] (slug is free)
+    //   2. system Partner Admin role lookup — return a seeded id
+    //   3. rolePermissions fetch — resolves on `.where()` (no .limit)
+    let selectCall = 0;
+    tx.select = vi.fn(() => {
+      selectCall += 1;
+      const s: any = {};
+      s.from = vi.fn(() => s);
+      s.innerJoin = vi.fn(() => s);
+      // rolePermissions chain terminates at `.where()` — make it awaitable.
+      s.where = vi.fn((_: unknown) => {
+        // If this chain eventually hits `.limit`, that call resolves.
+        // If instead the caller awaits `.where(...)` directly (permissions
+        // fetch), resolve to an empty permission list.
+        s.then = (resolve: any) => resolve([]);
+        return s;
+      });
+      s.limit = vi.fn(async () => {
+        if (selectCall === 1) return []; // slug free
+        if (selectCall === 2) return [{ id: 'system-partner-admin-id' }]; // seeded role
+        return [];
+      });
+      return s;
+    });
+
+    tx.update = vi.fn(() => {
+      const u: any = {};
+      u.set = vi.fn(() => u);
+      u.where = vi.fn(async () => undefined);
+      return u;
+    });
+
+    tx.execute = vi.fn(async () => undefined);
+
+    return tx;
+  };
+
+  return {
+    db: {
+      transaction: vi.fn(async (cb: any) => {
+        const tx = makeTx();
+        dbTestState.lastTransaction = tx;
+        return cb(tx);
+      }),
+      select: vi.fn(),
+    },
+  };
+});
+
+import { createPartner } from './partnerCreate';
+import { db } from '../db';
+
+beforeEach(() => {
+  insertCalls = [];
+  vi.mocked(ensureDefaultProfile).mockClear();
+});
+
+describe('createPartner', () => {
+  it('creates exactly one default card in the partner currency in the creation transaction', async () => {
+    await createPartner({ orgName: 'Rates', adminEmail: 'rates@example.com', adminName: 'Rates', passwordHash: null, origin: { mcp: false }, status: 'active' });
+    expect(ensureDefaultProfile).toHaveBeenCalledExactlyOnceWith('partners-id', 'CAD', dbTestState.lastTransaction);
+  });
+
+  it('writes probation whenever hosted partner trust evaluation is running (shadow or enforce), omits it when off', async () => {
+    const previousIsHosted = process.env.IS_HOSTED;
+    const previousMode = process.env.PARTNER_TRUST_MODE;
+    try {
+      process.env.IS_HOSTED = 'true';
+      process.env.PARTNER_TRUST_MODE = 'enforce';
+      await createPartner({
+        orgName: 'Enforced',
+        adminEmail: 'enforced@example.com',
+        adminName: 'Enforced',
+        passwordHash: 'hashed',
+        origin: { mcp: false },
+        status: 'active',
+      });
+      const enforcedInsert = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+      expect(enforcedInsert.values).toHaveProperty('trustState', 'probation');
+
+      insertCalls = [];
+      process.env.PARTNER_TRUST_MODE = 'shadow';
+      await createPartner({
+        orgName: 'Shadow',
+        adminEmail: 'shadow@example.com',
+        adminName: 'Shadow',
+        passwordHash: 'hashed',
+        origin: { mcp: false },
+        status: 'active',
+      });
+      const shadowInsert = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+      expect(shadowInsert.values).toHaveProperty('trustState', 'probation');
+
+      insertCalls = [];
+      process.env.PARTNER_TRUST_MODE = 'off';
+      await createPartner({
+        orgName: 'Off',
+        adminEmail: 'off@example.com',
+        adminName: 'Off',
+        passwordHash: 'hashed',
+        origin: { mcp: false },
+        status: 'active',
+      });
+      const offInsert = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+      expect(offInsert.values).not.toHaveProperty('trustState');
+    } finally {
+      if (previousIsHosted === undefined) delete process.env.IS_HOSTED;
+      else process.env.IS_HOSTED = previousIsHosted;
+      if (previousMode === undefined) delete process.env.PARTNER_TRUST_MODE;
+      else process.env.PARTNER_TRUST_MODE = previousMode;
+    }
+  });
+
+  it('uses a caller transaction without opening a nested transaction', async () => {
+    const input = {
+      orgName: 'Outer Transaction',
+      adminEmail: 'outer@example.com',
+      adminName: 'Outer',
+      passwordHash: 'hashed',
+      origin: { mcp: false as const },
+      status: 'active' as const,
+    };
+    await db.transaction(async () => undefined);
+    const tx = dbTestState.lastTransaction;
+    if (!tx) throw new Error('test transaction was not captured');
+    vi.mocked(db.transaction).mockClear();
+    insertCalls = [];
+
+    const result = await Reflect.apply(createPartner, null, [input, { tx }]);
+
+    expect(result.adminUserId).toBe('users-id');
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(insertCalls.some((call) => (call.table as any).__t === 'users')).toBe(true);
+  });
+
+  it('inserts partner, admin user, admin role, partner-user link, default org, and default site in a single transaction', async () => {
+    const result = await createPartner({
+      orgName: 'Acme',
+      adminEmail: 'Alex@Acme.com',
+      adminName: 'Alex',
+      passwordHash: 'hashed',
+      origin: { mcp: false },
+      status: 'active',
+    });
+
+    // Basic return shape.
+    expect(result.partnerId).toBe('partners-id');
+    expect(result.adminRoleId).toBe('roles-id');
+    expect(result.adminUserId).toBe('users-id');
+    expect(result.orgId).toBe('organizations-id');
+    expect(result.siteId).toBe('sites-id');
+    expect(result.mcpOrigin).toBe(false);
+
+    // Confirm each expected table was inserted into at least once.
+    const tables = insertCalls.map((c: InsertCall) => (c.table as any).__t);
+    expect(tables).toContain('partners');
+    expect(tables).toContain('roles');
+    expect(tables).toContain('users');
+    expect(tables).toContain('partner_users');
+    expect(tables).toContain('organizations');
+    expect(tables).toContain('sites');
+
+    // Partner insert: status active, mcpOrigin false, email lowercased for billingEmail.
+    const partnerCall = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+    expect(partnerCall.values).toMatchObject({
+      name: 'Acme',
+      status: 'active',
+      mcpOrigin: false,
+    });
+    expect(partnerCall.values.mcpOriginIp ?? null).toBeNull();
+    expect(partnerCall.values.mcpOriginUserAgent ?? null).toBeNull();
+
+    const orgCall = insertCalls.find((c) => (c.table as any).__t === 'organizations')!;
+    expect(orgCall.values.currencyCode).toBe('CAD');
+
+    // User insert: email lowercased.
+    const userCall = insertCalls.find((c) => (c.table as any).__t === 'users')!;
+    expect(userCall.values.email).toBe('alex@acme.com');
+    expect(userCall.values.passwordHash).toBe('hashed');
+  });
+
+  // Issue #3608: new partners must opt IN to inbound email-to-ticket rather
+  // than inheriting the readers' absent-flag-means-true fallback (which
+  // exists solely as the pre-#3606 upgrade path for existing partners).
+  it('writes an explicit settings.ticketing.inbound.enabled=false for new partners', async () => {
+    await createPartner({
+      orgName: 'Acme',
+      adminEmail: 'alex@acme.com',
+      adminName: 'Alex',
+      passwordHash: 'hashed',
+      origin: { mcp: false },
+      status: 'active',
+    });
+
+    const partnerCall = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+    expect(partnerCall.values.settings).toMatchObject({
+      ticketing: { inbound: { enabled: false } },
+    });
+  });
+
+  // Spec: docs/superpowers/specs/2026-09-18-mfa-required-default-new-partners-design.md (D1)
+  it('writes settings.security.requireMfa=true for new partners (signup path)', async () => {
+    await createPartner({
+      orgName: 'Acme',
+      adminEmail: 'alex@acme.com',
+      adminName: 'Alex',
+      passwordHash: 'hashed',
+      origin: { mcp: false },
+      status: 'active',
+    });
+
+    const partnerCall = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+    expect(partnerCall.values.settings).toMatchObject({
+      security: { requireMfa: true },
+    });
+  });
+
+  it('inserts six system ticket_statuses rows inside the transaction', async () => {
+    await createPartner({
+      orgName: 'Acme',
+      adminEmail: 'alex@acme.com',
+      adminName: 'Alex',
+      passwordHash: 'hashed',
+      origin: { mcp: false },
+      status: 'active',
+    });
+
+    const statusCalls = insertCalls.filter((c) => (c.table as any).__t === 'ticket_statuses');
+    // seedSystemTicketStatuses does a single bulk insert
+    expect(statusCalls).toHaveLength(1);
+
+    expect(statusCalls[0]).toBeDefined();
+    const rows = statusCalls[0]!.values as unknown as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(6);
+
+    // All rows must be system rows linked to the partner
+    for (const row of rows) {
+      expect(row.partnerId).toBe('partners-id');
+      expect(row.isSystem).toBe(true);
+    }
+
+    // Verify each core state is present with the correct label and sortOrder
+    const byCore = Object.fromEntries(rows.map((r) => [r.coreStatus as string, r]));
+    expect(byCore['new']).toMatchObject({ name: 'New', sortOrder: 0 });
+    expect(byCore['open']).toMatchObject({ name: 'Open', sortOrder: 1 });
+    expect(byCore['pending']).toMatchObject({ name: 'Pending', sortOrder: 2 });
+    expect(byCore['on_hold']).toMatchObject({ name: 'On hold', sortOrder: 3 });
+    expect(byCore['resolved']).toMatchObject({ name: 'Resolved', sortOrder: 4 });
+    expect(byCore['closed']).toMatchObject({ name: 'Closed', sortOrder: 5 });
+  });
+
+  it('tags partner with mcp_origin fields and sets status=pending when origin.mcp is true', async () => {
+    const result = await createPartner({
+      orgName: 'Acme',
+      adminEmail: 'alex@acme.com',
+      adminName: 'Alex',
+      passwordHash: null,
+      origin: { mcp: true, ip: '1.2.3.4', userAgent: 'ClaudeAgent/1.0' },
+      status: 'pending',
+    });
+
+    expect(result.mcpOrigin).toBe(true);
+
+    const partnerCall = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+    expect(partnerCall.values).toMatchObject({
+      status: 'pending',
+      mcpOrigin: true,
+      mcpOriginIp: '1.2.3.4',
+      mcpOriginUserAgent: 'ClaudeAgent/1.0',
+    });
+
+    // passwordHash passed through as null for MCP-originated partners.
+    const userCall = insertCalls.find((c) => (c.table as any).__t === 'users')!;
+    expect(userCall.values.passwordHash).toBeNull();
+  });
+
+  it('tags partner with signup_ip/signup_user_agent (not mcp_origin_*) when origin.mcp is false', async () => {
+    await createPartner({
+      orgName: 'Acme',
+      adminEmail: 'alex@acme.com',
+      adminName: 'Alex',
+      passwordHash: 'hashed',
+      origin: { mcp: false, ip: '198.51.100.7', userAgent: 'ua' },
+      status: 'active',
+    });
+
+    const partnerCall = insertCalls.find((c) => (c.table as any).__t === 'partners')!;
+    expect(partnerCall.values).toMatchObject({
+      signupIp: '198.51.100.7',
+      signupUserAgent: 'ua',
+      mcpOriginIp: null,
+    });
+  });
+
+  // RMM-QA-164: the tenant Partner Admin copy must be created with
+  // force_mfa=true. The 2026-05-25-f migration ran before this row existed
+  // and never revisits it, so the literal on the insert is the invariant.
+  it('inserts the tenant Partner Admin role with forceMfa: true', async () => {
+    await createPartner({
+      orgName: 'Forced MFA Co',
+      adminEmail: 'forced@example.com',
+      adminName: 'Forced',
+      passwordHash: 'hashed',
+      origin: { mcp: false },
+      status: 'active',
+    });
+
+    const roleCall = insertCalls.find((c) => (c.table as any).__t === 'roles');
+    expect(roleCall).toBeDefined();
+    expect(roleCall!.values).toMatchObject({
+      scope: 'partner',
+      name: 'Partner Admin',
+      isSystem: true,
+      forceMfa: true,
+    });
+  });
+});

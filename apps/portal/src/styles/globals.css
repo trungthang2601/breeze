@@ -1,0 +1,566 @@
+/* Condensed document theme fonts (Task 12) — Barlow Condensed for headings,
+   DM Sans for body copy, scoped to [data-doc-theme='condensed'] documents
+   only (see the rule near the end of this file). Declared unconditionally: a
+   browser only fetches a face when a matched element actually uses it, so a
+   'classic' document downloads nothing. These @imports must stay above
+   `@import 'tailwindcss'` — Vite's postcss-import resolves @import at build
+   time and drops any @import that isn't first (same rule as apps/web). */
+/* Portal UI typefaces — "The Guest Ledger" world. Hanken Grotesk carries every
+   control, label and body string: a warm humanist grotesk, closer to a
+   front-desk register than to a dashboard. Literata (a screen-first serif
+   commissioned for long-form reading) carries page titles and the money
+   figures — the two places a service business speaks with its own voice.
+   These are the portal's faces, distinct from apps/web on purpose: the
+   technician's console and the client's ledger are different rooms. */
+@import '@fontsource/hanken-grotesk/400.css';
+@import '@fontsource/hanken-grotesk/500.css';
+@import '@fontsource/hanken-grotesk/600.css';
+@import '@fontsource/hanken-grotesk/700.css';
+@import '@fontsource/literata/500.css';
+@import '@fontsource/literata/600.css';
+@import '@fontsource/barlow-condensed/600.css';
+@import '@fontsource/dm-sans/400.css';
+@import '@fontsource/dm-sans/500.css';
+@import '@fontsource/dm-sans/700.css';
+
+@import 'tailwindcss';
+
+@plugin '@tailwindcss/forms';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --color-success: hsl(var(--success));
+  --color-success-foreground: hsl(var(--success-foreground));
+
+  --color-warning: hsl(var(--warning));
+  --color-warning-foreground: hsl(var(--warning-foreground));
+
+  /* "-on-tint" pairs: the base status tokens are tuned as BACKGROUNDS, but the
+     badges and banners use them as foregrounds over a 10%-alpha wash of
+     themselves. That combination measured 1.92:1-3.30:1 (all failing WCAG AA
+     1.4.3, which applies here because every one of these is 12px text). These
+     darkened variants are the foreground to use on any 10%-alpha tint; the base
+     token stays the fill color. Ratios asserted in tokenContrast.test.ts. */
+  --color-success-on-tint: hsl(var(--success-on-tint));
+  --color-warning-on-tint: hsl(var(--warning-on-tint));
+  --color-destructive-on-tint: hsl(var(--destructive-on-tint));
+  --color-primary-on-tint: hsl(var(--primary-on-tint));
+
+  --font-sans: 'Hanken Grotesk', ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', Roboto, sans-serif;
+  --font-display: 'Literata', Georgia, 'Times New Roman', serif;
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-border, currentcolor);
+  }
+}
+
+@layer base {
+  /* "The Guest Ledger" palette. One warm hue family (38-42°, plaster and
+     linen) carries every neutral; the working ink is a deep service green
+     (155°) rather than SaaS blue. Status hues are warm-shifted to sit in the
+     same room: a brick red, a spruce green, an amber. No pure grey anywhere —
+     every neutral is tinted toward the paper. The status, button, body and
+     hairline pairs (light theme) are asserted in tokenContrast.test.ts. */
+  :root {
+    --background: 40 28% 94%;
+    --foreground: 30 12% 12%;
+    --card: 42 45% 99%;
+    --card-foreground: 30 12% 12%;
+    --popover: 42 45% 99%;
+    --popover-foreground: 30 12% 12%;
+    --primary: 155 32% 24%;
+    --primary-foreground: 42 45% 97%;
+    --secondary: 40 24% 90%;
+    --secondary-foreground: 30 12% 14%;
+    --muted: 40 24% 90%;
+    --muted-foreground: 32 8% 36%;
+    --accent: 40 26% 88%;
+    --accent-foreground: 30 12% 12%;
+    --destructive: 8 62% 40%;
+    --destructive-foreground: 42 45% 98%;
+    --success: 152 45% 26%;
+    --success-foreground: 0 0% 100%;
+    --warning: 35 90% 44%;
+    --warning-foreground: 28 90% 12%;
+
+    /* Foregrounds for text on a 10%-alpha tint. See the @theme block above. */
+    --success-on-tint: 152 45% 25%;
+    --warning-on-tint: 33 85% 28%;
+    --destructive-on-tint: 8 62% 38%;
+    --primary-on-tint: 155 32% 24%;
+
+    /* Visible hairline against the plaster ground (1.4:1 floor asserted in
+       tokenContrast.test.ts — the old 1.23:1 hairline hid the signature
+       checkbox from actual customers). */
+    --border: 38 16% 78%;
+    --input: 38 16% 74%;
+    --ring: 155 32% 30%;
+    --radius: 0.75rem;
+  }
+
+  /* Dark: the same room after hours — warm charcoal, never blue-black. The
+     neutrals keep the 30-40° tint; the working green and the status hues
+     lighten to carry text on dark surfaces. Kept in parity with the media
+     block below by themeParity.test.ts. */
+  .dark {
+    --background: 30 10% 9%;
+    --foreground: 40 26% 92%;
+    --card: 32 10% 12%;
+    --card-foreground: 40 26% 92%;
+    --popover: 32 10% 12%;
+    --popover-foreground: 40 26% 92%;
+    --primary: 152 30% 64%;
+    --primary-foreground: 155 40% 10%;
+    --secondary: 30 8% 18%;
+    --secondary-foreground: 40 26% 92%;
+    --muted: 30 8% 18%;
+    --muted-foreground: 36 12% 68%;
+    --accent: 30 9% 21%;
+    --accent-foreground: 40 26% 92%;
+    --destructive: 8 58% 44%;
+    --destructive-foreground: 42 45% 98%;
+    --success: 152 38% 58%;
+    --success-foreground: 150 60% 8%;
+    --warning: 38 85% 60%;
+    --warning-foreground: 28 90% 10%;
+
+    /* On a dark surface the tint wash is dark, so these lighten instead of
+       darkening. Same contract, mirrored. */
+    --success-on-tint: 152 42% 68%;
+    --warning-on-tint: 40 82% 70%;
+    --destructive-on-tint: 8 75% 74%;
+    --primary-on-tint: 152 38% 70%;
+
+    --border: 30 8% 24%;
+    --input: 30 8% 26%;
+    --ring: 152 30% 52%;
+  }
+
+  /* The dark palette above was dead code: nothing in the portal ever added
+     `.dark`, there was no toggle and no media query, so a viewer whose OS is
+     in dark mode got a full-white page. Honour the OS setting. `.dark` stays
+     as the explicit opt-in and `.light` as the opt-out. The two blocks are
+     asserted identical by themeParity.test.ts, so this copy cannot drift. */
+  @media (prefers-color-scheme: dark) {
+    :root:not(.light) {
+      --background: 30 10% 9%;
+      --foreground: 40 26% 92%;
+      --card: 32 10% 12%;
+      --card-foreground: 40 26% 92%;
+      --popover: 32 10% 12%;
+      --popover-foreground: 40 26% 92%;
+      --primary: 152 30% 64%;
+      --primary-foreground: 155 40% 10%;
+      --secondary: 30 8% 18%;
+      --secondary-foreground: 40 26% 92%;
+      --muted: 30 8% 18%;
+      --muted-foreground: 36 12% 68%;
+      --accent: 30 9% 21%;
+      --accent-foreground: 40 26% 92%;
+      --destructive: 8 58% 44%;
+      --destructive-foreground: 42 45% 98%;
+      --success: 152 38% 58%;
+      --success-foreground: 150 60% 8%;
+      --warning: 38 85% 60%;
+      --warning-foreground: 28 90% 10%;
+
+      /* On a dark surface the tint wash is dark, so these lighten instead of
+         darkening. Same contract, mirrored. */
+      --success-on-tint: 152 42% 68%;
+      --warning-on-tint: 40 82% 70%;
+      --destructive-on-tint: 8 75% 74%;
+      --primary-on-tint: 152 38% 70%;
+
+      --border: 30 8% 24%;
+      --input: 30 8% 26%;
+      --ring: 152 30% 52%;
+    }
+  }
+}
+
+/*
+  Curated portal chrome accents (packages/shared/src/types/portalChromeAccent.ts,
+  PORTAL_CHROME_ACCENTS) — GENERATED from that spec's `light`/`dark` HSL
+  triplets verbatim; do not hand-edit a value here without also updating the
+  spec (or the reverse). apps/portal/src/styles/chromeAccents.test.ts parses
+  this file and fails on any drift from PORTAL_CHROME_ACCENTS.
+
+  'spruce' is the default and needs no override — the base :root/.dark/media
+  blocks above already ARE spruce. Each other key gets three rules: a light
+  override selected by `[data-accent]` alone, and two dark overrides (the
+  explicit `.dark` opt-in and the `prefers-color-scheme` media opt-in) that
+  themeParity.test.ts asserts stay identical to each other, the same contract
+  the base palette keeps. `--primary-on-tint` and `--ring` ride along so the
+  score rule, links and focus ring pick up the accent too; every other token
+  (status colours, neutrals, hairline) is untouched — accents are chrome-only.
+*/
+:root[data-accent='ink'] {
+  --primary: 30 12% 18%;
+  --primary-foreground: 42 45% 97%;
+  --primary-on-tint: 30 12% 18%;
+  --ring: 30 12% 26%;
+}
+:root[data-accent='oxblood'] {
+  --primary: 8 55% 30%;
+  --primary-foreground: 42 45% 97%;
+  --primary-on-tint: 8 55% 30%;
+  --ring: 8 55% 36%;
+}
+:root[data-accent='navy'] {
+  --primary: 222 40% 28%;
+  --primary-foreground: 42 45% 97%;
+  --primary-on-tint: 222 40% 28%;
+  --ring: 222 40% 34%;
+}
+:root[data-accent='plum'] {
+  --primary: 300 30% 26%;
+  --primary-foreground: 42 45% 97%;
+  --primary-on-tint: 300 30% 26%;
+  --ring: 300 30% 32%;
+}
+:root[data-accent='bronze'] {
+  --primary: 30 55% 26%;
+  --primary-foreground: 42 45% 97%;
+  --primary-on-tint: 30 55% 26%;
+  --ring: 30 55% 32%;
+}
+:root[data-accent='teal'] {
+  --primary: 190 45% 24%;
+  --primary-foreground: 42 45% 97%;
+  --primary-on-tint: 190 45% 24%;
+  --ring: 190 45% 30%;
+}
+:root[data-accent='forest'] {
+  --primary: 140 40% 20%;
+  --primary-foreground: 42 45% 97%;
+  --primary-on-tint: 140 40% 20%;
+  --ring: 140 40% 26%;
+}
+
+.dark[data-accent='ink'] {
+  --primary: 38 20% 78%;
+  --primary-foreground: 30 12% 10%;
+  --primary-on-tint: 38 22% 82%;
+  --ring: 38 20% 64%;
+}
+.dark[data-accent='oxblood'] {
+  --primary: 10 45% 68%;
+  --primary-foreground: 8 50% 10%;
+  --primary-on-tint: 10 50% 74%;
+  --ring: 10 45% 56%;
+}
+.dark[data-accent='navy'] {
+  --primary: 218 38% 70%;
+  --primary-foreground: 222 45% 10%;
+  --primary-on-tint: 218 42% 76%;
+  --ring: 218 38% 58%;
+}
+.dark[data-accent='plum'] {
+  --primary: 300 26% 70%;
+  --primary-foreground: 300 35% 10%;
+  --primary-on-tint: 300 30% 76%;
+  --ring: 300 26% 58%;
+}
+.dark[data-accent='bronze'] {
+  --primary: 34 50% 66%;
+  --primary-foreground: 30 55% 10%;
+  --primary-on-tint: 34 55% 72%;
+  --ring: 34 50% 54%;
+}
+.dark[data-accent='teal'] {
+  --primary: 188 38% 64%;
+  --primary-foreground: 190 45% 10%;
+  --primary-on-tint: 188 42% 70%;
+  --ring: 188 38% 52%;
+}
+.dark[data-accent='forest'] {
+  --primary: 138 32% 64%;
+  --primary-foreground: 140 40% 10%;
+  --primary-on-tint: 138 36% 70%;
+  --ring: 138 32% 52%;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-accent='ink']:not(.light) {
+    --primary: 38 20% 78%;
+    --primary-foreground: 30 12% 10%;
+    --primary-on-tint: 38 22% 82%;
+    --ring: 38 20% 64%;
+  }
+  :root[data-accent='oxblood']:not(.light) {
+    --primary: 10 45% 68%;
+    --primary-foreground: 8 50% 10%;
+    --primary-on-tint: 10 50% 74%;
+    --ring: 10 45% 56%;
+  }
+  :root[data-accent='navy']:not(.light) {
+    --primary: 218 38% 70%;
+    --primary-foreground: 222 45% 10%;
+    --primary-on-tint: 218 42% 76%;
+    --ring: 218 38% 58%;
+  }
+  :root[data-accent='plum']:not(.light) {
+    --primary: 300 26% 70%;
+    --primary-foreground: 300 35% 10%;
+    --primary-on-tint: 300 30% 76%;
+    --ring: 300 26% 58%;
+  }
+  :root[data-accent='bronze']:not(.light) {
+    --primary: 34 50% 66%;
+    --primary-foreground: 30 55% 10%;
+    --primary-on-tint: 34 55% 72%;
+    --ring: 34 50% 54%;
+  }
+  :root[data-accent='teal']:not(.light) {
+    --primary: 188 38% 64%;
+    --primary-foreground: 190 45% 10%;
+    --primary-on-tint: 188 42% 70%;
+    --ring: 188 38% 52%;
+  }
+  :root[data-accent='forest']:not(.light) {
+    --primary: 138 32% 64%;
+    --primary-foreground: 140 40% 10%;
+    --primary-on-tint: 138 36% 70%;
+    --ring: 138 32% 52%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-sans);
+    /* Pin lining figures regardless of face default; the portal is full of
+       dates, totals and balances, and columns opt into tabular spacing via
+       .text-figures. */
+    font-variant-numeric: lining-nums;
+  }
+  /* Lets the UA theme scrollbars, form controls and the canvas to match. */
+  :root {
+    color-scheme: light;
+  }
+  :root.dark {
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not(.light) {
+      color-scheme: dark;
+    }
+  }
+}
+
+/* White-label branding support - these can be overridden via CSS variables */
+:root {
+  --brand-primary: var(--primary);
+  --brand-primary-foreground: var(--primary-foreground);
+  --brand-logo-url: none;
+  --brand-name: 'Customer Portal';
+}
+
+@layer components {
+  /* ---- The Guest Ledger voice ---------------------------------------- */
+
+  /* Page titles and money figures: the two places the portal speaks in its
+     own serif. Everything else stays in the grotesk. */
+  .font-display {
+    font-family: var(--font-display);
+  }
+
+  /* Amounts, dates and any column of figures: equal-width digits so a ledger
+     column actually aligns. Falls back gracefully where the face lacks the
+     feature. */
+  .text-figures {
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+
+  /* Row hover wash for the ledgers. The hairline rules themselves come from
+     `divide-y` on the tbody (see ROW in components/portal/ui.tsx). */
+  .ledger-row {
+    @apply transition-colors duration-150;
+  }
+  .ledger-row:hover {
+    background-color: hsl(var(--accent) / 0.55);
+  }
+
+  /* The one authored motion moment: page content settles onto the desk.
+     240ms, ease-out, 6px of travel — replayed per client-side navigation by
+     the view-transitions router, disabled wholesale for reduced motion. */
+  @keyframes settle {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .settle-in {
+    animation: settle 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .settle-in {
+      animation: none;
+    }
+  }
+
+  /*
+   * rich_text quote blocks (quoteBlocks.tsx) render sanitized author HTML via
+   * dangerouslySetInnerHTML — the API guarantees only richTextSanitize.ts's fixed
+   * subset (p/br/strong/em/u/h3/h4/ul/ol/li/a + table/thead/tbody/tfoot/tr/th/td)
+   * ever reaches this class. Tailwind's
+   * base reset strips list markers and heading weight, so restore the minimal
+   * styling that subset needs.
+   */
+  .quote-rich-text p {
+    @apply mb-2 last:mb-0;
+  }
+  .quote-rich-text h3 {
+    @apply mb-1.5 mt-4 text-base font-semibold text-foreground first:mt-0;
+  }
+  .quote-rich-text h4 {
+    @apply mb-1 mt-3 text-sm font-semibold text-foreground first:mt-0;
+  }
+  .quote-rich-text ul {
+    @apply mb-2 list-disc space-y-1 pl-5 last:mb-0;
+  }
+  .quote-rich-text ol {
+    @apply mb-2 list-decimal space-y-1 pl-5 last:mb-0;
+  }
+  /* Tailwind's base reset neutralizes b/strong/em weight+style in some resets;
+   * restore the emphasis the sanitizer allows so bold/italic/underline in an
+   * author's rich_text renders with the same fidelity as the in-app preview. */
+  .quote-rich-text strong,
+  .quote-rich-text b {
+    @apply font-semibold text-foreground;
+  }
+  .quote-rich-text em,
+  .quote-rich-text i {
+    @apply italic;
+  }
+  .quote-rich-text u {
+    @apply underline underline-offset-2;
+  }
+  .quote-rich-text a {
+    @apply text-primary underline underline-offset-2;
+  }
+  /* Tables inside rich_text (issue #3484). The portal deliberately does not
+   * pull in Tailwind's typography plugin (apps/web gets table styling from
+   * `prose` for free), so the grid has to be drawn by hand here — without it a
+   * customer-facing proposal shows a borderless run of cells. Kept visually in
+   * step with the PDF renderer's table (richTextPdf.ts): tinted header row,
+   * hairline borders, no zebra. */
+  .quote-rich-text table {
+    @apply mb-3 w-full table-auto border-collapse text-left text-sm last:mb-0;
+  }
+  .quote-rich-text th,
+  .quote-rich-text td {
+    @apply border border-border px-2 py-1 align-top;
+  }
+  .quote-rich-text th {
+    @apply bg-muted font-semibold text-foreground;
+  }
+}
+
+/* Condensed document theme (Task 12) — plain CSS vars/selectors, not @theme
+   tokens. Scoped to [data-doc-theme='condensed'], stamped by documentShell's
+   DocumentPaper on the rendered quote/invoice root, so it never touches the
+   rest of the portal. */
+[data-doc-theme='condensed'] {
+  font-family: 'DM Sans', var(--font-sans, system-ui), sans-serif;
+}
+[data-doc-theme='condensed'] :is(h1, h2, h3, h4, th) {
+  font-family: 'Barlow Condensed', 'DM Sans', sans-serif;
+  letter-spacing: 0.01em;
+}
+
+/* Partner brand accent for proposal/invoice documents. `--doc-accent` arrives
+   from the layout's nonced <style> element (see lib/docAccent.ts for why it
+   cannot be a style attribute); these classes are its only consumers, and the
+   `var()` fallback keeps documents sensible when a partner has set no colour. */
+.doc-accent-bg {
+  background-color: var(--doc-accent, hsl(var(--primary)));
+}
+.doc-accent-text {
+  color: var(--doc-accent, hsl(var(--primary)));
+}
+.doc-accent-border {
+  border-color: var(--doc-accent, hsl(var(--primary)));
+}
+
+/* The typed-name signature preview (a class, not an inline fontFamily — see
+   lib/docAccent.ts). No webfont is loaded for it, so on platforms without one
+   of these faces it degrades to the generic cursive keyword. */
+.signature-preview {
+  font-family: 'Snell Roundhand', 'Brush Script MT', 'Segoe Script', 'Apple Chancery', cursive;
+}
+
+/* Documents are paper. The chrome around them follows the OS colour scheme, but
+   a proposal or invoice carries partner brand colours chosen against white and
+   is what the customer prints or forwards to their accountant, so pin it. */
+[data-doc-theme] {
+  /* The ground stays true white — this is what the customer prints — but the
+     ink, rules and washes are authored warm neutrals from the portal's own
+     30-40° family. The block previously carried the scaffold's stock cool-slate
+     values verbatim, which put the one surface a customer forwards to their
+     accountant outside the No-Grey Rule the rest of the product lives by. */
+  --background: 0 0% 100%;
+  --foreground: 30 12% 13%;
+  --card: 0 0% 100%;
+  --card-foreground: 30 12% 13%;
+  --muted: 40 22% 96%;
+  --muted-foreground: 32 8% 36%;
+  --border: 38 14% 82%;
+  color-scheme: light;
+  background-color: hsl(var(--card));
+  color: hsl(var(--foreground));
+}

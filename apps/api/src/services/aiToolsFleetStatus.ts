@@ -1,0 +1,236 @@
+/**
+ * AI Deployment-Invite Funnel Tool
+ *
+ * get_invite_funnel (Tier 1): Returns per-tenant deployment-invite funnel
+ * metrics for the MCP bootstrap flow. The agent polls this during a deployment
+ * so it can report "3 of 5 devices online so far" back to the user.
+ *
+ * Named `get_fleet_status` until #5362: the name read as a fleet overview, so
+ * the model picked it for "Show fleet status" and narrated "your fleet is
+ * empty" from this tool's zeros on a 51-device tenant that had never used
+ * invites. The name is what wins tool selection — keep it funnel-specific.
+ *
+ * The response shape is intentionally minimal and bootstrap-focused: it does
+ * not overlap with `get_fleet_health` (reliability scoring) or `query_devices`
+ * (general search). It's the companion read tool for `send_deployment_invites`.
+ *
+ * Scoped by partner via the authed API key. Readonly-scope keys can call it
+ * (it's a Tier 1 read tool), so a pre-payment tenant can still see an empty
+ * funnel snapshot. Task 6.2 of the MCP bootstrap plan.
+ */
+import { and, eq, inArray } from 'drizzle-orm';
+import { db } from '../db';
+import { deploymentInvites } from '../db/schema/deploymentInvites';
+import { enrollmentKeys } from '../db/schema/orgs';
+import { devices } from '../db/schema/devices';
+import type { AuthContext } from '../middleware/auth';
+import { deviceScopeCondition, filterToDeviceScope } from './aiToolsSiteScope';
+import type { AiTool, AiToolTier } from './aiTools';
+
+export interface InviteFunnel {
+  total_invited: number;
+  invites_clicked: number;
+  devices_enrolled: number;
+  devices_online: number;
+  devices_pending: number;
+  recent_enrollments: Array<{
+    device_id: string;
+    hostname: string;
+    os: string;
+    invited_email: string;
+    enrolled_at: string;
+  }>;
+}
+
+const RECENT_ENROLLMENTS_LIMIT = 10;
+
+/**
+ * Compute the invite funnel for a caller. Exported so route/integration
+ * tests can assert behavior directly without going through the aiTools dispatch.
+ *
+ * MCP-OAUTH-06 axis separation: the scope predicate is chosen from the caller's
+ * own axis and NOT left to RLS alone.
+ *  - organization scope → filter by the caller's `org_id` (never partner-wide,
+ *    which would leak sibling-org invite counts to an org-scoped bearer).
+ *  - partner scope → aggregate by `partner_id` across the whole partner.
+ *  - anything else (system / missing axis) is rejected: fleet status is a
+ *    per-tenant bootstrap tool with no well-defined system-wide meaning.
+ */
+export async function computeInviteFunnel(auth: AuthContext): Promise<InviteFunnel> {
+  let inviteScopeCondition;
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) {
+      throw new Error('get_invite_funnel: organization scope requires an org context');
+    }
+    inviteScopeCondition = eq(deploymentInvites.orgId, auth.orgId);
+  } else if (auth.scope === 'partner') {
+    if (!auth.partnerId) {
+      throw new Error('get_invite_funnel: partner scope requires a partner context');
+    }
+    inviteScopeCondition = eq(deploymentInvites.partnerId, auth.partnerId);
+  } else {
+    throw new Error(`get_invite_funnel: unsupported auth scope '${auth.scope}'`);
+  }
+
+  // SR5-18: a site-restricted caller must additionally be narrowed by the
+  // enrollment key's site (invites carry no site of their own; their
+  // enrollment key does). Invites on an org-wide key (site_id NULL) are
+  // fail-closed out for a site-restricted caller.
+  const rawInvites = await db
+    .select({
+      id: deploymentInvites.id,
+      email: deploymentInvites.invitedEmail,
+      status: deploymentInvites.status,
+      clickedAt: deploymentInvites.clickedAt,
+      enrolledAt: deploymentInvites.enrolledAt,
+      deviceId: deploymentInvites.deviceId,
+      keySiteId: enrollmentKeys.siteId,
+    })
+    .from(deploymentInvites)
+    .leftJoin(enrollmentKeys, eq(deploymentInvites.enrollmentKeyId, enrollmentKeys.id))
+    .where(inviteScopeCondition);
+
+  // Site sub-axis (app-layer only; RLS does NOT enforce it). Drop invites whose
+  // enrollment key is outside the caller's site allowlist so the top-of-funnel
+  // totals/clicks reflect only site-visible invites. No-op for unrestricted
+  // callers (canAccessSite absent).
+  const siteScopedInvites = auth.canAccessSite
+    ? rawInvites.filter((i) => auth.canAccessSite!(i.keySiteId))
+    : rawInvites;
+
+  // Exact-device axis (#6096), independent of the site axis above. A run bound
+  // to a frozen device set may only count invites that landed on one of ITS
+  // devices: a sibling's invite is another device's row, and an invite with no
+  // device yet is attributable to none of them, so both drop out of the
+  // top-of-funnel totals. A device-LESS analysis run carries this axis with no
+  // site axis at all, which is why it cannot ride on `canAccessSite`.
+  const invites = auth.allowedDeviceIds
+    ? filterToDeviceScope(
+      auth,
+      siteScopedInvites.filter((i) => i.deviceId !== null),
+      (i) => i.deviceId,
+    )
+    : siteScopedInvites;
+
+  const total_invited = invites.length;
+  // `clicked` count uses status OR a non-null clickedAt so a row that has
+  // advanced past clicked (e.g. `enrolled`) still counts in the clicked funnel.
+  const invites_clicked = invites.filter(
+    (i) => i.status === 'clicked' || i.status === 'enrolled' || i.clickedAt !== null,
+  ).length;
+  const enrolledWithDevice = invites.filter((i) => i.deviceId !== null);
+  const deviceIds = enrolledWithDevice
+    .map((i) => i.deviceId)
+    .filter((x): x is string => typeof x === 'string');
+
+  const allDeviceRows = deviceIds.length === 0
+    ? []
+    : await db
+        .select({
+          id: devices.id,
+          hostname: devices.hostname,
+          osType: devices.osType,
+          status: devices.status,
+          orgId: devices.orgId,
+          siteId: devices.siteId,
+        })
+        .from(devices)
+        .where(
+          and(
+            inArray(devices.id, deviceIds),
+            // Exact-device axis: a device-bound/frozen-set run never reads a
+            // sibling device row, even one an in-scope invite points at.
+            deviceScopeCondition(auth, devices.id),
+            // Defense-in-depth: partner scope already implied by invite row, but
+            // re-scope via the device's org->partner link would require a join;
+            // skip it here — RLS on `devices` + the explicit inArray on invite-
+            // linked ids makes cross-tenant leakage impossible in practice.
+          ),
+        );
+
+  // Both app-layer axes (RLS enforces neither): a site-restricted caller must
+  // not see enrolled devices in sites outside their allowlist, and a run with a
+  // frozen device set must not see devices outside it. No-op for unrestricted
+  // callers (neither axis present).
+  const deviceRows = filterToDeviceScope(
+    auth,
+    auth?.canAccessSite ? allDeviceRows.filter((d) => auth.canAccessSite!(d.siteId)) : allDeviceRows,
+    (d) => d.id,
+  );
+
+  // "Is this caller narrowed on ANY device-bearing axis?" — the enrolled/recent
+  // counts below fail closed for a narrowed caller and keep their pre-existing
+  // lenient behaviour (count an enrolled invite whose device row is gone) only
+  // for a genuinely unrestricted one.
+  const deviceNarrowed = Boolean(auth?.canAccessSite || auth.allowedDeviceIds);
+
+  const byDeviceId = new Map(deviceRows.map((d) => [d.id, d] as const));
+  // Enrolled count. Only a NARROWED caller narrows to in-scope devices (fail
+  // closed). Unrestricted callers keep prior behavior: an enrolled invite
+  // counts even if its device row is missing (e.g. the device was deleted after
+  // enrollment) — `byDeviceId.has` would wrongly drop that case.
+  const devices_enrolled = invites.filter(
+    (i) =>
+      i.status === 'enrolled' &&
+      i.deviceId !== null &&
+      (deviceNarrowed ? byDeviceId.has(i.deviceId) : true),
+  ).length;
+  const devices_online = deviceRows.filter((d) => d.status === 'online').length;
+  const devices_pending = deviceRows.filter((d) => d.status === 'pending').length;
+
+  const recent_enrollments = enrolledWithDevice
+    .filter((i) => i.enrolledAt !== null)
+    // Narrowed callers: drop enrollments whose device is out of scope
+    // (filtered out of deviceRows) rather than surfacing an "unknown" stub.
+    .filter((i) => (deviceNarrowed ? byDeviceId.has(i.deviceId!) : true))
+    .sort((a, b) => (b.enrolledAt?.getTime() ?? 0) - (a.enrolledAt?.getTime() ?? 0))
+    .slice(0, RECENT_ENROLLMENTS_LIMIT)
+    .map((i) => {
+      const d = byDeviceId.get(i.deviceId!);
+      return {
+        device_id: i.deviceId!,
+        hostname: d?.hostname ?? 'unknown',
+        os: d?.osType ?? 'unknown',
+        invited_email: i.email,
+        enrolled_at: i.enrolledAt!.toISOString(),
+      };
+    });
+
+  return {
+    total_invited,
+    invites_clicked,
+    devices_enrolled,
+    devices_online,
+    devices_pending,
+    recent_enrollments,
+  };
+}
+
+export function registerFleetStatusTools(aiTools: Map<string, AiTool>): void {
+  aiTools.set('get_invite_funnel', {
+    tier: 1 as AiToolTier,
+    domain: 'admin',
+    searchHint: 'deployment invites sent, clicked and enrolled, recent enrollments and online conversions',
+    definition: {
+      name: 'get_invite_funnel',
+      description:
+        "Return deployment invites sent/clicked/enrolled/online and 10 recent enrollments. NOT a fleet overview: use query_devices or get_fleet_health for fleet counts/status. Devices enrolled without invites yield zeros here; this does NOT mean the fleet is empty.",
+      input_schema: {
+        type: 'object' as const,
+        properties: {},
+      },
+    },
+    handler: async (_input: Record<string, unknown>, auth: AuthContext) => {
+      try {
+        // Scope validation (org vs partner axis, malformed rejection) lives in
+        // computeInviteFunnel so it holds for every caller — see MCP-OAUTH-06.
+        const funnel = await computeInviteFunnel(auth);
+        return JSON.stringify({ invite_funnel: funnel });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Internal error';
+        console.error('[fleet:get_invite_funnel]', message, err);
+        return JSON.stringify({ error: 'Operation failed. Check server logs for details.' });
+      }
+    },
+  });
+}

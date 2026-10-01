@@ -1,0 +1,276 @@
+import { z } from 'zod';
+import { envFlag } from '../../utils/envFlag';
+import type { StepUpOperation } from '../../services/mfaStepUpGrant';
+import { MAINTENANCE_MAX_BULK_DEVICES, MAINTENANCE_MAX_DURATION_HOURS } from '../../services/maintenanceStepUpLimits';
+
+// ============================================
+// Feature flags
+// ============================================
+
+export const ENABLE_REGISTRATION = envFlag('ENABLE_REGISTRATION', false);
+export const ENABLE_2FA = envFlag('ENABLE_2FA', true);
+
+if (!ENABLE_2FA && process.env.NODE_ENV !== 'test') {
+  console.warn(
+    '[auth] WARNING: ENABLE_2FA=false. This disables ALL requireMfa() step-up ' +
+    'gates across the API (admin/abuse, tenant export/erasure, remote device ' +
+    'control, sensitive-data, API keys, SSO, backups/DR) — not just the ' +
+    '/auth/mfa endpoints. Do not use this configuration in production.',
+  );
+}
+
+// ============================================
+// Schemas
+// ============================================
+
+export const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1)
+});
+
+export const registerSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  name: z.string().min(1).max(255)
+});
+
+export const registerPartnerSchema = z.object({
+  companyName: z.string().min(2).max(255),
+  email: z.string().email(),
+  password: z.string().min(8),
+  name: z.string().min(1).max(255),
+  acceptTerms: z.boolean().refine(val => val === true, {
+    message: 'You must accept the terms of service'
+  })
+});
+
+// TOTP/SMS codes are 6 digits; recovery codes are `XXXX-XXXX` (8 [A-Z0-9]
+// with a hyphen). Accept either shape here; the handler routes on `method`.
+const totpOrSmsCode = /^\d{6}$/;
+const recoveryCode = /^[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
+export const mfaVerifySchema = z.object({
+  code: z.string().refine(
+    (v) => totpOrSmsCode.test(v.trim()) || recoveryCode.test(v.trim()),
+    { message: 'Invalid code format' },
+  ),
+  tempToken: z.string().optional(),
+  method: z.enum(['totp', 'sms', 'recovery']).optional(),
+  // SR2-20: presented on setup-confirm (Case 2 — no tempToken) so an
+  // already-protected account's TOTP-add can satisfy the existing-factor
+  // step-up gate. Ignored on Case 1 (login completion).
+  stepUpGrantId: z.string().optional(),
+  // #4018: presented on setup-confirm (Case 2) by a PASSWORDLESS SSO account,
+  // which has no password to satisfy the enrollment step-up. Consumed there as
+  // the terminal write of the /mfa/setup flow. Ignored on Case 1 (login
+  // completion — that path is pre-auth and mints no factor).
+  ssoReauthGrantId: z.string().uuid().optional(),
+});
+
+export const phoneVerifySchema = z.object({
+  phoneNumber: z.string().regex(/^\+[1-9]\d{6,14}$/, 'Invalid phone number. Use E.164 format (e.g. +14155551234)'),
+  currentPassword: z.string().min(1).max(256)
+});
+
+export const phoneConfirmSchema = z.object({
+  phoneNumber: z.string().regex(/^\+[1-9]\d{6,14}$/),
+  code: z.string().length(6),
+  currentPassword: z.string().min(1).max(256),
+  // SR2-20/C1: an ALREADY-PROTECTED account cannot verify/replace its phone
+  // with a password alone — that would let a stolen-token + phished-password
+  // attacker swap in their own number and then pass the SMS step-up. Required
+  // (via enforceExistingFactorStepUp) only when a factor already exists; initial
+  // enrollment (no factor yet) still passes password-only.
+  stepUpGrantId: z.string().optional()
+});
+
+export const smsMfaEnableSchema = z.object({
+  currentPassword: z.string().min(1).max(256),
+  // SR2-20: existing-factor step-up grant required when the account is
+  // already MFA-protected (see enforceExistingFactorStepUp in ./helpers).
+  stepUpGrantId: z.string().optional()
+});
+
+export const smsSendSchema = z.object({
+  tempToken: z.string()
+});
+
+export const forgotPasswordSchema = z.object({
+  // SR2-22: trim before validating so a paste-padded address ("  a@b.com ")
+  // reaches the handler and is normalized identically to every other address —
+  // rather than 400ing pre-handler, which would itself be an input-shape oracle
+  // distinct from the uniform accepted response.
+  email: z.string().trim().email()
+});
+
+export const resetPasswordSchema = z.object({
+  token: z.string(),
+  password: z.string().min(8)
+});
+
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(8)
+});
+
+export const mfaEnableSchema = z.object({
+  code: z.string().length(6)
+});
+
+// SR2-20: `POST /auth/mfa/step-up` proof-of-existing-factor request. Accepts
+// ALL factor types (not just the account's primary method) so a passkey-only
+// user is never locked out of adding a second factor. The passkey assertion
+// is shape-checked here only (`.passthrough()`) and cryptographically
+// verified downstream by verifyPasskeyAuthentication (passkeys.ts) — this
+// file deliberately does NOT import passkeys.ts's webAuthnCredentialSchema to
+// avoid a schemas.ts <-> passkeys.ts import cycle.
+const stepUpSixDigit = z.string().refine((v) => /^\d{6}$/.test(v.trim()), { message: 'Invalid code' });
+const stepUpAssertion = z.object({ id: z.string().min(1) }).passthrough();
+// Which grant the proven factor mints. Defaults to the original add_factor so
+// existing clients are untouched; register_approver_device gates the
+// /authenticator register routes (#2707).
+//
+// This is the CLIENT-REQUESTABLE allowlist; the service's StepUpOperation union
+// is legitimately wider, so this array is deliberately NOT exhaustive. The
+// `satisfies` target links it to that union so a value here can never be one
+// that matches no grant type.
+//
+// #5601: `approval_decide` is excluded for the same structural reason. It is
+// the credential that clears the four_eyes sole-operator L3 passkey gate; it
+// may be minted ONLY by `decideApprovalRequest`, after a real approver-device
+// ceremony it verified itself. Letting a client request one here would turn an
+// ordinary TOTP/SMS step-up into a bypass of that gate — i.e. the L3 passkey
+// requirement could be satisfied without a passkey.
+//
+// #4018: `enroll_first_factor` is excluded BY THE COMPILER, not by convention.
+// That grant is the sole output of the SSO re-auth callback, which mints it
+// only after a forced IdP round-trip proves identity for a PASSWORDLESS
+// account; letting a client request one here would turn a re-authentication
+// proof into a checkbox for anyone who can already satisfy step-up.
+//
+// A plain `satisfies readonly StepUpOperation[]` would NOT have stopped that —
+// it only constrains membership, so appending 'enroll_first_factor' still
+// typechecks and the exclusion would rest entirely on schemas.test.ts catching
+// it. Narrowing the target with `Exclude<>` makes appending it a compile error.
+// The test stays as the readable statement of intent.
+const STEP_UP_OPERATIONS = [
+  'add_factor',
+  'rotate_recovery_codes',
+  'delete_passkey',
+  'register_approver_device',
+  'agent_rollback',
+  'device_maintenance',
+  'device_move_org',
+  'ai_script_lane_grant',
+] as const satisfies readonly Exclude<
+  StepUpOperation,
+  'enroll_first_factor' | 'approval_decide'
+>[];
+const stepUpOperation = z
+  .enum(STEP_UP_OPERATIONS)
+  .default('add_factor');
+export const rollbackStepUpResource = z.object({
+  deviceId: z.string().uuid(),
+  currentVersion: z.string().min(1).max(100),
+  targetVersion: z.string().min(1).max(100),
+  reason: z.string().trim().min(1).max(1000),
+});
+// RMM-QA-176 D11: the maintenance binding. Mirrors maintenanceModeSchema /
+// bulkMaintenanceSchema (routes/devices/schemas.ts) exactly — a value the
+// device route would accept but this schema would not (or vice versa) is a
+// grant a technician can mint and never spend, or spend for more than they
+// proved. Both sides import the maxima from services/maintenanceStepUpLimits.ts.
+export const maintenanceStepUpResource = z.object({
+  deviceIds: z.array(z.string().uuid()).min(1).max(MAINTENANCE_MAX_BULK_DEVICES),
+  reason: z.string().trim().min(3).max(500),
+  durationHours: z.number().int().min(1).max(MAINTENANCE_MAX_DURATION_HOURS),
+});
+// Device move-org step-up (spec 2026-09-18 D2): the move binding. Mirrors
+// moveOrgSchema (routes/devices/schemas.ts) plus the path param. A value the
+// device route would accept but this schema would not (or vice versa) is a
+// grant a technician can mint and never spend, or spend for more than they
+// proved. acceptCurrencyMismatch stays optional on both sides; the digest
+// normalises its absence to false.
+export const moveOrgStepUpResource = z.object({
+  deviceId: z.string().uuid(),
+  targetOrgId: z.string().uuid(),
+  targetSiteId: z.string().uuid(),
+  acceptCurrencyMismatch: z.boolean().optional(),
+});
+// Coarse pre-filter only. The AUTHORITY on "does this resource match this
+// operation" is RESOURCE_BOUND_OPERATIONS in routes/auth/mfa.ts, which
+// re-parses under the operation's own schema — a union member alone would
+// happily accept a rollback-shaped body under operation:'device_maintenance'.
+// AI script authoring W04 (#5612): the unattended-lane grant / reset binding.
+// One org, one value — mirrors scriptLanePolicyResourceDigest exactly.
+export const scriptLaneStepUpResource = z.object({
+  orgId: z.string().uuid(),
+  unattendedEnabled: z.boolean(),
+  reset: z.boolean().optional(),
+});
+const stepUpResource = z.union([rollbackStepUpResource, maintenanceStepUpResource, moveOrgStepUpResource, scriptLaneStepUpResource]);
+export const mfaStepUpSchema = z.discriminatedUnion('method', [
+  z.object({
+    method: z.literal('totp'),
+    code: stepUpSixDigit,
+    operation: stepUpOperation,
+    resource: stepUpResource.optional(),
+    passkeyId: z.string().uuid().optional(),
+  }),
+  z.object({
+    method: z.literal('sms'),
+    code: stepUpSixDigit,
+    operation: stepUpOperation,
+    resource: stepUpResource.optional(),
+    passkeyId: z.string().uuid().optional(),
+  }),
+  z.object({
+    method: z.literal('passkey'),
+    credential: stepUpAssertion,
+    operation: stepUpOperation,
+    resource: stepUpResource.optional(),
+    passkeyId: z.string().uuid().optional(),
+  }),
+]);
+
+export const acceptInviteSchema = z.object({
+  token: z.string().min(1),
+  password: z.string().min(8),
+});
+
+export const invitePreviewSchema = z.object({
+  token: z.string().min(1),
+});
+
+// ============================================
+// Types
+// ============================================
+
+export type PublicTokenPayload = {
+  accessToken: string;
+  expiresInSeconds: number;
+};
+
+export type UserTokenContext = {
+  roleId: string | null;
+  partnerId: string | null;
+  orgId: string | null;
+  scope: 'system' | 'partner' | 'organization';
+};
+
+// ============================================
+// Constants
+// ============================================
+
+// SR2-21: the terms-of-service version recorded on a pending registration (and
+// carried through to account creation at verification time). Bump when the ToS
+// text materially changes so the accepted version is auditable per signup.
+export const TERMS_VERSION = 'v1';
+
+export const REFRESH_COOKIE_NAME = 'breeze_refresh_token';
+export const REFRESH_COOKIE_PATH = '/api/v1/auth';
+export const REFRESH_COOKIE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
+export const INVITE_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+export const CSRF_HEADER_NAME = 'x-breeze-csrf';
+export const CSRF_COOKIE_NAME = 'breeze_csrf_token';
+export const CSRF_COOKIE_PATH = '/';
+export const ANONYMOUS_ACTOR_ID = '00000000-0000-0000-0000-000000000000';

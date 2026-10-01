@@ -1,0 +1,356 @@
+---
+title: Devices
+description: Work with the device list and device Info tab — customizable columns, filters, VPN presence, battery status, and manual (hand-entered) assets.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+The **Devices** page is the home view for every managed endpoint — servers, workstations, laptops, discovered network devices, and hand-entered manual assets across all the organizations you can access. This page covers the device list itself (columns and filters) and the device detail **Info** tab, including VPN presence and battery status.
+
+---
+
+## The Device List
+
+### Columns
+
+The list shows a compact set of columns by default — hostname, class, organization, site, OS, role, status, CPU, RAM, and last seen. Many more columns are available but hidden until you enable them through the **column-visibility picker** in the list toolbar, including:
+
+- **OS version / OS build / architecture**
+- **Pending reboot** and **headless** indicators
+- **Power** — battery charge and charging state (see [Battery and Power Status](#battery-and-power-status))
+- **VPN** — active VPN/overlay clients (see [VPN Presence](#vpn-presence))
+- **CPU model, cores, total RAM, total disk**
+- **Agent version** and **watchdog version**
+- **WAN IP** and **LAN IP** — the device's public (egress) address as seen from the server, and its local network interface address. Both are sortable; see [IP History](/features/ip-history/) for the timeline of address changes.
+- **Tags, last logged-in user, uptime, enrollment date**
+- **Desktop access** and **reliability score**
+- **Serial, asset tag, location** — inventory fields for manual assets (asset tag and location) and, where reported, serial number (manual assets and agent devices); see [Manual Assets](#manual-assets).
+
+Your column selection and order are remembered per browser, so each technician can tailor the list to their workflow. Most columns are sortable by clicking the header.
+
+### Agent Version Colouring
+
+With the **Agent version** column enabled, each device's reported version is tinted against the organization's *effective* target version -- an org-level pin if one is set, otherwise the globally promoted release (see [Pinning Agent and Watchdog Versions](/deploy/upgrades/#pinning-agent-and-watchdog-versions)). Hovering the value shows which:
+
+- **Matches** the effective version.
+- **Ahead** of it -- a newer build than the target.
+- **Behind** it -- due for an update.
+
+The version renders in plain text with no tint when the comparison can't be made -- a network or manual row that has never reported an agent version, or an organization whose effective version hasn't resolved yet.
+
+### Filters
+
+Above the list you can:
+
+- **Search** by display name or hostname.
+- Build **structured filters** with the filter toolbar — status, OS, role, organization, site, group, hardware attributes, and more, combinable into saved filter conditions.
+- Switch the **class facet** between All, Agent (endpoints running the Breeze agent), Network (devices found by network discovery), and Manual (hand-entered assets — see [Manual Assets](#manual-assets)).
+- Filter by **VPN** when the VPN column is enabled (see below).
+
+---
+
+## Manual Assets
+
+Not everything an MSP is responsible for runs an agent or answers a ping. A spare laptop in a drawer, a desk phone, a non-networked label printer, a loaner tablet out with a field tech — a **manual asset** records that equipment as plain inventory so it shows up in the same unified Devices list as everything else.
+
+### Discovered asset vs. manual asset
+
+The rule is simple: **does it have a network identity?**
+
+- **Has an IP address, hostname, or URL** — it's a discovered network asset (the **Network** class), found automatically by network discovery scanning and eligible for monitors, alerts, and topology. See [Network Discovery](/features/discovery/) if that's what you're looking for.
+- **Does not** — it's a manual asset. You type it in by hand, and it carries no reachability at all: it was never "online" or "offline", so its **Status** column shows **Unknown** rather than a misleading Offline.
+
+Manual assets deliberately carry no IP, MAC address, monitoring, alerts, or remote access — those are all agent/network concepts a hand-entered row cannot answer.
+
+### Adding a manual asset
+
+From the Devices page, open the **Add** menu next to the device list and choose **Add asset manually…** (the other item, **Install agent…**, is the existing agent-enrollment flow — the two share one menu since they're both ways of adding something to your fleet). Fill in:
+
+- **Site** (required) — defaults to the organization's only site when it has just one.
+- **Name** (required) — the label that appears everywhere else in the list.
+- **Asset type** — the same device-type list (printer, workstation, phone, etc.) discovered devices use.
+- **Manufacturer, model, serial number, asset tag, location** — free-text inventory fields. Location is a free-text field within the site ("Closet B, shelf 2"), not a structured address.
+- **Assigned to** — an organization contact (not a Breeze technician login) responsible for the asset.
+- **Tags** and **notes**.
+
+Serial numbers are not required to be unique — the same manufacturer's serial format can legitimately repeat across vendors. If you enter a serial that already exists in the organization, the form shows a non-blocking warning; it does not stop you from saving.
+
+### Editing, linking, and deleting
+
+Select a manual asset's row to reopen the same modal for editing. From there you can also **link** the record to an agent device or a discovered network asset once one shows up for that physical machine — for example, after IT installs the agent on a spare laptop that had been tracked manually. Linking is reversible (**Unlink** restores the manual record to the list) and never merges data destructively: the manual record's inventory fields (serial, asset tag, location, assigned contact, notes) stay attached and surface alongside the linked device or asset. A linked manual asset drops out of the Manual segment — the fleet is never double-counted — until you unlink it.
+
+**Delete** permanently removes a manual asset record (no agent to uninstall, so there's no separate "remove" step). It's available from the row actions and, for a manual-only selection, from the bulk actions menu.
+
+### Filtering and search
+
+The **Manual** segment (and its Devices-list count) is independent of network discovery being enabled — a manual asset still shows up even in an environment with no network-discovered devices at all. Search matches a manual asset's name, serial number, and asset tag. Structured filters apply only where they make sense for a manual asset: name, tags, asset type, organization, site, manufacturer, model, and serial number are supported; anything that depends on reachability or an agent (status, IP/MAC, last-seen, OS, agent version, metrics) is reported as *not applicable* rather than silently hiding the row without explanation.
+
+---
+
+## Removing and Restoring Devices
+
+Removing a device takes it out of the active fleet and stops monitoring it, without deleting its history. A removed device can be restored later, or permanently deleted.
+
+### Removing a device
+
+From a device's **Actions** menu (or the bulk actions bar after selecting several active devices) choose **Remove**. The confirm dialog asks one question: what should happen to the Breeze agent still sitting on the machine.
+
+- **Uninstall the Breeze agent** (the default) -- queues a durable uninstall command. An online device collects it within moments; an offline one runs it the next time it checks in, up to a self-hosted drain window (a few days by default) after which the command is cancelled as expired rather than running late.
+- **Leave the agent installed** -- the machine keeps running the agent, but it can no longer be managed until the device is restored.
+
+Removing a device also cancels its other pending queued work (scripts, patch installs, reboots, and so on) and immediately disconnects any live remote session and the agent's own connection.
+
+### The agent-uninstall badge
+
+Once a device is removed, its detail page shows a badge next to the **Removed** status (and, in compact form, in the device's **Settings** dialog) reporting what became of the queued uninstall:
+
+| Badge | Meaning |
+|---|---|
+| Agent uninstall queued | Waiting for the device to check in. |
+| Agent uninstall delivered | The agent received the command; teardown isn't confirmed yet. |
+| Agent uninstalled | Teardown confirmed complete. |
+| Uninstall expired | The device never checked in before the drain window closed -- it may still be installed. |
+| Agent uninstall failed / cancelled | The command errored, or was cancelled (for example, by a Restore). |
+| Agent was left installed | The device was removed with "Leave the agent installed" selected. |
+
+### Restoring and permanently deleting
+
+A removed device's **Actions** menu offers two choices in place of Remove:
+
+- **Restore** -- returns the device to the active fleet and cancels any still-pending agent uninstall.
+- **Delete permanently** -- deletes the device record and every record that references it (open tickets are kept but detached from the device). This cannot be undone.
+
+Selecting several removed devices at once in the device list adds bulk equivalents: **Restore Selected** applies immediately, while **Delete Permanently…** asks you to type the device count to confirm, then runs as a background job (up to 500 devices per run) with a progress indicator -- deleting a large batch touches too many records to finish inside a single request.
+
+<Aside type="tip">
+  To purge removed devices automatically after a retention window instead of deleting them by hand, add the **Device Lifecycle** feature to a configuration policy (**Fleet Management → Config Policies**). It defaults to off; turning it on and setting a number of days (1-3650) permanently deletes any device still removed after that many days, on a daily schedule. See [Configuration Policies](/features/configuration-policies/).
+</Aside>
+
+---
+
+## Moving a Device to Another Organization
+
+A partner technician can relocate a device -- with its history, tickets, custom-field values and policy assignments -- to a different organization of the same partner. Open the device page, choose **Move to Organization** from the **…** menu, pick the target organization and one of its sites, and confirm.
+
+### What moving requires
+
+<Steps>
+1. **Partner or system scope, with `devices:write` and `organizations:write`.** Organization-scoped users do not see the action; the API refuses them.
+
+2. **A signed-in technician.** API keys, MCP tools and other machine principals cannot move devices. The route requires an interactive user session whether or not two-factor authentication is enabled for the deployment.
+
+3. **A fresh second factor.** An assured session is not enough on its own -- the technician re-verifies with an authenticator app code or a passkey at the moment of the move. A technician whose only second factor is SMS must add an authenticator app or a passkey first. The verification is bound to the exact device, target organization and target site chosen, so it cannot be replayed for a different move.
+</Steps>
+
+### Unbilled work in another currency
+
+If the device's tickets carry unbilled time or parts in a currency other than the target organization's, the move is refused with an explanation. A technician who also holds `invoices:write` may accept the mismatch, in which case those rows keep their original currency after the move; anyone else is asked to have the open work billed or cleared first.
+
+### What happens after the move
+
+The agent is disconnected and reconnects under the new organization within its normal heartbeat interval. The device page refreshes to the new organization and site. Two audit events are written, one in each organization's trail (`device.move_org.source` and `device.move_org.target`).
+
+<Aside type="note">
+Moving is refused while durable PAM lifecycle evidence exists for the device, and while any of its tickets is pinned to a service deliverable. Both refusals leave the device untouched.
+</Aside>
+
+---
+
+## Billing Coverage
+
+The device **Overview** tab carries a **Billing** card answering "which contract line bills this device?". It needs **Contracts read** access and a partner-scoped login, so techs without billing access do not see it at all. It shows one of four things:
+
+- **Covered** -- one row per active contract line that bills the device, with the contract name, the line description, and *why* it matches: **Org-wide**, **This site**, **Role: Server**, or **Group: VIP Laptops**. Two contracts can both bill the same device; both rows show.
+- **Not billed by any line** -- no active contract line reaches this device.
+- **Not billed** -- the device is decommissioned or an ephemeral support-session machine, so it is excluded from billing entirely. Nothing is wrong.
+- **Coverage unknown** -- a device group on an active contract could not be evaluated (a broken filter, for example). The card says so and offers a retry rather than reporting the device as unbilled.
+
+The **Role** chip names the contract line's configured role set, not the individual device's role.
+
+Only **active** contracts count, and the answer is computed live from the same rule the billing run uses, so the card and the contract's own coverage warning can never disagree.
+
+## VPN Presence
+
+Agents on Windows, macOS, and Linux detect active VPN and overlay-network clients on the device and report them to Breeze. Recognized providers:
+
+- **WireGuard**
+- **Tailscale**
+- **NetBird**
+- **ZeroTier**
+- **OpenVPN**
+- **Cloudflare WARP**
+- A generic **VPN** fallback for active tunnel interfaces that don't match a known provider
+
+Detection works purely from **local signals on the device** — tunnel interface names and addresses, corroborated by the provider's running service or process. It is read-only telemetry: Breeze does not read keys, peer lists, or any VPN configuration, and cannot manage the VPN. For Tailscale, the device's own DNS name is also reported.
+
+### Connected vs. disconnected
+
+Each reported VPN carries a state:
+
+- **Connected** — the tunnel interface is up and carries an overlay address. The interface and addresses are reported.
+- **Disconnected** — the VPN client is installed and running on the device, but no tunnel is up. Only the provider and the detection source are reported; there is no interface or address to show.
+
+A provider is only ever reported when the device gives a concrete signal for it — a tunnel interface, or a running service/process. Breeze never lists a VPN it merely guesses might be installed.
+
+<Aside type="note">
+  A VPN whose client is not running at all is not reported. "Disconnected" means the client is running with no tunnel up, which is the state operators usually care about; a stopped client is indistinguishable from an uninstalled one without scanning the filesystem, which the agent deliberately does not do.
+</Aside>
+
+### Naming tunnels on macOS
+
+macOS tunnels are all named `utunN`, which carries no provider information. The agent resolves the owner per interface from the network extension that created it, so a Mac running several VPN clients at once still names each tunnel correctly.
+
+Clients that create a plain `utun` from a background daemon rather than a network extension — NetBird and OpenVPN among them — expose no owner. Those tunnels are named only when exactly one known VPN client is running on the device; otherwise they show as the generic **VPN** provider rather than risk naming the wrong one. When a tunnel cannot be attributed this way, no VPN on that device is reported as disconnected either, since the unattributed tunnel may well belong to one of the running clients.
+
+<Aside type="note">
+  VPN data is the latest snapshot from the agent's periodic network inventory report (roughly every 15 minutes), not a live view. A blank value means either no VPN was detected or the agent is too old to report VPN presence.
+</Aside>
+
+### On the device list
+
+Enable the **VPN** column via the column picker (it is hidden by default). It shows a badge per provider — connected VPNs first in the provider's color, then any disconnected clients in a muted badge — is sortable, and adds a filter dropdown with:
+
+- **All VPN** — no VPN filtering
+- **Any active VPN** — only devices with at least one active VPN
+- One entry per provider seen in the current list (e.g. **Tailscale**), to show only devices running that provider
+
+Hovering a VPN badge shows the full detail — interface, addresses, and DNS name, or `disconnected` for a client with no tunnel up. The filter matches **connected** VPNs only, so a device whose VPN client is running but disconnected does not count as having a VPN.
+
+### On the device Info tab
+
+When a device has reported at least one VPN, its **Info** tab shows a **VPN** section with a card per VPN — connected tunnels first, then any disconnected clients:
+
+| Field | Description |
+|-------|-------------|
+| **State** | Connected, or Disconnected when the client is running with no tunnel up. |
+| **Interface** | The tunnel interface name on the device. Omitted when disconnected. |
+| **VPN IPv4 / VPN IPv6** | The device's overlay-network addresses. |
+| **VPN DNS Name** | The device's name on the overlay network (Tailscale). |
+| **Detection Source** | How the VPN was identified (interface, adapter, service, or process). |
+| **Last Reported** | When the agent last reported this VPN. |
+
+The section is hidden entirely when the device has reported no VPNs at all.
+
+---
+
+## Battery and Power Status
+
+For devices with a battery (laptops and other portables), the agent reports power status with every heartbeat:
+
+- **Battery charge** (percent)
+- **Charging state** (charging, discharging, full, or not charging)
+- **Power source** (plugged into AC or running on battery)
+- **Estimated time remaining** while on battery, or **time to full** while charging (where the platform reports it)
+
+This surfaces in two places:
+
+- **Device list** — an optional **Power** column (enable it via the column picker) showing the charge percent with a charging/plugged-in icon, sortable by charge level. Devices without a battery show a dash.
+- **Device Info tab** — a **Power** section with the battery charge, charging state, power source, time estimates, and when the status was last reported. The section only appears for devices that actually have a battery.
+
+---
+
+## The Device Info Tab
+
+Opening a device and selecting **Info** shows the device's identity and inventory at a glance:
+
+| Section | Contents |
+|---------|----------|
+| **System** | Hostname, display name (editable), serial number, manufacturer, model. |
+| **Device Role** | The device's assigned role and how it was determined. |
+| **Function** | What the device is *for* (domain controller, kiosk, finance workstation, …), assessed by the AI Fleet designer or set by hand — see [Device function](#device-function) below. |
+| **Operating System** | OS type, version, build, and architecture. |
+| **Hardware Summary** | CPU model, cores/threads, RAM, disk, GPU, motherboard, BIOS version. |
+| **Power** | Battery and power status (portable devices only — see above). |
+| **VPN** | Active VPN/overlay clients (only when at least one is active — see above). |
+| **Agent** | Agent and watchdog versions, status, last seen, enrollment date, system uptime, logged-in user. |
+| **Desktop Access** | macOS remote-desktop readiness (macOS devices only). |
+| **Tags** and **Custom Fields** | Organizational metadata, when present. |
+
+### Device function
+
+**Function** (v0.113.0+) records what a device is *for*, as distinct from the billable **Device Role**. The built-in functions are Domain controller, File server, Print server, Hypervisor, Database server, Line-of-business workstation, Finance workstation, Executive workstation, Shared workstation, Conference room, Kiosk, Core switch, Edge firewall, Backup target and Unknown; **Custom…** lets you enter your own short label.
+
+A function is either assessed by the [Fleet designer](/features/ai-agents/#fleet-designer) AI agent — badged **AI**, with a confidence percentage and a **Why the designer thinks so** explanation — or set by a technician with **Change function**, badged **Manual**. A manual assessment supersedes the AI one and the designer never overwrites it; **Clear** removes the assessment and the field reads **Not assessed**. Changing or clearing a function needs `devices:write` and a fresh MFA check.
+
+Function is also available as the **Device Function** field in the device catalog filters and saved filters.
+
+---
+
+## Queued Actions
+
+A laptop that is asleep, a workstation someone shut down for the weekend, a
+server on a maintenance reboot — Breeze no longer throws away work aimed at a
+device that happens to be offline. Instead the action is **queued** with a
+delivery deadline and handed to the device the moment it checks in again.
+
+The device page shows a **Queued actions** section listing everything currently
+waiting for that device: what the action is, who asked for it, when it was
+queued, and when it expires. Anything in the list can be **cancelled** from
+there if you no longer want it to run.
+
+Elsewhere in the product a waiting step reads **"Queued — device offline"**
+rather than Failed, so a nightly automation over a fleet of sleeping laptops no
+longer shows a wall of red. The trade-off is worth knowing: **work that used to
+fail fast now sits pending for up to a week.** If a step is only meaningful
+against a live device, set it to skip instead — see the offline behaviour control
+in [Automations](/features/automations/) and the patch-policy equivalent in
+[Patch Management](/features/patch-management/).
+
+Deadlines depend on the kind of work:
+
+| Kind of work | Waits for |
+|---|---|
+| Scripts, patch installs, patch scans, software installs, automation actions | **7 days** |
+| Inventory refreshes and other self-superseding config syncs | **24 hours** |
+| Reboot, shutdown, and scheduled restart | **24 hours** |
+
+A queued action that reaches its deadline without the device coming back expires
+undelivered and is reported as expired — it never sits pending forever, and it
+never runs late enough to surprise someone. Self-hosters can tune all three
+deadlines; see [Environment Variables](/deploy/environment/#feature-flags).
+
+<Aside type="note">
+  Interactive work is deliberately **not** queued. Anything where you are waiting
+  on a live answer — a terminal session, a remote-desktop connection, browsing
+  files, listing or controlling processes and services — still reports the device
+  as offline immediately rather than promising an answer later.
+</Aside>
+
+---
+
+## The Change History Tab
+
+Opening a device and selecting **Change History** shows a newest-first timeline of what has physically and logically changed on that endpoint over time — a swapped disk, added memory, a new CPU, a BIOS update, or an operating-system upgrade. Use it to answer questions like "when did this machine's RAM change?" or "did the OS get upgraded before that issue started?" without cross-referencing screenshots or asking the user.
+
+Breeze detects these changes automatically: the agent takes periodic inventory snapshots and compares each one against the previous snapshot. Any difference is recorded as a change entry and surfaced here. A device that has just been upgraded to a newer agent records nothing on its first snapshot, so upgrading never produces a spurious burst of "added" entries.
+
+### What's Recorded
+
+Alongside the system-level changes covered in [Change Tracking](/features/change-tracking/) (software, services, startup items, network, scheduled tasks, and user accounts), the Change History tab records:
+
+| Category | Examples |
+|----------|----------|
+| **Hardware** | Memory capacity (for example, "4 GB → 8 GB"), CPU model or core count, total fixed-disk capacity, BIOS, and serial / motherboard changes. |
+| **OS Version** | Operating-system version upgrades. |
+
+<Aside type="note">
+  Disk changes are tracked by **total fixed-disk capacity**, so an upgrade that increases capacity is recorded. Swapping a disk for one of the same size is not distinguished as a separate change.
+</Aside>
+
+### Reading the Timeline
+
+Each entry shows:
+
+| Column | Contents |
+|--------|----------|
+| **When** | Timestamp of the detected change. |
+| **Type** | The change category (Hardware, OS Version, Software, Service, and so on). |
+| **Action** | Added, Removed, Modified, or Updated. |
+| **Subject** | What changed. |
+| **Change** | The before-and-after values — rendered as `old → new`, with additions shown as a new value and removals struck through. |
+
+Two filters narrow the list: a **Type** filter (including dedicated **Hardware** and **OS Version** options) and an **Action** filter (Added / Removed / Modified / Updated). The tab loads in pages of 100 entries with a **Load more** control, and is deep-linkable via the `#change-history` anchor.
+
+---
+
+Related pages: [Device Groups](/features/device-groups/) for organizing devices into collections, [Tags](/features/tags/) and [Custom Fields](/features/custom-fields/) for metadata, [Change Tracking](/features/change-tracking/) for software and configuration change auditing, and [IP History](/features/ip-history/) for the timeline of a device's network addresses.

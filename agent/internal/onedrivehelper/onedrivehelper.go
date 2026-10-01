@@ -1,0 +1,364 @@
+// The platform-independent types and decision logic live here so they can be
+// unit-tested on any OS; the registry I/O is in onedrivehelper_windows.go, with
+// a no-op stub for other platforms in onedrivehelper_stub.go.
+// (Same layout rationale as internal/winupdate.)
+package onedrivehelper
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
+)
+
+// BaseConfig mirrors the server's onedrive_helper_settings.base object
+// (apps/api/src/routes/agents/helpers.ts OnedriveConfigUpdate).
+type BaseConfig struct {
+	SilentAccountConfig bool     `json:"silentAccountConfig"`
+	FilesOnDemand       bool     `json:"filesOnDemand"`
+	KfmSilentOptIn      bool     `json:"kfmSilentOptIn"`
+	KfmFolders          []string `json:"kfmFolders"`
+	KfmBlockOptOut      bool     `json:"kfmBlockOptOut"`
+	TenantAssociationID string   `json:"tenantAssociationId"`
+	RestartOnChange     bool     `json:"restartOnChange"`
+}
+
+// LibraryRule mirrors one entry of onedrive_helper_settings.libraries.
+type LibraryRule struct {
+	LibraryID     string   `json:"libraryId"`
+	DisplayName   string   `json:"displayName"`
+	SiteURL       string   `json:"siteUrl"`
+	TargetingMode string   `json:"targetingMode"`
+	GroupID       string   `json:"groupId"`
+	GroupName     string   `json:"groupName"`
+	HiveScope     string   `json:"hiveScope"`
+	AllowedUpns   []string `json:"allowedUpns"`
+}
+
+type Config struct {
+	Base      BaseConfig    `json:"base"`
+	Libraries []LibraryRule `json:"libraries"`
+}
+
+// Drift reasons reported to the server (heartbeat onedriveDeviceState.driftEntries).
+const (
+	// ReasonNotMounted — the library is entitled but no mounted folder matches it.
+	ReasonNotMounted = "not_mounted"
+	// ReasonNotMountedAmbiguous — same as above, except one or more SAME-NAMED
+	// libraries from other sites are also entitled and the mounted folders can't
+	// be attributed between them. The count of unmounted libraries is right;
+	// which one this entry names is not certain. See ComputeDrift.
+	ReasonNotMountedAmbiguous = "not_mounted_ambiguous"
+)
+
+// DriftEntry records an applied library that OneDrive did not actually mount
+// (e.g. the user previously "stopped sync" — AutoMount will not re-mount it).
+type DriftEntry struct {
+	LibraryID   string `json:"libraryId"`
+	DisplayName string `json:"displayName"`
+	Reason      string `json:"reason"`
+}
+
+// DeviceState is reported in the heartbeat payload as onedriveDeviceState and
+// must match the zod schema in apps/api/src/routes/agents/schemas.ts
+// (heartbeatSchema.onedriveDeviceState).
+type DeviceState struct {
+	SignedIn          bool              `json:"signedIn"`
+	SignedInUpns      []string          `json:"signedInUpns"`
+	OneDriveVersion   string            `json:"oneDriveVersion,omitempty"`
+	FilesOnDemandOn   bool              `json:"filesOnDemandOn"`
+	KfmFolderStates   map[string]string `json:"kfmFolderStates"`
+	MountedLibraries  []string          `json:"mountedLibraries"`
+	EntitledLibraries []string          `json:"entitledLibraries"`
+	DriftEntries      []DriftEntry      `json:"driftEntries"`
+}
+
+// ParseConfig converts the untyped heartbeat configUpdate value into a Config
+// via a JSON round-trip (same pattern as monitoring.ParseMonitorConfig).
+// nulls from the wire (e.g. tenantAssociationId) become Go zero values.
+func ParseConfig(raw any) (Config, bool) {
+	var cfg Config
+	if raw == nil {
+		return cfg, false
+	}
+	if _, isObj := raw.(map[string]any); !isObj {
+		return cfg, false
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return cfg, false
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, false
+	}
+	return cfg, true
+}
+
+// PartitionLibraries splits delivered rules into (apply, pending):
+//   - everyone            → apply
+//   - local_ad_group      → apply iff the user is a member of GroupName;
+//     a miss (or empty GroupName) is simply not entitled.
+//   - graph_group         → apply when the server tagged ANY of the session's
+//     UPNs (case-insensitive); a rule stays pending when sessionUpns is
+//     nil/empty (fail closed — no resolvable UPN can't satisfy an allow-list
+//     entry) or when none of the UPNs match.
+//   - anything unknown    → pending (fail closed)
+func PartitionLibraries(rules []LibraryRule, isLocalGroupMember func(groupName string) bool, sessionUpns []string) (apply, pending []LibraryRule) {
+	for _, r := range rules {
+		switch r.TargetingMode {
+		case "everyone":
+			apply = append(apply, r)
+		case "local_ad_group":
+			if r.GroupName != "" && isLocalGroupMember != nil && isLocalGroupMember(r.GroupName) {
+				apply = append(apply, r)
+			}
+		case "graph_group":
+			if anyContainsFold(r.AllowedUpns, sessionUpns) {
+				apply = append(apply, r)
+			} else {
+				pending = append(pending, r)
+			}
+		default: // future modes
+			pending = append(pending, r)
+		}
+	}
+	return apply, pending
+}
+
+// containsFold is a case-insensitive membership check (pairs with the server
+// cache's lowercased UPN keying). An empty needle never matches (fail closed:
+// a session with no resolvable UPN can't satisfy an allow-list entry).
+func containsFold(xs []string, x string) bool {
+	if x == "" {
+		return false
+	}
+	for _, candidate := range xs {
+		if strings.EqualFold(candidate, x) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyContainsFold reports whether any needle in needles case-insensitively
+// matches a candidate in xs. A nil/empty needles never matches (fail closed:
+// a session with no resolvable UPNs can't satisfy an allow-list entry).
+func anyContainsFold(xs []string, needles []string) bool {
+	for _, n := range needles {
+		if containsFold(xs, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// StaleValueNames returns the entries of existing that carry the exact
+// "Breeze-" prefix (our own deterministic value names) and are not present in
+// desired. Names without that prefix are never returned — those are
+// admin/Intune-managed values and must never be touched by the helper's
+// scrub pass.
+func StaleValueNames(existing, desired []string) []string {
+	want := make(map[string]bool, len(desired))
+	for _, d := range desired {
+		want[d] = true
+	}
+	var stale []string
+	for _, name := range existing {
+		if !strings.HasPrefix(name, "Breeze-") {
+			continue
+		}
+		if want[name] {
+			continue
+		}
+		stale = append(stale, name)
+	}
+	return stale
+}
+
+// ValueName derives the deterministic TenantAutoMount registry value name for a
+// library. The name is cosmetic to OneDrive (it uses the library's own title),
+// but the Breeze- prefix marks ownership and determinism makes writes idempotent.
+func ValueName(libraryID string) string {
+	sum := sha256.Sum256([]byte(libraryID))
+	return "Breeze-" + hex.EncodeToString(sum[:6])
+}
+
+// TenantIDFromComposite extracts the tenantId=… field from an AutoMount
+// composite; used as the KFMSilentOptIn tenant fallback when the policy has no
+// explicit tenantAssociationId.
+func TenantIDFromComposite(libraryID string) string {
+	for _, part := range strings.Split(libraryID, "&") {
+		if v, ok := strings.CutPrefix(part, "tenantId="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// pathBase returns the last path component of a mounted local folder path,
+// tolerating either separator (the values come from a Windows registry cache
+// but the logic is unit-tested on every OS).
+func pathBase(p string) string {
+	if i := strings.LastIndexAny(p, `\/`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+// mountSiteForLibrary reports whether a mounted path is a mount OF the named
+// library, and if so returns the site-title portion of its folder name.
+//
+// OneDrive names these folders "<Site title> - <Library name>" (or bare
+// "<Library name>" for a library whose site title OneDrive omits). Matching on
+// the SUFFIX rather than splitting on " - " keeps library names that themselves
+// contain " - " intact, which a naive split would tear apart.
+func mountSiteForLibrary(p, displayName string) (site string, ok bool) {
+	base := pathBase(p)
+	if strings.EqualFold(base, displayName) {
+		return "", true
+	}
+	suffix := " - " + displayName
+	if len(base) > len(suffix) && strings.EqualFold(base[len(base)-len(suffix):], suffix) {
+		return base[:len(base)-len(suffix)], true
+	}
+	return "", false
+}
+
+// siteHintFromURL derives a comparable token from a SharePoint site URL — the
+// last non-empty path segment, e.g. ".../sites/Marketing" → "Marketing".
+//
+// It is only a HINT: the folder name carries the site TITLE, which is free text
+// and frequently differs from the URL slug ("Marketing Team" vs. /sites/mktg).
+// So it is used strictly to break a tie between several identically-named
+// libraries and never to turn a single unambiguous match into drift.
+func siteHintFromURL(siteURL string) string {
+	trimmed := strings.TrimRight(siteURL, "/")
+	if i := strings.LastIndex(trimmed, "/"); i >= 0 {
+		return trimmed[i+1:]
+	}
+	return ""
+}
+
+// ComputeDrift flags applied libraries that OneDrive did not actually mount. A
+// rule the user previously stop-synced will never re-mount — that is exactly
+// the drift this surfaces (spec: report, don't rewrite forever).
+//
+// Matching is site-qualified and one-to-one. The old check asked, per rule,
+// "does the display name appear anywhere in any mounted path?", which cannot
+// tell "Contoso HR - Documents" from "Contoso Legal - Documents": two sites
+// entitling a same-named library (and "Documents" is the default name on EVERY
+// SharePoint site) meant a single mount suppressed the drift report for both.
+// That false negative was seen in live QA.
+//
+// Treating it as an assignment fixes it: each mounted folder can satisfy at
+// most one rule, so two rules and one mount always leaves one rule drifted.
+// Which one is decided in three passes, strongest evidence first:
+//
+//  1. Folder name is "<site> - <library>" AND the site title contains the hint
+//     from the rule's site URL — an unambiguous pairing.
+//  2. Folder name matches the library name, site unverified. Site TITLES are
+//     free text and routinely differ from the URL slug ("Marketing Team" vs.
+//     /sites/mktg), so a hint that fails to match is never taken as proof of
+//     drift — it only loses to a rule that did match in pass 1.
+//  3. Legacy substring scan, for cache shapes with no parseable folder name.
+//     Keeps an unrecognized shape degrading to the old behaviour rather than
+//     reporting drift on everything. Fuzzy, so it consumes nothing.
+//
+// When pass 2 has to resolve SEVERAL same-named rules against fewer mounts, the
+// assignment is correct in COUNT but arbitrary in attribution — nothing in the
+// data says which site the one mounted "Documents" belongs to. Those entries
+// are reported as ReasonNotMountedAmbiguous rather than ReasonNotMounted, so a
+// tech reading the panel knows the tool is saying "one of these same-named
+// libraries is unmounted and I can't tell which" instead of asserting a
+// coin-flip as fact.
+func ComputeDrift(applied []LibraryRule, mountedPaths []string) []DriftEntry {
+	matched := make([]bool, len(applied))
+	consumed := make([]bool, len(mountedPaths))
+
+	// Pass 1 — site-confirmed pairings claim their mount first.
+	for i, r := range applied {
+		hint := siteHintFromURL(r.SiteURL)
+		if r.DisplayName == "" || hint == "" {
+			continue
+		}
+		for j, p := range mountedPaths {
+			if consumed[j] {
+				continue
+			}
+			site, ok := mountSiteForLibrary(p, r.DisplayName)
+			if ok && strings.Contains(strings.ToLower(site), strings.ToLower(hint)) {
+				matched[i], consumed[j] = true, true
+				break
+			}
+		}
+	}
+
+	// How many rules each display name still has outstanding after pass 1 — more
+	// than one means pass 2 is choosing between indistinguishable candidates.
+	contenders := map[string]int{}
+	for i, r := range applied {
+		if !matched[i] && r.DisplayName != "" {
+			contenders[strings.ToLower(r.DisplayName)]++
+		}
+	}
+
+	// Pass 2 — name-only pairings for whatever is left over.
+	guessedFor := map[string]bool{}
+	for i, r := range applied {
+		if matched[i] || r.DisplayName == "" {
+			continue
+		}
+		key := strings.ToLower(r.DisplayName)
+		for j, p := range mountedPaths {
+			if consumed[j] {
+				continue
+			}
+			if _, ok := mountSiteForLibrary(p, r.DisplayName); ok {
+				matched[i], consumed[j] = true, true
+				if contenders[key] > 1 {
+					guessedFor[key] = true
+				}
+				break
+			}
+		}
+	}
+
+	out := []DriftEntry{}
+	for i, r := range applied {
+		if r.DisplayName == "" || matched[i] {
+			continue
+		}
+		// Pass 3 — legacy substring fallback over the unclaimed mounts.
+		needle := strings.ToLower(r.DisplayName)
+		for j, p := range mountedPaths {
+			if !consumed[j] && strings.Contains(strings.ToLower(p), needle) {
+				matched[i] = true
+				break
+			}
+		}
+		if !matched[i] {
+			reason := ReasonNotMounted
+			// A same-named sibling took a mount by position, not by evidence —
+			// the COUNT of unmounted libraries is right, but which one is named
+			// here is a guess. Say so rather than assert it.
+			if guessedFor[needle] {
+				reason = ReasonNotMountedAmbiguous
+			}
+			out = append(out, DriftEntry{LibraryID: r.LibraryID, DisplayName: r.DisplayName, Reason: reason})
+		}
+	}
+	return out
+}
+
+// FolderRedirectionState classifies a raw "User Shell Folders" value: KFM
+// rewrites the shell folder to an absolute path inside the OneDrive root, so
+// containing "onedrive" ⇒ redirected; an env-var/local path ⇒ not; empty ⇒ unknown.
+func FolderRedirectionState(rawShellFolderValue string) string {
+	if rawShellFolderValue == "" {
+		return "unknown"
+	}
+	if strings.Contains(strings.ToLower(rawShellFolderValue), "onedrive") {
+		return "redirected"
+	}
+	return "not_redirected"
+}

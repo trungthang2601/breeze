@@ -1,0 +1,385 @@
+package desktop
+
+import (
+	"fmt"
+	"log/slog"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
+
+	"github.com/breeze-rmm/agent/internal/logging"
+	"github.com/breeze-rmm/agent/internal/observability"
+)
+
+func (s *Session) startStreaming() {
+	s.startOnce.Do(func() {
+		s.mu.RLock()
+		active := s.isActive
+		s.mu.RUnlock()
+		if !active {
+			return
+		}
+
+		if err := GetWallpaperManager().Suppress(); err != nil {
+			slog.Warn("Failed to suppress wallpaper", "session", s.id, "error", err.Error())
+		}
+
+		// Best-effort: request an IDR immediately for fast viewer startup.
+		if enc := s.encoder.Load(); enc != nil {
+			_ = enc.ForceKeyframe()
+		}
+
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			// Local recover keeps the existing slog-with-stack diagnostic
+			// (captureLoop panics historically include native-side detail
+			// worth keeping inline) AND surfaces the event to Sentry via
+			// observability.Recoverer so fleet-wide regressions get noticed.
+			defer func() {
+				if r := recover(); r != nil {
+					buf := make([]byte, 4096)
+					n := runtime.Stack(buf, false)
+					slog.Error("capture loop panic (session will stop)",
+						"session", s.id,
+						"panic", fmt.Sprintf("%v", r),
+						"stack", string(buf[:n]),
+					)
+					// Re-raise so observability.Recoverer (next deferred)
+					// captures + scrubs + flushes to Sentry.
+					func() {
+						defer observability.Recoverer("desktop.captureLoop")
+						panic(r)
+					}()
+				}
+			}()
+			s.captureLoop()
+		}()
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer observability.Recoverer("desktop.metricsLogger")
+			s.metricsLogger()
+		}()
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer observability.Recoverer("desktop.adaptiveLoop")
+			s.adaptiveLoop()
+		}()
+		if s.cursorDC != nil {
+			if cp, ok := s.capturer.(CursorProvider); ok {
+				s.wg.Add(1)
+				go func() {
+					defer s.wg.Done()
+					defer observability.Recoverer("desktop.cursorStreamLoop")
+					s.cursorStreamLoop(cp)
+				}()
+			}
+		}
+
+		// Initialize audio capture (WASAPI loopback on Windows).
+		// Audio is muted by default — the viewer sends toggle_audio to unmute.
+		if s.audioTrack != nil {
+			ac := NewAudioCapturer()
+			if ac != nil {
+				s.audioCapturer = ac
+				audioTrack := s.audioTrack
+				err := ac.Start(func(frame []byte) {
+					if !s.audioEnabled.Load() {
+						return // muted — skip sending to save bandwidth
+					}
+					_ = audioTrack.WriteSample(media.Sample{
+						Data:     frame,
+						Duration: 20 * time.Millisecond,
+					})
+				})
+				if err != nil {
+					slog.Warn("Failed to start audio capture", "session", s.id, "error", err.Error())
+					ac.Stop() // release partially-initialized COM resources
+					s.audioCapturer = nil
+				} else {
+					slog.Info("Audio capture started (WASAPI loopback)", "session", s.id)
+				}
+			}
+		}
+
+		w, h, _ := s.capturer.GetScreenBounds()
+		slog.Info("Desktop WebRTC session started",
+			"session", s.id,
+			"width", w,
+			"height", h,
+		)
+
+		// Notify viewer if input injection is unavailable (e.g. macOS login
+		// window without IOHIDSystem). Send asynchronously because the control
+		// data channel may not be open yet at startStreaming time.
+		if !s.inputHandler.InputAvailable() {
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.sendInputStatus()
+			}()
+		}
+	})
+}
+
+// cursorStreamLoop runs an independent 120Hz loop that polls cursor position
+// and sends updates over the cursor data channel. Decoupled from the capture
+// loop so cursor movement stays smooth even when DXGI blocks on AcquireNextFrame.
+func (s *Session) cursorStreamLoop(prov CursorProvider) {
+	const (
+		cursorActiveInterval = time.Second / 120
+		cursorIdleInterval   = 250 * time.Millisecond
+	)
+
+	// Check if the provider also supports cursor shape detection.
+	shapeProv, hasShape := prov.(CursorShapeProvider)
+
+	enabled := s.cursorStreamEnabled.Load()
+	interval := cursorIdleInterval
+	if enabled {
+		interval = cursorActiveInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var lastRelX, lastRelY int32
+	var lastV bool
+	var lastShape string
+	haveLast := false
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			nowEnabled := s.cursorStreamEnabled.Load()
+			if nowEnabled != enabled {
+				enabled = nowEnabled
+				if enabled {
+					ticker.Reset(cursorActiveInterval)
+				} else {
+					ticker.Reset(cursorIdleInterval)
+				}
+			}
+			if !enabled {
+				continue
+			}
+			if s.cursorDC.ReadyState() != webrtc.DataChannelStateOpen {
+				continue
+			}
+			cx, cy, cv := prov.CursorPosition()
+			// Convert absolute virtual desktop coords to display-relative
+			// so viewer can map directly using videoWidth/videoHeight.
+			relX := cx - s.cursorOffsetX.Load()
+			relY := cy - s.cursorOffsetY.Load()
+
+			// Get cursor shape if the provider supports it.
+			// CursorShape() is cheap — it reads the value already sampled
+			// by CursorPosition() or sampleCursorForCrossThread().
+			var shape string
+			if hasShape {
+				shape = shapeProv.CursorShape()
+			}
+
+			if haveLast && relX == lastRelX && relY == lastRelY && cv == lastV && shape == lastShape {
+				continue
+			}
+			shapeChanged := shape != lastShape
+			lastRelX, lastRelY, lastV, lastShape = relX, relY, cv, shape
+			haveLast = true
+			v := 0
+			if cv {
+				v = 1
+			}
+			payload := make([]byte, 0, 64)
+			payload = append(payload, `{"x":`...)
+			payload = strconv.AppendInt(payload, int64(relX), 10)
+			payload = append(payload, `,"y":`...)
+			payload = strconv.AppendInt(payload, int64(relY), 10)
+			payload = append(payload, `,"v":`...)
+			payload = strconv.AppendInt(payload, int64(v), 10)
+			// Only include shape when it changes or on first message to
+			// minimize per-message overhead on the high-frequency channel.
+			if shapeChanged && shape != "" {
+				payload = append(payload, `,"s":"`...)
+				payload = append(payload, shape...)
+				payload = append(payload, '"')
+			}
+			payload = append(payload, '}')
+			if err := s.cursorDC.SendText(string(payload)); err != nil {
+				slog.Debug("Failed to send cursor update", "session", s.id, "error", err.Error())
+			}
+		}
+	}
+}
+
+// metricsLogger periodically logs streaming metrics
+func (s *Session) metricsLogger() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.logMetricsSnapshot()
+		}
+	}
+}
+
+// logMetricsSnapshot emits the periodic "Desktop WebRTC metrics" line.
+//
+// ShipAlways: this line and "Viewer WebRTC stats" are the only WebRTC
+// diagnostics we have, and the desktop-helper ships at
+// log_shipping_level=warn by default — without the override they never reach
+// Agent Logs (#5929). captureMs/convertMs sit next to encodeMs so a slow
+// capturer isn't blamed on the encoder.
+func (s *Session) logMetricsSnapshot() {
+	snap := s.metrics.Snapshot()
+	slog.Info("Desktop WebRTC metrics",
+		"session", s.id,
+		"captured", snap.FramesCaptured,
+		"encoded", snap.FramesEncoded,
+		"sent", snap.FramesSent,
+		"skipped", snap.FramesSkipped,
+		"dropped", snap.FramesDropped,
+		"captureMs", fmt.Sprintf("%.1f", snap.CaptureMs),
+		"convertMs", fmt.Sprintf("%.1f", snap.ConvertMs),
+		"encodeMs", fmt.Sprintf("%.1f", snap.EncodeMs),
+		"frameBytes", snap.LastFrameSize,
+		"bandwidthKBps", fmt.Sprintf("%.1f", snap.BandwidthKBps),
+		"uptime", snap.Uptime.Round(time.Second),
+		logging.ShipAlways(),
+	)
+}
+
+func (s *Session) adaptiveLoop() {
+	if s.adaptive == nil || s.peerConn == nil {
+		return
+	}
+
+	// RTCP stats — log only. Pion v4 RemoteInboundRTPStreamStats FractionLost
+	// conflicts with viewer-reported stats when both feed adaptive, causing
+	// oscillation. Viewer stats (1s interval) are the sole adaptive input;
+	// they include packet loss + frame drops that RTCP doesn't capture.
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var logCount int
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			rtt, loss, ok := extractRemoteInboundVideoStats(s.peerConn.GetStats())
+			if !ok {
+				continue
+			}
+			logCount++
+			if logCount%5 == 1 { // every 10s
+				slog.Info("WebRTC RTCP stats (diagnostic)",
+					"session", s.id,
+					"rtt", rtt.Round(time.Millisecond),
+					"fractionLost", fmt.Sprintf("%.4f", loss),
+				)
+			}
+		}
+	}
+}
+
+func extractRemoteInboundVideoStats(report webrtc.StatsReport) (rtt time.Duration, loss float64, ok bool) {
+	var bestPackets uint32
+	for _, s := range report {
+		ri, okRI := s.(webrtc.RemoteInboundRTPStreamStats)
+		if !okRI || ri.Kind != "video" {
+			continue
+		}
+
+		// Pick the stream with the most received packets as the primary one.
+		if !ok || ri.PacketsReceived >= bestPackets {
+			bestPackets = ri.PacketsReceived
+			rtt = time.Duration(ri.RoundTripTime * float64(time.Second))
+			loss = ri.FractionLost
+			ok = true
+		}
+	}
+	return rtt, loss, ok
+}
+
+// h264ContainsIDR checks if H.264 Annex B data contains an IDR NAL unit (type 5).
+// Used to prevent dropping keyframes — without IDRs the decoder accumulates corruption.
+func h264ContainsIDR(data []byte) bool {
+	for i := 0; i+2 < len(data); {
+		startLen := 0
+		if data[i] == 0 && data[i+1] == 0 {
+			if data[i+2] == 1 {
+				startLen = 3
+			} else if i+3 < len(data) && data[i+2] == 0 && data[i+3] == 1 {
+				startLen = 4
+			}
+		}
+		if startLen == 0 {
+			i++
+			continue
+		}
+		if i+startLen < len(data) && data[i+startLen]&0x1f == 5 {
+			return true
+		}
+		i += startLen + 1
+	}
+	return false
+}
+
+// describeH264NALUs parses Annex B start codes and returns a summary of NALU types.
+// Used for diagnostics after monitor switch to verify SPS/PPS presence.
+func describeH264NALUs(data []byte) string {
+	types := make(map[string]int)
+	for i := 0; i+2 < len(data); {
+		// Look for start code: 00 00 01 or 00 00 00 01
+		startLen := 0
+		if data[i] == 0 && data[i+1] == 0 {
+			if data[i+2] == 1 {
+				startLen = 3
+			} else if i+3 < len(data) && data[i+2] == 0 && data[i+3] == 1 {
+				startLen = 4
+			}
+		}
+		if startLen == 0 {
+			i++
+			continue
+		}
+		if i+startLen >= len(data) {
+			break
+		}
+		naluType := data[i+startLen] & 0x1f
+		name := fmt.Sprintf("type%d", naluType)
+		switch naluType {
+		case 7:
+			name = "SPS"
+		case 8:
+			name = "PPS"
+		case 5:
+			name = "IDR"
+		case 1:
+			name = "non-IDR"
+		case 6:
+			name = "SEI"
+		case 9:
+			name = "AUD"
+		}
+		types[name]++
+		i += startLen + 1
+	}
+	parts := make([]string, 0, len(types))
+	for t, c := range types {
+		parts = append(parts, fmt.Sprintf("%s:%d", t, c))
+	}
+	return strings.Join(parts, " ")
+}

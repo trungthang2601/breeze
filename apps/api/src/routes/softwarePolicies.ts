@@ -1,0 +1,1049 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { z } from 'zod';
+import { db } from '../db';
+import {
+  devices,
+  softwareComplianceStatus,
+  softwarePolicies,
+} from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { writeRouteAudit } from '../services/auditEvents';
+import { scheduleSoftwareComplianceCheck } from '../jobs/softwareComplianceWorker';
+import { scheduleSoftwareRemediation } from '../jobs/softwareRemediationWorker';
+import {
+  normalizeSoftwarePolicyRules,
+  recordSoftwarePolicyAudit,
+} from '../services/softwarePolicyService';
+import { computeInstallPreviewEligibleDeviceCount } from '../services/softwarePolicyInstallPreview';
+import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
+import { assertMayArmInstall } from '../services/softwarePolicyAuthorization';
+import { captureException } from '../services/sentry';
+import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import { requestPamCleanup } from '../services/pamActuationLifecycle';
+
+export const softwarePoliciesRoutes = new Hono();
+const requireSoftwarePolicyRead = requirePermission(
+  PERMISSIONS.DEVICES_READ.resource,
+  PERMISSIONS.DEVICES_READ.action,
+);
+const requireSoftwarePolicyWrite = requirePermission(
+  PERMISSIONS.DEVICES_WRITE.resource,
+  PERMISSIONS.DEVICES_WRITE.action,
+);
+const requireSoftwarePolicyExecute = requirePermission(
+  PERMISSIONS.DEVICES_EXECUTE.resource,
+  PERMISSIONS.DEVICES_EXECUTE.action,
+);
+
+softwarePoliciesRoutes.use('*', authMiddleware);
+softwarePoliciesRoutes.use('*', requireScope('organization', 'partner', 'system'));
+
+const policyIdParamSchema = z.object({
+  id: z.string().guid(),
+});
+
+const softwareRuleSchema = z.object({
+  name: z.string().min(1).max(500),
+  vendor: z.string().min(1).max(200).optional(),
+  minVersion: z.string().min(1).max(100).optional(),
+  maxVersion: z.string().min(1).max(100).optional(),
+  catalogId: z.string().guid().optional(),
+  reason: z.string().min(1).max(1000).optional(),
+});
+
+// PAM executable rule (parallel to softwareRuleSchema, consumed by the
+// PAM bridge — not the inventory matcher). sha256 regex is case-insensitive
+// for input; the DB CHECK constraint stores lowercase hex.
+export const executableRuleSchema = z.object({
+  name: z.string().min(1).max(200),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+  signer: z.string().max(255).optional(),
+  publisher: z.string().max(255).optional(),
+  pathGlob: z.string().max(500).optional(),
+});
+
+// Both software[] and executable[] are optional, but the policy must carry
+// at least one rule in at least one of them. A PAM-only policy
+// (executable[] populated, software[] empty/absent) is valid; an inventory-
+// only policy (software[] populated, executable[] absent) is valid.
+export const softwareRulesSchema = z.object({
+  software: z.array(softwareRuleSchema).optional(),
+  executable: z.array(executableRuleSchema).optional(),
+  allowUnknown: z.boolean().optional(),
+}).refine(
+  (r) => (r.software?.length ?? 0) > 0 || (r.executable?.length ?? 0) > 0,
+  { message: 'rules must include at least one software[] or executable[] entry' }
+);
+
+// NOTE: a non-strict z.object STRIPS unknown keys silently rather than
+// rejecting them, so a field is invisible to the API until it is declared
+// here. Both createPolicySchema and updatePolicySchema reference this one
+// object, so a field added here covers the create and update surfaces alike.
+export const remediationOptionsSchema = z.object({
+  autoUninstall: z.boolean().optional(),
+  autoInstall: z.boolean().optional(), // #5505 — see SoftwarePolicyRemediationOptions
+  notifyUser: z.boolean().optional(),
+  gracePeriod: z.number().int().min(0).max(24 * 90).optional(), // hours; max 90 days
+  cooldownMinutes: z.number().int().min(1).max(24 * 90 * 60).optional(),
+  maintenanceWindowOnly: z.boolean().optional(),
+});
+
+const listPoliciesQuerySchema = z.object({
+  mode: z.enum(['allowlist', 'blocklist', 'audit']).optional(),
+  isActive: z.enum(['true', 'false']).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+});
+
+const createPolicySchema = z.object({
+  orgId: z.string().guid().optional(),
+  // Ownership axis (#2126, mirroring config policies #1724). 'organization'
+  // (default) = classic org-scoped policy. 'partner' = partner-wide / all-orgs
+  // template; the server derives the partner from the caller's own token —
+  // a client-supplied partner id is NEVER trusted. orgId is ignored when
+  // ownerScope is 'partner'.
+  ownerScope: z.enum(['organization', 'partner']).optional(),
+  name: z.string().min(1).max(200),
+  description: z.string().max(4000).optional(),
+  mode: z.enum(['allowlist', 'blocklist', 'audit']),
+  rules: softwareRulesSchema,
+  enforceMode: z.boolean().optional(),
+  remediationOptions: remediationOptionsSchema.optional(),
+});
+
+const updatePolicySchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().max(4000).optional(),
+  mode: z.enum(['allowlist', 'blocklist', 'audit']).optional(),
+  rules: softwareRulesSchema.optional(),
+  isActive: z.boolean().optional(),
+  enforceMode: z.boolean().optional(),
+  remediationOptions: remediationOptionsSchema.optional(),
+});
+
+const violationsQuerySchema = z.object({
+  policyId: z.string().guid().optional(),
+  deviceId: z.string().guid().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+
+const optionalDeviceIdsSchema = z.object({
+  deviceIds: z.array(z.string().guid()).min(1).max(500).optional(),
+});
+
+export function resolveOrgIdForWrite(
+  auth: AuthContext,
+  requestedOrgId?: string
+): { orgId?: string; error?: string } {
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) {
+      return { error: 'Organization context required' };
+    }
+    if (requestedOrgId && requestedOrgId !== auth.orgId) {
+      return { error: 'Cannot write outside your organization' };
+    }
+    return { orgId: auth.orgId };
+  }
+
+  if (requestedOrgId) {
+    if (!auth.canAccessOrg(requestedOrgId)) {
+      return { error: 'Access denied to this organization' };
+    }
+    return { orgId: requestedOrgId };
+  }
+
+  if (auth.orgId) {
+    return { orgId: auth.orgId };
+  }
+
+  if (Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length === 1) {
+    return { orgId: auth.accessibleOrgIds[0] };
+  }
+
+  return { error: 'orgId is required for this scope' };
+}
+
+// Dual-axis access condition (#2126): org-owned rows the caller can reach OR
+// partner-wide rows (org_id NULL) owned by the caller's own partner. This
+// app-layer condition keeps partner-owned templates visible to reads that
+// filter by auth.orgCondition (which would otherwise exclude org_id IS NULL
+// rows). RLS is STRICTER, not identical: breeze_has_partner_access only passes
+// for partner-scope callers, so org-scope tokens (which also carry a
+// partnerId) never see partner-wide rows regardless of the app condition —
+// proven by softwarePoliciesPartnerRls.integration.test.ts. Gate the branch on
+// partner scope so app and DB agree.
+function softwarePolicyAccessCondition(auth: AuthContext): SQL | undefined {
+  const orgCond = auth.orgCondition(softwarePolicies.orgId);
+  // System scope: no filter on either axis.
+  if (!orgCond) return undefined;
+  if (auth.scope === 'partner' && auth.partnerId) {
+    return sql`(${orgCond} OR (${softwarePolicies.orgId} IS NULL AND ${softwarePolicies.partnerId} = ${auth.partnerId}))`;
+  }
+  return orgCond;
+}
+
+type SoftwarePolicyTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+export async function cleanupSoftwarePolicyElevations(
+  tx: SoftwarePolicyTx,
+  policyId: string,
+): Promise<number> {
+  const result = await tx.execute<{ id: string }>(sql`
+    WITH matching AS (
+      SELECT id
+      FROM elevation_requests
+      WHERE metadata->>'software_policy_match_id' = ${policyId}
+        AND status IN ('approved', 'auto_approved', 'actuating')
+      FOR UPDATE
+    )
+    UPDATE elevation_requests AS request
+    SET status = 'revoked',
+        revoked_at = now(),
+        revision = request.revision + 1,
+        updated_at = now()
+    FROM matching
+    WHERE request.id = matching.id
+      AND request.status IN ('approved', 'auto_approved', 'actuating')
+    RETURNING request.id
+  `);
+  const rows = (result as { rows?: Array<{ id: string }> }).rows ?? [];
+  for (const row of rows) {
+    await requestPamCleanup(tx, {
+      elevationRequestId: row.id,
+      cause: 'policy_removed',
+    });
+  }
+  return rows.length;
+}
+
+async function getPolicyWithAccess(policyId: string, auth: AuthContext) {
+  const conditions: SQL[] = [eq(softwarePolicies.id, policyId)];
+  const accessCondition = softwarePolicyAccessCondition(auth);
+  if (accessCondition) conditions.push(accessCondition);
+
+  const [policy] = await db
+    .select()
+    .from(softwarePolicies)
+    .where(and(...conditions))
+    .limit(1);
+
+  return policy ?? null;
+}
+
+// Resolve the device IDs a site-restricted caller may act on within their org,
+// narrowed by `permissions.allowedSiteIds`. Returns null when the caller has no
+// site restriction (no narrowing needed). Site is an app-layer-only authz axis
+// — Postgres RLS does NOT defend it — so a site-restricted org user must not
+// remediate devices in sites outside their allowlist. Mirrors
+// `resolveSiteAllowedDeviceIds` in browserSecurity.ts / sentinelOne.ts.
+async function resolveSiteAllowedDeviceIds(
+  orgId: string,
+  perms: UserPermissions | undefined,
+): Promise<string[] | null> {
+  if (!perms?.allowedSiteIds) return null;
+  const orgDevices = await db
+    .select({ id: devices.id, siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.orgId, orgId));
+  return orgDevices
+    .filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId))
+    .map((d) => d.id);
+}
+
+softwarePoliciesRoutes.get(
+  '/',
+  requireSoftwarePolicyRead,
+  zValidator('query', listPoliciesQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const query = c.req.valid('query');
+
+    const conditions: SQL[] = [];
+    const accessCondition = softwarePolicyAccessCondition(auth);
+    if (accessCondition) conditions.push(accessCondition);
+    if (query.mode) conditions.push(eq(softwarePolicies.mode, query.mode));
+    conditions.push(eq(softwarePolicies.isActive, query.isActive === undefined ? true : query.isActive === 'true'));
+
+    const where = conditions.length > 0 ? and(...conditions) : undefined;
+    const limit = query.limit ?? 50;
+    const offset = query.offset ?? 0;
+
+    const [countRow] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(softwarePolicies)
+      .where(where);
+
+    const rows = await db
+      .select()
+      .from(softwarePolicies)
+      .where(where)
+      .orderBy(desc(softwarePolicies.updatedAt), desc(softwarePolicies.id))
+      .limit(limit)
+      .offset(offset);
+
+    return c.json({
+      data: rows,
+      pagination: {
+        total: Number(countRow?.count ?? 0),
+        limit,
+        offset,
+      },
+    });
+  }
+);
+
+softwarePoliciesRoutes.post(
+  '/',
+  requireSoftwarePolicyWrite,
+  requireMfa(),
+  zValidator('json', createPolicySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const payload = c.req.valid('json');
+
+    // #5505 D3: arming remediationOptions.autoInstall installs software on
+    // managed devices, so it needs deployment-grade authorization
+    // (devices.execute + MFA) on top of the devices:write + requireMfa() this
+    // route already carries. `stored` is null — nothing exists yet — so the
+    // merged state is the body alone.
+    const armDenied = await assertMayArmInstall(c, null, {
+      mode: payload.mode,
+      enforceMode: payload.enforceMode,
+      remediationOptions: payload.remediationOptions,
+    });
+    if (armDenied) return armDenied;
+
+    // Ownership axis (#2126). Partner-wide templates push rules to devices in
+    // ALL orgs under the partner (including orgs created later), so creation is
+    // gated on the partner-wide capability — same gate as configuration
+    // policies. The partner is ALWAYS derived from the caller's own token.
+    let owner: { orgId: string | null; partnerId: string | null };
+    if (payload.ownerScope === 'partner') {
+      if (!auth.partnerId) {
+        return c.json({ error: 'Partner-wide software policies require partner scope' }, 403);
+      }
+      if (!canManagePartnerWidePolicies(auth)) {
+        return c.json({ error: 'Partner-wide software policies require full partner org access (orgAccess must be "all")' }, 403);
+      }
+      owner = { orgId: null, partnerId: auth.partnerId };
+    } else {
+      // The frontend always sends ?orgId=<currentOrgId> on partner-scope POSTs,
+      // not in the JSON body. Reading only from payload.orgId left partner-scope
+      // users with no resolvable org (#808: "orgId is required for this scope"
+      // after the underlying 500 from #807 was fixed).
+      const resolvedOrg = resolveOrgIdForWrite(
+        auth,
+        payload.orgId ?? c.req.query('orgId') ?? undefined
+      );
+      if (!resolvedOrg.orgId) {
+        return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
+      }
+      owner = { orgId: resolvedOrg.orgId, partnerId: null };
+    }
+
+    const rules = normalizeSoftwarePolicyRules(payload.rules);
+    if (rules.software.length === 0 && (rules.executable?.length ?? 0) === 0) {
+      return c.json({ error: 'At least one software or executable rule is required' }, 400);
+    }
+
+    const [policy] = await db
+      .insert(softwarePolicies)
+      .values({
+        orgId: owner.orgId,
+        partnerId: owner.partnerId,
+        name: payload.name,
+        description: payload.description ?? null,
+        mode: payload.mode,
+        rules,
+        enforceMode: payload.enforceMode ?? false,
+        remediationOptions: payload.remediationOptions ?? null,
+        createdBy: auth.user.id,
+      })
+      .returning();
+    if (!policy) {
+      return c.json({ error: 'Failed to create policy' }, 500);
+    }
+
+    let scheduleWarning: string | undefined;
+    try {
+      await scheduleSoftwareComplianceCheck(policy.id);
+    } catch (error) {
+      scheduleWarning = error instanceof Error ? error.message : 'Failed to schedule compliance check';
+      console.error(`[softwarePolicies] Failed to schedule compliance check for policy ${policy.id}:`, error);
+      captureException(error);
+    }
+
+    recordSoftwarePolicyAudit({
+      orgId: policy.orgId,
+      partnerId: policy.partnerId,
+      policyId: policy.id,
+      action: 'policy_created',
+      actor: 'user',
+      actorId: auth.user.id,
+      details: {
+        mode: policy.mode,
+      },
+    }).catch((err) => {
+      console.error('[softwarePolicies] Audit write failed for policy_created:', err);
+    });
+
+    writeRouteAudit(c, {
+      orgId: policy.orgId,
+      action: 'software_policy.create',
+      resourceType: 'software_policy',
+      resourceId: policy.id,
+      resourceName: policy.name,
+      details: {
+        mode: policy.mode,
+        enforceMode: policy.enforceMode,
+        rules: rules.software.length + (rules.executable?.length ?? 0),
+        scheduleWarning,
+      },
+    });
+
+    return c.json({ data: policy, warning: scheduleWarning }, 201);
+  }
+);
+
+softwarePoliciesRoutes.get('/compliance/overview', requireSoftwarePolicyRead, async (c) => {
+  const auth = c.get('auth');
+  const perms = c.get('permissions') as UserPermissions | undefined;
+
+  const conditions: SQL[] = [];
+  const orgCondition = auth.orgCondition(devices.orgId);
+  if (orgCondition) conditions.push(orgCondition);
+  if (perms?.allowedSiteIds && auth.orgId) {
+    if (perms.allowedSiteIds.length === 0) {
+      return c.json({ total: 0, compliant: 0, violations: 0, unknown: 0 });
+    }
+    conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
+  }
+
+  const worstStatusSq = db
+    .select({
+      deviceId: softwareComplianceStatus.deviceId,
+      worstStatus: sql<string>`
+        CASE
+          WHEN MAX(CASE WHEN ${softwareComplianceStatus.status} = 'violation' THEN 1 ELSE 0 END) = 1 THEN 'violation'
+          WHEN MAX(CASE WHEN ${softwareComplianceStatus.status} = 'unknown' THEN 1 ELSE 0 END) = 1 THEN 'unknown'
+          ELSE 'compliant'
+        END
+      `.as('worst_status'),
+    })
+    .from(softwareComplianceStatus)
+    .innerJoin(devices, eq(softwareComplianceStatus.deviceId, devices.id))
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .groupBy(softwareComplianceStatus.deviceId)
+    .as('device_worst');
+
+  const counts = await db
+    .select({
+      status: worstStatusSq.worstStatus,
+      count: sql<number>`count(*)::int`,
+    })
+    .from(worstStatusSq)
+    .groupBy(worstStatusSq.worstStatus);
+
+  let compliant = 0;
+  let violations = 0;
+  let unknown = 0;
+  let total = 0;
+  for (const row of counts) {
+    total += row.count;
+    if (row.status === 'compliant') compliant = row.count;
+    else if (row.status === 'violation') violations = row.count;
+    else unknown += row.count;
+  }
+
+  return c.json({ total, compliant, violations, unknown });
+});
+
+softwarePoliciesRoutes.get(
+  '/violations',
+  requireSoftwarePolicyRead,
+  zValidator('query', violationsQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    const conditions: SQL[] = [eq(softwareComplianceStatus.status, 'violation')];
+    const orgCondition = auth.orgCondition(devices.orgId);
+    if (orgCondition) conditions.push(orgCondition);
+    if (perms?.allowedSiteIds && auth.orgId) {
+      const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
+      if (query.deviceId && !allowedDeviceIds!.includes(query.deviceId)) {
+        return c.json({ error: 'Device not found or access denied' }, 403);
+      }
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({ data: [], total: 0 });
+      }
+      conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
+    }
+    if (query.policyId) conditions.push(eq(softwareComplianceStatus.policyId, query.policyId));
+    if (query.deviceId) conditions.push(eq(softwareComplianceStatus.deviceId, query.deviceId));
+
+    const rows = await db
+      .select({
+        device: {
+          id: devices.id,
+          hostname: devices.hostname,
+          status: devices.status,
+          osType: devices.osType,
+        },
+        compliance: {
+          id: softwareComplianceStatus.id,
+          policyId: softwareComplianceStatus.policyId,
+          status: softwareComplianceStatus.status,
+          violations: softwareComplianceStatus.violations,
+          lastChecked: softwareComplianceStatus.lastChecked,
+          remediationStatus: softwareComplianceStatus.remediationStatus,
+          installRemediationStatus: softwareComplianceStatus.installRemediationStatus,
+          lastInstallRemediationAttempt: softwareComplianceStatus.lastInstallRemediationAttempt,
+          installRemediationAttempts: softwareComplianceStatus.installRemediationAttempts,
+        },
+      })
+      .from(softwareComplianceStatus)
+      .innerJoin(devices, eq(softwareComplianceStatus.deviceId, devices.id))
+      .where(and(...conditions))
+      .orderBy(desc(softwareComplianceStatus.lastChecked))
+      .limit(query.limit ?? 100);
+
+    return c.json({ data: rows, total: rows.length });
+  }
+);
+
+softwarePoliciesRoutes.get(
+  '/:id',
+  requireSoftwarePolicyRead,
+  zValidator('param', policyIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+
+    const policy = await getPolicyWithAccess(id, auth);
+    if (!policy) {
+      return c.json({ error: 'Policy not found' }, 404);
+    }
+
+    return c.json({ data: policy });
+  }
+);
+
+// #5505 W06 — the pre-arm dry run behind PolicyForm's "this will install
+// missing software on ~N device(s)" warning (spec Risks §2, "Fleet-wide first
+// run"). Read-only: same auth gate and site-ceiling narrowing as its GET
+// siblings, arms nothing, needs no MFA and no canMutateOrgWideGovernance
+// (those gates exist only on writes).
+//
+// Response contract is exactly `{ eligibleDeviceCount: number }` and must stay
+// that way: W04 (#5509) is specified to consume that shape and degrade any
+// non-2xx to "unavailable". That UI has NOT landed — as of this wave nothing
+// under apps/web references install-preview — so the contract is owed to W04's
+// plan, not to shipped code.
+//
+// Known limitation the bare number cannot express: the count reflects
+// violations the compliance worker recorded on its last pass, and policy
+// create/update only ENQUEUE a recheck. A never-evaluated policy therefore
+// previews as 0. The service logs that case rather than returning a
+// distinguishable value; giving the operator an explicit "not measured yet"
+// state is W04's call, because it would change this contract.
+softwarePoliciesRoutes.get(
+  '/:id/install-preview',
+  requireSoftwarePolicyRead,
+  zValidator('param', policyIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const { id } = c.req.valid('param');
+
+    // Tenancy is the existing getPolicyWithAccess 404, unchanged: a
+    // nonexistent id and a cross-tenant id both match zero rows and produce
+    // the byte-identical body, so this route leaks neither case.
+    const policy = await getPolicyWithAccess(id, auth);
+    if (!policy) {
+      return c.json({ error: 'Policy not found' }, 404);
+    }
+
+    // `missing` violations — the only kind autoInstall ever acts on — are only
+    // ever emitted for allowlist policies (evaluateSoftwareInventory's
+    // blocklist/audit branches only ever emit `unauthorized`). Short-circuit
+    // before resolving a single device.
+    if (policy.mode !== 'allowlist') {
+      return c.json({ eligibleDeviceCount: 0 });
+    }
+
+    // Site-ceiling gate (app-layer only — Postgres RLS does not defend it),
+    // mirroring GET /violations, so a site-restricted caller previews the same
+    // device set they are actually allowed to act on.
+    let siteAllowedDeviceIds: string[] | null = null;
+    if (perms?.allowedSiteIds && auth.orgId) {
+      if (perms.allowedSiteIds.length === 0) {
+        return c.json({ eligibleDeviceCount: 0 });
+      }
+      siteAllowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
+    }
+
+    const rules = normalizeSoftwarePolicyRules(policy.rules);
+    const eligibleDeviceCount = await computeInstallPreviewEligibleDeviceCount({
+      policyId: policy.id,
+      rules,
+      siteAllowedDeviceIds,
+    });
+
+    return c.json({ eligibleDeviceCount });
+  }
+);
+
+softwarePoliciesRoutes.patch(
+  '/:id',
+  requireSoftwarePolicyWrite,
+  requireMfa(),
+  zValidator('param', policyIdParamSchema),
+  zValidator('json', updatePolicySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const { id } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    const policy = await getPolicyWithAccess(id, auth);
+    if (!policy) {
+      return c.json({ error: 'Policy not found' }, 404);
+    }
+
+    // Partner-wide templates are READABLE by any member of the partner but
+    // administrable only with the partner-wide capability — editing rules
+    // changes enforcement across every org under the partner.
+    if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    // #5505 D3: evaluated over the POST-WRITE merged state — the stored row
+    // overlaid with this body — so editing an ALREADY-armed policy is gated
+    // too. Adding a catalogId to an armed policy installs new software, and
+    // that must not be reachable with a weaker credential than arming was.
+    const armDenied = await assertMayArmInstall(c, policy, {
+      mode: payload.mode,
+      enforceMode: payload.enforceMode,
+      remediationOptions: payload.remediationOptions,
+    });
+    if (armDenied) return armDenied;
+
+    const updates: Omit<Partial<typeof softwarePolicies.$inferInsert>, 'approvalGeneration'> & { approvalGeneration?: SQL } = {
+      updatedAt: new Date(),
+      // Site-ceiling gate contract §3: bump on every PATCH so a queued
+      // compliance/remediation job carrying the OLD generation can tell it
+      // has been superseded and skip acting on stale config.
+      approvalGeneration: sql`${softwarePolicies.approvalGeneration} + 1`,
+    };
+
+    if (payload.name !== undefined) updates.name = payload.name;
+    if (payload.description !== undefined) updates.description = payload.description;
+    if (payload.mode !== undefined) updates.mode = payload.mode;
+    if (payload.isActive !== undefined) updates.isActive = payload.isActive;
+    if (payload.enforceMode !== undefined) updates.enforceMode = payload.enforceMode;
+    if (payload.remediationOptions !== undefined) updates.remediationOptions = payload.remediationOptions;
+
+    if (payload.rules !== undefined) {
+      const normalizedRules = normalizeSoftwarePolicyRules(payload.rules);
+      if (normalizedRules.software.length === 0 && (normalizedRules.executable?.length ?? 0) === 0) {
+        return c.json({ error: 'At least one software or executable rule is required' }, 400);
+      }
+      updates.rules = normalizedRules;
+    }
+
+    let updated: typeof policy | undefined;
+    try {
+      updated = await db.transaction(async (tx) => {
+        const [next] = await tx
+          .update(softwarePolicies)
+          .set(updates)
+          .where(eq(softwarePolicies.id, policy.id))
+          .returning();
+        if (policy.isActive && payload.isActive === false) {
+          await cleanupSoftwarePolicyElevations(tx, policy.id);
+        }
+        return next;
+      });
+    } catch (error) {
+      console.error(`[softwarePolicies] Failed to update policy ${id}:`, error);
+      captureException(error);
+      return c.json({ error: 'Failed to update policy' }, 500);
+    }
+
+    let scheduleWarning: string | undefined;
+    try {
+      await scheduleSoftwareComplianceCheck(policy.id, undefined, updated?.approvalGeneration);
+    } catch (error) {
+      scheduleWarning = error instanceof Error ? error.message : 'Failed to schedule compliance check';
+      console.error(`[softwarePolicies] Failed to schedule compliance check for policy ${policy.id}:`, error);
+      captureException(error);
+    }
+
+    recordSoftwarePolicyAudit({
+      orgId: policy.orgId,
+      partnerId: policy.partnerId,
+      policyId: policy.id,
+      action: 'policy_updated',
+      actor: 'user',
+      actorId: auth.user.id,
+      details: {
+        updatedFields: Object.keys(payload),
+        scheduleWarning,
+      },
+    }).catch((err) => {
+      console.error('[softwarePolicies] Audit write failed for policy_updated:', err);
+    });
+
+    writeRouteAudit(c, {
+      orgId: policy.orgId,
+      action: 'software_policy.update',
+      resourceType: 'software_policy',
+      resourceId: policy.id,
+      resourceName: updated?.name ?? policy.name,
+      details: {
+        updatedFields: Object.keys(payload),
+        scheduleWarning,
+      },
+    });
+
+    return c.json({ data: updated ?? policy, warning: scheduleWarning });
+  }
+);
+
+softwarePoliciesRoutes.delete(
+  '/:id',
+  requireSoftwarePolicyWrite,
+  requireMfa(),
+  zValidator('param', policyIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canMutateOrgWideGovernance(auth)) {
+      return c.json({ error: SITE_CEILING_WRITE_DENIED_MESSAGE }, 403);
+    }
+    const { id } = c.req.valid('param');
+
+    const policy = await getPolicyWithAccess(id, auth);
+    if (!policy) {
+      return c.json({ error: 'Policy not found' }, 404);
+    }
+
+    // Same partner-wide administration gate as PATCH: deleting a partner-wide
+    // template strips enforcement from every org under the partner.
+    if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    try {
+      await db.transaction(async (tx) => {
+        await tx
+          .update(softwarePolicies)
+          .set({ isActive: false, updatedAt: new Date() })
+          .where(eq(softwarePolicies.id, id));
+        await cleanupSoftwarePolicyElevations(tx, id);
+        await tx
+          .delete(softwareComplianceStatus)
+          .where(eq(softwareComplianceStatus.policyId, id));
+      });
+    } catch (error) {
+      console.error(`[softwarePolicies] Failed to delete policy ${id}:`, error);
+      captureException(error);
+      return c.json({ error: 'Failed to delete policy' }, 500);
+    }
+
+    recordSoftwarePolicyAudit({
+      orgId: policy.orgId,
+      partnerId: policy.partnerId,
+      policyId: policy.id,
+      action: 'policy_deleted',
+      actor: 'user',
+      actorId: auth.user.id,
+      details: { name: policy.name },
+    }).catch((err) => {
+      console.error('[softwarePolicies] Audit write failed for policy_deleted:', err);
+    });
+
+    writeRouteAudit(c, {
+      orgId: policy.orgId,
+      action: 'software_policy.delete',
+      resourceType: 'software_policy',
+      resourceId: policy.id,
+      resourceName: policy.name,
+    });
+
+    return c.json({ success: true, id: policy.id });
+  }
+);
+
+softwarePoliciesRoutes.post(
+  '/:id/check',
+  requireSoftwarePolicyExecute,
+  requireMfa(),
+  zValidator('param', policyIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+
+    const policy = await getPolicyWithAccess(id, auth);
+    if (!policy) {
+      return c.json({ error: 'Policy not found' }, 404);
+    }
+
+    // A partner-owned policy can evaluate (and auto-remediate) devices across
+    // every organization under the partner. Restricted partner users must not
+    // be able to trigger that system-scoped work.
+    if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    }
+
+    let rawPayload: unknown;
+    try {
+      rawPayload = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON in request body' }, 400);
+    }
+    const parsed = optionalDeviceIdsSchema.safeParse(rawPayload);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues.map((issue) => issue.message).join('; ') }, 400);
+    }
+
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const siteAllowedDeviceIds = policy.orgId
+      ? await resolveSiteAllowedDeviceIds(policy.orgId, perms)
+      : (perms?.allowedSiteIds ? [] : null);
+
+    let targetDeviceIds = parsed.data.deviceIds
+      ? Array.from(new Set(parsed.data.deviceIds))
+      : undefined;
+
+    if (targetDeviceIds) {
+      if (siteAllowedDeviceIds) {
+        const allowed = new Set(siteAllowedDeviceIds);
+        if (targetDeviceIds.some((deviceId) => !allowed.has(deviceId))) {
+          return c.json({ error: 'Access to one or more device sites denied' }, 403);
+        }
+      }
+
+      const deviceConditions: SQL[] = [inArray(devices.id, targetDeviceIds)];
+      const orgCondition = auth.orgCondition(devices.orgId);
+      if (orgCondition) deviceConditions.push(orgCondition);
+      if (policy.orgId) deviceConditions.push(eq(devices.orgId, policy.orgId));
+
+      const authorizedDevices = await db
+        .select({ id: devices.id })
+        .from(devices)
+        .where(and(...deviceConditions));
+      const authorizedIds = new Set(authorizedDevices.map((device) => device.id));
+      if (targetDeviceIds.some((deviceId) => !authorizedIds.has(deviceId))) {
+        return c.json({ error: 'Access to one or more devices denied' }, 403);
+      }
+    } else if (siteAllowedDeviceIds) {
+      if (siteAllowedDeviceIds.length === 0) {
+        return c.json({ message: 'No accessible devices found for compliance check', queued: 0 });
+      }
+      targetDeviceIds = siteAllowedDeviceIds;
+    }
+
+    let jobId: string;
+    try {
+      jobId = await scheduleSoftwareComplianceCheck(policy.id, targetDeviceIds);
+    } catch (error) {
+      console.error(`[softwarePolicies] Failed to schedule on-demand compliance check for policy ${id}:`, error);
+      captureException(error);
+      return c.json({ error: 'Failed to schedule compliance check. Please try again.' }, 503);
+    }
+
+    recordSoftwarePolicyAudit({
+      orgId: policy.orgId,
+      partnerId: policy.partnerId,
+      policyId: policy.id,
+      action: 'compliance_check_requested',
+      actor: 'user',
+      actorId: auth.user.id,
+      details: { jobId, deviceIds: targetDeviceIds ?? null },
+    }).catch((err) => {
+      console.error('[softwarePolicies] Audit write failed for compliance_check_requested:', err);
+    });
+
+    writeRouteAudit(c, {
+      orgId: policy.orgId,
+      action: 'software_policy.check',
+      resourceType: 'software_policy',
+      resourceId: policy.id,
+      resourceName: policy.name,
+      details: { jobId, deviceCount: targetDeviceIds?.length ?? 0 },
+    });
+
+    return c.json({ message: 'Compliance check scheduled', jobId });
+  }
+);
+
+softwarePoliciesRoutes.post(
+  '/:id/remediate',
+  requireSoftwarePolicyExecute,
+  requireMfa(),
+  zValidator('param', policyIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+
+    const policy = await getPolicyWithAccess(id, auth);
+    if (!policy) {
+      return c.json({ error: 'Policy not found' }, 404);
+    }
+
+    if (policy.mode === 'audit') {
+      return c.json({ error: 'Remediation is not available for audit-only policies' }, 400);
+    }
+
+    let rawPayload: unknown;
+    try {
+      rawPayload = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON in request body' }, 400);
+    }
+    const parsed = optionalDeviceIdsSchema.safeParse(rawPayload);
+    if (!parsed.success) {
+      return c.json({ error: parsed.error.issues.map((issue) => issue.message).join('; ') }, 400);
+    }
+
+    let targetDeviceIds = parsed.data.deviceIds ?? [];
+
+    // Site is an app-layer-only authz axis (RLS does not defend it). A
+    // site-restricted org user must not remediate devices in sites outside
+    // their allowlist — whether named explicitly via body.deviceIds or
+    // selected implicitly from the policy's violations. `allowedSiteIds` is
+    // only ever set for org-scope users, so `policy.orgId` is the relevant org.
+    // A partner-wide policy (orgId NULL, #2126) is RLS-invisible to org-scope
+    // callers, so a site-restricted caller can't normally reach this branch —
+    // if one somehow does, fail closed (empty allowlist = no devices).
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const siteAllowedDeviceIds = policy.orgId
+      ? await resolveSiteAllowedDeviceIds(policy.orgId, perms)
+      : (perms?.allowedSiteIds ? [] : null);
+
+    if (targetDeviceIds.length > 0) {
+      // Deny the whole batch (matching sentinelOne.ts hasDeniedDeviceSite) if
+      // any explicitly-named device is out of the caller's site scope.
+      if (siteAllowedDeviceIds) {
+        const allowed = new Set(siteAllowedDeviceIds);
+        if (targetDeviceIds.some((deviceId) => !allowed.has(deviceId))) {
+          return c.json({ error: 'Access to one or more device sites denied' }, 403);
+        }
+      }
+
+      const deviceConditions: SQL[] = [inArray(devices.id, targetDeviceIds)];
+      const orgCondition = auth.orgCondition(devices.orgId);
+      if (orgCondition) deviceConditions.push(orgCondition);
+
+      const allowedDevices = await db
+        .select({ id: devices.id })
+        .from(devices)
+        .where(and(...deviceConditions));
+      targetDeviceIds = allowedDevices.map((device) => device.id);
+    } else {
+      const complianceConditions: SQL[] = [
+        eq(softwareComplianceStatus.policyId, policy.id),
+        eq(softwareComplianceStatus.status, 'violation'),
+      ];
+      const orgCondition = auth.orgCondition(devices.orgId);
+      if (orgCondition) complianceConditions.push(orgCondition);
+      // Narrow the implicit target set to the caller's accessible devices.
+      if (siteAllowedDeviceIds) {
+        if (siteAllowedDeviceIds.length === 0) {
+          return c.json({ message: 'No matching violating devices found for remediation', queued: 0 });
+        }
+        complianceConditions.push(inArray(softwareComplianceStatus.deviceId, siteAllowedDeviceIds));
+      }
+
+      const rows = await db
+        .select({ deviceId: softwareComplianceStatus.deviceId })
+        .from(softwareComplianceStatus)
+        .innerJoin(devices, eq(softwareComplianceStatus.deviceId, devices.id))
+        .where(and(...complianceConditions))
+        .limit(500);
+
+      targetDeviceIds = Array.from(new Set(rows.map((row) => row.deviceId)));
+    }
+
+    if (targetDeviceIds.length === 0) {
+      return c.json({ message: 'No matching violating devices found for remediation', queued: 0 });
+    }
+
+    let queued: number;
+    try {
+      // `trigger: 'manual'` is stamped server-side, never taken from the request
+      // body — it is what exempts this job from the worker's arming re-check
+      // (#3543). This route is already behind the execute permission, MFA, and
+      // tenant/site filtering, and `enforceMode`/`autoUninstall` authorise
+      // UNATTENDED remediation rather than a deliberate operator action.
+      queued = await scheduleSoftwareRemediation(policy.id, targetDeviceIds, {
+        trigger: 'manual',
+        requestedByUserId: auth.user.id,
+      });
+    } catch (error) {
+      console.error(`[softwarePolicies] Failed to schedule remediation for policy ${id}:`, error);
+      captureException(error);
+      return c.json({ error: 'Failed to schedule remediation. Please try again.' }, 503);
+    }
+
+    if (queued > 0) {
+      const CHUNK = 500;
+      for (let i = 0; i < targetDeviceIds.length; i += CHUNK) {
+        const chunk = targetDeviceIds.slice(i, i + CHUNK);
+        await db
+          .update(softwareComplianceStatus)
+          .set({
+            remediationStatus: 'pending',
+            lastRemediationAttempt: new Date(),
+          })
+          .where(and(
+            eq(softwareComplianceStatus.policyId, policy.id),
+            inArray(softwareComplianceStatus.deviceId, chunk),
+          ));
+      }
+    }
+
+    recordSoftwarePolicyAudit({
+      orgId: policy.orgId,
+      partnerId: policy.partnerId,
+      policyId: policy.id,
+      action: 'remediation_requested',
+      actor: 'user',
+      actorId: auth.user.id,
+      details: {
+        requestedCount: targetDeviceIds.length,
+        queued,
+      },
+    }).catch((err) => {
+      console.error('[softwarePolicies] Audit write failed for remediation_requested:', err);
+    });
+
+    writeRouteAudit(c, {
+      orgId: policy.orgId,
+      action: 'software_policy.remediate',
+      resourceType: 'software_policy',
+      resourceId: policy.id,
+      resourceName: policy.name,
+      details: {
+        requestedCount: targetDeviceIds.length,
+        queued,
+      },
+    });
+
+    return c.json({
+      message: `Remediation scheduled for ${queued} device(s)`,
+      queued,
+      deviceIds: targetDeviceIds,
+    });
+  }
+);

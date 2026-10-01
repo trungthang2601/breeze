@@ -1,0 +1,67 @@
+import type { ConditionHandler } from '../registry';
+import type { ThresholdCondition, ConditionResult } from '../types';
+import { normalizeMetricName, compareValue, getOperatorDisplay, getRecentMetrics, METRIC_NAME_MAP } from '../utils';
+
+export const thresholdHandler: ConditionHandler = {
+  type: 'threshold',
+  aliases: ['metric'],
+
+  async evaluate(condition: unknown, deviceId: string): Promise<ConditionResult> {
+    const cond = condition as ThresholdCondition;
+    const durationMinutes = cond.durationMinutes || 1;
+
+    const metricName = normalizeMetricName(cond.metric);
+    if (!metricName) {
+      return { passed: false, description: `Unknown metric: ${cond.metric}`, dataAvailable: false };
+    }
+
+    const metrics = await getRecentMetrics(deviceId, durationMinutes);
+
+    if (metrics.length === 0) {
+      return { passed: false, description: `No metrics available for ${cond.metric}`, dataAvailable: false };
+    }
+
+    // Average the window rather than requiring every sample to exceed. Strict
+    // all-samples semantics let a single dip below (or one null sample) silently
+    // suppress a sustained-high condition — the CPU-fires-but-RAM/Disk-don't bug
+    // in #1854. Null/undefined samples are skipped, not counted as below-threshold.
+    const values = metrics
+      .map(m => m[metricName])
+      .filter((v): v is number => typeof v === 'number');
+
+    if (values.length === 0) {
+      return { passed: false, description: `No metrics available for ${cond.metric}`, dataAvailable: false };
+    }
+
+    const average = values.reduce((sum, v) => sum + v, 0) / values.length;
+    const passed = compareValue(average, cond.operator, cond.value);
+    const operatorDisplay = getOperatorDisplay(cond.operator);
+
+    return {
+      passed,
+      description: `${cond.metric} ${operatorDisplay} ${cond.value} for ${durationMinutes}min`,
+      actualValue: average
+    };
+  },
+
+  validate(condition: unknown, path: string): string[] {
+    const errors: string[] = [];
+    const c = condition as Record<string, unknown>;
+
+    const validMetrics = [...Object.keys(METRIC_NAME_MAP), ...Object.values(METRIC_NAME_MAP)];
+    if (!validMetrics.includes(c.metric as string)) {
+      errors.push(`${path}.metric: Invalid metric name`);
+    }
+    if (!['gt', 'gte', 'lt', 'lte', 'eq', 'neq'].includes(c.operator as string)) {
+      errors.push(`${path}.operator: Invalid operator`);
+    }
+    if (typeof c.value !== 'number') {
+      errors.push(`${path}.value: Must be a number`);
+    }
+    if (c.durationMinutes !== undefined && typeof c.durationMinutes !== 'number') {
+      errors.push(`${path}.durationMinutes: Must be a number`);
+    }
+
+    return errors;
+  }
+};

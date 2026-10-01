@@ -1,0 +1,961 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+import { sql } from 'drizzle-orm';
+
+// Shared mutable gates so individual tests can flip MFA/permission denial at
+// request time — the route registers `requireMfa()` / `requirePermission()`
+// once at import time, so the returned middleware must re-check a gate on
+// every invocation rather than baking in a decision at registration.
+const { mfaGate, permissionGate, siteScope } = vi.hoisted(() => ({
+  mfaGate: { deny: false },
+  permissionGate: { deny: false },
+  siteScope: { allowedSiteIds: undefined as string[] | undefined },
+}));
+
+// `db.transaction` is mocked to invoke its callback with the SAME object, so a
+// nested savepoint (used by the installer-usage aggregate, #2992) routes
+// straight back to the `db.select` mocks these tests already configure.
+const dbMock = vi.hoisted(() => {
+  const m: Record<string, any> = {
+    select: vi.fn(),
+    insert: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn(),
+  };
+  m.transaction = vi.fn(async (fn: (tx: unknown) => unknown) => fn(m));
+  return m;
+});
+
+vi.mock('../db', () => ({
+  runOutsideDbContext: vi.fn((fn) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  db: dbMock,
+}));
+
+vi.mock('../db/schema', () => ({
+  enrollmentKeys: {
+    id: 'enrollmentKeys.id',
+    orgId: 'enrollmentKeys.orgId',
+    siteId: 'enrollmentKeys.siteId',
+    name: 'enrollmentKeys.name',
+    key: 'enrollmentKeys.key',
+    credentialGeneration: 'enrollmentKeys.credentialGeneration',
+    bootstrapTokenId: 'enrollmentKeys.bootstrapTokenId',
+    maxUsage: 'enrollmentKeys.maxUsage',
+    usageCount: 'enrollmentKeys.usageCount',
+    expiresAt: 'enrollmentKeys.expiresAt',
+    createdAt: 'enrollmentKeys.createdAt',
+    createdBy: 'enrollmentKeys.createdBy',
+  },
+  // Referenced by the #2832 purge exemption
+  // (services/enrollmentKeyPurgeGuards.ts), which the purge-expired route
+  // pulls into its DELETE predicate.
+  installerBootstrapTokens: {
+    id: 'installerBootstrapTokens.id',
+    parentEnrollmentKeyId: 'installerBootstrapTokens.parentEnrollmentKeyId',
+    parentCredentialGeneration: 'installerBootstrapTokens.parentCredentialGeneration',
+    expiresAt: 'installerBootstrapTokens.expiresAt',
+    consumedCount: 'installerBootstrapTokens.consumedCount',
+    maxUsage: 'installerBootstrapTokens.maxUsage',
+  },
+}));
+
+vi.mock('../middleware/auth', async () => ({
+  ...(await vi.importActual<typeof import('../middleware/auth')>('../middleware/auth')),
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      user: { id: 'user-1', email: 'test@example.com', name: 'Test User' },
+      scope: 'organization',
+      partnerId: null,
+      orgId: 'org-111',
+      accessibleOrgIds: ['org-111'],
+      allowedSiteIds: siteScope.allowedSiteIds,
+      orgCondition: () => undefined,
+      canAccessOrg: (id: string) => id === 'org-111',
+    });
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn(() => async (c: any, next: any) => {
+    if (permissionGate.deny) return c.json({ error: 'Forbidden' }, 403);
+    return next();
+  }),
+  requireMfa: vi.fn(() => async (c: any, next: any) => {
+    if (mfaGate.deny) return c.json({ error: 'MFA required' }, 403);
+    return next();
+  }),
+}));
+
+vi.mock('../services/auditService', () => ({
+  createAuditLogAsync: vi.fn(),
+}));
+
+vi.mock('../services/permissions', () => ({
+  PERMISSIONS: {
+    ORGS_READ: { resource: 'orgs', action: 'read' },
+    ORGS_WRITE: { resource: 'orgs', action: 'write' },
+  },
+}));
+
+vi.mock('../services/enrollmentKeySecurity', () => ({
+  hashEnrollmentKey: vi.fn((key: string) => `hashed_${key}`),
+  hashEnrollmentKeyCandidates: vi.fn((key: string) => [`hashed_${key}`]),
+}));
+
+vi.mock('../services/redis', () => ({
+  getRedis: vi.fn(() => ({})),
+}));
+
+vi.mock('../services/rate-limit', () => ({
+  rateLimiter: vi.fn(async () => ({ allowed: true, remaining: 10, resetAt: new Date() })),
+}));
+
+// Partner-cap enforcement (#2776 task 3.4, fix round 2). Mocked at the wiring
+// level — see enrollmentKeys.test.ts's identically-named helper for
+// rationale. Permissive by default so every pre-existing test in this file
+// (which predates the cap gate on rotate) keeps passing.
+const assertTtlWithinCapMock = vi.fn(
+  async (_orgId: string, _ttlMinutes: number | undefined) => null as string | null,
+);
+vi.mock('../services/enrollmentDefaults', () => ({
+  assertTtlWithinCap: (...args: [string, number | undefined]) =>
+    assertTtlWithinCapMock(...args),
+}));
+
+/**
+ * Configure the mocked partner-cap gate for the current test. Mirrors the
+ * real assertTtlWithinCap contract: null when ttlMinutes is undefined or at/
+ * under the cap, an error string naming the cap when it's exceeded.
+ */
+function mockEnrollmentDefaults(opts: { maxTtlMinutes: number }) {
+  assertTtlWithinCapMock.mockImplementation(
+    async (_orgId: string, ttlMinutes: number | undefined) => {
+      if (ttlMinutes === undefined) return null;
+      return ttlMinutes > opts.maxTtlMinutes
+        ? `ttlMinutes exceeds the partner maximum of ${opts.maxTtlMinutes} minutes`
+        : null;
+    },
+  );
+}
+
+import { enrollmentKeyRoutes } from './enrollmentKeys';
+import { db } from '../db';
+import { createAuditLogAsync } from '../services/auditService';
+
+const ORG_ID = 'org-111';
+const KEY_ID = '11111111-1111-1111-1111-111111111111';
+
+function makeEnrollmentKey(overrides: Record<string, any> = {}) {
+  return {
+    id: KEY_ID,
+    orgId: ORG_ID,
+    siteId: null,
+    name: 'Test Key',
+    key: 'hashed_abc123',
+    credentialGeneration: 1,
+    maxUsage: 10,
+    usageCount: 0,
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    createdAt: new Date(),
+    createdBy: 'user-1',
+    ...overrides,
+  };
+}
+
+/**
+ * Mock for db.select().from().where().groupBy() — the installer bootstrap-token
+ * aggregate GET /:id runs after loading the key (#2992).
+ */
+function mockSelectFromWhereGroupBy(rows: any[]) {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        groupBy: vi.fn().mockResolvedValue(rows),
+      }),
+    }),
+  } as any);
+}
+
+/** Mock for db.select().from().where().limit() — single-record lookups */
+function mockSelectFromWhereLimit(rows: any[]) {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        limit: vi.fn().mockResolvedValue(rows),
+      }),
+    }),
+  } as any);
+}
+
+/** Mock for db.update().set().where().returning() */
+function mockUpdateSetWhereReturning(rows: any[]) {
+  vi.mocked(db.update).mockReturnValueOnce({
+    set: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue(rows),
+      }),
+    }),
+  } as any);
+}
+
+/** Mock the post-rotation deletion of unused children from old epochs. */
+function mockRevokedDerivedKeys(rows: any[] = []) {
+  vi.mocked(db.delete).mockReturnValueOnce({
+    where: vi.fn().mockReturnValue({
+      returning: vi.fn().mockResolvedValue(rows),
+    }),
+  } as any);
+}
+
+/** Mock for db.delete().where() */
+function mockDeleteWhere() {
+  vi.mocked(db.delete).mockReturnValueOnce({
+    where: vi.fn().mockResolvedValue(undefined),
+  } as any);
+}
+
+/**
+ * Mock for db.delete().where().returning() that captures the exact `where`
+ * condition passed in, so a test can assert on the composed scope + expired
+ * condition (via its JSON-serialized SQL chunks — drizzle SQL objects stringify
+ * to their operator/column/value shape, e.g. `"enrollmentKeys.orgId"`, `" = "`,
+ * `"enrollmentKeys.expiresAt"`, `" < "`) without needing a real DB.
+ */
+function mockDeleteWhereReturningCapture(rows: any[]): () => any {
+  let captured: any;
+  vi.mocked(db.delete).mockReturnValueOnce({
+    where: vi.fn((cond: any) => {
+      captured = cond;
+      return { returning: vi.fn().mockResolvedValue(rows) };
+    }),
+  } as any);
+  return () => captured;
+}
+
+/**
+ * Flattens a drizzle condition to its static text. The existing purge tests
+ * assert via `JSON.stringify`, which cannot see inside the #2832 exemption:
+ * `notExists()` embeds the subquery as an opaque `SQLWrapper` (an object whose
+ * only own property is a `getSQL` function), and JSON.stringify renders that
+ * as `{}`. Recursing through `getSQL()` is what makes the subquery's columns
+ * assertable. Same approach as jobs/enrollmentKeyCleanup.test.ts's `sqlText`.
+ */
+function sqlText(q: unknown): string {
+  if (q == null) return '';
+  if (typeof q === 'string') return q;
+  if (q instanceof Date) return q.toISOString();
+  const obj = q as {
+    queryChunks?: unknown[];
+    value?: unknown;
+    getSQL?: () => unknown;
+  };
+  if (Array.isArray(obj.queryChunks)) return obj.queryChunks.map(sqlText).join(' ');
+  if (Array.isArray(obj.value)) return (obj.value as unknown[]).map(sqlText).join('');
+  if (obj.value instanceof Date) return obj.value.toISOString();
+  if (typeof obj.value === 'string' || typeof obj.value === 'number') return String(obj.value);
+  if (typeof obj.getSQL === 'function') return sqlText(obj.getSQL());
+  return '';
+}
+
+/**
+ * The #2832 exemption builds a correlated NOT EXISTS subquery via
+ * `db.select(...).from(...).where(...)`. It never executes here (no Postgres
+ * in this suite) — it only has to satisfy drizzle's `SQLWrapper` duck-typing
+ * (a `getSQL()` method) so `notExists(...)` can embed it. Wrapping the REAL
+ * condition production code built (via the unmocked drizzle `and`/`eq`/`gt`/
+ * `lt`) means the captured WHERE genuinely reflects the generated predicate
+ * rather than a canned stand-in. Mirrors the identical stub in
+ * jobs/enrollmentKeyCleanup.test.ts.
+ *
+ * Registered with `mockReturnValue` (not `...Once`) so it stays in place for
+ * however many times the guard is built, and does not consume the
+ * `mockReturnValueOnce` queue the single-record `db.select` helpers rely on.
+ */
+function mockBootstrapTokenExemptionSubquery() {
+  vi.mocked(db.select).mockReturnValue({
+    from: () => ({
+      where: (cond: unknown) => ({
+        getSQL: () => sql`select 1 from installer_bootstrap_tokens where ${cond}`,
+      }),
+    }),
+  } as any);
+}
+
+describe('enrollment key routes — get, rotate, delete', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // vi.clearAllMocks clears call history but NOT implementations — restore
+    // the permissive default every test (mirrors the other route suites).
+    assertTtlWithinCapMock.mockReset();
+    assertTtlWithinCapMock.mockImplementation(async () => null);
+    mfaGate.deny = false;
+    permissionGate.deny = false;
+    siteScope.allowedSiteIds = undefined;
+    app = new Hono();
+    app.route('/enrollment-keys', enrollmentKeyRoutes);
+  });
+
+  // ============================================
+  // GET /:id — Get enrollment key details
+  // ============================================
+  describe('GET /enrollment-keys/:id', () => {
+    it('returns enrollment key details without raw key', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockSelectFromWhereGroupBy([]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.id).toBe(KEY_ID);
+      expect(body.name).toBe('Test Key');
+      expect(body.key).toBeUndefined();
+      // Key with no installers → null, so the UI falls back to the key's own
+      // counters (#2992).
+      expect(body.installerTokens).toBeNull();
+    });
+
+    // #2992 — the detail route carries the same installer aggregate as the
+    // list route, so a caller doesn't have to know which endpoint it read from.
+    it('reports installer bootstrap-token capacity when the key has minted one', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockSelectFromWhereGroupBy([
+        // liveConsumed/liveMax (#3039): same sums FILTERed to unexpired
+        // tokens, carried through verbatim next to the all-token totals.
+        { parentEnrollmentKeyId: KEY_ID, consumed: 3, max: 7, liveConsumed: 1, liveMax: 4 },
+      ]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.installerTokens).toEqual({
+        consumed: 3,
+        max: 7,
+        liveConsumed: 1,
+        liveMax: 4,
+      });
+      // The key's own budget is reported unchanged — the installer figure is a
+      // separate counter, not a rewrite of it.
+      expect(body.maxUsage).toBe(10);
+      expect(body.usageCount).toBe(0);
+    });
+
+    // #3034 — the detail route must answer the same as the list route, and both
+    // now discriminate per TOKEN. A short_code says nothing about whether a
+    // capacity token exists under the key: the authenticated build routes accept
+    // a short-link child id, so an operator CAN mint a real device-slot token
+    // there. These two cases pin both directions.
+    it('reports installer capacity for a short-link child that has a capacity token (#3034)', async () => {
+      mockSelectFromWhereLimit([
+        makeEnrollmentKey({ shortCode: 'A1B2C3D4E5', maxUsage: 7, usageCount: 3 }),
+      ]);
+      // The aggregate's `usage_kind = 'capacity'` predicate matched the token
+      // the operator minted by building a 4-device installer from this child
+      // row. Reinstating a per-key shortCode gate here would drop it on the
+      // floor — the defect #3034 reported, and the reason the detail route must
+      // not re-derive suppression of its own.
+      mockSelectFromWhereGroupBy([
+        { parentEnrollmentKeyId: KEY_ID, consumed: 1, max: 4, liveConsumed: 1, liveMax: 4 },
+      ]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.installerTokens).toEqual({
+        consumed: 1,
+        max: 4,
+        liveConsumed: 1,
+        liveMax: 4,
+      });
+      // The key's own counters — atomically claimed on every /s/:code
+      // download — are reported unchanged alongside it.
+      expect(body.usageCount).toBe(3);
+      expect(body.maxUsage).toBe(7);
+    });
+
+    it('reports no installer capacity for a short-link child whose tokens are all per-download', async () => {
+      mockSelectFromWhereLimit([
+        makeEnrollmentKey({ shortCode: 'A1B2C3D4E5', maxUsage: 7, usageCount: 3 }),
+      ]);
+      // The aggregate IS issued — there is no per-key skip any more — but its
+      // capacity predicate matches nothing, so no group comes back and the wire
+      // shows null instead of a meaningless "Installer devices 0 / 3".
+      mockSelectFromWhereGroupBy([]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.installerTokens).toBeNull();
+      // Two selects, not one: the key lookup AND the aggregate. The old per-key
+      // gate skipped the second entirely for a short_code row; that skip is what
+      // #3034 removed, so this count is the mutant-killer for reinstating it.
+      expect(dbMock.transaction).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(2);
+      expect(body.usageCount).toBe(3);
+      expect(body.maxUsage).toBe(7);
+    });
+
+    it('returns 404 for nonexistent key', async () => {
+      mockSelectFromWhereLimit([]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('returns an opaque 404 when accessing a key from a different org', async () => {
+      // The organization predicate is part of the initial lookup, so a real
+      // database returns no row and never exposes that the id exists.
+      mockSelectFromWhereLimit([]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('returns an opaque 404 without database or capacity work for an empty site ceiling', async () => {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementationOnce((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-1', email: 'test@example.com' },
+          scope: 'organization',
+          orgId: ORG_ID,
+          accessibleOrgIds: [ORG_ID],
+          allowedSiteIds: [],
+          canAccessOrg: (id: string) => id === ORG_ID,
+        });
+        return next();
+      });
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(404);
+      await expect(res.json()).resolves.toEqual({ error: 'Enrollment key not found' });
+      expect(db.select).not.toHaveBeenCalled();
+      expect(dbMock.transaction).not.toHaveBeenCalled();
+    });
+
+    it.each(['partner', 'system'] as const)(
+      'keeps site-null detail visible for an unrestricted %s caller',
+      async (scope) => {
+        const { authMiddleware } = await import('../middleware/auth');
+        vi.mocked(authMiddleware).mockImplementationOnce((c: any, next: any) => {
+          c.set('auth', {
+            user: { id: 'user-1', email: 'test@example.com' },
+            scope,
+            orgId: null,
+            accessibleOrgIds: scope === 'system' ? null : [ORG_ID],
+            canAccessOrg: () => true,
+          });
+          return next();
+        });
+        mockSelectFromWhereLimit([makeEnrollmentKey({ siteId: null })]);
+        mockSelectFromWhereGroupBy([]);
+
+        const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+          headers: { Authorization: 'Bearer token' },
+        });
+
+        expect(res.status).toBe(200);
+        expect((await res.json()).id).toBe(KEY_ID);
+      },
+    );
+  });
+
+  // ============================================
+  // POST /:id/rotate — Rotate enrollment key
+  // ============================================
+  describe('POST /enrollment-keys/:id/rotate', () => {
+    it('denies a restricted organization caller before rotating a hidden-site key', async () => {
+      siteScope.allowedSiteIds = ['site-visible'];
+      mockSelectFromWhereLimit([makeEnrollmentKey({ siteId: 'site-hidden' })]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.update).not.toHaveBeenCalled();
+      expect(db.delete).not.toHaveBeenCalled();
+      expect(createAuditLogAsync).not.toHaveBeenCalled();
+    });
+    it('allows a restricted organization caller to rotate a key in its allowed site', async () => {
+      siteScope.allowedSiteIds = ['site-visible'];
+      mockSelectFromWhereLimit([makeEnrollmentKey({ siteId: 'site-visible' })]);
+      mockUpdateSetWhereReturning([makeEnrollmentKey({ siteId: 'site-visible', credentialGeneration: 2 })]);
+      mockRevokedDerivedKeys();
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+
+      expect(res.status).toBe(200);
+      expect(db.update).toHaveBeenCalledOnce();
+      expect(db.delete).toHaveBeenCalledOnce();
+      expect(createAuditLogAsync).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'enrollment_key.rotate',
+        details: expect.objectContaining({
+          previousCredentialGeneration: 1,
+          nextCredentialGeneration: 2,
+          revokedUnusedDerivedKeys: 0,
+        }),
+      }));
+    });
+    it('rotates key material and resets usage count', async () => {
+      const existing = makeEnrollmentKey({ usageCount: 5 });
+      mockSelectFromWhereLimit([existing]);
+      mockUpdateSetWhereReturning([
+        makeEnrollmentKey({ usageCount: 0, key: 'hashed_newkey', credentialGeneration: 2 }),
+      ]);
+      mockRevokedDerivedKeys();
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({}),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.key).toBeDefined();
+      expect(typeof body.key).toBe('string');
+      expect(createAuditLogAsync).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'enrollment_key.rotate' })
+      );
+    });
+
+    it('allows updating maxUsage during rotation', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockUpdateSetWhereReturning([makeEnrollmentKey({ maxUsage: 50, credentialGeneration: 2 })]);
+      mockRevokedDerivedKeys();
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ maxUsage: 50 }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('returns 404 for nonexistent key', async () => {
+      mockSelectFromWhereLimit([]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({}),
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('returns 403 when key belongs to another org', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey({ orgId: 'other-org' })]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({}),
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    // #2776 task 3.4 fix round 2 — a sixth uncapped path: rotate re-mints the
+    // key value via generateEnrollmentKey(), so an uncapped expiresAt here
+    // would let a caller bound by a short partner cap create a key at the
+    // cap and immediately rotate it past it. rotateEnrollmentKeySchema has
+    // no ttlMinutes field (verified: only `maxUsage` and `expiresAt`), so
+    // expiresAt is the only path to cover.
+    it('rejects an expiresAt whose implied duration exceeds the partner cap', async () => {
+      mockEnrollmentDefaults({ maxTtlMinutes: 1440 });
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      const updateSet = vi.fn();
+      vi.mocked(db.update).mockReturnValue({ set: updateSet } as any);
+
+      // 30 days out — far above a 1440-minute (24h) cap.
+      const expiresAt = new Date(Date.now() + 43200 * 60 * 1000).toISOString();
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ expiresAt }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('1440');
+      expect(updateSet).not.toHaveBeenCalled();
+      // The route must derive an implied minutes value from expiresAt and
+      // check IT against the cap — there is no ttlMinutes field on this route.
+      const [, impliedMinutes] = assertTtlWithinCapMock.mock.calls[0]!;
+      expect(impliedMinutes).toBeGreaterThan(43199);
+      expect(impliedMinutes).toBeLessThanOrEqual(43201);
+    });
+
+    it('allows rotating with an expiresAt at or under the partner cap', async () => {
+      mockEnrollmentDefaults({ maxTtlMinutes: 1440 });
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockUpdateSetWhereReturning([makeEnrollmentKey({ key: 'hashed_newkey', credentialGeneration: 2 })]);
+      mockRevokedDerivedKeys();
+
+      // Exactly at the 1440-minute cap.
+      const expiresAt = new Date(Date.now() + 1440 * 60 * 1000).toISOString();
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ expiresAt }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('does not consult the cap when expiresAt is omitted (preserves the existing key\'s own expiry, not a new choice)', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockUpdateSetWhereReturning([makeEnrollmentKey({ key: 'hashed_newkey', credentialGeneration: 2 })]);
+      mockRevokedDerivedKeys();
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}/rotate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ maxUsage: 5 }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(assertTtlWithinCapMock).toHaveBeenCalledWith(ORG_ID, undefined);
+    });
+  });
+
+  // ============================================
+  // DELETE /:id — Delete enrollment key
+  // ============================================
+  describe('DELETE /enrollment-keys/:id', () => {
+    it('denies a restricted organization caller before deleting a hidden-site key', async () => {
+      siteScope.allowedSiteIds = ['site-visible'];
+      mockSelectFromWhereLimit([makeEnrollmentKey({ siteId: 'site-hidden' })]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, { method: 'DELETE' });
+
+      expect(res.status).toBe(403);
+      expect(db.delete).not.toHaveBeenCalled();
+      expect(createAuditLogAsync).not.toHaveBeenCalled();
+    });
+    it('denies a restricted organization caller before deleting a null-site legacy key', async () => {
+      siteScope.allowedSiteIds = ['site-visible'];
+      mockSelectFromWhereLimit([makeEnrollmentKey({ siteId: null })]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, { method: 'DELETE' });
+
+      expect(res.status).toBe(403);
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+    it('deletes an enrollment key', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockDeleteWhere();
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.success).toBe(true);
+      expect(createAuditLogAsync).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'enrollment_key.delete' })
+      );
+    });
+
+    it('returns 404 for nonexistent key', async () => {
+      mockSelectFromWhereLimit([]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('returns 403 when key belongs to another org', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey({ orgId: 'other-org' })]);
+
+      const res = await app.request(`/enrollment-keys/${KEY_ID}`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+    });
+  });
+
+  // ============================================
+  // POST /purge-expired — Bulk-delete expired enrollment keys in caller scope
+  // ============================================
+  describe('POST /enrollment-keys/purge-expired', () => {
+    beforeEach(() => {
+      mockBootstrapTokenExemptionSubquery();
+    });
+
+    it('purges expired keys within the org-scoped caller\'s org and returns the count', async () => {
+      const getCaptured = mockDeleteWhereReturningCapture([
+        { id: 'key-1' },
+        { id: 'key-2' },
+      ]);
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ success: true, deletedCount: 2 });
+
+      // Composed condition scopes to the caller's org AND filters expired —
+      // asserted via the serialized SQL chunk shape (see helper docstring).
+      const conditionJson = JSON.stringify(getCaptured());
+      expect(conditionJson).toContain('enrollmentKeys.orgId');
+      expect(conditionJson).toContain(ORG_ID);
+      expect(conditionJson).toContain('enrollmentKeys.expiresAt');
+      expect(conditionJson).toContain(' < ');
+
+      expect(createAuditLogAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'enrollment_key.purge_expired',
+          details: { deletedCount: 2 },
+        }),
+      );
+    });
+
+    it('returns deletedCount 0 when the delete matches nothing', async () => {
+      const getCaptured = mockDeleteWhereReturningCapture([]);
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ success: true, deletedCount: 0 });
+      expect(getCaptured()).toBeDefined();
+      expect(createAuditLogAsync).toHaveBeenCalledWith(
+        expect.objectContaining({ details: { deletedCount: 0 } }),
+      );
+    });
+
+    it('adds the explicit site ceiling to an organization purge', async () => {
+      siteScope.allowedSiteIds = ['site-visible'];
+      const getCaptured = mockDeleteWhereReturningCapture([]);
+
+      const res = await app.request('/enrollment-keys/purge-expired', { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      const conditionJson = JSON.stringify(getCaptured());
+      expect(conditionJson).toContain('enrollmentKeys.siteId');
+      expect(conditionJson).toContain('site-visible');
+    });
+
+    it('uses an always-false predicate for an empty organization site ceiling', async () => {
+      siteScope.allowedSiteIds = [];
+      const getCaptured = mockDeleteWhereReturningCapture([]);
+
+      const res = await app.request('/enrollment-keys/purge-expired', { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      expect(sqlText(getCaptured())).toContain('false');
+    });
+
+    it('returns 403 when org-scoped caller has no orgId', async () => {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementationOnce((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-1', email: 'test@example.com' },
+          scope: 'organization',
+          orgId: null,
+          accessibleOrgIds: [],
+          canAccessOrg: () => false,
+        });
+        return next();
+      });
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+
+    it('scopes to all accessible orgs for a partner-scoped caller', async () => {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementationOnce((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-1', email: 'test@example.com' },
+          scope: 'partner',
+          orgId: null,
+          accessibleOrgIds: ['org-a', 'org-b'],
+          canAccessOrg: (id: string) => ['org-a', 'org-b'].includes(id),
+        });
+        return next();
+      });
+      const getCaptured = mockDeleteWhereReturningCapture([{ id: 'key-1' }]);
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ success: true, deletedCount: 1 });
+      const conditionJson = JSON.stringify(getCaptured());
+      expect(conditionJson).toContain('org-a');
+      expect(conditionJson).toContain('org-b');
+    });
+
+    it('returns deletedCount 0 without querying when partner caller has no accessible orgs', async () => {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementationOnce((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'user-1', email: 'test@example.com' },
+          scope: 'partner',
+          orgId: null,
+          accessibleOrgIds: [],
+          canAccessOrg: () => false,
+        });
+        return next();
+      });
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ success: true, deletedCount: 0 });
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+
+    it('purges across all orgs (no org restriction) for a system-scoped caller', async () => {
+      const { authMiddleware } = await import('../middleware/auth');
+      vi.mocked(authMiddleware).mockImplementationOnce((c: any, next: any) => {
+        c.set('auth', {
+          user: { id: 'admin-1', email: 'admin@example.com' },
+          scope: 'system',
+          orgId: null,
+          accessibleOrgIds: null,
+          canAccessOrg: () => true,
+        });
+        return next();
+      });
+      const getCaptured = mockDeleteWhereReturningCapture([
+        { id: 'key-1' },
+        { id: 'key-2' },
+        { id: 'key-3' },
+      ]);
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ success: true, deletedCount: 3 });
+      const conditionJson = JSON.stringify(getCaptured());
+      // No org-scoping column present — only the expired condition.
+      expect(conditionJson).not.toContain('enrollmentKeys.orgId');
+      expect(conditionJson).toContain('enrollmentKeys.expiresAt');
+    });
+
+    // #2832: the nightly sweep got the live-bootstrap-token exemption in
+    // #2775; this route — the on-demand counterpart behind the web UI's
+    // "Delete expired" button — did not, and is the FASTER path to the same
+    // data loss (no grace period at all vs. the sweep's 7 days).
+    //
+    // This is a SQL-shape assertion: with `db` mocked there is no Postgres to
+    // evaluate the correlated NOT EXISTS per row. Proof that Postgres actually
+    // spares the right rows lives in
+    // routes/enrollmentKeysPurgeExpired.integration.test.ts. What is
+    // meaningfully verifiable here is that the predicate reaches the DELETE at
+    // all and correlates on the right columns.
+    it('exempts keys still backing a live, unexhausted installer bootstrap token (#2832)', async () => {
+      const getCaptured = mockDeleteWhereReturningCapture([{ id: 'key-1' }]);
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const text = sqlText(getCaptured());
+
+      expect(text).toContain('not exists');
+      // Correlated on the outer enrollment_keys row...
+      expect(text).toContain('installerBootstrapTokens.parentEnrollmentKeyId');
+      expect(text).toContain('enrollmentKeys.id');
+      // ...and both liveness arms are present: unexpired AND unexhausted.
+      // Dropping either would silently re-open the cascade for half the
+      // token population.
+      expect(text).toContain('installerBootstrapTokens.expiresAt');
+      expect(text).toContain('installerBootstrapTokens.consumedCount');
+      expect(text).toContain('installerBootstrapTokens.maxUsage');
+    });
+
+    it('is blocked without MFA (requireMfa)', async () => {
+      mfaGate.deny = true;
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+
+    it('is blocked without the required permission (requirePermission)', async () => {
+      permissionGate.deny = true;
+
+      const res = await app.request('/enrollment-keys/purge-expired', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.delete).not.toHaveBeenCalled();
+    });
+  });
+});

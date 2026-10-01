@@ -1,0 +1,231 @@
+import { and, eq } from 'drizzle-orm';
+import { db, withDbAccessContext, type DbAccessContext } from '../db';
+import { pax8Integrations, pax8ProductMappings } from '../db/schema/pax8';
+import { createPax8ClientForIntegration } from './pax8SyncService';
+import { applyImportedPricingBySku, createCatalogItem, CatalogServiceError, type CatalogActor } from './catalogService';
+import type { Pax8ProductRecord, Pax8ProductPriceRecord } from './pax8Client';
+import { getRedis } from './redis';
+import { enrichDistributorListing } from './catalogEnrichmentService';
+import { importedCost } from './catalogPricing';
+import type { CreateCatalogItemInput, EnrichmentProvenance } from '@breeze/shared';
+
+const CACHE_TTL_SECONDS = 600;
+const PRODUCT_FETCH_LIMIT = 5000;
+
+export class Pax8CatalogError extends Error {
+  constructor(message: string, public readonly status = 400, public readonly code?: string) {
+    super(message);
+    this.name = 'Pax8CatalogError';
+  }
+}
+
+function requirePartner(actor: CatalogActor): string {
+  if (!actor.partnerId) throw new Pax8CatalogError('Partner scope required', 403, 'NO_PARTNER');
+  return actor.partnerId;
+}
+
+async function getActiveIntegration(actor: CatalogActor) {
+  const partnerId = requirePartner(actor);
+  const [row] = await db
+    .select()
+    .from(pax8Integrations)
+    .where(and(eq(pax8Integrations.partnerId, partnerId), eq(pax8Integrations.isActive, true)))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function getPax8CatalogStatus(actor: CatalogActor): Promise<{ configured: boolean; enabled: boolean }> {
+  const row = await getActiveIntegration(actor);
+  return { configured: row !== null, enabled: row !== null };
+}
+
+async function loadPartnerProducts(actor: CatalogActor, vendor?: string): Promise<Pax8ProductRecord[]> {
+  const integration = await getActiveIntegration(actor);
+  if (!integration) throw new Pax8CatalogError('Pax8 is not connected', 400, 'PAX8_NOT_CONFIGURED');
+
+  const partnerId = requirePartner(actor);
+  const cacheKey = `pax8:products:${partnerId}${vendor ? `:${vendor.toLowerCase()}` : ''}`;
+  const redis = getRedis();
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return JSON.parse(cached) as Pax8ProductRecord[];
+    } catch { /* cache is best-effort */ }
+  }
+
+  const { client } = await createPax8ClientForIntegration(integration.id);
+  const products = await client.listProducts({ limit: PRODUCT_FETCH_LIMIT, vendorName: vendor });
+  if (redis) {
+    try { await redis.setex(cacheKey, CACHE_TTL_SECONDS, JSON.stringify(products)); } catch { /* best-effort */ }
+  }
+  return products;
+}
+
+export async function searchPax8Products(
+  input: { q: string; vendor?: string; limit: number },
+  actor: CatalogActor,
+): Promise<Pax8ProductRecord[]> {
+  const needle = input.q.trim().toLowerCase();
+  const products = await loadPartnerProducts(actor, input.vendor);
+  const matched = products.filter((p) =>
+    p.name.toLowerCase().includes(needle) ||
+    (p.vendorName?.toLowerCase().includes(needle) ?? false) ||
+    (p.vendorSku?.toLowerCase().includes(needle) ?? false));
+  return matched.slice(0, input.limit);
+}
+
+export async function getPax8ProductPricing(productId: string, actor: CatalogActor): Promise<Pax8ProductPriceRecord[]> {
+  const integration = await getActiveIntegration(actor);
+  if (!integration) throw new Pax8CatalogError('Pax8 is not connected', 400, 'PAX8_NOT_CONFIGURED');
+  const { client } = await createPax8ClientForIntegration(integration.id);
+  return client.getProductPricing(productId);
+}
+
+export interface Pax8ImportInput {
+  product: {
+    source: 'pax8';
+    pax8ProductId: string;
+    name: string;
+    vendorName: string | null;
+    vendorSku: string | null;
+    commitmentTerm: string | null;
+    billingTerm: string | null;
+    partnerBuyRate: string | null;
+    currency: string | null;
+    raw: Record<string, unknown>;
+  };
+  item: {
+    name: string;
+    sku?: string | null;
+    description?: string | null;
+    unitPrice: number;
+    /** ISO code the sell price is denominated in. Omitted → partner currency. */
+    sellCurrency?: string;
+    costBasis?: number | null;
+    taxable?: boolean;
+  };
+  /** When true, run a best-effort web-search enrichment of the product into a
+   *  tidy name + technical description before persisting. Falls back to the raw
+   *  values if the AI is rate-limited/unavailable, so import never fails. */
+  aiCleanup?: boolean;
+}
+
+// Pax8 billing terms map onto the catalog's billing_frequency enum. The schema
+// only allows 'monthly' | 'annual'; quarterly falls back to monthly as the
+// conservative default (shorter commitment, avoids over-committing). The raw
+// billingTerm is preserved in attributes.pax8.billingTerm for future quarterly support.
+function mapBillingFrequency(billingTerm: string | null): 'monthly' | 'annual' {
+  const t = (billingTerm ?? '').toLowerCase();
+  if (t.includes('year') || t.includes('annual')) return 'annual';
+  return 'monthly';
+}
+
+// #2190 — this route (POST /distributors/pax8/import) opts out of the auth
+// middleware's ambient request transaction (SELF_MANAGED_DB_CONTEXT_ROUTES) so
+// the up-to-12s enrichDistributorListing call below never runs inside a held DB
+// transaction. `dbCtx` is the request's RLS DbAccessContext, rebuilt by the route
+// from `auth` (dbAccessContextFromAuth) since it can no longer rely on an ambient
+// one; the getActiveIntegration read runs in its own short context, then — after
+// enrichment, under NO ambient context — the catalog-item write and the product-
+// mapping upsert run together in a second short context (same atomicity as
+// before, when both lived in the single ambient request transaction).
+export async function importPax8CatalogItem(input: Pax8ImportInput, actor: CatalogActor, dbCtx: DbAccessContext): Promise<Awaited<ReturnType<typeof createCatalogItem>>> {
+  const integration = await withDbAccessContext(dbCtx, () => getActiveIntegration(actor));
+  if (!integration) throw new Pax8CatalogError('Pax8 is not connected', 400, 'PAX8_NOT_CONFIGURED');
+  const { product, item } = input;
+
+  // Optional web-search enrichment: turn the raw vendor listing into a clean name
+  // + a real description. On any failure keep the raw values (enriched == null).
+  let name = item.name;
+  let description = item.description ?? null;
+  let aiProvenance: EnrichmentProvenance | undefined;
+  if (input.aiCleanup) {
+    const query = product.vendorName ? `${product.vendorName} ${product.name}` : product.name;
+    const enriched = await enrichDistributorListing(query, 'software', {
+      userId: actor.userId,
+      orgId: actor.accessibleOrgIds?.[0] ?? null,
+      partnerId: actor.partnerId,
+    });
+    if (enriched) {
+      name = enriched.name;
+      if (enriched.description) description = enriched.description;
+      aiProvenance = enriched.provenance;
+    }
+  }
+
+  const payload: CreateCatalogItemInput = {
+    itemType: 'software',
+    name,
+    sku: item.sku ?? product.vendorSku ?? null,
+    description,
+    billingType: 'recurring',
+    billingFrequency: mapBillingFrequency(product.billingTerm),
+    ...(item.sellCurrency
+      ? { prices: [{ currencyCode: item.sellCurrency, unitPrice: item.unitPrice }] }
+      : { unitPrice: item.unitPrice }),
+    // B4 (#3775): partnerBuyRate (and the form's echo of it in item.costBasis)
+    // is denominated in the FEED currency — stored as the cost currency (real
+    // column) so margin math can refuse cross-currency comparisons. A feed with
+    // no currency leaves the cost NULL (a gap), never the partner currency
+    // (#3775 review #2).
+    ...importedCost(
+      item.costBasis ?? (product.partnerBuyRate != null ? Number(product.partnerBuyRate) : null),
+      product.currency
+    ),
+    unitOfMeasure: 'each',
+    taxable: item.taxable ?? true,
+    isBundle: false,
+    attributes: {
+      pax8: {
+        source: product.source,
+        pax8ProductId: product.pax8ProductId,
+        vendorName: product.vendorName,
+        vendorSku: product.vendorSku,
+        commitmentTerm: product.commitmentTerm,
+        billingTerm: product.billingTerm,
+        currency: product.currency,
+        raw: product.raw,
+        importedAt: new Date().toISOString(),
+        rawName: product.name,
+        aiEnriched: aiProvenance != null,
+        ...(aiProvenance ? { aiProvenance } : {}),
+      },
+    },
+  };
+
+  return withDbAccessContext(dbCtx, async () => {
+    let created: Awaited<ReturnType<typeof createCatalogItem>>;
+    try {
+      created = await createCatalogItem(payload, actor);
+    } catch (err) {
+      const sku = payload.sku;
+      if (err instanceof CatalogServiceError && err.code === 'DUPLICATE_SKU' && sku) {
+        // Re-import of a SKU the partner already owns (#3775 review #9): apply
+        // the requested sell-currency price + the freshly fetched feed cost to
+        // the existing item under its row lock instead of silently dropping them,
+        // and return the same item-plus-price-book shape a fresh create does.
+        created = await applyImportedPricingBySku(sku, payload, actor);
+      } else {
+        throw err;
+      }
+    }
+
+    // Dedup + linkage so subscription pricing-sync can later reconcile this product.
+    await db
+      .insert(pax8ProductMappings)
+      .values({
+        integrationId: integration.id,
+        partnerId: integration.partnerId,
+        pax8ProductId: product.pax8ProductId,
+        vendorSkuId: product.vendorSku,
+        productName: product.name,
+        catalogItemId: created.id,
+      })
+      .onConflictDoUpdate({
+        target: [pax8ProductMappings.integrationId, pax8ProductMappings.pax8ProductId],
+        set: { catalogItemId: created.id, productName: product.name, vendorSkuId: product.vendorSku, updatedAt: new Date() },
+      });
+
+    return created;
+  });
+}

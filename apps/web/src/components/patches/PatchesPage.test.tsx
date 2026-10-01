@@ -1,0 +1,1739 @@
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import '@/lib/i18n';
+
+// PatchList renders through ResponsiveTable — a desktop <table> and a mobile
+// card list are both in the DOM at once (the sm: breakpoint is CSS-only, invisible
+// to jsdom), so row text/labels appear twice. Scope row-level interactions to the
+// desktop surface; use findAllByText for render-wait gates that tolerate the dupe.
+const desktop = () => within(screen.getByTestId('responsive-table-desktop'));
+
+// Mock showToast before importing PatchesPage so runAction uses the mock
+const showToast = vi.fn();
+vi.mock('../../components/shared/Toast', () => ({ showToast: (a: unknown) => showToast(a) }));
+
+import PatchesPage from './PatchesPage';
+import { fetchWithAuth } from '../../stores/auth';
+
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+}));
+
+// Mutable org-shell state so individual tests can model an org-scoped user
+// (currentOrgId set) vs. a partner on the global /patches view (currentOrgId null).
+const orgState = vi.hoisted(() => ({ currentOrgId: null as string | null }));
+
+vi.mock('../../stores/orgStore', () => {
+  const organizations = [
+    { id: 'org-1', name: 'Acme Corp' },
+    { id: 'org-2', name: 'Globex' },
+  ];
+  const read = () => ({ currentOrgId: orgState.currentOrgId, organizations });
+  return { useOrgStore: Object.assign(read, { getState: read }) };
+});
+
+// Mutable JWT scope so individual tests can simulate partner vs. org-scoped sessions.
+// Every test here models a session whose access token has already landed, so
+// `resolved` is true throughout — the not-yet-resolved cold-load window that
+// #4010 turns on is covered by PatchesPage.scopeResolution.test.tsx, which drives
+// the real useJwtClaims against a live auth store instead of mocking it.
+const jwtScope = vi.hoisted(() => ({ scope: 'partner' as 'partner' | 'system' | 'organization' | null }));
+
+vi.mock('../../lib/authScope', () => {
+  const claims = () => ({
+    scope: jwtScope.scope,
+    partnerId: jwtScope.scope !== 'organization' ? 'p1' : null,
+    orgId: jwtScope.scope === 'organization' ? 'org-1' : null,
+  });
+  return {
+    getJwtClaims: claims,
+    // NOTE: `status` is hard-wired to 'resolved' and is deliberately NOT derived
+    // from `jwtScope` — flipping `jwtScope.scope` to null here models an org-ish
+    // user with no claims, NOT the pre-token window. There is no way to reach
+    // 'unresolved' from this file; use PatchesPage.scopeResolution.test.tsx.
+    useJwtClaims: () => ({ status: 'resolved' as const, claims: claims() }),
+  };
+});
+
+const fetchMock = vi.mocked(fetchWithAuth);
+
+const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
+  ({
+    ok,
+    status,
+    statusText: ok ? 'OK' : 'ERROR',
+    json: vi.fn().mockResolvedValue(payload),
+  }) as unknown as Response;
+
+describe('PatchesPage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    orgState.currentOrgId = null;
+    jwtScope.scope = 'partner';
+    window.history.replaceState({}, '', '/#patches');
+  });
+
+  it('keeps failed bulk approvals pending when the API only approves some patches', async () => {
+    // Org-scoped session: the API derives the target org from auth.orgId, so the
+    // bulk-approve request fires without an explicit org/ring selection.
+    orgState.currentOrgId = 'org-1';
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') {
+        return makeJsonResponse({ data: [] });
+      }
+
+      if (url === '/patches?limit=200') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'patch-1',
+              title: 'Critical Security Update',
+              severity: 'critical',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-01T00:00:00.000Z',
+              approvalStatus: 'pending',
+            },
+            {
+              id: 'patch-2',
+              title: 'Feature Update',
+              severity: 'important',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-02T00:00:00.000Z',
+              approvalStatus: 'pending',
+            },
+          ],
+        });
+      }
+
+      if (url === '/patches/bulk-approve') {
+        return makeJsonResponse({
+          success: true,
+          approved: ['patch-1'],
+          failed: ['patch-2'],
+        });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('Critical Security Update');
+
+    fireEvent.click(desktop().getByRole('button', { name: 'Select Critical Security Update' }));
+    fireEvent.click(desktop().getByRole('button', { name: 'Select Feature Update' }));
+    // Wait for selection state to commit before clicking the conditionally-rendered Approve button.
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve 2' }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/bulk-approve',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            patchIds: ['patch-1', 'patch-2'],
+          }),
+        })
+      );
+    });
+
+    await screen.findByText('Failed to approve 1 patch');
+    expect(desktop().getAllByRole('button', { name: 'Deploy' })).toHaveLength(1);
+    expect(desktop().getAllByRole('button', { name: 'Review' })).toHaveLength(1);
+  });
+
+  // #5585: the Unapprove row action on an approved patch must open the
+  // approval modal preselected on 'decline' and actually POST the decline —
+  // proving handleUnapprove + modalInitialAction wiring, not just the two
+  // leaf components in isolation (PatchList's button, PatchApprovalModal's
+  // initialAction prop) which are covered elsewhere.
+  it('Unapprove on an approved row opens the modal on decline and declines the patch', async () => {
+    orgState.currentOrgId = 'org-1';
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+
+      if (url === '/patches?limit=200') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'patch-1',
+              title: 'Already Approved Patch',
+              severity: 'critical',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-01T00:00:00.000Z',
+              approvalStatus: 'approved',
+            },
+          ],
+        });
+      }
+
+      if (url === '/patches/patch-1/decline') {
+        return makeJsonResponse({ id: 'patch-1', status: 'declined' });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('Already Approved Patch');
+
+    fireEvent.click(desktop().getByTestId('patch-row-patch-1-unapprove'));
+
+    // Opens straight into the decline tab, not the default approve tab.
+    const declineTab = await screen.findByTestId('patch-approval-action-decline');
+    expect(declineTab).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('patch-approval-action-approve')).toHaveAttribute('aria-pressed', 'false');
+
+    fireEvent.click(screen.getAllByRole('button', { name: /Decline/i }).at(-1)!);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/patch-1/decline',
+        expect.objectContaining({ method: 'POST' })
+      );
+    });
+    // Declining does not go through the approve scope-naming confirm dialog.
+    expect(screen.queryByTestId('confirm-fleet-action')).toBeNull();
+  });
+
+  // #5585 follow-up: bulk decline now includes already-approved rows
+  // (PatchList's selectedDeclinableIds), and an approved patch can carry
+  // BOTH a blanket approval and ring-specific ones — a plain scoped decline
+  // would silently leave the other rings' approvals live. handleBulkDecline
+  // must route an approved row through allRings, while a still-pending row
+  // (nothing to clear elsewhere) keeps the ordinary scoped decline.
+  it('bulk decline sends allRings for an already-approved row but a scoped decline for a pending one', async () => {
+    orgState.currentOrgId = 'org-1';
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+
+      if (url === '/patches?limit=200') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'patch-approved',
+              title: 'Approved Patch',
+              severity: 'critical',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-01T00:00:00.000Z',
+              approvalStatus: 'approved',
+            },
+            {
+              id: 'patch-pending',
+              title: 'Pending Patch',
+              severity: 'important',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-02T00:00:00.000Z',
+              approvalStatus: 'pending',
+            },
+          ],
+        });
+      }
+
+      if (url === '/patches/patch-approved/decline' || url === '/patches/patch-pending/decline') {
+        return makeJsonResponse({ id: 'ok', status: 'declined' });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('Approved Patch');
+    await screen.findAllByText('Pending Patch');
+
+    fireEvent.click(desktop().getByRole('button', { name: 'Select Approved Patch' }));
+    fireEvent.click(desktop().getByRole('button', { name: 'Select Pending Patch' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Decline 2' }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/patch-approved/decline',
+        expect.objectContaining({ method: 'POST', body: JSON.stringify({ allRings: true }) })
+      );
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/patches/patch-pending/decline',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ ringId: undefined }) })
+    );
+  });
+
+  it('fetches the ring-scoped patches with ?limit=200 when a ring is selected', async () => {
+    // Regression: selecting a ring previously fetched `/update-rings/:id/patches`
+    // with NO limit, so the endpoint defaulted to a 50-row page and the visible
+    // list collapsed from the all-rings 200 down to 50. The ring path must now
+    // send the same `?limit=200` as the all-rings path.
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') {
+        return makeJsonResponse({
+          data: [
+            { id: 'ring-1', name: 'Pilot', ringOrder: 1, deferralDays: 0, enabled: true },
+          ],
+        });
+      }
+
+      if (url === '/patches?limit=200') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'patch-1',
+              title: 'All-Rings Patch',
+              severity: 'critical',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-01T00:00:00.000Z',
+              approvalStatus: 'pending',
+            },
+          ],
+        });
+      }
+
+      if (url === '/update-rings/ring-1/patches?limit=200') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'patch-2',
+              title: 'Ring Scoped Patch',
+              severity: 'important',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-02T00:00:00.000Z',
+              approvalStatus: 'approved',
+            },
+          ],
+          pagination: { page: 1, limit: 200, total: 1 },
+        });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('All-Rings Patch');
+
+    // The RingSelector's <select> owns the "All Rings" option; switch it to the ring.
+    const ringOption = await screen.findByRole('option', { name: /All Rings/ });
+    const ringSelect = ringOption.closest('select') as HTMLSelectElement;
+    fireEvent.change(ringSelect, { target: { value: 'ring-1' } });
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('/update-rings/ring-1/patches?limit=200');
+    });
+    // The ring path must never be fetched without the limit (the old bug).
+    expect(fetchMock).not.toHaveBeenCalledWith('/update-rings/ring-1/patches');
+    await screen.findAllByText('Ring Scoped Patch');
+  });
+
+  it('partner scope: allows bulk approve in all-orgs mode (no org, no ring) — request fires partner-wide', async () => {
+    // After the partner-scoping migration, the API derives the partner from
+    // auth.partnerId. A partner user in all-orgs mode (no org, no ring) is valid —
+    // the old "select an org or ring" guard was a UX regression.
+    jwtScope.scope = 'partner';
+    orgState.currentOrgId = null;
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'patch-1',
+              title: 'Critical Security Update',
+              severity: 'critical',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-01T00:00:00.000Z',
+              approvalStatus: 'pending',
+            },
+          ],
+        });
+      }
+      if (url === '/patches/bulk-approve') {
+        return makeJsonResponse({ approved: ['patch-1'], failed: [] });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('Critical Security Update');
+    fireEvent.click(desktop().getByRole('button', { name: 'Select Critical Security Update' }));
+    // Wait for selection state to commit before clicking the conditionally-rendered Approve button.
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve 1' }));
+
+    // Guard must NOT throw — the request must fire
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/bulk-approve',
+        expect.objectContaining({ method: 'POST' })
+      );
+    });
+  });
+
+  it('org scope: blocks bulk approve with partner-level message', async () => {
+    // Org-scoped users cannot manage approvals (rings are partner-scoped).
+    jwtScope.scope = 'organization';
+    orgState.currentOrgId = 'org-1';
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'patch-1',
+              title: 'Critical Security Update',
+              severity: 'critical',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-01T00:00:00.000Z',
+              approvalStatus: 'pending',
+            },
+          ],
+        });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('Critical Security Update');
+    fireEvent.click(desktop().getByRole('button', { name: 'Select Critical Security Update' }));
+    // Wait for selection state to commit before clicking the conditionally-rendered Approve button.
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve 1' }));
+
+    await screen.findByText(/patch approvals are managed at the partner level/i);
+    expect(fetchMock).not.toHaveBeenCalledWith('/patches/bulk-approve', expect.anything());
+  });
+
+  it('Deploy on an approved patch routes to the Compliance tab with feedback (no dead click)', async () => {
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#patches');
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'patch-1',
+              title: 'Approved Update',
+              severity: 'critical',
+              source: 'microsoft',
+              os: 'windows',
+              releaseDate: '2026-04-01T00:00:00.000Z',
+              approvalStatus: 'approved',
+            },
+          ],
+        });
+      }
+      // Compliance tab data (rendered after Deploy switches tabs).
+      if (url === '/patches/compliance') {
+        return makeJsonResponse({ data: { totalDevices: 0, compliantDevices: 0, devicesNeedingPatches: [] } });
+      }
+      if (url === '/devices?limit=200') return makeJsonResponse({ devices: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    const deploy = (await screen.findAllByRole('button', { name: 'Deploy' }))[0];
+    fireEvent.click(deploy);
+
+    // Feedback toast fires and the Compliance tab content renders.
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'success', message: expect.stringMatching(/Compliance tab/i) })
+      );
+    });
+  });
+
+  it('partner scope: shows Update Rings tab and enables New Ring even in All-orgs mode', async () => {
+    // Rings are partner-scoped — a partner user in all-orgs mode (no org selected)
+    // should see the tab and be able to open the create form.
+    jwtScope.scope = 'partner';
+    orgState.currentOrgId = null;
+    window.history.replaceState({}, '', '/#rings');
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    // The Update Rings tab must be visible.
+    expect(await screen.findByRole('button', { name: /Update Rings/i })).toBeInTheDocument();
+
+    // The New Ring button must be enabled (no disabled, no select-an-org hint).
+    const newRing = await screen.findByRole('button', { name: /New Ring/i });
+    expect(newRing).not.toBeDisabled();
+    expect(newRing).not.toHaveAttribute('title');
+  });
+
+  it('persists the selected tab in the URL hash (#hash convention, not ?tab=)', async () => {
+    // Tab state must live in window.location.hash per the project convention,
+    // and the default `compliance` tab keeps the hash empty so the URL stays clean.
+    jwtScope.scope = 'partner';
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#compliance');
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/patches/compliance') return makeJsonResponse({ data: { totalDevices: 0, compliantDevices: 0, devicesNeedingPatches: [] } });
+      if (url === '/devices?limit=200') return makeJsonResponse({ devices: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    // Switching to Patches writes #patches to the hash (and never a ?tab= query param).
+    fireEvent.click(await screen.findByRole('button', { name: /Patches/i }));
+    await waitFor(() => expect(window.location.hash).toBe('#patches'));
+    expect(window.location.search).toBe('');
+
+    // Returning to the default Compliance tab clears the hash entirely.
+    fireEvent.click(screen.getByRole('button', { name: /Compliance/i }));
+    await waitFor(() => expect(window.location.hash).toBe(''));
+    expect(window.location.search).toBe('');
+  });
+
+  it('falls back to the Compliance tab when the URL hash is not a valid tab', async () => {
+    // A malformed / unknown hash (stale bookmark, hand-edited URL) must resolve
+    // to the default Compliance tab rather than rendering a blank/none tab.
+    jwtScope.scope = 'partner';
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#bogus');
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/patches/compliance') return makeJsonResponse({ data: { totalDevices: 0, compliantDevices: 0, devicesNeedingPatches: [] } });
+      if (url === '/devices?limit=200') return makeJsonResponse({ devices: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    // The Compliance tab content (PatchComplianceView fetches /patches/compliance) renders.
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith('/patches/compliance');
+    });
+    // The Compliance nav tab carries the active styling (it is the first match).
+    const [complianceTab] = screen.getAllByRole('button', { name: /Compliance/i });
+    expect(complianceTab).toHaveClass('border-primary');
+  });
+
+  it('org scope: hides the Update Rings tab and disables New Ring with partner-level hint', async () => {
+    // Org-scoped users don't manage rings — they should not see the tab at all.
+    jwtScope.scope = 'organization';
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#compliance');
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/patches/compliance') return makeJsonResponse({ data: { totalDevices: 0, compliantDevices: 0, devicesNeedingPatches: [] } });
+      if (url === '/devices?limit=200') return makeJsonResponse({ devices: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    // Wait for the page to render (compliance tab is default here).
+    await screen.findByRole('button', { name: /Compliance/i });
+
+    // The Update Rings tab must NOT be rendered.
+    expect(screen.queryByRole('button', { name: /Update Rings/i })).toBeNull();
+  });
+
+  it('org scope: falls back to compliance when URL contains #rings (bookmark guard)', async () => {
+    // If an org user navigates to /patches#rings (e.g. a stale bookmark or
+    // shared link from a partner), the initializer guard must redirect to compliance
+    // so rings body content (UpdateRingList / New Ring button) is never rendered.
+    jwtScope.scope = 'organization';
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#rings');
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/patches/compliance') return makeJsonResponse({ data: { totalDevices: 0, compliantDevices: 0, devicesNeedingPatches: [] } });
+      if (url === '/devices?limit=200') return makeJsonResponse({ devices: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    // The Compliance tab nav button must be present (page fell back to compliance).
+    expect(await screen.findByRole('button', { name: /Compliance/i })).toBeInTheDocument();
+
+    // Rings-only body content must NOT be rendered.
+    expect(screen.queryByRole('button', { name: /New Ring/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Update Rings/i })).toBeNull();
+  });
+
+  // Standard empty-data fetch mock shared by the hash-sync tests below.
+  const emptyDataFetch = async (input: unknown): Promise<Response> => {
+    const url = String(input);
+    if (url === '/update-rings') return makeJsonResponse({ data: [] });
+    if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+    if (url === '/patches/compliance') {
+      return makeJsonResponse({ data: { totalDevices: 0, compliantDevices: 0, devicesNeedingPatches: [] } });
+    }
+    if (url === '/devices?limit=200') return makeJsonResponse({ devices: [] });
+    return makeJsonResponse({}, false, 404);
+  };
+
+  // The tab nav buttons are the only buttons carrying the `border-b-2` class; this
+  // disambiguates them from any same-named buttons rendered by the tab bodies
+  // (e.g. PatchComplianceView also surfaces "Compliance" text).
+  const navTab = (name: string) =>
+    screen.getAllByRole('button', { name }).find(b => b.className.includes('border-b-2'))!;
+
+  it('syncs the active tab on hashchange (browser back/forward, manual hash edits)', async () => {
+    // Mirrors DiscoveryPage: a hashchange (back/forward navigation or a manual
+    // URL edit) must re-select the active tab, not just the initial mount read.
+    jwtScope.scope = 'partner';
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#compliance');
+    fetchMock.mockImplementation(emptyDataFetch);
+
+    render(<PatchesPage />);
+
+    // Starts on Compliance.
+    await waitFor(() => expect(navTab('Compliance')).toHaveClass('border-primary'));
+
+    // Forward-nav to #patches re-selects the Patches tab.
+    act(() => {
+      window.location.hash = '#patches';
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+    await waitFor(() => expect(navTab('Patches')).toHaveClass('border-primary'));
+    expect(navTab('Compliance')).not.toHaveClass('border-primary');
+
+    // Back-nav to the default (empty hash) restores Compliance.
+    act(() => {
+      window.location.hash = '';
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+    await waitFor(() => expect(navTab('Compliance')).toHaveClass('border-primary'));
+    expect(navTab('Patches')).not.toHaveClass('border-primary');
+  });
+
+  it('clears the stale #rings hash when an org user is downgraded to Compliance at init', async () => {
+    // An org user landing on /patches#rings (stale bookmark / shared partner link)
+    // falls back to Compliance — and the URL must not keep #rings while Compliance
+    // is shown.
+    jwtScope.scope = 'organization';
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#rings');
+    fetchMock.mockImplementation(emptyDataFetch);
+
+    render(<PatchesPage />);
+
+    await screen.findByRole('button', { name: /Compliance/i });
+    // Stale hash wiped from the URL.
+    await waitFor(() => expect(window.location.hash).toBe(''));
+    // Rings-only chrome/body never rendered.
+    expect(screen.queryByRole('button', { name: /Update Rings/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /New Ring/i })).toBeNull();
+  });
+
+  it('re-applies the org-scope guard on hashchange and clears the hash (back/forward to #rings)', async () => {
+    // Post-mount navigation to a #rings history entry the org user can't access
+    // must re-downgrade to Compliance and clear the stale hash, not just on mount.
+    jwtScope.scope = 'organization';
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#compliance');
+    fetchMock.mockImplementation(emptyDataFetch);
+
+    render(<PatchesPage />);
+    await screen.findByRole('button', { name: /Compliance/i });
+
+    act(() => {
+      window.location.hash = '#rings';
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+
+    await waitFor(() => expect(window.location.hash).toBe(''));
+    expect(screen.queryByRole('button', { name: /Update Rings/i })).toBeNull();
+  });
+
+  it('enables New Ring when a specific org is selected and creates the ring (orgId auto-injected) with a success toast', async () => {
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#rings');
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === '/update-rings' && (!init || init.method === undefined)) {
+        return makeJsonResponse({ data: [] });
+      }
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/update-rings' && init?.method === 'POST') {
+        return makeJsonResponse({ data: { id: 'ring-new' } });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    const newRing = await screen.findByRole('button', { name: /New Ring/i });
+    expect(newRing).not.toBeDisabled();
+    fireEvent.click(newRing);
+
+    // Fill the minimal ring form and submit.
+    fireEvent.change(await screen.findByPlaceholderText(/Pilot, Broad/i), { target: { value: 'Pilot' } });
+    fireEvent.click(screen.getByRole('button', { name: /Create Ring/i }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/update-rings',
+        expect.objectContaining({ method: 'POST' })
+      );
+    });
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'success', message: 'Update ring created' })
+      );
+    });
+  });
+
+  it('surfaces a failure toast (and keeps the dialog open) when create-ring fails', async () => {
+    orgState.currentOrgId = 'org-1';
+    window.history.replaceState({}, '', '/#rings');
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === '/update-rings' && (!init || init.method === undefined)) {
+        return makeJsonResponse({ data: [] });
+      }
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/update-rings' && init?.method === 'POST') {
+        return makeJsonResponse({ error: 'Ring name already in use' }, false, 409);
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /New Ring/i }));
+    fireEvent.change(await screen.findByPlaceholderText(/Pilot, Broad/i), { target: { value: 'Pilot' } });
+    fireEvent.click(screen.getByRole('button', { name: /Create Ring/i }));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error', message: 'Ring name already in use' })
+      );
+    });
+    // Dialog remains open + actionable (the form's submit button is still there).
+    expect(screen.getByRole('button', { name: /Create Ring/i })).toBeTruthy();
+  });
+
+  it('does NOT fire the scan POST until the confirm button is clicked', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: [{ id: 'device-1', hostname: 'Workstation-1' }],
+          pagination: { page: 1, limit: 100, total: 1 },
+        });
+      }
+
+      if (url === '/patches/scan') {
+        return makeJsonResponse({ queuedCommandIds: ['cmd-1'] });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+
+    // Click "Run Scan" — this should NOT yet fire the POST
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // The confirmation dialog must appear with a message naming the organizations.
+    // scopeConfirmMessage formats multi-org as "across N organizations (Acme Corp, Globex)?"
+    const confirmMsg = await screen.findByText(/Scan for patches on \d+ device/i);
+    expect(confirmMsg).toBeTruthy();
+    expect(confirmMsg.textContent).toMatch(/Acme Corp|Globex|organizations/i);
+
+    // Scan POST must NOT have been called yet
+    expect(fetchMock).not.toHaveBeenCalledWith('/patches/scan', expect.anything());
+
+    // Now click the confirm button
+    fireEvent.click(screen.getByTestId('confirm-fleet-action'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/scan',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ deviceIds: ['device-1'] }),
+        })
+      );
+    });
+  });
+
+  it('queues scans for every device page instead of only the first 100 devices', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') {
+        return makeJsonResponse({ data: [] });
+      }
+
+      if (url === '/patches?limit=200') {
+        return makeJsonResponse({ data: [] });
+      }
+
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: [
+            { id: 'device-1', hostname: 'Workstation-1' },
+            { id: 'device-2', hostname: 'Workstation-2' },
+          ],
+          pagination: {
+            page: 1,
+            limit: 100,
+            total: 102,
+          },
+        });
+      }
+
+      if (url === '/devices?limit=100&page=2') {
+        return makeJsonResponse({
+          data: [
+            { id: 'device-3', hostname: 'Workstation-3' },
+          ],
+          pagination: {
+            page: 2,
+            limit: 100,
+            total: 102,
+          },
+        });
+      }
+
+      if (url === '/patches/scan') {
+        return makeJsonResponse({
+          queuedCommandIds: ['cmd-1', 'cmd-2', 'cmd-3'],
+          dispatchedCommandIds: ['cmd-1'],
+        });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // Wait for confirm dialog and click confirm
+    await screen.findByTestId('confirm-fleet-action');
+    fireEvent.click(screen.getByTestId('confirm-fleet-action'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/scan',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            deviceIds: ['device-1', 'device-2', 'device-3'],
+          }),
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'success',
+          message: expect.stringContaining('3 devices'),
+        })
+      );
+    });
+  });
+
+  it('uses singular "device" when exactly 1 device is queued for scan', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: [{ id: 'device-1', hostname: 'Workstation-1' }],
+          pagination: { page: 1, limit: 100, total: 1 },
+        });
+      }
+
+      if (url === '/patches/scan') {
+        return makeJsonResponse({ queuedCommandIds: ['cmd-1'] });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // Wait for confirm dialog and click confirm
+    await screen.findByTestId('confirm-fleet-action');
+    fireEvent.click(screen.getByTestId('confirm-fleet-action'));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'success',
+          message: expect.stringContaining('1 device'),
+        })
+      );
+    });
+    // Must NOT say "1 devices"
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.stringContaining('1 devices'),
+      })
+    );
+  });
+
+  it('shows error toast and does NOT call scan POST when device-paging GET fails with HTTP 500', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({ error: 'internal server error' }, false, 500);
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          message: expect.stringContaining('Failed to load devices'),
+        })
+      );
+    });
+    // Scan POST must NOT have been called
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      '/patches/scan',
+      expect.anything()
+    );
+  });
+
+  it('shows error toast and does NOT call scan POST when device list is empty', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: [],
+          pagination: { page: 1, limit: 100, total: 0 },
+        });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          message: expect.stringContaining('No devices available for scanning'),
+        })
+      );
+    });
+    // Scan POST must NOT have been called
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      '/patches/scan',
+      expect.anything()
+    );
+  });
+
+  it('surfaces an error toast (not a success toast) when the backend returns success:false', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: [{ id: 'device-1', hostname: 'Workstation-1' }],
+          pagination: { page: 1, limit: 100, total: 1 },
+        });
+      }
+
+      if (url === '/patches/scan') {
+        // Backend returns success:false (e.g. no eligible devices — #727/#734 fix)
+        return makeJsonResponse(
+          { success: false, error: 'no eligible devices' },
+          true, // HTTP 200 but body signals failure
+          200
+        );
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // Wait for confirm dialog and click confirm
+    await screen.findByTestId('confirm-fleet-action');
+    fireEvent.click(screen.getByTestId('confirm-fleet-action'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/patches/scan',
+        expect.objectContaining({ method: 'POST' })
+      );
+    });
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error' })
+      );
+    });
+    // Must NOT have emitted a success toast
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'success' })
+    );
+  });
+
+  it('surfaces an error toast (not a success toast) when the scan POST fails with HTTP 500', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: [{ id: 'device-1', hostname: 'Workstation-1' }],
+          pagination: { page: 1, limit: 100, total: 1 },
+        });
+      }
+
+      if (url === '/patches/scan') {
+        return makeJsonResponse({ error: 'internal server error' }, false, 500);
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // Wait for confirm dialog and click confirm
+    await screen.findByTestId('confirm-fleet-action');
+    fireEvent.click(screen.getByTestId('confirm-fleet-action'));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error' })
+      );
+    });
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'success' })
+    );
+  });
+
+  // ─── C1 regression: aggregate / partial-success scan outcomes ──────────────
+
+  it('reports a PARTIAL scan honestly (some queued, some failed) — error toast, not generic failure or false success', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: [
+            { id: 'device-1', hostname: 'W1' },
+            { id: 'device-2', hostname: 'W2' },
+            { id: 'device-3', hostname: 'W3' },
+          ],
+          pagination: { page: 1, limit: 100, total: 3 },
+        });
+      }
+      if (url === '/patches/scan') {
+        // success:false but 2 of 3 genuinely queued — must NOT collapse to a
+        // generic "Patch scan failed", and must NOT be a clean success.
+        return makeJsonResponse({
+          success: false,
+          queuedCommandIds: ['c1', 'c2'],
+          dispatchedCommandIds: ['c1'],
+          failedDeviceIds: ['device-3'],
+          skipped: { missingDeviceIds: [], inaccessibleDeviceIds: [] },
+        });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // Wait for confirm dialog and click confirm
+    await screen.findByTestId('confirm-fleet-action');
+    fireEvent.click(screen.getByTestId('confirm-fleet-action'));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          message: expect.stringContaining('2 of 3'),
+        })
+      );
+    });
+    expect(showToast).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('1 failed to queue') })
+    );
+    // Not the generic fallback, not a success.
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'success' })
+    );
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Patch scan failed' })
+    );
+  });
+
+  it('does NOT report a clean success when devices were silently skipped (false-negative regression)', async () => {
+    // The original defect: 1 queued + 9 skipped → API success:true → green
+    // "queued for 1 device" toast while 9 devices were silently dropped.
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: Array.from({ length: 10 }, (_, i) => ({ id: `device-${i + 1}`, hostname: `W${i + 1}` })),
+          pagination: { page: 1, limit: 100, total: 10 },
+        });
+      }
+      if (url === '/patches/scan') {
+        return makeJsonResponse({
+          success: true, // backend does NOT flip success for skipped devices
+          queuedCommandIds: ['c1'],
+          dispatchedCommandIds: [],
+          failedDeviceIds: [],
+          skipped: {
+            missingDeviceIds: ['device-2', 'device-3', 'device-4'],
+            inaccessibleDeviceIds: ['device-5', 'device-6', 'device-7', 'device-8', 'device-9', 'device-10'],
+          },
+        });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // Wait for confirm dialog and click confirm
+    await screen.findByTestId('confirm-fleet-action');
+    fireEvent.click(screen.getByTestId('confirm-fleet-action'));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          message: expect.stringContaining('1 of 10'),
+        })
+      );
+    });
+    expect(showToast).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('9 skipped') })
+    );
+    // The whole point: NO clean success toast despite API success:true.
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'success' })
+    );
+  });
+
+  it('names the devices\' true orgs in the scan confirmation — not the stale shell selection (multi-org regression)', async () => {
+    // The user shell has currentOrgId=null (global view). Devices belong to two
+    // different orgs. The scan confirmation must name both orgs and must NOT name
+    // a single stale org from currentOrgId.
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: [
+            { id: 'device-1', hostname: 'W1', orgId: 'org-1' },
+            { id: 'device-2', hostname: 'W2', orgId: 'org-2' },
+          ],
+          pagination: { page: 1, limit: 100, total: 2 },
+        });
+      }
+
+      if (url === '/patches/scan') {
+        return makeJsonResponse({ queuedCommandIds: ['cmd-1', 'cmd-2'] });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // Confirmation must reflect the two actual target orgs
+    const confirmDialog = await screen.findByTestId('confirm-fleet-action');
+    const dialogText = confirmDialog.closest('[role="dialog"]')?.textContent ?? document.body.textContent ?? '';
+    // Must mention multiple organizations (scopeConfirmMessage: "across N organizations (Acme Corp, Globex)")
+    expect(dialogText).toMatch(/across \d+ organizations/i);
+    expect(dialogText).toMatch(/Acme Corp/i);
+    expect(dialogText).toMatch(/Globex/i);
+    // Must NOT name a single org that was stale from the shell selection
+    // (currentOrgId is null in this mock, so neither should appear alone)
+    expect(dialogText).not.toMatch(/^.*in Acme Corp\?.*$/);
+
+    // Cancel — don't actually scan in this assertion-focused test
+    const cancelButton = screen.getAllByRole('button').find(b => b.textContent === 'Cancel');
+    if (cancelButton) fireEvent.click(cancelButton);
+  });
+
+  it('reports total failure with skipped breakdown when zero devices queued', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/update-rings') return makeJsonResponse({ data: [] });
+      if (url === '/patches?limit=200') return makeJsonResponse({ data: [] });
+      if (url === '/devices?limit=100&page=1') {
+        return makeJsonResponse({
+          data: Array.from({ length: 5 }, (_, i) => ({ id: `device-${i + 1}`, hostname: `W${i + 1}` })),
+          pagination: { page: 1, limit: 100, total: 5 },
+        });
+      }
+      if (url === '/patches/scan') {
+        return makeJsonResponse({
+          success: false,
+          queuedCommandIds: [],
+          skipped: {
+            missingDeviceIds: ['device-1', 'device-2'],
+            inaccessibleDeviceIds: ['device-3', 'device-4', 'device-5'],
+          },
+        });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<PatchesPage />);
+    await screen.findAllByText('No patches found. Try adjusting your search or filters.');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Scan' }));
+
+    // Wait for confirm dialog and click confirm
+    await screen.findByTestId('confirm-fleet-action');
+    fireEvent.click(screen.getByTestId('confirm-fleet-action'));
+
+    await waitFor(() => {
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          message: expect.stringContaining('0 of 5'),
+        })
+      );
+    });
+    expect(showToast).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('5 skipped') })
+    );
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'success' })
+    );
+  });
+
+  // ---- #3157: the catalog must be walked page-by-page ----
+  //
+  // The page used to issue exactly one `?limit=200` request. 200 is the API's
+  // MAX_PAGE_LIMIT, and PatchList filters/sorts/paginates client-side over
+  // whatever that single response contained, so a partner with 333 patches
+  // could never see — let alone select or approve — patches 201-333.
+  describe('patch catalog paging (#3157)', () => {
+    const makePatch = (n: number) => ({
+      id: `patch-${n}`,
+      title: `Linux Update ${n}`,
+      severity: 'important',
+      source: 'linux',
+      os: 'linux',
+      releaseDate: '2026-04-01T00:00:00.000Z',
+      approvalStatus: 'pending',
+    });
+
+    it('walks every page until the reported total is exhausted', async () => {
+      const page1 = Array.from({ length: 200 }, (_, i) => makePatch(i + 1));
+      const page2 = Array.from({ length: 133 }, (_, i) => makePatch(i + 201));
+
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: page1,
+            counts: { linux: 333 },
+            pagination: { page: 1, limit: 200, total: 333 },
+          });
+        }
+        if (url === '/patches?limit=200&page=2') {
+          return makeJsonResponse({
+            data: page2,
+            counts: { linux: 333 },
+            pagination: { page: 2, limit: 200, total: 333 },
+          });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      // The tail of the catalog is only reachable if page 2 was fetched.
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith('/patches?limit=200&page=2');
+      });
+      // ...and it must not keep walking past the last page.
+      await waitFor(() => {
+        expect(fetchMock).not.toHaveBeenCalledWith('/patches?limit=200&page=3');
+      });
+
+      // Patch 333 came from page 2 — with the old single-request fetch it never
+      // reached the browser at all. Page size defaults to 25, so assert via the
+      // pagination footer that all 333 rows are loaded (14 pages of 25).
+      await screen.findByText('Page 1 of 14');
+    });
+
+    it('walks the ring-scoped endpoint the same way', async () => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') {
+          return makeJsonResponse({
+            data: [{ id: 'ring-1', name: 'Ring 1', ringOrder: 1, deferralDays: 0, enabled: true }],
+          });
+        }
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({ data: [], pagination: { page: 1, limit: 200, total: 0 } });
+        }
+        if (url === '/update-rings/ring-1/patches?limit=200') {
+          return makeJsonResponse({
+            data: Array.from({ length: 200 }, (_, i) => makePatch(i + 1)),
+            pagination: { page: 1, limit: 200, total: 240 },
+          });
+        }
+        if (url === '/update-rings/ring-1/patches?limit=200&page=2') {
+          return makeJsonResponse({
+            data: Array.from({ length: 40 }, (_, i) => makePatch(i + 201)),
+            pagination: { page: 2, limit: 200, total: 240 },
+          });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      // The RingSelector's <select> owns the "All Rings" option; switch it to the ring.
+      const ringOption = await screen.findByRole('option', { name: /All Rings/ });
+      const ringSelect = ringOption.closest('select') as HTMLSelectElement;
+      fireEvent.change(ringSelect, { target: { value: 'ring-1' } });
+
+      await waitFor(() => {
+        expect(fetchMock).toHaveBeenCalledWith('/update-rings/ring-1/patches?limit=200&page=2');
+      });
+    });
+
+    it('stops at the page cap and says so rather than silently truncating', async () => {
+      // 20,000 patches would be 100 pages. The walk stops at 25 (5,000) and the
+      // user is told the list is capped — an invisible cap is the bug itself.
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url.startsWith('/patches?limit=200')) {
+          // Distinct ids per page — the walk dedupes, so a mock that repeated
+          // ids would collapse to one page's worth and mask the cap.
+          const pageNum = Number(new URLSearchParams(url.split('?')[1]).get('page') ?? '1');
+          return makeJsonResponse({
+            data: Array.from({ length: 200 }, (_, i) => makePatch((pageNum - 1) * 200 + i + 1)),
+            pagination: { page: pageNum, limit: 200, total: 20000 },
+          });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      const notice = await screen.findByTestId('patches-truncated-notice');
+      // Genuinely capped: a reload cannot help, so this variant points at the API.
+      expect(notice.getAttribute('data-cause')).toBe('cap');
+      expect(notice.textContent).toContain('use the patches API');
+      expect(screen.queryByTestId('patches-reload')).toBeNull();
+      expect(notice.textContent).toContain('5000');
+      expect(notice.textContent).toContain('20000');
+      expect(fetchMock).toHaveBeenCalledWith('/patches?limit=200&page=25');
+      expect(fetchMock).not.toHaveBeenCalledWith('/patches?limit=200&page=26');
+    });
+
+    it('issues a single request when the response carries no pagination metadata', async () => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url === '/patches?limit=200') return makeJsonResponse({ data: [makePatch(1)] });
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      await screen.findAllByText('Linux Update 1');
+      expect(fetchMock).not.toHaveBeenCalledWith('/patches?limit=200&page=2');
+    });
+
+    it('drops rows repeated across pages and flags the list as short', async () => {
+      // Offset paging can repeat a row when the catalog shifts mid-walk.
+      // Duplicates would collide on React keys and inflate "select all N
+      // matching", so they're dropped — but the resulting short list must not
+      // be presented as the complete catalog.
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: [makePatch(1), makePatch(2)],
+            pagination: { page: 1, limit: 2, total: 4 },
+          });
+        }
+        if (url === '/patches?limit=200&page=2') {
+          // patch-2 repeats; only patch-3 is new.
+          return makeJsonResponse({
+            data: [makePatch(2), makePatch(3)],
+            pagination: { page: 2, limit: 2, total: 4 },
+          });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      const notice = await screen.findByTestId('patches-truncated-notice');
+      // 3 distinct rows survived of the 4 the server reported. The cap wasn't
+      // reached, so this is the "catalog shifted" case — a reload can fix it,
+      // and the notice must say so rather than sending the user to the API.
+      expect(notice.getAttribute('data-cause')).toBe('shifted');
+      expect(notice.textContent).toContain('Reload to see the rest');
+      expect(screen.getByTestId('patches-reload')).toBeTruthy();
+      expect(notice.textContent).toContain('3');
+      expect(notice.textContent).toContain('4');
+      expect(desktop().getAllByRole('row').slice(1)).toHaveLength(3);
+    });
+
+    it('flags the list as short when a later page returns no pagination metadata', async () => {
+      // Page 1 promised 400; page 2 came back malformed. Stopping is fine —
+      // silently showing 200 rows as the whole catalog is not.
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: Array.from({ length: 200 }, (_, i) => makePatch(i + 1)),
+            pagination: { page: 1, limit: 200, total: 400 },
+          });
+        }
+        if (url === '/patches?limit=200&page=2') {
+          return makeJsonResponse({ data: [] });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      const notice = await screen.findByTestId('patches-truncated-notice');
+      expect(notice.getAttribute('data-cause')).toBe('shifted');
+      expect(notice.textContent).toContain('200');
+      expect(notice.textContent).toContain('400');
+    });
+
+    it('keeps the source-filter counts from the walk', async () => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: [makePatch(1), makePatch(2)],
+            counts: { microsoft: 0, apple: 0, linux: 333, third_party: 0, custom: 0 },
+            pagination: { page: 1, limit: 200, total: 2 },
+          });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      // The Linux source chip reflects the catalog-wide count from the response.
+      const chip = await screen.findByTestId('patches-count-linux');
+      expect(chip.textContent).toContain('333');
+    });
+
+    it('shows an error over the stale list when a refresh fails, not a silent swap', async () => {
+      // Regression: PatchList's full-page error state only renders when the
+      // list is EMPTY, and a failed walk deliberately keeps the previous array.
+      // Without a banner, switching rings and having the walk fail would show
+      // the all-rings catalog under a ring selection with no indication at all.
+      let ringPageOneFails = false;
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') {
+          return makeJsonResponse({
+            data: [{ id: 'ring-1', name: 'Ring 1', ringOrder: 1, deferralDays: 0, enabled: true }],
+          });
+        }
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: [{ ...makePatch(1), title: 'All Rings Patch' }],
+            pagination: { page: 1, limit: 200, total: 1 },
+          });
+        }
+        if (url.startsWith('/update-rings/ring-1/patches')) {
+          ringPageOneFails = true;
+          return makeJsonResponse({}, false, 500);
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+      await screen.findAllByText('All Rings Patch');
+
+      const ringOption = await screen.findByRole('option', { name: /All Rings/ });
+      fireEvent.change(ringOption.closest('select') as HTMLSelectElement, {
+        target: { value: 'ring-1' },
+      });
+
+      await waitFor(() => expect(ringPageOneFails).toBe(true));
+
+      // The stale rows are still on screen — so the failure MUST be visible.
+      const banner = await screen.findByTestId('patch-list-stale-error');
+      expect(banner.textContent).toContain('Failed to fetch patches');
+      expect(screen.getAllByText('All Rings Patch').length).toBeGreaterThan(0);
+    });
+
+    it('end-to-end: 333 patches walk in, select-all-matching, and all 333 are approved', async () => {
+      // The bug as reported, start to finish. The three other suites each cover
+      // one leg (walk / select / server accept); this is the only test that
+      // proves the legs connect, so a `.slice(0, 200)` anywhere along the path
+      // can't ship green.
+      const approvedBatches: string[][] = [];
+      fetchMock.mockImplementation(async (input, init) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: Array.from({ length: 200 }, (_, i) => makePatch(i + 1)),
+            pagination: { page: 1, limit: 200, total: 333 },
+          });
+        }
+        if (url === '/patches?limit=200&page=2') {
+          return makeJsonResponse({
+            data: Array.from({ length: 133 }, (_, i) => makePatch(i + 201)),
+            pagination: { page: 2, limit: 200, total: 333 },
+          });
+        }
+        if (url === '/patches/bulk-approve') {
+          const body = JSON.parse(String((init as RequestInit).body)) as { patchIds: string[] };
+          approvedBatches.push(body.patchIds);
+          return makeJsonResponse({ success: true, approved: body.patchIds, failed: [] });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      // All 333 loaded: 14 pages at the default page size of 25.
+      await screen.findByText('Page 1 of 14');
+
+      // Select the visible page, then escalate to the whole filtered set.
+      fireEvent.click(desktop().getByRole('button', { name: 'Select all patches' }));
+      fireEvent.click(await screen.findByTestId('patch-select-all-matching'));
+      expect(screen.getByText('333 selected')).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId('patch-bulk-approve'));
+
+      await waitFor(() => {
+        const submitted = approvedBatches.flat();
+        expect(submitted).toHaveLength(333);
+        // Every id exactly once, including the tail that only page 2 supplied.
+        expect(new Set(submitted).size).toBe(333);
+        expect(submitted).toContain('patch-333');
+      });
+      // Batched to bound request duration, not sent as one 333-id request.
+      expect(approvedBatches).toEqual([
+        expect.objectContaining({ length: 200 }),
+        expect.objectContaining({ length: 133 }),
+      ]);
+      // No bulk error surfaced.
+      expect(screen.queryByText(/Failed to approve/)).toBeNull();
+    });
+
+    it('keeps earlier batches\' rejections visible when a later batch aborts', async () => {
+      let call = 0;
+      fetchMock.mockImplementation(async (input, init) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: Array.from({ length: 200 }, (_, i) => makePatch(i + 1)),
+            pagination: { page: 1, limit: 200, total: 250 },
+          });
+        }
+        if (url === '/patches?limit=200&page=2') {
+          return makeJsonResponse({
+            data: Array.from({ length: 50 }, (_, i) => makePatch(i + 201)),
+            pagination: { page: 2, limit: 200, total: 250 },
+          });
+        }
+        if (url === '/patches/bulk-approve') {
+          call += 1;
+          if (call === 1) {
+            const body = JSON.parse(String((init as RequestInit).body)) as { patchIds: string[] };
+            // First batch: server rejects 3 of the 200.
+            return makeJsonResponse({
+              success: true,
+              approved: body.patchIds.slice(3),
+              failed: body.patchIds.slice(0, 3),
+            });
+          }
+          return makeJsonResponse({}, false, 500); // second batch dies
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+      await screen.findByText('Page 1 of 10');
+
+      fireEvent.click(desktop().getByRole('button', { name: 'Select all patches' }));
+      fireEvent.click(await screen.findByTestId('patch-select-all-matching'));
+      fireEvent.click(screen.getByTestId('patch-bulk-approve'));
+
+      // The abort message must not erase the 3 the server already refused.
+      const err = await screen.findByText(/3 patches were also rejected/);
+      expect(err.textContent).toContain('Failed to approve patches');
+    });
+
+    it('discards a superseded walk when the ring changes mid-walk', async () => {
+      // A walk is now up to 25 sequential requests, so the window in which a
+      // stale walk can finish last and repaint the list is much wider than it
+      // was for the old single request. Hold page 2 of the all-rings walk open
+      // until the ring walk has finished, then release it: the ring's patches
+      // must survive.
+      let releaseAllRingsPage2: () => void = () => {};
+      const allRingsPage2Gate = new Promise<void>((resolve) => { releaseAllRingsPage2 = resolve; });
+
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') {
+          return makeJsonResponse({
+            data: [{ id: 'ring-1', name: 'Ring 1', ringOrder: 1, deferralDays: 0, enabled: true }],
+          });
+        }
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: [makePatch(1)],
+            pagination: { page: 1, limit: 200, total: 201 },
+          });
+        }
+        if (url === '/patches?limit=200&page=2') {
+          await allRingsPage2Gate;
+          return makeJsonResponse({
+            data: [makePatch(2)],
+            pagination: { page: 2, limit: 200, total: 201 },
+          });
+        }
+        if (url === '/update-rings/ring-1/patches?limit=200') {
+          return makeJsonResponse({
+            data: [{ ...makePatch(99), title: 'Ring Only Patch' }],
+            pagination: { page: 1, limit: 200, total: 1 },
+          });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+
+      render(<PatchesPage />);
+
+      const ringOption = await screen.findByRole('option', { name: /All Rings/ });
+      const ringSelect = ringOption.closest('select') as HTMLSelectElement;
+      fireEvent.change(ringSelect, { target: { value: 'ring-1' } });
+
+      await screen.findAllByText('Ring Only Patch');
+
+      await act(async () => {
+        releaseAllRingsPage2();
+        await allRingsPage2Gate;
+      });
+
+      // The abandoned all-rings walk must not clobber the ring's list.
+      expect(await screen.findAllByText('Ring Only Patch')).not.toHaveLength(0);
+      expect(screen.queryByText('Linux Update 1')).toBeNull();
+    });
+
+    it('surfaces an error when a later page fails instead of showing a partial list', async () => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/update-rings') return makeJsonResponse({ data: [] });
+        if (url === '/patches?limit=200') {
+          return makeJsonResponse({
+            data: Array.from({ length: 200 }, (_, i) => makePatch(i + 1)),
+            pagination: { page: 1, limit: 200, total: 333 },
+          });
+        }
+        return makeJsonResponse({}, false, 500);
+      });
+
+      render(<PatchesPage />);
+
+      await screen.findByText('Failed to fetch patches');
+    });
+  });
+});

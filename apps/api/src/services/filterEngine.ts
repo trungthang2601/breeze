@@ -1,0 +1,872 @@
+import { and, eq, or, not, gt, gte, lt, lte, like, ilike, inArray, isNull, isNotNull, sql, SQL } from 'drizzle-orm';
+import { db } from '../db';
+import { sqlValue } from '../db/sqlValues';
+import { pgErrorCode } from '../utils/pgErrors';
+import { devices, deviceCustomFieldValues, deviceHardware, deviceNetwork, deviceMetrics, deviceSoftware, deviceGroups, deviceGroupMemberships, softwareInventory } from '../db/schema';
+import type {
+  FilterOperator,
+  FilterFieldCategory,
+  FilterFieldType,
+  FilterFieldDefinition,
+  FilterCondition,
+  FilterValue,
+  FilterConditionGroup,
+  FilterEvaluationResult,
+  FilterPreviewResult,
+  FilterPreviewDevice
+} from '@breeze/shared/types/filters';
+import { DEVICE_FUNCTION_KEYS } from '@breeze/shared/validators';
+export type {
+  FilterOperator,
+  FilterFieldCategory,
+  FilterFieldType,
+  FilterFieldDefinition,
+  FilterCondition,
+  FilterValue,
+  FilterConditionGroup,
+  FilterEvaluationResult,
+  FilterPreviewResult,
+  FilterPreviewDevice
+} from '@breeze/shared/types/filters';
+
+// ============================================
+// Field Definitions
+// ============================================
+
+const OPERATORS_BY_TYPE: Record<FilterFieldType, FilterOperator[]> = {
+  string: ['equals', 'notEquals', 'contains', 'notContains', 'startsWith', 'endsWith', 'matches', 'in', 'notIn', 'isNull', 'isNotNull'],
+  number: ['equals', 'notEquals', 'greaterThan', 'greaterThanOrEquals', 'lessThan', 'lessThanOrEquals', 'between', 'isNull', 'isNotNull'],
+  boolean: ['equals', 'notEquals', 'isNull', 'isNotNull'],
+  date: ['equals', 'notEquals', 'before', 'after', 'between', 'withinLast', 'notWithinLast', 'isNull', 'isNotNull'],
+  datetime: ['equals', 'notEquals', 'before', 'after', 'between', 'withinLast', 'notWithinLast', 'isNull', 'isNotNull'],
+  array: ['hasAny', 'hasAll', 'isEmpty', 'isNotEmpty', 'contains'],
+  enum: ['equals', 'notEquals', 'in', 'notIn']
+};
+
+const CUSTOM_FIELD_KEY_PATTERN = /^[a-z][a-z0-9_]*$/;
+
+// Upper bound on a user-supplied `matches` (regex) pattern. Postgres regex is
+// susceptible to catastrophic backtracking; capping the pattern length is a
+// cheap guard against query-time DoS (issue #1044, item 2).
+const MAX_REGEX_PATTERN_LENGTH = 250;
+
+// Escape LIKE/ILIKE wildcards in a user value so `%` and `_` match literally
+// (default ESCAPE is backslash). Without this a value of `%` matches every row
+// — a matching-semantics surprise, not injection (issue #1044, item 1).
+export function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+}
+
+function getCustomFieldKey(field: string): string | null {
+  if (!field.startsWith('custom.')) {
+    return null;
+  }
+  const customField = field.slice('custom.'.length);
+  if (!CUSTOM_FIELD_KEY_PATTERN.test(customField)) {
+    return null;
+  }
+  return customField;
+}
+
+export const FILTER_FIELDS: FilterFieldDefinition[] = [
+  // Core Device fields
+  { key: 'hostname', label: 'Hostname', category: 'core', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'displayName', label: 'Display Name', category: 'core', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'status', label: 'Status', category: 'core', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending'] },
+  { key: 'agentVersion', label: 'Agent Version', category: 'core', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'enrolledAt', label: 'Enrolled At', category: 'core', type: 'datetime', operators: OPERATORS_BY_TYPE.datetime },
+  { key: 'lastSeenAt', label: 'Last Seen At', category: 'core', type: 'datetime', operators: OPERATORS_BY_TYPE.datetime },
+  { key: 'tags', label: 'Tags', category: 'core', type: 'array', operators: OPERATORS_BY_TYPE.array },
+  { key: 'deviceRole', label: 'Device Role', category: 'core', type: 'enum', operators: OPERATORS_BY_TYPE.enum,
+    enumValues: ['workstation', 'server', 'printer', 'router', 'switch', 'firewall', 'access_point', 'phone', 'iot', 'camera', 'nas', 'unknown'] },
+  // Fleet Designer W02 (#5652): the ACTIVE device function projection. Known
+  // keys come from the shared SSOT; a custom:<slug> key is matchable through
+  // equals/in with the value typed by hand.
+  { key: 'deviceFunction', label: 'Device Function', category: 'core', type: 'enum', operators: OPERATORS_BY_TYPE.enum,
+    enumValues: [...DEVICE_FUNCTION_KEYS] },
+  { key: 'lastUser', label: 'Last User', category: 'core', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'isHeadless', label: 'Headless', category: 'core', type: 'boolean', operators: OPERATORS_BY_TYPE.boolean },
+  { key: 'uptimeSeconds', label: 'Uptime (seconds)', category: 'core', type: 'number', operators: OPERATORS_BY_TYPE.number },
+  { key: 'watchdogStatus', label: 'Watchdog Status', category: 'core', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['connected', 'failover', 'offline'] },
+  { key: 'quarantinedAt', label: 'Quarantined At', category: 'core', type: 'datetime', operators: OPERATORS_BY_TYPE.datetime },
+  { key: 'lastSeenIp', label: 'Last Seen IP', category: 'network', type: 'string', operators: OPERATORS_BY_TYPE.string },
+
+  // OS fields
+  { key: 'osType', label: 'OS Type', category: 'os', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['windows', 'macos', 'linux'] },
+  { key: 'osVersion', label: 'OS Version', category: 'os', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'osBuild', label: 'OS Build', category: 'os', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'architecture', label: 'Architecture', category: 'os', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['x64', 'x86', 'arm64'] },
+
+  // Hardware fields
+  { key: 'hardware.manufacturer', label: 'Manufacturer', category: 'hardware', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'hardware.model', label: 'Model', category: 'hardware', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'hardware.serialNumber', label: 'Serial Number', category: 'hardware', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'hardware.cpuModel', label: 'CPU Model', category: 'hardware', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'hardware.cpuCores', label: 'CPU Cores', category: 'hardware', type: 'number', operators: OPERATORS_BY_TYPE.number },
+  { key: 'hardware.ramTotalMb', label: 'RAM (MB)', category: 'hardware', type: 'number', operators: OPERATORS_BY_TYPE.number },
+  { key: 'hardware.diskTotalGb', label: 'Disk Size (GB)', category: 'hardware', type: 'number', operators: OPERATORS_BY_TYPE.number },
+  { key: 'hardware.gpuModel', label: 'GPU Model', category: 'hardware', type: 'string', operators: OPERATORS_BY_TYPE.string },
+
+  // Network fields
+  { key: 'network.ipAddress', label: 'IP Address', category: 'network', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'network.publicIp', label: 'Public IP', category: 'network', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'network.macAddress', label: 'MAC Address', category: 'network', type: 'string', operators: OPERATORS_BY_TYPE.string },
+
+  // Metrics fields (from latest metrics)
+  { key: 'metrics.cpuPercent', label: 'CPU %', category: 'metrics', type: 'number', operators: OPERATORS_BY_TYPE.number },
+  { key: 'metrics.ramPercent', label: 'RAM %', category: 'metrics', type: 'number', operators: OPERATORS_BY_TYPE.number },
+  { key: 'metrics.diskPercent', label: 'Disk %', category: 'metrics', type: 'number', operators: OPERATORS_BY_TYPE.number },
+
+  // Software fields (EXISTS against software_inventory)
+  { key: 'software.installed', label: 'Has Software Installed', category: 'software', type: 'string', operators: ['contains', 'notContains', 'equals', 'in', 'hasAny', 'hasAll'], description: 'Match devices with matching installed software' },
+  { key: 'software.notInstalled', label: 'Missing Software', category: 'software', type: 'string', operators: ['contains', 'equals', 'in', 'hasAny'], description: 'Match devices missing the named software' },
+
+  // Device-state predicates (virtual EXISTS fields against related tables)
+  { key: 'patches.pending', label: 'Has Pending Patches', category: 'core', type: 'boolean', operators: ['equals', 'notEquals'], description: 'Device has at least one pending patch' },
+  { key: 'alerts.critical', label: 'Has Critical Alerts', category: 'core', type: 'boolean', operators: ['equals', 'notEquals'], description: 'Device has an active critical alert' },
+  { key: 'system.rebootRequired', label: 'Reboot Required', category: 'core', type: 'boolean', operators: ['equals', 'notEquals'], description: 'Device OS reports a reboot is pending' },
+
+  // Hierarchy fields
+  { key: 'orgId', label: 'Organization', category: 'hierarchy', type: 'string', operators: ['equals', 'in'] },
+  { key: 'siteId', label: 'Site', category: 'hierarchy', type: 'string', operators: ['equals', 'in'] },
+  { key: 'groupId', label: 'Device Group', category: 'hierarchy', type: 'string', operators: ['equals', 'in'] },
+
+  // Computed fields
+  { key: 'daysSinceLastSeen', label: 'Days Since Last Seen', category: 'computed', type: 'number', operators: OPERATORS_BY_TYPE.number, computed: true },
+  { key: 'daysSinceEnrolled', label: 'Days Since Enrolled', category: 'computed', type: 'number', operators: OPERATORS_BY_TYPE.number, computed: true }
+];
+
+export function getFieldDefinition(fieldKey: string): FilterFieldDefinition | undefined {
+  // Check for custom fields
+  const customFieldKey = getCustomFieldKey(fieldKey);
+  if (customFieldKey) {
+    return {
+      key: fieldKey,
+      label: customFieldKey,
+      category: 'custom',
+      type: 'string', // Default type, actual type determined at runtime
+      operators: OPERATORS_BY_TYPE.string
+    };
+  }
+  return FILTER_FIELDS.find(f => f.key === fieldKey);
+}
+
+export function getFieldsByCategory(category: FilterFieldCategory): FilterFieldDefinition[] {
+  return FILTER_FIELDS.filter(f => f.category === category);
+}
+
+export function getAllFilterableFields(): FilterFieldDefinition[] {
+  return FILTER_FIELDS;
+}
+
+// ============================================
+// SQL Query Builder
+// ============================================
+
+type ColumnRef = ReturnType<typeof devices.id.getSQL> | SQL<unknown>;
+
+function getColumnForField(field: string): { table: 'devices' | 'hardware' | 'network' | 'metrics' | 'software' | 'groups'; column: string; computed?: SQL<unknown> } {
+  // Handle prefixed fields
+  if (field.startsWith('hardware.')) {
+    return { table: 'hardware', column: field.replace('hardware.', '') };
+  }
+  if (field.startsWith('network.')) {
+    return { table: 'network', column: field.replace('network.', '') };
+  }
+  if (field.startsWith('metrics.')) {
+    return { table: 'metrics', column: field.replace('metrics.', '') };
+  }
+  if (field.startsWith('software.')) {
+    return { table: 'software', column: field.replace('software.', '') };
+  }
+  if (field.startsWith('custom.')) {
+    const customField = getCustomFieldKey(field);
+    if (!customField) {
+      throw new Error(`Invalid custom field key: ${field}`);
+    }
+    // Reads the normalized table rather than jsonb_extract_path_text on
+    // devices.custom_fields (#3257 W05): the (org_id, field_key, value_text)
+    // index makes this a lookup instead of a per-row jsonb scan. The projection
+    // still exists, so nothing else in this file changes — and the returned
+    // shape is identical text, so every operator in `applyOperator` behaves as
+    // it did.
+    //
+    // LIMIT 1 is belt-and-braces, not load-bearing. (device_id, definition_id)
+    // is unique; W02's two partial unique indexes and W03's anti-shadow trigger
+    // together mean at most ONE definition with a given field_key is visible to
+    // any org; and the coherence trigger enforces visibility on every write. So
+    // (device_id, field_key) is single-valued and the subquery returns one row.
+    //
+    // It is kept because those guards can be disarmed (the test suite does it to
+    // forge legacy shapes). Degrading to an arbitrary pick among duplicates is
+    // strictly better here than a "more than one row returned by a subquery"
+    // error, which would abort every smart-group evaluation, deployment-target
+    // resolution and dynamic-group recompute that touches the affected org —
+    // a fleet-wide outage from one corrupt row. An ORDER BY would make the pick
+    // deterministic but no more correct, at the cost of implying the duplicate
+    // state is expected.
+    //
+    // No org predicate here on purpose: the outer query already pins
+    // devices.org_id, the correlation is on devices.id, and this expression is
+    // evaluated under the caller's RLS context where the table's own
+    // breeze_has_org_access(org_id) policy applies.
+    return {
+      table: 'devices',
+      column: 'customFields',
+      computed: sql`(
+        SELECT COALESCE(
+                 v.value_text,
+                 v.value_number::text,
+                 v.value_bool::text,
+                 v.value_date::text
+               )
+          FROM ${deviceCustomFieldValues} v
+         WHERE v.device_id = ${devices.id}
+           AND v.field_key = ${customField}
+         LIMIT 1)`
+    };
+  }
+
+  // #3166: the agent reports Go's `runtime.GOARCH` verbatim (`amd64`, `arm64`,
+  // `386`) and enrollment stores it untranslated, but this field advertises the
+  // friendlier `x64` / `x86` / `arm64`. A condition of `architecture equals x64`
+  // was therefore compared against a column literally containing `amd64` and
+  // matched nothing — on one live instance every device stores `amd64`, so the
+  // x64 option could never match anything at all. `arm64` worked only because
+  // Go's spelling happens to equal the enum's.
+  //
+  // Projecting the column into the advertised vocabulary (rather than mapping
+  // the value) fixes every operator at once — equals, notEquals, in, notIn,
+  // contains — instead of special-casing equality and leaving the rest broken.
+  // It also needs no migration and no change to what agents send: stored data
+  // stays raw GOARCH, which is what the agent actually knows.
+  //
+  // Historical spellings are folded in too, so a device enrolled by any agent
+  // version lands in the right bucket. Anything unrecognised passes through
+  // lower-cased rather than being swallowed, so a new architecture is still
+  // filterable by its raw name instead of silently matching nothing.
+  if (field === 'architecture') {
+    return {
+      table: 'devices',
+      column: 'architecture',
+      computed: sql`CASE lower(${devices.architecture})
+        WHEN 'amd64' THEN 'x64'
+        WHEN 'x86_64' THEN 'x64'
+        WHEN 'x64' THEN 'x64'
+        WHEN '386' THEN 'x86'
+        WHEN 'i386' THEN 'x86'
+        WHEN 'x86' THEN 'x86'
+        WHEN 'arm64' THEN 'arm64'
+        WHEN 'aarch64' THEN 'arm64'
+        ELSE lower(${devices.architecture})
+      END`
+    };
+  }
+
+  // Computed fields
+  if (field === 'daysSinceLastSeen') {
+    return {
+      table: 'devices',
+      column: 'lastSeenAt',
+      computed: sql`EXTRACT(EPOCH FROM (NOW() - ${devices.lastSeenAt})) / 86400`
+    };
+  }
+  if (field === 'daysSinceEnrolled') {
+    return {
+      table: 'devices',
+      column: 'enrolledAt',
+      computed: sql`EXTRACT(EPOCH FROM (NOW() - ${devices.enrolledAt})) / 86400`
+    };
+  }
+  if (field === 'groupId') {
+    return { table: 'groups', column: 'groupId' };
+  }
+
+  // Default to devices table
+  return { table: 'devices', column: field };
+}
+
+export function buildConditionSQL(condition: FilterCondition): SQL<unknown> {
+  const { field, operator, value } = condition;
+
+  // Virtual boolean predicates resolved as self-contained EXISTS subqueries.
+  // The outer query selects from `devices` only (no joins), so each correlates
+  // on devices.id and needs no join. The chip bar emits `equals 'yes'`/`'no'`;
+  // the advanced builder may send a real boolean — treat false/'no'/'false' as
+  // the negative, and `notEquals` flips the polarity.
+  if (field === 'patches.pending' || field === 'alerts.critical' || field === 'system.rebootRequired') {
+    let inner: SQL<unknown>;
+    if (field === 'patches.pending') {
+      inner = sql`EXISTS (SELECT 1 FROM device_patches WHERE device_id = ${devices.id} AND status = 'pending')`;
+    } else if (field === 'alerts.critical') {
+      inner = sql`EXISTS (SELECT 1 FROM alerts WHERE device_id = ${devices.id} AND status = 'active' AND severity = 'critical')`;
+    } else {
+      // OS-level flag persisted from the agent heartbeat. Intentionally
+      // broader than the old patch_job_results subquery: matches reboots
+      // from any cause, so the filter agrees with the "Reboot pending"
+      // badge. (Spec 2026-06-11-pending-reboot-indicator-design.md)
+      inner = sql`${devices.pendingReboot} = true`;
+    }
+    const negative = value === false || value === 'no' || value === 'false';
+    const negate = (operator === 'notEquals') !== negative;
+    return negate ? sql`NOT (${inner})` : inner;
+  }
+
+  const fieldInfo = getColumnForField(field);
+
+  // Installed-software predicates use an EXISTS subquery against
+  // software_inventory — the table the agent inventory ingest actually
+  // populates (device_software is unused). `software.notInstalled` is the
+  // negation of `software.installed`. Self-contained, so no outer join.
+  if (fieldInfo.table === 'software') {
+    const positive = field === 'software.installed';
+    let match: SQL<unknown>;
+    switch (operator) {
+      case 'contains':
+      case 'notContains':
+        match = sql`${softwareInventory.name} ILIKE ${'%' + escapeLikePattern(String(value)) + '%'}`;
+        break;
+      case 'equals':
+        match = sql`${softwareInventory.name} = ${String(value)}`;
+        break;
+      case 'in':
+      case 'hasAny': {
+        if (!Array.isArray(value) || value.length === 0) return sql`TRUE`;
+        // Explicit IN list — an ANY($1) array binding inside EXISTS doesn't
+        // infer the text[] cast and errors with "malformed array literal".
+        const names = (value as unknown[]).map((v) => sql`${String(v)}`);
+        match = sql`${softwareInventory.name} IN (${sql.join(names, sql`, `)})`;
+        break;
+      }
+      case 'hasAll': {
+        if (!Array.isArray(value) || value.length === 0) return sql`TRUE`;
+        const all = (value as unknown[])
+          .map((v) => sql`EXISTS (SELECT 1 FROM ${softwareInventory} WHERE ${softwareInventory.deviceId} = ${devices.id} AND ${softwareInventory.name} = ${String(v)})`)
+          .reduce((acc, part) => sql`${acc} AND ${part}`);
+        return positive ? all : sql`NOT (${all})`;
+      }
+      default:
+        throw new Error(`Unsupported software operator: ${operator}`);
+    }
+    const inner = sql`EXISTS (SELECT 1 FROM ${softwareInventory} WHERE ${softwareInventory.deviceId} = ${devices.id} AND ${match})`;
+    // notContains is its own negation regardless of installed/notInstalled.
+    if (operator === 'notContains') return sql`NOT (${inner})`;
+    return positive ? inner : sql`NOT (${inner})`;
+  }
+
+  // Resolve the field to a predicate. Device columns (and computed
+  // expressions) compare directly; related tables are reached via correlated
+  // subqueries so the list query stays `FROM devices` with no joins (no row
+  // multiplication, no pagination/RLS interaction). This closes the long-
+  // standing "we'd add the joins here" gap — hardware/network/metrics/group
+  // filters previously errored (unjoined table / unsupported).
+  if (fieldInfo.computed) {
+    return applyOperator(fieldInfo.computed, operator, value);
+  }
+  if (fieldInfo.table === 'devices') {
+    const col = devices[fieldInfo.column as keyof typeof devices];
+    if (!col) {
+      throw new Error(`Unknown device field: ${fieldInfo.column}`);
+    }
+    return applyOperator(sql`${col}`, operator, value);
+  }
+  if (fieldInfo.table === 'hardware') {
+    const col = deviceHardware[fieldInfo.column as keyof typeof deviceHardware];
+    if (!col) {
+      throw new Error(`Unknown hardware field: ${fieldInfo.column}`);
+    }
+    // device_hardware is 1:1 with devices (device_id is PK).
+    return sql`EXISTS (SELECT 1 FROM ${deviceHardware} WHERE ${deviceHardware.deviceId} = ${devices.id} AND ${applyOperator(sql`${col}`, operator, value)})`;
+  }
+  if (fieldInfo.table === 'network') {
+    const col = deviceNetwork[fieldInfo.column as keyof typeof deviceNetwork];
+    if (!col) {
+      throw new Error(`Unknown network field: ${fieldInfo.column}`);
+    }
+    // device_network is 1:many (interfaces); EXISTS = "any interface matches".
+    return sql`EXISTS (SELECT 1 FROM ${deviceNetwork} WHERE ${deviceNetwork.deviceId} = ${devices.id} AND ${applyOperator(sql`${col}`, operator, value)})`;
+  }
+  if (fieldInfo.table === 'metrics') {
+    const col = deviceMetrics[fieldInfo.column as keyof typeof deviceMetrics];
+    if (!col) {
+      throw new Error(`Unknown metrics field: ${fieldInfo.column}`);
+    }
+    // device_metrics is time-series; filter on the latest sample per device.
+    // The (device_id, timestamp) PK makes the per-device lookup an index scan.
+    const latest = sql`(SELECT ${col} FROM ${deviceMetrics} WHERE ${deviceMetrics.deviceId} = ${devices.id} ORDER BY ${deviceMetrics.timestamp} DESC LIMIT 1)`;
+    return applyOperator(latest, operator, value);
+  }
+  if (fieldInfo.table === 'groups') {
+    // Membership test against device_group_memberships.
+    if (operator === 'equals') {
+      return sql`EXISTS (SELECT 1 FROM ${deviceGroupMemberships} WHERE ${deviceGroupMemberships.deviceId} = ${devices.id} AND ${deviceGroupMemberships.groupId} = ${sqlValue(value)})`;
+    }
+    if (operator === 'in' && Array.isArray(value)) {
+      return sql`EXISTS (SELECT 1 FROM ${deviceGroupMemberships} WHERE ${deviceGroupMemberships.deviceId} = ${devices.id} AND ${deviceGroupMemberships.groupId} = ANY(${value}))`;
+    }
+    throw new Error(`Unsupported operator for groupId: ${operator}`);
+  }
+  throw new Error(`Unsupported table: ${fieldInfo.table}`);
+}
+
+// Build a SQL predicate applying an operator to a column expression. The
+// expression may be a plain device column or a correlated subquery (related
+// tables / latest-metric), so this stays purely about operator semantics.
+//
+// Every user-supplied scalar goes through `sqlValue` rather than being
+// interpolated bare (#3369). `columnRef` is an arbitrary `SQL` expression, not
+// a `Column`, so Drizzle has no encoder to consult and would hand postgres.js
+// the raw JS object — for a `Date` that throws ERR_INVALID_ARG_TYPE at the
+// driver's Bind step, and because the request runs inside a `begin()`
+// transaction the throw escapes as an HTTP 500 rather than a handled error.
+// `FilterValue` really does carry live `Date`s here: `filterValueSchema` parses
+// a `between` range through `z.coerce.date()`, so the advanced filter builder's
+// date-range picker produces them on every `POST /devices/filters/preview`.
+function applyOperator(columnRef: SQL<unknown>, operator: FilterOperator, value: FilterValue): SQL<unknown> {
+  switch (operator) {
+    case 'equals':
+      return sql`${columnRef} = ${sqlValue(value)}`;
+    case 'notEquals':
+      return sql`${columnRef} != ${sqlValue(value)}`;
+    case 'greaterThan':
+      return sql`${columnRef} > ${sqlValue(value)}`;
+    case 'greaterThanOrEquals':
+      return sql`${columnRef} >= ${sqlValue(value)}`;
+    case 'lessThan':
+      return sql`${columnRef} < ${sqlValue(value)}`;
+    case 'lessThanOrEquals':
+      return sql`${columnRef} <= ${sqlValue(value)}`;
+    case 'contains':
+      return sql`${columnRef} ILIKE ${'%' + escapeLikePattern(String(value)) + '%'}`;
+    case 'notContains':
+      return sql`${columnRef} NOT ILIKE ${'%' + escapeLikePattern(String(value)) + '%'}`;
+    case 'startsWith':
+      return sql`${columnRef} ILIKE ${escapeLikePattern(String(value)) + '%'}`;
+    case 'endsWith':
+      return sql`${columnRef} ILIKE ${'%' + escapeLikePattern(String(value))}`;
+    case 'matches':
+      return sql`${columnRef} ~ ${sqlValue(value)}`;
+    case 'in':
+      if (Array.isArray(value)) {
+        // Empty IN matches nothing. Build an explicit IN list (each value bound
+        // separately) rather than `= ANY($1)`: postgres.js interpolates a JS
+        // array as a row tuple `($1, $2)`, which Postgres rejects with "op
+        // ANY/ALL (array) requires array on right side". Mirrors the software
+        // `in` path above.
+        if (value.length === 0) return sql`FALSE`;
+        const items = (value as unknown[]).map((v) => sqlValue(v));
+        return sql`${columnRef} IN (${sql.join(items, sql`, `)})`;
+      }
+      throw new Error('Value must be array for "in" operator');
+    case 'notIn':
+      if (Array.isArray(value)) {
+        // Empty NOT IN matches everything; otherwise an explicit NOT IN list
+        // for the same reason as `in` above.
+        if (value.length === 0) return sql`TRUE`;
+        const items = (value as unknown[]).map((v) => sqlValue(v));
+        return sql`${columnRef} NOT IN (${sql.join(items, sql`, `)})`;
+      }
+      throw new Error('Value must be array for "notIn" operator');
+    case 'hasAny':
+      if (Array.isArray(value)) {
+        return sql`${columnRef} && ${value}`;
+      }
+      throw new Error('Value must be array for "hasAny" operator');
+    case 'hasAll':
+      if (Array.isArray(value)) {
+        return sql`${columnRef} @> ${value}`;
+      }
+      throw new Error('Value must be array for "hasAll" operator');
+    case 'isEmpty':
+      return sql`${columnRef} = '{}'::text[]`;
+    case 'isNotEmpty':
+      return sql`${columnRef} != '{}'::text[]`;
+    case 'isNull':
+      return sql`${columnRef} IS NULL`;
+    case 'isNotNull':
+      return sql`${columnRef} IS NOT NULL`;
+    case 'before':
+      return sql`${columnRef} < ${sqlValue(value)}`;
+    case 'after':
+      return sql`${columnRef} > ${sqlValue(value)}`;
+    case 'between':
+      if (typeof value === 'object' && value !== null && 'from' in value && 'to' in value) {
+        return sql`${columnRef} BETWEEN ${sqlValue(value.from)} AND ${sqlValue(value.to)}`;
+      }
+      throw new Error('Value must have from/to for "between" operator');
+    case 'withinLast':
+      if (typeof value === 'object' && value !== null && 'amount' in value && 'unit' in value) {
+        const interval = getIntervalSQL(value.amount, value.unit);
+        return sql`${columnRef} >= NOW() - ${interval}`;
+      }
+      throw new Error('Value must have amount/unit for "withinLast" operator');
+    case 'notWithinLast':
+      if (typeof value === 'object' && value !== null && 'amount' in value && 'unit' in value) {
+        const interval = getIntervalSQL(value.amount, value.unit);
+        return sql`${columnRef} < NOW() - ${interval}`;
+      }
+      throw new Error('Value must have amount/unit for "notWithinLast" operator');
+    default:
+      throw new Error(`Unsupported operator: ${operator}`);
+  }
+}
+
+function getIntervalSQL(amount: number, unit: string): SQL<unknown> {
+  const normalizedAmount = Number(amount);
+  if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
+    throw new Error(`Invalid interval amount: ${amount}`);
+  }
+
+  switch (unit) {
+    case 'minutes':
+      return sql`${normalizedAmount} * INTERVAL '1 minute'`;
+    case 'hours':
+      return sql`${normalizedAmount} * INTERVAL '1 hour'`;
+    case 'days':
+      return sql`${normalizedAmount} * INTERVAL '1 day'`;
+    case 'weeks':
+      return sql`${normalizedAmount} * INTERVAL '1 week'`;
+    case 'months':
+      return sql`${normalizedAmount} * INTERVAL '1 month'`;
+    default:
+      throw new Error(`Invalid time unit: ${unit}`);
+  }
+}
+
+function buildGroupSQL(group: FilterConditionGroup): SQL<unknown> {
+  if (group.conditions.length === 0) {
+    return sql`TRUE`;
+  }
+
+  const conditionSQLs = group.conditions.map(condition => {
+    if ('operator' in condition && (condition.operator === 'AND' || condition.operator === 'OR')) {
+      // It's a nested group
+      return buildGroupSQL(condition as FilterConditionGroup);
+    } else {
+      // It's a single condition
+      return buildConditionSQL(condition as FilterCondition);
+    }
+  });
+
+  if (group.operator === 'AND') {
+    return sql.join(conditionSQLs, sql` AND `);
+  } else {
+    return sql`(${sql.join(conditionSQLs, sql` OR `)})`;
+  }
+}
+
+// ============================================
+// Filter Evaluation Functions
+// ============================================
+
+export interface EvaluateFilterOptions {
+  orgId: string;
+  limit?: number;
+  offset?: number;
+  /**
+   * Site-axis allowlist (auth.allowedSiteIds). When provided (non-null), results
+   * are additionally confined to these sites. RLS does NOT enforce the site
+   * axis, so a site-restricted caller (org scope) MUST pass it — otherwise the
+   * preview returns the whole org's devices regardless of site restriction.
+   * Omit/null = unrestricted (system/partner scope and the dynamic-group /
+   * deployment / automation back-ends, which run with no per-user site scope).
+   * Empty array = caller has no accessible sites → matches nothing.
+   * (#sec-review-1)
+   */
+  allowedSiteIds?: string[] | null;
+  /**
+   * Exact-device allowlist (`auth.allowedDeviceIds`), the axis that actually
+   * bounds a preconfigured agent run (#6096). Independent of
+   * `allowedSiteIds`: a device-bound run shares its site with every sibling
+   * device, and a device-LESS analysis run carries this axis with no site
+   * axis at all. `undefined`/`null` means unrestricted; `[]` matches nothing.
+   */
+  allowedDeviceIds?: readonly string[] | null;
+}
+
+/**
+ * Optional site-axis predicate for the devices query. See
+ * EvaluateFilterOptions.allowedSiteIds.
+ */
+function siteScopeCondition(allowedSiteIds: string[] | null | undefined): SQL | undefined {
+  if (allowedSiteIds == null) return undefined;
+  if (allowedSiteIds.length === 0) return sql`false`;
+  return inArray(devices.siteId, allowedSiteIds);
+}
+
+/**
+ * Exact-device counterpart of {@link siteScopeCondition}. Same null/empty
+ * semantics: absent means unrestricted, `[]` matches nothing.
+ */
+function deviceIdScopeCondition(allowedDeviceIds: readonly string[] | null | undefined): SQL | undefined {
+  if (allowedDeviceIds == null) return undefined;
+  if (allowedDeviceIds.length === 0) return sql`false`;
+  return inArray(devices.id, [...allowedDeviceIds]);
+}
+
+// The `matches` operator emits a Postgres regex (`~`). `MAX_REGEX_PATTERN_LENGTH`
+// bounds the pattern's *size*, but not catastrophic backtracking — `(a+)+$` is six
+// characters and still pathological — so a crafted short pattern could otherwise
+// pin a worker (ReDoS). This caps the *execution time* of any filter query with a
+// transaction-local statement_timeout, which the length cap cannot do on its own.
+const FILTER_QUERY_TIMEOUT_MS = 500;
+
+type FilterQueryTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * The bounded `statement_timeout` above cancelled the filter query (SQLSTATE
+ * 57014). That is the guard working as designed — the filter is valid, it is
+ * just too expensive — so callers translate this into a 4xx telling the user
+ * to narrow it, never the 500 a raw `PostgresError` used to produce (#5181 /
+ * BREEZE-2C). Any other SQLSTATE propagates untouched and keeps its 500.
+ */
+export class FilterQueryTimeoutError extends Error {
+  /**
+   * NOT named `code`. `pgErrorCode` (utils/pgErrors.ts) duck-types any error
+   * with a string `.code`, checking the OUTER object before walking `.cause` —
+   * so a `code` field here would shadow the real SQLSTATE sitting on the cause
+   * and make `sentry.ts` tag the event `pg_code: 'filter_query_timeout'`
+   * instead of `'57014'`, defeating the SQLSTATE grouping that tag exists for.
+   * Any error class that wraps a Postgres error as its cause has to avoid the
+   * name.
+   */
+  readonly errorCode = 'filter_query_timeout';
+  constructor(options?: { cause?: unknown }) {
+    super('Filter query exceeded its time budget', options);
+  }
+}
+
+/**
+ * Run a filter query under a bounded statement_timeout. Uses `db.transaction` so
+ * the timeout applies whether the caller is inside the request's RLS transaction
+ * (a SAVEPOINT that inherits the tenant GUCs) or on the bare connection pool (the
+ * AI-fleet tool path runs outside the request db context). The DB role and RLS
+ * posture are identical to running the query directly — this only adds the bound.
+ * Queries MUST run on the passed `tx` (not the `db` proxy) so they execute inside
+ * the transaction where the timeout is set.
+ */
+async function withFilterStatementTimeout<T>(
+  run: (tx: FilterQueryTx) => Promise<T>
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    const previousResult = await tx.execute(
+      sql`select current_setting('statement_timeout', true) as value`
+    );
+    const previousRow = (Array.isArray(previousResult)
+      ? previousResult[0]
+      : (previousResult as unknown as { rows: Array<{ value: string | null }> }).rows[0]
+    ) as { value: string | null } | undefined;
+    // `statement_timeout` is a built-in setting, so PostgreSQL normally returns
+    // `0` when no timeout is configured. Keep the fallback for pool/session
+    // configurations that surface an empty value.
+    const previousTimeout = previousRow?.value || '0';
+    await tx.execute(
+      sql`select set_config('statement_timeout', ${`${FILTER_QUERY_TIMEOUT_MS}ms`}, true)`
+    );
+    try {
+      // Isolate a timed-out filter statement in its own savepoint. PostgreSQL
+      // rejects all commands after a statement error until that savepoint is
+      // rolled back, including the restoration in `finally` below.
+      return await tx.transaction((queryTx) => run(queryTx));
+    } catch (error) {
+      // Anything that is not a cancellation — a bad column, a lock error, a
+      // dropped connection — is a real fault and keeps its existing 500 path.
+      //
+      // 57014 is `query_canceled`, and this function's own 500ms
+      // `statement_timeout` is NOT its only source: `pg_cancel_backend()` and a
+      // hot-standby recovery conflict raise it too. Discriminating further
+      // would mean matching the driver's message text, which is localized by
+      // `lc_messages` and so would silently stop matching on a differently
+      // configured deployment — worse than the imprecision. The imprecision is
+      // bounded and acceptable here: the window is 500ms wide, the caller's
+      // worst case is being told to narrow a filter that was actually
+      // cancelled by an operator, and the event code's registry entry records
+      // this caveat so triage does not read the warning as proof of a slow
+      // filter. What it must never do is silently swallow a genuine fault, and
+      // it does not — every other SQLSTATE still propagates untouched.
+      if (pgErrorCode(error) === '57014') throw new FilterQueryTimeoutError({ cause: error });
+      throw error;
+    } finally {
+      await tx.execute(
+        sql`select set_config('statement_timeout', ${previousTimeout}, true)`
+      );
+    }
+  });
+}
+
+/**
+ * Evaluate a filter and return matching device IDs
+ */
+export async function evaluateFilter(
+  filter: FilterConditionGroup,
+  options: EvaluateFilterOptions
+): Promise<FilterEvaluationResult> {
+  const { orgId, limit, offset } = options;
+  const siteScope = siteScopeCondition(options.allowedSiteIds);
+  const deviceScope = deviceIdScopeCondition(options.allowedDeviceIds);
+
+  // Determine which tables we need to join
+  const fieldsUsed = extractFieldsFromFilter(filter);
+  const needsHardwareJoin = fieldsUsed.some(f => f.startsWith('hardware.'));
+  const needsNetworkJoin = fieldsUsed.some(f => f.startsWith('network.'));
+  const needsMetricsJoin = fieldsUsed.some(f => f.startsWith('metrics.'));
+  const needsSoftwareJoin = fieldsUsed.some(f => f.startsWith('software.'));
+  const needsGroupsJoin = fieldsUsed.includes('groupId');
+
+  // Build the WHERE clause
+  const filterSQL = buildGroupSQL(filter);
+
+  // Note: In a real implementation, we'd add the joins here
+  // For now, we'll handle simple device-table-only queries
+  // isEphemeral=false on every evaluation/preview query: Quick Support devices
+  // are reachable via accessibleOrgIds by design, and must never be swept into
+  // a dynamic device group.
+  const results = await withFilterStatementTimeout(async (tx) =>
+    tx
+      .select({ id: devices.id })
+      .from(devices)
+      .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), siteScope, deviceScope, filterSQL))
+  );
+
+  return {
+    deviceIds: results.map(r => r.id),
+    totalCount: results.length,
+    evaluatedAt: new Date()
+  };
+}
+
+/**
+ * Evaluate a filter and return preview results with device details
+ */
+export async function evaluateFilterWithPreview(
+  filter: FilterConditionGroup,
+  options: EvaluateFilterOptions & { previewLimit?: number }
+): Promise<FilterPreviewResult> {
+  const { orgId, previewLimit = 10 } = options;
+  const siteScope = siteScopeCondition(options.allowedSiteIds);
+  const deviceScope = deviceIdScopeCondition(options.allowedDeviceIds);
+
+  const filterSQL = buildGroupSQL(filter);
+
+  const { countResult, previewDevices } = await withFilterStatementTimeout(async (tx) => {
+    // Get count first
+    const [countResult] = await tx
+      .select({ count: sql<number>`count(*)` })
+      .from(devices)
+      .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), siteScope, deviceScope, filterSQL));
+
+    // Get preview devices
+    const previewDevices = await tx
+      .select({
+        id: devices.id,
+        hostname: devices.hostname,
+        displayName: devices.displayName,
+        osType: devices.osType,
+        status: devices.status,
+        lastSeenAt: devices.lastSeenAt
+      })
+      .from(devices)
+      .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), siteScope, deviceScope, filterSQL))
+      .limit(previewLimit);
+
+    return { countResult, previewDevices };
+  });
+
+  return {
+    totalCount: Number(countResult?.count ?? 0),
+    devices: previewDevices.map(d => ({
+      id: d.id,
+      hostname: d.hostname,
+      displayName: d.displayName,
+      osType: d.osType,
+      status: d.status,
+      lastSeenAt: d.lastSeenAt
+    })),
+    evaluatedAt: new Date()
+  };
+}
+
+/**
+ * Check if a single device matches a filter
+ */
+export async function deviceMatchesFilter(
+  deviceId: string,
+  filter: FilterConditionGroup
+): Promise<boolean> {
+  const filterSQL = buildGroupSQL(filter);
+
+  const [result] = await withFilterStatementTimeout(async (tx) =>
+    tx
+      .select({ id: devices.id })
+      .from(devices)
+      .where(and(eq(devices.id, deviceId), filterSQL))
+      .limit(1)
+  );
+
+  return Boolean(result);
+}
+
+/**
+ * Extract all field keys used in a filter (for optimization)
+ */
+export function extractFieldsFromFilter(filter: FilterConditionGroup | FilterCondition): string[] {
+  const fields: string[] = [];
+
+  if ('conditions' in filter) {
+    // It's a group
+    for (const condition of filter.conditions) {
+      fields.push(...extractFieldsFromFilter(condition as FilterConditionGroup | FilterCondition));
+    }
+  } else if ('field' in filter) {
+    // It's a single condition
+    fields.push(filter.field);
+  }
+
+  return [...new Set(fields)]; // Remove duplicates
+}
+
+/**
+ * Validate a filter structure
+ */
+export function validateFilter(filter: FilterConditionGroup | FilterCondition): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+
+  if ('conditions' in filter) {
+    // Validate group
+    if (!['AND', 'OR'].includes(filter.operator)) {
+      errors.push(`Invalid group operator: ${filter.operator}`);
+    }
+    if (!Array.isArray(filter.conditions) || filter.conditions.length === 0) {
+      errors.push('Group must have at least one condition');
+    }
+
+    // Validate nested conditions
+    for (const condition of filter.conditions) {
+      const nested = validateFilter(condition as FilterConditionGroup | FilterCondition);
+      errors.push(...nested.errors);
+    }
+  } else if ('field' in filter) {
+    // Validate single condition
+    const fieldDef = getFieldDefinition(filter.field);
+    if (filter.field.startsWith('custom.') && !getCustomFieldKey(filter.field)) {
+      errors.push(`Invalid custom field key: ${filter.field}`);
+    }
+    if (!fieldDef && !filter.field.startsWith('custom.')) {
+      errors.push(`Unknown field: ${filter.field}`);
+    }
+    if (fieldDef && !fieldDef.operators.includes(filter.operator)) {
+      errors.push(`Operator ${filter.operator} not valid for field ${filter.field}`);
+    }
+    if (
+      filter.operator === 'matches' &&
+      typeof filter.value === 'string' &&
+      filter.value.length > MAX_REGEX_PATTERN_LENGTH
+    ) {
+      errors.push(`Regex pattern too long for field ${filter.field} (max ${MAX_REGEX_PATTERN_LENGTH} characters)`);
+    }
+  } else {
+    errors.push('Invalid filter structure');
+  }
+
+  return { valid: errors.length === 0, errors };
+}

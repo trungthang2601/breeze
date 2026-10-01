@@ -1,0 +1,67 @@
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { zValidator } from '../../lib/validation';
+import { eq } from 'drizzle-orm';
+import { db } from '../../db';
+import { devices } from '../../db/schema';
+import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { executeCommand, CommandTypes } from '../../services/commandQueue';
+import { canAccessSite, PERMISSIONS, type UserPermissions } from '../../services/permissions';
+import { resolveScopedOrgId } from './helpers';
+
+const deviceIdParamSchema = z.object({
+  deviceId: z.string().guid(),
+});
+
+export const vssRoutes = new Hono();
+
+vssRoutes.get(
+  '/status/:deviceId',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  requireMfa(),
+  zValidator('param', deviceIdParamSchema),
+  async (c) => {
+  const auth = c.get('auth');
+  const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
+  if (!orgId) {
+    return c.json({ error: 'orgId is required for this scope' }, 400);
+  }
+
+  const { deviceId } = c.req.valid('param');
+
+  const [device] = await db
+    .select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) {
+    return c.json({ error: 'Device not found' }, 404);
+  }
+
+  if (device.orgId !== orgId) {
+    return c.json({ error: 'Device not found' }, 404);
+  }
+
+  const permissions = c.get('permissions') as UserPermissions | undefined;
+  if (permissions?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(permissions, device.siteId))) {
+    return c.json({ error: 'Access to this site denied' }, 403);
+  }
+
+  const result = await executeCommand(deviceId, CommandTypes.VSS_WRITER_LIST, {}, {
+    userId: auth?.user?.id,
+    timeoutMs: 30000,
+  });
+
+  if (result.status === 'failed') {
+    return c.json({ error: result.error || 'Failed to get VSS status' }, 500);
+  }
+
+  try {
+    const data = result.stdout ? JSON.parse(result.stdout) : null;
+    return c.json({ data });
+  } catch {
+    return c.json({ data: result.stdout });
+  }
+});

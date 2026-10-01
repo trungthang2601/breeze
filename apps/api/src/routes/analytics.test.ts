@@ -1,0 +1,1440 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+
+const ORG_ID = '11111111-1111-1111-1111-111111111111';
+const USER_ID = '11111111-1111-1111-1111-111111111112';
+
+// Site-scope test fixtures. allowedSiteIds restricts the caller to SITE_ALLOWED.
+const SITE_ALLOWED = '22222222-2222-2222-2222-222222222221';
+const SITE_DENIED = '22222222-2222-2222-2222-222222222222';
+const DEVICE_IN_SCOPE = '33333333-3333-3333-3333-333333333331';
+const DEVICE_OUT_OF_SCOPE = '33333333-3333-3333-3333-333333333332';
+
+// Mutable holder so individual tests can flip the caller's site restriction.
+// The authMiddleware mock reads this when setting c.get('permissions').
+let currentPermissions: { allowedSiteIds?: string[] } | undefined;
+
+vi.mock('drizzle-orm', () => {
+  const sql = (strings: TemplateStringsArray, ...values: unknown[]) => ({
+    strings,
+    values,
+    as: (alias: string) => ({ strings, values, alias })
+  });
+
+  return {
+    and: (...conditions: unknown[]) => ({ type: 'and', conditions }),
+    eq: (left: unknown, right: unknown) => ({ type: 'eq', left, right }),
+    gte: (left: unknown, right: unknown) => ({ type: 'gte', left, right }),
+    lte: (left: unknown, right: unknown) => ({ type: 'lte', left, right }),
+    ne: (left: unknown, right: unknown) => ({ type: 'ne', left, right }),
+    inArray: (left: unknown, right: unknown[]) => ({ type: 'inArray', left, right }),
+    isNull: (column: unknown) => ({ type: 'isNull', column }),
+    or: (...conditions: unknown[]) => ({ type: 'or', conditions }),
+    desc: (column: unknown) => ({ type: 'desc', column }),
+    sql
+  };
+});
+
+vi.mock('../services/auditEvents', () => ({
+  writeRouteAudit: vi.fn()
+}));
+
+vi.mock('../services/permissions', () => ({
+  PERMISSIONS: {
+    DEVICES_READ: { resource: 'devices', action: 'read' },
+    ORGS_WRITE: { resource: 'orgs', action: 'write' }
+  },
+  // Faithful to the real implementation: unrestricted callers (no
+  // allowedSiteIds) always pass; restricted callers pass only for listed sites.
+  canAccessSite: (perms: any, siteId: string) =>
+    !perms?.allowedSiteIds || perms.allowedSiteIds.includes(siteId)
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      scope: 'organization',
+      orgId: ORG_ID,
+      accessibleOrgIds: [ORG_ID],
+      canAccessOrg: (id: string) => id === ORG_ID,
+      orgCondition: () => undefined,
+      user: { id: USER_ID, email: 'test@example.com', name: 'Test User' },
+    });
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+}));
+
+vi.mock('../db', () => {
+  const createChain = (result: unknown = []) => {
+    const chain: Record<string, any> = {};
+    const methods = [
+      'from',
+      'where',
+      'leftJoin',
+      'innerJoin',
+      'groupBy',
+      'orderBy',
+      'limit',
+      'offset',
+      'values',
+      'set',
+      'returning'
+    ];
+
+    for (const method of methods) {
+      chain[method] = vi.fn(() => chain);
+    }
+
+    chain.then = (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+      Promise.resolve(result).then(onFulfilled, onRejected);
+
+    return chain;
+  };
+
+  return {
+    db: {
+      select: vi.fn(() => createChain([])),
+      insert: vi.fn(() => createChain([])),
+      update: vi.fn(() => createChain([])),
+      delete: vi.fn(() => createChain([]))
+    },
+    runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+    withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+    withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  };
+});
+
+vi.mock('../db/schema', () => ({
+  analyticsDashboards: {
+    id: 'analyticsDashboards.id',
+    orgId: 'analyticsDashboards.orgId',
+    name: 'analyticsDashboards.name',
+    description: 'analyticsDashboards.description',
+    isDefault: 'analyticsDashboards.isDefault',
+    isSystem: 'analyticsDashboards.isSystem',
+    layout: 'analyticsDashboards.layout',
+    createdBy: 'analyticsDashboards.createdBy',
+    createdAt: 'analyticsDashboards.createdAt',
+    updatedAt: 'analyticsDashboards.updatedAt'
+  },
+  dashboardWidgets: {
+    id: 'dashboardWidgets.id',
+    dashboardId: 'dashboardWidgets.dashboardId',
+    widgetType: 'dashboardWidgets.widgetType',
+    title: 'dashboardWidgets.title',
+    dataSource: 'dashboardWidgets.dataSource',
+    chartType: 'dashboardWidgets.chartType',
+    visualization: 'dashboardWidgets.visualization',
+    position: 'dashboardWidgets.position',
+    refreshInterval: 'dashboardWidgets.refreshInterval',
+    createdAt: 'dashboardWidgets.createdAt',
+    updatedAt: 'dashboardWidgets.updatedAt'
+  },
+  capacityPredictions: {
+    orgId: 'capacityPredictions.orgId',
+    deviceId: 'capacityPredictions.deviceId',
+    metricType: 'capacityPredictions.metricType',
+    metricName: 'capacityPredictions.metricName',
+    currentValue: 'capacityPredictions.currentValue',
+    predictedValue: 'capacityPredictions.predictedValue',
+    predictionDate: 'capacityPredictions.predictionDate',
+    growthRate: 'capacityPredictions.growthRate'
+  },
+  capacityThresholds: {
+    orgId: 'capacityThresholds.orgId',
+    metricType: 'capacityThresholds.metricType',
+    metricName: 'capacityThresholds.metricName',
+    warningThreshold: 'capacityThresholds.warningThreshold',
+    criticalThreshold: 'capacityThresholds.criticalThreshold'
+  },
+  deviceMetrics: {
+    timestamp: 'deviceMetrics.timestamp',
+    deviceId: 'deviceMetrics.deviceId',
+    cpuPercent: 'deviceMetrics.cpuPercent',
+    ramPercent: 'deviceMetrics.ramPercent',
+    diskPercent: 'deviceMetrics.diskPercent',
+    networkInBytes: 'deviceMetrics.networkInBytes',
+    networkOutBytes: 'deviceMetrics.networkOutBytes',
+    bandwidthInBps: 'deviceMetrics.bandwidthInBps',
+    processCount: 'deviceMetrics.processCount'
+  },
+  metricRollups: {
+    orgId: 'metricRollups.orgId',
+    sourceTable: 'metricRollups.sourceTable',
+    deviceId: 'metricRollups.deviceId',
+    metricName: 'metricRollups.metricName',
+    bucketStart: 'metricRollups.bucketStart',
+    bucketSeconds: 'metricRollups.bucketSeconds',
+    avgValue: 'metricRollups.avgValue',
+    minValue: 'metricRollups.minValue',
+    maxValue: 'metricRollups.maxValue',
+    sampleCount: 'metricRollups.sampleCount'
+  },
+  metricAnomalies: {
+    id: 'metricAnomalies.id',
+    orgId: 'metricAnomalies.orgId',
+    deviceId: 'metricAnomalies.deviceId',
+    sourceTable: 'metricAnomalies.sourceTable',
+    metricName: 'metricAnomalies.metricName',
+    anomalyType: 'metricAnomalies.anomalyType',
+    bucketSeconds: 'metricAnomalies.bucketSeconds',
+    windowStart: 'metricAnomalies.windowStart',
+    status: 'metricAnomalies.status',
+    detectedAt: 'metricAnomalies.detectedAt'
+  },
+  metricAnomalyCandidates: {
+    id: 'metricAnomalyCandidates.id',
+    orgId: 'metricAnomalyCandidates.orgId',
+    deviceId: 'metricAnomalyCandidates.deviceId',
+    sourceTable: 'metricAnomalyCandidates.sourceTable',
+    metricName: 'metricAnomalyCandidates.metricName',
+    anomalyType: 'metricAnomalyCandidates.anomalyType',
+    bucketSeconds: 'metricAnomalyCandidates.bucketSeconds',
+    windowStart: 'metricAnomalyCandidates.windowStart',
+    detectedAt: 'metricAnomalyCandidates.detectedAt',
+    modelVersion: 'metricAnomalyCandidates.modelVersion'
+  },
+  mlFeedbackEvents: {
+    orgId: 'mlFeedbackEvents.orgId',
+    sourceType: 'mlFeedbackEvents.sourceType',
+    sourceId: 'mlFeedbackEvents.sourceId',
+    eventType: 'mlFeedbackEvents.eventType',
+    occurredAt: 'mlFeedbackEvents.occurredAt'
+  },
+  metricAnomalyEpisodes: {
+    id: 'metricAnomalyEpisodes.id',
+    orgId: 'metricAnomalyEpisodes.orgId',
+    deviceId: 'metricAnomalyEpisodes.deviceId',
+    status: 'metricAnomalyEpisodes.status',
+    closeReason: 'metricAnomalyEpisodes.closeReason',
+    firstSeenAt: 'metricAnomalyEpisodes.firstSeenAt',
+    resolvedAt: 'metricAnomalyEpisodes.resolvedAt',
+    recurrenceCount: 'metricAnomalyEpisodes.recurrenceCount',
+    linkedAlertId: 'metricAnomalyEpisodes.linkedAlertId'
+  },
+  devices: {
+    id: 'devices.id',
+    orgId: 'devices.orgId',
+    siteId: 'devices.siteId',
+    status: 'devices.status',
+    enrolledAt: 'devices.enrolledAt',
+    lastSeenAt: 'devices.lastSeenAt',
+    osType: 'devices.osType',
+    osVersion: 'devices.osVersion'
+  },
+  slaDefinitions: {
+    id: 'slaDefinitions.id',
+    orgId: 'slaDefinitions.orgId',
+    name: 'slaDefinitions.name',
+    uptimeTarget: 'slaDefinitions.uptimeTarget',
+    updatedAt: 'slaDefinitions.updatedAt'
+  },
+  slaCompliance: {
+    slaId: 'slaCompliance.slaId',
+    orgId: 'slaCompliance.orgId',
+    periodEnd: 'slaCompliance.periodEnd'
+  }
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      scope: 'organization',
+      orgId: '11111111-1111-1111-1111-111111111111',
+      partnerId: null,
+      user: { id: '11111111-1111-1111-1111-111111111112', email: 'test@example.com' },
+      accessibleOrgIds: ['11111111-1111-1111-1111-111111111111'],
+      canAccessOrg: (orgId: string) => orgId === '11111111-1111-1111-1111-111111111111',
+      orgCondition: vi.fn((column: unknown) => ({ column, orgId: '11111111-1111-1111-1111-111111111111' }))
+    });
+
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
+  requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+}));
+
+import { db } from '../db';
+import { analyticsDashboards, dashboardWidgets } from '../db/schema';
+import { authMiddleware } from '../middleware/auth';
+import { analyticsRoutes } from './analytics';
+
+function createChain(result: unknown = []) {
+  const chain: Record<string, any> = {};
+  const methods = [
+    'from',
+    'where',
+    'leftJoin',
+    'innerJoin',
+    'groupBy',
+    'orderBy',
+    'limit',
+    'offset',
+    'values',
+    'set',
+    'returning'
+  ];
+
+  for (const method of methods) {
+    chain[method] = vi.fn(() => chain);
+  }
+
+  chain.then = (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+    Promise.resolve(result).then(onFulfilled, onRejected);
+
+  return chain;
+}
+
+function mockSelectOnce(result: unknown) {
+  return vi.mocked(db.select).mockImplementationOnce(() => createChain(result) as any);
+}
+
+function mockInsertOnce(result: unknown) {
+  const chain = createChain(result);
+  vi.mocked(db.insert).mockImplementationOnce(() => chain as any);
+  return chain;
+}
+
+function mockUpdateOnce(result: unknown) {
+  const chain = createChain(result);
+  vi.mocked(db.update).mockImplementationOnce(() => chain as any);
+  return chain;
+}
+
+function mockDeleteOnce(result: unknown) {
+  const chain = createChain(result);
+  vi.mocked(db.delete).mockImplementationOnce(() => chain as any);
+  return chain;
+}
+
+describe('analytics routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    currentPermissions = undefined;
+
+    vi.mocked(authMiddleware).mockImplementation((c: any, next: any) => {
+      c.set('auth', {
+        scope: 'organization',
+        orgId: ORG_ID,
+        partnerId: null,
+        user: { id: USER_ID, email: 'test@example.com' },
+        accessibleOrgIds: [ORG_ID],
+        canAccessOrg: (orgId: string) => orgId === ORG_ID,
+        orgCondition: vi.fn((column: unknown) => ({ column, orgId: ORG_ID }))
+      });
+      c.set('permissions', currentPermissions);
+
+      return next();
+    });
+
+    app = new Hono();
+    app.route('/analytics', analyticsRoutes);
+  });
+
+  describe('POST /analytics/query', () => {
+    it('should return metric series with requested aggregation', async () => {
+      const res = await app.request('/analytics/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceIds: [ORG_ID],
+          metricTypes: ['cpu_usage'],
+          startTime: '2024-01-01T00:00:00Z',
+          endTime: '2024-01-02T00:00:00Z',
+          aggregation: 'p95',
+          interval: 'hour'
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.query.aggregation).toBe('p95');
+      expect(body.series).toHaveLength(1);
+      expect(body.series[0].metricType).toBe('cpu_usage');
+      expect(body.series[0].data).toEqual([]);
+    });
+
+    it('uses metric rollups for hourly averages when available', async () => {
+      mockSelectOnce([
+        { bucket: new Date('2026-06-18T12:00:00.000Z'), value: 42.5 },
+      ]);
+
+      const res = await app.request('/analytics/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceIds: [DEVICE_IN_SCOPE],
+          metricTypes: ['cpu_usage'],
+          startTime: '2026-06-18T00:00:00Z',
+          endTime: '2026-06-19T00:00:00Z',
+          aggregation: 'avg',
+          interval: 'hour'
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.series[0].data).toEqual([
+        { timestamp: '2026-06-18T12:00:00.000Z', value: 42.5 },
+      ]);
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to raw metrics when hourly rollups are empty', async () => {
+      mockSelectOnce([]); // metric_rollups
+      mockSelectOnce([
+        { bucket: new Date('2026-06-18T12:00:00.000Z'), value: 37 },
+      ]); // raw device_metrics
+
+      const res = await app.request('/analytics/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceIds: [DEVICE_IN_SCOPE],
+          metricTypes: ['cpu_usage'],
+          startTime: '2026-06-18T00:00:00Z',
+          endTime: '2026-06-19T00:00:00Z',
+          aggregation: 'avg',
+          interval: 'hour'
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.series[0].data).toEqual([
+        { timestamp: '2026-06-18T12:00:00.000Z', value: 37 },
+      ]);
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(2);
+    });
+
+    it('uses metric rollup sample counts for daily count aggregation', async () => {
+      mockSelectOnce([
+        { bucket: new Date('2026-06-18T00:00:00.000Z'), value: 15 },
+      ]);
+
+      const res = await app.request('/analytics/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceIds: [DEVICE_IN_SCOPE],
+          metricTypes: ['memory_usage'],
+          startTime: '2026-06-18T00:00:00Z',
+          endTime: '2026-06-19T00:00:00Z',
+          aggregation: 'count',
+          interval: 'day'
+        })
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.series[0].data).toEqual([
+        { timestamp: '2026-06-18T00:00:00.000Z', value: 15 },
+      ]);
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(1);
+    });
+
+    it('should validate required fields', async () => {
+      const res = await app.request('/analytics/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceIds: [],
+          metricTypes: ['cpu_usage'],
+          startTime: '2024-01-01T00:00:00Z',
+          endTime: '2024-01-02T00:00:00Z',
+          aggregation: 'avg',
+          interval: 'hour'
+        })
+      });
+
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe('GET /analytics/capacity', () => {
+    it('should return stored predictions when available', async () => {
+      mockSelectOnce([
+        {
+          metricName: 'disk_used_percent',
+          currentValue: 72,
+          predictedValue: 76,
+          predictionDate: new Date('2026-02-01T00:00:00.000Z'),
+          growthRate: 1.5
+        }
+      ]);
+      mockSelectOnce([
+        {
+          warningThreshold: 80,
+          criticalThreshold: 90
+        }
+      ]);
+
+      const res = await app.request(
+        `/analytics/capacity?deviceId=${ORG_ID}&metricType=disk`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } }
+      );
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.currentValue).toBe(72);
+      expect(body.predictions).toHaveLength(1);
+      expect(body.predictions[0].value).toBe(76);
+      expect(body.thresholds).toEqual({ warning: 80, critical: 90 });
+    });
+
+    it('uses daily metric rollups before falling back to raw device metrics', async () => {
+      mockSelectOnce([]); // stored predictions empty
+      mockSelectOnce([
+        { timestamp: new Date('2026-06-17T00:00:00.000Z'), value: 10 },
+        { timestamp: new Date('2026-06-18T00:00:00.000Z'), value: 20 },
+      ]); // metric_rollups aggregate
+
+      const res = await app.request('/analytics/capacity?metricType=disk', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.currentValue).toBe(20);
+      expect(body.predictions[0]).toMatchObject({
+        timestamp: '2026-06-17T00:00:00.000Z',
+        value: 10,
+      });
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('GET /analytics/anomalies/evaluation', () => {
+    // This file's `drizzle-orm` mock (top of file) makes `sql` a plain tag
+    // function returning `{ strings, values }` (the raw template pieces), not a
+    // real drizzle SQL/queryChunks object. Interleave them back into one string.
+    // Mocked schema columns are plain strings (e.g. 'metricAnomalyEpisodes.closeReason'),
+    // so this asserts the semantic SQL text (which columns, which operators),
+    // not exact DB identifier spelling.
+    function sqlText(fragment: unknown): string {
+      const { strings, values } = (fragment ?? {}) as { strings?: string[]; values?: unknown[] };
+      if (!strings) return '';
+      let out = strings[0] ?? '';
+      (values ?? []).forEach((value, i) => {
+        out += String(value) + (strings[i + 1] ?? '');
+      });
+      return out;
+    }
+
+    it('returns anomaly status rates and lifecycle feedback counts', async () => {
+      mockSelectOnce([
+        { status: 'open', count: 4 },
+        { status: 'dismissed', count: 3 },
+        { status: 'promoted', count: 2 },
+        { status: 'resolved', count: 1 },
+        { status: 'cleared', count: 5 },
+      ]);
+      mockSelectOnce([
+        { eventType: 'anomaly.dismissed', count: 2 },
+        { eventType: 'anomaly.promoted', count: 1 },
+        { eventType: 'anomaly.resolved', count: 1 },
+      ]);
+      mockSelectOnce([
+        { status: 'open', closeReason: null, count: 3 },
+        { status: 'resolved', closeReason: 'cleared', count: 2 },
+        { status: 'dismissed', closeReason: 'user', count: 1 },
+      ]);
+      mockSelectOnce([
+        { total: 6, recurring: 2, labelEligibleClosed: 3, humanLabelled: 1, medianDurationSeconds: 900 },
+      ]);
+
+      const res = await app.request('/analytics/anomalies/evaluation?range=30d', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // cleared is excluded from the human-label denominator (total) and rates,
+      // but still reported as its own count.
+      expect(body.total).toBe(10);
+      expect(body.status).toEqual({ open: 4, dismissed: 3, promoted: 2, resolved: 1, cleared: 5 });
+      expect(body.rates).toEqual({ dismissRate: 0.3, promoteRate: 0.2, resolveRate: 0.1 });
+      expect(body.feedback).toEqual({ total: 4, dismissed: 2, promoted: 1, resolved: 1 });
+      expect(body.window.range).toBe('30d');
+      expect(body.orgId).toBe(ORG_ID);
+      expect(body.episodes).toEqual({
+        total: 6,
+        byStatus: { open: 3, resolved: 2, dismissed: 1 },
+        byCloseReason: { cleared: 2, expired_offline: 0, expired_no_data: 0, detection_off: 0, user: 1, snoozed: 0 },
+        medianDurationSeconds: 900,
+        recurrenceShare: 2 / 6,
+        humanLabelledShare: 1 / 3,
+      });
+    });
+
+    it('humanLabelledShare counts promoted episodes and excludes snoozed successors (second quorum A8)', async () => {
+      mockSelectOnce([]);
+      mockSelectOnce([]);
+      mockSelectOnce([]);
+      mockSelectOnce([{ total: 0, recurring: 0, labelEligibleClosed: 0, humanLabelled: 0, medianDurationSeconds: null }]);
+
+      await app.request('/analytics/anomalies/evaluation?range=7d', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      const agg = vi.mocked(db.select).mock.calls[3]![0] as Record<string, unknown>;
+      expect(sqlText(agg.labelEligibleClosed)).toContain(
+        "status <> 'open' and metricAnomalyEpisodes.closeReason is distinct from 'snoozed'",
+      );
+      expect(sqlText(agg.humanLabelled)).toContain(
+        "(metricAnomalyEpisodes.closeReason = 'user' or metricAnomalyEpisodes.linkedAlertId is not null)",
+      );
+      expect(sqlText(agg.humanLabelled)).toContain(
+        "metricAnomalyEpisodes.closeReason is distinct from 'snoozed'",
+      );
+    });
+
+    it('returns zero rates when no anomalies match', async () => {
+      mockSelectOnce([]);
+      mockSelectOnce([]);
+      mockSelectOnce([]);
+      mockSelectOnce([{ total: 0, recurring: 0, labelEligibleClosed: 0, humanLabelled: 0, medianDurationSeconds: null }]);
+
+      const res = await app.request('/analytics/anomalies/evaluation?range=7d', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.total).toBe(0);
+      expect(body.rates).toEqual({ dismissRate: 0, promoteRate: 0, resolveRate: 0 });
+      expect(body.feedback.total).toBe(0);
+      expect(body.episodes).toEqual({
+        total: 0,
+        byStatus: { open: 0, resolved: 0, dismissed: 0 },
+        byCloseReason: { cleared: 0, expired_offline: 0, expired_no_data: 0, detection_off: 0, user: 0, snoozed: 0 },
+        medianDurationSeconds: null,
+        recurrenceShare: 0,
+        humanLabelledShare: 0,
+      });
+    });
+
+    it('includes v1 shadow comparison only when requested', async () => {
+      mockSelectOnce([
+        { status: 'open', count: 4 },
+        { status: 'dismissed', count: 1 },
+      ]);
+      mockSelectOnce([
+        { eventType: 'anomaly.dismissed', count: 1 },
+      ]);
+      mockSelectOnce([]); // episode group rows
+      mockSelectOnce([{ total: 0, recurring: 0, labelEligibleClosed: 0, humanLabelled: 0, medianDurationSeconds: null }]); // episode agg
+      mockSelectOnce([{ totalCandidates: 6 }]);
+      mockSelectOnce([{ overlapWithV0: 3 }]);
+      mockSelectOnce([
+        { eventType: 'anomaly.dismissed', count: 2 },
+        { eventType: 'anomaly.promoted', count: 1 },
+      ]);
+
+      const res = await app.request('/analytics/anomalies/evaluation?range=30d&includeV1=true', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.total).toBe(5);
+      expect(body.v1Shadow).toMatchObject({
+        modelVersion: 'metric-anomaly-v1-seasonal-robust',
+        totalCandidates: 6,
+        overlapWithV0: 3,
+        v1Only: 3,
+        v0Only: 2,
+        labeledOutcomes: { total: 3, dismissed: 2, promoted: 1, resolved: 0 },
+      });
+      expect(body.v1Shadow.rates.overlapRate).toBe(0.5);
+      expect(body.v1Shadow.rates.v0OnlyRate).toBe(0.4);
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(7);
+    });
+
+    it('omits v1 shadow and issues no candidate queries by default', async () => {
+      mockSelectOnce([
+        { status: 'open', count: 4 },
+        { status: 'dismissed', count: 1 },
+      ]);
+      mockSelectOnce([
+        { eventType: 'anomaly.dismissed', count: 1 },
+      ]);
+      mockSelectOnce([]); // episode group rows
+      mockSelectOnce([{ total: 0, recurring: 0, labelEligibleClosed: 0, humanLabelled: 0, medianDurationSeconds: null }]); // episode agg
+
+      const res = await app.request('/analytics/anomalies/evaluation?range=30d', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.total).toBe(5);
+      expect(body.v1Shadow).toBeUndefined();
+      // Only the status + feedback + episode selects run — the 3 candidate queries must stay dark.
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(4);
+    });
+
+    it('reports an all-zero v1 shadow block when there are no candidates', async () => {
+      mockSelectOnce([
+        { status: 'open', count: 2 },
+      ]);
+      mockSelectOnce([]);
+      mockSelectOnce([]); // episode group rows
+      mockSelectOnce([{ total: 0, recurring: 0, labelEligibleClosed: 0, humanLabelled: 0, medianDurationSeconds: null }]); // episode agg
+      mockSelectOnce([{ totalCandidates: 0 }]);
+      mockSelectOnce([{ overlapWithV0: 0 }]);
+      mockSelectOnce([]);
+
+      const res = await app.request('/analytics/anomalies/evaluation?range=30d&includeV1=true', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.total).toBe(2);
+      expect(body.v1Shadow).toMatchObject({
+        totalCandidates: 0,
+        overlapWithV0: 0,
+        v1Only: 0,
+        v0Only: 2,
+        labeledOutcomes: { total: 0, dismissed: 0, promoted: 0, resolved: 0 },
+      });
+      // With no candidates but live v0 anomalies, every v0 row is v0-only.
+      expect(body.v1Shadow.rates.v0OnlyRate).toBe(1);
+      expect(body.v1Shadow.rates.overlapRate).toBe(0);
+      expect(body.v1Shadow.rates.v1OnlyRate).toBe(0);
+    });
+  });
+
+  describe('GET /analytics/executive-summary', () => {
+    it('should return summary data for the requested period', async () => {
+      mockSelectOnce([
+        { status: 'online', count: 2 },
+        { status: 'offline', count: 1 }
+      ]);
+      mockSelectOnce([
+        { week: '2026-02-01T00:00:00.000Z', count: 3 }
+      ]);
+
+      const res = await app.request('/analytics/executive-summary?periodType=monthly', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data.periodType).toBe('monthly');
+      expect(body.data.devices).toEqual({ total: 3, online: 2, offline: 1, pending: 0 });
+      expect(body.data.highlights).toEqual([]);
+    });
+
+    it('returns 500 (not a zeroed 200) when the query fails (issue #1608)', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.mocked(db.select).mockImplementationOnce(() => {
+        throw new Error('too many clients already');
+      });
+
+      const res = await app.request('/analytics/executive-summary?periodType=monthly', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body).toEqual({ error: 'Failed to load executive summary' });
+      // The old behavior returned a fully-zeroed success body; assert we no longer do.
+      expect(body.data).toBeUndefined();
+      errSpy.mockRestore();
+    });
+  });
+
+  describe('GET /analytics/os-distribution', () => {
+    it('returns the OS distribution on success', async () => {
+      mockSelectOnce([
+        { osType: 'Windows', osVersion: '11', count: 4 },
+        { osType: 'Linux', osVersion: 'Ubuntu 24.04', count: 1 }
+      ]);
+
+      const res = await app.request('/analytics/os-distribution', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual([
+        { name: 'Windows 11', value: 4 },
+        { name: 'Linux Ubuntu 24.04', value: 1 }
+      ]);
+    });
+
+    it('returns 500 (not an empty 200) when the query fails (issue #1608)', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.mocked(db.select).mockImplementationOnce(() => {
+        throw new Error('query timeout');
+      });
+
+      const res = await app.request('/analytics/os-distribution', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ error: 'Failed to load OS distribution' });
+      errSpy.mockRestore();
+    });
+  });
+
+  describe('dashboards and widgets', () => {
+    it('should create a dashboard, attach widgets, and fetch with joined widgets', async () => {
+      const dashboardRow = {
+        id: 'dashboard-1',
+        orgId: ORG_ID,
+        name: 'Ops Overview',
+        description: 'Ops dashboard',
+        isDefault: false,
+        isSystem: false,
+        layout: { columns: 2 },
+        createdBy: USER_ID,
+        createdAt: new Date('2026-02-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-02-01T00:00:00.000Z')
+      };
+
+      const createDashboardInsert = mockInsertOnce([dashboardRow]);
+
+      const createRes = await app.request('/analytics/dashboards', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Ops Overview',
+          description: 'Ops dashboard',
+          layout: { columns: 2 }
+        })
+      });
+
+      expect(createRes.status).toBe(201);
+      const created = await createRes.json();
+      expect(created.orgId).toBe(ORG_ID);
+      expect(created.widgetIds).toEqual([]);
+      expect(db.insert).toHaveBeenCalledWith(analyticsDashboards);
+      expect(createDashboardInsert.values).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orgId: ORG_ID,
+          name: 'Ops Overview',
+          description: 'Ops dashboard',
+          createdBy: USER_ID
+        })
+      );
+
+      mockSelectOnce([dashboardRow]);
+      const createWidgetInsert = mockInsertOnce([
+        {
+          id: 'widget-1',
+          dashboardId: 'dashboard-1',
+          widgetType: 'chart',
+          title: 'CPU Avg',
+          dataSource: { metric: 'cpu_usage' },
+          chartType: null,
+          visualization: {},
+          position: { x: 0, y: 0, w: 4, h: 3 },
+          refreshInterval: null,
+          createdAt: new Date('2026-02-01T00:00:00.000Z'),
+          updatedAt: new Date('2026-02-01T00:00:00.000Z')
+        }
+      ]);
+      mockUpdateOnce([]);
+
+      const widgetRes = await app.request('/analytics/dashboards/dashboard-1/widgets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'CPU Avg',
+          type: 'chart',
+          config: { metric: 'cpu_usage' },
+          layout: { x: 0, y: 0, w: 4, h: 3 }
+        })
+      });
+
+      expect(widgetRes.status).toBe(201);
+      const widget = await widgetRes.json();
+      expect(widget.dashboardId).toBe('dashboard-1');
+      expect(widget.name).toBe('CPU Avg');
+      expect(widget.type).toBe('chart');
+      expect(widget.config).toEqual({ metric: 'cpu_usage' });
+      expect(createWidgetInsert.values).toHaveBeenCalledWith(
+        expect.objectContaining({
+          dashboardId: 'dashboard-1',
+          title: 'CPU Avg',
+          widgetType: 'chart',
+          dataSource: { metric: 'cpu_usage' },
+          position: { x: 0, y: 0, w: 4, h: 3 }
+        })
+      );
+
+      mockSelectOnce([
+        {
+          dashboardId: 'dashboard-1',
+          orgId: ORG_ID,
+          name: 'Ops Overview',
+          description: 'Ops dashboard',
+          isDefault: false,
+          isSystem: false,
+          layout: { columns: 2 },
+          createdBy: USER_ID,
+          createdAt: new Date('2026-02-01T00:00:00.000Z'),
+          updatedAt: new Date('2026-02-01T00:00:00.000Z'),
+          widgetId: 'widget-1',
+          widgetDashboardId: 'dashboard-1',
+          widgetType: 'chart',
+          widgetTitle: 'CPU Avg',
+          widgetDataSource: { metric: 'cpu_usage' },
+          widgetChartType: null,
+          widgetVisualization: {},
+          widgetPosition: { x: 0, y: 0, w: 4, h: 3 },
+          widgetRefreshInterval: null,
+          widgetCreatedAt: new Date('2026-02-01T00:00:00.000Z'),
+          widgetUpdatedAt: new Date('2026-02-01T00:00:00.000Z')
+        }
+      ]);
+
+      const getRes = await app.request('/analytics/dashboards/dashboard-1', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(getRes.status).toBe(200);
+      const dashboard = await getRes.json();
+      expect(dashboard.widgetIds).toEqual(['widget-1']);
+      expect(dashboard.widgets).toHaveLength(1);
+      expect(dashboard.widgets[0].name).toBe('CPU Avg');
+    });
+
+    it('should list dashboards with pagination and widget IDs', async () => {
+      mockSelectOnce([{ count: 1 }]);
+      mockSelectOnce([
+        {
+          id: 'dashboard-1',
+          orgId: ORG_ID,
+          name: 'Security Overview',
+          description: 'Security dashboard',
+          isDefault: false,
+          isSystem: false,
+          layout: {},
+          createdBy: USER_ID,
+          createdAt: new Date('2026-02-01T00:00:00.000Z'),
+          updatedAt: new Date('2026-02-01T00:00:00.000Z')
+        }
+      ]);
+      mockSelectOnce([{ id: 'widget-1', dashboardId: 'dashboard-1' }]);
+
+      const res = await app.request('/analytics/dashboards?page=1&limit=5', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.pagination).toEqual({ page: 1, limit: 5, total: 1 });
+      expect(body.data[0].id).toBe('dashboard-1');
+      expect(body.data[0].widgetIds).toEqual(['widget-1']);
+    });
+
+    it('should update and delete widgets through dashboard lookup', async () => {
+      mockSelectOnce([
+        {
+          id: 'widget-1',
+          dashboardId: 'dashboard-1',
+          title: 'CPU Avg',
+          orgId: ORG_ID
+        }
+      ]);
+      const widgetUpdate = mockUpdateOnce([
+        {
+          id: 'widget-1',
+          dashboardId: 'dashboard-1',
+          widgetType: 'chart',
+          title: 'CPU P95',
+          dataSource: { metric: 'cpu_p95' },
+          chartType: null,
+          visualization: {},
+          position: { x: 1, y: 0 },
+          refreshInterval: null,
+          createdAt: new Date('2026-02-01T00:00:00.000Z'),
+          updatedAt: new Date('2026-02-02T00:00:00.000Z')
+        }
+      ]);
+
+      const patchRes = await app.request('/analytics/widgets/widget-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'CPU P95',
+          config: { metric: 'cpu_p95' },
+          layout: { x: 1, y: 0 }
+        })
+      });
+
+      expect(patchRes.status).toBe(200);
+      const patchedWidget = await patchRes.json();
+      expect(patchedWidget.name).toBe('CPU P95');
+      expect(patchedWidget.config).toEqual({ metric: 'cpu_p95' });
+      expect(widgetUpdate.set).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'CPU P95',
+          dataSource: { metric: 'cpu_p95' },
+          position: { x: 1, y: 0 }
+        })
+      );
+
+      mockSelectOnce([
+        {
+          id: 'widget-1',
+          dashboardId: 'dashboard-1',
+          title: 'CPU P95',
+          orgId: ORG_ID
+        }
+      ]);
+      mockDeleteOnce([]);
+      mockUpdateOnce([]);
+
+      const deleteRes = await app.request('/analytics/widgets/widget-1', {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(deleteRes.status).toBe(200);
+      const deleteBody = await deleteRes.json();
+      expect(deleteBody).toEqual({ success: true });
+      expect(db.delete).toHaveBeenCalledWith(dashboardWidgets);
+    });
+  });
+
+  describe('SLA definitions', () => {
+    it('should create and list SLA definitions', async () => {
+      const createdSla = {
+        id: 'sla-1',
+        orgId: ORG_ID,
+        name: 'Availability',
+        description: 'Uptime SLA',
+        uptimeTarget: 99.5,
+        measurementWindow: 'weekly',
+        enabled: true,
+        createdAt: new Date('2026-02-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-02-01T00:00:00.000Z')
+      };
+
+      mockInsertOnce([createdSla]);
+
+      const createRes = await app.request('/analytics/sla', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Availability',
+          description: 'Uptime SLA',
+          uptimeTarget: 99.5,
+          measurementWindow: 'weekly',
+          targetType: 'organization'
+        })
+      });
+
+      expect(createRes.status).toBe(201);
+      const created = await createRes.json();
+      expect(created.id).toBe('sla-1');
+
+      mockSelectOnce([{ count: 1 }]);
+      mockSelectOnce([createdSla]);
+
+      const listRes = await app.request('/analytics/sla?page=1&limit=10', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(listRes.status).toBe(200);
+      const listBody = await listRes.json();
+      expect(listBody.data[0].id).toBe('sla-1');
+      expect(listBody.pagination.total).toBe(1);
+    });
+
+    it('should return compliance history for an SLA', async () => {
+      mockSelectOnce([
+        {
+          id: 'sla-1',
+          orgId: ORG_ID,
+          name: 'Response Time',
+          uptimeTarget: 97
+        }
+      ]);
+      mockSelectOnce([]);
+      mockSelectOnce([{ count: 2 }]);
+      mockSelectOnce([{ count: 4 }]);
+
+      const res = await app.request('/analytics/sla/sla-1/compliance', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' }
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.slaId).toBe('sla-1');
+      expect(body.history).toEqual([]);
+      expect(body.liveUptime).toBe(50);
+    });
+  });
+
+  describe('site-scope authorization', () => {
+    // Org devices used to resolve the site allowlist into device IDs.
+    const ORG_DEVICE_ROWS = [
+      { id: DEVICE_IN_SCOPE, siteId: SITE_ALLOWED },
+      { id: DEVICE_OUT_OF_SCOPE, siteId: SITE_DENIED }
+    ];
+
+    describe('GET /analytics/capacity', () => {
+      it('returns 403 when a site-restricted caller drills into an out-of-scope deviceId', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        // Device-resolution select runs first when restricted.
+        mockSelectOnce(ORG_DEVICE_ROWS);
+
+        const res = await app.request(
+          `/analytics/capacity?deviceId=${DEVICE_OUT_OF_SCOPE}&metricType=disk`,
+          { method: 'GET', headers: { Authorization: 'Bearer token' } }
+        );
+
+        expect(res.status).toBe(403);
+        const body = await res.json();
+        expect(body.error).toBe('Device not found or access denied');
+      });
+
+      it('allows a site-restricted caller to drill into an in-scope deviceId', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce(ORG_DEVICE_ROWS); // device resolution
+        mockSelectOnce([
+          {
+            metricName: 'disk_used_percent',
+            currentValue: 50,
+            predictedValue: 55,
+            predictionDate: new Date('2026-02-01T00:00:00.000Z'),
+            growthRate: 1
+          }
+        ]); // predictions
+        mockSelectOnce([{ warningThreshold: 80, criticalThreshold: 90 }]); // thresholds
+
+        const res = await app.request(
+          `/analytics/capacity?deviceId=${DEVICE_IN_SCOPE}&metricType=disk`,
+          { method: 'GET', headers: { Authorization: 'Bearer token' } }
+        );
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.currentValue).toBe(50);
+      });
+
+      it('leaves the org-wide capacity aggregate (no deviceId) unchanged for a restricted caller', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce(ORG_DEVICE_ROWS); // device resolution
+        mockSelectOnce([]); // predictions empty -> fall through to live metrics
+        mockSelectOnce([]); // metric_rollups aggregate empty
+        mockSelectOnce([]); // live device_metrics aggregate
+
+        const res = await app.request('/analytics/capacity?metricType=disk', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        // Aggregate still returns a forecast envelope (no 403, not narrowed away).
+        expect(Array.isArray(body.predictions)).toBe(true);
+      });
+
+      it('does not narrow capacity for an unrestricted caller (no extra resolution query)', async () => {
+        currentPermissions = undefined; // unrestricted
+        mockSelectOnce([
+          {
+            metricName: 'disk_used_percent',
+            currentValue: 72,
+            predictedValue: 76,
+            predictionDate: new Date('2026-02-01T00:00:00.000Z'),
+            growthRate: 1.5
+          }
+        ]); // predictions (first select — no resolution select)
+        mockSelectOnce([{ warningThreshold: 80, criticalThreshold: 90 }]);
+
+        const res = await app.request(
+          `/analytics/capacity?deviceId=${DEVICE_OUT_OF_SCOPE}&metricType=disk`,
+          { method: 'GET', headers: { Authorization: 'Bearer token' } }
+        );
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.currentValue).toBe(72);
+      });
+    });
+
+    describe('GET /analytics/anomalies/evaluation', () => {
+      it('returns 403 when a site-restricted caller drills into an out-of-scope deviceId', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce(ORG_DEVICE_ROWS); // device resolution
+
+        const res = await app.request(
+          `/analytics/anomalies/evaluation?deviceId=${DEVICE_OUT_OF_SCOPE}`,
+          { method: 'GET', headers: { Authorization: 'Bearer token' } }
+        );
+
+        expect(res.status).toBe(403);
+        const body = await res.json();
+        expect(body.error).toBe('Device not found or access denied');
+      });
+
+      it('narrows org-wide anomaly evaluation to in-scope devices for a site-restricted caller', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce(ORG_DEVICE_ROWS); // device resolution
+        mockSelectOnce([
+          { status: 'open', count: 1 },
+          { status: 'dismissed', count: 1 },
+        ]); // anomaly status counts
+        mockSelectOnce([
+          { eventType: 'anomaly.dismissed', count: 1 },
+        ]); // feedback counts
+        mockSelectOnce([]); // episode group rows
+        mockSelectOnce([{ total: 0, recurring: 0, labelEligibleClosed: 0, humanLabelled: 0, medianDurationSeconds: null }]); // episode agg
+
+        const res = await app.request('/analytics/anomalies/evaluation?range=90d', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.total).toBe(2);
+        expect(body.status.dismissed).toBe(1);
+        expect(body.rates.dismissRate).toBe(0.5);
+        expect(body.feedback.dismissed).toBe(1);
+        expect(vi.mocked(db.select)).toHaveBeenCalledTimes(5);
+      });
+
+      it('short-circuits anomaly evaluation when a site-restricted caller has no in-scope devices', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce([{ id: DEVICE_OUT_OF_SCOPE, siteId: SITE_DENIED }]); // device resolution
+
+        const res = await app.request('/analytics/anomalies/evaluation', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.total).toBe(0);
+        expect(body.status).toEqual({ open: 0, dismissed: 0, promoted: 0, resolved: 0, cleared: 0 });
+        expect(body.episodes).toEqual({
+          total: 0,
+          byStatus: { open: 0, resolved: 0, dismissed: 0 },
+          byCloseReason: { cleared: 0, expired_offline: 0, expired_no_data: 0, detection_off: 0, user: 0, snoozed: 0 },
+          medianDurationSeconds: null,
+          recurrenceShare: 0,
+          humanLabelledShare: 0,
+        });
+        expect(vi.mocked(db.select)).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('POST /analytics/query (timeseries)', () => {
+      it('returns 403 when any requested deviceId is out of the site allowlist', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce(ORG_DEVICE_ROWS); // device resolution
+
+        const res = await app.request('/analytics/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceIds: [DEVICE_IN_SCOPE, DEVICE_OUT_OF_SCOPE],
+            metricTypes: ['cpu_usage'],
+            startTime: '2024-01-01T00:00:00Z',
+            endTime: '2024-01-02T00:00:00Z',
+            aggregation: 'avg',
+            interval: 'hour'
+          })
+        });
+
+        expect(res.status).toBe(403);
+        const body = await res.json();
+        expect(body.error).toBe('Access to one or more device sites denied');
+      });
+
+      it('allows a site-restricted caller when all requested deviceIds are in scope', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce(ORG_DEVICE_ROWS); // device resolution
+        mockSelectOnce([]); // metric_rollups
+        mockSelectOnce([]); // raw metric series query
+
+        const res = await app.request('/analytics/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceIds: [DEVICE_IN_SCOPE],
+            metricTypes: ['cpu_usage'],
+            startTime: '2024-01-01T00:00:00Z',
+            endTime: '2024-01-02T00:00:00Z',
+            aggregation: 'avg',
+            interval: 'hour'
+          })
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.series).toHaveLength(1);
+      });
+
+      it('does not narrow timeseries for an unrestricted caller', async () => {
+        currentPermissions = undefined; // unrestricted — no resolution query
+        mockSelectOnce([]); // metric_rollups query is the first select
+        mockSelectOnce([]); // raw metric series query
+
+        const res = await app.request('/analytics/query', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceIds: [DEVICE_OUT_OF_SCOPE],
+            metricTypes: ['cpu_usage'],
+            startTime: '2024-01-01T00:00:00Z',
+            endTime: '2024-01-02T00:00:00Z',
+            aggregation: 'avg',
+            interval: 'hour'
+          })
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.series).toHaveLength(1);
+      });
+    });
+
+    describe('SLA site scoping (audit §1.1 / §4)', () => {
+      const ORG_WIDE = { id: 'sla-org', orgId: ORG_ID, name: 'Org SLA', targetType: 'organization', targetIds: null };
+      const SITE_IN = { id: 'sla-in', orgId: ORG_ID, name: 'In', targetType: 'site', targetIds: [SITE_ALLOWED] };
+      const SITE_OUT = { id: 'sla-out', orgId: ORG_ID, name: 'Out', targetType: 'site', targetIds: [SITE_DENIED] };
+      const DEVICE_OUT = { id: 'sla-dev', orgId: ORG_ID, name: 'Dev', targetType: 'device', targetIds: [DEVICE_OUT_OF_SCOPE] };
+
+      it('GET /analytics/sla hides definitions targeting sites/devices outside the caller scope', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce([ORG_WIDE, SITE_IN, SITE_OUT, DEVICE_OUT]); // definitions
+        mockSelectOnce(ORG_DEVICE_ROWS); // device resolution (device-targeted def present)
+
+        const res = await app.request('/analytics/sla?page=1&limit=10', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.data.map((d: any) => d.id)).toEqual(['sla-org', 'sla-in']);
+        expect(body.pagination.total).toBe(2);
+        expect(JSON.stringify(body)).not.toContain(SITE_DENIED);
+      });
+
+      it('GET /analytics/sla is unchanged for an unrestricted caller', async () => {
+        currentPermissions = undefined;
+        mockSelectOnce([{ count: 4 }]);
+        mockSelectOnce([ORG_WIDE, SITE_IN, SITE_OUT, DEVICE_OUT]);
+
+        const res = await app.request('/analytics/sla?page=1&limit=10', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.data).toHaveLength(4);
+        expect(body.pagination.total).toBe(4);
+      });
+
+      it('GET /analytics/sla paginates the FILTERED set — page 2 holds the next visible rows', async () => {
+        // The narrowed branch paginates in memory after filtering. Asserting
+        // only `total` would pass even if the slice were taken from the
+        // unfiltered list, so page 2's contents are the real control.
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        const visible = Array.from({ length: 5 }, (_, i) => ({
+          id: `sla-in-${i}`, orgId: ORG_ID, name: `In ${i}`, targetType: 'site', targetIds: [SITE_ALLOWED],
+        }));
+        // Interleave out-of-scope rows so an unfiltered slice would differ.
+        const interleaved = visible.flatMap((row, i) => [
+          { id: `sla-out-${i}`, orgId: ORG_ID, name: `Out ${i}`, targetType: 'site', targetIds: [SITE_DENIED] },
+          row,
+        ]);
+        mockSelectOnce(interleaved); // definitions (no device-targeted row -> no resolution query)
+
+        const res = await app.request('/analytics/sla?page=2&limit=2', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.data.map((d: any) => d.id)).toEqual(['sla-in-2', 'sla-in-3']);
+        expect(body.pagination).toEqual({ page: 2, limit: 2, total: 5 });
+        expect(JSON.stringify(body)).not.toContain(SITE_DENIED);
+      });
+
+      it('GET /analytics/sla denies a device-targeted definition when the resolved device set is empty', async () => {
+        // The `[]` (resolved to nothing) arm of the null-vs-[] pair. The `null`
+        // arm — a narrowed caller with no orgId — is covered directly in
+        // services/slaSiteScope.test.ts, which this route now shares.
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce([DEVICE_OUT]); // definitions
+        mockSelectOnce([]); // device resolution resolves nothing
+
+        const res = await app.request('/analytics/sla?page=1&limit=10', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.data).toEqual([]);
+        expect(JSON.stringify(body)).not.toContain(DEVICE_OUT_OF_SCOPE);
+      });
+
+      it('GET /analytics/sla/:id/compliance denies an out-of-scope definition', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce([SITE_OUT]); // the definition
+
+        const res = await app.request('/analytics/sla/sla-out/compliance', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(403);
+        expect((await res.json()).error).toBe('Access denied');
+      });
+
+      it('GET /analytics/sla/:id/compliance still serves an in-scope definition', async () => {
+        currentPermissions = { allowedSiteIds: [SITE_ALLOWED] };
+        mockSelectOnce([SITE_IN]); // the definition
+        mockSelectOnce([]); // compliance history
+        mockSelectOnce([{ count: 2 }]);
+        mockSelectOnce([{ count: 4 }]);
+
+        const res = await app.request('/analytics/sla/sla-in/compliance', {
+          method: 'GET',
+          headers: { Authorization: 'Bearer token' }
+        });
+
+        expect(res.status).toBe(200);
+        expect((await res.json()).slaId).toBe('sla-in');
+      });
+    });
+
+  });
+});

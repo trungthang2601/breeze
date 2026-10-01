@@ -1,0 +1,706 @@
+import { useState, useEffect, useRef } from 'react';
+import {
+  Moon,
+  Sun,
+  Monitor,
+  Check,
+  ChevronDown,
+  LogOut,
+  User,
+  Settings,
+  Key,
+  Shield,
+  Smartphone,
+  Plug,
+  Activity,
+  Sparkles,
+  BookOpen,
+  Menu,
+  LifeBuoy,
+  CreditCard,
+  Rows3,
+  Rows4,
+  AlignJustify
+} from 'lucide-react';
+import OrgSwitcher from './OrgSwitcher';
+import NotificationCenter from './NotificationCenter';
+import TimerWidget from '../time/TimerWidget';
+import CommandPalette from './CommandPalette';
+import SupportModal from '../support/SupportModal';
+import {
+  useAuthStore,
+  apiLogout,
+  apiPrepareCfTerminalLogout,
+  fetchWithAuth,
+} from '../../stores/auth';
+import { useAiStore } from '../../stores/aiStore';
+import { usePermissions } from '../../lib/permissions';
+import { useHelpStore } from '../../stores/helpStore';
+import { useUiStore } from '../../stores/uiStore';
+import { useFeaturesStore } from '../../stores/featuresStore';
+import { showToast } from '../shared/Toast';
+import { navigateTo } from '../../lib/navigation';
+import { useAvatarBlobUrl } from '../../lib/avatarBlobCache';
+import {
+  readDensity,
+  readThemePreference,
+  subscribeDensity,
+  subscribeTheme,
+  writeDensity,
+  writeThemePreference,
+  type Density,
+  type ThemePreference,
+} from '../../lib/appearance';
+import { saveUserPreferences } from '../../lib/userPreferences';
+import { useTranslation } from 'react-i18next';
+// Initializes the shared i18next singleton. Islands hydrate independently, so
+// an island that hydrates before whichever other island happens to pull i18n in
+// would otherwise render raw keys (and mismatch the SSR markup).
+import '../../lib/i18n';
+
+const LOGOUT_BEARER_DEADLINE_MS = 30_000;
+const LOGOUT_MAX_ATTEMPTS = 2;
+
+interface LogoutBearerLease {
+  token: string;
+  expiresAt: number;
+  attempts: number;
+}
+
+export default function Header() {
+  const { t } = useTranslation('common');
+  const [mounted, setMounted] = useState(false);
+  const [theme, setTheme] = useState<ThemePreference>('system');
+  // Interface density: account-wide preference (breeze.density) shared with
+  // any table that opts in. The control lives in this theme/display submenu;
+  // changing it re-skins the whole app via <html data-density> (globals.css).
+  const [density, setDensity] = useState<Density>('comfortable');
+  const [showUserMenu, setShowUserMenu] = useState(false);
+  const [showThemeMenu, setShowThemeMenu] = useState(false);
+  const [showSupportModal, setShowSupportModal] = useState(false);
+  const [billingLoading, setBillingLoading] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [logoutFailure, setLogoutFailure] = useState<{ message: string } | null>(null);
+  const features = useFeaturesStore((s) => s.features);
+  const loadFeatures = useFeaturesStore((s) => s.load);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const themeRef = useRef<HTMLDivElement>(null);
+  const themeTriggerRef = useRef<HTMLButtonElement>(null);
+  const themePanelRef = useRef<HTMLDivElement>(null);
+  const userTriggerRef = useRef<HTMLButtonElement>(null);
+  const userPanelRef = useRef<HTMLDivElement>(null);
+  const logoutBearerRef = useRef<LogoutBearerLease | null>(null);
+  const logoutBearerDeadlineRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const logoutFlowStartedRef = useRef(false);
+
+  const { user, isAuthenticated } = useAuthStore();
+  // Resolve the avatar through fetchWithAuth so internal /api/v1/users/<id>/avatar
+  // paths return a blob: URL that <img> can render. External URLs pass through.
+  const resolvedAvatarUrl = useAvatarBlobUrl(user?.avatarUrl ?? null);
+  const { isOpen: isAiOpen, toggle: toggleAi } = useAiStore();
+  // #6396: POST /ai/sessions requires ai_sessions:use — don't show a button
+  // that can only 403 for roles without it (UX only; the route re-checks).
+  const { can } = usePermissions();
+  const canUseAi = can('ai_sessions', 'use');
+  const { isOpen: isHelpOpen, toggle: toggleHelp } = useHelpStore();
+  const { toggleMobileMenu } = useUiStore();
+
+  // Mark as mounted after hydration to avoid SSR/client mismatch
+  useEffect(() => {
+    setMounted(true);
+    setTheme(readThemePreference());
+    // Hydrate density from storage and stay in sync if another component
+    // (e.g. a table toolbar) ever flips it.
+    setDensity(readDensity());
+  }, []);
+
+  useEffect(() => subscribeTheme(setTheme), []);
+  useEffect(() => subscribeDensity(setDensity), []);
+
+  const clearLogoutBearer = () => {
+    logoutBearerRef.current = null;
+    if (logoutBearerDeadlineRef.current !== null) {
+      clearTimeout(logoutBearerDeadlineRef.current);
+      logoutBearerDeadlineRef.current = null;
+    }
+  };
+
+  useEffect(() => () => clearLogoutBearer(), []);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      void loadFeatures();
+    }
+  }, [isAuthenticated, loadFeatures]);
+
+  const openBillingPortal = async () => {
+    if (billingLoading) return;
+    setBillingLoading(true);
+    try {
+      const res = await fetchWithAuth('/billing/portal', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ returnUrl: window.location.href }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        console.error('[billing] portal failed', { status: res.status, body });
+        const code = typeof body.error === 'string' ? body.error : '';
+        const messages: Record<string, string> = {
+          no_billing_record: t('layout.header.billingErrors.noRecord'),
+          not_configured: t('layout.header.billingErrors.notConfigured'),
+          upstream_unavailable: t('layout.header.billingErrors.unavailable'),
+          rate_limited: t('layout.header.billingErrors.rateLimited'),
+        };
+        const message = messages[code] ?? (code || t('layout.header.billingErrors.open'));
+        showToast({ type: 'error', message });
+        return;
+      }
+      const data = (await res.json()) as { url?: string };
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        console.error('[billing] upstream returned no url', data);
+        showToast({ type: 'error', message: t('layout.header.billingErrors.missingUrl') });
+      }
+    } catch (err) {
+      console.error('[billing] portal request threw', err);
+      showToast({ type: 'error', message: t('layout.header.billingErrors.open') });
+    } finally {
+      setBillingLoading(false);
+    }
+  };
+
+  // Close dropdowns when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setShowUserMenu(false);
+      }
+      if (themeRef.current && !themeRef.current.contains(event.target as Node)) {
+        setShowThemeMenu(false);
+      }
+    }
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // When the theme menu opens, move focus into it; Escape closes it and returns
+  // focus to the trigger so keyboard users aren't stranded behind an open panel.
+  useEffect(() => {
+    if (!showThemeMenu) return;
+    themePanelRef.current?.querySelector<HTMLElement>('button, a')?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setShowThemeMenu(false);
+        themeTriggerRef.current?.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [showThemeMenu]);
+
+  // Same focus + Escape handling for the account menu.
+  useEffect(() => {
+    if (!showUserMenu) return;
+    userPanelRef.current?.querySelector<HTMLElement>('button, a')?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setShowUserMenu(false);
+        userTriggerRef.current?.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [showUserMenu]);
+
+  const applyTheme = (next: ThemePreference) => {
+    setTheme(next);
+    setShowThemeMenu(false);
+    writeThemePreference(next);
+
+    if (isAuthenticated) {
+      saveUserPreferences({ theme: next }, 'Failed to save theme preference')
+        .catch((err) => console.warn('[theme] Failed to persist preference:', err));
+    }
+  };
+
+  // writeDensity persists the choice, mirrors data-density onto <html> so the
+  // page-level CSS in globals.css applies app-wide, and notifies subscribers
+  // (subscribeDensity above keeps this menu's checkmark in sync).
+  const applyDensity = (next: Density) => {
+    writeDensity(next);
+    if (isAuthenticated) {
+      saveUserPreferences({ density: next }, 'Failed to save density preference')
+        .catch((err) => console.warn('[density] Failed to persist preference:', err));
+    }
+  };
+
+  // Listen for OS theme changes when in system mode
+  useEffect(() => {
+    if (theme !== 'system') return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const handler = (e: MediaQueryListEvent) => {
+      document.documentElement.classList.toggle('dark', e.matches);
+    };
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, [theme]);
+
+  const handleSignOut = async () => {
+    setIsLoggingOut(true);
+    setLogoutFailure(null);
+    let bearer = logoutBearerRef.current;
+    if (
+      bearer
+      && (Date.now() >= bearer.expiresAt || bearer.attempts >= LOGOUT_MAX_ATTEMPTS)
+    ) {
+      clearLogoutBearer();
+      bearer = null;
+    }
+    if (!bearer) {
+      if (logoutFlowStartedRef.current) {
+        setIsLoggingOut(false);
+        await navigateTo('/login', { replace: true });
+        return;
+      }
+      logoutFlowStartedRef.current = true;
+      const accessToken = useAuthStore.getState().tokens?.accessToken;
+      if (!accessToken) {
+        setIsLoggingOut(false);
+        await navigateTo('/login', { replace: true });
+        return;
+      }
+      bearer = {
+        token: accessToken,
+        expiresAt: Date.now() + LOGOUT_BEARER_DEADLINE_MS,
+        attempts: 0,
+      };
+      logoutBearerRef.current = bearer;
+      logoutBearerDeadlineRef.current = setTimeout(() => {
+        logoutBearerRef.current = null;
+        logoutBearerDeadlineRef.current = null;
+      }, LOGOUT_BEARER_DEADLINE_MS);
+    }
+    bearer.attempts += 1;
+
+    const routeToSafeReauthentication = async () => {
+      clearLogoutBearer();
+      setIsLoggingOut(false);
+      await navigateTo('/login', { replace: true });
+    };
+
+    // When CF Access trust is in front of Breeze, a normal SPA-side logout
+    // only clears the Breeze session — CF Access still holds a session for
+    // the user, so the SSO redirect on the next /login visit silently
+    // re-enters them. Route through the server-side cf-access-logout
+    // endpoint, which clears the Breeze refresh cookie and bounces the
+    // browser through CF Access's own logout endpoint with returnTo set
+    // to /login?signedOut=1.
+    try {
+      const cfAccessEnabled = useFeaturesStore.getState().cfAccessLogin.enabled;
+      if (cfAccessEnabled) {
+        const outcome = await apiPrepareCfTerminalLogout(bearer.token);
+        if (outcome.kind === 'ready') {
+          clearLogoutBearer();
+          window.location.assign(outcome.navigationUrl);
+          return;
+        }
+        if (bearer.attempts >= LOGOUT_MAX_ATTEMPTS) {
+          await routeToSafeReauthentication();
+          return;
+        }
+        setLogoutFailure({ message: outcome.message });
+        setIsLoggingOut(false);
+        return;
+      }
+
+      const outcome = await apiLogout(bearer.token);
+      if (outcome.kind === 'complete') {
+        clearLogoutBearer();
+        await navigateTo('/login', { replace: true });
+        return;
+      }
+      if (bearer.attempts >= LOGOUT_MAX_ATTEMPTS) {
+        await routeToSafeReauthentication();
+        return;
+      }
+      setLogoutFailure({ message: outcome.message });
+    } catch {
+      console.error('[logout] Unexpected terminal logout failure');
+      if (bearer.attempts >= LOGOUT_MAX_ATTEMPTS) {
+        await routeToSafeReauthentication();
+        return;
+      }
+      setLogoutFailure({
+        message: 'Your local session was cleared, but server sign-out could not be confirmed.',
+      });
+    }
+    setIsLoggingOut(false);
+  };
+
+  // Get user initials for avatar
+  const getUserInitials = () => {
+    // Guard against whitespace-only names: split() would yield empty strings
+    // and indexing [0][0] would throw.
+    const parts = user?.name?.trim().split(/\s+/).filter(Boolean) ?? [];
+    if (parts.length === 0) return '?';
+    if (parts.length >= 2) {
+      return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+    }
+    return parts[0][0].toUpperCase();
+  };
+
+  if (logoutFailure) {
+    return (
+      <section
+        data-testid="logout-failure"
+        className="fixed inset-0 z-[100] flex items-center justify-center bg-background px-4"
+        aria-live="polite"
+      >
+        <div className="w-full max-w-md rounded-lg border bg-card p-6 text-center shadow-lg">
+          <h1 className="text-lg font-semibold">Signed out on this device</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{logoutFailure.message}</p>
+          <button
+            data-testid="logout-retry"
+            type="button"
+            disabled={isLoggingOut}
+            onClick={() => void handleSignOut()}
+            className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+          >
+            {isLoggingOut ? 'Retrying…' : 'Retry server sign-out'}
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <header className="flex h-16 items-center justify-between gap-2 border-b bg-card px-2 sm:px-4 md:px-6">
+      <div className={`flex min-w-0 flex-1 items-center gap-2 transition-opacity duration-150 sm:gap-4 ${mounted ? 'opacity-100' : 'opacity-0'}`}>
+        {/* Hamburger menu — visible below lg (< 1024px): mobile AND tablet. On
+            tablet the sidebar is force-collapsed to an icon rail with no
+            in-rail expand control, so this is the only way to reach the full
+            labeled nav (opens the same slide-out overlay as mobile). */}
+        <button
+          className="rounded-md p-2 hover:bg-muted transition-colors lg:hidden"
+          onClick={toggleMobileMenu}
+          title={t('layout.header.menu')}
+          aria-label={t('layout.header.openMenu')}
+        >
+          <Menu className="h-5 w-5 text-muted-foreground" />
+        </button>
+
+        {/* Organization Switcher */}
+        <div data-tour="org-switcher">
+          <OrgSwitcher />
+        </div>
+
+        {/* Global Search — icon-width until xl, flexible bar at xl+ */}
+        <div data-tour="search" className="shrink-0 xl:min-w-0 xl:flex-1 xl:max-w-md">
+          <CommandPalette />
+        </div>
+      </div>
+
+      <div className={`flex shrink-0 items-center gap-1 transition-opacity duration-150 sm:gap-2 ${mounted ? 'opacity-100' : 'opacity-0'}`}>
+        {/* AI Assistant */}
+        {mounted && isAuthenticated && canUseAi && (
+          <button
+            type="button"
+            data-tour="ai-assistant"
+            onClick={toggleAi}
+            className="relative rounded-md p-2 hover:bg-muted transition-colors"
+            title={t('layout.header.aiTitle')}
+            aria-label={t('layout.header.ai')}
+            aria-pressed={isAiOpen}
+          >
+            <Sparkles className="h-5 w-5" />
+            {isAiOpen && (
+              <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-primary" />
+            )}
+          </button>
+        )}
+
+        {/* Help & Docs — grouped with the AI assistant as the "assist" tools */}
+        {mounted && isAuthenticated && (
+          <button
+            type="button"
+            onClick={toggleHelp}
+            className="relative rounded-md p-2 hover:bg-muted transition-colors"
+            title={t('layout.header.helpTitle')}
+            aria-label={t('layout.header.help')}
+            aria-pressed={isHelpOpen}
+          >
+            <BookOpen className="h-5 w-5" />
+            {isHelpOpen && (
+              <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-primary" />
+            )}
+          </button>
+        )}
+
+        {/* Divider splits assist tools from status + account so the right side
+            reads as two small groups instead of one icon wall. Hidden on the
+            narrowest screens to conserve horizontal space. */}
+        {mounted && isAuthenticated && (
+          <div className="mx-1 hidden h-5 w-px bg-border sm:block" aria-hidden="true" />
+        )}
+
+        {/* Notifications */}
+        {mounted && isAuthenticated && <TimerWidget />}
+        {mounted && isAuthenticated && <NotificationCenter />}
+
+        {/* Theme Picker */}
+        <div className="relative" ref={themeRef}>
+          <button
+            type="button"
+            ref={themeTriggerRef}
+            onClick={() => setShowThemeMenu(!showThemeMenu)}
+            className="rounded-md p-2 hover:bg-muted"
+            title={t('layout.header.theme')}
+            aria-label={t('layout.header.theme')}
+            aria-expanded={showThemeMenu}
+            aria-haspopup="true"
+          >
+            {mounted ? (
+              theme === 'dark' ? <Moon className="h-5 w-5" /> :
+              theme === 'system' ? <Monitor className="h-5 w-5" /> :
+              <Sun className="h-5 w-5" />
+            ) : <Moon className="h-5 w-5" />}
+          </button>
+
+          {showThemeMenu && (
+            <div ref={themePanelRef} className="absolute right-0 top-full z-50 mt-2 w-52 rounded-lg border bg-popover py-1 shadow-lg">
+              <p className="px-3 pb-1 pt-1.5 chart-legend-xs font-medium uppercase tracking-wide text-muted-foreground">{t('layout.header.theme')}</p>
+              {([
+                { value: 'light' as const, labelKey: 'layout.header.themeOptions.light', Icon: Sun },
+                { value: 'dark' as const, labelKey: 'layout.header.themeOptions.dark', Icon: Moon },
+                { value: 'system' as const, labelKey: 'layout.header.themeOptions.system', Icon: Monitor },
+              ]).map(({ value, labelKey, Icon }) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => applyTheme(value)}
+                  className="flex w-full items-center gap-3 px-3 py-2 text-sm transition hover:bg-muted"
+                >
+                  <Icon className="h-4 w-4 text-muted-foreground" />
+                  <span className="flex-1 text-left">{t(/* i18n-dynamic */ labelKey)}</span>
+                  {theme === value && <Check className="h-4 w-4 text-primary" />}
+                </button>
+              ))}
+
+              {/* Interface density — account-wide; applies across the whole app. */}
+              <div className="my-1 border-t" />
+              <p className="px-3 pb-1 pt-1.5 chart-legend-xs font-medium uppercase tracking-wide text-muted-foreground">{t('layout.header.density')}</p>
+              {([
+                { value: 'comfortable' as const, labelKey: 'layout.header.densityOptions.comfortable', Icon: Rows3 },
+                { value: 'compact' as const, labelKey: 'layout.header.densityOptions.compact', Icon: Rows4 },
+                { value: 'dense' as const, labelKey: 'layout.header.densityOptions.dense', Icon: AlignJustify },
+              ]).map(({ value, labelKey, Icon }) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => applyDensity(value)}
+                  aria-label={t('layout.header.densityOptionLabel', { label: t(/* i18n-dynamic */ labelKey) })}
+                  className="flex w-full items-center gap-3 px-3 py-2 text-sm transition hover:bg-muted"
+                >
+                  <Icon className="h-4 w-4 text-muted-foreground" />
+                  <span className="flex-1 text-left">{t(/* i18n-dynamic */ labelKey)}</span>
+                  {density === value && <Check className="h-4 w-4 text-primary" />}
+                </button>
+              ))}
+              <p className="px-3 pb-1.5 pt-1 chart-legend-xs leading-snug text-muted-foreground">{t('layout.header.densityDescription')}</p>
+            </div>
+          )}
+        </div>
+
+        {/* User Menu */}
+        <div className="relative" ref={dropdownRef}>
+          <button
+            type="button"
+            ref={userTriggerRef}
+            onClick={() => setShowUserMenu(!showUserMenu)}
+            className="flex items-center gap-2 rounded-md p-2 hover:bg-muted"
+            title={t('layout.header.accountMenu')}
+            aria-label={t('layout.header.accountMenu')}
+            aria-expanded={showUserMenu}
+            aria-haspopup="true"
+          >
+            {mounted && resolvedAvatarUrl ? (
+              <img
+                src={resolvedAvatarUrl}
+                alt={user?.name ?? t('layout.header.userAvatar')}
+                className="h-8 w-8 rounded-full object-cover"
+              />
+            ) : (
+              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-xs font-medium text-primary-foreground">
+                {mounted && isAuthenticated ? getUserInitials() : <User className="h-4 w-4" />}
+              </div>
+            )}
+            <ChevronDown className={`hidden h-4 w-4 transition-transform sm:block ${showUserMenu ? 'rotate-180' : ''}`} />
+          </button>
+
+          {showUserMenu && (
+            <div ref={userPanelRef} className="absolute right-0 top-full z-50 mt-2 w-64 rounded-lg border bg-popover shadow-lg">
+              {/* User Info Section */}
+              <div className="border-b p-4">
+                <div className="flex items-center gap-3">
+                  {resolvedAvatarUrl ? (
+                    <img
+                      src={resolvedAvatarUrl}
+                      alt={user?.name ?? t('layout.header.userAvatar')}
+                      className="h-10 w-10 rounded-full object-cover"
+                    />
+                  ) : (
+                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-sm font-medium text-primary-foreground">
+                      {isAuthenticated ? getUserInitials() : '?'}
+                    </div>
+                  )}
+                  <div className="flex-1 overflow-hidden">
+                    <p className="truncate text-sm font-medium">
+                      {user?.name || t('layout.header.guest')}
+                    </p>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {user?.email || t('layout.header.notSignedIn')}
+                    </p>
+                  </div>
+                </div>
+                {user?.mfaEnabled && (
+                  <div className="mt-2 flex items-center gap-1.5 text-xs text-emerald-600">
+                    <Shield className="h-3 w-3" />
+                    <span>{t('layout.header.mfaEnabled')}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Account */}
+              <div className="p-1">
+                <p className="px-3 pb-1 pt-1.5 chart-legend-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  {t('layout.header.account')}
+                </p>
+                <a
+                  href="/settings/profile"
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted"
+                  onClick={() => setShowUserMenu(false)}
+                >
+                  <User className="h-4 w-4 text-muted-foreground" />
+                  <span>{t('layout.header.profile')}</span>
+                </a>
+                <a
+                  href="/settings"
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted"
+                  onClick={() => setShowUserMenu(false)}
+                >
+                  <Settings className="h-4 w-4 text-muted-foreground" />
+                  <span>{t('nav.sectionSettings')}</span>
+                </a>
+              </div>
+
+              {/* Security */}
+              <div className="border-t p-1">
+                <p className="px-3 pb-1 pt-1.5 chart-legend-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  {t('nav.sectionSecurity')}</p>
+                <a
+                  href="/settings/api-keys"
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted"
+                  onClick={() => setShowUserMenu(false)}
+                >
+                  <Key className="h-4 w-4 text-muted-foreground" />
+                  <span>{t('layout.header.apiKeys')}</span>
+                </a>
+                <a
+                  href="/settings/partner-service-principals"
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted"
+                  onClick={() => setShowUserMenu(false)}
+                >
+                  <Shield className="h-4 w-4 text-muted-foreground" />
+                  <span>{t('layout.header.partnerServicePrincipals')}</span>
+                </a>
+                <a
+                  href="/account/devices"
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted"
+                  onClick={() => setShowUserMenu(false)}
+                >
+                  <Smartphone className="h-4 w-4 text-muted-foreground" />
+                  <span>{t('account.nav.devices')}</span>
+                </a>
+                <a
+                  href="/account/connected-apps"
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted"
+                  onClick={() => setShowUserMenu(false)}
+                >
+                  <Plug className="h-4 w-4 text-muted-foreground" />
+                  <span>{t('account.nav.connectedApps')}</span>
+                </a>
+              </div>
+
+              {/* Billing & support */}
+              {(features.billing || features.support) && (
+                <div className="border-t p-1">
+                  <p className="px-3 pb-1 pt-1.5 chart-legend-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    {t('layout.header.billingSupport')}
+                  </p>
+                  {features.billing && (
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted disabled:opacity-50"
+                      disabled={billingLoading}
+                      onClick={() => {
+                        setShowUserMenu(false);
+                        void openBillingPortal();
+                      }}
+                    >
+                      <CreditCard className="h-4 w-4 text-muted-foreground" />
+                      <span>{billingLoading ? t('layout.header.opening') : t('layout.header.billing')}</span>
+                    </button>
+                  )}
+                  {features.support && (
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted"
+                      onClick={() => {
+                        setShowUserMenu(false);
+                        setShowSupportModal(true);
+                      }}
+                    >
+                      <LifeBuoy className="h-4 w-4 text-muted-foreground" />
+                      <span>{t('layout.header.contactSupport')}</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Activity Section */}
+              <div className="border-t p-1">
+                <a
+                  href="/audit"
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition hover:bg-muted"
+                  onClick={() => setShowUserMenu(false)}
+                >
+                  <Activity className="h-4 w-4 text-muted-foreground" />
+                  <span>{t('layout.header.activityLog')}</span>
+                </a>
+              </div>
+
+              {/* Sign Out */}
+              <div className="border-t p-1">
+                <button
+                  type="button"
+                  onClick={handleSignOut}
+                  disabled={isLoggingOut}
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm text-destructive transition hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <LogOut className="h-4 w-4" />
+                  <span>{isLoggingOut ? t('layout.header.signingOut') : t('layout.header.signOut')}</span>
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      <SupportModal open={showSupportModal} onClose={() => setShowSupportModal(false)} />
+    </header>
+  );
+}

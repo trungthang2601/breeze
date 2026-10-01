@@ -1,0 +1,475 @@
+// Typed fetch wrappers for the Quotes / Proposals API.
+//
+// Mirrors the invoice / contracts / catalog web layer: there is no generic
+// `apiFetch`/`apiClient` helper in this app — list/detail/mutation calls go
+// through `fetchWithAuth` (apps/web/src/stores/auth.ts), which auto-injects the
+// active orgId + auth header, refreshes tokens, prepends the `/api/v1` prefix,
+// and returns a raw `Response`. Each wrapper here returns that `Response` so the
+// CALLING COMPONENT keeps full control over 401 handling and wraps the request
+// in `runAction` (apps/web/src/lib/runAction.ts) — exactly the pattern
+// InvoiceEditor.tsx uses (`runAction({ request: () => fetchWithAuth(...) })`).
+// The CLAUDE.md "mutations must go through runAction" rule is therefore
+// satisfied at the component layer, not inside these thin wrappers; that is the
+// established convention for invoices/contracts/catalog rather than the
+// approximate `runAction(() => apiFetch(...))` shape sketched in the plan.
+//
+// Every quotes route responds with a `{ data: ... }` envelope. Money / quantity
+// fields arrive from the API as numeric(12,2) strings (e.g. '150.00'), matching
+// the invoice client's string-money convention.
+
+import { fetchWithAuth } from '../../stores/auth';
+import type {
+  AcceptQuoteOnBehalfInput,
+  DeclineQuoteOnBehalfInput,
+  CreateQuoteInput,
+  CreateQuoteOrderInput,
+  UpdateQuoteInput,
+  UpdateQuoteOrderInput,
+  UpdateQuoteOrderLineInput,
+  QuoteLineInput,
+  QuoteBlockInput,
+} from '@breeze/shared';
+
+/** Query params for `GET /quotes`. Mirrors `listQuotesQuerySchema` in shared. */
+export interface ListQuotesParams {
+  orgId?: string;
+  status?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+function buildQuery(params: ListQuotesParams): string {
+  const qs = new URLSearchParams();
+  if (params.orgId) qs.set('orgId', params.orgId);
+  if (params.status) qs.set('status', params.status);
+  if (params.from) qs.set('from', params.from);
+  if (params.to) qs.set('to', params.to);
+  if (params.limit != null) qs.set('limit', String(params.limit));
+  if (params.cursor) qs.set('cursor', params.cursor);
+  const s = qs.toString();
+  return s ? `?${s}` : '';
+}
+
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
+
+// ---- reads ----------------------------------------------------------------
+
+export function listQuotes(params: ListQuotesParams = {}): Promise<Response> {
+  return fetchWithAuth(`/quotes${buildQuery(params)}`);
+}
+
+export function getQuote(id: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}`);
+}
+
+// ---- mutations (callers wrap these in runAction) --------------------------
+
+export function createQuote(body: CreateQuoteInput): Promise<Response> {
+  return fetchWithAuth('/quotes', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Schedule the delayed (undo-able) send: the server enqueues the real send
+ *  ~30s out and stamps sendScheduledAt on the quote. Body mirrors the API's
+ *  `.strict()` schedule schema (SendQuoteOptions + delaySeconds), so a
+ *  mis-keyed field is a compile error here instead of a runtime 400. */
+export function scheduleQuoteSend(
+  id: string,
+  body: SendQuoteOptions & { delaySeconds?: number },
+): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/schedule-send`, { method: 'POST', body: JSON.stringify(body) });
+}
+
+/** Undo a scheduled send. `canceled:false` in the response means the window
+ *  had already elapsed. */
+export function cancelScheduledSend(id: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/schedule-send`, { method: 'DELETE' });
+}
+
+/** Clone a quote into a new draft. Optional body retargets it to another
+ *  organization (same partner) and/or renames it — omitted fields fall back to
+ *  the source quote (matches `cloneQuoteSchema` in shared). */
+export function cloneQuote(id: string, body?: { orgId?: string; title?: string }): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/clone`, {
+    method: 'POST',
+    ...(body ? { headers: JSON_HEADERS, body: JSON.stringify(body) } : {}),
+  });
+}
+
+/** Create a linked draft revision of a sent quote. Unlike `cloneQuote` (which
+ *  starts an unrelated quote), the draft this returns is bound to its parent:
+ *  sending it retires the original and revokes the customer's link. Refuses
+ *  with 409 `REVISION_IN_PROGRESS` + `meta.revisionQuoteId` when one already
+ *  exists — only one open revision per quote. */
+export function reviseQuote(id: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/revise`, { method: 'POST' });
+}
+
+export function updateQuote(id: string, body: UpdateQuoteInput): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteQuote(id: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}`, { method: 'DELETE' });
+}
+
+/** Draft-only atomic change-currency op (#3774, mirrors changeContractCurrency
+ *  in lib/api/contracts.ts). `clearLines` and `reprice` are mutually
+ *  exclusive; the server 409s CURRENCY_LOCKED when monetary lines exist and
+ *  neither is set. */
+export interface ChangeQuoteCurrencyBody {
+  currencyCode: string;
+  clearLines?: boolean;
+  reprice?: boolean;
+}
+
+export function changeQuoteCurrency(id: string, body: ChangeQuoteCurrencyBody): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/currency`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+export function addBlock(id: string, body: QuoteBlockInput): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/blocks`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Update a block's content in place (PATCH /quotes/:id/blocks/:blockId). The
+ *  body restates the (immutable) blockType so content is validated by shape. */
+export function updateBlock(id: string, blockId: string, body: QuoteBlockInput): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/blocks/${blockId}`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Delete a block and its lines (DELETE /quotes/:id/blocks/:blockId).
+ *  keepalive: the editor defers deletions for an undo grace window and flushes
+ *  them on pagehide — the request must survive the page teardown. */
+export function deleteBlock(id: string, blockId: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/blocks/${blockId}`, { method: 'DELETE', keepalive: true });
+}
+
+export function addManualLine(
+  id: string,
+  body: QuoteLineInput & { unitCost?: number | null; sku?: string | null; partNumber?: string | null },
+): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/lines`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Body shape matches `catalogQuoteLineSchema` (catalogItemId + quantity, optional blockId + partNumber). */
+export function addCatalogLine(
+  id: string,
+  body: { catalogItemId: string; quantity: number; blockId?: string; partNumber?: string },
+): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/lines/catalog`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateLine(
+  id: string,
+  lineId: string,
+  body: { unitCost?: number | null; sku?: string | null; partNumber?: string | null } & Record<string, unknown>,
+): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/lines/${lineId}`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** keepalive: undo-grace deletions flush on pagehide (see deleteBlock). */
+export function removeLine(id: string, lineId: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/lines/${lineId}`, { method: 'DELETE', keepalive: true });
+}
+
+/** Reorder a quote's blocks. Body is the full ordered id list; the server
+ *  renumbers sortOrder 0..n-1 (PATCH /quotes/:id/blocks/reorder). */
+export function reorderBlocks(id: string, body: { blockIds: string[] }): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/blocks/reorder`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Reorder the lines within a pricing-table block. Full ordered id list; the
+ *  server renumbers sortOrder 0..n-1 (PATCH /quotes/:id/blocks/:blockId/lines/reorder). */
+export function reorderLines(id: string, blockId: string, body: { lineIds: string[] }): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/blocks/${blockId}/lines/reorder`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Move a line to a different pricing-table block
+ *  (PATCH /quotes/:id/lines/:lineId/move). The server appends it to the end of
+ *  the target block's sort order; bundle children follow their parent. */
+export function moveLine(id: string, lineId: string, body: { blockId: string }): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/lines/${lineId}/move`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+// ---- fulfillment (procurement order tracking) -----------------------------
+// All three are gated server-side on `quotes:fulfill` — a distinct permission
+// from quotes:write, so the UI must gate on it separately too.
+
+/** Record a purchase order against a won quote's lines
+ *  (POST /quotes/:id/orders). `clientRequestId` is the idempotency key: the
+ *  server dedupes a retry with the same id instead of creating a second order,
+ *  so the caller must mint it ONCE per submit-session (not per render/click). */
+export function createQuoteOrder(quoteId: string, body: CreateQuoteOrderInput): Promise<Response> {
+  return fetchWithAuth(`/quotes/${quoteId}/orders`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Edit an order's header fields (PATCH /quotes/:id/orders/:orderId). */
+export function updateQuoteOrder(
+  quoteId: string,
+  orderId: string,
+  body: UpdateQuoteOrderInput,
+): Promise<Response> {
+  return fetchWithAuth(`/quotes/${quoteId}/orders/${orderId}`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Receive / re-track / cancel a single allocation
+ *  (PATCH /quotes/:id/orders/:orderId/lines/:lineId). `receivedQty: 0` is a
+ *  legal correction (it clears a mistaken receipt), and receiving against a
+ *  cancelled allocation 400s unless the same patch also sets `cancelled: false`. */
+export function updateQuoteOrderLine(
+  quoteId: string,
+  orderId: string,
+  lineId: string,
+  body: UpdateQuoteOrderLineInput,
+): Promise<Response> {
+  return fetchWithAuth(`/quotes/${quoteId}/orders/${orderId}/lines/${lineId}`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Absolute API path for the quote PDF (`GET /api/v1/quotes/:id/pdf`). The route
+ *  streams `application/pdf` inline; callers fetch it via `fetchWithAuth` (to
+ *  attach the auth header) the same way InvoiceDetail downloads its PDF. */
+export function quotePdfUrl(id: string): string {
+  return `/api/v1/quotes/${id}/pdf`;
+}
+
+// ---- Phase 2 lifecycle / image upload -------------------------------------
+
+/** Composer fields for `POST /quotes/:id/send`. Everything is optional — the
+ *  server's `.strict()` schema treats an absent field as "use the default". */
+export interface SendQuoteOptions {
+  /** Explicit recipients (1-10) — override the org billing-contact fallback. */
+  to?: string[];
+  /** Extra recipients (0-10). */
+  cc?: string[];
+  /** Overrides the server default "Proposal <number> from <partner>". */
+  subject?: string;
+  /** Personal note shown in the customer email above the accept link. */
+  message?: string;
+  /** false skips the PDF attachment; the server defaults to attaching it. */
+  includePdf?: boolean;
+}
+
+/** Persisted send-outcome codes (mirrors `SendQuoteEmailReason` in
+ *  apps/api/src/db/schema/quotes.ts). Semantics depend on quote status:
+ *  on a SENT quote, why the best-effort email step did NOT deliver after the
+ *  send committed (`data.emailed === false`):
+ *  - `no_billing_contact` — the org has no billing-contact email to fall back to
+ *  - `no_email_service`   — email isn't configured on this server
+ *  - `pdf_render_failed`  — the PDF attachment couldn't be generated
+ *  - `send_failed`        — the transport itself rejected/failed the message
+ *  On a DRAFT, only:
+ *  - `schedule_failed`    — a scheduled send was rejected at fire time; nothing
+ *    was sent and the quote is still a draft. */
+export type QuoteSendEmailReason =
+  | 'no_billing_contact'
+  | 'no_email_service'
+  | 'pdf_render_failed'
+  | 'send_failed'
+  | 'schedule_failed';
+
+/** Issue + send a draft quote (POST /quotes/:id/send). Gated server-side on
+ *  quotes:send. Only non-empty / non-default fields are POSTed, so a bare
+ *  `sendQuote(id)` reproduces the classic body-less send. Responds with
+ *  `{ data: { quote, emailed, emailReason?, acceptUrl } }` (emailReason is a
+ *  `QuoteSendEmailReason` when emailed is false). */
+export function sendQuote(id: string, opts: SendQuoteOptions = {}): Promise<Response> {
+  const body = composerBody(opts);
+  return fetchWithAuth(`/quotes/${id}/send`, {
+    method: 'POST',
+    ...(Object.keys(body).length > 0 ? { headers: JSON_HEADERS, body: JSON.stringify(body) } : {}),
+  });
+}
+
+/** Why a resolved share link is what it is. Mirrors `AcceptUrlOrigin` in
+ *  apps/api/src/services/quoteLifecycle.ts — keep in sync.
+ *
+ *  The distinction is user-facing, not diagnostic: on `minted_no_identity` the
+ *  customer's ORIGINAL link is still live alongside the new one (we never
+ *  stored what we'd need to revoke it), while on `minted_key_unavailable` and
+ *  `minted_expired` their original link no longer works at all. Telling them
+ *  the wrong one is worse than saying nothing. */
+export type QuoteAcceptUrlOrigin =
+  | 'reproduced'
+  | 'minted_no_identity'
+  | 'minted_key_unavailable'
+  | 'minted_expired';
+
+/** Build the shared composer body for send/re-send. Only non-empty / non-default
+ *  fields are included, so a bare call reproduces the classic body-less send. */
+function composerBody(opts: SendQuoteOptions): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  if (opts.to && opts.to.length > 0) body.to = opts.to;
+  if (opts.cc && opts.cc.length > 0) body.cc = opts.cc;
+  const subject = opts.subject?.trim();
+  if (subject) body.subject = subject;
+  const note = opts.message?.trim();
+  if (note) body.message = note;
+  if (opts.includePdf === false) body.includePdf = false;
+  return body;
+}
+
+/** Re-email an already-sent quote (POST /quotes/:id/resend). Gated server-side
+ *  on quotes:send. Reuses the quote's EXISTING share link and leaves its status,
+ *  sentAt and number untouched — this is a second copy of the same document, not
+ *  a second issue. Responds with
+ *  `{ data: { quote, emailed, emailReason?, acceptUrl, origin, reissued } }`.
+ *  `origin` says WHY a link was reissued, which matters because the outcomes
+ *  differ: see `QuoteAcceptUrlOrigin`. */
+export function resendQuote(id: string, opts: SendQuoteOptions = {}): Promise<Response> {
+  const body = composerBody(opts);
+  return fetchWithAuth(`/quotes/${id}/resend`, {
+    method: 'POST',
+    ...(Object.keys(body).length > 0 ? { headers: JSON_HEADERS, body: JSON.stringify(body) } : {}),
+  });
+}
+
+/** Record a customer's acceptance on their behalf (POST
+ *  /quotes/:id/accept-on-behalf). Gated server-side on quotes:accept. This
+ *  runs the full conversion: the invoice is numbered and issued now, recurring
+ *  lines become draft contracts, and the partner's auto-email flag is honoured.
+ *  Callers MUST wrap this in `runAction` — see the module header. */
+export function acceptQuoteOnBehalf(id: string, body: AcceptQuoteOnBehalfInput): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/accept-on-behalf`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Record a customer's decline on their behalf (POST
+ *  /quotes/:id/decline-on-behalf, #6634). Gated server-side on quotes:accept;
+ *  only a sent or viewed quote qualifies. Responds with `{ data: <quote> }`.
+ *  Callers MUST wrap this in `runAction` — see the module header. */
+export function declineQuoteOnBehalf(id: string, body: DeclineQuoteOnBehalfInput): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/decline-on-behalf`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify(body),
+  });
+}
+
+/** Fetch a sent quote's customer-facing share link WITHOUT emailing anything
+ *  (GET /quotes/:id/share-link) — for pasting into a chat or SMS by hand. Gated
+ *  server-side on quotes:send (it hands out a live accept credential) and
+ *  audit-logged. Responds with
+ *  `{ data: { acceptUrl, origin, reissued, recipients, orgId } }`. */
+export function getQuoteShareLink(id: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/share-link`);
+}
+
+/** Upload an image for a quote (POST /quotes/:id/images). The body is multipart
+ *  FormData — `fetchWithAuth` deliberately does NOT set a JSON Content-Type for
+ *  FormData so the browser appends the multipart boundary itself. Responds with
+ *  `{ data: { imageId, mime, byteSize } }`. Gated server-side on quotes:write. */
+export function uploadQuoteImage(id: string, file: File): Promise<Response> {
+  const form = new FormData();
+  form.append('file', file);
+  return fetchWithAuth(`/quotes/${id}/images`, { method: 'POST', body: form });
+}
+
+/** Copy an image into a quote from a URL (POST /quotes/:id/images with a JSON
+ *  body). The server fetches + stores the bytes — not a hotlink. Responds with
+ *  the same `{ data: { imageId, mime, byteSize } }` as the multipart upload.
+ *  Gated server-side on quotes:write. */
+export function addQuoteImageFromUrl(id: string, url: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/images`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ url }),
+  });
+}
+
+/** Absolute API path for a quote image (`GET /api/v1/quotes/:id/images/:imageId`).
+ *  The route serves the raw bytes; used as an `<img src>` for the editor preview. */
+export function quoteImageUrl(id: string, imageId: string): string {
+  return `/api/v1/quotes/${id}/images/${imageId}`;
+}
+
+// ---- accept-on-behalf evidence (#6633) -------------------------------------
+
+/** Max evidence file size the API accepts, mirrored here so the web layer can
+ *  reject an oversized pick before ever sending it. */
+export const QUOTE_ACCEPTANCE_EVIDENCE_MAX_BYTES = 10 * 1024 * 1024;
+
+/** MIME types the API accepts for an acceptance-evidence upload. */
+export const QUOTE_ACCEPTANCE_EVIDENCE_ALLOWED_TYPES = ['application/pdf', 'image/png', 'image/jpeg'];
+
+/** Attach (or replace) the evidence file behind an on-behalf acceptance
+ *  (POST /quotes/:id/acceptance/evidence). Multipart FormData — `fetchWithAuth`
+ *  deliberately does NOT set a JSON Content-Type for FormData so the browser
+ *  appends the multipart boundary itself (see `uploadQuoteImage` above). Only
+ *  works when the quote's latest acceptance has origin `on_behalf`; a prior
+ *  file is replaced, not appended to. Gated server-side on quotes:accept.
+ *  Responds with `{ data: { acceptanceId, evidence: { filename, contentType,
+ *  sizeBytes, uploadedAt } } }`. Callers MUST wrap this in `runAction`. */
+export function uploadQuoteAcceptanceEvidence(id: string, file: File): Promise<Response> {
+  const form = new FormData();
+  form.append('file', file);
+  return fetchWithAuth(`/quotes/${id}/acceptance/evidence`, { method: 'POST', body: form });
+}
+
+/** Download an on-behalf acceptance's evidence file (GET
+ *  /quotes/:id/acceptance/evidence). The route streams the file back as an
+ *  attachment. Gated server-side on quotes:read. This is a read, not a
+ *  mutation — callers should NOT wrap it in `runAction`; turn the response
+ *  into a blob and drive a temporary `<a download>` instead. */
+export function downloadQuoteAcceptanceEvidence(id: string): Promise<Response> {
+  return fetchWithAuth(`/quotes/${id}/acceptance/evidence`);
+}

@@ -1,0 +1,555 @@
+/**
+ * AI Hyper-V Backup Tools
+ *
+ * 6 Hyper-V tools for listing VMs, inspecting VM details, and dispatching
+ * VM state, backup, restore, and checkpoint operations.
+ * Each tool wraps existing DB schema with org-scoped isolation.
+ */
+
+import { db } from '../db';
+import { backupJobs, devices, hypervVms } from '../db/schema';
+import { eq, and, desc, inArray, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { CommandTypes } from './commandQueue';
+import { aiQueueCommandForExecution } from './aiDispatch';
+import { resolveBackupConfigForDevice } from './featureConfigResolver';
+import { deviceSiteDenied, deviceIdSiteDenied, resolveSiteAllowedDeviceIds, runFrozenDeviceIds } from './aiToolsSiteScope';
+import { loadSnapshotWithSiteAccess } from './aiToolsBackupShared';
+import {
+  resolveBackupWriteCommandDestination,
+  resolveBackupProviderConfig,
+  resolveBackupDestinationError,
+} from './backupProviderConfig';
+
+function getOrgId(auth: AuthContext): string | null {
+  return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+type HypervHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
+
+// ============================================
+// Helpers
+// ============================================
+
+function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof eq> | any): SQL | undefined {
+  return auth.orgCondition(orgIdCol) ?? undefined;
+}
+
+/** Wrap handler in try-catch so DB/runtime errors return JSON instead of crashing */
+function safeHandler(toolName: string, fn: HypervHandler): HypervHandler {
+  return async (input, auth) => {
+    try {
+      return await fn(input, auth);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal error';
+      console.error(`[hyperv:${toolName}] ${err?.constructor?.name ?? 'Error'}:`, message, err);
+      return JSON.stringify({ error: 'Operation failed. Check server logs for details.' });
+    }
+  };
+}
+
+function clampLimit(value: unknown, fallback = 25, max = 100): number {
+  return Math.min(Math.max(1, Number(value) || fallback), max);
+}
+
+async function loadVmWithAccess(vmId: string, auth: AuthContext) {
+  const vmConditions: SQL[] = [eq(hypervVms.id, vmId)];
+  const vc = orgWhere(auth, hypervVms.orgId);
+  if (vc) vmConditions.push(vc);
+
+  const [vm] = await db
+    .select({
+      id: hypervVms.id,
+      orgId: hypervVms.orgId,
+      deviceId: hypervVms.deviceId,
+      vmId: hypervVms.vmId,
+      vmName: hypervVms.vmName,
+      state: hypervVms.state,
+    })
+    .from(hypervVms)
+    .where(and(...vmConditions))
+    .limit(1);
+
+  if (!vm) return null;
+  // Site axis (app-layer only; RLS does NOT enforce it): the VM resolves to a
+  // host device that may be in a site outside a restricted caller's allowlist.
+  if (await deviceIdSiteDenied(auth, vm.deviceId)) return null;
+  return vm;
+}
+
+// ============================================
+// Register all Hyper-V tools into the aiTools Map
+// ============================================
+
+export function registerHypervTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+  // ============================================
+  // 1. query_hyperv_vms — List discovered Hyper-V VMs
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'backup',
+    searchHint: 'Hyper-V virtual machine inventory, host and power state filters',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'query_hyperv_vms',
+      description: 'List discovered Hyper-V virtual machines in the accessible organization scope.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'Filter to a specific Hyper-V host device UUID' },
+          state: { type: 'string', description: 'Filter by VM state' },
+          limit: { type: 'number', description: 'Max results (default 25, max 100)' },
+        },
+        required: [],
+      },
+    },
+    handler: safeHandler('query_hyperv_vms', async (input, auth) => {
+      const conditions: SQL[] = [];
+      const oc = orgWhere(auth, hypervVms.orgId);
+      if (oc) conditions.push(oc);
+      if (typeof input.deviceId === 'string') conditions.push(eq(hypervVms.deviceId, input.deviceId));
+      if (typeof input.state === 'string') conditions.push(eq(hypervVms.state, input.state));
+
+      // Site axis: narrow to host devices in the caller's allowed sites.
+      const vmsOrgId = getOrgId(auth);
+      // EITHER axis narrows: a device-LESS analysis run carries `allowedDeviceIds`
+      // and no site axis, so an `&&`-gated check no-ops and the list reads
+      // org-wide (#6096 RC3). Without a resolvable org there is no device scan to
+      // do — fall back to the frozen device set rather than skipping narrowing.
+      if (auth.allowedSiteIds || auth.allowedDeviceIds) {
+        const allowed = vmsOrgId
+          ? await resolveSiteAllowedDeviceIds(vmsOrgId, auth)
+          : runFrozenDeviceIds(auth);
+        if (!allowed || allowed.length === 0) return JSON.stringify({ vms: [], showing: 0 });
+        if (typeof input.deviceId === 'string' && !allowed.includes(input.deviceId)) return JSON.stringify({ vms: [], showing: 0 });
+        conditions.push(inArray(hypervVms.deviceId, allowed));
+      }
+
+      const limit = clampLimit(input.limit);
+      const rows = await db
+        .select({
+          id: hypervVms.id,
+          deviceId: hypervVms.deviceId,
+          hostname: devices.hostname,
+          vmId: hypervVms.vmId,
+          vmName: hypervVms.vmName,
+          generation: hypervVms.generation,
+          state: hypervVms.state,
+          memoryMb: hypervVms.memoryMb,
+          processorCount: hypervVms.processorCount,
+          rctEnabled: hypervVms.rctEnabled,
+          hasPassthroughDisks: hypervVms.hasPassthroughDisks,
+          checkpoints: hypervVms.checkpoints,
+          lastDiscoveredAt: hypervVms.lastDiscoveredAt,
+          updatedAt: hypervVms.updatedAt,
+        })
+        .from(hypervVms)
+        .leftJoin(devices, eq(hypervVms.deviceId, devices.id))
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(hypervVms.updatedAt))
+        .limit(limit);
+
+      const vms = rows.map((row) => ({
+        ...row,
+        checkpoints: Array.isArray(row.checkpoints) ? row.checkpoints : [],
+        checkpointCount: Array.isArray(row.checkpoints) ? row.checkpoints.length : 0,
+      }));
+
+      return JSON.stringify({ vms, showing: vms.length });
+    }),
+  });
+
+  // ============================================
+  // 2. get_hyperv_vm_details — Full details for one VM
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'backup',
+    searchHint: 'Hyper-V virtual machine details for one VM record',
+    definition: {
+      name: 'get_hyperv_vm_details',
+      description: 'Get detailed Hyper-V VM information for a specific VM record.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          vmId: { type: 'string', description: 'Hyper-V VM record UUID (required)' },
+        },
+        required: ['vmId'],
+      },
+    },
+    handler: safeHandler('get_hyperv_vm_details', async (input, auth) => {
+      const vmId = input.vmId as string;
+      if (!vmId) return JSON.stringify({ error: 'vmId is required' });
+
+      const vmConditions: SQL[] = [eq(hypervVms.id, vmId)];
+      const vc = orgWhere(auth, hypervVms.orgId);
+      if (vc) vmConditions.push(vc);
+
+      const [vm] = await db
+        .select({
+          id: hypervVms.id,
+          deviceId: hypervVms.deviceId,
+          hostname: devices.hostname,
+          deviceStatus: devices.status,
+          vmId: hypervVms.vmId,
+          vmName: hypervVms.vmName,
+          generation: hypervVms.generation,
+          state: hypervVms.state,
+          vhdPaths: hypervVms.vhdPaths,
+          memoryMb: hypervVms.memoryMb,
+          processorCount: hypervVms.processorCount,
+          rctEnabled: hypervVms.rctEnabled,
+          hasPassthroughDisks: hypervVms.hasPassthroughDisks,
+          checkpoints: hypervVms.checkpoints,
+          notes: hypervVms.notes,
+          lastDiscoveredAt: hypervVms.lastDiscoveredAt,
+          createdAt: hypervVms.createdAt,
+          updatedAt: hypervVms.updatedAt,
+        })
+        .from(hypervVms)
+        .leftJoin(devices, eq(hypervVms.deviceId, devices.id))
+        .where(and(...vmConditions))
+        .limit(1);
+
+      if (!vm) return JSON.stringify({ error: 'VM not found or access denied' });
+      // Site axis: deny VM detail reads for a host device outside the caller's sites.
+      if (await deviceIdSiteDenied(auth, vm.deviceId)) {
+        return JSON.stringify({ error: 'VM not found or access denied' });
+      }
+
+      return JSON.stringify({
+        ...vm,
+        vhdPaths: Array.isArray(vm.vhdPaths) ? vm.vhdPaths : [],
+        checkpoints: Array.isArray(vm.checkpoints) ? vm.checkpoints : [],
+      });
+    }),
+  });
+
+  // ============================================
+  // 3. manage_hyperv_vm — Queue VM power-state command
+  // ============================================
+
+  registerTool({
+    tier: 3,
+    domain: 'backup',
+    searchHint: 'Hyper-V virtual machine power: start, stop, force stop, pause, resume, save',
+    definition: {
+      name: 'manage_hyperv_vm',
+      description: 'Dispatch a Hyper-V VM state command such as start, stop, pause, or resume. Actions: start, stop, force_stop, pause, resume, save.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          vmId: { type: 'string', description: 'Hyper-V VM record UUID (required)' },
+          action: {
+            type: 'string',
+            enum: ['start', 'stop', 'force_stop', 'pause', 'resume', 'save'],
+            description: 'Requested VM state transition',
+          },
+        },
+        required: ['vmId', 'action'],
+      },
+    },
+    handler: safeHandler('manage_hyperv_vm', async (input, auth) => {
+      const vmId = input.vmId as string;
+      const action = input.action as string;
+      if (!vmId || !action) return JSON.stringify({ error: 'vmId and action are required' });
+
+      const vm = await loadVmWithAccess(vmId, auth);
+      if (!vm) return JSON.stringify({ error: 'VM not found or access denied' });
+
+      const { command, error } = await aiQueueCommandForExecution(
+        auth,
+        'manage_hyperv_vm',
+        vm.deviceId,
+        CommandTypes.HYPERV_VM_STATE,
+        { vmName: vm.vmName, targetState: action },
+        { userId: auth.user?.id }
+      );
+
+      if (error) return JSON.stringify({ error });
+
+      return JSON.stringify({
+        success: true,
+        commandId: command?.id,
+        status: command?.status,
+        vmId: vm.id,
+        vmName: vm.vmName,
+        deviceId: vm.deviceId,
+        requestedState: action,
+      });
+    }),
+  });
+
+  // ============================================
+  // 4. trigger_hyperv_backup — Queue VM backup command
+  // ============================================
+
+  registerTool({
+    tier: 3,
+    domain: 'backup',
+    searchHint: 'Hyper-V virtual machine backup with application or crash consistency',
+    definition: {
+      name: 'trigger_hyperv_backup',
+      description: 'Dispatch a Hyper-V VM backup command to provider-backed snapshot storage for a specific VM.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          vmId: { type: 'string', description: 'Hyper-V VM record UUID (required)' },
+          consistencyType: {
+            type: 'string',
+            enum: ['application', 'crash'],
+            description: 'Consistency mode for the backup',
+          },
+        },
+        required: ['vmId'],
+      },
+    },
+    handler: safeHandler('trigger_hyperv_backup', async (input, auth) => {
+      const vmId = input.vmId as string;
+      const consistencyType = (input.consistencyType as string) ?? 'application';
+      if (!vmId) return JSON.stringify({ error: 'vmId is required' });
+
+      const vm = await loadVmWithAccess(vmId, auth);
+      if (!vm) return JSON.stringify({ error: 'VM not found or access denied' });
+
+      const resolvedConfig = await resolveBackupConfigForDevice(vm.deviceId);
+      if (!resolvedConfig?.configId) {
+        return JSON.stringify({ error: 'A provider-backed backup configuration is required on this device' });
+      }
+
+      // D20b follow-up: the helper only builds a manager from the command
+      // payload when it has no agent.yaml backup config (mgr == nil — the
+      // normal state for every policy-managed device); without
+      // provider/providerConfig here the helper fails every AI-dispatched
+      // hyperv_backup with "backup not configured on this device", exactly
+      // like the REST route did before D20b item A.
+      const destinationResult = await resolveBackupWriteCommandDestination(resolvedConfig.configId, vm.orgId);
+      if (!destinationResult.ok) {
+        return JSON.stringify({ error: destinationResult.message });
+      }
+      const { destination } = destinationResult;
+
+      const [backupJob] = await db
+        .insert(backupJobs)
+        .values({
+          orgId: vm.orgId,
+          configId: resolvedConfig.configId,
+          featureLinkId: resolvedConfig.featureLinkId,
+          deviceId: vm.deviceId,
+          status: 'pending',
+          type: 'manual',
+          backupType: 'application',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning({ id: backupJobs.id });
+
+      const { command, error } = await aiQueueCommandForExecution(
+        auth,
+        'trigger_hyperv_backup',
+        vm.deviceId,
+        CommandTypes.HYPERV_BACKUP,
+        {
+          backupJobId: backupJob?.id,
+          configId: resolvedConfig.configId,
+          provider: destination.provider,
+          providerConfig: destination.providerConfig,
+          storageEncryption: destination.storageEncryption,
+          vmName: vm.vmName,
+          consistencyType,
+        },
+        { userId: auth.user?.id }
+      );
+
+      if (error) {
+        if (backupJob?.id) {
+          await db
+            .update(backupJobs)
+            .set({
+              status: 'failed',
+              completedAt: new Date(),
+              updatedAt: new Date(),
+              errorLog: error,
+            })
+            .where(eq(backupJobs.id, backupJob.id));
+        }
+        return JSON.stringify({ error });
+      }
+
+      return JSON.stringify({
+        success: true,
+        commandId: command?.id,
+        backupJobId: backupJob?.id,
+        status: command?.status,
+        vmId: vm.id,
+        vmName: vm.vmName,
+        deviceId: vm.deviceId,
+        consistencyType,
+      });
+    }),
+  });
+
+  // ============================================
+  // 5. restore_hyperv_vm — Queue VM restore command
+  // ============================================
+
+  registerTool({
+    tier: 3,
+    domain: 'backup',
+    searchHint: 'Hyper-V virtual machine recovery and import from a backup snapshot to a host',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'restore_hyperv_vm',
+      description: 'Dispatch a Hyper-V restore/import command from a provider-backed snapshot to a host device.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'Target Hyper-V host device UUID (required)' },
+          snapshotId: { type: 'string', description: 'Provider-backed Hyper-V snapshot identifier (required)' },
+          vmName: { type: 'string', description: 'Optional VM name override' },
+          generateNewId: { type: 'boolean', description: 'Generate a new VM ID during import' },
+        },
+        required: ['deviceId', 'snapshotId'],
+      },
+    },
+    handler: safeHandler('restore_hyperv_vm', async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const snapshotId = input.snapshotId as string;
+      if (!deviceId || !snapshotId) return JSON.stringify({ error: 'deviceId and snapshotId are required' });
+
+      const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+      const dc = orgWhere(auth, devices.orgId);
+      if (dc) deviceConditions.push(dc);
+      const [device] = await db
+        .select({ id: devices.id, siteId: devices.siteId })
+        .from(devices)
+        .where(and(...deviceConditions))
+        .limit(1);
+      if (!device) return JSON.stringify({ error: 'Device not found or access denied' });
+      if (deviceSiteDenied(auth, device.siteId, device.id)) return JSON.stringify({ error: 'Device not found or access denied' });
+
+      // Load the snapshot under org AND site scope (source device site gated),
+      // so a site-restricted caller cannot import a cross-site snapshot onto a
+      // Hyper-V host they legitimately own.
+      const snapshotResult = await loadSnapshotWithSiteAccess(auth, snapshotId);
+      if ('error' in snapshotResult) return JSON.stringify({ error: snapshotResult.error });
+      const snapshot = snapshotResult.snapshot;
+      const metadata =
+        snapshot.metadata && typeof snapshot.metadata === 'object' && !Array.isArray(snapshot.metadata)
+          ? snapshot.metadata as Record<string, unknown>
+          : {};
+      if (metadata.backupKind !== 'hyperv_export') {
+        return JSON.stringify({ error: 'Snapshot is not a Hyper-V export artifact' });
+      }
+
+      // D20b follow-up: the helper builds its read provider from THIS
+      // command's own payload (restoreProviderForCommand), the same way the
+      // REST /hyperv/restore route does — mirroring the destination the
+      // BACKUP command wrote this snapshot to, not whatever the device's
+      // CURRENT config happens to be.
+      const backupProviderConfig = snapshot.configId
+        ? await resolveBackupProviderConfig(snapshot.configId, snapshot.orgId)
+        : null;
+      if (!backupProviderConfig) {
+        const { message } = resolveBackupDestinationError(snapshot.configId);
+        return JSON.stringify({ error: message });
+      }
+
+      const { command, error } = await aiQueueCommandForExecution(
+        auth,
+        'restore_hyperv_vm',
+        deviceId,
+        CommandTypes.HYPERV_RESTORE,
+        {
+          snapshotId: snapshot.providerSnapshotId,
+          vmName: typeof input.vmName === 'string' ? input.vmName : undefined,
+          generateNewId:
+            typeof input.generateNewId === 'boolean'
+              ? input.generateNewId
+              : true,
+          provider: backupProviderConfig.provider,
+          providerConfig: backupProviderConfig.providerConfig,
+        },
+        { userId: auth.user?.id }
+      );
+
+      if (error) return JSON.stringify({ error });
+
+      return JSON.stringify({
+        success: true,
+        commandId: command?.id,
+        status: command?.status,
+        deviceId,
+        snapshotId: snapshot.id,
+        providerSnapshotId: snapshot.providerSnapshotId,
+      });
+    }),
+  });
+
+  // ============================================
+  // 6. manage_hyperv_checkpoints — Queue checkpoint action
+  // ============================================
+
+  registerTool({
+    tier: 2,
+    domain: 'backup',
+    searchHint: 'Hyper-V virtual machine checkpoints: create, delete, apply',
+    definition: {
+      name: 'manage_hyperv_checkpoints',
+      description: 'Dispatch a Hyper-V checkpoint create, delete, or apply command for a specific VM.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          vmId: { type: 'string', description: 'Hyper-V VM record UUID (required)' },
+          action: {
+            type: 'string',
+            enum: ['create', 'delete', 'apply'],
+            description: 'Checkpoint action to perform',
+          },
+          checkpointName: { type: 'string', description: 'Checkpoint name when applicable' },
+        },
+        required: ['vmId', 'action'],
+      },
+    },
+    handler: safeHandler('manage_hyperv_checkpoints', async (input, auth) => {
+      const vmId = input.vmId as string;
+      const action = input.action as string;
+      if (!vmId || !action) return JSON.stringify({ error: 'vmId and action are required' });
+
+      const vm = await loadVmWithAccess(vmId, auth);
+      if (!vm) return JSON.stringify({ error: 'VM not found or access denied' });
+
+      const { command, error } = await aiQueueCommandForExecution(
+        auth,
+        'manage_hyperv_checkpoints',
+        vm.deviceId,
+        CommandTypes.HYPERV_CHECKPOINT,
+        {
+          vmName: vm.vmName,
+          action,
+          checkpointName: typeof input.checkpointName === 'string' ? input.checkpointName : '',
+        },
+        { userId: auth.user?.id }
+      );
+
+      if (error) return JSON.stringify({ error });
+
+      return JSON.stringify({
+        success: true,
+        commandId: command?.id,
+        status: command?.status,
+        vmId: vm.id,
+        vmName: vm.vmName,
+        deviceId: vm.deviceId,
+        action,
+      });
+    }),
+  });
+}

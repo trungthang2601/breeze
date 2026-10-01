@@ -1,0 +1,843 @@
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import {
+  M365_PERMISSION_PROFILES,
+  type CompleteConsentRequest,
+  type CompleteConsentResult,
+} from '@breeze/shared/m365';
+import { and, eq } from 'drizzle-orm';
+import { Hono, type Context } from 'hono';
+import { isM365TenantSyncEnabled } from '../config/env';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { m365Connections } from '../db/schema';
+import {
+  buildClearM365ActionsConsentBindingCookie,
+  buildClearM365ConsentBindingCookie,
+  buildM365ActionsConsentBindingCookie,
+  buildM365ConsentBindingCookie,
+  inspectM365ActionsConsentBindingCookie,
+  inspectM365ConsentBindingCookie,
+  type M365ConsentBrowserBinding,
+  type M365ConsentBindingPhase,
+} from '../services/m365ControlPlane/browserBinding';
+import {
+  applyIdentityVerificationResult,
+  applyUpgradeVerificationResult,
+  markConsentAttemptFailed,
+  transitionAdminConsentToIdentity,
+  transitionUpgradeConsentToIdentity,
+  type M365ConnectionSnapshot,
+  type M365ConsentAttemptSnapshot,
+} from '../services/m365ControlPlane/connectionService';
+import {
+  consumeConsentSession,
+  hashTenantHint,
+  prepareIdentityVerificationSession,
+  readConsentSessionPurpose,
+  type ConsentSessionPurposeLookup,
+  type M365ConsentPurpose,
+  type M365ConsentSession,
+  type M365ConsentSessionProfile,
+  type PreparedIdentityVerificationSession,
+} from '../services/m365ControlPlane/consentSessionService';
+import {
+  createGraphActionsExecutorClient,
+  type GraphActionsExecutorClientConfig,
+} from '../services/m365ControlPlane/graphActionsExecutorClient';
+import {
+  createGraphReadExecutorClient,
+  type GraphReadExecutorClientConfig,
+} from '../services/m365ControlPlane/graphReadExecutorClient';
+import { buildMicrosoftIdentityAuthorizationUrl } from '../services/m365ControlPlane/microsoftAuthorization';
+import { loadM365CustomerGraphReadRuntimeConfig } from '../services/m365ControlPlane/runtimeConfig';
+import { actionsConnectionService } from '../services/m365ControlPlane/writeActionConnectionService';
+import { loadM365CustomerGraphActionsRuntimeConfig } from '../services/m365ControlPlane/writeActionRuntimeConfig';
+import {
+  recordM365CustomerGraphActionsEvent,
+  recordM365CustomerGraphActionsMetric,
+  recordM365CustomerGraphReadEvent,
+  recordM365CustomerGraphReadMetric,
+} from '../services/m365ControlPlane/metrics';
+import { onConnectionConsented, onConnectionUpgraded } from '../services/m365Sync/lifecycle';
+
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** The two M365 profiles that run the two-phase consent callback. */
+type CallbackProfile = M365ConsentSessionProfile;
+
+/** Profile-parameterized snapshot types — one interface, narrowed per instance. */
+type CallbackConnectionSnapshot = M365ConnectionSnapshot<CallbackProfile>;
+type CallbackAttemptSnapshot = M365ConsentAttemptSnapshot<CallbackProfile>;
+
+export type ParsedM365ConsentCallback =
+  | { kind: 'admin_success'; state: string; tenantId: string }
+  | { kind: 'identity_success'; state: string; code: string }
+  | { kind: 'provider_error'; state: string };
+
+function single(params: URLSearchParams, name: string): string | null {
+  const values = params.getAll(name);
+  return values.length === 1 ? values[0]! : null;
+}
+
+function validOpaque(value: string | null, maxLength: number): value is string {
+  return value !== null
+    && value.length > 0
+    && value.length <= maxLength
+    && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+export function parseM365ConsentCallbackQuery(
+  phase: M365ConsentBindingPhase,
+  params: URLSearchParams,
+): ParsedM365ConsentCallback | null {
+  const keys = [...params.keys()];
+  if (new Set(keys).size !== keys.length) return null;
+  const state = single(params, 'state');
+  if (!validOpaque(state, 256)) return null;
+
+  const hasError = params.has('error');
+  const successKeys = phase === 'admin_consent'
+    ? new Set(['state', 'tenant', 'admin_consent'])
+    : new Set(['state', 'code', 'session_state']);
+  const errorKeys = new Set(['state', 'error', 'error_description']);
+
+  if (hasError) {
+    if (keys.some((key) => !errorKeys.has(key))) return null;
+    const error = single(params, 'error');
+    const description = params.has('error_description')
+      ? single(params, 'error_description')
+      : '';
+    if (!validOpaque(error, 128) || description === null || description.length > 4_096) return null;
+    return { kind: 'provider_error', state };
+  }
+
+  if (keys.some((key) => !successKeys.has(key))) return null;
+  if (phase === 'admin_consent') {
+    if (keys.length !== successKeys.size) return null;
+    const tenantId = single(params, 'tenant');
+    // Microsoft's admin-consent endpoint returns `admin_consent=True` in
+    // production (capital T), while some mocks and historical examples use
+    // lowercase `true`. Treat the boolean marker case-insensitively, but keep
+    // rejecting every value other than true.
+    const adminConsent = single(params, 'admin_consent');
+    if (!tenantId || !GUID.test(tenantId) || adminConsent?.toLowerCase() !== 'true') return null;
+    return { kind: 'admin_success', state, tenantId };
+  }
+  const code = single(params, 'code');
+  if (!validOpaque(code, 8_192)) return null;
+  // Entra commonly appends session_state to a successful authorization-code
+  // response. It is not used as authority by Breeze, but validate and accept
+  // the bounded opaque value rather than rejecting Microsoft's normal shape.
+  if (params.has('session_state') && !validOpaque(single(params, 'session_state'), 256)) return null;
+  return { kind: 'identity_success', state, code };
+}
+
+type PublicOutcome =
+  | 'active'
+  | 'degraded'
+  | 'consent_expired'
+  | 'consent_state_mismatch'
+  | 'consent_cancelled'
+  | 'admin_role_required'
+  | 'tenant_mismatch'
+  | 'tenant_already_bound'
+  | 'credential_unavailable'
+  | 'identity_token_invalid'
+  | 'application_token_invalid'
+  | 'grant_reconciliation_unavailable'
+  | 'grant_missing'
+  | 'grant_unexpected'
+  | 'manifest_stale'
+  | 'organization_probe_failed'
+  | 'executor_unavailable';
+
+const PUBLIC_OUTCOMES = new Set<PublicOutcome>([
+  'active', 'degraded', 'consent_expired', 'consent_state_mismatch',
+  'consent_cancelled', 'admin_role_required', 'tenant_mismatch',
+  'tenant_already_bound', 'credential_unavailable', 'identity_token_invalid',
+  'application_token_invalid', 'grant_reconciliation_unavailable', 'grant_missing',
+  'grant_unexpected', 'manifest_stale', 'organization_probe_failed', 'executor_unavailable',
+]);
+interface CallbackRuntimeConfig {
+  clientId: string;
+  callbackUrl: string;
+}
+
+/**
+ * Superset of CallbackRuntimeConfig carrying the executor-signing fields both
+ * the read and actions runtime configs expose. Kept loose (string audience)
+ * so both profile-specific configs satisfy it structurally; the strict
+ * literal audience is only required at the point each concrete executor
+ * client constructor is called.
+ */
+interface CallbackExecutorRuntimeConfig extends CallbackRuntimeConfig {
+  executorUrl: string;
+  executorAudience: string;
+  executorSigningPrivateJwk: Record<string, unknown>;
+  executorSigningKid: string;
+}
+
+interface CallbackExecutorClient {
+  completeIdentityVerification(input: CompleteConsentRequest): Promise<CompleteConsentResult>;
+}
+
+/** The subset of a profile-bound ConnectionService the callback route needs. */
+interface CallbackConnectionServiceLike {
+  markConsentAttemptFailed(
+    input: CallbackAttemptSnapshot,
+    errorCode: string,
+  ): Promise<CallbackConnectionSnapshot>;
+  transitionAdminConsentToIdentity(input: {
+    attempt: CallbackAttemptSnapshot;
+    rawAdminState: string;
+    prepared: PreparedIdentityVerificationSession;
+  }): Promise<{ connection: CallbackConnectionSnapshot; actorId: string }>;
+  applyIdentityVerificationResult(
+    input: CallbackAttemptSnapshot,
+    result: CompleteConsentResult,
+  ): Promise<CallbackConnectionSnapshot>;
+  transitionUpgradeConsentToIdentity(input: {
+    attempt: CallbackAttemptSnapshot;
+    rawAdminState: string;
+    prepared: PreparedIdentityVerificationSession;
+  }): Promise<{ connection: CallbackConnectionSnapshot; actorId: string }>;
+  applyUpgradeVerificationResult(
+    input: CallbackAttemptSnapshot,
+    result: CompleteConsentResult,
+  ): Promise<{ connection: CallbackConnectionSnapshot; failureCode: string | null }>;
+}
+
+interface CallbackEventNames {
+  verificationFailed: string;
+  adminConsentReturned: string;
+  tenantBindingVerified: string;
+  grantDriftDetected: string;
+}
+
+interface CallbackAuditInput {
+  event: string;
+  orgId: string;
+  connectionId: string;
+  profile: CallbackProfile;
+  consentAttemptId: string;
+  manifestVersion?: number;
+  outcome: string;
+  correlationId?: string;
+  verifiedTenantId?: string;
+  actorId?: string;
+}
+
+interface CallbackDependencies {
+  profile: CallbackProfile;
+  redirectBase: string;
+  events: CallbackEventNames;
+  verifyBindingCookie(cookieHeader: string | undefined): M365ConsentBrowserBinding | 'expired' | null;
+  buildBindingCookie(binding: M365ConsentBrowserBinding): string;
+  clearBindingCookie(): string;
+  loadAttempt(binding: M365ConsentBrowserBinding): Promise<CallbackAttemptSnapshot | null>;
+  consumeSession(input: Parameters<typeof consumeConsentSession>[0]): Promise<M365ConsentSession | null>;
+  /**
+   * Reads which flow this callback is resuming without consuming the session.
+   * Needed BEFORE the attempt status is validated, because an upgrade session
+   * expects an executable connection and a first-time session expects
+   * pending-consent/verifying (spec §2.2).
+   */
+  readSessionPurpose(input: ConsentSessionPurposeLookup): Promise<M365ConsentPurpose | null>;
+  transitionUpgradePhase(input: {
+    attempt: CallbackAttemptSnapshot;
+    rawAdminState: string;
+    prepared: PreparedIdentityVerificationSession;
+  }): Promise<{ connection: CallbackConnectionSnapshot; actorId: string }>;
+  applyUpgradeResult(
+    input: CallbackAttemptSnapshot,
+    result: CompleteConsentResult,
+  ): Promise<{ connection: CallbackConnectionSnapshot; failureCode: string | null }>;
+  markAttemptFailed(input: CallbackAttemptSnapshot, outcome: string): Promise<CallbackConnectionSnapshot>;
+  prepareIdentitySession(input: { tenantHint: string }): PreparedIdentityVerificationSession;
+  buildIdentityUrl(input: Parameters<typeof buildMicrosoftIdentityAuthorizationUrl>[0]): string;
+  transitionAdminPhase(input: {
+    attempt: CallbackAttemptSnapshot;
+    rawAdminState: string;
+    prepared: PreparedIdentityVerificationSession;
+  }): Promise<{ connection: CallbackConnectionSnapshot; actorId: string }>;
+  completeIdentity(input: CompleteConsentRequest): Promise<CompleteConsentResult>;
+  applyIdentityResult(input: CallbackAttemptSnapshot, result: CompleteConsentResult): Promise<CallbackConnectionSnapshot>;
+  loadConfig(): CallbackRuntimeConfig;
+  correlationId(): string;
+  audit(c: Context, input: CallbackAuditInput): void;
+  metric(event: string, outcome: PublicOutcome): void;
+  /**
+   * Tenant-sync lifecycle (W05, spec §5.8). A verified first-time/re-consent
+   * seeds the sync; an upgrade that promoted the manifest re-arms domains
+   * parked on needs_consent. No-ops for the actions profile: the sync reads
+   * exclusively through the customer-graph-read connection.
+   */
+  onSyncConsented(conn: { id: string; orgId: string; tenantId: string; status: 'active' | 'degraded' }): Promise<void>;
+  onSyncUpgraded(conn: { id: string; orgId: string }): Promise<void>;
+}
+
+const NO_SYNC_HOOK = async (): Promise<void> => {};
+
+/**
+ * Spec §10.1: every sync entry point is flag-gated, and a Microsoft consent
+ * that actually succeeded must never redirect the administrator to a failure
+ * page because our scheduler had a bad minute. The lifecycle hooks already log
+ * and never throw by contract; this is the belt to that brace, and the ticker's
+ * reconciliation re-seeds on the next tick either way.
+ */
+async function runSyncLifecycleHook(label: string, run: () => Promise<void>): Promise<void> {
+  if (!isM365TenantSyncEnabled()) return;
+  try {
+    await run();
+  } catch (err) {
+    console.error(`[m365ConsentCallback] ${label} failed:`, err);
+  }
+}
+
+/** Fixed per-profile event names — the audit/metric event enums are profile-scoped siblings. */
+const CALLBACK_EVENT_NAMES: Record<CallbackProfile, CallbackEventNames> = {
+  'customer-graph-read': {
+    verificationFailed: 'm365.customer_graph_read.verification_failed',
+    adminConsentReturned: 'm365.customer_graph_read.admin_consent_returned',
+    tenantBindingVerified: 'm365.customer_graph_read.tenant_binding_verified',
+    grantDriftDetected: 'm365.customer_graph_read.grant_drift_detected',
+  },
+  'customer-graph-actions': {
+    verificationFailed: 'm365.customer_graph_actions.verification_failed',
+    adminConsentReturned: 'm365.customer_graph_actions.admin_consent_returned',
+    tenantBindingVerified: 'm365.customer_graph_actions.tenant_binding_verified',
+    grantDriftDetected: 'm365.customer_graph_actions.grant_drift_detected',
+  },
+};
+
+/**
+ * Builds the profile-scoped attempt lookup: the WHERE clause pins both the
+ * connection id AND the profile column, so a binding minted for one profile
+ * can never resolve an attempt row that belongs to the other — even though
+ * the browser-binding cookie itself carries no profile field.
+ */
+function buildLoadAttemptFromBinding(
+  profile: CallbackProfile,
+): (binding: M365ConsentBrowserBinding) => Promise<CallbackAttemptSnapshot | null> {
+  return async function loadAttemptFromBinding(
+    binding: M365ConsentBrowserBinding,
+  ): Promise<CallbackAttemptSnapshot | null> {
+    return runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+      const rows = await db.select().from(m365Connections).where(and(
+        eq(m365Connections.id, binding.connectionId),
+        eq(m365Connections.profile, profile),
+        eq(m365Connections.consentAttemptId, binding.consentAttemptId),
+      )).limit(1);
+      const row = rows[0];
+      if (!row?.orgId || !row.consentAttemptId || row.profile !== profile) return null;
+      return {
+        id: row.id,
+        orgId: row.orgId,
+        profile,
+        consentAttemptId: row.consentAttemptId,
+        status: row.status,
+      };
+    }));
+  };
+}
+
+function completeIdentityWithRuntime(
+  loadRuntimeConfig: () => CallbackExecutorRuntimeConfig,
+  createExecutorClient: (config: CallbackExecutorRuntimeConfig) => CallbackExecutorClient,
+): (input: CompleteConsentRequest) => Promise<CompleteConsentResult> {
+  return (input) => createExecutorClient(loadRuntimeConfig()).completeIdentityVerification(input);
+}
+
+function defaultLoadRuntimeConfig(profile: CallbackProfile): () => CallbackExecutorRuntimeConfig {
+  return profile === 'customer-graph-actions'
+    ? loadM365CustomerGraphActionsRuntimeConfig
+    : loadM365CustomerGraphReadRuntimeConfig;
+}
+
+function defaultCreateExecutorClient(
+  profile: CallbackProfile,
+): (config: CallbackExecutorRuntimeConfig) => CallbackExecutorClient {
+  if (profile === 'customer-graph-actions') {
+    return (config) => createGraphActionsExecutorClient({
+      executorUrl: config.executorUrl,
+      executorAudience: config.executorAudience,
+      signingPrivateJwk: config.executorSigningPrivateJwk,
+      signingKid: config.executorSigningKid,
+    } as GraphActionsExecutorClientConfig);
+  }
+  return (config) => createGraphReadExecutorClient({
+    executorUrl: config.executorUrl,
+    executorAudience: config.executorAudience,
+    signingPrivateJwk: config.executorSigningPrivateJwk,
+    signingKid: config.executorSigningKid,
+  } as GraphReadExecutorClientConfig);
+}
+
+function defaultConnectionService(profile: CallbackProfile): CallbackConnectionServiceLike {
+  return profile === 'customer-graph-actions'
+    ? actionsConnectionService
+    : {
+      markConsentAttemptFailed,
+      transitionAdminConsentToIdentity,
+      applyIdentityVerificationResult,
+      transitionUpgradeConsentToIdentity,
+      applyUpgradeVerificationResult,
+    };
+}
+
+/**
+ * Profile-scoped binding functions. Each profile has its own cookie name,
+ * cookie Path, and HMAC context (see browserBinding.ts) — the actions
+ * instance never builds, clears, or verifies the read instance's cookie
+ * and vice versa, so a browser only ever round-trips the correct cookie to
+ * the correct callback path, and a cross-profile replay fails signature
+ * verification even if forged past Path scoping.
+ */
+function defaultBindingFunctions(profile: CallbackProfile): {
+  inspect: typeof inspectM365ConsentBindingCookie;
+  build: typeof buildM365ConsentBindingCookie;
+  buildClear: typeof buildClearM365ConsentBindingCookie;
+} {
+  return profile === 'customer-graph-actions'
+    ? {
+      inspect: inspectM365ActionsConsentBindingCookie,
+      build: buildM365ActionsConsentBindingCookie,
+      buildClear: buildClearM365ActionsConsentBindingCookie,
+    }
+    : {
+      inspect: inspectM365ConsentBindingCookie,
+      build: buildM365ConsentBindingCookie,
+      buildClear: buildClearM365ConsentBindingCookie,
+    };
+}
+
+function buildDefaultDependencies(
+  profile: CallbackProfile,
+  loadRuntimeConfig: () => CallbackExecutorRuntimeConfig,
+  createExecutorClient: (config: CallbackExecutorRuntimeConfig) => CallbackExecutorClient,
+  connectionService: CallbackConnectionServiceLike,
+): CallbackDependencies {
+  const binding = defaultBindingFunctions(profile);
+  return {
+    profile,
+    redirectBase: `/integrations#m365/${profile}`,
+    events: CALLBACK_EVENT_NAMES[profile],
+    verifyBindingCookie: (header) => {
+      const inspected = binding.inspect(header);
+      if (inspected.status === 'expired') return 'expired';
+      return inspected.status === 'valid' ? inspected.binding : null;
+    },
+    buildBindingCookie: (bound) => binding.build(bound),
+    clearBindingCookie: () => binding.buildClear(),
+    loadAttempt: buildLoadAttemptFromBinding(profile),
+    consumeSession: consumeConsentSession,
+    readSessionPurpose: readConsentSessionPurpose,
+    transitionUpgradePhase: connectionService.transitionUpgradeConsentToIdentity,
+    applyUpgradeResult: connectionService.applyUpgradeVerificationResult,
+    markAttemptFailed: connectionService.markConsentAttemptFailed,
+    prepareIdentitySession: prepareIdentityVerificationSession,
+    buildIdentityUrl: buildMicrosoftIdentityAuthorizationUrl,
+    transitionAdminPhase: connectionService.transitionAdminConsentToIdentity,
+    completeIdentity: completeIdentityWithRuntime(loadRuntimeConfig, createExecutorClient),
+    applyIdentityResult: connectionService.applyIdentityVerificationResult,
+    loadConfig: () => {
+      const config = loadRuntimeConfig();
+      return { clientId: config.clientId, callbackUrl: config.callbackUrl };
+    },
+    correlationId: randomUUID,
+    audit: profile === 'customer-graph-actions' ? recordM365CustomerGraphActionsEvent : recordM365CustomerGraphReadEvent,
+    metric: profile === 'customer-graph-actions' ? recordM365CustomerGraphActionsMetric : recordM365CustomerGraphReadMetric,
+    onSyncConsented: profile === 'customer-graph-read' ? onConnectionConsented : NO_SYNC_HOOK,
+    onSyncUpgraded: profile === 'customer-graph-read' ? onConnectionUpgraded : NO_SYNC_HOOK,
+  };
+}
+
+function constantTimeTextEqual(left: string, right: string): boolean {
+  const a = Buffer.from(left, 'utf8');
+  const b = Buffer.from(right, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function outcomeFromConnection(value: CallbackConnectionSnapshot): PublicOutcome {
+  if (value.status === 'active') return 'active';
+  if (value.status === 'degraded') return 'degraded';
+  return PUBLIC_OUTCOMES.has(value.lastErrorCode as PublicOutcome)
+    ? value.lastErrorCode as PublicOutcome
+    : 'executor_unavailable';
+}
+
+/** Statuses a callback may legally act on, per flow and phase. */
+function statusAllowed(
+  status: string,
+  isUpgrade: boolean,
+  phase: M365ConsentBindingPhase,
+): boolean {
+  // An upgrade never moved the connection, so it is still executable in BOTH
+  // phases. A first-time consent walks pending-consent -> verifying.
+  if (isUpgrade) return status === 'active' || status === 'degraded';
+  return status === (phase === 'admin_consent' ? 'pending-consent' : 'verifying');
+}
+
+/**
+ * An upgrade leaves an executable connection executable even when it fails, so
+ * status alone would report `active` for an approval that granted nothing.
+ * Whether the stored manifest version actually moved is the real outcome.
+ *
+ * `failureCode` is the reason the apply returned in band. It matters because
+ * every upgrade failure is a deliberate no-op on the row: without it a
+ * wrong-tenant or wrong-application consent would be reported to the
+ * administrator with the same generic "manifest is stale" copy as never having
+ * started, and the specific per-cause copy the UI already ships would be
+ * unreachable.
+ */
+function upgradeOutcome(
+  value: CallbackConnectionSnapshot,
+  currentManifestVersion: number,
+  failureCode: string | null,
+): PublicOutcome {
+  if (value.permissionManifestVersion !== currentManifestVersion) {
+    for (const candidate of [failureCode, value.lastErrorCode]) {
+      if (PUBLIC_OUTCOMES.has(candidate as PublicOutcome)) return candidate as PublicOutcome;
+    }
+    return 'manifest_stale';
+  }
+  return outcomeFromConnection(value);
+}
+
+function errorOutcome(error: unknown): PublicOutcome {
+  if (error && typeof error === 'object' && 'code' in error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === 'tenant_already_bound') return 'tenant_already_bound';
+    if (code === 'stale_attempt') return 'consent_state_mismatch';
+  }
+  return 'executor_unavailable';
+}
+
+export interface CreateM365ConsentCallbackRoutesOverrides extends Partial<CallbackDependencies> {
+  /** Full runtime-config loader (superset of `loadConfig`'s clientId/callbackUrl). */
+  loadRuntimeConfig?: () => CallbackExecutorRuntimeConfig;
+  /** Builds the executor client used to complete identity verification. */
+  createExecutorClient?: (config: CallbackExecutorRuntimeConfig) => CallbackExecutorClient;
+  /** Profile-bound connection-lifecycle service (markConsentAttemptFailed / transitionAdminConsentToIdentity / applyIdentityVerificationResult). */
+  connectionService?: CallbackConnectionServiceLike;
+}
+
+export function createM365ConsentCallbackRoutes(
+  overrides: CreateM365ConsentCallbackRoutesOverrides = {},
+): Hono {
+  const profile = overrides.profile ?? 'customer-graph-read';
+  const loadRuntimeConfig = overrides.loadRuntimeConfig ?? defaultLoadRuntimeConfig(profile);
+  const createExecutorClient = overrides.createExecutorClient ?? defaultCreateExecutorClient(profile);
+  const connectionService = overrides.connectionService ?? defaultConnectionService(profile);
+
+  const dependencies: CallbackDependencies = {
+    ...buildDefaultDependencies(profile, loadRuntimeConfig, createExecutorClient, connectionService),
+    ...overrides,
+  };
+  const routes = new Hono();
+  const callbackPath = dependencies.profile === 'customer-graph-actions'
+    ? '/actions-consent/callback'
+    : '/consent/callback';
+  // Full mounted pathname — must match the redirect_uri Microsoft is sent back to
+  // (config.callbackUrl), which microsoftAuthorization.ts's requireRedirectUri
+  // validates against exactly. The read and actions instances mount distinct
+  // suffixes under the same '/m365' base (see index.ts).
+  const expectedCallbackPath = `/api/v1/m365${callbackPath}`;
+
+  routes.get(callbackPath, async (c) => {
+    const correlationId = dependencies.correlationId();
+    const terminalRedirect = (outcome: PublicOutcome) => {
+      c.header('Set-Cookie', dependencies.clearBindingCookie(), { append: true });
+      return c.redirect(`${dependencies.redirectBase}/${outcome}`);
+    };
+    const terminalFailure = (
+      outcome: PublicOutcome,
+      attempt?: CallbackAttemptSnapshot,
+      actorId?: string,
+    ) => {
+      if (attempt) {
+        dependencies.audit(c, {
+          event: dependencies.events.verificationFailed,
+          orgId: attempt.orgId,
+          connectionId: attempt.id,
+          profile: attempt.profile,
+          consentAttemptId: attempt.consentAttemptId,
+          manifestVersion: M365_PERMISSION_PROFILES[dependencies.profile].version,
+          outcome,
+          correlationId,
+          ...(actorId ? { actorId } : {}),
+        });
+      } else {
+        dependencies.metric(dependencies.events.verificationFailed, outcome);
+      }
+      return terminalRedirect(outcome);
+    };
+
+    const binding = dependencies.verifyBindingCookie(c.req.header('cookie'));
+    if (binding === 'expired') {
+      console.warn('[m365ConsentCallback] browser binding expired', {
+        profile: dependencies.profile,
+        correlationId,
+      });
+      return terminalFailure('consent_expired');
+    }
+    if (!binding) {
+      console.warn('[m365ConsentCallback] browser binding missing or invalid', {
+        profile: dependencies.profile,
+        correlationId,
+        cookieHeaderPresent: Boolean(c.req.header('cookie')),
+      });
+      return terminalFailure('consent_state_mismatch');
+    }
+    const parsed = parseM365ConsentCallbackQuery(
+      binding.phase,
+      new URL(c.req.url).searchParams,
+    );
+    if (!parsed || !constantTimeTextEqual(parsed.state, binding.rawState)) {
+      console.warn('[m365ConsentCallback] callback query did not match browser binding', {
+        profile: dependencies.profile,
+        phase: binding.phase,
+        correlationId,
+        parsed: Boolean(parsed),
+      });
+      return terminalFailure('consent_state_mismatch');
+    }
+
+    const purpose = await dependencies.readSessionPurpose({
+      rawState: binding.rawState,
+      phase: binding.phase,
+      connectionId: binding.connectionId,
+      consentAttemptId: binding.consentAttemptId,
+      profile: dependencies.profile,
+    });
+    // A missing session is not an upgrade; the consume below fails it anyway.
+    const isUpgrade = purpose === 'upgrade';
+    const currentManifestVersion = M365_PERMISSION_PROFILES[dependencies.profile].version;
+
+    if (binding.phase === 'admin_consent' && parsed.kind === 'admin_success') {
+      let prepared: PreparedIdentityVerificationSession;
+      let preparedCookie: string;
+      let authorizationUrl: string;
+      try {
+        const config = dependencies.loadConfig();
+        prepared = dependencies.prepareIdentitySession({ tenantHint: parsed.tenantId });
+        preparedCookie = dependencies.buildBindingCookie({
+          phase: 'identity_verification',
+          rawState: prepared.rawState,
+          connectionId: binding.connectionId,
+          consentAttemptId: binding.consentAttemptId,
+          tenantHint: parsed.tenantId,
+        });
+        authorizationUrl = dependencies.buildIdentityUrl({
+          tenantId: parsed.tenantId,
+          clientId: config.clientId,
+          redirectUri: config.callbackUrl,
+          expectedCallbackPath,
+          state: prepared.rawState,
+          nonce: prepared.nonce,
+          codeChallenge: prepared.codeChallenge,
+        });
+      } catch {
+        dependencies.metric(dependencies.events.verificationFailed, 'executor_unavailable');
+        return c.json({ error: 'M365 consent callback temporarily unavailable' }, 503);
+      }
+
+      const attempt = await dependencies.loadAttempt(binding);
+      if (!attempt || !statusAllowed(attempt.status, isUpgrade, binding.phase)) {
+        return terminalFailure('consent_state_mismatch');
+      }
+      let actorId: string;
+      try {
+        const transition = isUpgrade
+          ? dependencies.transitionUpgradePhase
+          : dependencies.transitionAdminPhase;
+        const transitioned = await transition({
+          attempt,
+          rawAdminState: binding.rawState,
+          prepared,
+        });
+        actorId = transitioned.actorId;
+      } catch (error) {
+        if (errorOutcome(error) === 'consent_state_mismatch') {
+          return terminalFailure('consent_state_mismatch', attempt);
+        }
+        dependencies.metric(dependencies.events.verificationFailed, 'executor_unavailable');
+        return c.json({ error: 'M365 consent callback temporarily unavailable' }, 503);
+      }
+
+      c.header('Set-Cookie', preparedCookie, { append: true });
+      dependencies.audit(c, {
+        event: dependencies.events.adminConsentReturned,
+        orgId: attempt.orgId,
+        connectionId: attempt.id,
+        profile: attempt.profile,
+        consentAttemptId: attempt.consentAttemptId,
+        manifestVersion: M365_PERMISSION_PROFILES[dependencies.profile].version,
+        outcome: 'identity_verification_started',
+        correlationId,
+        actorId,
+      });
+      return c.redirect(authorizationUrl);
+    }
+
+    const attempt = await dependencies.loadAttempt(binding);
+    if (!attempt || !statusAllowed(attempt.status, isUpgrade, binding.phase)) {
+      return terminalFailure('consent_state_mismatch');
+    }
+
+    const session = await dependencies.consumeSession({
+      rawState: binding.rawState,
+      phase: binding.phase,
+      connectionId: binding.connectionId,
+      orgId: attempt.orgId,
+      consentAttemptId: binding.consentAttemptId,
+      profile: dependencies.profile,
+    });
+    if (!session) return terminalFailure('consent_state_mismatch', attempt);
+
+    if (parsed.kind === 'provider_error') {
+      // An upgrade must leave the connection exactly as it was — and
+      // markAttemptFailed writes status = 'pending-consent', which would take a
+      // live connection out of service on a CANCEL (spec §2.2).
+      if (!isUpgrade) {
+        try {
+          await dependencies.markAttemptFailed(attempt, 'consent_cancelled');
+        } catch {
+          return terminalFailure('consent_state_mismatch', attempt, session.userId);
+        }
+      }
+      return terminalFailure('consent_cancelled', attempt, session.userId);
+    }
+
+    if (
+      binding.phase !== 'identity_verification'
+      || parsed.kind !== 'identity_success'
+      || !binding.tenantHint
+      || !session.tenantHintHash
+      || !session.nonce
+      || !session.codeVerifier
+    ) return terminalFailure('consent_state_mismatch', attempt, session.userId);
+
+    const actualTenantHash = hashTenantHint(binding.tenantHint);
+    if (!constantTimeTextEqual(actualTenantHash, session.tenantHintHash)) {
+      return terminalFailure('tenant_mismatch', attempt, session.userId);
+    }
+
+    let result: CompleteConsentResult;
+    try {
+      result = await dependencies.completeIdentity({
+        correlationId,
+        consentAttemptId: attempt.consentAttemptId,
+        tenantHint: binding.tenantHint,
+        authorizationCode: parsed.code,
+        codeVerifier: session.codeVerifier,
+        nonce: session.nonce,
+        redirectUri: dependencies.loadConfig().callbackUrl,
+      });
+    } catch {
+      if (!isUpgrade) {
+        try {
+          await dependencies.markAttemptFailed(attempt, 'executor_unavailable');
+        } catch {
+          return terminalFailure('consent_state_mismatch', attempt, session.userId);
+        }
+      }
+      return terminalFailure('executor_unavailable', attempt, session.userId);
+    }
+
+    try {
+      let applied: CallbackConnectionSnapshot;
+      let outcome: PublicOutcome;
+      let upgradeFailureCode: string | null = null;
+      if (isUpgrade) {
+        const upgraded = await dependencies.applyUpgradeResult(attempt, result);
+        applied = upgraded.connection;
+        upgradeFailureCode = upgraded.failureCode;
+        // Spec §5.8: the in-place promotion may have granted the scopes some
+        // domains were parked on needs_consent for; re-arm them. Only when the
+        // apply did not fail in band (a failed upgrade is a deliberate no-op on
+        // the row). Idempotent: it touches only rows that are BOTH unscheduled
+        // and needs_consent, so an approval that granted nothing costs one
+        // indexed UPDATE of zero rows.
+        if (upgradeFailureCode === null) {
+          await runSyncLifecycleHook(
+            `sync re-seed for connection=${attempt.id}`,
+            () => dependencies.onSyncUpgraded({ id: attempt.id, orgId: attempt.orgId }),
+          );
+        }
+        outcome = upgradeOutcome(applied, currentManifestVersion, upgradeFailureCode);
+      } else {
+        applied = await dependencies.applyIdentityResult(attempt, result);
+        // A verified first-time (or re-)consent seeds all six domains due now
+        // at priority 1, for `degraded` as well as `active` — a connection
+        // missing one optional grant still syncs every other domain.
+        const seededStatus = applied.status;
+        const seededTenant = applied.tenantId;
+        if (result.success && seededTenant && (seededStatus === 'active' || seededStatus === 'degraded')) {
+          await runSyncLifecycleHook(
+            `sync seeding for connection=${attempt.id}`,
+            () => dependencies.onSyncConsented({
+              id: attempt.id, orgId: attempt.orgId, tenantId: seededTenant, status: seededStatus,
+            }),
+          );
+        }
+        outcome = outcomeFromConnection(applied);
+      }
+      // An upgrade that did not promote is a FAILED verification even though
+      // the executor reported success and the connection is still executable —
+      // reporting it as tenant_binding_verified would log a wrong-tenant
+      // consent attempt as a verified binding.
+      if (isUpgrade && upgradeFailureCode !== null) {
+        return terminalFailure(outcome, attempt, session.userId);
+      }
+      if (result.success && (applied.status === 'active' || applied.status === 'degraded')) {
+        const driftOutcome = applied.lastErrorCode === 'grant_missing'
+          || applied.lastErrorCode === 'grant_unexpected'
+          || applied.lastErrorCode === 'manifest_stale'
+          ? applied.lastErrorCode
+          : null;
+        const event = {
+          orgId: attempt.orgId,
+          connectionId: attempt.id,
+          profile: attempt.profile,
+          consentAttemptId: attempt.consentAttemptId,
+          manifestVersion: result.manifestVersion,
+          correlationId,
+          verifiedTenantId: result.tenantId,
+          actorId: session.userId,
+        } as const;
+        dependencies.audit(c, {
+          ...event,
+          event: dependencies.events.tenantBindingVerified,
+          outcome,
+        });
+        if (driftOutcome) {
+          dependencies.audit(c, {
+            ...event,
+            event: dependencies.events.grantDriftDetected,
+            outcome: driftOutcome,
+          });
+        }
+        return terminalRedirect(outcome);
+      }
+      return terminalFailure(outcome, attempt, session.userId);
+    } catch (error) {
+      return terminalFailure(errorOutcome(error), attempt, session.userId);
+    }
+  });
+
+  return routes;
+}
+
+export const m365ConsentCallbackRoutes = createM365ConsentCallbackRoutes();
+
+export const m365ActionsConsentCallbackRoutes = createM365ConsentCallbackRoutes({
+  profile: 'customer-graph-actions',
+  loadRuntimeConfig: loadM365CustomerGraphActionsRuntimeConfig,
+  createExecutorClient: (config) => createGraphActionsExecutorClient({
+    executorUrl: config.executorUrl,
+    executorAudience: config.executorAudience,
+    signingPrivateJwk: config.executorSigningPrivateJwk,
+    signingKid: config.executorSigningKid,
+  } as GraphActionsExecutorClientConfig),
+  connectionService: actionsConnectionService,
+});

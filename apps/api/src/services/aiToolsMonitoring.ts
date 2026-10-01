@@ -1,0 +1,692 @@
+/**
+ * AI Monitoring Tools
+ *
+ * 2 monitoring MCP tools for querying and managing network monitors.
+ * Each tool wraps existing DB schema with org-scoped isolation.
+ */
+
+import { db } from '../db';
+import {
+  networkMonitors,
+  networkMonitorResults,
+  networkMonitorAlertRules,
+} from '../db/schema/monitors';
+import { serviceProcessCheckResults } from '../db/schema/serviceProcessMonitoring';
+import { deviceChangeLog, discoveredAssets } from '../db/schema';
+import { eq, and, desc, gte, lte, inArray, sql, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { loadReachability } from './assetReachabilityLoader';
+import {
+  deviceScopeCondition,
+  resolveSiteAllowedDeviceIds,
+  runFrozenDeviceIds,
+  SITE_SCOPE_EMPTY_NOTE,
+} from './aiToolsSiteScope';
+
+type MonitoringHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
+
+// ============================================
+// Helpers
+// ============================================
+
+function getOrgId(auth: AuthContext): string | null {
+  return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof sql.raw> | any): SQL | undefined {
+  return auth.orgCondition(orgIdCol) ?? undefined;
+}
+
+/** Wrap handler in try-catch so DB/runtime errors return JSON instead of crashing */
+function safeHandler(toolName: string, fn: MonitoringHandler): MonitoringHandler {
+  return async (input, auth) => {
+    try {
+      return await fn(input, auth);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal error';
+      console.error(`[monitoring:${toolName}]`, input.action, message, err);
+      return JSON.stringify({ error: 'Operation failed. Check server logs for details.' });
+    }
+  };
+}
+
+// ============================================
+// Register all monitoring tools into the aiTools Map
+// ============================================
+
+export function registerMonitoringTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+  // ============================================
+  // 1. query_monitors — List monitors with status
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'monitoring',
+    searchHint: 'network monitor status, uptime and response times for ping, TCP, HTTP and DNS checks',
+    definition: {
+      name: 'query_monitors',
+      description: 'List network monitors with their current status, uptime, and response time statistics.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          status: { type: 'string', enum: ['online', 'offline', 'degraded', 'unknown'], description: 'Filter by monitor status' },
+          monitorType: { type: 'string', description: 'Filter by monitor type (e.g. icmp_ping, tcp_port, http_check, dns_check)' },
+          isActive: { type: 'boolean', description: 'Filter by active/inactive state' },
+          search: { type: 'string', description: 'Search by name or target (case-insensitive partial match)' },
+          limit: { type: 'number', description: 'Max results to return (default 25, max 100)' },
+        },
+        required: [],
+      },
+    },
+    handler: safeHandler('query_monitors', async (input, auth) => {
+      const conditions: SQL[] = [];
+      const oc = orgWhere(auth, networkMonitors.orgId);
+      if (oc) conditions.push(oc);
+
+      if (typeof input.status === 'string') {
+        conditions.push(eq(networkMonitors.lastStatus, input.status as any));
+      }
+      if (typeof input.monitorType === 'string') {
+        conditions.push(eq(networkMonitors.monitorType, input.monitorType as any));
+      }
+      if (typeof input.isActive === 'boolean') {
+        conditions.push(eq(networkMonitors.isActive, input.isActive));
+      }
+      if (typeof input.search === 'string' && input.search.trim()) {
+        const term = input.search.trim().replace(/[\\%_]/g, '\\$&');
+        conditions.push(
+          sql`(${networkMonitors.name} ILIKE ${'%' + term + '%'} OR ${networkMonitors.target} ILIKE ${'%' + term + '%'})`
+        );
+      }
+
+      const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
+
+      // Site axis (app-layer only; RLS does NOT enforce it). networkMonitors is
+      // not device-linked — its site is the linked discovered asset's site
+      // (mirrors hasMonitorSiteAccess in routes/monitors.ts). A site-restricted
+      // caller only sees monitors whose asset lives in an allowed site;
+      // monitors with no asset (siteId null) are denied (fail closed).
+      const allowedSites = auth.allowedSiteIds;
+      const siteRestricted = !!(allowedSites && auth.canAccessSite);
+      if (siteRestricted) {
+        if (allowedSites!.length === 0) {
+          return JSON.stringify({ monitors: [], showing: 0, scopeNote: SITE_SCOPE_EMPTY_NOTE });
+        }
+        conditions.push(inArray(discoveredAssets.siteId, allowedSites!));
+      }
+
+      // Exact-device axis (#6086). A monitor's device is its linked asset's
+      // `linkedDeviceId`; scoped by site alone, a device-bound agent run saw
+      // every sibling device's monitors — and the device-LESS analysis shape
+      // (allowedDeviceIds, no allowedSiteIds) skipped the site branch above
+      // entirely. Independent of the site flag for exactly that reason.
+      const frozenDeviceIds = runFrozenDeviceIds(auth);
+      const deviceRestricted = frozenDeviceIds !== null;
+      if (deviceRestricted) {
+        if (frozenDeviceIds!.length === 0) {
+          return JSON.stringify({ monitors: [], showing: 0, scopeNote: SITE_SCOPE_EMPTY_NOTE });
+        }
+        conditions.push(deviceScopeCondition(auth, discoveredAssets.linkedDeviceId)!);
+      }
+      const joinAssets = siteRestricted || deviceRestricted;
+
+      const selection = {
+        id: networkMonitors.id,
+        name: networkMonitors.name,
+        monitorType: networkMonitors.monitorType,
+        target: networkMonitors.target,
+        isActive: networkMonitors.isActive,
+        lastChecked: networkMonitors.lastChecked,
+        lastStatus: networkMonitors.lastStatus,
+        lastResponseMs: networkMonitors.lastResponseMs,
+        consecutiveFailures: networkMonitors.consecutiveFailures,
+        pollingInterval: networkMonitors.pollingInterval,
+        assetId: networkMonitors.assetId,
+      };
+
+      // Unrestricted callers take the exact pre-existing query (no join).
+      const scopedRows = joinAssets
+        ? await db.select({ ...selection, assetDeviceId: discoveredAssets.linkedDeviceId })
+          .from(networkMonitors)
+          .leftJoin(discoveredAssets, eq(networkMonitors.assetId, discoveredAssets.id))
+          .where(and(...conditions))
+          .orderBy(desc(networkMonitors.updatedAt))
+          .limit(limit)
+        : await db.select(selection).from(networkMonitors)
+          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .orderBy(desc(networkMonitors.updatedAt))
+          .limit(limit);
+
+      // Post-fetch counterpart of the SQL narrowing: makes the guard observable
+      // and fails CLOSED on a monitor whose asset has no linked device — an
+      // unattributable monitor is not this run's device (mirrors the
+      // fail-closed assetless handling on the site axis). `assetDeviceId` is an
+      // authorization column only, so it is dropped from the tool's output.
+      type MonitorRow = { [K in keyof typeof selection]: (typeof selection)[K]['_']['data'] };
+      const rows = (scopedRows as Array<MonitorRow & { assetDeviceId?: string | null }>)
+        .filter((r) => !deviceRestricted
+          || (typeof r.assetDeviceId === 'string' && frozenDeviceIds!.includes(r.assetDeviceId)))
+        .map(({ assetDeviceId: _assetDeviceId, ...rest }): MonitorRow => rest as MonitorRow);
+
+      // W01 (spec §4.4): never phrase a monitor's verdict as the DEVICE's
+      // state. A failing HTTP check on a reachable host is a TLS problem, not
+      // an outage, and the agent used to have no way to tell them apart.
+      const assetIds = rows.map((r) => r.assetId).filter((id): id is string => Boolean(id));
+      const reachabilityByAsset = await loadReachability(assetIds);
+
+      return JSON.stringify({
+        monitors: rows.map((row) => {
+          const r = row.assetId ? reachabilityByAsset.get(row.assetId) : undefined;
+          return {
+            ...row,
+            assetReachability: r ? { state: r.state, source: r.source, observedAt: r.observedAt } : null,
+          };
+        }),
+        showing: rows.length,
+      });
+    }),
+  });
+
+  // ============================================
+  // 2. manage_monitors — CRUD + history
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'monitoring',
+    searchHint: 'network monitors: get check history, create, update, delete',
+    definition: {
+      name: 'manage_monitors',
+      description: 'Get monitor details with recent check history, or create/update/delete monitors. Actions: get, create, update, delete.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          action: { type: 'string', enum: ['get', 'create', 'update', 'delete'], description: 'The action to perform' },
+          monitorId: { type: 'string', description: 'Monitor UUID (required for get/update/delete)' },
+          assetId: { type: 'string', description: 'Discovered-asset UUID to bind the monitor to (sets its site scope). Required for site-restricted users on create.' },
+          name: { type: 'string', description: 'Monitor name (for create/update)' },
+          monitorType: { type: 'string', description: 'Monitor type: icmp_ping, tcp_port, http_check, dns_check (for create)' },
+          target: { type: 'string', description: 'Target host/URL (for create/update)' },
+          pollingInterval: { type: 'number', description: 'Polling interval in seconds (for create/update)' },
+          timeout: { type: 'number', description: 'Timeout in seconds (for create/update)' },
+          config: { type: 'object', description: 'Monitor-specific configuration (for create/update)' },
+          isActive: { type: 'boolean', description: 'Enable or disable the monitor (for create/update)' },
+          limit: { type: 'number', description: 'Max recent check results to return (for get, default 50)' },
+        },
+        required: ['action'],
+      },
+    },
+    handler: safeHandler('manage_monitors', async (input, auth) => {
+      const action = input.action as string;
+      const orgId = getOrgId(auth);
+
+      /**
+       * Site-axis check for a loaded monitor (app-layer; RLS does NOT enforce
+       * site isolation). Mirrors hasMonitorSiteAccess in routes/monitors.ts:
+       * resolve the monitor's linked asset's siteId, then check canAccessSite.
+       * A monitor with no linked asset is denied for a site-restricted caller
+       * (fail-closed — same as query_monitors list handler ~101-113).
+       * Unrestricted callers (canAccessSite undefined) always pass.
+       */
+      async function assertMonitorSiteAccess(
+        monitor: { id: string; assetId: string | null; orgId: string | null },
+      ): Promise<boolean> {
+        // #5291 W04 — `network_monitors.org_id` is nullable now (org XOR
+        // partner). A partner-wide row is always a compiled artefact of a
+        // `network_check` monitor definition: it has no org axis to authorize
+        // on and is owned by the compiler, so this org-axis AI surface refuses
+        // it outright rather than falling through to the unrestricted-caller
+        // short-circuit below. Read and edit it through the monitor editor.
+        if (monitor.orgId === null) return false;
+        // Exact-device axis (#6086): a device-bound run may only reach the
+        // monitor bound to ITS device. Checked alongside the site axis because
+        // the device-LESS analysis shape has no site axis to check.
+        const frozenDeviceIds = runFrozenDeviceIds(auth);
+        if (!auth.canAccessSite && !frozenDeviceIds) return true; // unrestricted caller
+        if (!monitor.assetId) return false;   // no asset → fail-closed
+        const [asset] = await db
+          .select({ siteId: discoveredAssets.siteId, linkedDeviceId: discoveredAssets.linkedDeviceId })
+          .from(discoveredAssets)
+          .where(and(eq(discoveredAssets.id, monitor.assetId), eq(discoveredAssets.orgId, monitor.orgId)))
+          .limit(1);
+        if (!asset) return false;
+        if (frozenDeviceIds
+          && (typeof asset.linkedDeviceId !== 'string' || !frozenDeviceIds.includes(asset.linkedDeviceId))) {
+          return false;
+        }
+        if (!auth.canAccessSite) return true; // device axis satisfied, no site axis
+        return typeof asset.siteId === 'string' && auth.canAccessSite(asset.siteId);
+      }
+
+      if (action === 'get') {
+        if (!input.monitorId) return JSON.stringify({ error: 'monitorId is required' });
+
+        const conditions: SQL[] = [eq(networkMonitors.id, input.monitorId as string)];
+        const oc = orgWhere(auth, networkMonitors.orgId);
+        if (oc) conditions.push(oc);
+
+        const [monitor] = await db.select().from(networkMonitors).where(and(...conditions)).limit(1);
+        if (!monitor) return JSON.stringify({ error: 'Monitor not found or access denied' });
+
+        // Site-axis gate — deny same as "not found" (no oracle).
+        if (!(await assertMonitorSiteAccess(monitor))) {
+          return JSON.stringify({ error: 'Monitor not found or access denied' });
+        }
+
+        // Get recent check results
+        const historyLimit = Math.min(Math.max(1, Number(input.limit) || 50), 100);
+        const results = await db.select({
+          id: networkMonitorResults.id,
+          status: networkMonitorResults.status,
+          responseMs: networkMonitorResults.responseMs,
+          statusCode: networkMonitorResults.statusCode,
+          error: networkMonitorResults.error,
+          details: networkMonitorResults.details,
+          timestamp: networkMonitorResults.timestamp,
+        }).from(networkMonitorResults)
+          .where(eq(networkMonitorResults.monitorId, monitor.id))
+          .orderBy(desc(networkMonitorResults.timestamp))
+          .limit(historyLimit);
+
+        // Get alert rules
+        const rules = await db.select({
+          id: networkMonitorAlertRules.id,
+          condition: networkMonitorAlertRules.condition,
+          threshold: networkMonitorAlertRules.threshold,
+          severity: networkMonitorAlertRules.severity,
+          message: networkMonitorAlertRules.message,
+          isActive: networkMonitorAlertRules.isActive,
+        }).from(networkMonitorAlertRules)
+          .where(eq(networkMonitorAlertRules.monitorId, monitor.id));
+
+        return JSON.stringify({ monitor, recentResults: results, alertRules: rules });
+      }
+
+      if (action === 'create') {
+        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        if (!input.name) return JSON.stringify({ error: 'name is required' });
+        if (!input.monitorType) return JSON.stringify({ error: 'monitorType is required' });
+        if (!input.target) return JSON.stringify({ error: 'target is required' });
+
+        const assetId = typeof input.assetId === 'string' && input.assetId ? input.assetId : null;
+
+        // Validate the asset binding belongs to the caller's org (fail closed
+        // on a cross-org assetId) before it can set the monitor's site scope.
+        if (assetId) {
+          const [asset] = await db
+            .select({ id: discoveredAssets.id })
+            .from(discoveredAssets)
+            .where(and(eq(discoveredAssets.id, assetId), eq(discoveredAssets.orgId, orgId)))
+            .limit(1);
+          if (!asset) return JSON.stringify({ error: 'Asset not found or access denied' });
+        }
+
+        // Site-axis gate on create (SR5-08): a site-restricted caller MUST bind
+        // the monitor to an asset in a site they can access. Fail closed if
+        // unbound — an assetless monitor has no site, and the worker would then
+        // pick an arbitrary org agent to probe an arbitrary target across sites.
+        // Unrestricted callers pass regardless (assertMonitorSiteAccess short-
+        // circuits when auth.canAccessSite is undefined).
+        if (!(await assertMonitorSiteAccess({ id: 'new', assetId, orgId }))) {
+          return JSON.stringify({
+            error:
+              'Site-restricted users must bind the monitor to an asset in an accessible site (provide assetId).',
+          });
+        }
+
+        const [monitor] = await db.insert(networkMonitors).values({
+          orgId,
+          assetId,
+          name: input.name as string,
+          monitorType: input.monitorType as 'icmp_ping' | 'tcp_port' | 'http_check' | 'dns_check',
+          target: input.target as string,
+          config: (input.config as Record<string, unknown>) ?? {},
+          pollingInterval: typeof input.pollingInterval === 'number' ? input.pollingInterval : 60,
+          timeout: typeof input.timeout === 'number' ? input.timeout : 5,
+          isActive: typeof input.isActive === 'boolean' ? input.isActive : true,
+        }).returning();
+
+        return JSON.stringify({ success: true, monitorId: monitor?.id, name: monitor?.name });
+      }
+
+      if (action === 'update') {
+        if (!input.monitorId) return JSON.stringify({ error: 'monitorId is required' });
+
+        const conditions: SQL[] = [eq(networkMonitors.id, input.monitorId as string)];
+        const oc = orgWhere(auth, networkMonitors.orgId);
+        if (oc) conditions.push(oc);
+
+        const [existing] = await db.select().from(networkMonitors).where(and(...conditions)).limit(1);
+        if (!existing) return JSON.stringify({ error: 'Monitor not found or access denied' });
+
+        // Site-axis gate — deny same as "not found" (no oracle).
+        if (!(await assertMonitorSiteAccess(existing))) {
+          return JSON.stringify({ error: 'Monitor not found or access denied' });
+        }
+
+        // #5291 W04 — a compiled `network_check` row is owned by the monitor
+        // compiler; a side edit here would survive only until the next compile.
+        if (existing.managedByMonitorId) {
+          return JSON.stringify({
+            error: 'network_monitor_managed_by_monitor',
+            monitorId: existing.managedByMonitorId,
+          });
+        }
+
+        const updates: Record<string, unknown> = { updatedAt: new Date() };
+        if (typeof input.name === 'string') updates.name = input.name;
+        if (typeof input.target === 'string') updates.target = input.target;
+        if (typeof input.pollingInterval === 'number') updates.pollingInterval = input.pollingInterval;
+        if (typeof input.timeout === 'number') updates.timeout = input.timeout;
+        if (input.config !== undefined) updates.config = input.config;
+        if (typeof input.isActive === 'boolean') updates.isActive = input.isActive;
+
+        await db.update(networkMonitors).set(updates).where(eq(networkMonitors.id, existing.id));
+        return JSON.stringify({ success: true, message: `Monitor "${existing.name}" updated` });
+      }
+
+      if (action === 'delete') {
+        if (!input.monitorId) return JSON.stringify({ error: 'monitorId is required' });
+
+        const conditions: SQL[] = [eq(networkMonitors.id, input.monitorId as string)];
+        const oc = orgWhere(auth, networkMonitors.orgId);
+        if (oc) conditions.push(oc);
+
+        const [existing] = await db.select().from(networkMonitors).where(and(...conditions)).limit(1);
+        if (!existing) return JSON.stringify({ error: 'Monitor not found or access denied' });
+
+        // Site-axis gate — deny same as "not found" (no oracle).
+        if (!(await assertMonitorSiteAccess(existing))) {
+          return JSON.stringify({ error: 'Monitor not found or access denied' });
+        }
+
+        // #5291 W04 — a compiled `network_check` row is owned by the monitor
+        // compiler; a side edit here would survive only until the next compile.
+        if (existing.managedByMonitorId) {
+          return JSON.stringify({
+            error: 'network_monitor_managed_by_monitor',
+            monitorId: existing.managedByMonitorId,
+          });
+        }
+
+        // Cascade delete handles results and alert rules via FK onDelete: 'cascade'
+        await db.delete(networkMonitors).where(eq(networkMonitors.id, existing.id));
+        return JSON.stringify({ success: true, message: `Monitor "${existing.name}" deleted` });
+      }
+
+      return JSON.stringify({ error: `Unknown action: ${action}` });
+    }),
+  });
+
+  // ============================================
+  // 3. get_service_monitoring_status — Service/process watcher status
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    deviceArgs: ['deviceId'],
+    domain: 'monitoring',
+    searchHint: 'service and process watchers: status, summary, results, known services',
+    definition: {
+      name: 'get_service_monitoring_status',
+      description: 'Query service and process monitoring status for managed devices. Actions: status (health overview), summary (latest result per watcher), results (check history), known_services (autocomplete).',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          action: { type: 'string', enum: ['status', 'summary', 'results', 'known_services'], description: 'The action to perform' },
+          deviceId: { type: 'string', description: 'Device UUID (required for status/summary)' },
+          watchType: { type: 'string', enum: ['service', 'process'], description: 'Filter by watch type (for results/known_services)' },
+          name: { type: 'string', description: 'Filter by service/process name (for results)' },
+          since: { type: 'string', description: 'ISO datetime — return results after this time (for results)' },
+          until: { type: 'string', description: 'ISO datetime — return results before this time (for results)' },
+          search: { type: 'string', description: 'Search by name (case-insensitive, for known_services)' },
+          limit: { type: 'number', description: 'Max results (default 100, max 500)' },
+        },
+        required: ['action'],
+      },
+    },
+    handler: safeHandler('get_service_monitoring_status', async (input, auth) => {
+      const action = input.action as string;
+      const orgId = getOrgId(auth);
+
+      if (action === 'status') {
+        if (!input.deviceId) return JSON.stringify({ error: 'deviceId is required for status action' });
+        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        const deviceId = input.deviceId as string;
+
+        const allResults = await db
+          .select({ watchType: serviceProcessCheckResults.watchType, name: serviceProcessCheckResults.name, status: serviceProcessCheckResults.status })
+          .from(serviceProcessCheckResults)
+          .where(and(eq(serviceProcessCheckResults.deviceId, deviceId), eq(serviceProcessCheckResults.orgId, orgId)))
+          .orderBy(desc(serviceProcessCheckResults.timestamp))
+          .limit(500);
+
+        const seen = new Set<string>();
+        const latestStatuses: string[] = [];
+        for (const r of allResults) {
+          const key = `${r.watchType}:${r.name}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          latestStatuses.push(r.status);
+        }
+
+        const runningCount = latestStatuses.filter(s => s === 'running').length;
+        const notRunningCount = latestStatuses.filter(s => s !== 'running').length;
+        const totalCount = latestStatuses.length;
+
+        let healthStatus = 'healthy';
+        if (totalCount === 0) healthStatus = 'unknown';
+        else if (notRunningCount > 0 && runningCount === 0) healthStatus = 'critical';
+        else if (notRunningCount > 0) healthStatus = 'degraded';
+
+        return JSON.stringify({ deviceId, healthStatus, runningCount, notRunningCount, totalCount });
+      }
+
+      if (action === 'summary') {
+        if (!input.deviceId) return JSON.stringify({ error: 'deviceId is required for summary action' });
+        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        const deviceId = input.deviceId as string;
+
+        const allResults = await db
+          .select()
+          .from(serviceProcessCheckResults)
+          .where(and(eq(serviceProcessCheckResults.deviceId, deviceId), eq(serviceProcessCheckResults.orgId, orgId)))
+          .orderBy(desc(serviceProcessCheckResults.timestamp))
+          .limit(500);
+
+        // Deduplicate to latest per (watchType, name)
+        const seen = new Set<string>();
+        const latest = allResults.filter(r => {
+          const key = `${r.watchType}:${r.name}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+
+        return JSON.stringify({
+          data: latest.map(r => ({
+            id: r.id,
+            deviceId: r.deviceId,
+            watchType: r.watchType,
+            name: r.name,
+            status: r.status,
+            cpuPercent: r.cpuPercent,
+            memoryMb: r.memoryMb,
+            pid: r.pid,
+            details: r.details,
+            autoRestartAttempted: r.autoRestartAttempted,
+            autoRestartSucceeded: r.autoRestartSucceeded,
+            timestamp: r.timestamp.toISOString(),
+          })),
+        });
+      }
+
+      if (action === 'results') {
+        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+
+        const conditions: SQL[] = [eq(serviceProcessCheckResults.orgId, orgId)];
+        if (typeof input.deviceId === 'string') conditions.push(eq(serviceProcessCheckResults.deviceId, input.deviceId));
+        if (typeof input.watchType === 'string') conditions.push(eq(serviceProcessCheckResults.watchType, input.watchType as 'service' | 'process'));
+        if (typeof input.name === 'string') conditions.push(eq(serviceProcessCheckResults.name, input.name));
+        if (typeof input.since === 'string') conditions.push(gte(serviceProcessCheckResults.timestamp, new Date(input.since)));
+        if (typeof input.until === 'string') conditions.push(lte(serviceProcessCheckResults.timestamp, new Date(input.until)));
+
+        // Site axis (app-layer only; RLS does NOT enforce it). Without a
+        // caller-supplied deviceId this path enumerates check results org-wide,
+        // so narrow a site-restricted caller to its in-scope device-id set.
+        // (A caller-supplied deviceId is already org+site gated centrally via
+        // `deviceArgs` → enforceDeviceArgs; this intersects with it.)
+        if (auth.allowedSiteIds && auth.canAccessSite) {
+          const allowed = await resolveSiteAllowedDeviceIds(orgId, auth);
+          if (!allowed || allowed.length === 0) {
+            return JSON.stringify({ data: [], showing: 0, scopeNote: SITE_SCOPE_EMPTY_NOTE });
+          }
+          conditions.push(inArray(serviceProcessCheckResults.deviceId, allowed));
+        }
+
+        // Exact-device axis, applied independently of the site axis: a
+        // device-LESS analysis run carries `allowedDeviceIds` with NO
+        // `allowedSiteIds`, so the branch above no-ops for it (#6086).
+        const resultsDeviceCondition = deviceScopeCondition(auth, serviceProcessCheckResults.deviceId);
+        if (resultsDeviceCondition) conditions.push(resultsDeviceCondition);
+
+        const limit = Math.min(Math.max(1, Number(input.limit) || 100), 500);
+
+        const results = await db
+          .select()
+          .from(serviceProcessCheckResults)
+          .where(and(...conditions))
+          .orderBy(desc(serviceProcessCheckResults.timestamp))
+          .limit(limit);
+
+        return JSON.stringify({
+          data: results.map(r => ({
+            id: r.id,
+            deviceId: r.deviceId,
+            watchType: r.watchType,
+            name: r.name,
+            status: r.status,
+            cpuPercent: r.cpuPercent,
+            memoryMb: r.memoryMb,
+            pid: r.pid,
+            details: r.details,
+            autoRestartAttempted: r.autoRestartAttempted,
+            autoRestartSucceeded: r.autoRestartSucceeded,
+            timestamp: r.timestamp.toISOString(),
+          })),
+          showing: results.length,
+        });
+      }
+
+      if (action === 'known_services') {
+        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+
+        // Site axis (app-layer only; RLS does NOT enforce it). Both name sources
+        // below are derived per-device org-wide, so narrow a site-restricted
+        // caller to its in-scope device-id set (empty set ⇒ empty result).
+        let siteAllowedDeviceIds: string[] | null = null;
+        if (auth.allowedSiteIds && auth.canAccessSite) {
+          siteAllowedDeviceIds = await resolveSiteAllowedDeviceIds(orgId, auth);
+          if (!siteAllowedDeviceIds || siteAllowedDeviceIds.length === 0) {
+            return JSON.stringify({ data: [], scopeNote: SITE_SCOPE_EMPTY_NOTE });
+          }
+        }
+
+        // Normalize service names by stripping per-user/per-device hex suffixes
+        const normalizeServiceName = (name: string): string =>
+          name.replace(/_[a-f0-9]{4,}$/i, '');
+
+        // Source 1: Distinct service names from device change log
+        const changeLogConditions: SQL[] = [eq(deviceChangeLog.orgId, orgId), eq(deviceChangeLog.changeType, 'service')];
+        if (siteAllowedDeviceIds) changeLogConditions.push(inArray(deviceChangeLog.deviceId, siteAllowedDeviceIds));
+        // Exact-device axis, applied independently of the site axis (#6086).
+        const changeLogDeviceCondition = deviceScopeCondition(auth, deviceChangeLog.deviceId);
+        if (changeLogDeviceCondition) changeLogConditions.push(changeLogDeviceCondition);
+        let changeLogNames: { subject: string }[] = [];
+        try {
+          changeLogNames = await db
+            .select({ subject: deviceChangeLog.subject })
+            .from(deviceChangeLog)
+            .where(and(...changeLogConditions))
+            .groupBy(deviceChangeLog.subject)
+            .limit(1000);
+        } catch (err) {
+          // Tolerate missing-table environments (older self-hosted schemas) as
+          // an empty source; any other DB error must surface as a tool error
+          // (via safeHandler / the aiAgentSdkTools catch), not a silent empty.
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('does not exist')) throw err;
+        }
+
+        // Source 2: Distinct service/process names from check results
+        const checkNameConditions: SQL[] = [eq(serviceProcessCheckResults.orgId, orgId)];
+        if (siteAllowedDeviceIds) checkNameConditions.push(inArray(serviceProcessCheckResults.deviceId, siteAllowedDeviceIds));
+        // Exact-device axis, applied independently of the site axis (#6086).
+        const checkNameDeviceCondition = deviceScopeCondition(auth, serviceProcessCheckResults.deviceId);
+        if (checkNameDeviceCondition) checkNameConditions.push(checkNameDeviceCondition);
+        let checkNames: { name: string; watchType: string }[] = [];
+        try {
+          checkNames = await db
+            .select({
+              name: serviceProcessCheckResults.name,
+              watchType: serviceProcessCheckResults.watchType,
+            })
+            .from(serviceProcessCheckResults)
+            .where(and(...checkNameConditions))
+            .groupBy(serviceProcessCheckResults.name, serviceProcessCheckResults.watchType)
+            .limit(500);
+        } catch (err) {
+          // Same policy as the change-log source: only missing-table errors are
+          // tolerated as an empty source; everything else surfaces as a tool error.
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!msg.includes('does not exist')) throw err;
+        }
+
+        const seen = new Set<string>();
+        const results: { name: string; source: string; watchType: string | null }[] = [];
+
+        for (const row of changeLogNames) {
+          const normalized = normalizeServiceName(row.subject);
+          const key = normalized.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          results.push({ name: normalized, source: 'change_log', watchType: 'service' });
+        }
+
+        for (const row of checkNames) {
+          const normalized = normalizeServiceName(row.name);
+          const key = normalized.toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          results.push({ name: normalized, source: 'check_results', watchType: row.watchType });
+        }
+
+        // Filter by watchType if provided
+        let filtered = results;
+        if (typeof input.watchType === 'string') {
+          filtered = filtered.filter(r => r.watchType === input.watchType);
+        }
+
+        // Filter by search term
+        if (typeof input.search === 'string' && input.search.trim()) {
+          const term = (input.search as string).toLowerCase();
+          filtered = filtered.filter(r => r.name.toLowerCase().includes(term));
+        }
+
+        // Sort alphabetically and limit
+        filtered.sort((a, b) => a.name.localeCompare(b.name));
+        const limit = Math.min(Math.max(1, Number(input.limit) || 200), 500);
+        if (filtered.length > limit) filtered = filtered.slice(0, limit);
+
+        return JSON.stringify({ data: filtered });
+      }
+
+      return JSON.stringify({ error: `Unknown action: ${action}` });
+    }),
+  });
+}

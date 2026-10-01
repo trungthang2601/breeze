@@ -1,0 +1,10 @@
+---
+import DashboardLayout from '../../../layouts/DashboardLayout.astro';
+import NetworkDeviceDetailPage from '../../../components/devices/NetworkDeviceDetailPage';
+
+const { id } = Astro.params;
+---
+
+<DashboardLayout titleKey="titles.devicesNetworkDetail">
+  <NetworkDeviceDetailPage assetId={id!} client:load />
+</DashboardLayout>

@@ -1,0 +1,680 @@
+import { useState, useMemo, useCallback } from 'react';
+import {
+  Search,
+  RefreshCw,
+  Play,
+  Square,
+  ChevronDown,
+  ChevronRight,
+  AlertTriangle,
+  AlertCircle,
+  Loader2,
+  Monitor,
+  ChevronLeft
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { useTranslation } from 'react-i18next';
+import '@/lib/i18n';
+
+export type ServiceStatus = 'Running' | 'Stopped' | 'Paused' | 'Starting' | 'Stopping';
+export type StartupType = 'Automatic' | 'Manual' | 'Disabled' | 'Automatic (Delayed)';
+
+export type WindowsService = {
+  name: string;
+  displayName: string;
+  status: ServiceStatus;
+  startupType: StartupType;
+  account: string;
+  description?: string;
+  path?: string;
+  dependencies?: string[];
+  dependentServices?: string[];
+};
+
+export type ServicesManagerProps = {
+  deviceId: string;
+  deviceName?: string;
+  deviceOs?: 'windows' | 'macos' | 'linux';
+  services?: WindowsService[];
+  loading?: boolean;
+  /**
+   * Reason the last service-list fetch failed, or null/undefined for none.
+   * Rendered INSTEAD of the empty state so an offline device's 503 can never
+   * fall through and read as "No Services Available" (mirrors ProcessManager
+   * post-#4935).
+   */
+  loadError?: string | null;
+  onRefresh?: () => void;
+  onStartService?: (name: string) => Promise<void>;
+  onStopService?: (name: string) => Promise<void>;
+  onRestartService?: (name: string) => Promise<void>;
+  onChangeStartupType?: (name: string, startupType: string) => Promise<void>;
+};
+
+type SortField = 'name' | 'displayName' | 'status' | 'startupType' | 'account';
+type SortDirection = 'asc' | 'desc';
+
+const statusColors: Record<ServiceStatus, string> = {
+  Running: 'bg-success/15 text-success border-success/30',
+  Stopped: 'bg-destructive/15 text-destructive border-destructive/30',
+  Paused: 'bg-warning/15 text-warning border-warning/30',
+  Starting: 'bg-blue-500/20 text-blue-700 border-blue-500/40',
+  Stopping: 'bg-blue-500/20 text-blue-700 border-blue-500/40'
+};
+
+const startupTypeColors: Record<StartupType, string> = {
+  Automatic: 'bg-success/15 text-success border-success/30',
+  'Automatic (Delayed)': 'bg-success/15 text-success border-success/30',
+  Manual: 'bg-muted text-muted-foreground border-border',
+  Disabled: 'bg-destructive/15 text-destructive border-destructive/30'
+};
+
+const startupTypeOptions: StartupType[] = ['Automatic', 'Automatic (Delayed)', 'Manual', 'Disabled'];
+
+// The Breeze agent's own service name per platform
+export const AGENT_SERVICE_NAMES = new Set([
+  'breezeagent',       // Windows (case-insensitive match)
+  'breeze-agent',      // Linux systemd
+  'com.breeze.agent',  // macOS launchd
+]);
+
+export function isAgentService(name: string): boolean {
+  return AGENT_SERVICE_NAMES.has(name.toLowerCase());
+}
+
+export default function ServicesManager({
+  deviceId,
+  deviceName = 'Unknown Device',
+  deviceOs = 'windows',
+  services = [],
+  loading = false,
+  loadError,
+  onRefresh,
+  onStartService,
+  onStopService,
+  onRestartService,
+  onChangeStartupType
+}: ServicesManagerProps) {
+  const { t } = useTranslation('remote');
+  const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'Running' | 'Stopped'>('all');
+  const [sortField, setSortField] = useState<SortField>('displayName');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
+  const [expandedService, setExpandedService] = useState<string | null>(null);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [confirmAction, setConfirmAction] = useState<{
+    type: 'start' | 'stop' | 'restart';
+    serviceName: string;
+    serviceDisplayName: string;
+  } | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const pageSize = 10;
+
+  // Filter and sort services
+  const filteredServices = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+
+    let result = services.filter(service => {
+      const matchesQuery =
+        normalizedQuery.length === 0 ||
+        service.name.toLowerCase().includes(normalizedQuery) ||
+        service.displayName.toLowerCase().includes(normalizedQuery);
+
+      const matchesStatus =
+        statusFilter === 'all' || service.status === statusFilter;
+
+      return matchesQuery && matchesStatus;
+    });
+
+    // Sort
+    result = [...result].sort((a, b) => {
+      let comparison = 0;
+      const aValue = a[sortField];
+      const bValue = b[sortField];
+
+      if (typeof aValue === 'string' && typeof bValue === 'string') {
+        comparison = aValue.localeCompare(bValue);
+      }
+
+      return sortDirection === 'asc' ? comparison : -comparison;
+    });
+
+    return result;
+  }, [services, query, statusFilter, sortField, sortDirection]);
+
+  // Pagination
+  const totalPages = Math.ceil(filteredServices.length / pageSize);
+  const startIndex = (currentPage - 1) * pageSize;
+  const paginatedServices = filteredServices.slice(startIndex, startIndex + pageSize);
+
+  const handleSort = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(prev => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortDirection('asc');
+    }
+  };
+
+  const handleAction = useCallback(
+    async (type: 'start' | 'stop' | 'restart', serviceName: string) => {
+      setActionLoading(serviceName);
+      setConfirmAction(null);
+
+      try {
+        if (type === 'start' && onStartService) {
+          await onStartService(serviceName);
+        } else if (type === 'stop' && onStopService) {
+          await onStopService(serviceName);
+        } else if (type === 'restart' && onRestartService) {
+          await onRestartService(serviceName);
+        }
+      } catch (error) {
+        console.error(`Failed to ${type} service:`, error);
+      } finally {
+        setActionLoading(null);
+      }
+    },
+    [onStartService, onStopService, onRestartService]
+  );
+
+  const handleStartupTypeChange = useCallback(
+    async (serviceName: string, newStartupType: string) => {
+      if (!onChangeStartupType) return;
+
+      setActionLoading(serviceName);
+      try {
+        await onChangeStartupType(serviceName, newStartupType);
+      } catch (error) {
+        console.error('Failed to change startup type:', error);
+      } finally {
+        setActionLoading(null);
+      }
+    },
+    [onChangeStartupType]
+  );
+
+  const toggleExpanded = (serviceName: string) => {
+    setExpandedService(prev => (prev === serviceName ? null : serviceName));
+  };
+
+  const SortableHeader = ({
+    field,
+    children
+  }: {
+    field: SortField;
+    children: React.ReactNode;
+  }) => (
+    <th
+      className="px-4 py-3 cursor-pointer hover:bg-muted/60 select-none"
+      onClick={() => handleSort(field)}
+    >
+      <div className="flex items-center gap-1">
+        {children}
+        {sortField === field && (
+          <ChevronDown
+            className={cn('h-4 w-4 transition-transform', sortDirection === 'desc' && 'rotate-180')}
+          />
+        )}
+      </div>
+    </th>
+  );
+
+  // Show Windows-only alert for non-Windows devices
+  if (deviceOs !== 'windows') {
+    return (
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        <div className="flex items-center gap-3 rounded-md border border-yellow-500/40 bg-yellow-500/10 p-4">
+          <AlertTriangle className="h-5 w-5 text-yellow-600" />
+          <div>
+            <h3 className="font-medium text-yellow-700">{t('servicesManager.windowsOnlyTitle')}</h3>
+            <p className="text-sm text-yellow-600">
+              {t('servicesManager.windowsOnlyDescription', { device: deviceName, os: deviceOs === 'macos' ? 'macOS' : 'Linux' })}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border bg-card p-6 shadow-xs">
+      {/* Header */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-3">
+          <Monitor className="h-5 w-5 text-muted-foreground" />
+          <div>
+            <h2 className="text-lg font-semibold">{t('servicesManager.title')}</h2>
+            <p className="text-sm text-muted-foreground">
+              {/* A failed fetch must not report counts that were never
+                  actually fetched (same fix as ProcessManager's tiles, #4935). */}
+              {t('servicesManager.summary', {
+                shown: loadError ? '-' : filteredServices.length,
+                total: loadError ? '-' : services.length,
+                device: deviceName
+              })}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          {/* Search */}
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="search"
+              placeholder={t('servicesManager.searchPlaceholder')}
+              value={query}
+              onChange={e => {
+                setQuery(e.target.value);
+                setCurrentPage(1);
+              }}
+              className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-56"
+            />
+          </div>
+
+          {/* Status Filter */}
+          <select
+            value={statusFilter}
+            onChange={e => {
+              setStatusFilter(e.target.value as 'all' | 'Running' | 'Stopped');
+              setCurrentPage(1);
+            }}
+            className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-32"
+          >
+            <option value="all">{t('servicesManager.allStatus')}</option>
+            <option value="Running">{t('servicesManager.status.running')}</option>
+            <option value="Stopped">{t('servicesManager.status.stopped')}</option>
+          </select>
+
+          {/* Refresh Button */}
+          <button
+            type="button"
+            onClick={onRefresh}
+            disabled={loading}
+            className="flex h-10 items-center justify-center gap-2 rounded-md border bg-background px-4 text-sm font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
+            <span className="hidden sm:inline">{t('common:actions.refresh')}</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Confirmation Dialog */}
+      {confirmAction && isAgentService(confirmAction.serviceName) && confirmAction.type === 'stop' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
+            <h3 className="text-lg font-semibold">{t('servicesManager.actionBlocked')}</h3>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t('servicesManager.agentStopBlocked')}
+            </p>
+            <div className="mt-4 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmAction(null)}
+                className="rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted"
+              >
+                {t('servicesManager.ok')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {confirmAction && isAgentService(confirmAction.serviceName) && confirmAction.type === 'restart' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
+            <h3 className="text-lg font-semibold">{t('servicesManager.confirmAction')}</h3>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t('servicesManager.agentRestartConfirm')}
+            </p>
+            <div className="mt-4 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmAction(null)}
+                className="rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted"
+              >
+                {t('common:actions.cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAction(confirmAction.type, confirmAction.serviceName)}
+                className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+              >
+                {t('servicesManager.restartService')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {confirmAction && !isAgentService(confirmAction.serviceName) && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
+            <h3 className="text-lg font-semibold">{t('servicesManager.confirmAction')}</h3>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {t('servicesManager.serviceConfirm', { action: t(/* i18n-dynamic */ `servicesManager.action.${confirmAction.type}`), service: confirmAction.serviceDisplayName })}
+            </p>
+            <div className="mt-4 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmAction(null)}
+                className="rounded-md border px-4 py-2 text-sm font-medium hover:bg-muted"
+              >
+                {t('common:actions.cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAction(confirmAction.type, confirmAction.serviceName)}
+                className={cn(
+                  'rounded-md px-4 py-2 text-sm font-medium text-white',
+                  confirmAction.type === 'stop'
+                    ? 'bg-red-600 hover:bg-red-700'
+                    : 'bg-blue-600 hover:bg-blue-700'
+                )}
+              >
+                {confirmAction.type === 'start'
+                  ? t('servicesManager.startService')
+                  : confirmAction.type === 'stop'
+                    ? t('servicesManager.stopService')
+                    : t('servicesManager.restartService')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Table */}
+      <div className="mt-6 overflow-x-auto rounded-md border">
+        <table className="min-w-full divide-y">
+          <thead className="bg-muted/40">
+            <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              <th className="w-8 px-4 py-3"></th>
+              <SortableHeader field="name">{t('common:labels.name')}</SortableHeader>
+              <SortableHeader field="displayName">{t('servicesManager.displayName')}</SortableHeader>
+              <SortableHeader field="status">{t('common:labels.status')}</SortableHeader>
+              <SortableHeader field="startupType">{t('servicesManager.startup')}</SortableHeader>
+              <SortableHeader field="account">{t('servicesManager.account')}</SortableHeader>
+              <th className="px-4 py-3">{t('common:labels.actions')}</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {loading ? (
+              <tr>
+                <td colSpan={7} className="px-4 py-12 text-center">
+                  <Loader2 className="mx-auto h-6 w-6 animate-spin text-muted-foreground" />
+                  <p className="mt-2 text-sm text-muted-foreground">{t('servicesManager.loading')}</p>
+                </td>
+              </tr>
+            ) : loadError ? (
+              // Checked BEFORE the empty state so a failed fetch (e.g. an
+              // offline device's 503) can never fall through and read as "No
+              // Services Available" (#4935-style regression, same fix as
+              // ProcessManager).
+              <tr>
+                <td colSpan={7} className="px-4 py-12 text-center">
+                  <div className="flex flex-col items-center gap-2">
+                    <AlertCircle className="h-8 w-8 text-red-500" />
+                    <p className="text-sm text-red-500">{loadError}</p>
+                    <button
+                      type="button"
+                      onClick={onRefresh}
+                      className="text-xs text-primary hover:underline"
+                    >
+                      {t('common:actions.retry')}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ) : paginatedServices.length === 0 ? (
+              <tr>
+                <td colSpan={7} className="px-4 py-12 text-center">
+                  <Monitor className="mx-auto h-8 w-8 text-muted-foreground/50" />
+                  <p className="mt-2 text-sm font-medium text-muted-foreground">
+                    {services.length === 0
+                      ? t('servicesManager.noServicesAvailable')
+                      : t('servicesManager.noServicesFound')}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground/70">
+                    {services.length === 0
+                      ? t('servicesManager.refreshHint')
+                      : t('servicesManager.adjustHint')}
+                  </p>
+                </td>
+              </tr>
+            ) : (
+              paginatedServices.map(service => (
+                <>
+                  <tr
+                    key={service.name}
+                    onClick={() => toggleExpanded(service.name)}
+                    className="cursor-pointer transition hover:bg-muted/40"
+                  >
+                    <td className="px-4 py-3">
+                      <ChevronRight
+                        className={cn(
+                          'h-4 w-4 text-muted-foreground transition-transform',
+                          expandedService === service.name && 'rotate-90'
+                        )}
+                      />
+                    </td>
+                    <td className="px-4 py-3 text-sm font-mono">{service.name}</td>
+                    <td className="px-4 py-3 text-sm font-medium">{service.displayName}</td>
+                    <td className="px-4 py-3 text-sm">
+                      <span
+                        className={cn(
+                          'inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium',
+                          statusColors[service.status]
+                        )}
+                      >
+                        {service.status}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-sm">
+                      <span
+                        className={cn(
+                          'inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium',
+                          startupTypeColors[service.startupType]
+                        )}
+                      >
+                        {service.startupType}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-sm text-muted-foreground">{service.account}</td>
+                    <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
+                      <div className="flex items-center gap-1">
+                        {actionLoading === service.name ? (
+                          <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                        ) : (
+                          <>
+                            {/* Start Button */}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setConfirmAction({
+                                  type: 'start',
+                                  serviceName: service.name,
+                                  serviceDisplayName: service.displayName
+                                })
+                              }
+                              disabled={service.status === 'Running' || service.startupType === 'Disabled'}
+                              title={t('servicesManager.startService')}
+                              className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted disabled:cursor-not-allowed disabled:opacity-30"
+                            >
+                              <Play className="h-4 w-4 text-green-600" />
+                            </button>
+
+                            {/* Stop Button */}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setConfirmAction({
+                                  type: 'stop',
+                                  serviceName: service.name,
+                                  serviceDisplayName: service.displayName
+                                })
+                              }
+                              disabled={service.status === 'Stopped' || isAgentService(service.name)}
+                              title={isAgentService(service.name) ? t('servicesManager.cannotStopAgent') : t('servicesManager.stopService')}
+                              className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted disabled:cursor-not-allowed disabled:opacity-30"
+                            >
+                              <Square className="h-4 w-4 text-red-600" />
+                            </button>
+
+                            {/* Restart Button */}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setConfirmAction({
+                                  type: 'restart',
+                                  serviceName: service.name,
+                                  serviceDisplayName: service.displayName
+                                })
+                              }
+                              disabled={service.status === 'Stopped' || service.startupType === 'Disabled'}
+                              title={t('servicesManager.restartService')}
+                              className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted disabled:cursor-not-allowed disabled:opacity-30"
+                            >
+                              <RefreshCw className="h-4 w-4 text-blue-600" />
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+
+                  {/* Expanded Details Panel */}
+                  {expandedService === service.name && (
+                    <tr key={`${service.name}-details`} className="bg-muted/20">
+                      <td colSpan={7} className="px-4 py-4">
+                        <div className="grid gap-4 sm:grid-cols-2">
+                          {/* Description */}
+                          <div>
+                            <h4 className="text-xs font-semibold uppercase text-muted-foreground">
+                              {t('common:labels.description')}
+                            </h4>
+                            <p className="mt-1 text-sm">
+                              {service.description || t('servicesManager.noDescription')}
+                            </p>
+                          </div>
+
+                          {/* Executable Path */}
+                          <div>
+                            <h4 className="text-xs font-semibold uppercase text-muted-foreground">
+                              {t('servicesManager.executablePath')}
+                            </h4>
+                            <p className="mt-1 break-all font-mono text-xs">
+                              {service.path || 'N/A'}
+                            </p>
+                          </div>
+
+                          {/* Dependencies */}
+                          <div>
+                            <h4 className="text-xs font-semibold uppercase text-muted-foreground">
+                              {t('servicesManager.dependencies')}
+                            </h4>
+                            <div className="mt-1">
+                              {service.dependencies && service.dependencies.length > 0 ? (
+                                <div className="flex flex-wrap gap-1">
+                                  {service.dependencies.map(dep => (
+                                    <span
+                                      key={dep}
+                                      className="rounded bg-muted px-2 py-0.5 text-xs"
+                                    >
+                                      {dep}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : (
+                                <span className="text-sm text-muted-foreground">{t('common:labels.none')}</span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Dependent Services */}
+                          <div>
+                            <h4 className="text-xs font-semibold uppercase text-muted-foreground">
+                              {t('servicesManager.dependentServices')}
+                            </h4>
+                            <div className="mt-1">
+                              {service.dependentServices && service.dependentServices.length > 0 ? (
+                                <div className="flex flex-wrap gap-1">
+                                  {service.dependentServices.map(dep => (
+                                    <span
+                                      key={dep}
+                                      className="rounded bg-muted px-2 py-0.5 text-xs"
+                                    >
+                                      {dep}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : (
+                                <span className="text-sm text-muted-foreground">{t('common:labels.none')}</span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Change Startup Type */}
+                          <div className="sm:col-span-2">
+                            <h4 className="text-xs font-semibold uppercase text-muted-foreground">
+                              {t('servicesManager.changeStartupType')}
+                            </h4>
+                            <div className="mt-2 flex items-center gap-2">
+                              <select
+                                value={service.startupType}
+                                onChange={e => handleStartupTypeChange(service.name, e.target.value)}
+                                disabled={actionLoading === service.name}
+                                className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {startupTypeOptions.map(option => (
+                                  <option key={option} value={option}>
+                                    {option}
+                                  </option>
+                                ))}
+                              </select>
+                              {actionLoading === service.name && (
+                                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="mt-4 flex items-center justify-between">
+          <p className="text-sm text-muted-foreground">
+            {t('servicesManager.showing', { start: startIndex + 1, end: Math.min(startIndex + pageSize, filteredServices.length), total: filteredServices.length })}
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+              disabled={currentPage === 1}
+              className="flex h-9 w-9 items-center justify-center rounded-md border hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+            <span className="text-sm">
+              {t('servicesManager.page', { current: currentPage, total: totalPages })}
+            </span>
+            <button
+              type="button"
+              onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+              disabled={currentPage === totalPages}
+              className="flex h-9 w-9 items-center justify-center rounded-md border hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

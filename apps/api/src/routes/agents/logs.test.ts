@@ -1,0 +1,422 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
+
+const AGENT_ID = 'agent-001';
+const DEVICE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const ORG_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+// ---------------------------------------------------------------------------
+// Mocks
+// ---------------------------------------------------------------------------
+
+vi.mock('../../db', () => ({
+  db: {
+    select: vi.fn(),
+    insert: vi.fn(),
+  },
+  runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
+  withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+}));
+
+vi.mock('../../db/schema', () => ({
+  devices: {
+    id: 'id',
+    agentId: 'agent_id',
+    orgId: 'org_id',
+  },
+  agentLogs: {
+    deviceId: 'device_id',
+    orgId: 'org_id',
+    timestamp: 'timestamp',
+    level: 'level',
+    component: 'component',
+    message: 'message',
+    fields: 'fields',
+    agentVersion: 'agent_version',
+  },
+}));
+
+vi.mock('../../services/auditEvents', () => ({
+  writeAuditEvent: vi.fn(),
+}));
+
+import { db } from '../../db';
+import { writeAuditEvent } from '../../services/auditEvents';
+import { logsRoutes } from './logs';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function mockDeviceLookup(found: boolean) {
+  vi.mocked(db.select).mockReturnValueOnce({
+    from: vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({
+        limit: vi
+          .fn()
+          .mockResolvedValue(
+            found ? [{ id: DEVICE_ID, agentId: AGENT_ID, orgId: ORG_ID }] : []
+          ),
+      }),
+    }),
+  } as any);
+}
+
+function mockInsertSuccess() {
+  const values = vi.fn().mockResolvedValue(undefined);
+  vi.mocked(db.insert).mockReturnValue({
+    values,
+  } as any);
+  return values;
+}
+
+// The route inserts in batches of 100. This lets the FIRST batch land and the
+// SECOND batch throw, so we exercise the partial-insert path (some rows in,
+// some lost) while the swallowed error still leaves an ingest-audit trail.
+function mockInsertPartial() {
+  const values = vi
+    .fn()
+    .mockResolvedValueOnce(undefined) // first 100-row batch succeeds
+    .mockRejectedValueOnce(new Error('insert failed for batch 2'));
+  vi.mocked(db.insert).mockReturnValue({ values } as any);
+  return values;
+}
+
+// Every batch insert throws → inserted stays 0.
+function mockInsertFailure() {
+  const values = vi.fn().mockRejectedValue(new Error('insert failed'));
+  vi.mocked(db.insert).mockReturnValue({ values } as any);
+  return values;
+}
+
+function makeLogEntry(overrides: Partial<Record<string, unknown>> = {}) {
+  return {
+    timestamp: '2026-05-01T00:00:00.000Z',
+    level: 'info',
+    component: 'test',
+    message: 'hello',
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('agent logs routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = new Hono();
+    app.route('/agents', logsRoutes);
+  });
+
+  it('clamps excessive future event time and records server-authored provenance', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-01T12:00:00.000Z'));
+    try {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          logs: [makeLogEntry({
+            timestamp: '2099-01-01T00:00:00.000Z',
+            fields: { sequence: 7, timestampClamped: false },
+          })],
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(values).toHaveBeenCalledWith([
+        expect.objectContaining({
+          timestamp: new Date('2026-05-01T12:00:00.000Z'),
+          fields: {
+            sequence: 7,
+            originalTimestamp: '2099-01-01T00:00:00.000Z',
+            timestampClamped: true,
+          },
+        }),
+      ]);
+      expect(writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        details: expect.objectContaining({ timestampClampedCount: 1 }),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('strips agent-forged clamp provenance from a row the server did not clamp', async () => {
+    // redactAgentLogFields redacts values but preserves unknown keys, so an
+    // agent shipping its own timestampClamped/originalTimestamp on an ordinary
+    // in-window row would otherwise fabricate server-authored provenance.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-01T12:00:00.000Z'));
+    try {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          logs: [makeLogEntry({
+            timestamp: '2026-05-01T11:59:00.000Z',
+            fields: {
+              sequence: 7,
+              timestampClamped: true,
+              originalTimestamp: '2099-01-01T00:00:00.000Z',
+            },
+          })],
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      const row = values.mock.calls[0]![0][0];
+      expect(row.timestamp).toEqual(new Date('2026-05-01T11:59:00.000Z'));
+      expect(row.fields).toEqual({ sequence: 7 });
+      expect(row.fields).not.toHaveProperty('timestampClamped');
+      expect(row.fields).not.toHaveProperty('originalTimestamp');
+      expect(writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        details: expect.not.objectContaining({ timestampClampedCount: expect.anything() }),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores an agent-supplied createdAt — receipt time is server-assigned', async () => {
+    mockDeviceLookup(true);
+    const values = mockInsertSuccess();
+
+    const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        logs: [makeLogEntry({ createdAt: '2099-01-01T00:00:00.000Z' })],
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const row = values.mock.calls[0]![0][0];
+    // Nothing named createdAt reaches the insert; the column defaults to now()
+    // in the database, so an agent cannot pre-date or post-date its receipt.
+    expect(row).not.toHaveProperty('createdAt');
+  });
+
+  describe('POST /agents/:id/logs — batch size limit', () => {
+    it('accepts a batch with exactly 200 entries (at the cap)', async () => {
+      mockDeviceLookup(true);
+      mockInsertSuccess();
+
+      const logs = Array.from({ length: 200 }, () => makeLogEntry());
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs }),
+      });
+
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.received).toBe(200);
+    });
+
+    it('rejects a batch with 250 entries (over the 200 cap)', async () => {
+      // No device lookup — request should be rejected by Zod before DB.
+      const logs = Array.from({ length: 250 }, () => makeLogEntry());
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/invalid request body/i);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /agents/:id/logs — body size limit', () => {
+    it('rejects payloads larger than 256 KB with 413', async () => {
+      // Build a payload that's >256KB on the wire. Three entries × ~100KB
+      // message each = ~300KB JSON total.
+      const bigMessage = 'x'.repeat(100 * 1024);
+      const logs = Array.from({ length: 3 }, () =>
+        makeLogEntry({ message: bigMessage })
+      );
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs }),
+      });
+
+      expect(res.status).toBe(413);
+      const body = await res.json();
+      expect(body.error).toMatch(/too large/i);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    it('accepts payloads under 256 KB', async () => {
+      mockDeviceLookup(true);
+      mockInsertSuccess();
+
+      // ~45KB total — well under the 256KB cap. Each message stays under
+      // the per-entry 10000-char Zod limit.
+      const logs = Array.from({ length: 5 }, () =>
+        makeLogEntry({ message: 'a'.repeat(9 * 1024) })
+      );
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs }),
+      });
+
+      expect(res.status).toBe(201);
+    });
+
+    it('redacts secrets before storing log rows', async () => {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          logs: [
+            makeLogEntry({
+              message: 'install failed token=raw-token password=hunter2',
+              fields: {
+                apiKey: 'raw-api-key',
+                nested: { authPassword: 'raw-auth-password' },
+                output: 'Authorization: Bearer raw-bearer-token',
+              },
+            }),
+          ],
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(values).toHaveBeenCalledWith([
+        expect.objectContaining({
+          message: 'install failed token=[REDACTED] password=[REDACTED]',
+          fields: {
+            apiKey: '[REDACTED]',
+            nested: { authPassword: '[REDACTED]' },
+            output: 'Authorization: Bearer [REDACTED]',
+          },
+        }),
+      ]);
+    });
+  });
+
+  describe('POST /agents/:id/logs — ingest audit (Finding #9)', () => {
+    it('writes a content-free agent.logs.submit audit event on ingest', async () => {
+      mockDeviceLookup(true);
+      mockInsertSuccess();
+
+      const logs = Array.from({ length: 3 }, () =>
+        makeLogEntry({ message: 'secret token=abc123' })
+      );
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(writeAuditEvent).toHaveBeenCalledTimes(1);
+      const [, event] = vi.mocked(writeAuditEvent).mock.calls[0]!;
+      expect(event).toMatchObject({
+        orgId: ORG_ID,
+        actorType: 'agent',
+        actorId: AGENT_ID,
+        action: 'agent.logs.submit',
+        resourceType: 'device',
+        resourceId: DEVICE_ID,
+        details: { submittedCount: 3, insertedCount: 3 },
+      });
+      // Content-free: no log message contents leak into the audit details.
+      expect(JSON.stringify(event.details)).not.toContain('token=');
+      // partialFailure omitted on a fully-successful insert.
+      expect(event.details).not.toHaveProperty('partialFailure');
+    });
+
+    it('still writes the ingest audit with partialFailure when some rows fail to insert', async () => {
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      mockDeviceLookup(true);
+      mockInsertPartial();
+
+      // 150 entries → two batches (100 + 50). The 100-row batch lands, the
+      // 50-row batch throws, so 100 are inserted and 50 are lost.
+      const logs = Array.from({ length: 150 }, () =>
+        makeLogEntry({ message: 'secret token=abc123' })
+      );
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs }),
+      });
+
+      // Partial success → 207 with the inserted/total split.
+      expect(res.status).toBe(207);
+      expect(await res.json()).toEqual({ received: 100, total: 150, partial: true });
+
+      // The ingest audit STILL fires on partial failure, carrying the reduced
+      // insertedCount and the partialFailure shortfall.
+      expect(writeAuditEvent).toHaveBeenCalledTimes(1);
+      const [, event] = vi.mocked(writeAuditEvent).mock.calls[0]!;
+      expect(event).toMatchObject({
+        orgId: ORG_ID,
+        actorType: 'agent',
+        actorId: AGENT_ID,
+        action: 'agent.logs.submit',
+        resourceType: 'device',
+        resourceId: DEVICE_ID,
+        details: { submittedCount: 150, insertedCount: 100, partialFailure: 50 },
+      });
+      // Content-free even on the failure path.
+      expect(JSON.stringify(event.details)).not.toContain('token=');
+
+      consoleError.mockRestore();
+    });
+
+    it('writes the ingest audit and returns 500 when every insert fails (inserted === 0)', async () => {
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      mockDeviceLookup(true);
+      mockInsertFailure();
+
+      const logs = Array.from({ length: 3 }, () =>
+        makeLogEntry({ message: 'secret token=abc123' })
+      );
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs }),
+      });
+
+      // Total failure → 500, no rows accepted.
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ error: 'Failed to insert logs', received: 0 });
+
+      // The audit fires BEFORE the 500 return, so the arrival of the batch is
+      // still recorded even though nothing persisted.
+      expect(writeAuditEvent).toHaveBeenCalledTimes(1);
+      const [, event] = vi.mocked(writeAuditEvent).mock.calls[0]!;
+      expect(event).toMatchObject({
+        action: 'agent.logs.submit',
+        resourceId: DEVICE_ID,
+        details: { submittedCount: 3, insertedCount: 0, partialFailure: 3 },
+      });
+      expect(JSON.stringify(event.details)).not.toContain('token=');
+
+      consoleError.mockRestore();
+    });
+  });
+});

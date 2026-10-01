@@ -1,0 +1,208 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+
+const mocks = vi.hoisted(() => ({
+  authRef: {
+    current: {
+      orgId: '11111111-1111-4111-8111-111111111111',
+      canAccessOrg: (orgId: string) => orgId === '11111111-1111-4111-8111-111111111111',
+    },
+  },
+  resolveAllMlFeatureFlagsForOrg: vi.fn(),
+}));
+
+vi.mock('../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', mocks.authRef.current);
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+}));
+
+vi.mock('../services/mlFeatureFlags', () => ({
+  resolveAllMlFeatureFlagsForOrg: mocks.resolveAllMlFeatureFlagsForOrg,
+}));
+
+import { configRoutes } from './config';
+
+describe('GET /config', () => {
+  const originalEnv = process.env.BREEZE_BILLING_URL;
+  const originalReg = process.env.ENABLE_REGISTRATION;
+
+  beforeEach(() => {
+    vi.stubEnv('BREEZE_AI_AGENTS_SWEEP_ACT_ENABLED', undefined);
+    vi.stubEnv('CALLER_VERIFICATION_ENABLED', 'false');
+    delete process.env.BREEZE_BILLING_URL;
+    delete process.env.ENABLE_REGISTRATION;
+    mocks.authRef.current = {
+      orgId: '11111111-1111-4111-8111-111111111111',
+      canAccessOrg: (orgId: string) => orgId === '11111111-1111-4111-8111-111111111111',
+    };
+    mocks.resolveAllMlFeatureFlagsForOrg.mockReset();
+    mocks.resolveAllMlFeatureFlagsForOrg.mockResolvedValue({
+      'ml.rca.enabled': {
+        flag: 'ml.rca.enabled',
+        enabled: false,
+        defaultEnabled: false,
+        source: 'org_settings',
+      },
+      'ml.remediation_suggestions.enabled': {
+        flag: 'ml.remediation_suggestions.enabled',
+        enabled: true,
+        defaultEnabled: false,
+        source: 'org_settings',
+      },
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    if (originalEnv === undefined) {
+      delete process.env.BREEZE_BILLING_URL;
+    } else {
+      process.env.BREEZE_BILLING_URL = originalEnv;
+    }
+    if (originalReg === undefined) {
+      delete process.env.ENABLE_REGISTRATION;
+    } else {
+      process.env.ENABLE_REGISTRATION = originalReg;
+    }
+  });
+
+  const request = async () => {
+    const app = new Hono().route('/config', configRoutes);
+    const res = await app.request('/config');
+    return { status: res.status, body: await res.json() as any };
+  };
+
+  it('returns both flags false when BREEZE_BILLING_URL unset', async () => {
+    const { status, body } = await request();
+    expect(status).toBe(200);
+    expect(body.features).toEqual({ billing: false, support: false, aiOperatorTasks: false, toolSources: false, aiAgentsSweepAct: false, callerVerification: false });
+  });
+
+  it('returns both flags true when BREEZE_BILLING_URL is set', async () => {
+    process.env.BREEZE_BILLING_URL = 'http://localhost:4000';
+    const { status, body } = await request();
+    expect(status).toBe(200);
+    expect(body.features).toEqual({ billing: true, support: true, aiOperatorTasks: false, toolSources: false, aiAgentsSweepAct: false, callerVerification: false });
+  });
+
+  it.each(['true', 'false', '', 'garbage'])('returns caller verification readiness for %s', async (value) => {
+    vi.stubEnv('CALLER_VERIFICATION_ENABLED', value);
+    const { status, body } = await request();
+    expect(status).toBe(200);
+    expect(body.features.callerVerification).toBe(value === 'true');
+  });
+
+  it('features.aiOperatorTasks is false when neither AI Operator env var is set', async () => {
+    const { body } = await request();
+    expect(body.features.aiOperatorTasks).toBe(false);
+  });
+
+  it('features.aiOperatorTasks is false when only AI_OPERATOR_TASKS_ENABLED is set', async () => {
+    vi.stubEnv('AI_OPERATOR_TASKS_ENABLED', 'true');
+    vi.stubEnv('AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED', 'false');
+    const { body } = await request();
+    expect(body.features.aiOperatorTasks).toBe(false);
+    vi.unstubAllEnvs();
+  });
+
+  it('features.aiOperatorTasks is false when only AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED is set', async () => {
+    vi.stubEnv('AI_OPERATOR_TASKS_ENABLED', 'false');
+    vi.stubEnv('AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED', 'true');
+    const { body } = await request();
+    expect(body.features.aiOperatorTasks).toBe(false);
+    vi.unstubAllEnvs();
+  });
+
+  it('features.aiOperatorTasks is true when both AI Operator env vars are set', async () => {
+    vi.stubEnv('AI_OPERATOR_TASKS_ENABLED', 'true');
+    vi.stubEnv('AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED', 'true');
+    const { body } = await request();
+    expect(body.features.aiOperatorTasks).toBe(true);
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    [undefined, false],
+    ['false', false],
+    ['true', true],
+  ])('features.aiAgentsSweepAct reflects deployment flag %s', async (flag, enabled) => {
+    vi.stubEnv('BREEZE_AI_AGENTS_SWEEP_ACT_ENABLED', flag);
+    const { status, body } = await request();
+    expect(status).toBe(200);
+    expect(body.features.aiAgentsSweepAct).toBe(enabled);
+  });
+
+  it('features.toolSources is false when TOOL_SOURCES_ENABLED is unset', async () => {
+    const { body } = await request();
+    expect(body.features.toolSources).toBe(false);
+  });
+
+  it('features.toolSources is true when TOOL_SOURCES_ENABLED=true', async () => {
+    vi.stubEnv('TOOL_SOURCES_ENABLED', 'true');
+    const { body } = await request();
+    expect(body.features.toolSources).toBe(true);
+    vi.unstubAllEnvs();
+  });
+
+  it('registration.enabled defaults to false when ENABLE_REGISTRATION unset', async () => {
+    const { body } = await request();
+    expect(body.registration).toEqual({ enabled: false });
+  });
+
+  it('registration.enabled is true when ENABLE_REGISTRATION=true (runtime, #1308)', async () => {
+    process.env.ENABLE_REGISTRATION = 'true';
+    const { body } = await request();
+    expect(body.registration).toEqual({ enabled: true });
+  });
+
+  it('registration.enabled is false when ENABLE_REGISTRATION=false', async () => {
+    process.env.ENABLE_REGISTRATION = 'false';
+    const { body } = await request();
+    expect(body.registration).toEqual({ enabled: false });
+  });
+
+  it('softwarePackages.uploadsEnabled is false without full S3 config', async () => {
+    vi.stubEnv('S3_BUCKET', '');
+    vi.stubEnv('S3_ACCESS_KEY', '');
+    vi.stubEnv('S3_SECRET_KEY', '');
+    const { body } = await request();
+    expect(body.softwarePackages).toEqual({ uploadsEnabled: false });
+    vi.unstubAllEnvs();
+  });
+
+  it('softwarePackages.uploadsEnabled requires bucket AND both keys', async () => {
+    vi.stubEnv('S3_BUCKET', 'bucket');
+    vi.stubEnv('S3_ACCESS_KEY', '');
+    vi.stubEnv('S3_SECRET_KEY', 'secret');
+    const partial = await request();
+    expect(partial.body.softwarePackages).toEqual({ uploadsEnabled: false });
+
+    vi.stubEnv('S3_ACCESS_KEY', 'key');
+    const full = await request();
+    expect(full.body.softwarePackages).toEqual({ uploadsEnabled: true });
+    vi.unstubAllEnvs();
+  });
+
+  it('returns authenticated org-scoped ML feature flag resolutions', async () => {
+    const app = new Hono().route('/config', configRoutes);
+    const res = await app.request('/config/ml-feature-flags');
+
+    expect(res.status).toBe(200);
+    expect(mocks.resolveAllMlFeatureFlagsForOrg).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111');
+    const body = await res.json();
+    expect(body.orgId).toBe('11111111-1111-4111-8111-111111111111');
+    expect(body.mlFeatureFlags['ml.rca.enabled']).toMatchObject({ enabled: false, source: 'org_settings' });
+    expect(body.data).toEqual(body.mlFeatureFlags);
+  });
+
+  it('rejects ML feature flag requests for inaccessible orgs', async () => {
+    const app = new Hono().route('/config', configRoutes);
+    const res = await app.request('/config/ml-feature-flags?orgId=22222222-2222-4222-8222-222222222222');
+
+    expect(res.status).toBe(403);
+    expect(mocks.resolveAllMlFeatureFlagsForOrg).not.toHaveBeenCalled();
+  });
+});

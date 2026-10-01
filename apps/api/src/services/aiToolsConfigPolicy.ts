@@ -1,0 +1,1124 @@
+import { db } from '../db';
+import { CONFIG_FEATURE_TYPES, ORG_SCOPED_ONLY_FEATURE_TYPES, type ConfigFeatureType } from '@breeze/shared/constants';
+import { configurationPolicies, configPolicyFeatureLinks, configPolicyAssignments, automationPolicyCompliance } from '../db/schema';
+import { eq, and, desc, isNull, isNotNull, inArray, SQL } from 'drizzle-orm';
+import { hasSatisfiedMfa, type AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import {
+  alertRuleInlineSettingsSchema,
+  maintenanceInlineSettingsSchema,
+  monitoringInlineSettingsSchema,
+  onedriveHelperInlineSettingsSchema,
+  warrantyInlineSettingsSchema,
+} from '@breeze/shared/validators';
+import { sanitizeThrownToolError } from './aiToolErrors';
+import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
+import { deviceScopeCondition } from './aiToolsSiteScope';
+import { describeFirstZodIssue } from '../lib/zodIssues';
+import {
+  resolveEffectiveConfig,
+  previewEffectiveConfig,
+  assignPolicy,
+  unassignPolicy,
+  getConfigPolicy,
+  createConfigPolicy,
+  updateConfigPolicy,
+  deleteConfigPolicy,
+  addFeatureLink,
+  updateFeatureLink,
+  WarrantyConsentError,
+  policyEffectivelyEnablesHpCmslCollection,
+  removeFeatureLink,
+  listFeatureLinks,
+  listAssignments,
+  validateAssignmentTarget,
+  authorizeAssignmentTarget,
+  canManagePartnerWidePolicies,
+  policyAccessCondition,
+  PARTNER_WIDE_WRITE_DENIED_MESSAGE,
+  PolicyHasChildrenError,
+} from './configurationPolicy';
+import {
+  getConfigPolicyComplianceRuleInfo,
+  getConfigPolicyComplianceStats,
+  buildComplianceSummary,
+} from '../routes/policyManagement/helpers';
+
+function getOrgId(auth: AuthContext): string | null {
+  return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+const MFA_REQUIRED_ERROR = JSON.stringify({ error: 'MFA required' });
+
+/**
+ * Match the HTTP `requireMfa()` boundary for config-policy mutations reached
+ * through AI or MCP instead of a Hono route: a human session must carry the
+ * live MFA claim before it can change what takes effect across a fleet.
+ *
+ * `ai_agent` principals are EXEMPT, deliberately. `requireMfa()` rejects them
+ * (middleware/auth.ts) because HTTP is not an agent's channel at all — not
+ * because an agent failed an MFA check. An agent never has, and never could
+ * have, a session MFA claim, so deriving its authorization from one would
+ * permanently disable the grantable `config_policies` agent capability
+ * (agentToolCatalog.ts) rather than gate it. An approved agent run's
+ * authorization is the UPSTREAM Tier-3 approval enforced in aiGuardrails; the
+ * maintenance-link machine-principal check below exempts `ai_agent` for exactly
+ * the same reason (RMM-QA-176 D9.3).
+ *
+ * API-key and OAuth MCP callers carry `token: {}` (mcpServer.ts) and so are
+ * denied while `ENABLE_2FA` is on, and retain the product-wide
+ * `ENABLE_2FA=false` behavior through `hasSatisfiedMfa`.
+ */
+function configPolicyMutationMfaError(auth: AuthContext): string | null {
+  if (auth.principal?.kind === 'ai_agent') return null;
+  return hasSatisfiedMfa(auth) ? null : MFA_REQUIRED_ERROR;
+}
+
+/**
+ * Feature types whose inline settings are validated here, in the handler, rather
+ * than left to throw out of decomposeInlineSettings.
+ *
+ * Two reasons, one per flag:
+ *
+ * - `normalize: true` — addFeatureLink/updateFeatureLink keep the feature link's
+ *   inlineSettings JSONB as a compatibility/UI mirror alongside the normalized
+ *   settings tables. decomposeInlineSettings runs the raw input back through the
+ *   same schema when writing the normalized row, so that row always carries
+ *   schema defaults — but the JSONB mirror gets whatever was passed in. Without
+ *   pre-normalizing, the AI path leaves the mirror storing un-defaulted raw input
+ *   while every other write path gets defaults filled in. (Mirrors
+ *   validateRingAutoApprove's shape, aiToolsPolicyPrereqs.ts.)
+ * - validating at all — decomposeInlineSettings uses `.parse()`, so a bad payload
+ *   throws a ZodError that `safeHandler` hands to `sanitizeThrownToolError`,
+ *   which is fail-closed and replaces it with GENERIC_TOOL_ERROR_MESSAGE. The
+ *   model then has no idea what to fix: the monitoring write barrier's
+ *   "moved to the Alerts feature" pointer never reached the chat at all.
+ *
+ * `monitoring` is validate-only: its schema defaults the deprecated
+ * `alertRules`/`eventLogAlerts` barrier keys to `[]`, and normalizing would write
+ * those dead keys back into the stored JSONB mirror. Same call made in the HTTP
+ * route (routes/configurationPolicies/featureLinks.ts).
+ */
+const VALIDATED_INLINE_SETTINGS: Record<string, { schema: { safeParse: (raw: unknown) => any }; normalize: boolean }> = {
+  onedrive_helper: { schema: onedriveHelperInlineSettingsSchema, normalize: true },
+  alert_rule: { schema: alertRuleInlineSettingsSchema, normalize: true },
+  monitoring: { schema: monitoringInlineSettingsSchema, normalize: false },
+  // #6312: without this entry a malformed maintenance payload throws out of
+  // decomposeInlineSettings and reaches the model as GENERIC_TOOL_ERROR_MESSAGE,
+  // so it cannot learn that (say) its recurrence value is not one of the four.
+  maintenance: { schema: maintenanceInlineSettingsSchema, normalize: true },
+  // #5511 W02: the CLIENT schema, so an assistant that invents an hpCmsl
+  // consent object is told which field is wrong. It still cannot ENABLE
+  // collection — addFeatureLink refuses without an authenticated actor, and
+  // this Tier-2 tool has none.
+  warranty: { schema: warrantyInlineSettingsSchema, normalize: false },
+};
+
+/**
+ * Refuses an assistant-authored automation action that asks to run a script
+ * ELEVATED (#4888).
+ *
+ * `automation` inline settings are not schema-validated at this layer (they
+ * are not in VALIDATED_INLINE_SETTINGS), so `actions` reaches
+ * `normalizeAutomationActions` as an opaque record — and that function
+ * tolerates `runAs: 'elevated'` on purpose, because it also runs over
+ * already-stored rows every time an automation executes and must not take a
+ * live automation offline.
+ *
+ * The result, without this guard, is a privilege hole with this PR's name on
+ * it: `manage_policy_feature_link` is TIER 2 (auto-executes, audit only, no
+ * human approval), so an assistant could author an automation action that runs
+ * a script with full administrator/root privileges — while the very same
+ * assistant calling `run_script` directly is held to `executeScriptSchema`,
+ * which excludes 'elevated', AND to a Tier-3 human approval. An assistant must
+ * not be able to reach through a config policy for a capability it is refused
+ * head-on.
+ *
+ * Scope, stated plainly: this closes the ASSISTANT path only. A raw
+ * `POST /automations` call still reaches the same tolerant
+ * `normalizeAutomationActions` (`routes/automations.ts` types `actions` as
+ * `z.unknown()`), because closing that safely needs to distinguish a NEWLY
+ * SUBMITTED 'elevated' from one already stored on the row being edited — a
+ * design decision, not a guard. Tracked as follow-up work on #4888; it is a
+ * pre-existing gap, not one this change opens.
+ */
+function rejectElevatedAutomationActions(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const items = (raw as { items?: unknown }).items;
+  if (!Array.isArray(items)) return null;
+
+  for (const item of items) {
+    const actions = (item as { actions?: unknown } | null)?.actions;
+    if (!Array.isArray(actions)) continue;
+    for (const action of actions) {
+      const candidate = action as { type?: unknown; runAs?: unknown } | null;
+      if (candidate?.type !== 'run_script' || candidate.runAs === undefined || candidate.runAs === null) continue;
+      if (candidate.runAs !== 'system' && candidate.runAs !== 'user') {
+        return `A run_script automation action may set runAs to "system" or "user" only (got "${String(candidate.runAs)}"). Elevation is a property of the saved script, not something an automation action may request.`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * #5511 W02: enabling HP CMSL warranty collection records an acceptance of
+ * HP's licence, which the service will only stamp for an authenticated user —
+ * and this tool never passes one. Map that refusal to a readable tool result:
+ * left to safeHandler it would be scrubbed to the generic "the tool failed",
+ * which tells the assistant neither why nor that a human must do it in the UI.
+ * The message is a fixed literal authored in configurationPolicy.ts, so it
+ * carries no driver or schema detail.
+ */
+function warrantyConsentRefusal(err: unknown): string | null {
+  if (!(err instanceof WarrantyConsentError)) return null;
+  return JSON.stringify({
+    error: `${err.message} Ask a user to switch it on from the policy's Warranty tab, where they accept HP's licence themselves.`,
+  });
+}
+
+function validateInlineSettingsForFeature(
+  featureType: string | undefined,
+  raw: unknown
+): { value: unknown } | { error: string } {
+  if (featureType === 'automation') {
+    const elevated = rejectElevatedAutomationActions(raw);
+    if (elevated) return { error: elevated };
+  }
+
+  const entry = featureType ? VALIDATED_INLINE_SETTINGS[featureType] : undefined;
+  if (!entry || raw === undefined || raw === null) return { value: raw };
+
+  const parsed = entry.schema.safeParse(raw);
+  if (!parsed.success) {
+    // describeFirstZodIssue prefixes the field path AND unwraps `invalid_union`
+    // into the offending sub-issue: alert-rule conditions are a union several
+    // levels deep inside items[], and the raw union issue is a bare
+    // "Invalid input" that tells the model nothing about what to fix.
+    const described = describeFirstZodIssue(parsed.error);
+    if (!described) return { error: `Invalid ${featureType} inline settings.` };
+    return { error: `Invalid ${featureType} inline settings — ${described}` };
+  }
+  return { value: entry.normalize ? parsed.data : raw };
+}
+
+function safeHandler(
+  toolName: string,
+  fn: (input: Record<string, unknown>, auth: AuthContext) => Promise<string>
+): (input: Record<string, unknown>, auth: AuthContext) => Promise<string> {
+  return async (input, auth) => {
+    try {
+      return await fn(input, auth);
+    } catch (err) {
+      // Fail closed: `message` may be a raw driver string (#2603).
+      return JSON.stringify({
+        error: sanitizeThrownToolError(`config-policy:${toolName}`, err),
+      });
+    }
+  };
+}
+
+/**
+ * RMM-QA-176 D9.3. Exported so the tests assert the SAME string the handler
+ * returns, rather than a copy that can drift.
+ */
+export const MAINTENANCE_LINK_MACHINE_PRINCIPAL_DENIED =
+  'Authoring a maintenance feature link suppresses monitoring and requires an interactive user session. API-key and OAuth-grant callers cannot perform this action.';
+export const MAINTENANCE_LINK_FEATURE_TYPE_REQUIRED =
+  'This feature link is a maintenance link. Re-issue the call with featureType: "maintenance" so the change routes through approval.';
+
+/** Per-feature inline settings reference, returned on demand by describe. */
+export const POLICY_FEATURE_INLINE_SETTINGS_REFERENCE: Readonly<Record<ConfigFeatureType, string>> = {
+  patch: `{ sources: ["os","third_party"], autoApprove: true, autoApproveSeverities: ["critical","important"], scheduleFrequency: "daily"|"weekly"|"monthly", scheduleTime: "02:00", scheduleDayOfWeek?: "tue", scheduleDayOfMonth?: 1, rebootPolicy: "never"|"if_required"|"always"|"maintenance_window" } can also use featurePolicyId → existing update ring UUID (for approval deferral), combined with inlineSettings for schedule/reboot`,
+  alert_rule: `server-evaluated rules — CPU/RAM/disk thresholds, offline detection, and event log alerts. { items: [{ name, severity: "critical"|"high"|"medium"|"low"|"info" (default "medium"), conditions: 1-10 of [ { type: "metric" ("threshold" is accepted as an alias and canonicalized to "metric"), metric: "cpu"|"ram"|"disk"|"processCount" (these four are canonical; the aliases "cpuPercent"->cpu, "ramPercent"/"memory"->ram, "diskPercent"->disk, "processes"->processCount are accepted but map onto them — prefer the canonical names), operator: "gt"|"gte"|"lt"|"lte"|"eq"|"neq", value: number (a PERCENTAGE 0-100 for cpu/ram/disk; a plain count for processCount), durationMinutes?: number (1-10080; sustained window the samples are averaged over, default 1 minute) } | { type: "offline", durationMinutes?: number } | { type: "event_log", category: "security"|"hardware"|"application"|"system", level: "warning"|"error"|"critical" (matches this level and above), sourcePattern?: string (case-insensitive substring match, NOT a regex), messagePattern?: string, countThreshold?: number (1-10000, default 1), windowMinutes?: number (1-1440, default 15) } ], cooldownMinutes?: number (default 5), autoResolve?: boolean (default false), autoResolveConditions?: same condition shapes or null, titleTemplate?: string, messageTemplate?: string, sortOrder?: number }] } — 'custom' conditions and the extended types (bandwidth_high, disk_io_high, network_errors, patch_compliance, cert_expiry) are rejected on write. When the same threshold is configured in policies at different levels (e.g. org and site), the CLOSEST level to the device wins.`,
+  monitoring: `agent-side service/process watches with auto-restart, delivered via heartbeat — not evaluated by the alert engine; watch failures are recorded and shown in the UI but do not currently raise alerts (alertOnStop/alertSeverity are stored but unused at runtime). { checkIntervalSeconds: 60, watches: [{ watchType: "service"|"process", name: "wuauserv", displayName?: "Windows Update", enabled: true, alertOnStop: true, alertAfterConsecutiveFailures: 2, alertSeverity: "critical"|"high"|"medium"|"low"|"info", cpuThresholdPercent?: 90, memoryThresholdMb?: 500, thresholdDurationSeconds: 300, autoRestart: false, maxRestartAttempts: 3, restartCooldownSeconds: 300 }] } — inline settings carry ONLY checkIntervalSeconds/watches now; metric alert rules and event log alerts moved to the alert_rule feature. Sending a non-empty 'alertRules' or 'eventLogAlerts' array is rejected with an error directing you to the alert_rule feature type instead.`,
+  maintenance: `{ recurrence: "once"|"daily"|"weekly"|"monthly", windowStart?: "naive ISO-8601 local datetime for once (e.g. 2026-03-15T02:00) | HH:MM local time of day for daily/weekly/monthly (omit or null = 00:00). Never pass a Z-suffixed or offset-bearing instant for a recurring cadence — it is rejected and the window falls back to midnight.", durationHours: 1-72, timezone: "America/New_York", suppressAlerts: true, suppressPatching: true, suppressAutomations: false, suppressScripts: false, notifyBeforeMinutes?: 15, notifyOnStart: true, notifyOnEnd: true }`,
+  automation: `{ items: [{ name, enabled: true, triggerType: "schedule"|"event"|"manual", cronExpression?: "0 2 * * *", timezone?: "America/New_York", eventType?: "device.offline"|"alert.triggered"|"compliance.failed"|"patch.available", actions: [{ type: "run_script"|"send_notification"|"create_alert"|"execute_command", scriptId?|channelId?|severity?|message?|command? }], onFailure: "stop"|"continue"|"notify" }] }`,
+  event_log: `{ retentionDays: 30, maxEventsPerCycle: 100, collectCategories: ["security","hardware","application","system"], minimumLevel: "info"|"warning"|"error"|"critical", collectionIntervalMinutes: 15, rateLimitPerHour: 12000 }`,
+  compliance: `{ items: [{ name, enforcementLevel: "monitor"|"warn"|"enforce", checkIntervalMinutes: 60, rules: [{ type: "required_software"|"prohibited_software"|"disk_space_minimum"|"os_version"|"registry_check"|"config_file_check", name?|minGb?|osType?|path?|valueName?|expectedValue?|minVersion? }] }] }`,
+  security: `{ realTimeProtection: true, behavioralMonitoring: true, cloudLookup: true, scheduledScans: true, scanHour: "2", scanMinute: "0", scanDayOfWeek: "*", scanDayOfMonth: "*", autoQuarantine: true, notifyUser: true, blockUntrustedUsb: false, exclusions: [] }`,
+  backup: `{ schedule: { frequency: "daily"|"weekly"|"monthly", time: "02:00", dayOfWeek?: 2 (0=Sunday..6=Saturday), dayOfMonth?: 1 (1..28), timezone?: "UTC" }, retention: { preset: "standard"|"extended"|"compliance"|"custom", retentionDays?: 30, maxVersions?: 5 }, paths: [], targets: { paths: [], excludes: [] }, backupMode: "file"|"hyperv"|"mssql"|"system_image", destinationConfigId?: "UUID" }. featurePolicyId → backup PROFILE UUID (manage_backup_profiles — "what to protect"), combined with inlineSettings { schedule, retention, destinationConfigId? } (destination omitted = the device org's default destination). Legacy links with featurePolicyId → backup config UUID still work. Partner-wide policies may link partner-wide profiles; their destination always resolves per device org. Compression, encryption and notification flags are not persisted by configuration-policy backup settings.`,
+  sensitive_data: `{ detectionClasses: ["credential","pci","phi","pii","financial"], includePaths: [], excludePaths: [], fileTypes: [], maxFileSizeBytes: 104857600, workers: 4, timeoutSeconds: 300, scheduleType: "manual"|"interval"|"cron", intervalMinutes?: 60, cron?: "...", timezone: "UTC" }`,
+  warranty: `{ enabled: true, warnDays: 90, criticalDays: 30 }`,
+  helper: `{ enabled: true, showTrayIcon: true, showOpenPortal: true, showDeviceInfo: true, showRequestSupport: true, portalUrl?: "" } — showTrayIcon:false hides the system-tray icon while the helper keeps serving chat, remote-access consent and PAM dialogs.`,
+  pam: `inlineSettings {uacInterceptionEnabled: boolean} — Windows UAC elevation prompt capture (default false / opt-in: capture is OFF when no policy assigns this feature). PAM rules/approvals are managed separately in the /pam console, not via config policies.`,
+  vulnerability: `inlineSettings {enabled: boolean} — per-device CVE correlation / vulnerability scanning (default false / opt-in: devices with no policy are NOT scanned). Findings appear in the /vulnerabilities console; correlation runs daily.`,
+  device_lifecycle: `inlineSettings {purgeRemovedAfterDays: number|null} — permanently delete removed devices N days after removal (1..3650); null/absent = keep forever. Purge is IRREVERSIBLE: it destroys the device record and all of its history. A daily job applies it; devices whose agent uninstall is still queued are skipped until it completes. Closest level wins, so an org-level link with null opts that org out of a partner-wide window.`,
+  remote_access: `{ webrtcDesktop: true, vncRelay: false, remoteTools: true, clipboardHostToViewer: true, clipboardViewerToHost: true, enableProxy: false, defaultAllowedPorts: [80,443], autoEnableProxy: false, maxConcurrentTunnels: 5, idleTimeoutMinutes: 5, maxSessionDurationHours: 8 (whole hours, 1..12 — remote desktop sessions are hard-capped at 12h and "unlimited"/0 is rejected), sessionPromptMode?: "off"|"notify"|"consent", consentUnavailableBehavior?: "proceed"|"block", notifyOnSessionEnd?: true, showActiveIndicator?: true, technicianIdentityLevel?: "name_email"|"name"|"generic" } — all fields optional; updates MERGE over the currently stored settings, so send only the fields to change. Unknown keys are stripped, never applied — use exactly these key names.`,
+  onedrive_helper: `{ silentAccountConfig?, filesOnDemand?, kfmSilentOptIn?, kfmFolders? (Desktop/Documents/Pictures), kfmBlockOptOut?, tenantAssociationId?, restartOnChange?, libraries?: [{ libraryId, displayName, targetingMode (everyone|graph_group|local_ad_group), groupId?, groupName?, siteUrl? }] }`,
+  software_policy: `Link-only: featurePolicyId → existing software policy UUID; no inlineSettings.`,
+  peripheral_control: `Link-only: featurePolicyId → existing peripheral policy UUID; no inlineSettings.`,
+  monitors: `{ items: [{ monitorId: "existing monitor definition UUID", enabled: true, overrides?: {}, sortOrder?: 0 }], inheritance: "cumulative"|"replace" (default "cumulative") }. Up to 200 attachments; create monitor definitions with manage_monitor_definitions before linking.`,
+};
+
+const LINK_ONLY_FEATURE_TYPES = new Set<ConfigFeatureType>(['software_policy', 'peripheral_control']);
+const FEATURE_POLICY_ID_HINTS: Partial<Record<ConfigFeatureType, string>> = {
+  backup: 'featurePolicyId → backup PROFILE UUID (manage_backup_profiles — "what to protect"), combined with inlineSettings { schedule, retention, destinationConfigId? }',
+  patch: 'featurePolicyId → existing update ring UUID (approval deferral), combined with inlineSettings for schedule/reboot',
+  software_policy: 'featurePolicyId → existing software policy UUID',
+  peripheral_control: 'featurePolicyId → existing peripheral policy UUID',
+};
+
+export function registerConfigPolicyTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+  // 1. list_configuration_policies — Tier 1 (read)
+  registerTool({
+    tier: 1,
+    domain: 'security',
+    searchHint: 'configuration policies, bundled feature settings, policy status and linked feature types',
+    definition: {
+      name: 'list_configuration_policies',
+      description: 'List available configuration policies (bundled feature settings) visible to the caller — organization-owned policies plus, for partner-scoped callers, partner-wide ("all orgs") policies. Shows policy name, status, and linked feature types.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          status: { type: 'string', enum: ['active', 'inactive', 'archived'], description: 'Filter by status' },
+          limit: { type: 'number', description: 'Max results (default 25)' },
+        },
+      },
+    },
+    handler: safeHandler('list_configuration_policies', async (input, auth) => {
+      const conditions: SQL[] = [];
+      // Dual-axis visibility (#1724): a partner-scoped caller must also see
+      // partner-OWNED policies (org_id NULL), which auth.orgCondition alone
+      // excludes. policyAccessCondition is the same reader the HTTP routes use.
+      const oc = policyAccessCondition(auth);
+      if (oc) conditions.push(oc);
+      if (typeof input.status === 'string') {
+        conditions.push(eq(configurationPolicies.status, input.status as 'active' | 'inactive' | 'archived'));
+      }
+
+      const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
+      const rows = await db
+        .select()
+        .from(configurationPolicies)
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(configurationPolicies.updatedAt))
+        .limit(limit);
+
+      // Get feature link counts per policy
+      const policyIds = rows.map((r) => r.id);
+      const links = policyIds.length > 0
+        ? await db
+            .select({
+              configPolicyId: configPolicyFeatureLinks.configPolicyId,
+              featureType: configPolicyFeatureLinks.featureType,
+            })
+            .from(configPolicyFeatureLinks)
+            .where(inArray(configPolicyFeatureLinks.configPolicyId, policyIds))
+        : [];
+
+      const linksByPolicy = new Map<string, string[]>();
+      for (const link of links) {
+        const types = linksByPolicy.get(link.configPolicyId) ?? [];
+        types.push(link.featureType);
+        linksByPolicy.set(link.configPolicyId, types);
+      }
+
+      const policiesWithFeatures = rows.map((p) => ({
+        ...p,
+        featureTypes: linksByPolicy.get(p.id) ?? [],
+      }));
+
+      return JSON.stringify({ policies: policiesWithFeatures, showing: rows.length });
+    }),
+  });
+
+  // 2. get_effective_configuration — Tier 1 (read)
+  registerTool({
+    tier: 1,
+    domain: 'security',
+    searchHint: 'device effective configuration, winning policies and inheritance across partner, organization, site and group',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'get_effective_configuration',
+      description: 'Resolve the effective configuration for a device by evaluating all configuration policy assignments in the hierarchy (device > group > site > org > partner). Returns the winning policy per feature type with full inheritance chain for debugging.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID to resolve configuration for' },
+        },
+        required: ['deviceId'],
+      },
+    },
+    handler: safeHandler('get_effective_configuration', async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const result = await resolveEffectiveConfig(deviceId, auth);
+      if (!result) return JSON.stringify({ error: 'Device not found or access denied' });
+      return JSON.stringify(result);
+    }),
+  });
+
+  // 3. preview_configuration_change — Tier 1 (read)
+  registerTool({
+    tier: 1,
+    domain: 'security',
+    searchHint: 'configuration assignment changes, current versus proposed device settings preview',
+    deviceArgs: ['deviceId'],
+    definition: {
+      name: 'preview_configuration_change',
+      description: 'Preview how adding or removing configuration policy assignments would change the effective configuration for a device. Returns current vs proposed effective config.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          deviceId: { type: 'string', description: 'The device UUID' },
+          add: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                configPolicyId: { type: 'string', description: 'Configuration policy UUID' },
+                level: { type: 'string', enum: ['partner', 'organization', 'site', 'device_group', 'device'], description: 'Assignment level' },
+                targetId: { type: 'string', description: 'Target UUID at the given level' },
+                priority: { type: 'number', description: 'Priority (lower = higher)' },
+              },
+              required: ['configPolicyId', 'level', 'targetId'],
+            },
+            description: 'Assignments to add',
+          },
+          remove: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Assignment UUIDs to remove',
+          },
+        },
+        required: ['deviceId'],
+      },
+    },
+    handler: safeHandler('preview_configuration_change', async (input, auth) => {
+      const deviceId = input.deviceId as string;
+      const changes = {
+        add: input.add as any[] | undefined,
+        remove: input.remove as string[] | undefined,
+      };
+
+      const result = await previewEffectiveConfig(deviceId, changes, auth);
+      if (!result) return JSON.stringify({ error: 'Device not found or access denied' });
+      return JSON.stringify(result);
+    }),
+  });
+
+  // 4. apply_configuration_policy — Tier 2 (write)
+  registerTool({
+    tier: 2,
+    domain: 'security',
+    searchHint: 'configuration policy assignments to partners, organizations, sites, device groups or devices',
+    definition: {
+      name: 'apply_configuration_policy',
+      description: 'Assign a configuration policy to a partner, organization, site, device group or device; filter by role or OS. Only partner-owned policies allow partner-level assignment. Org-owned policies require organization/site/device_group/device level.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          configPolicyId: { type: 'string', description: 'Configuration policy UUID' },
+          level: { type: 'string', enum: ['partner', 'organization', 'site', 'device_group', 'device'], description: 'Assignment level' },
+          targetId: { type: 'string', description: 'Target UUID; required for organization/site/device_group/device. Omit for partner level: target is the policy owner.' },
+          priority: { type: 'number', description: 'Priority (lower = higher priority, default 0)' },
+          roleFilter: { type: 'array', items: { type: 'string' }, description: 'Only apply to devices with these roles (e.g. ["workstation","server"]). Omit for all roles.' },
+          osFilter: { type: 'array', items: { type: 'string' }, description: 'Only apply to devices with these OS types (e.g. ["windows","macos","linux"]). Omit for all OS.' },
+        },
+        required: ['configPolicyId', 'level'],
+      },
+    },
+    handler: safeHandler('apply_configuration_policy', async (input, auth) => {
+      const mfaError = configPolicyMutationMfaError(auth);
+      if (mfaError) return mfaError;
+
+      // Dual-axis reader so a partner-scoped caller can reach a partner-OWNED
+      // policy (org_id NULL) to assign it — auth.orgCondition alone hid these.
+      const conditions: SQL[] = [eq(configurationPolicies.id, input.configPolicyId as string)];
+      const oc = policyAccessCondition(auth);
+      if (oc) conditions.push(oc);
+
+      const [policy] = await db.select().from(configurationPolicies).where(and(...conditions)).limit(1);
+      if (!policy) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
+
+      // Partner-owned policies (org_id NULL) are the partner library (#2280).
+      // ANY assignment on one — at any level, not just 'partner' — pushes
+      // config into orgs the caller may not fully control, so all writes
+      // require full partner org access. Mirrors the HTTP route's gate
+      // (routes/configurationPolicies/assignments.ts).
+      if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
+        return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
+      }
+
+      // At the partner level the target is the partner itself, derived
+      // server-side — never from a client-supplied value (#1724). It's the
+      // policy's own partner (or the caller's, for a fresh partner-owned
+      // policy). An org-owned policy also reaches this block, but its
+      // auth.partnerId fallback target is rejected downstream by
+      // validateAssignmentTarget, so the fallback only ever serves partner-owned
+      // policies.
+      let targetId = input.targetId as string;
+      if (input.level === 'partner') {
+        const derived = policy.partnerId ?? auth.partnerId;
+        if (!derived) {
+          return JSON.stringify({ error: 'Partner-wide assignments require partner scope' });
+        }
+        targetId = derived;
+      }
+      if (!targetId) {
+        return JSON.stringify({ error: 'targetId is required for this assignment level' });
+      }
+
+      const targetValidation = await validateAssignmentTarget(
+        { orgId: policy.orgId, partnerId: policy.partnerId },
+        input.level as any,
+        targetId
+      );
+      if (!targetValidation.valid) {
+        return JSON.stringify({ error: targetValidation.error });
+      }
+
+      // Site sub-axis (SR5-07): RLS does not enforce the site allowlist, so a
+      // site-restricted caller must be blocked from assigning to org/partner
+      // targets or to a site/group/device outside their allowed sites.
+      const siteAuth = await authorizeAssignmentTarget(auth, input.level as any, targetId);
+      if (!siteAuth.valid) {
+        return JSON.stringify({ error: siteAuth.error });
+      }
+
+      // #5511 W02 (contract D4): assigning a policy whose effective warranty
+      // link collects is how HP CMSL collection REACHES devices — the HTTP
+      // route gates that on devices:execute + MFA, because it installs HP
+      // software on every HP endpoint the assignment covers. This tool is
+      // Tier 2 (auto-executes, no approval), so it refuses rather than widen
+      // collection: an assistant can no more spread it than switch it on.
+      if (await policyEffectivelyEnablesHpCmslCollection(policy.id)) {
+        return JSON.stringify({
+          error: `Policy "${policy.name}" has HP warranty collection switched on, which installs HP software on the devices it reaches. Assigning it requires a user with the devices:execute permission — ask them to assign it from the Configuration Policies page.`,
+        });
+      }
+
+      // assignPolicy returns null (instead of throwing) on a duplicate — see
+      // the comment on its onConflictDoNothing insert in configurationPolicy.ts
+      // for why the raised-violation catch pattern doesn't work inside this
+      // tool call's withDbAccessContext transaction.
+      const assignment = await assignPolicy(
+        input.configPolicyId as string,
+        input.level as any,
+        targetId,
+        Number(input.priority) || 0,
+        auth.user.id,
+        (input.roleFilter as string[] | undefined),
+        (input.osFilter as string[] | undefined)
+      );
+
+      if (!assignment) {
+        return JSON.stringify({ error: 'This policy is already assigned to this target at this level' });
+      }
+
+      return JSON.stringify({
+        success: true,
+        message: `Policy "${policy.name}" assigned to ${input.level} ${targetId}`,
+        assignmentId: assignment.id,
+      });
+    }),
+  });
+
+  // 5. remove_configuration_policy_assignment — Tier 2 (write)
+  registerTool({
+    tier: 2,
+    domain: 'security',
+    searchHint: 'configuration policy assignment removal and inherited setting reversal',
+    definition: {
+      name: 'remove_configuration_policy_assignment',
+      description: 'Remove a configuration policy assignment, undoing its effect on the target and all devices beneath it in the hierarchy.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          assignmentId: { type: 'string', description: 'The assignment UUID to remove' },
+        },
+        required: ['assignmentId'],
+      },
+    },
+    handler: safeHandler('remove_configuration_policy_assignment', async (input, auth) => {
+      const mfaError = configPolicyMutationMfaError(auth);
+      if (mfaError) return mfaError;
+
+      // Verify the assignment belongs to a policy the caller can see. The
+      // dual-axis reader keeps partner-OWNED policies (org_id NULL) reachable
+      // for partner-scoped callers; policyOrgId is selected so the partner-wide
+      // write gate below can fire.
+      const conditions: SQL[] = [eq(configPolicyAssignments.id, input.assignmentId as string)];
+      const oc = policyAccessCondition(auth);
+      if (oc) conditions.push(oc);
+
+      const [assignment] = await db
+        .select({
+          id: configPolicyAssignments.id,
+          configPolicyId: configPolicyAssignments.configPolicyId,
+          policyName: configurationPolicies.name,
+          policyOrgId: configurationPolicies.orgId,
+          level: configPolicyAssignments.level,
+          targetId: configPolicyAssignments.targetId,
+        })
+        .from(configPolicyAssignments)
+        .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+        .where(and(...conditions))
+        .limit(1);
+
+      if (!assignment) return JSON.stringify({ error: 'Assignment not found' });
+
+      // Any assignment on a partner-owned library policy (#2280) — partner-level
+      // (all orgs) or a narrower org/site/group/device row — is a partner-wide-
+      // access capability: the delete may strip config from one org or every org
+      // under the partner. Same blast radius as assigning, so the same gate applies.
+      if (assignment.policyOrgId === null && !canManagePartnerWidePolicies(auth)) {
+        return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
+      }
+
+      // Site sub-axis (SR5-07): re-check against the stored target so a
+      // site-restricted caller can't remove an assignment reaching a site,
+      // group, or device outside their allowlist (RLS does not enforce site).
+      const siteAuth = await authorizeAssignmentTarget(auth, assignment.level as any, assignment.targetId);
+      if (!siteAuth.valid) {
+        return JSON.stringify({ error: siteAuth.error });
+      }
+
+      const deleted = await unassignPolicy(input.assignmentId as string, assignment.configPolicyId);
+      if (!deleted) return JSON.stringify({ error: 'Assignment not found' });
+
+      return JSON.stringify({
+        success: true,
+        message: `Removed "${assignment.policyName}" assignment from ${assignment.level} ${assignment.targetId}`,
+      });
+    }),
+  });
+
+  // 6. get_configuration_policy — Tier 1 (read)
+  registerTool({
+    tier: 1,
+    domain: 'security',
+    searchHint: 'configuration policy details, bundled feature links and assignments',
+    definition: {
+      name: 'get_configuration_policy',
+      description: 'Get a single configuration policy by ID with its feature links (bundled feature settings) and assignment count.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          policyId: { type: 'string', description: 'Configuration policy UUID' },
+        },
+        required: ['policyId'],
+      },
+    },
+    handler: safeHandler('get_configuration_policy', async (input, auth) => {
+      const policyId = input.policyId as string;
+      const policy = await getConfigPolicy(policyId, auth);
+      if (!policy) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
+
+      const featureLinks = await listFeatureLinks(policyId);
+      const assignments = await listAssignments(policyId);
+
+      return JSON.stringify({
+        policy,
+        featureLinks,
+        assignmentCount: assignments.length,
+        assignments,
+      });
+    }),
+  });
+
+  // 7. manage_configuration_policy — Tier 1 base, action-escalated
+  registerTool({
+    tier: 1,
+    domain: 'security',
+    searchHint: 'configuration policies: create, update, activate, deactivate, delete',
+    definition: {
+      name: 'manage_configuration_policy',
+      description: 'Manage bundled feature settings. Partner ownership requires full partner org access; policies apply to no orgs until assigned via apply_configuration_policy. Organization ownership is the default. Actions: create, update, activate, deactivate, delete.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          action: { type: 'string', enum: ['create', 'update', 'activate', 'deactivate', 'delete'], description: 'The action to perform' },
+          policyId: { type: 'string', description: 'Configuration policy UUID (required for update/activate/deactivate/delete)' },
+          name: { type: 'string', description: 'Policy name (required for create)' },
+          description: { type: 'string', description: 'Policy description' },
+          status: { type: 'string', enum: ['active', 'inactive', 'archived'], description: 'Policy status (for create/update)' },
+          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: 'Create ownership: organization (default, one org) or partner (unassigned library policy; requires full partner org access).' },
+          orgId: { type: 'string', description: 'Organization UUID (for org-scoped create; defaults to current org). Ignored when ownerScope is "partner".' },
+        },
+        required: ['action'],
+      },
+    },
+    handler: safeHandler('manage_configuration_policy', async (input, auth) => {
+      const mfaError = configPolicyMutationMfaError(auth);
+      if (mfaError) return mfaError;
+
+      if (!canMutateOrgWideGovernance(auth)) {
+        return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+      }
+
+      const action = input.action as string;
+
+      if (action === 'create') {
+        if (!input.name) return JSON.stringify({ error: 'name is required for create' });
+
+        // Partner-wide ("all orgs") policy (#1724). The partner is ALWAYS derived
+        // from the caller's own token — never a client-supplied value — so a
+        // caller cannot create a policy owned by another partner. A partner-wide
+        // policy pushes config to EVERY org under the partner, so only callers
+        // with full partner org access (orgAccess='all', or system scope) may
+        // create one — the same gate the HTTP route enforces.
+        if (input.ownerScope === 'partner') {
+          if (!auth.partnerId) {
+            return JSON.stringify({ error: 'Partner-wide policies require partner scope' });
+          }
+          if (!canManagePartnerWidePolicies(auth)) {
+            return JSON.stringify({ error: 'Partner-wide policies require full partner org access (orgAccess must be "all")' });
+          }
+
+          // Duplicate-name check within the partner's own partner-wide policies.
+          const [existing] = await db.select({ id: configurationPolicies.id, status: configurationPolicies.status })
+            .from(configurationPolicies)
+            .where(and(
+              eq(configurationPolicies.partnerId, auth.partnerId),
+              eq(configurationPolicies.name, input.name as string),
+            ))
+            .limit(1);
+          if (existing) {
+            return JSON.stringify({
+              error: `A partner-wide configuration policy named "${input.name}" already exists (id: ${existing.id}, status: ${existing.status}). Use get_configuration_policy to view it, or choose a different name.`,
+            });
+          }
+
+          const policy = await createConfigPolicy({ partnerId: auth.partnerId }, {
+            name: input.name as string,
+            description: input.description as string | undefined,
+            status: (input.status as 'active' | 'inactive' | 'archived') ?? 'active',
+          }, auth.user.id);
+
+          // Library model (#2280): partner-owned policies are created EMPTY —
+          // no auto-seeded assignment. It's applied to orgs later via explicit
+          // apply_configuration_policy calls (partner-wide, or a subset of
+          // orgs). Mirrors the HTTP create route
+          // (routes/configurationPolicies/crud.ts), which stopped auto-seeding
+          // the partner-level assignment for the same reason.
+          return JSON.stringify({ success: true, policy });
+        }
+
+        const orgId = (input.orgId as string) || getOrgId(auth);
+        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        if (input.orgId && !auth.canAccessOrg(input.orgId as string)) {
+          return JSON.stringify({ error: 'Access denied to this organization' });
+        }
+
+        // Check for duplicate name in same org
+        const [existing] = await db.select({ id: configurationPolicies.id, status: configurationPolicies.status })
+          .from(configurationPolicies)
+          .where(and(
+            eq(configurationPolicies.orgId, orgId),
+            eq(configurationPolicies.name, input.name as string),
+          ))
+          .limit(1);
+        if (existing) {
+          return JSON.stringify({
+            error: `A configuration policy named "${input.name}" already exists (id: ${existing.id}, status: ${existing.status}). Use get_configuration_policy to view it, or choose a different name.`,
+          });
+        }
+
+        const policy = await createConfigPolicy({ orgId }, {
+          name: input.name as string,
+          description: input.description as string | undefined,
+          status: (input.status as 'active' | 'inactive' | 'archived') ?? 'active',
+        }, auth.user.id);
+
+        return JSON.stringify({ success: true, policy });
+      }
+
+      if (action === 'update') {
+        if (!input.policyId) return JSON.stringify({ error: 'policyId is required for update' });
+        const updates: { name?: string; description?: string; status?: 'active' | 'inactive' | 'archived' } = {};
+        if (typeof input.name === 'string') updates.name = input.name;
+        if (typeof input.description === 'string') updates.description = input.description;
+        if (typeof input.status === 'string') updates.status = input.status as 'active' | 'inactive' | 'archived';
+
+        const updated = await updateConfigPolicy(input.policyId as string, updates, auth);
+        if (!updated) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
+        return JSON.stringify({ success: true, policy: updated });
+      }
+
+      if (action === 'activate' || action === 'deactivate') {
+        if (!input.policyId) return JSON.stringify({ error: 'policyId is required' });
+        const newStatus = action === 'activate' ? 'active' : 'inactive';
+        const updated = await updateConfigPolicy(input.policyId as string, { status: newStatus }, auth);
+        if (!updated) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
+        return JSON.stringify({ success: true, message: `Policy "${updated.name}" ${action}d`, policy: updated });
+      }
+
+      if (action === 'delete') {
+        if (!input.policyId) return JSON.stringify({ error: 'policyId is required for delete' });
+        let deleted;
+        try {
+          deleted = await deleteConfigPolicy(input.policyId as string, auth);
+        } catch (err) {
+          // Without this branch safeHandler would flatten an actionable refusal
+          // into "Operation failed. Check server logs for details.", leaving the
+          // model with no way to know WHY or what to do next (#5080).
+          if (err instanceof PolicyHasChildrenError) {
+            // The children list is EMPTY for the lost-race variant (a child was
+            // created between the pre-check and the DELETE, caught by the FK).
+            // Rendering the generic message there would read "0 policy/policies
+            // inherit from it" while still refusing — self-contradicting, and it
+            // hides the one fact that matters: a retry may now behave differently.
+            if (err.children.length === 0) {
+              return JSON.stringify({
+                error: 'Cannot delete this configuration policy: another policy started inheriting from it just now. Re-check its child policies and retry.',
+              });
+            }
+            const names = err.children.map((c) => `"${c.name}" (${c.id})`).join(', ');
+            return JSON.stringify({
+              error: `Cannot delete this configuration policy: ${err.children.length} policy/policies inherit from it — ${names}. Delete or re-create those first.`,
+            });
+          }
+          throw err;
+        }
+        if (!deleted) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
+        return JSON.stringify({ success: true, message: `Policy "${deleted.name}" deleted` });
+      }
+
+      return JSON.stringify({ error: `Unknown action: ${action}` });
+    }),
+  });
+
+  // 8. configuration_policy_compliance — Tier 1 (read)
+  registerTool({
+    tier: 1,
+    domain: 'security',
+    searchHint: 'configuration policy compliance: organization summary, per-policy device status',
+    definition: {
+      name: 'configuration_policy_compliance',
+      description: 'Check compliance status for configuration policies. Use "summary" for org-wide compliance overview across all config policies, or "status" for per-device compliance details for a specific config policy.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          action: { type: 'string', enum: ['summary', 'status'], description: 'summary = org-wide overview, status = per-policy device compliance' },
+          policyId: { type: 'string', description: 'Configuration policy UUID (required for status)' },
+          limit: { type: 'number', description: 'Max results for status (default 50)' },
+        },
+        required: ['action'],
+      },
+    },
+    handler: safeHandler('configuration_policy_compliance', async (input, auth) => {
+      const action = input.action as string;
+
+      if (action === 'summary') {
+        // Get all config policies the caller can see — org-owned AND partner-wide
+        // (org_id NULL) for partner-scoped callers, via the dual-axis reader.
+        const conditions: SQL[] = [];
+        const oc = policyAccessCondition(auth);
+        if (oc) conditions.push(oc);
+
+        const policies = await db
+          .select({ id: configurationPolicies.id, name: configurationPolicies.name, status: configurationPolicies.status })
+          .from(configurationPolicies)
+          .where(conditions.length > 0 ? and(...conditions) : undefined);
+
+        if (policies.length === 0) {
+          return JSON.stringify({ summary: [], message: 'No configuration policies found' });
+        }
+
+        // Get all feature links for these policies
+        const policyIds = policies.map((p) => p.id);
+        const links = await db
+          .select({ id: configPolicyFeatureLinks.id, configPolicyId: configPolicyFeatureLinks.configPolicyId, featureType: configPolicyFeatureLinks.featureType })
+          .from(configPolicyFeatureLinks)
+          .where(inArray(configPolicyFeatureLinks.configPolicyId, policyIds));
+
+        const featureLinkIds = links.map((l) => l.id);
+
+        // Get compliance stats per feature link, narrowed to the devices this
+        // caller may see. Without the exact-device axis a device-bound (or
+        // device-LESS analysis) AI run read fleet-wide compliance counts here
+        // (#6096) — the `status` branch below already narrows, `summary` did not.
+        const { byFeatureLink } = featureLinkIds.length > 0
+          ? await getConfigPolicyComplianceStats(featureLinkIds, auth.allowedSiteIds, auth.allowedDeviceIds)
+          : { byFeatureLink: new Map() };
+
+        // Aggregate stats per config policy
+        const summary = policies.map((policy) => {
+          const policyLinks = links.filter((l) => l.configPolicyId === policy.id);
+          let total = 0, compliant = 0, nonCompliant = 0, pending = 0, error = 0;
+
+          for (const link of policyLinks) {
+            const stats = byFeatureLink.get(link.id);
+            if (stats) {
+              total += stats.total;
+              compliant += stats.compliant;
+              nonCompliant += stats.nonCompliant;
+              pending += stats.pending;
+              error += stats.error;
+            }
+          }
+
+          return {
+            policyId: policy.id,
+            policyName: policy.name,
+            status: policy.status,
+            featureCount: policyLinks.length,
+            compliance: { total, compliant, nonCompliant, pending, error },
+          };
+        });
+
+        return JSON.stringify({ summary });
+      }
+
+      if (action === 'status') {
+        if (!input.policyId) return JSON.stringify({ error: 'policyId is required for status' });
+        const policyId = input.policyId as string;
+
+        // Verify access to this policy
+        const policy = await getConfigPolicy(policyId, auth);
+        if (!policy) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
+
+        // Get feature links for this policy
+        const links = await listFeatureLinks(policyId);
+        const featureLinkIds = links.map((l) => l.id);
+
+        if (featureLinkIds.length === 0) {
+          return JSON.stringify({ policyId, policyName: policy.name, devices: [], message: 'No feature links configured' });
+        }
+
+        // Get per-device compliance rows for these feature links
+        const limit = Math.min(Math.max(1, Number(input.limit) || 50), 100);
+        const rows = await db
+          .select({
+            configPolicyId: automationPolicyCompliance.configPolicyId,
+            configItemName: automationPolicyCompliance.configItemName,
+            deviceId: automationPolicyCompliance.deviceId,
+            status: automationPolicyCompliance.status,
+            details: automationPolicyCompliance.details,
+            lastCheckedAt: automationPolicyCompliance.lastCheckedAt,
+            remediationAttempts: automationPolicyCompliance.remediationAttempts,
+          })
+          .from(automationPolicyCompliance)
+          .where(
+            and(
+              isNull(automationPolicyCompliance.policyId),
+              isNotNull(automationPolicyCompliance.configPolicyId),
+              inArray(automationPolicyCompliance.configPolicyId, featureLinkIds),
+              // Exact-device axis (#6096 #11): these rows are device-attributable
+              // (status + `details`) and the tool takes no deviceId, so the
+              // declarative gate never runs. `undefined` for an unrestricted
+              // caller — no narrowing.
+              deviceScopeCondition(auth, automationPolicyCompliance.deviceId)
+            )
+          )
+          .limit(limit);
+
+        return JSON.stringify({
+          policyId,
+          policyName: policy.name,
+          devices: rows,
+          showing: rows.length,
+        });
+      }
+
+      return JSON.stringify({ error: `Unknown action: ${action}` });
+    }),
+  });
+
+  // 9. manage_policy_feature_link — Tier 2 (write)
+  registerTool({
+    tier: 2,
+    domain: 'security',
+    searchHint: 'configuration policy feature links and bundled settings: add, update, remove, list',
+    definition: {
+      name: 'manage_policy_feature_link',
+      description: 'Manage configuration-policy feature links. Actions: add, update, remove, list, describe. Use describe with featureType for inlineSettings and featurePolicyId guidance. Device lifecycle purge is irreversible and destroys device history. Backup destinations resolve per device org.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          action: { type: 'string', enum: ['add', 'update', 'remove', 'list', 'describe'], description: 'The action to perform' },
+          configPolicyId: { type: 'string', description: 'Configuration policy UUID' },
+          featureLinkId: { type: 'string', description: 'Feature link UUID (required for update/remove)' },
+          featureType: {
+            type: 'string',
+            enum: [...CONFIG_FEATURE_TYPES],
+            description: 'Feature type (required for add/describe)',
+          },
+          featurePolicyId: { type: 'string', description: 'Standalone policy UUID to link (for linked policy types)' },
+          inlineSettings: { type: 'object', description: 'Inline configuration settings (use describe for the feature type shape)' },
+        },
+        required: ['action'],
+        anyOf: [
+          { properties: { action: { const: 'describe' } }, required: ['featureType'] },
+          { properties: { action: { enum: ['add', 'update', 'remove', 'list'] } }, required: ['configPolicyId'] },
+        ],
+      },
+    },
+    handler: safeHandler('manage_policy_feature_link', async (input, auth) => {
+      const action = input.action as string;
+      if (action === 'describe') {
+        const featureType = input.featureType;
+        if (typeof featureType !== 'string' || !Object.prototype.hasOwnProperty.call(POLICY_FEATURE_INLINE_SETTINGS_REFERENCE, featureType)) {
+          return JSON.stringify({ error: `featureType must be one of: ${CONFIG_FEATURE_TYPES.join(', ')}` });
+        }
+        const ft = featureType as ConfigFeatureType;
+        return JSON.stringify({ featureType: ft, linkOnly: LINK_ONLY_FEATURE_TYPES.has(ft), inlineSettings: POLICY_FEATURE_INLINE_SETTINGS_REFERENCE[ft], featurePolicyIdHint: FEATURE_POLICY_ID_HINTS[ft] });
+      }
+      const configPolicyId = input.configPolicyId as string;
+      if (!configPolicyId) return JSON.stringify({ error: 'configPolicyId is required' });
+
+      if (action === 'add' || action === 'update' || action === 'remove') {
+        const mfaError = configPolicyMutationMfaError(auth);
+        if (mfaError) return mfaError;
+      }
+
+      // Reads (list) are not gated by the site-ceiling — only add/update/remove.
+      if (action !== 'list' && !canMutateOrgWideGovernance(auth)) {
+        return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+      }
+
+      // Verify access to the parent policy
+      const policy = await getConfigPolicy(configPolicyId, auth);
+      if (!policy) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
+
+      if (action === 'list') {
+        const links = await listFeatureLinks(configPolicyId);
+        return JSON.stringify({ configPolicyId, policyName: policy.name, featureLinks: links });
+      }
+
+      // Feature-link writes on a partner-wide policy (org_id NULL) push config
+      // to every org under the partner — same capability gate as the HTTP
+      // routes. (The add/update/remove services below don't take auth, so this
+      // handler is the enforcement point for the AI path.)
+      if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
+        return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
+      }
+
+      // RMM-QA-176 D9.3. Belt-and-braces to the input-aware tier escalation in
+      // aiGuardrails, and the ANTI-BYPASS for `update`: featureType is not a
+      // required input there, so a call that omits it presents nothing the
+      // guardrail hook can recognise as maintenance and would auto-execute at
+      // tier 2. Resolve the EXISTING link's type unconditionally (one indexed
+      // lookup, reused by the update branch below) and make the omission an
+      // actionable refusal, not a silent write.
+      let existingFeatureType: string | undefined;
+      if (action === 'update') {
+        const featureLinkIdForLookup = input.featureLinkId as string | undefined;
+        if (!featureLinkIdForLookup) return JSON.stringify({ error: 'featureLinkId is required for update' });
+        const [existingLink] = await db
+          .select({ featureType: configPolicyFeatureLinks.featureType })
+          .from(configPolicyFeatureLinks)
+          .where(and(
+            eq(configPolicyFeatureLinks.id, featureLinkIdForLookup),
+            eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
+          ))
+          .limit(1);
+        existingFeatureType = existingLink?.featureType as string | undefined;
+      }
+
+      const touchesMaintenance =
+        (action === 'add' && input.featureType === 'maintenance') ||
+        (action === 'update' && existingFeatureType === 'maintenance');
+
+      if (touchesMaintenance) {
+        // `?.` deliberately: callers build this context in several shapes and a
+        // hard read would turn any principal-less one into a safeHandler-wrapped
+        // generic tool error rather than reaching the real handler.
+        const principalKind = auth.principal?.kind;
+        if (principalKind === 'api_key' || principalKind === 'oauth_grant') {
+          // NOT an MFA check. Machine contexts carry token:{} (mcpServer.ts:2246)
+          // and hasSatisfiedMfa passes ANY context when ENABLE_2FA is off
+          // (middleware/auth.ts:884-887), so an MFA-based denial would admit
+          // exactly the callers this refuses. `ai_agent` is deliberately NOT
+          // here: an approved agent run must proceed (approval is upstream).
+          return JSON.stringify({ error: MAINTENANCE_LINK_MACHINE_PRINCIPAL_DENIED });
+        }
+        if (action === 'update' && input.featureType !== 'maintenance') {
+          return JSON.stringify({ error: MAINTENANCE_LINK_FEATURE_TYPE_REQUIRED });
+        }
+      }
+
+      if (action === 'add') {
+        const featureType = input.featureType as string | undefined;
+        if (!featureType) return JSON.stringify({ error: 'featureType is required for add' });
+
+        // Org-scoped-only features (backup, onedrive_helper) can't be authored
+        // on a partner-wide policy — mirror the HTTP route's 400 rejection
+        // (featureLinks.ts) here, since addFeatureLink itself doesn't know the
+        // policy's owner. Shared source of truth: ORG_SCOPED_ONLY_FEATURE_TYPES.
+        if (policy.orgId === null && ORG_SCOPED_ONLY_FEATURE_TYPES.has(featureType as ConfigFeatureType)) {
+          return JSON.stringify({
+            error: `The "${featureType}" feature is not supported on partner-wide policies; it must be configured on an organization-scoped policy.`,
+          });
+        }
+
+        let inlineSettings: unknown = input.inlineSettings;
+        const validated = validateInlineSettingsForFeature(featureType, inlineSettings);
+        if ('error' in validated) return JSON.stringify({ error: validated.error });
+        inlineSettings = validated.value;
+
+        // addFeatureLink returns null (instead of throwing) on a duplicate —
+        // see the comment on its onConflictDoNothing insert in
+        // configurationPolicy.ts for why the raised-violation catch pattern
+        // doesn't work inside this tool call's withDbAccessContext transaction.
+        let link;
+        try {
+          link = await addFeatureLink(
+            configPolicyId,
+            featureType as any,
+            (input.featurePolicyId as string) ?? null,
+            inlineSettings ?? null
+          );
+        } catch (err) {
+          const refusal = warrantyConsentRefusal(err);
+          if (refusal) return refusal;
+          throw err;
+        }
+        if (!link) {
+          return JSON.stringify({ error: `Feature type "${featureType}" already exists on this policy. Use update action instead.` });
+        }
+        return JSON.stringify({ success: true, featureLink: link });
+      }
+
+      if (action === 'update') {
+        const featureLinkId = input.featureLinkId as string | undefined;
+        if (!featureLinkId) return JSON.stringify({ error: 'featureLinkId is required for update' });
+
+        const updates: { featurePolicyId?: string | null; inlineSettings?: unknown } = {};
+        if (input.featurePolicyId !== undefined) updates.featurePolicyId = input.featurePolicyId as string | null;
+        if (input.inlineSettings !== undefined) {
+          let inlineSettings: unknown = input.inlineSettings;
+          // update doesn't take featureType, so the existing link's type says
+          // which validate-via-schema rule applies (same reasoning as the 'add'
+          // branch above). Resolved once, above the maintenance gate — the
+          // lookup has to happen for EVERY update, not only inlineSettings
+          // ones, or a featurePolicyId-only edit of a maintenance link would
+          // slip past that gate entirely.
+          const validated = validateInlineSettingsForFeature(existingFeatureType, inlineSettings);
+          if ('error' in validated) return JSON.stringify({ error: validated.error });
+          inlineSettings = validated.value;
+          updates.inlineSettings = inlineSettings;
+        }
+
+        let updated;
+        try {
+          updated = await updateFeatureLink(featureLinkId, updates, configPolicyId);
+        } catch (err) {
+          const refusal = warrantyConsentRefusal(err);
+          if (refusal) return refusal;
+          throw err;
+        }
+        if (!updated) return JSON.stringify({ error: 'Feature link not found' });
+        return JSON.stringify({ success: true, featureLink: updated });
+      }
+
+      if (action === 'remove') {
+        const featureLinkId = input.featureLinkId as string | undefined;
+        if (!featureLinkId) return JSON.stringify({ error: 'featureLinkId is required for remove' });
+
+        const deleted = await removeFeatureLink(featureLinkId, configPolicyId);
+        if (!deleted) return JSON.stringify({ error: 'Feature link not found' });
+        return JSON.stringify(deleted.kept
+          ? { success: true, kept: true, reason: deleted.reason, message: 'Feature items removed; retired history retained' }
+          : { success: true, message: 'Feature link removed' });
+      }
+
+      return JSON.stringify({ error: `Unknown action: ${action}` });
+    }),
+  });
+}

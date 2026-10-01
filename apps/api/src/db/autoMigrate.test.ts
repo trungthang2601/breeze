@@ -1,0 +1,1512 @@
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+
+// ── Mocks for the "core migration advisory lock" describe block below ──────
+// Hoisted above the `./autoMigrate` import (vitest hoists every `vi.mock`
+// call to the top of the file regardless of source position) so the module's
+// internal `import postgres from 'postgres'` and `readFile`/`readdir` from
+// `node:fs/promises` resolve to these fakes. No other describe block in this
+// file calls `autoMigrate()` itself or reads via `node:fs/promises` — every
+// other test below exercises pure exports or reads the real migrations
+// directory via the SYNC `node:fs` API imported below, which this does not
+// touch.
+const { postgresFactory, clientMock, callLog, lockState } = vi.hoisted(() => {
+  const callLog: string[] = [];
+  const lockState: { failPattern: RegExp | null } = { failPattern: null };
+
+  const clientMock = Object.assign(
+    vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      callLog.push(`${strings.join('?')} | values=${JSON.stringify(values)}`);
+      return [];
+    }),
+    {
+      unsafe: vi.fn(async (query: string) => {
+        callLog.push(query);
+        if (lockState.failPattern?.test(query)) {
+          throw new Error(`mock DB failure: ${query}`);
+        }
+        return [];
+      }),
+      begin: vi.fn(async (cb: (tx: unknown) => unknown) => cb(clientMock)),
+      end: vi.fn(async () => undefined),
+      // `./autoMigrate` transitively imports `./seed` -> `./index`, whose
+      // module-level `drizzle(client, { schema })` call (the app's own
+      // request pool, unrelated to autoMigrate's own `postgres(...)` client)
+      // also resolves through this same mocked factory. drizzle-orm's
+      // postgres-js driver reads `client.options.parsers`/`serializers` at
+      // construction time (see requestDatabasePool.test.ts for the same
+      // shape requirement).
+      options: { parsers: {}, serializers: {} },
+    },
+  );
+
+  return { postgresFactory: vi.fn(() => clientMock), clientMock, callLog, lockState };
+});
+
+vi.mock('postgres', () => ({ default: postgresFactory }));
+vi.mock('node:fs/promises', () => ({
+  // Empty migration set: `autoMigrate()` takes the "no migration files
+  // found" early return right after the tracking-table setup, which is
+  // exactly the phase this describe block needs to observe the lock around
+  // without simulating the entire apply pipeline (ensureAppRole/seed/etc).
+  readdir: vi.fn(async () => []),
+  readFile: vi.fn(async () => ''),
+}));
+
+import {
+  detectState,
+  assertAppRoleBootstrapped,
+  hashSql,
+  hasNoTransactionDirective,
+  extractDefinedFunctionNames,
+  extractTouchedConstraintNames,
+  selectReplayFollowers,
+  splitSqlStatements,
+  CHECKSUM_RECONCILIATIONS,
+  planMigrations,
+  partitionLedgerRows,
+  autoMigrate,
+  CORE_MIGRATION_LOCK_KEY,
+} from './autoMigrate';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { getTableConfig } from 'drizzle-orm/pg-core';
+import { users } from './schema/users';
+import * as oauthSchema from './schema/oauth';
+import { quotes } from './schema/quotes';
+import { deviceMtlsCertificates } from './schema/deviceMtlsCertificates';
+import { manifestSigningKeyDelegations } from './schema/manifestSigningKeys';
+import { devices } from './schema/devices';
+
+// The 2026-08-06 date was reserved for the security remediation waves — though
+// two same-day migrations from unrelated work landed in it as well
+// (-e-action-intents-origin-principal, -f-m365-comms-delegated; see the Wave 6
+// tests below, which document exactly that). All eight have now shipped.
+//
+// The block is CLOSED. Every file in it is content-hash immutable, and the
+// files carry ordering dependencies on each other (the wave tests below assert
+// several), so a new file wedged into the block replays in the wrong order on
+// a fresh DB. At least one planned migration is already known to re-create a
+// function the block defines — see the m365-comms plan doc, whose migrations
+// this PR moved to a later date for exactly this reason.
+//
+// Previous guards expressed this as a shape (`-a..-f` slot letters). That was
+// wrong twice over: it silently blessed `2026-08-06-a-something-unrelated.sql`,
+// and it read as an open range with `-g-` free for the taking. Three separate
+// authors reached for `-g-` (#2995, #3008, and the m365-comms plan doc) — the
+// convention documented for same-day ordering is exactly "take the next
+// letter", so that is the *natural* reading of a slot-letter rule.
+//
+// The mechanism is therefore an explicit frozen manifest, not a pattern: these
+// eight filenames and no others. A ninth file on this date fails and is told to
+// use a later date. See `scripts/check-migration-naming.sh` for the same rule
+// enforced at commit time (which is where an author should hit it) — its copy
+// of this manifest is asserted identical below — and
+// `apps/api/migrations/README.md` for the authoring-facing writeup.
+const RESERVED_MIGRATION_DATE = '2026-08-06-';
+const RESERVED_BLOCK_MIGRATIONS = [
+  '2026-08-06-a-report-site-scope.sql',
+  '2026-08-06-b-live-authorization.sql',
+  '2026-08-06-c-quote-response-capability.sql',
+  '2026-08-06-d-device-mtls-certificate-history.sql',
+  '2026-08-06-e-action-intents-origin-principal.sql',
+  '2026-08-06-e-agent-outbound-network-capability.sql',
+  '2026-08-06-f-m365-comms-delegated.sql',
+  '2026-08-06-f-manifest-key-delegations.sql',
+] as const;
+
+const MIGRATIONS_DIR = path.resolve(__dirname, '../../migrations');
+const REPO_ROOT = path.resolve(__dirname, '../../../..');
+const GUARD_SCRIPT = path.join(REPO_ROOT, 'scripts/check-migration-naming.sh');
+
+function listMigrationFilenames(): string[] {
+  return readdirSync(MIGRATIONS_DIR)
+    .filter((filename) => /^\d{4}-.*\.sql$/.test(filename))
+    .sort((a, b) => a.localeCompare(b));
+}
+
+describe('autoMigrate', () => {
+  describe('detectState', () => {
+    it('should return "fresh" when no users table exists', () => {
+      expect(detectState(false, false)).toBe('fresh');
+    });
+
+    it('should return "fresh" when users table missing even if breeze_migrations exists', () => {
+      // Impossible in practice but the function should treat no users as fresh
+      expect(detectState(false, true)).toBe('fresh');
+    });
+
+    it('should return "legacy" when users exists but breeze_migrations does not', () => {
+      expect(detectState(true, false)).toBe('legacy');
+    });
+
+    it('should return "normal" when both users and breeze_migrations exist', () => {
+      expect(detectState(true, true)).toBe('normal');
+    });
+  });
+
+  describe('assertAppRoleBootstrapped', () => {
+    it('does not throw when ensureAppRole succeeded', () => {
+      expect(() => assertAppRoleBootstrapped(true, false)).not.toThrow();
+      expect(() => assertAppRoleBootstrapped(true, true)).not.toThrow();
+    });
+
+    it('does not throw when ensureAppRole was skipped but breeze_app already exists (e.g. compose-provisioned dev DB)', () => {
+      expect(() => assertAppRoleBootstrapped(false, true)).not.toThrow();
+    });
+
+    it('throws a pointed error when ensureAppRole was skipped AND breeze_app does not exist (#4048)', () => {
+      expect(() => assertAppRoleBootstrapped(false, false)).toThrow(
+        /BREEZE_APP_DB_PASSWORD.*POSTGRES_PASSWORD.*globalPassThroughEnv/s,
+      );
+    });
+  });
+
+  describe('hashSql', () => {
+    it('should return a hex SHA-256 hash of the input', () => {
+      const input = 'SELECT 1;';
+      const expected = createHash('sha256').update(input).digest('hex');
+      expect(hashSql(input)).toBe(expected);
+    });
+
+    it('should return a 64-character hex string', () => {
+      const result = hashSql('CREATE TABLE foo (id INT);');
+      expect(result).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it('should return consistent results for the same input', () => {
+      const sql = 'ALTER TABLE devices ADD COLUMN test TEXT;';
+      expect(hashSql(sql)).toBe(hashSql(sql));
+    });
+
+    it('should return different hashes for different inputs', () => {
+      expect(hashSql('SELECT 1;')).not.toBe(hashSql('SELECT 2;'));
+    });
+
+    it('should handle empty string', () => {
+      const expected = createHash('sha256').update('').digest('hex');
+      expect(hashSql('')).toBe(expected);
+    });
+
+    it('should handle multiline SQL', () => {
+      const sql = `
+        CREATE TABLE test (
+          id SERIAL PRIMARY KEY,
+          name TEXT NOT NULL
+        );
+      `;
+      const expected = createHash('sha256').update(sql).digest('hex');
+      expect(hashSql(sql)).toBe(expected);
+    });
+  });
+
+  describe('migration file pattern', () => {
+    const MIGRATION_FILE_PATTERN = /^\d{4}-.*\.sql$/;
+
+    it('should match numbered migration files', () => {
+      expect(MIGRATION_FILE_PATTERN.test('0001-baseline.sql')).toBe(true);
+      expect(MIGRATION_FILE_PATTERN.test('0065-users-setup-completed-at.sql')).toBe(true);
+    });
+
+    it('should match files with hyphens and multiple words', () => {
+      expect(MIGRATION_FILE_PATTERN.test('0010-psa-provider-and-patch-compliance-reports.sql')).toBe(true);
+    });
+
+    it('should reject files without leading digits', () => {
+      expect(MIGRATION_FILE_PATTERN.test('baseline.sql')).toBe(false);
+      expect(MIGRATION_FILE_PATTERN.test('abc-baseline.sql')).toBe(false);
+    });
+
+    it('should reject files with fewer than 4 leading digits', () => {
+      expect(MIGRATION_FILE_PATTERN.test('001-baseline.sql')).toBe(false);
+    });
+
+    it('should reject non-SQL files', () => {
+      expect(MIGRATION_FILE_PATTERN.test('0001-baseline.ts')).toBe(false);
+      expect(MIGRATION_FILE_PATTERN.test('0001-baseline.txt')).toBe(false);
+    });
+
+    it('should reject directories and other entries', () => {
+      expect(MIGRATION_FILE_PATTERN.test('optional')).toBe(false);
+      expect(MIGRATION_FILE_PATTERN.test('.gitkeep')).toBe(false);
+    });
+
+    it('should require something after the digits', () => {
+      expect(MIGRATION_FILE_PATTERN.test('0001.sql')).toBe(false);
+    });
+
+    it('should match exactly 4-digit prefixes', () => {
+      expect(MIGRATION_FILE_PATTERN.test('9999-last.sql')).toBe(true);
+      // 5-digit prefix still matches because \d{4} matches the first four
+      // and the fifth digit is consumed by .*
+      expect(MIGRATION_FILE_PATTERN.test('00001-future.sql')).toBe(false);
+    });
+  });
+
+  describe('hasNoTransactionDirective', () => {
+    it('returns true when "-- @no-transaction" is the first line', () => {
+      expect(hasNoTransactionDirective('-- @no-transaction\nCREATE INDEX foo ON bar (x);')).toBe(
+        true,
+      );
+    });
+
+    it('returns true when the directive has leading whitespace', () => {
+      expect(hasNoTransactionDirective('   -- @no-transaction\nSELECT 1;')).toBe(true);
+    });
+
+    it('returns true when the directive appears after non-directive lines', () => {
+      // Order in the file should not matter — operators may add the marker
+      // after a copyright header. The runner checks the whole file.
+      expect(
+        hasNoTransactionDirective('-- header\n-- comment\n-- @no-transaction\nSELECT 1;'),
+      ).toBe(true);
+    });
+
+    it('returns false when the directive is missing', () => {
+      expect(hasNoTransactionDirective('CREATE INDEX IF NOT EXISTS foo ON bar (x);')).toBe(false);
+    });
+
+    it('returns false for a comment that merely mentions @no-transaction inline', () => {
+      // The marker must be the start of the comment ("-- @no-transaction"),
+      // not a substring of a normal comment, so that a sentence like
+      // "# @no-transaction can be useful" in a docstring doesn't accidentally
+      // opt a migration out of the transaction.
+      expect(
+        hasNoTransactionDirective(
+          '-- This migration is normal. See the @no-transaction docs for index migrations.\nSELECT 1;',
+        ),
+      ).toBe(false);
+    });
+
+    it('returns false for a line that is not a SQL comment', () => {
+      expect(hasNoTransactionDirective('@no-transaction\nSELECT 1;')).toBe(false);
+      expect(hasNoTransactionDirective('# @no-transaction\nSELECT 1;')).toBe(false);
+    });
+
+    it('matches "@no-transaction" only as a whole word', () => {
+      expect(hasNoTransactionDirective('-- @no-transactional\nSELECT 1;')).toBe(false);
+    });
+  });
+
+  describe('extractDefinedFunctionNames', () => {
+    it('returns an empty array for a file that defines no function', () => {
+      expect(extractDefinedFunctionNames('ALTER TABLE devices ADD COLUMN IF NOT EXISTS foo text;')).toEqual([]);
+    });
+
+    it('extracts a schema-qualified CREATE OR REPLACE FUNCTION, lowercased', () => {
+      const sql = 'CREATE OR REPLACE FUNCTION public.Breeze_Guard_Pam_Device_Org_Move()\nRETURNS trigger\nAS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;';
+      expect(extractDefinedFunctionNames(sql)).toEqual(['public.breeze_guard_pam_device_org_move']);
+    });
+
+    it('extracts every function/procedure a real multi-definer migration redefines', () => {
+      // Trimmed shape of apps/api/migrations/2026-09-17-pam-device-move-guard.sql:
+      // two CREATE OR REPLACE FUNCTION statements in one file.
+      const sql = `
+CREATE OR REPLACE FUNCTION public.breeze_guard_pam_device_org_move()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.breeze_device_child_orgid_tables()
+  RETURNS SETOF text
+  LANGUAGE sql
+  STABLE
+  AS $$
+  SELECT 1;
+$$;
+`;
+      expect(extractDefinedFunctionNames(sql)).toEqual([
+        'public.breeze_device_child_orgid_tables',
+        'public.breeze_guard_pam_device_org_move',
+      ]);
+    });
+
+    it('recognizes bare CREATE FUNCTION and CREATE [OR REPLACE] PROCEDURE, without the "OR REPLACE" branch', () => {
+      const sql = `
+CREATE FUNCTION public.plain_new_function() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+CREATE PROCEDURE public.plain_procedure() LANGUAGE sql AS $$ SELECT 1; $$;
+CREATE OR REPLACE PROCEDURE public.replaced_procedure() LANGUAGE sql AS $$ SELECT 1; $$;
+`;
+      expect(extractDefinedFunctionNames(sql)).toEqual([
+        'public.plain_new_function',
+        'public.plain_procedure',
+        'public.replaced_procedure',
+      ]);
+    });
+
+    it('ignores a CREATE OR REPLACE FUNCTION mentioned only in a line comment', () => {
+      const sql = [
+        '-- Idempotent throughout: ADD COLUMN IF NOT EXISTS, DO-guarded constraint add,',
+        '-- CREATE OR REPLACE FUNCTION public.should_not_count(). autoMigrate wraps this',
+        '-- file in one transaction -- no inner BEGIN/COMMIT.',
+        '',
+        'ALTER TABLE action_intents ADD COLUMN IF NOT EXISTS approval_scope text;',
+      ].join('\n');
+      expect(extractDefinedFunctionNames(sql)).toEqual([]);
+    });
+
+    it('dedupes a name defined more than once in the same file', () => {
+      const sql = `
+CREATE OR REPLACE FUNCTION public.dup() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION public.dup() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+`;
+      expect(extractDefinedFunctionNames(sql)).toEqual(['public.dup']);
+    });
+
+    it('is case-insensitive on the CREATE/FUNCTION keywords themselves', () => {
+      expect(extractDefinedFunctionNames('create or replace function public.lower_kw() returns void as $$ begin end; $$ language plpgsql;'))
+        .toEqual(['public.lower_kw']);
+    });
+  });
+
+  describe('extractTouchedConstraintNames (#6700 / #6701)', () => {
+    it('returns an empty array for a file that touches no constraint', () => {
+      expect(extractTouchedConstraintNames('ALTER TABLE devices ADD COLUMN IF NOT EXISTS foo text;')).toEqual([]);
+    });
+
+    it('extracts DROP ... IF EXISTS and ADD of the same CHECK (the pam-actuation-lifecycle shape)', () => {
+      const sql = `
+ALTER TABLE intent_outbox DROP CONSTRAINT IF EXISTS intent_outbox_event_type_check;
+ALTER TABLE intent_outbox ADD CONSTRAINT intent_outbox_event_type_check CHECK (event_type IN ('a'));
+`;
+      expect(extractTouchedConstraintNames(sql)).toEqual(['intent_outbox_event_type_check']);
+    });
+
+    it('extracts ALTER CONSTRAINT ... [NOT] DEFERRABLE and VALIDATE CONSTRAINT', () => {
+      const sql = `
+ALTER TABLE public.devices ALTER CONSTRAINT devices_site_org_fk NOT DEFERRABLE;
+ALTER TABLE public.sites ALTER CONSTRAINT sites_org_fk DEFERRABLE INITIALLY IMMEDIATE;
+ALTER TABLE public.tickets VALIDATE CONSTRAINT tickets_org_fk;
+`;
+      expect(extractTouchedConstraintNames(sql)).toEqual(['devices_site_org_fk', 'sites_org_fk', 'tickets_org_fk']);
+    });
+
+    it('extracts both sides of RENAME CONSTRAINT', () => {
+      expect(extractTouchedConstraintNames('ALTER TABLE t RENAME CONSTRAINT old_chk TO new_chk;'))
+        .toEqual(['new_chk', 'old_chk']);
+    });
+
+    it('extracts names from a DO-block EXECUTE string literal and strips double quotes', () => {
+      const sql = `
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'foo_chk') THEN
+    EXECUTE 'ALTER TABLE foo ADD CONSTRAINT "Foo_Chk" CHECK (x > 0)';
+  END IF;
+END $$;
+`;
+      expect(extractTouchedConstraintNames(sql)).toEqual(['foo_chk']);
+    });
+
+    it('ignores constraint mentions in line comments and SET CONSTRAINTS', () => {
+      const sql = [
+        '-- ALTER TABLE devices DROP CONSTRAINT should_not_count;',
+        'SET CONSTRAINTS ALL DEFERRED;',
+        'SET CONSTRAINTS devices_site_org_fk DEFERRED;',
+      ].join('\n');
+      expect(extractTouchedConstraintNames(sql)).toEqual([]);
+    });
+
+    it('ignores an inline CONSTRAINT clause in CREATE TABLE (replaying CREATE TABLE IF NOT EXISTS never rewrites it)', () => {
+      const sql = 'CREATE TABLE IF NOT EXISTS t (id uuid, CONSTRAINT t_pk PRIMARY KEY (id));';
+      expect(extractTouchedConstraintNames(sql)).toEqual([]);
+    });
+  });
+
+  describe('selectReplayFollowers (#6700 / #6701)', () => {
+    const file = (name: string, content: string) => ({ name, content });
+
+    it('selects nothing when the base file defines no function and touches no constraint', () => {
+      expect(selectReplayFollowers('ALTER TABLE t ADD COLUMN IF NOT EXISTS x int;', [
+        file('b.sql', 'CREATE OR REPLACE FUNCTION public.f() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+      ])).toEqual([]);
+    });
+
+    it('selects a later file that widens a CHECK the base file narrows (#6700)', () => {
+      const base = `
+ALTER TABLE intent_outbox DROP CONSTRAINT IF EXISTS intent_outbox_event_type_check;
+ALTER TABLE intent_outbox ADD CONSTRAINT intent_outbox_event_type_check CHECK (event_type IN ('a'));
+`;
+      expect(selectReplayFollowers(base, [
+        file('b-unrelated.sql', 'ALTER TABLE t ADD CONSTRAINT other_chk CHECK (true);'),
+        file('c-widen.sql', `
+ALTER TABLE intent_outbox DROP CONSTRAINT IF EXISTS intent_outbox_event_type_check;
+ALTER TABLE intent_outbox ADD CONSTRAINT intent_outbox_event_type_check CHECK (event_type IN ('a','b'));
+`),
+      ])).toEqual(['c-widen.sql']);
+    });
+
+    it('still selects later redefiners of a function the base file defines', () => {
+      const base = 'CREATE OR REPLACE FUNCTION public.f() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;';
+      expect(selectReplayFollowers(base, [
+        file('b.sql', 'CREATE OR REPLACE FUNCTION public.f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;'),
+      ])).toEqual(['b.sql']);
+    });
+
+    it('closes transitively across the two name kinds, in filename order', () => {
+      // base touches chk_a; b re-touches chk_a AND defines g; c redefines g
+      // (never mentioned by base); d re-touches chk_b, which c introduced.
+      const base = 'ALTER TABLE t ADD CONSTRAINT chk_a CHECK (true);';
+      expect(selectReplayFollowers(base, [
+        file('b.sql', `ALTER TABLE t DROP CONSTRAINT IF EXISTS chk_a;
+CREATE OR REPLACE FUNCTION public.g() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;`),
+        file('c.sql', `CREATE OR REPLACE FUNCTION public.g() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;
+ALTER TABLE t2 ADD CONSTRAINT chk_b CHECK (true);`),
+        file('d.sql', 'ALTER TABLE t2 VALIDATE CONSTRAINT chk_b;'),
+        file('e.sql', 'ALTER TABLE t3 ADD CONSTRAINT chk_c CHECK (true);'),
+      ])).toEqual(['b.sql', 'c.sql', 'd.sql']);
+    });
+
+    it('does not cross-match a function name against a constraint name', () => {
+      const base = 'ALTER TABLE t ADD CONSTRAINT same_name CHECK (true);';
+      expect(selectReplayFollowers(base, [
+        file('b.sql', 'CREATE OR REPLACE FUNCTION same_name() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;'),
+      ])).toEqual([]);
+    });
+  });
+
+  describe('splitSqlStatements', () => {
+    it('splits a typical CREATE INDEX CONCURRENTLY migration', () => {
+      const sql = `-- @no-transaction
+-- Devices: scale indexes for /devices list endpoint.
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS devices_org_id_last_seen_at_idx
+  ON devices (org_id, last_seen_at DESC);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS devices_org_id_status_idx
+  ON devices (org_id, status);
+`;
+      const out = splitSqlStatements(sql);
+      expect(out).toHaveLength(2);
+      expect(out[0]).toContain('devices_org_id_last_seen_at_idx');
+      expect(out[1]).toContain('devices_org_id_status_idx');
+      expect(out[0]).not.toContain(';');
+      expect(out[1]).not.toContain(';');
+    });
+
+    it('returns an empty array for a comment-only file', () => {
+      expect(splitSqlStatements('-- nothing here\n-- @no-transaction\n')).toEqual([]);
+    });
+
+    it('returns a single statement when there is no trailing semicolon', () => {
+      expect(splitSqlStatements('SELECT 1')).toEqual(['SELECT 1']);
+    });
+
+    it('preserves semicolons inside single-quoted string literals', () => {
+      const sql = "INSERT INTO t (s) VALUES ('a;b;c'); INSERT INTO t (s) VALUES ('d');";
+      const out = splitSqlStatements(sql);
+      expect(out).toHaveLength(2);
+      expect(out[0]).toBe("INSERT INTO t (s) VALUES ('a;b;c')");
+      expect(out[1]).toBe("INSERT INTO t (s) VALUES ('d')");
+    });
+
+    it("handles SQL-doubled single quotes inside literals", () => {
+      const sql = "INSERT INTO t (s) VALUES ('Bobby''s; table'); SELECT 1;";
+      const out = splitSqlStatements(sql);
+      expect(out).toHaveLength(2);
+      expect(out[0]).toBe("INSERT INTO t (s) VALUES ('Bobby''s; table')");
+      expect(out[1]).toBe('SELECT 1');
+    });
+
+    it('preserves semicolons inside dollar-quoted blocks', () => {
+      const sql = `CREATE OR REPLACE FUNCTION f() RETURNS void AS $$
+BEGIN
+  RAISE NOTICE 'a;b;c';
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT 1;`;
+      const out = splitSqlStatements(sql);
+      expect(out).toHaveLength(2);
+      expect(out[0]).toContain('CREATE OR REPLACE FUNCTION');
+      expect(out[0]).toContain("RAISE NOTICE 'a;b;c'");
+      expect(out[1]).toBe('SELECT 1');
+    });
+
+    it('handles tagged dollar quotes ($tag$ ... $tag$)', () => {
+      const sql = "DO $body$ BEGIN PERFORM 1; END $body$; SELECT 2;";
+      const out = splitSqlStatements(sql);
+      expect(out).toHaveLength(2);
+      expect(out[0]).toBe('DO $body$ BEGIN PERFORM 1; END $body$');
+      expect(out[1]).toBe('SELECT 2');
+    });
+
+    it('strips line comments but preserves the statements following them', () => {
+      const sql = `-- header comment with a; semicolon
+CREATE INDEX CONCURRENTLY IF NOT EXISTS foo_idx ON t (a);
+-- another comment
+CREATE INDEX CONCURRENTLY IF NOT EXISTS bar_idx ON t (b);`;
+      const out = splitSqlStatements(sql);
+      expect(out).toHaveLength(2);
+      expect(out[0]).toContain('foo_idx');
+      expect(out[1]).toContain('bar_idx');
+    });
+  });
+});
+
+describe('core migration advisory lock (#4086)', () => {
+  beforeEach(() => {
+    callLog.length = 0;
+    lockState.failPattern = null;
+    vi.clearAllMocks();
+  });
+
+  function acquireIndex(): number {
+    return callLog.findIndex((c) => c.includes('pg_advisory_lock(') && c.includes(CORE_MIGRATION_LOCK_KEY));
+  }
+  function releaseIndex(): number {
+    return callLog.findIndex((c) => c.includes('pg_advisory_unlock(') && c.includes(CORE_MIGRATION_LOCK_KEY));
+  }
+
+  it('acquires the session advisory lock before any tracking-table work, and releases it after (happy path)', async () => {
+    await autoMigrate();
+
+    const trackingTableIndex = callLog.findIndex((c) => c.includes('CREATE TABLE IF NOT EXISTS breeze_migrations'));
+
+    expect(acquireIndex()).toBe(0);
+    expect(trackingTableIndex).toBeGreaterThan(acquireIndex());
+    expect(releaseIndex()).toBeGreaterThan(trackingTableIndex);
+    // The lock release is the LAST DB call this run makes — nothing runs
+    // after it except closing the connection.
+    expect(releaseIndex()).toBe(callLog.length - 1);
+    expect(clientMock.end).toHaveBeenCalledTimes(1);
+  });
+
+  it('still releases the lock (and closes the connection) when a migration step throws', async () => {
+    lockState.failPattern = /CREATE TABLE IF NOT EXISTS breeze_migrations/;
+
+    await expect(autoMigrate()).rejects.toThrow(/mock DB failure/);
+
+    const failureIndex = callLog.findIndex((c) => c.includes('CREATE TABLE IF NOT EXISTS breeze_migrations'));
+
+    expect(acquireIndex()).toBe(0);
+    expect(failureIndex).toBeGreaterThan(acquireIndex());
+    // The unlock in autoMigrate()'s inner `finally` still ran despite the throw.
+    expect(releaseIndex()).toBeGreaterThan(failureIndex);
+    expect(clientMock.end).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('db:migrate entrypoint (#3065)', () => {
+  // `pnpm db:migrate` executes a dedicated entry file via tsx. That file must
+  // unconditionally invoke autoMigrate() — the original bug was the script
+  // pointing at the library module itself, which only exports the function,
+  // so the command exited 0 having applied nothing. A conditional
+  // "am I the main module?" guard is not acceptable here either: comparing
+  // import.meta.url to process.argv[1] fails open on percent-encodable or
+  // symlinked paths, silently reproducing the same no-op.
+  const apiRoot = path.resolve(__dirname, '..', '..');
+
+  function resolveEntrypoint(): { entrypoint: string; source: string } {
+    const pkg = JSON.parse(readFileSync(path.join(apiRoot, 'package.json'), 'utf8'));
+    const script: string = pkg.scripts['db:migrate'];
+    expect(script).toMatch(/^tsx /);
+    const entrypoint = script.replace(/^tsx\s+/, '').trim();
+    return { entrypoint, source: readFileSync(path.join(apiRoot, entrypoint), 'utf8') };
+  }
+
+  it('package.json db:migrate points at a dedicated entry file, not the library module', () => {
+    const { entrypoint, source } = resolveEntrypoint();
+    expect(source.length).toBeGreaterThan(0);
+    // The library module must stay import-safe for the API boot path, so the
+    // script may not point straight at it.
+    expect(path.basename(entrypoint)).not.toBe('autoMigrate.ts');
+  });
+
+  it('the entrypoint invokes autoMigrate() unconditionally and exits by outcome', () => {
+    const { source } = resolveEntrypoint();
+
+    // Invokes the runner (not just imports it)...
+    expect(source).toContain('autoMigrate()');
+    // ...must not hide the call behind a main-module guard (fails open on
+    // percent-encoded/symlinked paths — the silent-no-op failure mode again).
+    expect(source).not.toContain('import.meta.url ===');
+    // Success must exit 0 explicitly (the auto-seed step opens the shared
+    // pool, which would otherwise hold the event loop open forever)...
+    expect(source).toContain('process.exit(0)');
+    // ...and failure must exit non-zero.
+    expect(source).toContain('process.exit(1)');
+  });
+});
+
+describe('CHECKSUM_RECONCILIATIONS', () => {
+  const migrationsDir = path.resolve(__dirname, '../../migrations');
+
+  it('each entry targets a real shipped migration whose CURRENT content hashes to `to`', () => {
+    const entries = Object.entries(CHECKSUM_RECONCILIATIONS);
+    expect(entries.length).toBeGreaterThan(0);
+    for (const [filename, rec] of entries) {
+      // The current on-disk file must hash to the declared `to`. If someone
+      // edits one of these migrations again, this fails until `to` is updated —
+      // preventing a silently-stale heal map.
+      const content = readFileSync(path.join(migrationsDir, filename), 'utf8');
+      expect(hashSql(content)).toBe(rec.to);
+      // A reconciliation must represent an actual change, with valid checksums.
+      expect(rec.from).not.toBe(rec.to);
+      expect(rec.from).toMatch(/^[0-9a-f]{64}$/);
+      expect(rec.to).toMatch(/^[0-9a-f]{64}$/);
+      expect(rec.reason.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('migration filename conventions', () => {
+  it('#3205 W07: the billing-evidence migrations sort A -> B -> C and A is no-transaction', () => {
+    const dir = path.join(__dirname, '../../migrations');
+    const files = readdirSync(dir)
+      .filter((f) => /^\d{4}-.*\.sql$/.test(f))
+      .sort((a, b) => a.localeCompare(b));
+    const a = files.findIndex((f) => f.endsWith('-billing-evidence-fk-targets.sql'));
+    const b = files.findIndex((f) => f.endsWith('-101200-billing-evidence.sql'));
+    const c = files.findIndex((f) => f.endsWith('-device-move-exclude-billing-evidence.sql'));
+    expect(a).toBeGreaterThan(-1);
+    expect(b).toBeGreaterThan(a);
+    expect(c).toBeGreaterThan(b);
+    // A builds indexes CONCURRENTLY, which is illegal inside a transaction.
+    expect(hasNoTransactionDirective(readFileSync(path.join(dir, files[a]!), 'utf8'))).toBe(true);
+    // B and C are ordinary transactional files.
+    expect(hasNoTransactionDirective(readFileSync(path.join(dir, files[b]!), 'utf8'))).toBe(false);
+    expect(hasNoTransactionDirective(readFileSync(path.join(dir, files[c]!), 'utf8'))).toBe(false);
+  });
+
+  it('adds no new migration to the closed 2026-08-06 reserved block', () => {
+    const onDisk = listMigrationFilenames().filter((filename) =>
+      filename.startsWith(RESERVED_MIGRATION_DATE),
+    );
+    const manifest: string[] = [...RESERVED_BLOCK_MIGRATIONS];
+    const squatters = onDisk.filter((filename) => !manifest.includes(filename));
+
+    expect(
+      squatters,
+      squatters.length === 0
+        ? ''
+        : `Migration(s) added to the CLOSED reserved ${RESERVED_MIGRATION_DATE} block:\n` +
+          squatters.map((filename) => `  - ${filename}`).join('\n') +
+          `\n\nThat date is not a free namespace and its letters do NOT run past the\n` +
+          `shipped set. Rename the file to a date AFTER the block (a plain\n` +
+          `YYYY-MM-DD-<slug>.sql on today's date sorts last, which is normally\n` +
+          `what you actually want) and update every reference to the old path —\n` +
+          `integration tests replay migrations BY PATH, so a stale name is an\n` +
+          `ENOENT in Integration Tests, not a compile error.\n` +
+          `See apps/api/migrations/README.md.`,
+    ).toEqual([]);
+
+    // Guard the other direction too: a manifest entry that no longer exists on
+    // disk means a shipped migration was deleted or renamed, which re-applies
+    // under the new name on every already-migrated database.
+    const missing = manifest.filter((filename) => !onDisk.includes(filename));
+    expect(
+      missing,
+      missing.length === 0
+        ? ''
+        : `Shipped reserved-block migration(s) missing from apps/api/migrations: ${missing.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('keeps the commit-time naming guard in sync with the reserved-block manifest', () => {
+    // The pre-commit guard is where an author should hit this, and it is
+    // deliberately a standalone shell script (no toolchain needed). It carries
+    // its own copy of the date and the manifest, so assert BOTH element-for-
+    // element — a substring check on the date alone would still pass while the
+    // two guards enforced different memberships.
+    const guard = readFileSync(GUARD_SCRIPT, 'utf8');
+
+    expect(guard).toMatch(new RegExp(`^RESERVED_DATE="${RESERVED_MIGRATION_DATE}"$`, 'm'));
+
+    const arrayBody = guard.match(/^RESERVED_BLOCK=\(\n([\s\S]*?)^\)$/m)?.[1];
+    expect(arrayBody, 'could not parse RESERVED_BLOCK=( … ) out of the guard script').toBeDefined();
+
+    const shellManifest = (arrayBody ?? '')
+      .split('\n')
+      .map((line) => line.trim().replace(/^"(.*)"$/, '$1'))
+      .filter((line) => line.length > 0 && !line.startsWith('#'));
+
+    expect(shellManifest).toEqual([...RESERVED_BLOCK_MIGRATIONS]);
+  });
+
+  it('rejects a squatter migration when the commit-time guard actually runs', () => {
+    // The guard runs on every PR, but only ever against a clean tree — that
+    // proves the pass branch and nothing else. Drive its FAILURE path against a
+    // fixture directory so "the guard still fires" is a test, not a memory of
+    // having tried it once by hand.
+    const fixture = mkdtempSync(path.join(tmpdir(), 'migration-naming-'));
+    try {
+      for (const filename of RESERVED_BLOCK_MIGRATIONS) {
+        writeFileSync(path.join(fixture, filename), '-- fixture\n');
+      }
+
+      const run = (): { status: number | null; stderr: string } => {
+        const result = spawnSync('bash', [GUARD_SCRIPT], {
+          cwd: REPO_ROOT,
+          encoding: 'utf8',
+          env: { ...process.env, BREEZE_MIGRATIONS_DIR: fixture },
+        });
+        return { status: result.status, stderr: result.stderr };
+      };
+
+      // The shipped block alone is clean.
+      expect(run().status).toBe(0);
+
+      // A ninth file on the reserved date is rejected, and named.
+      writeFileSync(path.join(fixture, '2026-08-06-g-squatter.sql'), '-- fixture\n');
+      const squatter = run();
+      expect(squatter.status).toBe(1);
+      expect(squatter.stderr).toContain('2026-08-06-g-squatter.sql');
+      expect(squatter.stderr).toContain('CLOSED');
+      rmSync(path.join(fixture, '2026-08-06-g-squatter.sql'));
+
+      // A filename the runner would silently skip is rejected, and named.
+      writeFileSync(path.join(fixture, 'no-date-prefix.sql'), '-- fixture\n');
+      const undiscoverable = run();
+      expect(undiscoverable.status).toBe(1);
+      expect(undiscoverable.stderr).toContain('no-date-prefix.sql');
+      rmSync(path.join(fixture, 'no-date-prefix.sql'));
+
+      // An empty directory must FAIL rather than report OK having checked
+      // nothing — the vacuous-guard failure mode this whole suite exists for.
+      for (const filename of RESERVED_BLOCK_MIGRATIONS) {
+        rmSync(path.join(fixture, filename));
+      }
+      expect(run().status).toBe(1);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves every core migration path referenced from apps/api/src', () => {
+    // Integration suites replay migrations by path (readFileSync of
+    // `../../../migrations/<file>.sql`). Those references are executable code,
+    // not prose: renaming a migration without sweeping them fails as an ENOENT
+    // minutes into Integration Tests, long after Test API has gone green.
+    // This assertion moves that failure into the unit job, where it is instant.
+    const srcDir = path.resolve(__dirname, '..');
+    const referenced = new Map<string, string>();
+
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== 'node_modules') walk(full);
+          continue;
+        }
+        if (!entry.name.endsWith('.ts')) continue;
+        // Extension bundles carry their OWN migrations directories, and their
+        // tests build synthetic in-memory bundles whose fixture filenames
+        // intentionally do not exist on disk. Skip only those test files —
+        // extension SOURCE files do cite real core migrations (e.g.
+        // extensions/stateStore.ts), and those references should be held to
+        // the same standard as any other.
+        //
+        // Note this scan does not distinguish code from comments, so a prose
+        // mention of a migration path is checked too. That is intended: a
+        // comment citing a migration that no longer exists is also rot.
+        if (full.includes(`${path.sep}extensions${path.sep}`) && entry.name.endsWith('.test.ts')) {
+          continue;
+        }
+        const contents = readFileSync(full, 'utf8');
+        for (const match of contents.matchAll(/migrations\/(\d{4}-[A-Za-z0-9._-]*\.sql)/g)) {
+          const filename = match[1];
+          if (filename && !referenced.has(filename)) {
+            referenced.set(filename, path.relative(REPO_ROOT, full));
+          }
+        }
+      }
+    };
+    walk(srcDir);
+
+    expect(referenced.size).toBeGreaterThan(0);
+
+    const onDisk = new Set(readdirSync(MIGRATIONS_DIR));
+    const dangling = [...referenced.entries()]
+      .filter(([filename]) => !onDisk.has(filename))
+      .map(([filename, source]) => `${filename} (referenced from ${source})`);
+
+    expect(
+      dangling,
+      dangling.length === 0
+        ? ''
+        : `Migration path(s) referenced from apps/api/src that do not exist:\n` +
+          dangling.map((entry) => `  - ${entry}`).join('\n') +
+          `\n\nA migration was renamed or deleted without sweeping its references.`,
+    ).toEqual([]);
+    // Explicit timeout: this case reads every .ts file under apps/api/src, so
+    // its runtime scales with the repo and is dominated by scheduler delay when
+    // the full 1,342-file suite runs it in parallel. Vitest's 5s default is a
+    // latent tripwire — and one that matters more here than most, because a
+    // flaky version of this guard is indistinguishable from the renamed-
+    // migration ENOENT it exists to move out of Integration Tests.
+  }, 60_000);
+});
+
+describe('migration ordering vs a remote ref (--against-ref, pre-push guard)', () => {
+  // The commit-time guard (--staged, above) can only see history already
+  // reachable from the branch's own HEAD. It is blind to a migration that
+  // lands on origin/main AFTER the branch was cut — which is exactly what
+  // happened on 2026-10-03: a branch carrying 2026-10-02-100001-… passed the
+  // commit-time guard clean, while origin/main had meanwhile gained
+  // 2026-10-03-audit-chain-verify-range.sql, which sorts after it. CI's
+  // "Check Migrations" job (running against the merge commit) would have
+  // caught it, but only after a push and a red run — the file had to be
+  // renamed and pushed again. --against-ref exists to catch this locally,
+  // in a pre-push hook, before that round-trip.
+  //
+  // This drives the guard against a REAL temporary git repo (with a bare
+  // "origin" remote) rather than the fixture-directory technique the
+  // --staged tests above use, because the new mode's whole job is to diff
+  // two refs — there is no ref to diff without an actual repository.
+  function git(args: string[], cwd: string): string {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    if (result.status !== 0) {
+      throw new Error(
+        `git ${args.join(' ')} (cwd=${cwd}) failed:\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+      );
+    }
+    return result.stdout;
+  }
+
+  function runGuard(
+    cwd: string,
+    args: string[],
+  ): { status: number | null; stdout: string; stderr: string } {
+    const result = spawnSync('bash', [GUARD_SCRIPT, ...args], {
+      cwd,
+      encoding: 'utf8',
+      env: { ...process.env, BREEZE_MIGRATIONS_DIR: 'migrations' },
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  // Builds: a bare "origin" remote, a work tree with a base migration pushed
+  // to origin/main, then a "feature" branch cut from that base — mirroring a
+  // real branch-and-push flow.
+  function makeRepo(): { dir: string; origin: string } {
+    const dir = mkdtempSync(path.join(tmpdir(), 'migration-order-work-'));
+    const origin = mkdtempSync(path.join(tmpdir(), 'migration-order-origin-'));
+    git(['init', '--bare', '--initial-branch=main', origin], origin);
+
+    git(['init', '--initial-branch=main', dir], dir);
+    git(['config', 'user.email', 'guard-test@example.com'], dir);
+    git(['config', 'user.name', 'Guard Test'], dir);
+    git(['remote', 'add', 'origin', origin], dir);
+
+    mkdirSync(path.join(dir, 'migrations'));
+    writeFileSync(path.join(dir, 'migrations', '2026-10-01-base.sql'), '-- base\n');
+    git(['add', '.'], dir);
+    git(['commit', '-m', 'base'], dir);
+    git(['push', 'origin', 'main'], dir);
+
+    git(['checkout', '-b', 'feature'], dir);
+    return { dir, origin };
+  }
+
+  function cleanup(repo: { dir: string; origin: string }): void {
+    rmSync(repo.dir, { recursive: true, force: true });
+    rmSync(repo.origin, { recursive: true, force: true });
+  }
+
+  it('passes when the branch\'s new migration sorts after the newest on origin/main', () => {
+    const repo = makeRepo();
+    try {
+      writeFileSync(path.join(repo.dir, 'migrations', '2026-10-04-feature.sql'), '-- feature\n');
+      git(['add', '.'], repo.dir);
+      git(['commit', '-m', 'feature migration'], repo.dir);
+      git(['fetch', 'origin', 'main'], repo.dir);
+
+      const result = runGuard(repo.dir, ['--against-ref', 'origin/main']);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('OK');
+    } finally {
+      cleanup(repo);
+    }
+  });
+
+  it('fails, naming the offending file and the remedy, when origin/main gained a migration meanwhile that sorts after the branch\'s new one', () => {
+    const repo = makeRepo();
+    try {
+      // The branch adds a migration that looks fine relative to its own
+      // history (sorts after the base it was cut from)...
+      writeFileSync(path.join(repo.dir, 'migrations', '2026-10-02-100001-feature.sql'), '-- feature\n');
+      git(['add', '.'], repo.dir);
+      git(['commit', '-m', 'feature migration'], repo.dir);
+
+      // ...but meanwhile origin/main gained a migration that sorts AFTER it.
+      git(['checkout', 'main'], repo.dir);
+      writeFileSync(path.join(repo.dir, 'migrations', '2026-10-03-main-progressed.sql'), '-- main\n');
+      git(['add', '.'], repo.dir);
+      git(['commit', '-m', 'main progressed'], repo.dir);
+      git(['push', 'origin', 'main'], repo.dir);
+      git(['checkout', 'feature'], repo.dir);
+      git(['fetch', 'origin', 'main'], repo.dir);
+
+      const result = runGuard(repo.dir, ['--against-ref', 'origin/main']);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('2026-10-02-100001-feature.sql');
+      expect(result.stderr).toContain('2026-10-03-main-progressed.sql');
+      expect(result.stderr.toLowerCase()).toContain('rename');
+    } finally {
+      cleanup(repo);
+    }
+  });
+
+  it('passes with no violations when the branch adds no new migrations', () => {
+    const repo = makeRepo();
+    try {
+      git(['fetch', 'origin', 'main'], repo.dir);
+      const result = runGuard(repo.dir, ['--against-ref', 'origin/main']);
+      expect(result.status, result.stderr).toBe(0);
+    } finally {
+      cleanup(repo);
+    }
+  });
+
+  it('fails with a clear error, not a false OK, when the given ref does not exist', () => {
+    const repo = makeRepo();
+    try {
+      const result = runGuard(repo.dir, ['--against-ref', 'origin/does-not-exist']);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('origin/does-not-exist');
+    } finally {
+      cleanup(repo);
+    }
+  });
+});
+
+describe('core migration ordering', () => {
+  it('discovers the report site-scope migration exactly once in lexical order', () => {
+    const ledgerNames = planMigrations(listMigrationFilenames()).map(
+      (migration) => migration.ledgerName,
+    );
+    const reserved = '2026-08-06-a-report-site-scope.sql';
+
+    expect(ledgerNames.filter((filename) => filename === reserved)).toHaveLength(1);
+    expect(ledgerNames).toEqual([...ledgerNames].sort((a, b) => a.localeCompare(b)));
+    // This file opens the reserved block. The block's membership is guarded by
+    // 'migration filename conventions' above — deliberately NOT here, so a
+    // squatter reds a test whose name says what is wrong instead of this one.
+    const reservedBlock = ledgerNames.filter((filename) =>
+      filename.startsWith(RESERVED_MIGRATION_DATE),
+    );
+    expect(reservedBlock[0]).toBe(reserved);
+  });
+});
+
+describe('AI origin attribution migration (#5022 W01)', () => {
+  it('sorts after the portal lifecycle flag migration it was authored on top of', () => {
+    const files = listMigrationFilenames();
+
+    expect(files).toContain('2026-10-16-182100-ai-origin-attribution.sql');
+    // Relative order against the newest migration on main when this file was
+    // authored — NOT absolute-last, so a later migration landing anywhere
+    // else does not redden this test (see the sibling "device removal
+    // retention" test above for the same pattern).
+    expect(files.indexOf('2026-10-16-182100-ai-origin-attribution.sql')).toBeGreaterThan(
+      files.indexOf('2026-10-16-181500-portal-lifecycle-flag.sql'),
+    );
+  });
+});
+
+describe('report_run_deliveries migration (#4248 W03)', () => {
+  const FILE = '2026-10-16-183300-report-run-deliveries.sql';
+
+  it('sorts after the newest migration on main when it was authored', () => {
+    const files = listMigrationFilenames();
+    expect(files).toContain(FILE);
+    expect(files.indexOf(FILE)).toBeGreaterThan(
+      files.indexOf('2026-10-16-182600-ticket-comment-proposal-note-uq.sql'),
+    );
+  });
+
+  it('is DDL-only: no DML, hence no breeze.scope election and no baseline entry', () => {
+    const sqlText = readFileSync(path.join(MIGRATIONS_DIR, FILE), 'utf8');
+    const withoutComments = sqlText.replace(/--[^\n]*/g, '');
+    expect(withoutComments).not.toMatch(/\b(INSERT|UPDATE|DELETE|MERGE)\b\s+(INTO|FROM|\w+\s+SET)/i);
+    expect(withoutComments).not.toContain("set_config('breeze.scope'");
+    // The FK is the reason no ASSOCIATED_SYSTEM_SCOPED_TABLES entry exists.
+    expect(withoutComments).toMatch(/REFERENCES public\.report_runs\(id\) ON DELETE CASCADE/);
+  });
+});
+
+describe('Wave 3 durable live authorization expansion', () => {
+  it('maps the user permission epoch as a non-null bigint defaulting to zero', () => {
+    const column = getTableConfig(users).columns.find((candidate) => candidate.name === 'permissions_epoch');
+
+    expect(column).toBeDefined();
+    expect(column?.getSQLType()).toBe('bigint');
+    expect(column?.notNull).toBe(true);
+    expect(column?.default).toBe(0);
+  });
+
+  it('defines the complete oauth_revocation_retries schema contract', () => {
+    const retryTable = (oauthSchema as Record<string, unknown>).oauthRevocationRetries;
+    expect(retryTable).toBeDefined();
+    if (!retryTable) return;
+
+    const config = getTableConfig(retryTable as Parameters<typeof getTableConfig>[0]);
+    expect(config.name).toBe('oauth_revocation_retries');
+    expect(config.columns.map((column) => column.name)).toEqual([
+      'id',
+      'user_id',
+      'marker_type',
+      'marker_id',
+      'expires_at',
+      'attempts',
+      'next_attempt_at',
+      'last_error_code',
+      'completed_at',
+      'created_at',
+      'updated_at',
+    ]);
+    expect(config.indexes.map((index) => index.config.name).sort()).toEqual([
+      'oauth_revocation_retries_due_idx',
+      'oauth_revocation_retries_incomplete_marker_uq',
+      'oauth_revocation_retries_user_idx',
+    ]);
+  });
+
+  it('maps versioned quote response and read-link revocation columns', () => {
+    const columns = new Map(
+      getTableConfig(quotes).columns.map((column) => [column.name, column]),
+    );
+
+    expect(columns.get('public_token_version')?.getSQLType()).toBe('integer');
+    expect(columns.get('public_token_version')?.notNull).toBe(true);
+    expect(columns.get('public_token_version')?.default).toBe(0);
+    expect(columns.get('public_response_jti')?.getSQLType()).toBe('varchar(128)');
+    expect(columns.get('public_response_consumed_at')?.getSQLType()).toBe('timestamp with time zone');
+    expect(columns.get('public_response_outcome')?.getSQLType()).toBe('varchar(16)');
+    expect(columns.get('public_link_revoked_at')?.getSQLType()).toBe('timestamp with time zone');
+  });
+
+  it('orders the reserved live-authorization migrations after all preceding migrations', () => {
+    const files = listMigrationFilenames();
+    const liveAuthorization = '2026-08-06-b-live-authorization.sql';
+    const quoteCapability = '2026-08-06-c-quote-response-capability.sql';
+
+    expect(files).toContain(liveAuthorization);
+    expect(files).toContain(quoteCapability);
+    const reservedBlock = files.filter((file) => file.startsWith(RESERVED_MIGRATION_DATE));
+    // Assert RELATIVE order, not adjacency (see the Wave 6 capability and
+    // delegation migration tests below for the full rationale): a sibling
+    // branch is free to land its own migration between -b- and -c- in the
+    // same date block, and adjacency would turn that into a red main
+    // pointing at the wrong wave.
+    expect(reservedBlock.indexOf(quoteCapability)).toBeGreaterThan(
+      reservedBlock.indexOf(liveAuthorization),
+    );
+  });
+
+  it('registers oauth_revocation_retries as a user-id-scoped RLS table', () => {
+    const rlsCoverage = readFileSync(
+      path.resolve(__dirname, '../__tests__/integration/rls-coverage.integration.test.ts'),
+      'utf8',
+    );
+    const allowlist = rlsCoverage.match(
+      /const USER_ID_SCOPED_TABLES[\s\S]*?new Set<string>\(\[([\s\S]*?)\]\);/,
+    )?.[1];
+
+    expect(allowlist).toContain("'oauth_revocation_retries'");
+  });
+});
+
+describe('Wave 5 device mTLS certificate history', () => {
+  const migrationsDir = path.resolve(__dirname, '../../migrations');
+  const certificateHistory = '2026-08-06-d-device-mtls-certificate-history.sql';
+
+  it('orders the certificate-history migration after the reserved Wave 3 quote-capability migration', () => {
+    const files = listMigrationFilenames();
+    const quoteCapability = '2026-08-06-c-quote-response-capability.sql';
+
+    expect(files).toContain(certificateHistory);
+    const reservedBlock = files.filter((file) => file.startsWith(RESERVED_MIGRATION_DATE));
+    // Assert RELATIVE order, not adjacency (see the Wave 6 capability and
+    // delegation migration tests below for the full rationale): a sibling
+    // branch is free to land its own migration between -c- and -d- in the
+    // same date block, and adjacency would turn that into a red main
+    // pointing at the wrong wave.
+    expect(reservedBlock.indexOf(certificateHistory)).toBeGreaterThan(
+      reservedBlock.indexOf(quoteCapability),
+    );
+  });
+
+  it('defines the composite FK, state checks, indexes, and column shape for device_mtls_certificates', () => {
+    const cfg = getTableConfig(deviceMtlsCertificates);
+
+    expect(cfg.columns.map((c) => c.name).sort()).toEqual(
+      [
+        'activated_at',
+        'activation_expires_at',
+        'created_at',
+        'device_id',
+        'expires_at',
+        'fingerprint_sha256',
+        'id',
+        'issued_at',
+        'last_revoke_error',
+        'legacy_provenance',
+        'next_revoke_attempt_at',
+        'org_id',
+        'provider_certificate_id',
+        'public_key_spki',
+        'revoke_attempts',
+        'revoked_at',
+        'serial_number',
+        'state',
+        'updated_at',
+      ].sort(),
+    );
+
+    expect(cfg.foreignKeys.map((fk) => fk.getName())).toContain(
+      'device_mtls_certificates_device_org_fkey',
+    );
+
+    expect(cfg.checks.map((check) => check.name).sort()).toEqual(
+      [
+        'device_mtls_certificates_active_time_chk',
+        'device_mtls_certificates_fingerprint_chk',
+        'device_mtls_certificates_pending_expiry_chk',
+        'device_mtls_certificates_revoked_time_chk',
+        'device_mtls_certificates_state_chk',
+      ].sort(),
+    );
+
+    expect(cfg.indexes.map((i) => i.config.name).sort()).toEqual(
+      [
+        'device_mtls_certificates_one_active_uq',
+        'device_mtls_certificates_org_device_state_idx',
+        'device_mtls_certificates_org_serial_uq',
+        'device_mtls_certificates_provider_uq',
+        'device_mtls_certificates_retry_idx',
+      ].sort(),
+    );
+  });
+
+  it('enables and forces RLS with all four breeze_has_org_access policies plus breeze_app grants in the migration file', () => {
+    const migrationSql = readFileSync(path.join(migrationsDir, certificateHistory), 'utf8');
+
+    expect(migrationSql).toMatch(/ALTER TABLE device_mtls_certificates ENABLE ROW LEVEL SECURITY/);
+    expect(migrationSql).toMatch(/ALTER TABLE device_mtls_certificates FORCE ROW LEVEL SECURITY/);
+    for (const cmd of ['SELECT', 'INSERT', 'UPDATE', 'DELETE']) {
+      expect(migrationSql).toMatch(new RegExp(`FOR ${cmd}[\\s\\S]*?breeze_has_org_access`));
+    }
+    expect(migrationSql).toMatch(
+      /GRANT SELECT, INSERT, UPDATE, DELETE ON device_mtls_certificates TO breeze_app/,
+    );
+  });
+});
+
+describe('Wave 6 agent outbound-network-policy capability handshake', () => {
+  const migrationsDir = path.resolve(__dirname, '../../migrations');
+  const capabilityMigration = '2026-08-06-e-agent-outbound-network-capability.sql';
+  const certificateHistory = '2026-08-06-d-device-mtls-certificate-history.sql';
+
+  it('orders the capability migration after the reserved Wave 5 certificate-history migration and before the delegation migration', () => {
+    const files = listMigrationFilenames();
+
+    expect(files).toContain(capabilityMigration);
+
+    // Assert RELATIVE order, not adjacency. An earlier revision asserted this
+    // file sorted *immediately* after Wave 5's, which is not an invariant this
+    // wave owns: a sibling branch is free to land its own migration in the
+    // same date block, and one did (2026-08-06-e-action-intents-origin-
+    // principal.sql, from the action-intents work). Adjacency assertions turn
+    // any concurrent migration into a red main that points at the wrong wave.
+    //
+    // What actually matters is the dependency order this wave relies on:
+    // Wave 5's certificate-history migration first, then this wave's capability
+    // column, then the delegation table.
+    const delegationTable = '2026-08-06-f-manifest-key-delegations.sql';
+    expect(files.indexOf(capabilityMigration)).toBeGreaterThan(files.indexOf(certificateHistory));
+    expect(files.indexOf(delegationTable)).toBeGreaterThan(files.indexOf(capabilityMigration));
+  });
+
+  it('maps outbound_network_policy_version as a non-null integer defaulting to zero', () => {
+    const column = getTableConfig(devices).columns.find(
+      (candidate) => candidate.name === 'outbound_network_policy_version',
+    );
+
+    expect(column).toBeDefined();
+    expect(column?.getSQLType()).toBe('integer');
+    expect(column?.notNull).toBe(true);
+    expect(column?.default).toBe(0);
+  });
+
+  it('is an idempotent expand-only ADD COLUMN with no inner transaction directives', () => {
+    const migrationSql = readFileSync(path.join(migrationsDir, capabilityMigration), 'utf8');
+
+    expect(migrationSql).toMatch(
+      /ADD COLUMN IF NOT EXISTS outbound_network_policy_version integer NOT NULL DEFAULT 0/,
+    );
+    expect(migrationSql).not.toMatch(/\bBEGIN;/);
+    expect(migrationSql).not.toMatch(/\bCOMMIT;/);
+  });
+});
+
+describe('Wave 6 signed manifest key delegation', () => {
+  const migrationsDir = path.resolve(__dirname, '../../migrations');
+  const delegationMigration = '2026-08-06-f-manifest-key-delegations.sql';
+  const capabilityMigration = '2026-08-06-e-agent-outbound-network-capability.sql';
+
+  it('orders the delegation migration after the Wave 6 capability migration', () => {
+    const files = listMigrationFilenames();
+
+    expect(files).toContain(delegationMigration);
+    expect(files).toContain(capabilityMigration);
+
+    // Assert RELATIVE order, not adjacency. An earlier revision asserted this
+    // file sorted *immediately* after the capability migration, which is not
+    // an invariant this wave owns: a sibling branch is free to land its own
+    // migration in the same 2026-08-06 date block, and one did
+    // (2026-08-06-f-m365-comms-delegated.sql, from the delegated-comms work),
+    // landing lexically between the two. Adjacency assertions turn any
+    // concurrent migration into a red main that points at the wrong wave.
+    //
+    // What actually matters is the sequencing this wave relies on: its own
+    // capability-column migration lands before its own delegation-table
+    // migration, matching the design order in the Wave 6 plan.
+    expect(files.indexOf(delegationMigration)).toBeGreaterThan(
+      files.indexOf(capabilityMigration),
+    );
+  });
+
+  it('declares the delegation table column shape, unique epoch, and window check', () => {
+    const cfg = getTableConfig(manifestSigningKeyDelegations);
+
+    expect(cfg.name).toBe('manifest_signing_key_delegations');
+    expect(cfg.columns.map((c) => c.name).sort()).toEqual(
+      [
+        'activated_at',
+        'created_at',
+        'epoch',
+        'id',
+        'new_key_id',
+        'new_public_key_b64',
+        'not_after',
+        'not_before',
+        'old_key_id',
+        'signature_b64',
+      ].sort(),
+    );
+
+    // The epoch is the monotonic replay counter the agent compares against.
+    // UNIQUE is what makes epoch reuse impossible at the storage layer rather
+    // than only in the CLI's pre-checks.
+    const epoch = cfg.columns.find((c) => c.name === 'epoch');
+    expect(epoch?.notNull).toBe(true);
+    expect(epoch?.isUnique).toBe(true);
+    expect(epoch?.getSQLType()).toBe('bigint');
+
+    expect(cfg.checks.map((check) => check.name).sort()).toEqual(
+      ['manifest_signing_key_delegations_window_chk'].sort(),
+    );
+  });
+
+  it('is idempotent, has no inner transaction directives, and forces system-only RLS', () => {
+    const migrationSql = readFileSync(path.join(migrationsDir, delegationMigration), 'utf8');
+
+    expect(migrationSql).toMatch(
+      /CREATE TABLE IF NOT EXISTS manifest_signing_key_delegations/,
+    );
+    // autoMigrate wraps each file in client.begin(...) — an inner BEGIN;/COMMIT;
+    // only emits "there is already a transaction in progress".
+    expect(migrationSql).not.toMatch(/\bBEGIN;/);
+    expect(migrationSql).not.toMatch(/\bCOMMIT;/);
+
+    expect(migrationSql).toMatch(
+      /ALTER TABLE manifest_signing_key_delegations ENABLE ROW LEVEL SECURITY/,
+    );
+    expect(migrationSql).toMatch(
+      /ALTER TABLE manifest_signing_key_delegations FORCE ROW LEVEL SECURITY/,
+    );
+
+    // Exact system-only policy shape, copied from manifest_signing_keys: BOTH
+    // USING and WITH CHECK must require the system scope. A USING-only policy
+    // would let a tenant context INSERT rows it cannot read.
+    expect(migrationSql).toMatch(
+      /CREATE POLICY manifest_signing_key_delegations_system_only[\s\S]*?USING \(current_setting\('breeze\.scope', true\) = 'system'\)[\s\S]*?WITH CHECK \(current_setting\('breeze\.scope', true\) = 'system'\)/,
+    );
+    // Policy creation guarded on pg_policies so re-applying is a no-op.
+    expect(migrationSql).toMatch(/FROM pg_policies/);
+
+    // Only what the system-context service role needs. DELETE is deliberately
+    // absent: nothing in the delegation lifecycle removes a record.
+    //
+    // Assert against EXECUTABLE sql — `--` comment text in this file discusses
+    // grants in prose, and a naive whole-file regex matches the prose instead
+    // of the statement (it did, on the first run).
+    const executableSql = migrationSql
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('--'))
+      .join('\n');
+
+    expect(executableSql).toMatch(
+      /GRANT SELECT, INSERT, UPDATE ON manifest_signing_key_delegations TO breeze_app;/,
+    );
+    const grantStatements = executableSql.match(/GRANT[\s\S]*?;/g) ?? [];
+    expect(grantStatements).toHaveLength(1);
+    expect(grantStatements[0]).not.toMatch(/DELETE/);
+  });
+
+  it('has the same system-only policy shape as manifest_signing_keys (no drift between the two)', () => {
+    const delegationSql = readFileSync(path.join(migrationsDir, delegationMigration), 'utf8');
+    const signingKeySql = readFileSync(
+      path.join(migrationsDir, '2026-05-09-manifest-signing-keys.sql'),
+      'utf8',
+    );
+
+    const predicate = /current_setting\('breeze\.scope', true\) = 'system'/g;
+    // Two occurrences each (USING + WITH CHECK) — the delegation table must
+    // not be laxer than the key table it derives its trust from.
+    expect(signingKeySql.match(predicate)).toHaveLength(2);
+    expect(delegationSql.match(predicate)).toHaveLength(2);
+  });
+});
+
+describe('extension-owned ledger rows', () => {
+  it('plans core migrations only — extension migrations are the extension migrator\'s job', () => {
+    const plan = planMigrations([
+      '2026-07-08-automation-run-device-results.sql',
+      '9999-last.sql',
+    ]);
+
+    expect(plan.map((migration) => migration.ledgerName)).toEqual([
+      '2026-07-08-automation-run-device-results.sql',
+      '9999-last.sql',
+    ]);
+  });
+
+  it('partitions ledger rows: bare core rows verified, namespaced extension rows skipped', () => {
+    const { verify, skip } = partitionLedgerRows([
+      '0001-core.sql',
+      'workspace/2026-07-10-a.sql',
+      'ghost/2026-01-01-x.sql',
+    ]);
+
+    expect(verify).toEqual(['0001-core.sql']);
+    expect(skip).toEqual(['workspace/2026-07-10-a.sql', 'ghost/2026-01-01-x.sql']);
+  });
+});
+
+// #2787 wave 04 — the device_lifecycle retention feature needs a config-policy
+// enum value and a `devices.decommissioned_at` stamp. The stamp is what the
+// daily purge job compares against; without it there is no record anywhere of
+// WHEN a device was removed, so the whole feature hangs on this column being
+// added, backfilled, and indexed correctly.
+describe('device removal retention: decommissioned_at + device_lifecycle feature type', () => {
+  const migrationsDir = path.resolve(__dirname, '../../migrations');
+  const retentionMigration = '2026-10-11-160000-device-lifecycle-feature-and-decommissioned-at.sql';
+
+  it('sorts after every migration that shipped before it', () => {
+    const files = listMigrationFilenames();
+
+    expect(files).toContain(retentionMigration);
+    // Relative order against the newest migration on main when this wave was
+    // cut — NOT adjacency, so a sibling branch landing its own file in the
+    // same date block does not redden this wave (see the Wave 6 note above).
+    expect(files.indexOf(retentionMigration)).toBeGreaterThan(
+      files.indexOf('2026-10-11-150000-ai-partner-wide-select.sql'),
+    );
+  });
+
+  it('maps decommissioned_at as a nullable timestamptz on the devices table', () => {
+    const column = getTableConfig(devices).columns.find(
+      (candidate) => candidate.name === 'decommissioned_at',
+    );
+
+    expect(column).toBeDefined();
+    expect(column?.getSQLType()).toBe('timestamp with time zone');
+    expect(column?.notNull).toBe(false);
+  });
+
+  it('adds the enum value, the column, the partial index, and an idempotent scoped backfill', () => {
+    const migrationSql = readFileSync(path.join(migrationsDir, retentionMigration), 'utf8');
+
+    expect(migrationSql).toMatch(
+      /ALTER TYPE .*config_feature_type ADD VALUE IF NOT EXISTS 'device_lifecycle'/,
+    );
+    expect(migrationSql).toMatch(/ADD COLUMN IF NOT EXISTS decommissioned_at timestamptz/);
+    expect(migrationSql).toMatch(/CREATE INDEX IF NOT EXISTS devices_decommissioned_at_idx/);
+
+    // The backfill runs as an unprivileged role against forced-RLS `devices`.
+    // Without breeze.scope=system it is a SILENT 0-row no-op on managed
+    // Postgres, and the CI superuser masks that — so the elevation and the
+    // row-count report are both asserted, not assumed.
+    //
+    // The CANONICAL form specifically: `migrationRlsScope.ts` recognises only
+    // `SELECT`/`PERFORM set_config(...)`, so a functionally-equivalent
+    // `SET LOCAL breeze.scope = 'system'` elevates at runtime but is invisible
+    // to the guard — which then reports this file as an unscoped write.
+    expect(migrationSql).toMatch(
+      /SELECT set_config\('breeze\.scope', 'system', true\);/,
+    );
+    // Line comments stripped: the file DOCUMENTS why `SET LOCAL` is the wrong
+    // form, so a naive negative match would fail on its own explanation.
+    const executable = migrationSql.replace(/--[^\n]*/g, '');
+    expect(executable).not.toMatch(/SET LOCAL breeze\.scope/);
+    expect(migrationSql).toMatch(/GET DIAGNOSTICS/);
+    expect(migrationSql).toMatch(/RAISE WARNING/);
+    expect(migrationSql).toMatch(
+      /UPDATE devices\s+SET decommissioned_at = updated_at\s+WHERE status = 'decommissioned' AND decommissioned_at IS NULL/,
+    );
+
+    // autoMigrate wraps every file in its own transaction.
+    expect(migrationSql).not.toMatch(/\bBEGIN;/);
+    expect(migrationSql).not.toMatch(/\bCOMMIT;/);
+  });
+});
+
+
+describe('filesystem scan_path contraction (Disk Cleanup v2 W03)', () => {
+  const contraction = '2026-10-22-160000-filesystem-scan-path-not-null.sql';
+
+  it('sorts after both W02 expand migrations', () => {
+    const files = listMigrationFilenames();
+    expect(files).toContain(contraction);
+    for (const expanded of [
+      '2026-10-21-110000-filesystem-multi-volume.sql',
+      '2026-10-21-110100-filesystem-cleanup-run-status-running.sql',
+    ]) {
+      expect(files).toContain(expanded);
+      expect(files.indexOf(contraction)).toBeGreaterThan(files.indexOf(expanded));
+    }
+  });
+
+  it('requires scan paths and replaces the interim index with the named composite primary key', async () => {
+    const { deviceFilesystemSnapshots, deviceFilesystemScanState, deviceFilesystemCleanupRuns } =
+      await import('./schema/filesystem');
+    expect(deviceFilesystemSnapshots.scanPath.notNull).toBe(true);
+    expect(deviceFilesystemScanState.scanPath.notNull).toBe(true);
+    // System cleanup runs remain path-independent.
+    expect(deviceFilesystemCleanupRuns.scanPath.notNull).toBe(false);
+    const config = getTableConfig(deviceFilesystemScanState);
+    expect(config.primaryKeys).toHaveLength(1);
+    expect(config.primaryKeys[0]!.getName()).toBe('device_filesystem_scan_state_pkey');
+    expect(config.primaryKeys[0]!.columns.map((column) => column.name)).toEqual(['device_id', 'scan_path']);
+    expect(config.indexes).toHaveLength(0);
+  });
+
+  it('reconciles duplicate root candidates before converting NULL scan paths', () => {
+    const migration = readFileSync(path.resolve(__dirname, '../../migrations', contraction), 'utf8');
+    expect(migration).toMatch(/row_number\(\) OVER[\s\S]*PARTITION BY st.device_id[\s\S]*ORDER BY st.updated_at DESC/);
+    expect(migration).toMatch(/DELETE FROM device_filesystem_scan_state[\s\S]*position > 1/);
+    expect(migration.indexOf('DELETE FROM device_filesystem_scan_state'))
+      .toBeLessThan(migration.indexOf('UPDATE device_filesystem_scan_state'));
+    expect(migration).toMatch(/RAISE WARNING 'filesystem scan_path contraction: discarded % duplicate root candidates'/);
+  });
+
+  it('promotes W02’s actual unique index even though W02 already removed the old primary key', () => {
+    const migration = readFileSync(path.resolve(__dirname, '../../migrations', contraction), 'utf8');
+    expect(migration).toMatch(/IF NOT EXISTS[\s\S]*contype = 'p'/);
+    expect(migration).toMatch(/ADD CONSTRAINT device_filesystem_scan_state_pkey\s+PRIMARY KEY USING INDEX device_filesystem_scan_state_device_path_uidx/);
+    expect(migration).not.toMatch(/\bBEGIN;|\bCOMMIT;/);
+  });
+});
+
+it('keeps the retirement migration scoped to legacy source columns', () => {
+  const sql = readFileSync(new URL('../../migrations/2026-10-23-120000-legacy-source-retirement-columns.sql', import.meta.url), 'utf8');
+  expect(sql).not.toMatch(/ALTER\s+TABLE\s+(?:public\.)?monitor_definitions\b/i);
+});

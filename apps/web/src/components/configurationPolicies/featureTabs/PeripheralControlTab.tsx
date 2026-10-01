@@ -1,0 +1,214 @@
+import { useState, useEffect } from "react";
+import { Usb } from "lucide-react";
+import type { FeatureTabProps } from "./types";
+import { FEATURE_META } from "./types";
+import { useFeatureLink } from "./useFeatureLink";
+import FeatureTabShell from "./FeatureTabShell";
+import PolicyLinkSelector from "./PolicyLinkSelector";
+import { fetchWithAuth } from "../../../stores/auth";
+import { useTranslation } from "react-i18next";
+import { i18n } from "@/lib/i18n";
+type PolicySummary = {
+  name: string;
+  deviceClass: string;
+  action: string;
+  targetType: string;
+  isActive: boolean;
+  exceptions?: Array<{
+    vendor?: string;
+    product?: string;
+    serialNumber?: string;
+  }>;
+};
+const deviceClassBadge: Record<string, string> = {
+  storage: "bg-blue-500/20 text-blue-700 border-blue-500/40",
+  all_usb: "bg-purple-500/20 text-purple-700 border-purple-500/40",
+  bluetooth: "bg-indigo-500/20 text-indigo-700 border-indigo-500/40",
+  thunderbolt: "bg-amber-500/20 text-amber-700 border-amber-500/40",
+};
+const actionBadge: Record<string, string> = {
+  allow: "bg-success/15 text-success border-success/30",
+  block: "bg-destructive/15 text-destructive border-destructive/30",
+  read_only: "bg-warning/15 text-warning border-warning/30",
+  alert: "bg-warning/15 text-warning border-warning/30",
+};
+export default function PeripheralControlTab({
+  policyId,
+  existingLink,
+  onLinkChanged,
+  linkedPolicyId,
+  parentLink,
+}: FeatureTabProps) {
+  useTranslation("policies");
+  const { save, remove, saving, error, clearError } = useFeatureLink(policyId);
+  const isInherited = !!parentLink && !existingLink;
+  const effectiveLink = existingLink ?? parentLink;
+  const [selectedPolicyId, setSelectedPolicyId] = useState<string | null>(
+    effectiveLink?.featurePolicyId ?? null,
+  );
+  const [linkedPolicySummary, setLinkedPolicySummary] =
+    useState<PolicySummary | null>(null);
+  // #5080: the initializer above only runs once, at mount — if `parentLink`
+  // arrives afterward (or `existingLink` is cleared, e.g. by handleLinkChanged
+  // after a revert on this or another tab causing a re-render), the selection
+  // must re-sync rather than freeze the stale answer. Own link always wins.
+  useEffect(() => {
+    if (!existingLink) setSelectedPolicyId(parentLink?.featurePolicyId ?? null);
+  }, [existingLink, parentLink]);
+  const meta = FEATURE_META.peripheral_control;
+  useEffect(() => {
+    if (!selectedPolicyId || !meta.fetchUrl) {
+      setLinkedPolicySummary(null);
+      return;
+    }
+    let cancelled = false;
+    fetchWithAuth(`${meta.fetchUrl}/${selectedPolicyId}`)
+      .then(async (res) => {
+        if (!res.ok || cancelled) return;
+        const json = await res.json();
+        const data = json.data ?? json;
+        if (!cancelled) {
+          setLinkedPolicySummary({
+            name: data.name,
+            deviceClass: data.deviceClass,
+            action: data.action,
+            targetType: data.targetType,
+            isActive: data.isActive,
+            exceptions: data.exceptions,
+          });
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.warn(
+            `[PeripheralControlTab] Failed to load linked policy ${selectedPolicyId}:`,
+            err,
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedPolicyId, meta.fetchUrl]);
+  const handleSave = async () => {
+    if (!selectedPolicyId) return;
+    clearError();
+    const result = await save(existingLink?.id ?? null, {
+      featureType: "peripheral_control",
+      featurePolicyId: selectedPolicyId,
+    });
+    if (result) onLinkChanged(result, "peripheral_control");
+  };
+  const handleRemove = async () => {
+    if (!existingLink) return;
+    const ok = await remove(existingLink.id);
+    if (ok) {
+      onLinkChanged(null, "peripheral_control");
+      setSelectedPolicyId(null);
+      setLinkedPolicySummary(null);
+    }
+  };
+  const handleOverride = async () => {
+    if (!parentLink?.featurePolicyId) return;
+    clearError();
+    const result = await save(null, {
+      featureType: "peripheral_control",
+      featurePolicyId: parentLink.featurePolicyId,
+    });
+    if (result) {
+      onLinkChanged(result, "peripheral_control");
+      setSelectedPolicyId(parentLink.featurePolicyId);
+    }
+  };
+  const handleRevert = async () => {
+    if (!existingLink || !parentLink) return;
+    const ok = await remove(existingLink.id);
+    if (ok) {
+      onLinkChanged(null, "peripheral_control");
+      setSelectedPolicyId(parentLink.featurePolicyId ?? null);
+    }
+  };
+  return (
+    <FeatureTabShell
+      title={meta.label}
+      description={meta.description}
+      icon={<Usb className="h-5 w-5" />}
+      isConfigured={!!effectiveLink}
+      saving={saving}
+      error={error}
+      onSave={handleSave}
+      onRemove={existingLink ? handleRemove : undefined}
+      isInherited={isInherited}
+      onOverride={isInherited ? handleOverride : undefined}
+      onRevert={existingLink && parentLink ? handleRevert : undefined}
+    >
+      <div className="space-y-4">
+        <div>
+          <label className="text-sm font-medium">
+            {i18n.t(
+              "policies:configurationPolicies.featureTabs.peripheralControlTab.linkPeripheralPolicy",
+            )}
+          </label>
+          <p className="mb-2 text-xs text-muted-foreground">
+            {i18n.t(
+              "policies:configurationPolicies.featureTabs.peripheralControlTab.selectAnExistingPeripheralControlPolicyTo",
+            )}
+          </p>
+          {meta.fetchUrl && (
+            <PolicyLinkSelector
+              fetchUrl={meta.fetchUrl}
+              selectedId={selectedPolicyId}
+              onSelect={setSelectedPolicyId}
+            />
+          )}
+        </div>
+
+        {linkedPolicySummary && (
+          <div className="rounded-md border bg-muted/20 p-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-medium">
+                {linkedPolicySummary.name}
+              </h4>
+              <span
+                className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${linkedPolicySummary.isActive ? "bg-success/15 text-success border-success/30" : "bg-muted text-muted-foreground border-border"}`}
+              >
+                {linkedPolicySummary.isActive
+                  ? i18n.t("common:states.active")
+                  : i18n.t("common:states.inactive")}
+              </span>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <span
+                className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${deviceClassBadge[linkedPolicySummary.deviceClass] ?? "bg-muted text-muted-foreground"}`}
+              >
+                {linkedPolicySummary.deviceClass.replace("_", " ")}
+              </span>
+              <span
+                className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${actionBadge[linkedPolicySummary.action] ?? "bg-muted text-muted-foreground"}`}
+              >
+                {linkedPolicySummary.action.replace("_", " ")}
+              </span>
+              <span className="inline-flex items-center rounded-full border bg-muted/50 px-2.5 py-1 text-xs font-medium text-muted-foreground capitalize">
+                {linkedPolicySummary.targetType}
+              </span>
+            </div>
+            {linkedPolicySummary.exceptions &&
+              linkedPolicySummary.exceptions.length > 0 && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {linkedPolicySummary.exceptions.length}
+                  {i18n.t(
+                    "policies:configurationPolicies.featureTabs.peripheralControlTab.exception",
+                  )}
+                  {linkedPolicySummary.exceptions.length !== 1
+                    ? i18n.t(
+                        "policies:configurationPolicies.featureTabs.peripheralControlTab.s",
+                      )
+                    : ""}
+                </p>
+              )}
+          </div>
+        )}
+      </div>
+    </FeatureTabShell>
+  );
+}

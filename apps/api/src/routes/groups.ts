@@ -1,0 +1,1470 @@
+import { Hono } from 'hono';
+import { zValidator } from '../lib/validation';
+import { z } from 'zod';
+import { and, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { db } from '../db';
+import { configPolicyAssignments, configurationPolicies, deviceGroups, deviceGroupMemberships, devices, groupMembershipLog, sites } from '../db/schema';
+import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { evaluateFilterWithPreview, extractFieldsFromFilter, validateFilter, FilterQueryTimeoutError } from '../services/filterEngine';
+import { FILTER_PREVIEW_TIMEOUT_BODY, FILTER_PREVIEW_TIMEOUT_STATUS, reportFilterPreviewTimeout } from '../services/filterPreviewTimeout';
+import {
+  addManualGroupMemberships,
+  evaluateGroupMembership,
+  pinDeviceToGroup,
+  pruneGroupMembershipsOutsideSite,
+  validateManualMembershipDevices,
+} from '../services/groupMembership';
+import { writeRouteAudit } from '../services/auditEvents';
+import type { FilterConditionGroup } from '../services/filterEngine';
+import { PERMISSIONS, canAccessSite, hasPermission, type UserPermissions } from '../services/permissions';
+import { PG_UUID_REGEX } from '../utils/uuid';
+import { schedulePeripheralPolicyDevice } from '../jobs/peripheralJobs';
+import { deleteDeviceGroup, DeviceGroupDeleteError } from '../services/deviceGroupDelete';
+
+export const groupRoutes = new Hono();
+const requireGroupRead = requirePermission(PERMISSIONS.DEVICES_READ.resource, PERMISSIONS.DEVICES_READ.action);
+const requireGroupWrite = requirePermission(PERMISSIONS.DEVICES_WRITE.resource, PERMISSIONS.DEVICES_WRITE.action);
+
+/**
+ * Site-scope gate: partner-scope users restricted via `allowedSiteIds` must
+ * not add/remove/pin a device in a site they cannot access, even when the
+ * group itself is org-scoped. RLS does not defend the site axis — mirrors
+ * PR #864/#868 (SP2 launch-readiness sweep).
+ * Returns true when access is granted, false when site-denied.
+ */
+async function canAccessDeviceSite(
+  c: { get(key: 'permissions'): UserPermissions | undefined },
+  deviceId: string,
+  groupSiteId?: string | null,
+): Promise<boolean> {
+  const userPerms = c.get('permissions');
+  if (!userPerms?.allowedSiteIds && !groupSiteId) return true;
+  const [device] = await db
+    .select({ siteId: devices.siteId })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+  if (!device || typeof device.siteId !== 'string') return false;
+  if (groupSiteId && device.siteId !== groupSiteId) return false;
+  return !userPerms?.allowedSiteIds || canAccessSite(userPerms, device.siteId);
+}
+
+type DeviceGroup = {
+  id: string;
+  orgId: string;
+  siteId: string | null;
+  name: string;
+  type: 'static' | 'dynamic';
+  rules: unknown;
+  filterConditions: FilterConditionGroup | null;
+  filterFieldsUsed: string[];
+  parentId: string | null;
+  deviceCount: number;
+  createdAt: string;
+  updatedAt: string;
+  deviceIds?: string[];
+  policy?: { id: string; name: string };
+};
+
+type GroupMembership = {
+  deviceId: string;
+  groupId: string;
+  isPinned: boolean;
+  addedAt: string;
+  addedBy: 'manual' | 'dynamic_rule' | 'policy';
+};
+
+// Helper to validate filter condition groups
+// Using a more permissive schema since deep validation is done by validateFilter
+const filterConditionSchema = z.object({
+  field: z.string(),
+  operator: z.string(),
+  value: z.any()
+});
+
+const filterConditionGroupSchema: z.ZodType<FilterConditionGroup> = z.lazy(() =>
+  z.object({
+    operator: z.enum(['AND', 'OR']),
+    conditions: z.array(z.union([filterConditionSchema, filterConditionGroupSchema]))
+  })
+) as z.ZodType<FilterConditionGroup>;
+
+const listGroupsQuerySchema = z.object({
+  /**
+   * Narrows the result to one org, for callers (e.g. the configuration-policy
+   * assignments target picker) that need only the groups belonging to one
+   * org they can already access — never widens access beyond what
+   * `getOrgIdsForAuth` already computed from the caller's own scope; an
+   * `orgId` outside that set returns an empty list rather than 403ing, so a
+   * partner-scoped caller can't use this to probe org existence.
+   */
+  orgId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
+  type: z.enum(['static', 'dynamic']).optional(),
+  parentId: z.string().guid().optional(),
+  search: z.string().optional(),
+  includeMemberships: z.enum(['true', 'false']).optional()
+});
+
+/**
+ * ONE definition of the `filterConditions` field, shared by create and update.
+ *
+ * #3159: create declared this `.optional()` while update declared it
+ * `.nullable().optional()`, so the very same dashboard payload could edit a
+ * group but never create one — every static-group creation 400'd on
+ * `expected object, received null`. Three accepted forms, identical on both
+ * verbs: omitted, a filter object, or an explicit `null` meaning "no filter".
+ *
+ * `null` is not merely tolerated, it is load-bearing on update: the PATCH route
+ * distinguishes `undefined` ("leave the filter alone") from `null` ("clear it"),
+ * which is how a dynamic group is converted to static. Keep this as one
+ * constant — the two schemas drifting apart is the defect itself, not the
+ * symptom.
+ */
+const groupFilterConditionsField = filterConditionGroupSchema.nullable().optional();
+
+const createGroupSchema = z.object({
+  orgId: z.string().guid().optional(),
+  siteId: z.string().guid().optional(),
+  name: z.string().min(1).max(255),
+  type: z.enum(['static', 'dynamic']).default('static'),
+  rules: z.any().optional(),
+  filterConditions: groupFilterConditionsField,
+  /**
+   * Initial membership for a STATIC group. The dashboard has always sent this
+   * on create; the schema used to omit the key entirely, so Zod stripped it and
+   * the group was created empty with a 201 — a silent failure that outlived the
+   * 400 above (#3159). Validated against the group's own org and site before
+   * the group row is written.
+   */
+  deviceIds: z.array(z.string().guid()).optional(),
+  parentId: z.string().guid().optional()
+});
+
+const updateGroupSchema = z.object({
+  name: z.string().min(1).max(255).optional(),
+  siteId: z.string().guid().nullable().optional(),
+  type: z.enum(['static', 'dynamic']).optional(),
+  rules: z.any().optional(),
+  filterConditions: groupFilterConditionsField,
+  parentId: z.string().guid().nullable().optional()
+});
+
+const addDevicesSchema = z.object({
+  deviceIds: z.array(z.string().guid()).min(1)
+});
+
+const groupIdParamSchema = z.object({
+  id: z.string().guid()
+});
+
+const deviceIdParamSchema = z.object({
+  id: z.string().guid(),
+  deviceId: z.string().guid()
+});
+
+groupRoutes.use('*', authMiddleware);
+
+async function ensureOrgAccess(
+  orgId: string,
+  auth: Pick<AuthContext, 'scope' | 'orgId' | 'accessibleOrgIds' | 'canAccessOrg'>
+) {
+  if (auth.scope === 'organization') {
+    return auth.orgId === orgId;
+  }
+
+  if (auth.scope === 'partner') {
+    return auth.canAccessOrg(orgId);
+  }
+
+  return true;
+}
+
+async function getOrgIdsForAuth(
+  auth: Pick<AuthContext, 'scope' | 'orgId' | 'accessibleOrgIds'>
+): Promise<string[] | null> {
+  if (auth.scope === 'organization') {
+    if (!auth.orgId) return null;
+    return [auth.orgId];
+  }
+
+  if (auth.scope === 'partner') {
+    return auth.accessibleOrgIds ?? [];
+  }
+
+  return null;
+}
+
+async function getGroupWithAccess(
+  groupId: string,
+  auth: Pick<AuthContext, 'scope' | 'partnerId' | 'orgId' | 'accessibleOrgIds' | 'canAccessOrg'>
+) {
+  const [group] = await db
+    .select()
+    .from(deviceGroups)
+    .where(eq(deviceGroups.id, groupId))
+    .limit(1);
+
+  if (!group) {
+    return null;
+  }
+
+  const hasAccess = await ensureOrgAccess(group.orgId, auth);
+  if (!hasAccess) {
+    return null;
+  }
+
+  return group;
+}
+
+/**
+ * Site-axis gate for an existing group. RLS only defends the org axis, so a
+ * site-restricted org user could otherwise mutate/delete a group bound to a
+ * site outside their allowlist (same org). Org-wide groups (siteId null) fail
+ * closed for site-restricted callers. Empty/unset allowlist (partner/system
+ * scope) = full access.
+ */
+export function groupSiteAllowed(
+  group: { siteId: string | null },
+  perms: UserPermissions | undefined
+): boolean {
+  if (!perms?.allowedSiteIds) return true;
+  return typeof group.siteId === 'string' && canAccessSite(perms, group.siteId);
+}
+
+async function getDeviceCountForGroup(groupId: string): Promise<number> {
+  const [result] = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(deviceGroupMemberships)
+    .where(eq(deviceGroupMemberships.groupId, groupId));
+
+  return Number(result?.count ?? 0);
+}
+
+async function siteBelongsToOrg(siteId: string, orgId: string): Promise<boolean> {
+  const [site] = await db
+    .select({ id: sites.id })
+    .from(sites)
+    .where(and(eq(sites.id, siteId), eq(sites.orgId, orgId)))
+    .limit(1);
+
+  return Boolean(site);
+}
+
+function mapGroupRow(
+  group: typeof deviceGroups.$inferSelect,
+  deviceCount: number,
+  deviceIds?: string[],
+  policy?: { id: string; name: string } | null
+): DeviceGroup {
+  const result: DeviceGroup = {
+    id: group.id,
+    orgId: group.orgId,
+    siteId: group.siteId,
+    name: group.name,
+    type: group.type,
+    rules: group.rules,
+    filterConditions: group.filterConditions as FilterConditionGroup | null,
+    filterFieldsUsed: group.filterFieldsUsed ?? [],
+    parentId: group.parentId,
+    deviceCount,
+    createdAt: group.createdAt.toISOString(),
+    updatedAt: group.updatedAt.toISOString(),
+    policy: policy ?? undefined,
+  };
+  if (deviceIds) {
+    result.deviceIds = deviceIds;
+  }
+  return result;
+}
+
+// GET / - List groups for the org
+groupRoutes.get(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupRead,
+  zValidator('query', listGroupsQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const query = c.req.valid('query');
+
+    const orgIds = await getOrgIdsForAuth(auth);
+    if (auth.scope !== 'system' && (!orgIds || orgIds.length === 0)) {
+      return c.json({ data: [], total: 0 });
+    }
+
+    // Intersect with the requested org, never widen: `orgIds` is null only for
+    // system scope (unrestricted), so a system caller's `?orgId=` is used
+    // as-is; every other scope already computed the exact set it may see, and
+    // a requested org outside that set yields nothing rather than a 403 that
+    // would confirm the org exists.
+    let effectiveOrgIds = orgIds;
+    if (query.orgId) {
+      if (orgIds) {
+        if (!orgIds.includes(query.orgId)) {
+          return c.json({ data: [], total: 0 });
+        }
+        effectiveOrgIds = [query.orgId];
+      } else {
+        effectiveOrgIds = [query.orgId];
+      }
+    }
+
+    if (query.siteId && perms?.allowedSiteIds && !canAccessSite(perms, query.siteId)) {
+      return c.json({ error: 'Device not found or access denied' }, 403);
+    }
+
+    const conditions: SQL[] = [];
+    if (effectiveOrgIds) {
+      conditions.push(inArray(deviceGroups.orgId, effectiveOrgIds));
+    }
+    if (perms?.allowedSiteIds) {
+      if (perms.allowedSiteIds.length === 0) return c.json({ data: [], total: 0 });
+      conditions.push(inArray(deviceGroups.siteId, perms.allowedSiteIds));
+    }
+    if (query.siteId) {
+      conditions.push(eq(deviceGroups.siteId, query.siteId));
+    }
+    if (query.type) {
+      conditions.push(eq(deviceGroups.type, query.type));
+    }
+    if (query.parentId) {
+      conditions.push(eq(deviceGroups.parentId, query.parentId));
+    }
+
+    const whereCondition = conditions.length ? and(...conditions) : undefined;
+
+    const groups = await db
+      .select()
+      .from(deviceGroups)
+      .where(whereCondition)
+      .orderBy(desc(deviceGroups.createdAt));
+
+    let results = groups;
+    if (perms?.allowedSiteIds) {
+      results = results.filter((group) => groupSiteAllowed(group, perms));
+    }
+    if (query.search) {
+      const term = query.search.toLowerCase();
+      results = results.filter((group) => group.name.toLowerCase().includes(term));
+    }
+
+    // Get device counts for all groups
+    const groupIds = results.map((g) => g.id);
+    const countRows = groupIds.length
+      ? perms?.allowedSiteIds
+        ? perms.allowedSiteIds.length > 0
+          ? await db
+              .select({
+                groupId: deviceGroupMemberships.groupId,
+                count: sql<number>`count(*)`
+              })
+              .from(deviceGroupMemberships)
+              .innerJoin(devices, eq(deviceGroupMemberships.deviceId, devices.id))
+              .where(
+                and(
+                  inArray(deviceGroupMemberships.groupId, groupIds),
+                  inArray(devices.siteId, perms.allowedSiteIds)
+                )
+              )
+              .groupBy(deviceGroupMemberships.groupId)
+          : []
+        : await db
+            .select({
+              groupId: deviceGroupMemberships.groupId,
+              count: sql<number>`count(*)`
+            })
+            .from(deviceGroupMemberships)
+            .where(inArray(deviceGroupMemberships.groupId, groupIds))
+            .groupBy(deviceGroupMemberships.groupId)
+      : [];
+
+    const countMap = new Map(countRows.map((row) => [row.groupId, Number(row.count)]));
+
+    // NOTE: Membership query is unbounded. Acceptable at current scale (<100 groups,
+    // <10k devices). If group/membership counts grow significantly, consider pagination
+    // or server-side filtering instead of loading all memberships into the client.
+
+    // Optionally fetch device memberships
+    let membershipMap: Map<string, string[]> | null = null;
+    if (query.includeMemberships === 'true' && groupIds.length > 0) {
+      const membershipRows = perms?.allowedSiteIds
+        ? perms.allowedSiteIds.length > 0
+          ? await db
+              .select({
+                groupId: deviceGroupMemberships.groupId,
+                deviceId: deviceGroupMemberships.deviceId,
+                siteId: devices.siteId
+              })
+              .from(deviceGroupMemberships)
+              .innerJoin(devices, eq(deviceGroupMemberships.deviceId, devices.id))
+              .where(
+                and(
+                  inArray(deviceGroupMemberships.groupId, groupIds),
+                  inArray(devices.siteId, perms.allowedSiteIds)
+                )
+              )
+          : []
+        : await db
+            .select({
+              groupId: deviceGroupMemberships.groupId,
+              deviceId: deviceGroupMemberships.deviceId
+            })
+            .from(deviceGroupMemberships)
+            .where(inArray(deviceGroupMemberships.groupId, groupIds));
+
+      membershipMap = new Map<string, string[]>();
+      for (const row of membershipRows) {
+        if (perms?.allowedSiteIds && !canAccessSite(perms, (row as { siteId?: string }).siteId ?? '')) {
+          continue;
+        }
+        const existing = membershipMap.get(row.groupId) ?? [];
+        existing.push(row.deviceId);
+        membershipMap.set(row.groupId, existing);
+      }
+    }
+
+    // Query policy assignments for these groups
+    const groupPolicyMap = new Map<string, { id: string; name: string }>();
+    if (groupIds.length > 0) {
+      const policyRows = await db
+        .select({
+          groupId: configPolicyAssignments.targetId,
+          policyId: configPolicyAssignments.configPolicyId,
+          policyName: configurationPolicies.name,
+        })
+        .from(configPolicyAssignments)
+        .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+        .where(
+          and(
+            eq(configPolicyAssignments.level, 'device_group'),
+            inArray(configPolicyAssignments.targetId, groupIds),
+            eq(configurationPolicies.status, 'active')
+          )
+        )
+        .orderBy(configPolicyAssignments.priority, configPolicyAssignments.createdAt);
+
+      for (const row of policyRows) {
+        if (!groupPolicyMap.has(row.groupId)) {
+          groupPolicyMap.set(row.groupId, { id: row.policyId, name: row.policyName });
+        }
+      }
+    }
+
+    const data = results.map((group) =>
+      mapGroupRow(
+        group,
+        countMap.get(group.id) ?? 0,
+        membershipMap?.get(group.id),
+        groupPolicyMap.get(group.id)
+      )
+    );
+
+    return c.json({ data, total: data.length });
+  }
+);
+
+// GET /:id - Get single group
+groupRoutes.get(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupRead,
+  zValidator('param', groupIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const { id } = c.req.valid('param');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    if (!groupSiteAllowed(group, perms)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    const deviceCount = await getDeviceCountForGroup(id);
+
+    const [assignedPolicy] = await db
+      .select({
+        policyId: configPolicyAssignments.configPolicyId,
+        policyName: configurationPolicies.name,
+      })
+      .from(configPolicyAssignments)
+      .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+      .where(
+        and(
+          eq(configPolicyAssignments.level, 'device_group'),
+          eq(configPolicyAssignments.targetId, id),
+          eq(configurationPolicies.status, 'active')
+        )
+      )
+      .orderBy(configPolicyAssignments.priority, configPolicyAssignments.createdAt)
+      .limit(1);
+
+    return c.json({
+      data: mapGroupRow(
+        group,
+        deviceCount,
+        undefined,
+        assignedPolicy ? { id: assignedPolicy.policyId, name: assignedPolicy.policyName } : null
+      ),
+    });
+  }
+);
+
+// POST / - Create group
+groupRoutes.post(
+  '/',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupWrite,
+  requireMfa(),
+  zValidator('json', createGroupSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const payload = c.req.valid('json');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+
+    // The dashboard never puts orgId in this body — fetchWithAuth scopes every
+    // request with an `?orgId=` query param instead. Without this fallback a
+    // partner with 2+ orgs can never create a group from the UI (400 below).
+    // Access is still enforced by ensureOrgAccess, same as a body-sourced org.
+    const queryOrgId = c.req.query('orgId');
+    let orgId = payload.orgId
+      ?? (queryOrgId && PG_UUID_REGEX.test(queryOrgId) ? queryOrgId : undefined);
+    if (auth.scope === 'organization') {
+      if (!auth.orgId) {
+        return c.json({ error: 'Organization context required' }, 403);
+      }
+      orgId = auth.orgId;
+    } else if (auth.scope === 'partner') {
+      if (!orgId) {
+        const singleOrg = auth.accessibleOrgIds?.[0];
+        if (auth.accessibleOrgIds?.length === 1 && singleOrg) {
+          orgId = singleOrg;
+        } else {
+          return c.json({ error: 'orgId is required when partner has multiple organizations' }, 400);
+        }
+      }
+      const hasAccess = await ensureOrgAccess(orgId, auth);
+      if (!hasAccess) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+    } else if (auth.scope === 'system' && !orgId) {
+      return c.json({ error: 'orgId is required' }, 400);
+    }
+
+    if (perms?.allowedSiteIds && (!payload.siteId || !canAccessSite(perms, payload.siteId))) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (payload.siteId) {
+      const validSite = await siteBelongsToOrg(payload.siteId, orgId!);
+      if (!validSite) {
+        return c.json({ error: 'Site not found or belongs to different organization' }, 400);
+      }
+    }
+
+    // Validate parent group if provided
+    if (payload.parentId) {
+      const parent = await getGroupWithAccess(payload.parentId, auth);
+      if (!parent) {
+        return c.json({ error: 'Parent group not found' }, 400);
+      }
+      if (parent.orgId !== orgId) {
+        return c.json({ error: 'Parent group must belong to the same organization' }, 400);
+      }
+      if (!groupSiteAllowed(parent, perms)) {
+        return c.json({ error: 'Access to parent group site denied' }, 403);
+      }
+    }
+
+    // Validate filter conditions for dynamic groups
+    let filterFieldsUsed: string[] = [];
+    if (payload.type === 'dynamic' && payload.filterConditions) {
+      const validation = validateFilter(payload.filterConditions);
+      if (!validation.valid) {
+        return c.json({ error: 'Invalid filter conditions', details: validation.errors }, 400);
+      }
+      filterFieldsUsed = extractFieldsFromFilter(payload.filterConditions);
+    }
+
+    // Initial static membership, validated BEFORE the group row is inserted.
+    //
+    // Order matters: a `return c.json(..., 400)` is a normal response, not an
+    // exception, so the request transaction still commits. Validating after the
+    // insert would leave a stranded empty group behind on every rejected batch
+    // and invite a duplicate on retry. An empty array is not an error — it is
+    // what the dashboard sends for a group with no devices selected.
+    const requestedDeviceIds = payload.deviceIds ?? [];
+    if (requestedDeviceIds.length > 0) {
+      if (payload.type === 'dynamic') {
+        return c.json(
+          {
+            error:
+              'Cannot assign devices to a dynamic group; its membership is computed from filterConditions'
+          },
+          400
+        );
+      }
+
+      const deviceValidation = await validateManualMembershipDevices({
+        deviceIds: requestedDeviceIds,
+        orgId: orgId!,
+        siteId: payload.siteId ?? null
+      });
+
+      if (!deviceValidation.ok) {
+        const body = deviceValidation.invalidDevices
+          ? { error: deviceValidation.error, invalidDevices: deviceValidation.invalidDevices }
+          : { error: deviceValidation.error };
+        return c.json(body, deviceValidation.status);
+      }
+    }
+
+    const [group] = await db
+      .insert(deviceGroups)
+      .values({
+        orgId: orgId!,
+        siteId: payload.siteId,
+        name: payload.name,
+        type: payload.type,
+        rules: payload.rules,
+        filterConditions: payload.filterConditions ?? null,
+        filterFieldsUsed,
+        parentId: payload.parentId
+      })
+      .returning();
+
+    if (!group) {
+      return c.json({ error: 'Failed to create group' }, 500);
+    }
+
+    writeRouteAudit(c, {
+      orgId: group.orgId,
+      action: 'device_group.create',
+      resourceType: 'device_group',
+      resourceId: group.id,
+      resourceName: group.name,
+      details: {
+        type: group.type,
+        siteId: group.siteId,
+        parentId: group.parentId,
+        hasFilter: Boolean(group.filterConditions)
+      }
+    });
+
+    // Membership is materialized before responding, so the 201 carries a device
+    // count the caller can trust for either group type.
+    let deviceCount = 0;
+
+    // Static groups: materialize the devices the caller selected, in the same
+    // request (and therefore the same transaction) as the group itself. Shares
+    // the exact validation + insert path as `POST /:id/devices`, so there is one
+    // implementation of the cross-tenant guard, not two.
+    if (group.type === 'static' && requestedDeviceIds.length > 0) {
+      const { added } = await addManualGroupMemberships({
+        groupId: group.id,
+        orgId: group.orgId,
+        deviceIds: requestedDeviceIds
+      });
+      deviceCount = added.length;
+
+      writeRouteAudit(c, {
+        orgId: group.orgId,
+        action: 'device_group.device.add',
+        resourceType: 'device_group',
+        resourceId: group.id,
+        resourceName: group.name,
+        details: {
+          addedCount: added.length,
+          skippedCount: 0,
+          deviceIds: added,
+          viaGroupCreate: true
+        }
+      });
+    }
+
+    // Dynamic groups: evaluate the filter before responding.
+    //
+    // This used to be fire-and-forget (`evaluateGroupMembership(id).catch(...)`),
+    // which never worked: the detached promise resumed AFTER the request's
+    // `withDbAccessContext` transaction had committed and released its pooled
+    // connection, so its next query was queued on a dead transaction handle and
+    // never executed. The promise never settled, the `.catch` never ran, and the
+    // group stayed permanently empty with nothing in the logs. Awaiting inside
+    // the request keeps the evaluation in the caller's own org-scoped RLS
+    // context — the correct tenant, enforced by Postgres — and lets the response
+    // carry the real device count. The evaluation is a handful of statements
+    // (bounded filter query + bulk insert), not a per-device loop.
+    if (group.type === 'dynamic' && group.filterConditions) {
+      try {
+        await evaluateGroupMembership(group.id);
+        deviceCount = await getDeviceCountForGroup(group.id);
+      } catch (err) {
+        // The group itself was created; failing the request would invite a
+        // duplicate on retry. Surface the failure instead of swallowing it.
+        console.error(`Failed to evaluate membership for new group ${group.id}:`, err);
+      }
+    }
+
+    return c.json({ data: mapGroupRow(group, deviceCount) }, 201);
+  }
+);
+
+// PATCH /:id - Update group
+groupRoutes.patch(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupWrite,
+  requireMfa(),
+  zValidator('param', groupIdParamSchema),
+  zValidator('json', updateGroupSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (!groupSiteAllowed(group, perms)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    // Validate parent group if provided
+    if (payload.parentId) {
+      if (payload.parentId === id) {
+        return c.json({ error: 'Group cannot be its own parent' }, 400);
+      }
+      const parent = await getGroupWithAccess(payload.parentId, auth);
+      if (!parent) {
+        return c.json({ error: 'Parent group not found' }, 400);
+      }
+      if (parent.orgId !== group.orgId) {
+        return c.json({ error: 'Parent group must belong to the same organization' }, 400);
+      }
+      if (!groupSiteAllowed(parent, perms)) {
+        return c.json({ error: 'Access to parent group site denied' }, 403);
+      }
+    }
+
+    if (payload.siteId !== undefined && perms?.allowedSiteIds
+      && (payload.siteId === null || !canAccessSite(perms, payload.siteId))) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (payload.siteId) {
+      const validSite = await siteBelongsToOrg(payload.siteId, group.orgId);
+      if (!validSite) {
+        return c.json({ error: 'Site not found or belongs to different organization' }, 400);
+      }
+    }
+
+    // Determine the effective type (updated or existing)
+    const effectiveType = payload.type ?? group.type;
+    const siteChanged = payload.siteId !== undefined && payload.siteId !== group.siteId;
+
+    // Validate filter conditions if provided
+    let filterFieldsUsed: string[] | undefined;
+    const filterChanged = payload.filterConditions !== undefined;
+
+    if (filterChanged && payload.filterConditions !== null && payload.filterConditions !== undefined) {
+      const validation = validateFilter(payload.filterConditions);
+      if (!validation.valid) {
+        return c.json({ error: 'Invalid filter conditions', details: validation.errors }, 400);
+      }
+      filterFieldsUsed = extractFieldsFromFilter(payload.filterConditions);
+    } else if (filterChanged && payload.filterConditions === null) {
+      // Clearing filter conditions
+      filterFieldsUsed = [];
+    }
+
+    const updates: Record<string, unknown> = { updatedAt: new Date() };
+    if (payload.name !== undefined) updates.name = payload.name;
+    if (payload.siteId !== undefined) updates.siteId = payload.siteId;
+    if (payload.type !== undefined) updates.type = payload.type;
+    if (payload.rules !== undefined) updates.rules = payload.rules;
+    if (payload.parentId !== undefined) updates.parentId = payload.parentId;
+    if (filterChanged) {
+      updates.filterConditions = payload.filterConditions ?? null;
+      updates.filterFieldsUsed = filterFieldsUsed;
+    }
+
+    let prunedDeviceIds: string[] = [];
+    const updated = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(deviceGroups)
+        .set(updates)
+        .where(eq(deviceGroups.id, id))
+        .returning();
+
+      if (siteChanged && row?.siteId) {
+        const pruned = await pruneGroupMembershipsOutsideSite(
+          row.id,
+          row.siteId,
+          row.orgId,
+          tx,
+          { deferPeripheralReconciliation: true },
+        );
+        prunedDeviceIds = pruned.deviceIds ?? [];
+      }
+
+      return row;
+    });
+
+    if (!updated) {
+      return c.json({ error: 'Failed to update group' }, 500);
+    }
+
+    await Promise.all(prunedDeviceIds.map((deviceId) =>
+      schedulePeripheralPolicyDevice(deviceId, 'dynamic_membership_changed').catch((error) => {
+        console.error(`[groups] failed to schedule peripheral reconciliation for ${deviceId}:`, error);
+      })
+    ));
+
+    writeRouteAudit(c, {
+      orgId: updated.orgId,
+      action: 'device_group.update',
+      resourceType: 'device_group',
+      resourceId: updated.id,
+      resourceName: updated.name,
+      details: {
+        changedFields: Object.keys(payload)
+      }
+    });
+
+    // Always finish the re-evaluation before returning. Site changes are
+    // security-boundary changes and always had to be awaited; the filter-only
+    // branch used to be fire-and-forget, which silently did nothing at all —
+    // the detached promise resumed after this request's `withDbAccessContext`
+    // transaction had committed, so its queries were stranded on a closed
+    // transaction handle and never ran (no rows, no error, no log). Awaiting
+    // also means the `deviceCount` returned below reflects the new filter.
+    // A failure propagates (PATCH is idempotent, so a 500 is retryable) rather
+    // than leaving membership silently stale against the new filter or site.
+    if (effectiveType === 'dynamic' && (filterChanged || siteChanged) && updated.filterConditions) {
+      await evaluateGroupMembership(updated.id);
+    }
+
+    const deviceCount = await getDeviceCountForGroup(id);
+
+    return c.json({ data: mapGroupRow(updated, deviceCount) });
+  }
+);
+
+// DELETE /:id - Delete group
+groupRoutes.delete(
+  '/:id',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupWrite,
+  requireMfa(),
+  zValidator('param', groupIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    if (!groupSiteAllowed(group, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    let result: Awaited<ReturnType<typeof deleteDeviceGroup>>;
+    try {
+      result = await deleteDeviceGroup(id, group.orgId);
+    } catch (err) {
+      if (err instanceof DeviceGroupDeleteError) {
+        if (err.code === 'NOT_FOUND') return c.json({ error: 'Group not found' }, 404);
+        if (err.code === 'HAS_CHILDREN') return c.json({ error: 'Cannot delete group with child groups' }, 400);
+        // Contract and quote names/numbers are billing data — disclose each
+        // list only to a caller with that domain's read permission.
+        const perms = c.get('permissions') as UserPermissions | undefined;
+        const canReadContracts = !!perms && hasPermission(perms, PERMISSIONS.CONTRACTS_READ.resource, PERMISSIONS.CONTRACTS_READ.action);
+        const canReadQuotes = !!perms && hasPermission(perms, PERMISSIONS.QUOTES_READ.resource, PERMISSIONS.QUOTES_READ.action);
+        return c.json({
+          error: err.message,
+          code: err.code === 'QUOTED_BY_QUOTES' ? 'GROUP_IN_USE_BY_QUOTES' : 'GROUP_IN_USE_BY_CONTRACTS',
+          ...(err.contractCount ? { contractCount: err.contractCount } : {}),
+          ...(err.quoteCount ? { quoteCount: err.quoteCount } : {}),
+          ...(canReadContracts && err.contracts ? { contracts: err.contracts } : {}),
+          ...(canReadQuotes && err.quotes ? { quotes: err.quotes } : {}),
+        }, 409);
+      }
+      throw err;
+    }
+
+    await Promise.all(result.affectedDeviceIds.map((deviceId) =>
+      schedulePeripheralPolicyDevice(deviceId, 'group_deleted').catch((error) => {
+        console.error(`[groups] failed to schedule peripheral reconciliation for ${deviceId}:`, error);
+      })
+    ));
+
+    writeRouteAudit(c, {
+      orgId: group.orgId,
+      action: 'device_group.delete',
+      resourceType: 'device_group',
+      resourceId: group.id,
+      resourceName: group.name
+    });
+
+    return c.json({ data: mapGroupRow(group, 0) });
+  }
+);
+
+// GET /:id/devices - List devices in a group
+groupRoutes.get(
+  '/:id/devices',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupRead,
+  zValidator('param', groupIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const { id } = c.req.valid('param');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    if (!groupSiteAllowed(group, perms)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (perms?.allowedSiteIds && perms.allowedSiteIds.length === 0) {
+      return c.json({ data: [], total: 0 });
+    }
+
+    const conditions: SQL[] = [eq(deviceGroupMemberships.groupId, id)];
+    if (perms?.allowedSiteIds) {
+      conditions.push(inArray(devices.siteId, perms.allowedSiteIds));
+    }
+
+    const memberships = await db
+      .select({
+        deviceId: deviceGroupMemberships.deviceId,
+        isPinned: deviceGroupMemberships.isPinned,
+        addedAt: deviceGroupMemberships.addedAt,
+        addedBy: deviceGroupMemberships.addedBy,
+        siteId: devices.siteId,
+        hostname: devices.hostname,
+        displayName: devices.displayName,
+        status: devices.status,
+        osType: devices.osType
+      })
+      .from(deviceGroupMemberships)
+      .innerJoin(devices, eq(deviceGroupMemberships.deviceId, devices.id))
+      .where(and(...conditions))
+      .orderBy(desc(deviceGroupMemberships.addedAt));
+
+    const scopedMemberships = perms?.allowedSiteIds
+      ? memberships.filter((m) => typeof m.siteId === 'string' && canAccessSite(perms, m.siteId))
+      : memberships;
+
+    const data = scopedMemberships.map((m) => ({
+      deviceId: m.deviceId,
+      hostname: m.hostname,
+      displayName: m.displayName,
+      status: m.status,
+      osType: m.osType,
+      isPinned: m.isPinned,
+      addedAt: m.addedAt.toISOString(),
+      addedBy: m.addedBy
+    }));
+
+    return c.json({ data, total: data.length });
+  }
+);
+
+// POST /:id/devices - Add devices to group
+groupRoutes.post(
+  '/:id/devices',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupWrite,
+  requireMfa(),
+  zValidator('param', groupIdParamSchema),
+  zValidator('json', addDevicesSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+    const payload = c.req.valid('json');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    if (!groupSiteAllowed(group, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (group.type === 'dynamic') {
+      return c.json({ error: 'Cannot manually add devices to a dynamic group' }, 400);
+    }
+
+    // Verify every device exists, belongs to this org, and respects a
+    // site-bound group's boundary. Shared with the create route so the
+    // cross-tenant guard has exactly one implementation (#3159).
+    const deviceValidation = await validateManualMembershipDevices({
+      deviceIds: payload.deviceIds,
+      orgId: group.orgId,
+      siteId: group.siteId
+    });
+
+    if (!deviceValidation.ok) {
+      const body = deviceValidation.invalidDevices
+        ? { error: deviceValidation.error, invalidDevices: deviceValidation.invalidDevices }
+        : { error: deviceValidation.error };
+      return c.json(body, deviceValidation.status);
+    }
+
+    const { added: newDeviceIds, skipped } = await addManualGroupMemberships({
+      groupId: id,
+      orgId: group.orgId,
+      deviceIds: payload.deviceIds
+    });
+
+    writeRouteAudit(c, {
+      orgId: group.orgId,
+      action: 'device_group.device.add',
+      resourceType: 'device_group',
+      resourceId: group.id,
+      resourceName: group.name,
+      details: {
+        addedCount: newDeviceIds.length,
+        skippedCount: skipped,
+        deviceIds: newDeviceIds
+      }
+    });
+
+    const deviceCount = await getDeviceCountForGroup(id);
+
+    return c.json({
+      data: {
+        added: newDeviceIds.length,
+        skipped,
+        total: deviceCount
+      }
+    }, 201);
+  }
+);
+
+// DELETE /:id/devices/:deviceId - Remove device from group
+groupRoutes.delete(
+  '/:id/devices/:deviceId',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupWrite,
+  requireMfa(),
+  zValidator('param', deviceIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id, deviceId } = c.req.valid('param');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    if (!groupSiteAllowed(group, perms)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (group.type === 'dynamic') {
+      return c.json({ error: 'Cannot manually remove devices from a dynamic group' }, 400);
+    }
+
+    if (!(await canAccessDeviceSite(c, deviceId, group.siteId))) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    const [membership] = await db
+      .select()
+      .from(deviceGroupMemberships)
+      .where(
+        and(
+          eq(deviceGroupMemberships.groupId, id),
+          eq(deviceGroupMemberships.deviceId, deviceId)
+        )
+      )
+      .limit(1);
+
+    if (!membership) {
+      return c.json({ error: 'Device is not a member of this group' }, 404);
+    }
+
+    await db
+      .delete(deviceGroupMemberships)
+      .where(
+        and(
+          eq(deviceGroupMemberships.groupId, id),
+          eq(deviceGroupMemberships.deviceId, deviceId)
+        )
+      );
+
+    await schedulePeripheralPolicyDevice(deviceId, 'manual_membership_changed').catch((error) => {
+      console.error(`[groups] failed to schedule peripheral reconciliation for ${deviceId}:`, error);
+    });
+
+    writeRouteAudit(c, {
+      orgId: group.orgId,
+      action: 'device_group.device.remove',
+      resourceType: 'device_group',
+      resourceId: group.id,
+      resourceName: group.name,
+      details: {
+        deviceId
+      }
+    });
+
+    return c.json({ data: { deviceId, groupId: id, removed: true } });
+  }
+);
+
+// POST /:id/preview - Preview devices matching the group's filter
+const previewQuerySchema = z.object({
+  limit: z.coerce.number().min(1).max(100).default(10)
+});
+
+groupRoutes.post(
+  '/:id/preview',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupRead,
+  zValidator('param', groupIdParamSchema),
+  zValidator('query', previewQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id } = c.req.valid('param');
+    const { limit } = c.req.valid('query');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    if (!groupSiteAllowed(group, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (group.type !== 'dynamic') {
+      return c.json({ error: 'Preview is only available for dynamic groups' }, 400);
+    }
+
+    if (!group.filterConditions) {
+      return c.json({ error: 'Group has no filter conditions defined' }, 400);
+    }
+
+    const filter = group.filterConditions as FilterConditionGroup;
+    let preview;
+    try {
+      preview = await evaluateFilterWithPreview(filter, {
+        orgId: group.orgId,
+        allowedSiteIds: group.siteId ? [group.siteId] : null,
+        previewLimit: limit
+      });
+    } catch (error) {
+      // The fourth preview endpoint, and the one most likely to time out: a
+      // dynamic group's stored filter is applied to the whole org rather than
+      // being typed interactively, so nothing bounds its cost up front. Same
+      // treatment as the three in routes/filters.ts (#5181) — without it this
+      // endpoint would keep answering the anonymous 500 the issue is about.
+      if (!(error instanceof FilterQueryTimeoutError)) throw error;
+      reportFilterPreviewTimeout(group.orgId);
+      return c.json(FILTER_PREVIEW_TIMEOUT_BODY, FILTER_PREVIEW_TIMEOUT_STATUS);
+    }
+
+    return c.json({
+      data: {
+        totalCount: preview.totalCount,
+        devices: preview.devices.map((d) => ({
+          id: d.id,
+          hostname: d.hostname,
+          displayName: d.displayName,
+          osType: d.osType,
+          status: d.status,
+          lastSeenAt: d.lastSeenAt?.toISOString() ?? null
+        })),
+        evaluatedAt: preview.evaluatedAt.toISOString()
+      }
+    });
+  }
+);
+
+// POST /:id/devices/:deviceId/pin - Pin a device to the group (prevents dynamic removal)
+groupRoutes.post(
+  '/:id/devices/:deviceId/pin',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupWrite,
+  requireMfa(),
+  zValidator('param', deviceIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id, deviceId } = c.req.valid('param');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    if (!groupSiteAllowed(group, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (group.type !== 'dynamic') {
+      return c.json({ error: 'Pinning is only supported for dynamic groups' }, 400);
+    }
+
+    // Verify device exists and belongs to the same org
+    const [device] = await db
+      .select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId })
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
+
+    if (!device || device.orgId !== group.orgId) {
+      return c.json({ error: 'Device not found or belongs to a different organization' }, 404);
+    }
+
+    if (group.siteId !== null && device.siteId !== group.siteId) {
+      return c.json({ error: 'Device does not belong to the group site' }, 403);
+    }
+
+    const userPerms = c.get('permissions') as UserPermissions | undefined;
+    if (userPerms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(userPerms, device.siteId))) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    await pinDeviceToGroup(id, deviceId, true, group.orgId);
+
+    writeRouteAudit(c, {
+      orgId: group.orgId,
+      action: 'device_group.device.pin',
+      resourceType: 'device_group',
+      resourceId: group.id,
+      resourceName: group.name,
+      details: {
+        deviceId
+      }
+    });
+
+    return c.json({
+      data: {
+        groupId: id,
+        deviceId,
+        isPinned: true,
+        pinnedAt: new Date().toISOString()
+      }
+    }, 201);
+  }
+);
+
+// DELETE /:id/devices/:deviceId/pin - Unpin a device from the group
+groupRoutes.delete(
+  '/:id/devices/:deviceId/pin',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupWrite,
+  requireMfa(),
+  zValidator('param', deviceIdParamSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const { id, deviceId } = c.req.valid('param');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    if (!groupSiteAllowed(group, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (group.type !== 'dynamic') {
+      return c.json({ error: 'Unpinning is only supported for dynamic groups' }, 400);
+    }
+
+    if (!(await canAccessDeviceSite(c, deviceId, group.siteId))) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    // Check if device is a member of this group
+    const [membership] = await db
+      .select({ deviceId: deviceGroupMemberships.deviceId, isPinned: deviceGroupMemberships.isPinned })
+      .from(deviceGroupMemberships)
+      .where(
+        and(
+          eq(deviceGroupMemberships.groupId, id),
+          eq(deviceGroupMemberships.deviceId, deviceId)
+        )
+      )
+      .limit(1);
+
+    if (!membership) {
+      return c.json({ error: 'Device is not a member of this group' }, 404);
+    }
+
+    if (!membership.isPinned) {
+      return c.json({ error: 'Device is not pinned to this group' }, 400);
+    }
+
+    await pinDeviceToGroup(id, deviceId, false, group.orgId);
+
+    writeRouteAudit(c, {
+      orgId: group.orgId,
+      action: 'device_group.device.unpin',
+      resourceType: 'device_group',
+      resourceId: group.id,
+      resourceName: group.name,
+      details: {
+        deviceId
+      }
+    });
+
+    return c.json({
+      data: {
+        groupId: id,
+        deviceId,
+        isPinned: false,
+        unpinnedAt: new Date().toISOString()
+      }
+    });
+  }
+);
+
+// GET /:id/membership-log - Get audit log of membership changes
+const membershipLogQuerySchema = z.object({
+  deviceId: z.string().guid().optional(),
+  action: z.enum(['added', 'removed']).optional(),
+  limit: z.coerce.number().min(1).max(500).default(50),
+  offset: z.coerce.number().min(0).default(0)
+});
+
+groupRoutes.get(
+  '/:id/membership-log',
+  requireScope('organization', 'partner', 'system'),
+  requireGroupRead,
+  zValidator('param', groupIdParamSchema),
+  zValidator('query', membershipLogQuerySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const { id } = c.req.valid('param');
+    const query = c.req.valid('query');
+
+    const group = await getGroupWithAccess(id, auth);
+    if (!group) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+
+    if (!groupSiteAllowed(group, perms)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    if (query.deviceId && perms?.allowedSiteIds && !(await canAccessDeviceSite(c, query.deviceId))) {
+      return c.json({ error: 'Device not found or access denied' }, 403);
+    }
+
+    if (perms?.allowedSiteIds && perms.allowedSiteIds.length === 0) {
+      return c.json({
+        data: [],
+        total: 0,
+        limit: query.limit,
+        offset: query.offset
+      });
+    }
+
+    // Build conditions
+    const conditions: SQL[] = [eq(groupMembershipLog.groupId, id)];
+    if (query.deviceId) {
+      conditions.push(eq(groupMembershipLog.deviceId, query.deviceId));
+    }
+    if (query.action) {
+      conditions.push(eq(groupMembershipLog.action, query.action));
+    }
+
+    // Get total count
+    const [countResult] = perms?.allowedSiteIds
+      ? await db
+          .select({ count: sql<number>`count(*)` })
+          .from(groupMembershipLog)
+          .innerJoin(devices, eq(groupMembershipLog.deviceId, devices.id))
+          .where(and(...conditions, inArray(devices.siteId, perms.allowedSiteIds)))
+      : await db
+          .select({ count: sql<number>`count(*)` })
+          .from(groupMembershipLog)
+          .where(and(...conditions));
+
+    const total = Number(countResult?.count ?? 0);
+
+    // Get log entries with device info
+    const logEntries = perms?.allowedSiteIds
+      ? await db
+          .select({
+            id: groupMembershipLog.id,
+            groupId: groupMembershipLog.groupId,
+            deviceId: groupMembershipLog.deviceId,
+            action: groupMembershipLog.action,
+            reason: groupMembershipLog.reason,
+            createdAt: groupMembershipLog.createdAt,
+            siteId: devices.siteId,
+            hostname: devices.hostname,
+            displayName: devices.displayName
+          })
+          .from(groupMembershipLog)
+          .innerJoin(devices, eq(groupMembershipLog.deviceId, devices.id))
+          .where(and(...conditions, inArray(devices.siteId, perms.allowedSiteIds)))
+          .orderBy(desc(groupMembershipLog.createdAt), desc(groupMembershipLog.id))
+          .limit(query.limit)
+          .offset(query.offset)
+      : await db
+          .select({
+            id: groupMembershipLog.id,
+            groupId: groupMembershipLog.groupId,
+            deviceId: groupMembershipLog.deviceId,
+            action: groupMembershipLog.action,
+            reason: groupMembershipLog.reason,
+            createdAt: groupMembershipLog.createdAt,
+            hostname: devices.hostname,
+            displayName: devices.displayName
+          })
+          .from(groupMembershipLog)
+          .leftJoin(devices, eq(groupMembershipLog.deviceId, devices.id))
+          .where(and(...conditions))
+          .orderBy(desc(groupMembershipLog.createdAt), desc(groupMembershipLog.id))
+          .limit(query.limit)
+          .offset(query.offset);
+
+    const scopedLogEntries = perms?.allowedSiteIds
+      ? logEntries.filter((entry) => {
+          const siteId = (entry as { siteId?: string }).siteId;
+          return typeof siteId === 'string' && canAccessSite(perms, siteId);
+        })
+      : logEntries;
+
+    const data = scopedLogEntries.map((entry) => ({
+      id: entry.id,
+      groupId: entry.groupId,
+      deviceId: entry.deviceId,
+      hostname: entry.hostname,
+      displayName: entry.displayName,
+      action: entry.action,
+      reason: entry.reason,
+      createdAt: entry.createdAt.toISOString()
+    }));
+
+    return c.json({
+      data,
+      total,
+      limit: query.limit,
+      offset: query.offset
+    });
+  }
+);

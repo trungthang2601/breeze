@@ -1,0 +1,370 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const loadEnv = async () => import('./env');
+
+const OAUTH_ENV_KEYS = [
+  'MCP_OAUTH_ENABLED',
+  'OAUTH_DCR_ENABLED',
+  'OAUTH_DCR_REQUIRE_IAT',
+  'OAUTH_DCR_ALLOW_ANONYMOUS',
+  'OAUTH_ISSUER',
+  'OAUTH_RESOURCE_URL',
+  'OAUTH_JWKS_PRIVATE_JWK',
+  'OAUTH_JWKS_PUBLIC_JWK',
+  'OAUTH_COOKIE_SECRET',
+  'NODE_ENV',
+  'MFA_FORCE_FOR_PARTNER_ADMIN',
+  'M365_CUSTOMER_GRAPH_READ_ONBOARDING_ENABLED',
+  'M365_CUSTOMER_GRAPH_ACTIONS_ONBOARDING_ENABLED',
+  'AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED',
+] as const;
+
+const clearOauthEnv = () => {
+  for (const key of OAUTH_ENV_KEYS) delete process.env[key];
+};
+
+describe('config env', () => {
+  beforeEach(() => {
+    clearOauthEnv();
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    clearOauthEnv();
+  });
+
+  it('defaults MCP_OAUTH_ENABLED to false when unset', async () => {
+    const mod = await loadEnv();
+    expect(mod.MCP_OAUTH_ENABLED).toBe(false);
+  });
+
+  it('keeps terminal preparation disabled by default', async () => {
+    const mod = await loadEnv();
+    expect(mod.authBrowserTerminalPreparationEnabled()).toBe(false);
+  });
+
+  it('reads the terminal preparation rollout flag at call time', async () => {
+    const mod = await loadEnv();
+    process.env.AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED = 'true';
+    expect(mod.authBrowserTerminalPreparationEnabled()).toBe(true);
+    process.env.AUTH_BROWSER_TERMINAL_PREPARATION_ENABLED = 'false';
+    expect(mod.authBrowserTerminalPreparationEnabled()).toBe(false);
+  });
+
+  it('treats recognized true values as enabled', async () => {
+    for (const value of ['true', '1', 'yes', 'on']) {
+      process.env.MCP_OAUTH_ENABLED = value;
+      vi.resetModules();
+      const mod = await loadEnv();
+      expect(mod.MCP_OAUTH_ENABLED).toBe(true);
+    }
+  });
+
+  it('treats unrecognized MCP_OAUTH_ENABLED values as false', async () => {
+    process.env.MCP_OAUTH_ENABLED = 'foo';
+    const mod = await loadEnv();
+    expect(mod.MCP_OAUTH_ENABLED).toBe(false);
+  });
+
+  it('defaults M365 customer Graph-read onboarding to false', async () => {
+    const mod = await loadEnv();
+    expect(mod.m365CustomerGraphReadOnboardingEnabled()).toBe(false);
+  });
+
+  it('reads M365 customer Graph-read onboarding at call time', async () => {
+    const mod = await loadEnv();
+    process.env.M365_CUSTOMER_GRAPH_READ_ONBOARDING_ENABLED = 'true';
+    expect(mod.m365CustomerGraphReadOnboardingEnabled()).toBe(true);
+    process.env.M365_CUSTOMER_GRAPH_READ_ONBOARDING_ENABLED = 'false';
+    expect(mod.m365CustomerGraphReadOnboardingEnabled()).toBe(false);
+  });
+
+  it('defaults M365 customer Graph-actions onboarding to false', async () => {
+    const mod = await loadEnv();
+    expect(mod.m365CustomerGraphActionsOnboardingEnabled()).toBe(false);
+  });
+
+  it('reads M365 customer Graph-actions onboarding at call time', async () => {
+    const mod = await loadEnv();
+    process.env.M365_CUSTOMER_GRAPH_ACTIONS_ONBOARDING_ENABLED = 'true';
+    expect(mod.m365CustomerGraphActionsOnboardingEnabled()).toBe(true);
+    process.env.M365_CUSTOMER_GRAPH_ACTIONS_ONBOARDING_ENABLED = 'false';
+    expect(mod.m365CustomerGraphActionsOnboardingEnabled()).toBe(false);
+  });
+
+  // Task 21 (May 2026): DCR now defaults OFF in every environment.
+  // Production deploys must explicitly set OAUTH_DCR_ENABLED=true AND
+  // OAUTH_DCR_REQUIRE_IAT=true (boot-refused otherwise — see validate.ts).
+  it('defaults OAUTH_DCR_ENABLED to false in development', async () => {
+    process.env.NODE_ENV = 'development';
+    const mod = await loadEnv();
+    expect(mod.OAUTH_DCR_ENABLED).toBe(false);
+  });
+
+  it('defaults OAUTH_DCR_ENABLED to false in production', async () => {
+    process.env.NODE_ENV = 'production';
+    const mod = await loadEnv();
+    expect(mod.OAUTH_DCR_ENABLED).toBe(false);
+  });
+
+  it('allows OAUTH_DCR_ENABLED to opt in explicitly', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.OAUTH_DCR_ENABLED = 'true';
+    const mod = await loadEnv();
+    expect(mod.OAUTH_DCR_ENABLED).toBe(true);
+  });
+
+  it('defaults OAUTH_DCR_REQUIRE_IAT to false when unset', async () => {
+    const mod = await loadEnv();
+    expect(mod.OAUTH_DCR_REQUIRE_IAT).toBe(false);
+  });
+
+  it('allows OAUTH_DCR_REQUIRE_IAT to opt in explicitly', async () => {
+    process.env.OAUTH_DCR_REQUIRE_IAT = 'true';
+    const mod = await loadEnv();
+    expect(mod.OAUTH_DCR_REQUIRE_IAT).toBe(true);
+  });
+
+  it('defaults OAUTH_ISSUER and OAUTH_RESOURCE_URL to empty strings', async () => {
+    const mod = await loadEnv();
+    expect(mod.OAUTH_ISSUER).toBe('');
+    expect(mod.OAUTH_RESOURCE_URL).toBe('');
+  });
+
+  it('allows OAUTH_RESOURCE_URL to override the derived value', async () => {
+    process.env.OAUTH_ISSUER = 'https://issuer.example';
+    process.env.OAUTH_RESOURCE_URL = 'https://resource.example/custom';
+    const mod = await loadEnv();
+    expect(mod.OAUTH_RESOURCE_URL).toBe('https://resource.example/custom');
+  });
+
+  // mfaForcePartnerAdmin is the kill-switch for the role-level MFA gate
+  // introduced in Task 8 of the launch-readiness sprint. Defaults OFF for
+  // this release (#4491): the reconcile migration
+  // (2026-10-11-170000-partner-admin-force-mfa-reconcile.sql) flips
+  // force_mfa on every EXISTING Partner Admin role, so enforcing on
+  // upgrade with no warning would lock admins into enrolment with zero
+  // notice. Enforcement returns to default ON once the notification-period
+  // feature (#5306) ships; MFA_FORCE_FOR_PARTNER_ADMIN=true opts in now.
+  it('defaults mfaForcePartnerAdmin to false when unset', async () => {
+    const mod = await loadEnv();
+    expect(mod.mfaForcePartnerAdmin()).toBe(false);
+  });
+
+  it('returns false when MFA_FORCE_FOR_PARTNER_ADMIN is explicitly disabled', async () => {
+    process.env.MFA_FORCE_FOR_PARTNER_ADMIN = 'false';
+    const mod = await loadEnv();
+    expect(mod.mfaForcePartnerAdmin()).toBe(false);
+  });
+
+  it('returns true when MFA_FORCE_FOR_PARTNER_ADMIN is explicitly true', async () => {
+    process.env.MFA_FORCE_FOR_PARTNER_ADMIN = 'true';
+    const mod = await loadEnv();
+    expect(mod.mfaForcePartnerAdmin()).toBe(true);
+  });
+
+  // Fail-closed self-host gate for private-network fetching (on-prem PSAs, DNS
+  // appliances, internal OIDC IdPs). Only an AFFIRMATIVE self-host declaration
+  // opens RFC1918/ULA; unset/garbage/truthy IS_HOSTED stays strict (#570).
+  describe('selfHostAllowsPrivateNetwork', () => {
+    afterEach(() => {
+      delete process.env.IS_HOSTED;
+    });
+
+    it('is true only for recognized self-host signals', async () => {
+      for (const value of ['false', '0', 'no', 'off', 'FALSE', ' off ']) {
+        process.env.IS_HOSTED = value;
+        vi.resetModules();
+        const mod = await loadEnv();
+        expect(mod.selfHostAllowsPrivateNetwork()).toBe(true);
+      }
+    });
+
+    it('is false when IS_HOSTED is unset (fail-closed)', async () => {
+      delete process.env.IS_HOSTED;
+      const mod = await loadEnv();
+      expect(mod.selfHostAllowsPrivateNetwork()).toBe(false);
+    });
+
+    it('is false for hosted/truthy or garbage IS_HOSTED', async () => {
+      for (const value of ['true', '1', 'yes', 'on', '', 'garbage']) {
+        process.env.IS_HOSTED = value;
+        vi.resetModules();
+        const mod = await loadEnv();
+        expect(mod.selfHostAllowsPrivateNetwork()).toBe(false);
+      }
+    });
+  });
+
+  // Signup-abuse detection defaults to IS_HOSTED. The failure that matters is a
+  // HOSTED deployment silently not policing its signups, so an unrecognized
+  // ABUSE_SIGNALS_ENABLED must NOT read as "off" — it warns and falls back to
+  // the default. (config/validate.ts refuses boot on such a value; this path is
+  // only reachable in a process that skipped the validator.)
+  describe('abuseSignalsEnabled / abuseSignalsExplicitlyDisabled', () => {
+    afterEach(() => {
+      delete process.env.IS_HOSTED;
+      delete process.env.ABUSE_SIGNALS_ENABLED;
+    });
+
+    it('defaults to on when hosted and off when self-hosted or unset', async () => {
+      const mod = await loadEnv();
+      process.env.IS_HOSTED = 'true';
+      expect(mod.abuseSignalsEnabled()).toBe(true);
+      process.env.IS_HOSTED = 'false';
+      expect(mod.abuseSignalsEnabled()).toBe(false);
+      delete process.env.IS_HOSTED;
+      expect(mod.abuseSignalsEnabled()).toBe(false);
+    });
+
+    // Both compose files inject `${ABUSE_SIGNALS_ENABLED:-}`, so "" is what
+    // most stacks actually pass and it has to keep meaning "unset".
+    it.each(['', '   '])('treats a compose-injected empty value (%j) as unset', async (value) => {
+      const mod = await loadEnv();
+      process.env.ABUSE_SIGNALS_ENABLED = value;
+      process.env.IS_HOSTED = 'true';
+      expect(mod.abuseSignalsEnabled()).toBe(true);
+      expect(mod.abuseSignalsExplicitlyDisabled()).toBe(false);
+    });
+
+    it('opts a self-hosted install in on an explicit truthy value', async () => {
+      const mod = await loadEnv();
+      process.env.IS_HOSTED = 'false';
+      for (const value of ['true', '1', 'yes', 'on', 'TRUE', ' on ']) {
+        process.env.ABUSE_SIGNALS_ENABLED = value;
+        expect(mod.abuseSignalsEnabled()).toBe(true);
+        expect(mod.abuseSignalsExplicitlyDisabled()).toBe(false);
+      }
+    });
+
+    it('switches a hosted install off on an explicit falsey value', async () => {
+      const mod = await loadEnv();
+      process.env.IS_HOSTED = 'true';
+      for (const value of ['false', '0', 'no', 'off', 'FALSE', ' off ']) {
+        process.env.ABUSE_SIGNALS_ENABLED = value;
+        expect(mod.abuseSignalsEnabled()).toBe(false);
+        expect(mod.abuseSignalsExplicitlyDisabled()).toBe(true);
+      }
+    });
+
+    // The bug: `ture` used to parse as falsey and silently disable detection on
+    // a hosted box — the exact polarity failure the default exists to prevent.
+    it('falls back to the IS_HOSTED default (with a warning) on an unrecognized value', async () => {
+      const mod = await loadEnv();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        for (const value of ['ture', 'enabled', 'disabled', 'y']) {
+          warn.mockClear();
+          process.env.ABUSE_SIGNALS_ENABLED = value;
+          process.env.IS_HOSTED = 'true';
+          expect(mod.abuseSignalsEnabled()).toBe(true);
+          process.env.IS_HOSTED = 'false';
+          expect(mod.abuseSignalsEnabled()).toBe(false);
+          expect(warn).toHaveBeenCalled();
+          expect(String(warn.mock.calls[0]?.[0])).toContain(value);
+        }
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    // Strictly narrower than !abuseSignalsEnabled(): the default-off self-host
+    // path and the typo path are both excluded, so a caller gating a
+    // destructive teardown on it never fires on an ambiguous "off".
+    it('reports an explicit opt-out only for recognized falsey values', async () => {
+      const mod = await loadEnv();
+      process.env.IS_HOSTED = 'false';
+      for (const value of ['ture', 'disabled', '', 'true', '1']) {
+        process.env.ABUSE_SIGNALS_ENABLED = value;
+        expect(mod.abuseSignalsExplicitlyDisabled()).toBe(false);
+      }
+      delete process.env.ABUSE_SIGNALS_ENABLED;
+      expect(mod.abuseSignalsEnabled()).toBe(false);
+      expect(mod.abuseSignalsExplicitlyDisabled()).toBe(false);
+    });
+  });
+
+  describe('Apple App Attest configuration (#1374 W03)', () => {
+    afterEach(() => {
+      delete process.env.APPLE_APP_ATTEST_ENVIRONMENT;
+      delete process.env.APPLE_APP_ATTEST_APP_ID;
+    });
+
+    // The verifier's entire environment gate rests on this one comparison. A
+    // refactor that inverted it (`!== 'production'`) would silently start
+    // accepting developer-signed App Attest attestations in production, which
+    // is exactly the L4 bypass wave W03 exists to close — and nothing else in
+    // the suite would notice.
+    it('resolves production for anything that is not exactly "development"', async () => {
+      const mod = await loadEnv();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        for (const value of ['Development', 'develop', 'dev', 'DEVELOPMENT', 'prod', 'true', '']) {
+          process.env.APPLE_APP_ATTEST_ENVIRONMENT = value;
+          expect(mod.appleAppAttestEnvironment()).toBe('production');
+        }
+        delete process.env.APPLE_APP_ATTEST_ENVIRONMENT;
+        expect(mod.appleAppAttestEnvironment()).toBe('production');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('resolves development only for the exact string, whitespace tolerated', async () => {
+      const mod = await loadEnv();
+      process.env.APPLE_APP_ATTEST_ENVIRONMENT = 'development';
+      expect(mod.appleAppAttestEnvironment()).toBe('development');
+      process.env.APPLE_APP_ATTEST_ENVIRONMENT = '  development  ';
+      expect(mod.appleAppAttestEnvironment()).toBe('development');
+    });
+
+    // Failing safe silently is what makes a misconfiguration take weeks to
+    // find: every genuine development-build attestation would be rejected with
+    // no hint that the cause is a typo rather than a forged blob.
+    it('warns on an unrecognized value but stays on production', async () => {
+      const mod = await loadEnv();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        process.env.APPLE_APP_ATTEST_ENVIRONMENT = 'Development';
+        expect(mod.appleAppAttestEnvironment()).toBe('production');
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining('APPLE_APP_ATTEST_ENVIRONMENT'),
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('does not warn for the two recognized values or for unset', async () => {
+      const mod = await loadEnv();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        for (const value of ['production', 'development']) {
+          process.env.APPLE_APP_ATTEST_ENVIRONMENT = value;
+          mod.appleAppAttestEnvironment();
+        }
+        delete process.env.APPLE_APP_ATTEST_ENVIRONMENT;
+        mod.appleAppAttestEnvironment();
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('falls back to the shipped appId when unset or blank', async () => {
+      // Read at MODULE LOAD, unlike the environment selector — so each case
+      // needs its own module instance.
+      delete process.env.APPLE_APP_ATTEST_APP_ID;
+      vi.resetModules();
+      expect((await loadEnv()).APPLE_APP_ATTEST_APP_ID).toBe('D8W6N2JYMA.com.breeze.rmm');
+
+      process.env.APPLE_APP_ATTEST_APP_ID = '   ';
+      vi.resetModules();
+      expect((await loadEnv()).APPLE_APP_ATTEST_APP_ID).toBe('D8W6N2JYMA.com.breeze.rmm');
+
+      process.env.APPLE_APP_ATTEST_APP_ID = '  OTHER00000.com.example.app  ';
+      vi.resetModules();
+      expect((await loadEnv()).APPLE_APP_ATTEST_APP_ID).toBe('OTHER00000.com.example.app');
+    });
+  });
+});

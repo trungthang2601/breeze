@@ -1,0 +1,208 @@
+import { useState, type ReactNode } from "react";
+import { Loader2, Trash2, RotateCcw, PenLine } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import { i18n } from "@/lib/i18n";
+import { ConfirmDialog } from "@/components/shared/ConfirmDialog";
+type FeatureTabShellProps = {
+  title: string;
+  description: string;
+  icon: ReactNode;
+  isConfigured: boolean;
+  /**
+   * When the tab is configured (a feature link exists) but the feature is not
+   * actually being deployed/enabled, pass true so the badge reflects "saved but
+   * inactive" instead of a green "Configured". Optional; does not affect the
+   * Remove control, which still keys off isConfigured (#1863).
+   */
+  configuredButInactive?: boolean;
+  saving: boolean;
+  /**
+   * When true, the Save (and Override) button is disabled independent of the
+   * saving state — used by tabs with client-side validation (e.g. an invalid
+   * library targeting row) to block a save the server would 400 on anyway.
+   */
+  saveDisabled?: boolean;
+  error?: string;
+  onSave: () => void;
+  onRemove?: () => void;
+  /** True when this tab is showing inherited settings from a parent policy */
+  isInherited?: boolean;
+  /** Called when user clicks "Override" on an inherited tab */
+  onOverride?: () => void;
+  /** Called when user clicks "Revert to Parent" on an overridden tab */
+  onRevert?: () => void;
+  children: ReactNode;
+};
+export default function FeatureTabShell({
+  title,
+  description,
+  icon,
+  isConfigured,
+  configuredButInactive,
+  saving,
+  saveDisabled,
+  error,
+  onSave,
+  onRemove,
+  isInherited,
+  onOverride,
+  onRevert,
+  children,
+}: FeatureTabShellProps) {
+  useTranslation("policies");
+  // #5314: Revert to Parent and Remove both fire an irreversible
+  // DELETE .../features/:id that destroys this policy's override. The shell
+  // renders the footer for every feature tab, so guarding here covers all of
+  // them at once rather than per-tab.
+  const [pendingAction, setPendingAction] = useState<"revert" | "remove" | null>(
+    null,
+  );
+  const savedInactive = !isInherited && isConfigured && !!configuredButInactive;
+  const badgeText = isInherited
+    ? "Configured (inherited)"
+    : savedInactive
+      ? "Saved (not deployed)"
+      : isConfigured
+        ? "Configured"
+        : "Not configured";
+  const badgeClass = isInherited
+    ? "border-blue-500/40 bg-blue-500/20 text-blue-700"
+    : savedInactive
+      ? "border-amber-500/40 bg-amber-500/20 text-amber-700"
+      : isConfigured
+        ? "border-green-500/40 bg-green-500/20 text-green-700"
+        : "border-muted bg-muted/50 text-muted-foreground";
+  return (
+    <div className="space-y-6">
+      <div className="rounded-lg border bg-card p-6 shadow-xs">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg border bg-muted/50">
+              {icon}
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold">{title}</h2>
+              <p className="text-sm text-muted-foreground">{description}</p>
+            </div>
+          </div>
+          <span
+            className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${badgeClass}`}
+          >
+            {badgeText}
+          </span>
+        </div>
+
+        {/* Error banner */}
+        {error && (
+          <div className="mt-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {error}
+          </div>
+        )}
+
+        {/* Inline settings form */}
+        <div
+          className={`mt-6 ${isInherited ? "opacity-60 pointer-events-none" : ""}`}
+        >
+          {children}
+        </div>
+
+        {/* Footer */}
+        <div className="mt-6 flex items-center justify-between border-t pt-4">
+          <div>
+            {isInherited && onOverride && (
+              <button
+                type="button"
+                onClick={onOverride}
+                disabled={saving || saveDisabled}
+                className="inline-flex items-center gap-2 rounded-md border border-primary/40 px-3 py-2 text-sm font-medium text-primary transition hover:bg-primary/10 disabled:opacity-50"
+              >
+                <PenLine className="h-4 w-4" />
+                {i18n.t(
+                  "policies:configurationPolicies.featureTabs.featureTabShell.override",
+                )}
+              </button>
+            )}
+            {!isInherited && onRevert && (
+              <button
+                type="button"
+                onClick={() => setPendingAction("revert")}
+                disabled={saving}
+                className="inline-flex items-center gap-2 rounded-md border border-blue-500/40 px-3 py-2 text-sm font-medium text-blue-700 transition hover:bg-blue-500/10 disabled:opacity-50"
+              >
+                <RotateCcw className="h-4 w-4" />
+                {i18n.t(
+                  "policies:configurationPolicies.featureTabs.featureTabShell.revertToParent",
+                )}
+              </button>
+            )}
+            {!isInherited && !onRevert && isConfigured && onRemove && (
+              <button
+                type="button"
+                onClick={() => setPendingAction("remove")}
+                disabled={saving}
+                className="inline-flex items-center gap-2 rounded-md border border-destructive/40 px-3 py-2 text-sm font-medium text-destructive transition hover:bg-destructive/10 disabled:opacity-50"
+              >
+                <Trash2 className="h-4 w-4" />
+                {i18n.t("common:actions.remove")}
+              </button>
+            )}
+          </div>
+          {!isInherited && (
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={saving || saveDisabled}
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
+            >
+              {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+              {saving
+                ? i18n.t(
+                    "policies:configurationPolicies.featureTabs.featureTabShell.saving",
+                  )
+                : i18n.t("common:actions.save")}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <ConfirmDialog
+        open={pendingAction === "revert"}
+        onClose={() => setPendingAction(null)}
+        onConfirm={() => {
+          setPendingAction(null);
+          onRevert?.();
+        }}
+        title={i18n.t(
+          "policies:configurationPolicies.featureTabs.featureTabShell.revertConfirmTitle",
+        )}
+        message={i18n.t(
+          "policies:configurationPolicies.featureTabs.featureTabShell.revertConfirmMessage",
+          { feature: title },
+        )}
+        confirmLabel={i18n.t(
+          "policies:configurationPolicies.featureTabs.featureTabShell.revertToParent",
+        )}
+        confirmTestId="feature-tab-revert-confirm"
+      />
+
+      <ConfirmDialog
+        open={pendingAction === "remove"}
+        onClose={() => setPendingAction(null)}
+        onConfirm={() => {
+          setPendingAction(null);
+          onRemove?.();
+        }}
+        title={i18n.t(
+          "policies:configurationPolicies.featureTabs.featureTabShell.removeConfirmTitle",
+        )}
+        message={i18n.t(
+          "policies:configurationPolicies.featureTabs.featureTabShell.removeConfirmMessage",
+          { feature: title },
+        )}
+        confirmLabel={i18n.t("common:actions.remove")}
+        confirmTestId="feature-tab-remove-confirm"
+      />
+    </div>
+  );
+}

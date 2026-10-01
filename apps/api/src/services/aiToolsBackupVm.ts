@@ -1,0 +1,455 @@
+/**
+ * AI Backup VM Restore Tools
+ *
+ * 3 VM-specific tools extracted from aiToolsBackup.ts:
+ * restore_as_vm, instant_boot_vm, get_vm_restore_estimate
+ */
+
+import { db } from '../db';
+import {
+  backupSnapshots,
+  restoreJobs,
+  devices,
+} from '../db/schema';
+import { eq, and, sql, SQL } from 'drizzle-orm';
+import type { AuthContext } from '../middleware/auth';
+import type { AiTool } from './aiTools';
+import { CommandTypes } from './commandQueue';
+import { aiQueueCommandForExecution } from './aiDispatch';
+import { deviceSiteDenied, deviceIdSiteDenied } from './aiToolsSiteScope';
+import { loadSnapshotWithSiteAccess } from './aiToolsBackupShared';
+import { startRebuildEngineVmRestore } from './vmRestoreRebuildEngine';
+
+type BackupHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
+
+function getOrgId(auth: AuthContext): string | null {
+  return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof sql.raw> | any): SQL | undefined {
+  return auth.orgCondition(orgIdCol) ?? undefined;
+}
+
+function safeHandler(toolName: string, fn: BackupHandler): BackupHandler {
+  return async (input, auth) => {
+    try {
+      return await fn(input, auth);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal error';
+      console.error(`[backup:${toolName}]`, message, err);
+      return JSON.stringify({ error: 'Operation failed. Check server logs for details.' });
+    }
+  };
+}
+
+async function markRestoreJobFailed(restoreJobId: string, error: string): Promise<void> {
+  const now = new Date();
+  await db
+    .update(restoreJobs)
+    .set({
+      status: 'failed',
+      completedAt: now,
+      updatedAt: now,
+      targetConfig: sql`coalesce(${restoreJobs.targetConfig}, '{}'::jsonb) || jsonb_build_object('error', ${error})`,
+    })
+    .where(eq(restoreJobs.id, restoreJobId));
+}
+
+export function registerBackupVmTools(aiTools: Map<string, AiTool>): void {
+  function registerTool(tool: AiTool): void {
+    aiTools.set(tool.definition.name, tool);
+  }
+
+  // ============================================
+  // restore_as_vm — Restore snapshot as VM
+  // ============================================
+
+  registerTool({
+    tier: 3,
+    domain: 'backup',
+    searchHint: 'backup snapshot recovery as a Hyper-V virtual machine or Linux rebuild to a VHDX image',
+    // Both engines' hosts are device args: the central gate (enforceDeviceArgs)
+    // runs the org+site check on whichever one the call carries.
+    deviceArgs: ['targetDeviceId', 'rebuildHostDeviceId'],
+    definition: {
+      name: 'restore_as_vm',
+      description:
+        'Restore a snapshot as a VM. hyperv (default) creates a Hyper-V VM on Windows; rebuild turns a Linux whole-machine snapshot with a disk layout manifest into VHDX on Linux. Rebuilt images always get a NEW machine identity and require manual attachment to Hyper-V.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          engine: {
+            type: 'string',
+            enum: ['hyperv', 'rebuild'],
+            description: 'Restore engine. Defaults to "hyperv".',
+          },
+          snapshotId: { type: 'string', description: 'Snapshot UUID (required)' },
+          targetDeviceId: { type: 'string', description: 'Target Hyper-V host device UUID (required for engine "hyperv")' },
+          hypervisor: {
+            type: 'string',
+            enum: ['hyperv'],
+            description: 'Target hypervisor platform (engine "hyperv")',
+          },
+          vmName: { type: 'string', description: 'Name of the restored VM (required for engine "hyperv")' },
+          switchName: { type: 'string', description: 'Optional Hyper-V switch name (engine "hyperv")' },
+          vmSpecs: {
+            type: 'object',
+            properties: {
+              memoryMb: { type: 'number' },
+              cpuCount: { type: 'number' },
+              diskSizeGb: { type: 'number' },
+            },
+            description: 'Optional VM resource overrides (engine "hyperv")',
+          },
+          rebuildHostDeviceId: { type: 'string', description: 'Linux device UUID that runs the rebuild (required for engine "rebuild")' },
+          outputPath: { type: 'string', description: 'Absolute .vhdx output path on the rebuild host (required for engine "rebuild")' },
+          imageSizeGb: { type: 'number', description: 'Optional virtual disk size in GB (engine "rebuild")' },
+        },
+        required: ['snapshotId'],
+      },
+    },
+    handler: safeHandler('restore_as_vm', async (input, auth) => {
+      const snapshotId = input.snapshotId as string;
+      const engine = input.engine === 'rebuild' ? 'rebuild' : 'hyperv';
+
+      if (engine === 'rebuild') {
+        const rebuildHostDeviceId = input.rebuildHostDeviceId as string;
+        const outputPath = input.outputPath as string;
+        if (!snapshotId || !rebuildHostDeviceId || !outputPath) {
+          return JSON.stringify({ error: 'snapshotId, rebuildHostDeviceId, and outputPath are required for engine "rebuild"' });
+        }
+        // Org axis via orgCondition and site axis on the SOURCE device
+        // (app-layer only). The rebuild host is gated by deviceArgs before the
+        // handler runs; the service re-checks it inside the snapshot's org.
+        const snapshotResult = await loadSnapshotWithSiteAccess(auth, snapshotId);
+        if ('error' in snapshotResult) return JSON.stringify({ error: snapshotResult.error });
+
+        // `identity` is deliberately not read from the input: the server forces
+        // `identity: 'new'` for engine-produced images (spec §9).
+        const result = await startRebuildEngineVmRestore({
+          orgId: snapshotResult.snapshot.orgId,
+          snapshotId,
+          rebuildHostDeviceId,
+          outputPath,
+          ...(typeof input.imageSizeGb === 'number' ? { imageSizeGb: input.imageSizeGb } : {}),
+          userId: auth.user?.id ?? null,
+        });
+        if (!result.ok) {
+          return JSON.stringify({ error: result.error, ...(result.details ? { details: result.details } : {}) });
+        }
+        return JSON.stringify({
+          success: true,
+          engine: 'rebuild',
+          restoreJobId: result.jobId,
+          recoveryId: result.recoveryId,
+          commandId: result.commandId,
+          status: result.status,
+          rebuildHostDeviceId,
+          outputPath,
+          identity: 'new',
+          note: 'Attach the VHDX to a Hyper-V VM manually; automatic VM creation for Linux guests arrives with the Windows engine.',
+        });
+      }
+
+      const targetDeviceId = input.targetDeviceId as string;
+      const hypervisor = input.hypervisor as string;
+      const vmName = input.vmName as string;
+      const switchName = typeof input.switchName === 'string' ? input.switchName : undefined;
+      if (!snapshotId || !targetDeviceId || !hypervisor || !vmName) {
+        return JSON.stringify({ error: 'snapshotId, targetDeviceId, hypervisor, and vmName are required' });
+      }
+      if (hypervisor !== 'hyperv') {
+        return JSON.stringify({ error: 'Only Hyper-V VM restore is currently supported' });
+      }
+
+      // Load the snapshot under org AND site scope (source device site gated),
+      // so a site-restricted caller cannot restore a cross-site snapshot onto a
+      // target they legitimately own.
+      const snapshotResult = await loadSnapshotWithSiteAccess(auth, snapshotId);
+      if ('error' in snapshotResult) return JSON.stringify({ error: snapshotResult.error });
+      const snapshot = snapshotResult.snapshot;
+
+      const deviceConditions: SQL[] = [eq(devices.id, targetDeviceId)];
+      const dc = orgWhere(auth, devices.orgId);
+      if (dc) deviceConditions.push(dc);
+      const [targetDevice] = await db
+        .select({ id: devices.id, siteId: devices.siteId })
+        .from(devices)
+        .where(and(...deviceConditions))
+        .limit(1);
+      if (!targetDevice) return JSON.stringify({ error: 'Target device not found or access denied' });
+      // Site axis (app-layer only; RLS does NOT enforce it).
+      if (deviceSiteDenied(auth, targetDevice.siteId, targetDevice.id)) return JSON.stringify({ error: 'Target device not found or access denied' });
+
+      const vmSpecs =
+        input.vmSpecs && typeof input.vmSpecs === 'object'
+          ? input.vmSpecs as Record<string, unknown>
+          : {};
+
+      const [restoreJob] = await db
+        .insert(restoreJobs)
+        .values({
+          orgId: snapshot.orgId,
+          snapshotId: snapshot.id,
+          deviceId: targetDeviceId,
+          restoreType: 'full',
+          status: 'pending',
+          targetConfig: {
+            hypervisor,
+            vmName,
+            switchName: switchName ?? null,
+            vmSpecs,
+          },
+          initiatedBy: auth.user?.id ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning({ id: restoreJobs.id, status: restoreJobs.status, createdAt: restoreJobs.createdAt });
+
+      const { command, error } = await aiQueueCommandForExecution(
+        auth,
+        'restore_as_vm',
+        targetDeviceId,
+        CommandTypes.VM_RESTORE_FROM_BACKUP,
+        {
+          restoreJobId: restoreJob?.id,
+          snapshotId: snapshot.providerSnapshotId,
+          vmName,
+          memoryMb: vmSpecs.memoryMb,
+          cpuCount: vmSpecs.cpuCount,
+          diskSizeGb: vmSpecs.diskSizeGb,
+          switchName,
+        },
+        { userId: auth.user?.id }
+      );
+
+      if (error) {
+        await markRestoreJobFailed(restoreJob!.id, error);
+        return JSON.stringify({ error });
+      }
+
+      if (!command?.id) {
+        const commandError = 'Restore command was queued without a command ID';
+        await markRestoreJobFailed(restoreJob!.id, commandError);
+        return JSON.stringify({ error: commandError });
+      }
+
+      await db
+        .update(restoreJobs)
+        .set({
+          commandId: command.id,
+          updatedAt: new Date(),
+        })
+        .where(eq(restoreJobs.id, restoreJob!.id));
+
+      return JSON.stringify({
+        success: true,
+        restoreJobId: restoreJob?.id,
+        commandId: command?.id,
+        status: restoreJob?.status,
+        targetDeviceId,
+        hypervisor,
+        vmName,
+      });
+    }),
+  });
+
+  // ============================================
+  // instant_boot_vm — Instant boot a snapshot
+  // ============================================
+
+  registerTool({
+    tier: 3,
+    domain: 'backup',
+    searchHint: 'backup snapshot instant boot as a virtual machine on a target device',
+    deviceArgs: ['targetDeviceId'],
+    definition: {
+      name: 'instant_boot_vm',
+      description: 'Instant boot a backup snapshot as a VM on a target device.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          snapshotId: { type: 'string', description: 'Snapshot UUID (required)' },
+          targetDeviceId: { type: 'string', description: 'Target device UUID (required)' },
+          vmName: { type: 'string', description: 'Name of the instant boot VM (required)' },
+          vmSpecs: {
+            type: 'object',
+            properties: {
+              memoryMb: { type: 'number' },
+              cpuCount: { type: 'number' },
+              diskSizeGb: { type: 'number' },
+            },
+            description: 'Optional VM resource overrides',
+          },
+        },
+        required: ['snapshotId', 'targetDeviceId', 'vmName'],
+      },
+    },
+    handler: safeHandler('instant_boot_vm', async (input, auth) => {
+      const snapshotId = input.snapshotId as string;
+      const targetDeviceId = input.targetDeviceId as string;
+      const vmName = input.vmName as string;
+      if (!snapshotId || !targetDeviceId || !vmName) {
+        return JSON.stringify({ error: 'snapshotId, targetDeviceId, and vmName are required' });
+      }
+
+      // Load the snapshot under org AND site scope (source device site gated),
+      // so a site-restricted caller cannot instant-boot a cross-site snapshot
+      // onto a target they legitimately own.
+      const snapshotResult = await loadSnapshotWithSiteAccess(auth, snapshotId);
+      if ('error' in snapshotResult) return JSON.stringify({ error: snapshotResult.error });
+      const snapshot = snapshotResult.snapshot;
+
+      const deviceConditions: SQL[] = [eq(devices.id, targetDeviceId)];
+      const dc = orgWhere(auth, devices.orgId);
+      if (dc) deviceConditions.push(dc);
+      const [targetDevice] = await db
+        .select({ id: devices.id, siteId: devices.siteId })
+        .from(devices)
+        .where(and(...deviceConditions))
+        .limit(1);
+      if (!targetDevice) return JSON.stringify({ error: 'Target device not found or access denied' });
+      // Site axis (app-layer only; RLS does NOT enforce it).
+      if (deviceSiteDenied(auth, targetDevice.siteId, targetDevice.id)) return JSON.stringify({ error: 'Target device not found or access denied' });
+
+      const vmSpecs =
+        input.vmSpecs && typeof input.vmSpecs === 'object'
+          ? input.vmSpecs as Record<string, unknown>
+          : {};
+
+      const [restoreJob] = await db
+        .insert(restoreJobs)
+        .values({
+          orgId: snapshot.orgId,
+          snapshotId: snapshot.id,
+          deviceId: targetDeviceId,
+          restoreType: 'full',
+          status: 'pending',
+          targetConfig: {
+            mode: 'instant_boot',
+            vmName,
+            vmSpecs,
+          },
+          initiatedBy: auth.user?.id ?? null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning({ id: restoreJobs.id, status: restoreJobs.status, createdAt: restoreJobs.createdAt });
+
+      const { command, error } = await aiQueueCommandForExecution(
+        auth,
+        'instant_boot_vm',
+        targetDeviceId,
+        CommandTypes.VM_INSTANT_BOOT,
+        {
+          restoreJobId: restoreJob?.id,
+          snapshotId: snapshot.providerSnapshotId,
+          vmName,
+          memoryMb: vmSpecs.memoryMb,
+          cpuCount: vmSpecs.cpuCount,
+          diskSizeGb: vmSpecs.diskSizeGb,
+        },
+        { userId: auth.user?.id }
+      );
+
+      if (error) {
+        await markRestoreJobFailed(restoreJob!.id, error);
+        return JSON.stringify({ error });
+      }
+
+      if (!command?.id) {
+        const commandError = 'Instant boot command was queued without a command ID';
+        await markRestoreJobFailed(restoreJob!.id, commandError);
+        return JSON.stringify({ error: commandError });
+      }
+
+      await db
+        .update(restoreJobs)
+        .set({
+          commandId: command.id,
+          updatedAt: new Date(),
+        })
+        .where(eq(restoreJobs.id, restoreJob!.id));
+
+      return JSON.stringify({
+        success: true,
+        restoreJobId: restoreJob?.id,
+        commandId: command?.id,
+        status: restoreJob?.status,
+        targetDeviceId,
+        vmName,
+      });
+    }),
+  });
+
+  // ============================================
+  // get_vm_restore_estimate — Estimate VM resources
+  // ============================================
+
+  registerTool({
+    tier: 1,
+    domain: 'backup',
+    searchHint: 'virtual machine restore resource estimate for a backup snapshot',
+    definition: {
+      name: 'get_vm_restore_estimate',
+      description: 'Get a resource estimate for restoring a snapshot as a virtual machine.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          snapshotId: { type: 'string', description: 'Snapshot UUID (required)' },
+        },
+        required: ['snapshotId'],
+      },
+    },
+    handler: safeHandler('get_vm_restore_estimate', async (input, auth) => {
+      const snapshotId = input.snapshotId as string;
+      if (!snapshotId) return JSON.stringify({ error: 'snapshotId is required' });
+
+      const snapshotConditions: SQL[] = [eq(backupSnapshots.id, snapshotId)];
+      const sc = orgWhere(auth, backupSnapshots.orgId);
+      if (sc) snapshotConditions.push(sc);
+      const [snapshot] = await db
+        .select({
+          id: backupSnapshots.id,
+          size: backupSnapshots.size,
+          metadata: backupSnapshots.metadata,
+          hardwareProfile: backupSnapshots.hardwareProfile,
+          deviceId: backupSnapshots.deviceId,
+        })
+        .from(backupSnapshots)
+        .where(and(...snapshotConditions))
+        .limit(1);
+      if (!snapshot) return JSON.stringify({ error: 'Snapshot not found or access denied' });
+      // Site axis (app-layer only; RLS does NOT enforce it). The snapshot is
+      // device-keyed and this returns CPU/memory/disk/OS metadata — gate on the
+      // source device's site, matching the sibling verify_mssql_backup pattern.
+      if (await deviceIdSiteDenied(auth, snapshot.deviceId)) {
+        return JSON.stringify({ error: 'Snapshot not found or access denied' });
+      }
+
+      const hardwareProfile = snapshot.hardwareProfile as {
+        cpuCores?: number;
+        totalMemoryMB?: number;
+        disks?: Array<{ sizeBytes?: number }>;
+      } | null;
+      const metadata = snapshot.metadata as { platform?: string; osVersion?: string } | null;
+      const snapshotSizeGb = Math.ceil(Number(snapshot.size ?? 0) / (1024 * 1024 * 1024));
+
+      const estimate = {
+        recommendedMemoryMb: hardwareProfile?.totalMemoryMB ?? Math.max(2048, snapshotSizeGb * 2),
+        recommendedCpu: hardwareProfile?.cpuCores ?? 2,
+        requiredDiskGb: Math.max(
+          snapshotSizeGb * 2,
+          hardwareProfile?.disks?.reduce(
+            (sum, disk) => sum + Math.ceil(Number(disk.sizeBytes ?? 0) / (1024 * 1024 * 1024)),
+            0
+          ) ?? 40
+        ),
+        platform: metadata?.platform ?? 'unknown',
+        osVersion: metadata?.osVersion ?? 'unknown',
+      };
+
+      return JSON.stringify(estimate);
+    }),
+  });
+}

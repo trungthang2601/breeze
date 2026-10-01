@@ -1,0 +1,13 @@
+---
+import DashboardLayout from '../../layouts/DashboardLayout.astro';
+import DeviceGroupsPage from '../../components/devices/DeviceGroupsPage';
+import Breadcrumbs from '../../components/layout/Breadcrumbs';
+---
+
+<DashboardLayout titleKey="titles.devicesGroups">
+  <Breadcrumbs client:load items={[
+    { label: 'Devices', href: '/devices' },
+    { label: 'Groups' }
+  ]} />
+  <DeviceGroupsPage client:load />
+</DashboardLayout>

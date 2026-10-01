@@ -1,0 +1,266 @@
+package unifi
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+)
+
+func TestRunOnceUploadsTelemetry(t *testing.T) {
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/proxy/network/integration/v1/sites":
+			_, _ = w.Write([]byte(`{"data":[{"id":"s1"}]}`))
+		case "/proxy/network/integration/v1/sites/s1/devices":
+			_, _ = w.Write([]byte(`{"data":[{"id":"d1","macAddress":"aa:bb:cc:dd:ee:01","name":"sw1"}]}`))
+		case "/proxy/network/integration/v1/sites/s1/clients":
+			_, _ = w.Write([]byte(`{"data":[{"id":"c1","macAddress":"aa:bb:cc:dd:ee:02","type":"WIRED"}]}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer controller.Close()
+
+	var mu sync.Mutex
+	var got map[string]any
+	var gotPath string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Agent telemetry endpoints are mounted under /api/v1/agents/<agentId>/ —
+		// the /api/v1 prefix is mandatory (matches heartbeat & every other agent
+		// call); dropping it 404s and pins the collector at status=pending.
+		if r.URL.Path == "/api/v1/agents/agent-1/unifi-telemetry" {
+			mu.Lock()
+			defer mu.Unlock()
+			gotPath = r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			w.WriteHeader(202)
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer api.Close()
+
+	cfg := CollectorConfig{CollectorID: "c1", ControllerURL: controller.URL, APIKey: "k"}
+	err := RunOnce(context.Background(), CollectorDeps{APIBaseURL: func() string { return api.URL }, AgentID: "agent-1", HTTP: api.Client()}, cfg, controller.Client())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotPath != "/api/v1/agents/agent-1/unifi-telemetry" {
+		t.Fatalf("telemetry posted to unexpected path: %q", gotPath)
+	}
+	if got["collectorId"] != "c1" || got["firmwareOk"] != true {
+		t.Fatalf("unexpected payload: %+v", got)
+	}
+	// The uploaded device must carry the camelCase unifiDeviceId the API requires;
+	// posting the controller's snake_case shape would 400 (regression guard, C2).
+	devs, ok := got["devices"].([]any)
+	if !ok || len(devs) != 1 {
+		t.Fatalf("expected 1 device in payload, got %+v", got["devices"])
+	}
+	d0, _ := devs[0].(map[string]any)
+	if d0["unifiDeviceId"] != "d1" {
+		t.Fatalf("device missing camelCase unifiDeviceId: %+v", devs[0])
+	}
+	// The controller's macAddress must survive the decode → upload hop (#5087).
+	if d0["mac"] != "aa:bb:cc:dd:ee:01" {
+		t.Fatalf("device mac did not reach the upload payload: %+v", devs[0])
+	}
+}
+
+// Metrics the collector cannot read from the device LIST endpoint must be ABSENT
+// from the upload body, not sent as literal 0. The API column and the web UI both
+// treat null as "not collected" (`d.numClients ?? "—"`), so a zero here renders as
+// a real measurement — the same "silent zero looks like data" failure #5087 was
+// about, one hop downstream.
+func TestUploadOmitsUncollectedDeviceMetrics(t *testing.T) {
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/proxy/network/integration/v1/sites":
+			_, _ = w.Write([]byte(`{"data":[{"id":"s1"}]}`))
+		case "/proxy/network/integration/v1/sites/s1/devices":
+			_, _ = w.Write([]byte(`{"data":[{"id":"d1","macAddress":"aa:bb:cc:dd:ee:01","name":"sw1"}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}
+	}))
+	defer controller.Close()
+
+	var mu sync.Mutex
+	var got map[string]any
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(202)
+	}))
+	defer api.Close()
+
+	cfg := CollectorConfig{CollectorID: "c1", ControllerURL: controller.URL, APIKey: "k"}
+	if err := RunOnce(context.Background(), CollectorDeps{APIBaseURL: func() string { return api.URL }, AgentID: "agent-1", HTTP: api.Client()}, cfg, controller.Client()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	devs, _ := got["devices"].([]any)
+	if len(devs) != 1 {
+		t.Fatalf("expected 1 device, got %+v", got["devices"])
+	}
+	d0, _ := devs[0].(map[string]any)
+	for _, key := range []string{"uptimeSeconds", "cpuPct", "memPct", "txBytes", "rxBytes", "numClients"} {
+		if v, present := d0[key]; present {
+			t.Errorf("%s must be omitted while uncollected, got %v — a zero here is indistinguishable from a real measurement", key, v)
+		}
+	}
+	// Fields that ARE collected must still be present.
+	if d0["mac"] != "aa:bb:cc:dd:ee:01" || d0["unifiDeviceId"] != "d1" {
+		t.Errorf("omitempty must not drop collected fields: %+v", d0)
+	}
+}
+
+func TestRunOnceUploadsSites(t *testing.T) {
+	controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/proxy/network/integration/v1/sites":
+			_, _ = w.Write([]byte(`{"data":[{"id":"s1","name":"HQ"},{"id":"s2","name":"Branch"}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}
+	}))
+	defer controller.Close()
+
+	var mu sync.Mutex
+	var got map[string]any
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/agents/agent-1/unifi-telemetry" {
+			mu.Lock()
+			defer mu.Unlock()
+			_ = json.NewDecoder(r.Body).Decode(&got)
+			w.WriteHeader(202)
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer api.Close()
+
+	cfg := CollectorConfig{CollectorID: "c1", ControllerURL: controller.URL, APIKey: "k"}
+	err := RunOnce(context.Background(), CollectorDeps{APIBaseURL: func() string { return api.URL }, AgentID: "agent-1", HTTP: api.Client()}, cfg, controller.Client())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	sitesRaw, ok := got["sites"].([]any)
+	if !ok || len(sitesRaw) != 2 {
+		t.Fatalf("expected 2 sites in payload, got %+v", got["sites"])
+	}
+	s0, _ := sitesRaw[0].(map[string]any)
+	if s0["id"] != "s1" || s0["name"] != "HQ" {
+		t.Fatalf("unexpected first site: %+v", sitesRaw[0])
+	}
+}
+
+// fetchConfigs must GET the agent-scoped path /api/v1/agents/<id>/unifi-collectors.
+// Dropping the /api/v1 prefix (as the loop did before the fix) 404s and never
+// returns configs, so the collector stays status=pending forever — C3.
+func TestFetchConfigsHitsAgentScopedPath(t *testing.T) {
+	var gotPath string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if r.URL.Path == "/api/v1/agents/agent-1/unifi-collectors" {
+			_, _ = w.Write([]byte(`{"collectors":[{"collectorId":"c1","controllerUrl":"https://10.0.0.1","apiKey":"k","pollIntervalSeconds":60}]}`))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer api.Close()
+
+	configs, err := fetchConfigs(context.Background(), CollectorDeps{APIBaseURL: func() string { return api.URL }, AgentID: "agent-1", HTTP: api.Client()})
+	if err != nil {
+		t.Fatalf("fetchConfigs: %v", err)
+	}
+	if gotPath != "/api/v1/agents/agent-1/unifi-collectors" {
+		t.Fatalf("fetchConfigs hit unexpected path: %q", gotPath)
+	}
+	if len(configs) != 1 || configs[0].CollectorID != "c1" {
+		t.Fatalf("unexpected configs: %+v", configs)
+	}
+}
+
+// TestFetchConfigsFollowsAPIBaseURLProviderAcrossFailover pins #2423:
+// CollectorDeps.APIBaseURL is a URL provider (heartbeat.ServerURL in
+// production), so after backup-server-URL promotion (#2323) the SAME deps
+// value must send subsequent requests to the promoted URL. A copied
+// cfg.ServerURL string kept POSTing to the dead primary for the process
+// lifetime.
+func TestFetchConfigsFollowsAPIBaseURLProviderAcrossFailover(t *testing.T) {
+	var primaryHits, backupHits atomic.Int32
+	newServer := func(hits *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/v1/agents/agent-1/unifi-collectors" {
+				w.WriteHeader(404)
+				return
+			}
+			hits.Add(1)
+			_, _ = w.Write([]byte(`{"collectors":[]}`))
+		}))
+	}
+	primary := newServer(&primaryHits)
+	defer primary.Close()
+	backup := newServer(&backupHits)
+	defer backup.Close()
+
+	var serverURL atomic.Value
+	serverURL.Store(primary.URL)
+	deps := CollectorDeps{
+		APIBaseURL: func() string { return serverURL.Load().(string) },
+		AgentID:    "agent-1",
+		HTTP:       &http.Client{},
+	}
+
+	if _, err := fetchConfigs(context.Background(), deps); err != nil {
+		t.Fatalf("fetchConfigs via primary: %v", err)
+	}
+	// Simulate backup-server-URL promotion: the provider now returns the
+	// promoted URL and the same long-lived deps must follow it.
+	serverURL.Store(backup.URL)
+	if _, err := fetchConfigs(context.Background(), deps); err != nil {
+		t.Fatalf("fetchConfigs via promoted backup: %v", err)
+	}
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary received %d requests, want 1", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("promoted backup received %d requests, want 1 — deps still pinned to the old primary (#2423)", got)
+	}
+}
+
+// TestAgentBaseRejectsUnsetOrEmptyProvider pins the wiring-bug contract: an
+// unset APIBaseURL provider must surface as a named error, never a nil-func
+// panic that takes the agent process down from inside the collector goroutine.
+func TestAgentBaseRejectsUnsetOrEmptyProvider(t *testing.T) {
+	tests := []struct {
+		name string
+		deps CollectorDeps
+	}{
+		{name: "nil provider", deps: CollectorDeps{AgentID: "agent-1"}},
+		{name: "provider returns empty", deps: CollectorDeps{AgentID: "agent-1", APIBaseURL: func() string { return "" }}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := tt.deps.agentBase(); err == nil {
+				t.Fatal("agentBase() error = nil, want a named wiring error")
+			}
+			// fetchConfigs must propagate it rather than panicking.
+			if _, err := fetchConfigs(context.Background(), tt.deps); err == nil {
+				t.Fatal("fetchConfigs() error = nil, want the wiring error propagated")
+			}
+		})
+	}
+}

@@ -1,0 +1,229 @@
+package executor
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/securefs"
+)
+
+// MaxScriptSize is the maximum allowed script content size
+const MaxScriptSize = 1024 * 1024 // 1MB
+
+// ScriptType constants
+const (
+	ScriptTypePowerShell = "powershell"
+	ScriptTypeBash       = "bash"
+	ScriptTypePython     = "python"
+	ScriptTypeCMD        = "cmd"
+)
+
+// GetShellCommand returns the shell executable and arguments for a given script type
+func GetShellCommand(scriptType string) (string, []string) {
+	switch strings.ToLower(scriptType) {
+	case ScriptTypePowerShell:
+		if runtime.GOOS == "windows" {
+			return "powershell.exe", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File"}
+		}
+		// For Linux/macOS, try pwsh (PowerShell Core)
+		return "pwsh", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File"}
+
+	case ScriptTypeBash:
+		if runtime.GOOS == "windows" {
+			// Try Git Bash or WSL bash
+			return "bash.exe", []string{}
+		}
+		return "/bin/bash", []string{}
+
+	case ScriptTypePython:
+		if runtime.GOOS == "windows" {
+			return "python", []string{}
+		}
+		// Try python3 first on Unix systems
+		return "python3", []string{}
+
+	case ScriptTypeCMD:
+		if runtime.GOOS == "windows" {
+			return "cmd.exe", []string{"/C"}
+		}
+		// CMD is Windows-only, return empty for other platforms
+		return "", nil
+
+	default:
+		// Default to bash on Unix, cmd on Windows
+		if runtime.GOOS == "windows" {
+			return "cmd.exe", []string{"/C"}
+		}
+		return "/bin/bash", []string{}
+	}
+}
+
+// GetScriptExtension returns the appropriate file extension for a script type
+func GetScriptExtension(scriptType string) string {
+	switch strings.ToLower(scriptType) {
+	case ScriptTypePowerShell:
+		return ".ps1"
+	case ScriptTypeBash:
+		return ".sh"
+	case ScriptTypePython:
+		return ".py"
+	case ScriptTypeCMD:
+		return ".bat"
+	default:
+		if runtime.GOOS == "windows" {
+			return ".bat"
+		}
+		return ".sh"
+	}
+}
+
+// normalizeLineEndings converts CRLF (and stray CR) to LF for script types
+// interpreted by unix tooling. Scripts authored or pasted in a browser on
+// Windows arrive with \r\n; bash then sees tokens like `then\r` / `elif\r`
+// and fails with "syntax error near unexpected token" (#1184) — or, for
+// simple command lines, silently passes a trailing \r into arguments.
+// PowerShell and cmd handle (and in .bat's case, sometimes require) CRLF,
+// so Windows-native script types are left untouched.
+func normalizeLineEndings(content, scriptType string) string {
+	switch strings.ToLower(scriptType) {
+	case ScriptTypeBash, ScriptTypePython:
+		content = strings.ReplaceAll(content, "\r\n", "\n")
+		return strings.ReplaceAll(content, "\r", "\n")
+	default:
+		return content
+	}
+}
+
+// utf8BOM is prepended to PowerShell scripts on write. Windows PowerShell 5.1
+// decodes a BOM-less .ps1 as the system ANSI codepage, so non-ASCII UTF-8
+// content turns into mojibake: accented letters merely garble output, but
+// mis-decoded curly quotes lose their delimiter role and the parser reports
+// cascading "Unexpected token" / "missing terminator" errors. The BOM forces
+// UTF-8 decoding; pwsh on all platforms handles it too. Only .ps1 gets one:
+// a BOM keeps bash from recognizing the shebang and its bytes run as a
+// garbage first command, cmd likewise feeds it to the first command, and
+// python skips a BOM anyway so there is no reason to add it.
+const utf8BOM = "\xEF\xBB\xBF"
+
+// WriteScriptFile writes script content to a temporary file with the appropriate extension
+func WriteScriptFile(content, scriptType string) (string, error) {
+	content = normalizeLineEndings(content, scriptType)
+	if strings.ToLower(scriptType) == ScriptTypePowerShell && !strings.HasPrefix(content, utf8BOM) {
+		content = utf8BOM + content
+	}
+	// Each execution owns a fresh private directory (see createPrivateScriptDir
+	// — 0700 from the OS on unix, an explicit protected DACL on Windows).
+	securefs.LogLegacyStagingTrees(log.Warn)
+	scriptDir, err := createPrivateScriptDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to create private script directory: %w", err)
+	}
+	cleanupDir := true
+	defer func() {
+		if cleanupDir {
+			_ = os.Remove(scriptDir)
+		}
+	}()
+
+	// Generate a unique filename
+	ext := GetScriptExtension(scriptType)
+	filename := fmt.Sprintf("breeze_%s%s", generateUniqueID(), ext)
+	scriptPath := filepath.Join(scriptDir, filename)
+
+	// Determine file permissions based on OS
+	var perm os.FileMode = 0600
+	if runtime.GOOS != "windows" {
+		perm = 0700 // Executable on Unix
+	}
+
+	// Write the script content
+	file, err := os.OpenFile(scriptPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return "", fmt.Errorf("failed to write script file: %w", err)
+	}
+	if _, err := file.WriteString(content); err != nil {
+		_ = file.Close()
+		_ = os.Remove(scriptPath)
+		return "", fmt.Errorf("failed to write script file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(scriptPath)
+		return "", fmt.Errorf("failed to close script file: %w", err)
+	}
+
+	cleanupDir = false
+	return scriptPath, nil
+}
+
+// CleanupScript removes a script file from disk
+func CleanupScript(path string) {
+	if path == "" {
+		return
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+	scriptDir := filepath.Dir(absPath)
+	rel, err := filepath.Rel(os.TempDir(), scriptDir)
+	if err != nil || rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) ||
+		filepath.Dir(rel) != "." || !strings.HasPrefix(filepath.Base(rel), "breeze-scripts-") {
+		return
+	}
+
+	if err := os.Remove(absPath); err != nil {
+		log.Warn("failed to cleanup script file", "path", path, "error", err)
+		return
+	}
+	if err := os.Remove(scriptDir); err != nil {
+		log.Warn("failed to cleanup script directory", "path", scriptDir, "error", err)
+	}
+}
+
+// generateUniqueID creates a unique identifier for script files
+func generateUniqueID() string {
+	b := make([]byte, 8)
+	_, err := rand.Read(b)
+	if err != nil {
+		// Fallback to timestamp-based ID if crypto/rand fails
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// IsSupportedScriptType checks if a script type is supported
+func IsSupportedScriptType(scriptType string) bool {
+	switch strings.ToLower(scriptType) {
+	case ScriptTypePowerShell, ScriptTypeBash, ScriptTypePython, ScriptTypeCMD:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsScriptTypeAvailableOnPlatform checks if a script type can run on the current platform
+func IsScriptTypeAvailableOnPlatform(scriptType string) bool {
+	switch strings.ToLower(scriptType) {
+	case ScriptTypePowerShell:
+		// PowerShell is available on all platforms (pwsh on Linux/macOS)
+		return true
+	case ScriptTypeBash:
+		// Bash might be available on Windows via Git Bash or WSL
+		return true
+	case ScriptTypePython:
+		// Python can be installed on any platform
+		return true
+	case ScriptTypeCMD:
+		// CMD is Windows-only
+		return runtime.GOOS == "windows"
+	default:
+		return false
+	}
+}

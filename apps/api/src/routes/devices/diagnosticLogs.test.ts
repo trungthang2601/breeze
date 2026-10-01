@@ -1,0 +1,142 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+
+const { requirePermissionMock } = vi.hoisted(() => ({
+  requirePermissionMock: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
+    c.set('permissions', {
+      permissions: [{ resource, action }],
+      allowedSiteIds: c.req.header('x-site-restricted') === 'true' ? ['site-allowed'] : undefined,
+    });
+    return next();
+  }),
+}));
+
+vi.mock('../../db', () => ({
+  db: {
+    select: vi.fn(),
+  },
+}));
+
+vi.mock('../../db/schema', () => ({
+  devices: {
+    id: 'devices.id',
+    orgId: 'devices.orgId',
+    siteId: 'devices.siteId',
+  },
+  agentLogs: {
+    id: 'agentLogs.id',
+    deviceId: 'agentLogs.deviceId',
+    timestamp: 'agentLogs.timestamp',
+    createdAt: 'agentLogs.createdAt',
+    level: 'agentLogs.level',
+    component: 'agentLogs.component',
+    message: 'agentLogs.message',
+    fields: 'agentLogs.fields',
+  },
+}));
+
+vi.mock('../../middleware/auth', () => ({
+  authMiddleware: vi.fn((c: any, next: any) => {
+    c.set('auth', {
+      user: { id: 'user-1' },
+      scope: 'organization',
+      orgId: 'org-1',
+      accessibleOrgIds: ['org-1'],
+      canAccessOrg: (orgId: string) => orgId === 'org-1',
+    });
+    return next();
+  }),
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  requirePermission: requirePermissionMock,
+}));
+
+import { db } from '../../db';
+import { diagnosticLogsRoutes } from './diagnosticLogs';
+
+const registeredPermissionCalls = [...requirePermissionMock.mock.calls];
+
+describe('diagnostic log routes', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = new Hono();
+    app.route('/devices', diagnosticLogsRoutes);
+  });
+
+  it('requires explicit device read permission', () => {
+    expect(registeredPermissionCalls).toContainEqual(['devices', 'read']);
+  });
+
+  it('redacts legacy raw secrets before returning diagnostic logs', async () => {
+    const orderBy = vi.fn().mockReturnValue({
+      limit: vi.fn().mockReturnValue({
+        offset: vi.fn().mockResolvedValue([{
+          id: 'log-1',
+          deviceId: '11111111-2222-4333-8444-555555555555',
+          message: 'failed with token=raw-token',
+          fields: { apiKey: 'raw-key', nested: { password: 'raw-password' } },
+          timestamp: new Date('2099-05-01T00:00:00.000Z'),
+          createdAt: new Date('2026-05-01T00:00:00.000Z'),
+        }]),
+      }),
+    });
+    vi.mocked(db.select)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: '11111111-2222-4333-8444-555555555555', orgId: 'org-1', siteId: 'site-allowed' }]),
+          }),
+        }),
+      } as any)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy,
+          }),
+        }),
+      } as any)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([{ total: 1 }]),
+        }),
+      } as any);
+
+    const res = await app.request('/devices/11111111-2222-4333-8444-555555555555/diagnostic-logs', {
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.logs[0].message).toBe('failed with token=[REDACTED]');
+    expect(body.logs[0].fields).toEqual({
+      apiKey: '[REDACTED]',
+      nested: { password: '[REDACTED]' },
+    });
+    // Receipt time dominates; event time only breaks ties inside one receipt
+    // instant (a 100-row ingest batch shares created_at), and the random uuid
+    // is last. Assert the sequence, not just membership.
+    const orderingDump = JSON.stringify(orderBy.mock.calls);
+    expect(orderingDump).toContain('agentLogs.createdAt');
+    expect(orderingDump.indexOf('agentLogs.timestamp'))
+      .toBeGreaterThan(orderingDump.indexOf('agentLogs.createdAt'));
+    expect(orderingDump.indexOf('agentLogs.id'))
+      .toBeGreaterThan(orderingDump.indexOf('agentLogs.timestamp'));
+  });
+
+  it('denies diagnostic logs when site scope excludes the device', async () => {
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{ id: '11111111-2222-4333-8444-555555555555', orgId: 'org-1', siteId: 'site-denied' }]),
+        }),
+      }),
+    } as any);
+
+    const res = await app.request('/devices/11111111-2222-4333-8444-555555555555/diagnostic-logs', {
+      headers: { Authorization: 'Bearer token', 'x-site-restricted': 'true' },
+    });
+
+    expect(res.status).toBe(403);
+  });
+});

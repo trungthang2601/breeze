@@ -1,0 +1,101 @@
+import { describe, expect, it } from 'vitest';
+import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const localesDir = join(dirname(fileURLToPath(import.meta.url)), '../../locales');
+const translatedLocales = ['pt-BR', 'es-419', 'fr-FR', 'fr-CA', 'de-DE', 'it-IT', 'tr-TR'] as const;
+
+function catalog(locale: string, namespace: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(join(localesDir, locale, `${namespace}.json`), 'utf8'));
+}
+
+function valueAt(source: Record<string, unknown>, path: string): string {
+  const value = path.split('.').reduce<unknown>((current, segment) =>
+    typeof current === 'object' && current !== null
+      ? (current as Record<string, unknown>)[segment]
+      : undefined, source);
+  expect(typeof value, path).toBe('string');
+  return value as string;
+}
+
+describe('product terminology quality', () => {
+  it('translates network switches as devices rather than actions or electrical switches', () => {
+    const expected = {
+      'pt-BR': 'Switch',
+      'es-419': 'Conmutador',
+      'fr-FR': 'Commutateur',
+      'fr-CA': 'Commutateur',
+      'de-DE': 'Netzwerk-Switch',
+      'it-IT': 'Switch',
+      'tr-TR': 'Ağ anahtarı',
+    } as const;
+
+    for (const locale of translatedLocales) {
+      expect(valueAt(catalog(locale, 'devices'), 'deviceList.roles.switch')).toBe(expected[locale]);
+      expect(valueAt(catalog(locale, 'discovery'), 'assetTypes.switch')).toBe(expected[locale]);
+    }
+  });
+
+  it('keeps reviewed false friends and malformed machine translations out of catalogs', () => {
+    const forbidden = {
+      'pt-BR': [/\bvoce\b(?!@)/i, /\besta ativa\b/i, /\bcomecar\b/i, /teste de fumaça/i],
+      'es-419': [/conocimientos impulsados/i, /AI-ayuda impulsada/i],
+      'fr-FR': [/\bpostuler\b/i, /\bsubventions?\b/i, /test de fumée/i, /oscilloire/i],
+      'fr-CA': [/\bpostuler\b/i, /\bsubventions?\b/i, /test de fumée/i, /oscilloire/i],
+      'de-DE': [/\bHauptschalter\b/i, /\bKernschalter\b/i],
+      'it-IT': [/\bpotrài\b/i],
+      'tr-TR': [],
+    } as const;
+
+    for (const locale of translatedLocales) {
+      const localeDir = join(localesDir, locale);
+      const text = readdirSync(localeDir)
+        .filter(file => file.endsWith('.json'))
+        .map(file => readFileSync(join(localeDir, file), 'utf8'))
+        .join('\n');
+      for (const pattern of forbidden[locale]) {
+        expect(text, `${locale}: ${pattern}`).not.toMatch(pattern);
+      }
+    }
+  });
+
+  it('uses agreement vocabulary consistently in the signed-agreement download panel (#5834 miss)', () => {
+    // PR #5834 renamed quotes.document.contract.download / previewTitle from
+    // "contract" to "agreement" vocabulary in every catalog but left the
+    // sibling unavailable string on the old "contract" wording; the portal
+    // twin (apps/portal quoteBlocks.tsx) already says "Agreement file
+    // unavailable". Each locale's value must use the same "agreement" term
+    // the PR itself chose for that locale's download/previewTitle strings.
+    const expected = {
+      en: 'Agreement file unavailable',
+      'de-DE': 'Vereinbarungsdatei nicht verfügbar',
+      'es-419': 'Archivo del acuerdo no disponible',
+      'fr-CA': "Fichier de l'entente indisponible",
+      'fr-FR': 'Fichier de la convention indisponible',
+      'it-IT': 'File accordo non disponibile',
+      'pt-BR': 'Arquivo do acordo indisponível',
+      'tr-TR': 'Anlaşma dosyası mevcut değil',
+    } as const;
+
+    for (const locale of Object.keys(expected) as (keyof typeof expected)[]) {
+      expect(valueAt(catalog(locale, 'billing'), 'quotes.document.contract.unavailable')).toBe(
+        expected[locale]
+      );
+    }
+  });
+
+  it('keeps alert-verdict badge feedback copy in the formal register the rest of alerts.json uses (#4449)', () => {
+    // de-DE and es-419 alerts.json otherwise address the user formally
+    // (Sie / su); the machine-translated feedbackThanks string was the lone
+    // informal (du / tu) outlier in each file.
+    const expected = {
+      'de-DE': 'Danke für Ihr Feedback',
+      'es-419': 'Gracias por su comentario',
+    } as const;
+
+    for (const locale of Object.keys(expected) as (keyof typeof expected)[]) {
+      expect(valueAt(catalog(locale, 'alerts'), 'alertVerdict.feedbackThanks')).toBe(expected[locale]);
+    }
+  });
+});

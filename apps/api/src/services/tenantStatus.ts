@@ -1,0 +1,329 @@
+import { and, eq, isNull, sql, type SQL } from 'drizzle-orm';
+import type { PgColumn } from 'drizzle-orm/pg-core';
+import { db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { organizations, partners } from '../db/schema';
+import { getRedis } from './redis';
+
+export class TenantInactiveError extends Error {
+  constructor(message = 'Tenant is not active') {
+    super(message);
+    this.name = 'TenantInactiveError';
+  }
+}
+
+export function isUsableOrgStatus(status: string | null | undefined): boolean {
+  return status === 'active' || status === 'trial';
+}
+
+/**
+ * Org statuses whose rows fleet-wide background automation may still act on.
+ *
+ * This is the exact complement of the three LIFECYCLE-FROZEN statuses —
+ * `archived` and `purging` (hidden, read-only, purge timer running) and
+ * `merging` (fenced mid-merge). It deliberately does NOT re-litigate the legacy
+ * statuses: a `suspended` or `churned` org's invoices went overdue and its
+ * contracts renewed before Wave 4 and still do. The only new behaviour is that
+ * a tenant the operator archived stops accruing new commerce it will never see.
+ *
+ * An inclusion list, not `NOT IN (...)`, so a status added later is excluded
+ * from automation until someone deliberately admits it.
+ */
+export const AUTOMATION_ELIGIBLE_ORG_STATUSES = [
+  'active',
+  'trial',
+  'suspended',
+  'churned',
+  'offboarding',
+] as const;
+
+/**
+ * `EXISTS`-shaped org-status predicate for fleet-wide sweeps that select
+ * org-scoped rows under a system context (invoice overdue sweep, contract
+ * billing/renewal sweeps). Exported as a builder so each call site is
+ * compiled-SQL assertable — a sweep test that seeds rows straight past the
+ * WHERE clause cannot tell a present predicate from an absent one.
+ */
+export function buildAutomationEligibleOrgPredicate(orgIdColumn: PgColumn): SQL {
+  const statuses = sql.join(
+    AUTOMATION_ELIGIBLE_ORG_STATUSES.map((status) => sql`${status}`),
+    sql`, `,
+  );
+  return sql`EXISTS (
+    SELECT 1 FROM ${organizations} AS automation_eligible_org
+     WHERE automation_eligible_org.id = ${orgIdColumn}
+       AND automation_eligible_org.status::text IN (${statuses})
+  )`;
+}
+
+/**
+ * Run a tenant-status read under a genuine system-scoped DB context, whatever
+ * the caller's ambient context is.
+ *
+ * Whether a tenant is active is an INFRASTRUCTURE question, not a tenant-data
+ * one — it must not be filtered by the caller's RLS visibility. But
+ * `withSystemDbAccessContext` early-returns (no-ops) when a context is already
+ * active; it does NOT widen a narrower ambient context. So when a request has
+ * already established an org/partner-scoped context whose partner allowlist is
+ * empty — the manual-API-key MCP path is exactly this (`accessiblePartnerIds:
+ * []`, see middleware/apiKeyAuth.ts) — a bare `withSystemDbAccessContext` here
+ * would run the `partners` read under that narrow context, RLS
+ * (`breeze_has_partner_access` → false) filters it to 0 rows, and an active
+ * partner looks unresolvable: `getActiveOrgTenant` returns null → the owning
+ * partnerId is never threaded into `getUserPermissions` → every MCP `tools/call`
+ * dies "no role assigned" (#2108 / re-report of #2019).
+ *
+ * Fix: when the ambient context is narrower than system, exit it FIRST
+ * (`runOutsideDbContext`) then open a fresh system transaction — the same
+ * escalation `services/permissions.ts` (getUserPermissions) already uses.
+ * Contextless callers (agent paths, pre-auth middleware) and already-system
+ * callers are unchanged and acquire no extra connection: the former open a
+ * fresh system tx exactly as before, the latter reuse the active system tx.
+ */
+function readAsSystem<T>(fn: () => Promise<T>): Promise<T> {
+  const ambient = getCurrentDbAccessContext();
+  if (ambient && ambient.scope !== 'system') {
+    return runOutsideDbContext(() => withSystemDbAccessContext(fn));
+  }
+  return withSystemDbAccessContext(fn);
+}
+
+export async function getActivePartner(partnerId: string): Promise<{ id: string } | null> {
+  return readAsSystem(async () => {
+    const [partner] = await db
+      .select({ id: partners.id, status: partners.status, deletedAt: partners.deletedAt })
+      .from(partners)
+      .where(and(eq(partners.id, partnerId), isNull(partners.deletedAt)))
+      .limit(1);
+
+    if (!partner || partner.status !== 'active') return null;
+    return { id: partner.id };
+  });
+}
+
+// Partner statuses allowed to hold an authenticated session. `pending`
+// is legitimate — a self-service signup that has verified email but not
+// yet completed payment. It MUST be able to authenticate so the
+// downstream partnerGuard (status !== 'active' → 403 PARTNER_INACTIVE)
+// can redirect it to the billing page. Feature gating is partnerGuard's
+// job, not the auth/token gate's. `suspended`/`churned`/soft-deleted
+// stay rejected — that is the SR-001..SR-024 (PR #568) mid-session
+// cutoff we keep. Deliberately distinct from getActivePartner (strictly
+// 'active'), which the org-cascade / API-key path relies on — do not
+// merge them.
+const PARTNER_SESSION_ALLOWED_STATUSES = new Set(['active', 'pending']);
+
+export async function getSessionAllowedPartner(partnerId: string): Promise<{ id: string } | null> {
+  return readAsSystem(async () => {
+    const [partner] = await db
+      .select({ id: partners.id, status: partners.status, deletedAt: partners.deletedAt })
+      .from(partners)
+      .where(and(eq(partners.id, partnerId), isNull(partners.deletedAt)))
+      .limit(1);
+
+    if (!partner || !PARTNER_SESSION_ALLOWED_STATUSES.has(partner.status)) return null;
+    return { id: partner.id };
+  });
+}
+
+export async function getActiveOrgTenant(orgId: string): Promise<{ orgId: string; partnerId: string } | null> {
+  return readAsSystem(async () => {
+    const [org] = await db
+      .select({
+        orgId: organizations.id,
+        orgStatus: organizations.status,
+        orgDeletedAt: organizations.deletedAt,
+        partnerId: organizations.partnerId,
+      })
+      .from(organizations)
+      .where(and(eq(organizations.id, orgId), isNull(organizations.deletedAt)))
+      .limit(1);
+
+    if (!org || !isUsableOrgStatus(org.orgStatus) || org.orgDeletedAt) return null;
+
+    const activePartner = await getActivePartner(org.partnerId);
+    if (!activePartner) return null;
+
+    return { orgId: org.orgId, partnerId: org.partnerId };
+  });
+}
+
+/**
+ * Options for tightening the tenant-status gate when the caller is NOT a
+ * first-party dashboard session.
+ *
+ * `strictForOauth` (Task 15 / MCP H-1): when true, require partners.status
+ * === 'active' for partner-scope contexts (instead of admitting `pending`).
+ * The lax behavior is correct for first-party JWTs — a `pending` partner
+ * needs to authenticate so partnerGuard can redirect them to billing — but
+ * is WRONG for OAuth bearer tokens: a `pending` partner should never have
+ * an OAuth grant honored, and any flip to suspended/churned post-issuance
+ * must invalidate already-minted access tokens at request time (proactive
+ * revoke + this request-time check are belt-and-suspenders). Org-scope is
+ * unaffected — `getActiveOrgTenant` already cascades through
+ * `getActivePartner` which is strict.
+ */
+export interface AssertActiveTenantOptions {
+  strictForOauth?: boolean;
+}
+
+export async function assertActiveTenantContext(
+  context: {
+    scope: 'system' | 'partner' | 'organization';
+    partnerId: string | null;
+    orgId: string | null;
+  },
+  options: AssertActiveTenantOptions = {},
+): Promise<void> {
+  if (context.scope === 'system') return;
+
+  if (context.scope === 'partner') {
+    if (!context.partnerId) {
+      throw new TenantInactiveError('Partner is not active');
+    }
+    if (options.strictForOauth) {
+      // OAuth bearer / non-session caller: require strictly active.
+      // Rejects pending, suspended, churned, soft-deleted.
+      if (!(await getActivePartner(context.partnerId))) {
+        throw new TenantInactiveError('Partner is not active');
+      }
+      return;
+    }
+    // Session gate, not feature gate: admit `pending` (partnerGuard
+    // handles the billing redirect). Strictly-dead tenants still rejected.
+    if (!(await getSessionAllowedPartner(context.partnerId))) {
+      throw new TenantInactiveError('Partner is not active');
+    }
+    return;
+  }
+
+  if (!context.orgId) {
+    throw new TenantInactiveError('Organization context required');
+  }
+
+  const org = await getActiveOrgTenant(context.orgId);
+  if (!org || (context.partnerId && org.partnerId !== context.partnerId)) {
+    throw new TenantInactiveError('Organization is not active');
+  }
+}
+
+// Hot-path agent tenant-status gate for the agent REST (heartbeat, inventory,
+// log-ship, command fetch/result, patches) and WS upgrade paths. Agent
+// credentials are org-scoped; a suspended/churned/soft-deleted org or partner
+// must not keep authenticating its fleet. The first-party JWT and API-key
+// paths already enforce this via getActiveOrgTenant — the agent paths did not.
+//
+// Positive results are cached in Redis for a short TTL, so the per-heartbeat
+// cost on the happy path is a single GET. Negatives are deliberately NOT
+// cached: a reactivated tenant should resume promptly, and inactive-tenant
+// traffic is already throttled upstream (the REST gate runs after the
+// per-agent/per-org rate limiters; the WS path is bounded by reconnect
+// backoff). Redis errors fall through to the authoritative DB check — fail to
+// the source of truth, never fail open.
+const AGENT_TENANT_OK_CACHE_PREFIX = 'agent_tenant_ok:';
+const AGENT_TENANT_OK_CACHE_SECONDS = 60;
+// Cache values: '1' = fully active, 'drain' = offboarding drain mode.
+const AGENT_TENANT_CACHE_ACTIVE = '1';
+const AGENT_TENANT_CACHE_DRAINING = 'drain';
+
+/**
+ * Agent-facing tenant state (#2774):
+ * - 'active'   — org active/trial under an active partner: full agent surface.
+ * - 'draining' — org and/or partner is `offboarding`: the agent may still
+ *   authenticate, but only on the narrowed drain surface (heartbeat, command
+ *   poll/result filtered to self_uninstall, token rotation, log ship) so a
+ *   queued self_uninstall is deliverable while users are already locked out.
+ * - null       — everything else (suspended/churned/pending/soft-deleted):
+ *   agents fail closed exactly as before.
+ *
+ * This is deliberately a SEPARATE predicate from getActiveOrgTenant: the
+ * user/API-key/OAuth gates must keep rejecting `offboarding` — only the agent
+ * delivery path is allowed to see the drain window.
+ */
+export type AgentTenantState = 'active' | 'draining';
+
+export async function getAgentTenantState(orgId: string): Promise<AgentTenantState | null> {
+  const cacheKey = `${AGENT_TENANT_OK_CACHE_PREFIX}${orgId}`;
+  const redis = getRedis();
+
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached === AGENT_TENANT_CACHE_ACTIVE) return 'active';
+      if (cached === AGENT_TENANT_CACHE_DRAINING) return 'draining';
+    } catch {
+      // Cache read failed — fall through to the authoritative DB check.
+    }
+  }
+
+  const state = await readAsSystem(async (): Promise<AgentTenantState | null> => {
+    const [row] = await db
+      .select({
+        orgStatus: organizations.status,
+        partnerStatus: partners.status,
+        partnerDeletedAt: partners.deletedAt,
+      })
+      .from(organizations)
+      .innerJoin(partners, eq(partners.id, organizations.partnerId))
+      .where(and(eq(organizations.id, orgId), isNull(organizations.deletedAt)))
+      .limit(1);
+
+    if (!row || row.partnerDeletedAt) return null;
+
+    const orgUsable = isUsableOrgStatus(row.orgStatus);
+    if (orgUsable && row.partnerStatus === 'active') return 'active';
+
+    const orgDraining =
+      row.orgStatus === 'offboarding'
+      && (row.partnerStatus === 'active' || row.partnerStatus === 'offboarding');
+    const partnerDraining = row.partnerStatus === 'offboarding' && orgUsable;
+    if (orgDraining || partnerDraining) return 'draining';
+
+    return null;
+  });
+
+  if (state && redis) {
+    try {
+      await redis.set(
+        cacheKey,
+        state === 'active' ? AGENT_TENANT_CACHE_ACTIVE : AGENT_TENANT_CACHE_DRAINING,
+        'EX',
+        AGENT_TENANT_OK_CACHE_SECONDS
+      );
+    } catch {
+      // Best-effort cache write; correctness does not depend on it.
+    }
+  }
+
+  return state;
+}
+
+/**
+ * True when the agent may authenticate AT ALL — i.e. 'active' OR 'draining'.
+ * Callers that must distinguish full capability from the narrowed drain
+ * surface (agentAuth route allowlist, agentWs upgrade refusal) use
+ * getAgentTenantState directly; boolean callers where drain-mode access is
+ * intended (mTLS cert renewal — an agent quarantined mid-drain could never
+ * collect its uninstall) keep this wrapper.
+ */
+export async function isAgentTenantActive(orgId: string): Promise<boolean> {
+  return (await getAgentTenantState(orgId)) !== null;
+}
+
+/**
+ * Drop the cached positive `isAgentTenantActive` result for each org. Called
+ * when a tenant is suspended/deleted so a still-cached `OK` can't admit the
+ * fleet during the brief window before (or if) the device-level
+ * `agentTokenSuspendedAt` flag is written — the next agent request re-checks
+ * the (now-inactive) DB status. Best-effort: the device flag remains the
+ * real-time cutoff, so a Redis error here is non-fatal.
+ */
+export async function invalidateAgentTenantCache(orgIds: string[]): Promise<void> {
+  if (orgIds.length === 0) return;
+  const redis = getRedis();
+  if (!redis) return;
+  try {
+    await Promise.all(orgIds.map((id) => redis.del(`${AGENT_TENANT_OK_CACHE_PREFIX}${id}`)));
+  } catch {
+    // Best-effort; the device-level agentTokenSuspendedAt flag is the cutoff.
+  }
+}

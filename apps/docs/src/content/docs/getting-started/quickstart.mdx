@@ -1,0 +1,344 @@
+---
+title: Quickstart
+description: Get Breeze RMM running in minutes with guided or manual setup, then reach the dashboard and enroll your first agent with an enrollment token.
+sidebar:
+  order: 3
+  label: Quickstart
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+Get a working Breeze instance running with a single `docker compose up`.
+
+## Guided setup (recommended)
+
+The guided installer downloads the templates, generates **every** required
+secret in the right format, checks that the version you pick has published
+container images, and starts the stack:
+
+```bash
+mkdir breeze && cd breeze
+curl -fsSLO https://raw.githubusercontent.com/lanternops/breeze/main/scripts/guided-setup.sh
+bash guided-setup.sh
+```
+
+On Linux the installer also offers to register a boot service (`breeze-rmm`) so
+the stack comes back up on its own after a reboot. Accept it on a server you
+want running unattended; you can install or update it later with
+`bash guided-setup.sh --install-systemd`.
+
+Prefer to configure `.env` yourself? The manual path is below.
+
+<Aside type="tip">
+  Installing on a **headless server**? Read
+  [Reaching the dashboard from another machine](#reaching-the-dashboard-from-another-machine)
+  before you start — `BREEZE_DOMAIN=localhost` only serves requests made from the
+  Docker host itself.
+</Aside>
+
+## Manual setup
+
+<Steps>
+
+1. **Download the compose file and environment template**
+
+   ```bash
+   mkdir breeze && cd breeze
+   curl -fsSLO https://raw.githubusercontent.com/lanternops/breeze/main/docker-compose.yml
+   curl -fsSLO https://raw.githubusercontent.com/lanternops/breeze/main/.env.example
+   # Caddy config — the compose file bind-mounts this, so it must exist on disk first
+   curl -fsSL --create-dirs -o docker/Caddyfile.prod https://raw.githubusercontent.com/lanternops/breeze/main/docker/Caddyfile.prod
+   cp .env.example .env
+   ```
+
+   <Aside type="caution">
+     Don't skip the `docker/Caddyfile.prod` download. The compose file bind-mounts
+     it into the `caddy` container; if the file isn't on disk when you run
+     `docker compose up`, Docker silently creates `docker/Caddyfile.prod` as an empty
+     **directory** and Caddy fails to start.
+   </Aside>
+
+2. **Set your domain**
+
+   ```bash
+   # Domain (use "localhost" for local testing — see the headless note below)
+   BREEZE_DOMAIN=localhost
+   ACME_EMAIL=you@example.com
+   ```
+
+3. **Generate the secrets**
+
+   `.env.example` ships placeholder values for every secret. Replace them
+   **in place** — edit the existing line for each key rather than appending a
+   second copy at the end of the file.
+
+   This one-liner rewrites each placeholder with a fresh value:
+
+   ```bash
+   for key in JWT_SECRET SESSION_SECRET AGENT_ENROLLMENT_SECRET \
+     APP_ENCRYPTION_KEY MFA_ENCRYPTION_KEY ENROLLMENT_KEY_PEPPER \
+     MFA_RECOVERY_CODE_PEPPER METRICS_SCRAPE_TOKEN; do
+     sed -i "s|^${key}=.*|${key}=$(openssl rand -hex 32)|" .env
+   done
+
+   # Must be canonical base64 decoding to >= 32 bytes, and must not reuse JWT_SECRET
+   sed -i "s|^PARTNER_API_CURSOR_SIGNING_KEY=.*|PARTNER_API_CURSOR_SIGNING_KEY=$(openssl rand -base64 32)|" .env
+
+   # Database and Redis. Redis auth is REQUIRED — the API refuses to start without it.
+   POSTGRES_PASSWORD="$(openssl rand -base64 24 | tr -d '/+=')"
+   REDIS_PASSWORD="$(openssl rand -hex 32)"
+   sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${POSTGRES_PASSWORD}|" .env
+   sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=${REDIS_PASSWORD}|" .env
+   sed -i "s|^REDIS_URL=.*|REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379|" .env
+   ```
+
+   On macOS, use `sed -i ''` instead of `sed -i`.
+
+   <Aside type="note">
+     `APP_ENCRYPTION_KEY` and `MFA_ENCRYPTION_KEY` must differ from each other,
+     and `PARTNER_API_CURSOR_SIGNING_KEY` must not reuse `JWT_SECRET`. The loop
+     above satisfies both. The authoritative list of every variable, its format,
+     and whether it is required lives in
+     [Environment Variables](/deploy/environment/).
+   </Aside>
+
+   <Aside type="danger">
+     Never commit `.env` to version control. It contains secrets.
+   </Aside>
+
+4. **Check the version pin**
+
+   `.env.example` pins `BREEZE_VERSION` to a specific release. Confirm it is the
+   one you want before starting:
+
+   ```bash
+   grep '^BREEZE_VERSION=' .env
+   ```
+
+   To upgrade later, set it to a newer release from
+   [the releases page](https://github.com/lanternops/breeze/releases) and re-run
+   `docker compose up -d`.
+
+   <Aside type="caution">
+     Pick a version that has **published container images**, which is not always
+     the newest git tag — a release can be tagged before its images finish
+     building. If you pin one that was never published, `docker compose up` fails
+     with `not found`. The guided installer checks this for you.
+   </Aside>
+
+   **Then fill in the image digests.** Since v0.112.0, `.env.example` ships the
+   four `BREEZE_*_IMAGE_REF` lines as `@sha256:replace-with-signed-release-digest`
+   placeholders, and `docker compose up` will not start until they name real
+   images. The guided installer resolves them from the release's signed image
+   inventory automatically; on the manual path, run the verifier script from the
+   release and copy the four refs it emits into `.env` — see
+   [Signed, digest-pinned image references](/deploy/production/#signed-digest-pinned-image-references-v01120-and-later).
+
+5. **Start Breeze**
+
+   ```bash
+   docker compose up -d
+   ```
+
+   On first boot the API container automatically:
+   - Runs database migrations
+   - Seeds the default admin user
+   - Starts the background job workers
+
+6. **Verify**
+
+   ```bash
+   # Wait for API to be healthy (~30s on first boot)
+   docker compose logs -f api --since 1m
+   ```
+
+   Once you see `Breeze API running`, open the dashboard:
+
+   - **Dashboard**: `https://localhost` (accept the self-signed cert)
+   - **Health check**: `curl -k https://localhost/health`
+
+</Steps>
+
+## Reaching the dashboard from another machine
+
+`BREEZE_DOMAIN` becomes Caddy's site address, and Caddy only answers requests
+whose `Host` header matches it. With `BREEZE_DOMAIN=localhost` the ports are
+published on all interfaces, but a browser on your laptop sends
+`Host: 192.168.1.50`, which matches nothing — so a minimal/headless server
+install has no reachable UI even though `curl -k https://localhost/health`
+returns `OK` on the box itself.
+
+Pick whichever fits:
+
+- **SSH tunnel** — leave `BREEZE_DOMAIN=localhost` and forward the port:
+
+  ```bash
+  ssh -L 8443:127.0.0.1:443 user@your-server
+  # then browse to https://localhost:8443
+  ```
+
+  A browser origin includes the **port**, so `https://localhost:8443` is a
+  different origin from the `https://localhost` that the generated `.env`
+  allows, and the API rejects sign-in requests coming from it. Pick one of:
+
+  ```bash
+  # Forward the SAME port — 443 is privileged, so run this as root
+  sudo ssh -L 443:127.0.0.1:443 user@your-server
+  # then browse to https://localhost
+  ```
+
+  ```bash
+  # …or keep the high port and add the tunnel origin to .env on the server
+  # (comma-separated, no spaces, no trailing paths)
+  CORS_ALLOWED_ORIGINS=https://localhost,https://localhost:8443
+  docker compose up -d api
+  ```
+
+  The API now accepts same-origin requests on its own, so this entry is
+  optional — a browser reaching Breeze through the tunnel is already treated as
+  same-origin. It stays correct either way.
+
+- **LAN address** — serve the machine's IP or hostname directly:
+
+  ```bash
+  BREEZE_DOMAIN=192.168.1.50
+  PUBLIC_APP_URL=https://192.168.1.50
+  DASHBOARD_URL=https://192.168.1.50
+  ```
+
+  Caddy cannot get a public certificate for a private address, so it serves its
+  internal self-signed cert — accept the browser warning.
+
+- **Internal domain** — a name that resolves only on your LAN or VPN, or a host
+  whose ports 80 and 443 are not reachable from the internet:
+
+  ```bash
+  BREEZE_DOMAIN=breeze.mydomain.com
+  PUBLIC_APP_URL=https://breeze.mydomain.com
+  DASHBOARD_URL=https://breeze.mydomain.com
+  CADDY_LOCAL_CERTS=local_certs
+  ```
+
+  Let's Encrypt cannot validate a name it cannot reach, so
+  `CADDY_LOCAL_CERTS=local_certs` switches Caddy to its own internal CA instead.
+  The guided installer asks this for you — *"Can Let's Encrypt reach this
+  domain?"* — whenever you give it a domain that is not `localhost` or an IP.
+
+  Browsers warn on every visit until that CA root is trusted on each client
+  machine. Export it with:
+
+  ```bash
+  docker compose exec caddy cat /data/caddy/pki/authorities/local/root.crt
+  ```
+
+  <Aside type="note">
+    `PUBLIC_APP_URL` still uses `https://` — the site is HTTPS either way, only
+    the issuer changes. Leave `CADDY_LOCAL_CERTS` empty for any deployment
+    Let's Encrypt *can* reach.
+  </Aside>
+
+- **Real domain** — the production path. See
+  [Production Deploy](/deploy/production/).
+
+Whichever you choose, `PUBLIC_APP_URL` must be the URL users actually visit:
+it is what agent installers and portal links are built from.
+
+## Troubleshooting
+
+**You are sent back to the login page with "session expired" right after signing in**
+- Cause: the address in your browser's address bar is not an origin this server
+  accepts. `CORS_ALLOWED_ORIGINS` doesn't list it, or `PUBLIC_APP_URL` is set to
+  a different address than the one you are visiting. Reaching a
+  `BREEZE_DOMAIN=localhost` install through an SSH tunnel on a different port is
+  the usual way to land here — the password was fine, the sign-in worked, and
+  the token refresh that follows it is what got rejected.
+- Confirm: open your browser devtools, go to the **Network** tab, and sign in
+  again. `POST /api/v1/auth/refresh` returns **403** with the body
+  `{"error":"Invalid request origin"}`. Newer Breeze builds also say so on the
+  login page itself, naming the exact origin that was refused.
+- Fix: browse to the address in `PUBLIC_APP_URL`, or add the address you are
+  actually using to `CORS_ALLOWED_ORIGINS` in `.env` (comma-separated, no spaces,
+  no trailing paths) and restart the API with `docker compose up -d api`.
+
+### The browser shows ERR_SSL_PROTOCOL_ERROR
+
+Chrome reports `ERR_SSL_PROTOCOL_ERROR` and Firefox `SSL_ERROR_INTERNAL_ERROR_ALERT`,
+with no certificate warning you can click through. That is Caddy aborting the TLS
+handshake with alert 80 (`internal_error`) because it holds no certificate for the
+name you asked for. Confirm it from the Caddy log:
+
+```bash
+docker logs breeze-caddy 2>&1 | grep tls.obtain
+```
+
+`could not get certificate from issuer` there means the Let's Encrypt order for
+`BREEZE_DOMAIN` failed. Let's Encrypt needs **public DNS pointing at this host and
+ports 80 and 443 open from the internet** — an internal-only name, or a host behind
+a firewall, can never pass validation.
+
+Two ways out:
+
+- Make the domain publicly resolvable and open 80/443 inbound, then restart Caddy
+  so it retries the order.
+- Or keep it internal and switch to Caddy's own CA — set
+  `CADDY_LOCAL_CERTS=local_certs` in `.env` (see **Internal domain** above) and
+  restart Caddy:
+
+  ```bash
+  docker compose up -d caddy
+  ```
+
+<Aside type="caution">
+  An empty `CADDY_LOCAL_CERTS` is the default and is correct for every
+  internet-reachable deployment. Only set it when the ACME order genuinely cannot
+  succeed — an internal CA means every browser and agent must trust that root.
+</Aside>
+
+## What's Running
+
+| Container | Port | Purpose |
+|---|---|---|
+| `breeze-caddy` | 80, 443 | Reverse proxy + auto-TLS |
+| `breeze-api` | 3001 (internal) | Hono API server |
+| `breeze-web` | 4321 (internal) | Astro SSR dashboard |
+| `breeze-portal` | 4322 (internal) | Customer portal, served under `/portal` |
+| `breeze-postgres` | 5432 (internal) | PostgreSQL 16 database |
+| `breeze-redis` | 6379 (internal) | Redis 7 (BullMQ + caching) |
+| `breeze-worker` | — (internal) | Background job workers, split out from the API process (only with `--profile worker-split`) |
+| `breeze-coturn` | 3478 (host) | TURN relay for WebRTC remote desktop (only with `--profile turn`) |
+
+## Next: Enroll Your First Agent
+
+Download and install the Breeze agent on a device. `BREEZE_SERVER` must be the
+URL of your Breeze server **as the target device can reach it** — not
+`localhost`, which on the target device means the target device itself:
+
+```bash
+# On the target device:
+# The enrollment token is REQUIRED — grab it from the Add Device dialog.
+curl -fsSL https://breeze.example.com/api/v1/agents/install.sh | \
+  BREEZE_SERVER=https://breeze.example.com \
+  BREEZE_ENROLL_TOKEN=<your-enrollment-token> \
+  bash
+```
+
+If your server is configured with an org enrollment secret, pass it as an
+**optional** extra gate alongside the token (never instead of it):
+
+```bash
+curl -fsSL https://breeze.example.com/api/v1/agents/install.sh | \
+  BREEZE_SERVER=https://breeze.example.com \
+  BREEZE_ENROLL_TOKEN=<your-enrollment-token> \
+  BREEZE_ENROLLMENT_SECRET=<your-enrollment-secret> \
+  bash
+```
+
+<Aside type="caution">
+  Agents cannot enrol against a `localhost`-only install. Give the server a LAN
+  address or a real domain first (see above) — the agent needs to reach it from
+  wherever it runs.
+</Aside>
+
+See [Agent Installation](/agents/installation/) for detailed instructions per platform.
+
+For production deployment with a real domain and monitoring, see [Production Deploy](/deploy/production/).

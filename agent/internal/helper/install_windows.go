@@ -1,0 +1,397 @@
+package helper
+
+import (
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
+)
+
+const registryKey = `SOFTWARE\Microsoft\Windows\CurrentVersion\Run`
+const registryValue = "BreezeHelper"
+
+func packageExtension() string { return ".msi" }
+
+const helperDisplayName = "Breeze Helper"
+
+// uninstallPackage finds the MSI ProductCode in the registry and runs
+// msiexec /x to uninstall it. Idempotent: returns nil if not installed.
+func uninstallPackage() error {
+	productCode, err := findHelperProductCode(helperDisplayName)
+	if err != nil {
+		return fmt.Errorf("locate product code: %w", err)
+	}
+	if productCode == "" {
+		return nil // not installed
+	}
+
+	cmd := exec.Command("msiexec", "/x", productCode, "/qn", "/norestart")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 3010 {
+			log.Info("MSI uninstalled (reboot required)", "productCode", productCode)
+			return nil
+		}
+		return fmt.Errorf("msiexec /x %s: %w (output: %s)", productCode, err, strings.TrimSpace(string(out)))
+	}
+	log.Info("MSI uninstalled", "productCode", productCode)
+	return nil
+}
+
+// findHelperProductCode walks the standard 64-bit and 32-bit Uninstall keys
+// looking for a ProductCode-style subkey whose DisplayName matches displayName.
+func findHelperProductCode(displayName string) (string, error) {
+	roots := []string{
+		`SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`,
+		`SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall`,
+	}
+	for _, root := range roots {
+		key, err := registry.OpenKey(registry.LOCAL_MACHINE, root, registry.READ)
+		if err != nil {
+			continue
+		}
+		subKeys, err := key.ReadSubKeyNames(0)
+		key.Close()
+		if err != nil {
+			continue
+		}
+		for _, sk := range subKeys {
+			if !strings.HasPrefix(sk, "{") {
+				continue // only ProductCode-style entries
+			}
+			child, err := registry.OpenKey(registry.LOCAL_MACHINE, root+`\`+sk, registry.READ)
+			if err != nil {
+				continue
+			}
+			name, _, _ := child.GetStringValue("DisplayName")
+			child.Close()
+			if name == displayName {
+				return sk, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// installPackage runs the MSI installer silently.
+// Exit code 3010 means success but reboot required — treated as success.
+func installPackage(msiPath, _ string) error {
+	cmd := exec.Command("msiexec", "/i", msiPath, "/qn", "/norestart")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Exit code 3010 = ERROR_SUCCESS_REBOOT_REQUIRED
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 3010 {
+			log.Info("MSI installed successfully (reboot required)", "msi", msiPath)
+			return nil
+		}
+		return fmt.Errorf("msiexec: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	log.Info("MSI installed successfully", "msi", msiPath)
+	return nil
+}
+
+func isHelperRunning() bool {
+	out, err := outputHelperCommand("tasklist", "/FI", "IMAGENAME eq breeze-helper.exe", "/NH")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(out)), "breeze-helper.exe")
+}
+
+func stopHelper() error {
+	return runHelperCommand("taskkill", "/F", "/IM", "breeze-helper.exe")
+}
+
+func removeAutoStart() error {
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, registryKey, registry.SET_VALUE)
+	if err != nil {
+		return nil // key doesn't exist
+	}
+	defer key.Close()
+	if err := key.DeleteValue(registryValue); err != nil && err != registry.ErrNotExist {
+		return fmt.Errorf("delete registry value: %w", err)
+	}
+	return nil
+}
+
+// stopByPIDIfOurs terminates pid only if it is a Breeze helper process, using a
+// SINGLE process handle for both the image-path check and the kill.
+//
+// This closes the PID-reuse TOCTOU (#2531) that existed when the caller ran
+// isOurProcess() (one OpenProcess to check the image) and then stopByPID()
+// (a second OpenProcess to terminate) as two separate syscalls on a bare PID.
+// A Windows handle pins the exact kernel process object, so once we have opened
+// the PID nothing can redirect our TerminateProcess to a different process:
+//   - if the helper exits and Windows recycles the PID AFTER our OpenProcess,
+//     our handle still refers to the original (now-dead) process, so the
+//     terminate is a harmless no-op on the process we verified — never the
+//     unrelated process that inherited the number;
+//   - if the PID was already recycled BEFORE our OpenProcess, the image-path
+//     check on this handle fails and we terminate nothing.
+//
+// Returns (true, nil) when the process was ours and was terminated, (false, nil)
+// when the pid is gone or is not a helper, and (false, err) when a confirmed
+// helper could not be terminated.
+func stopByPIDIfOurs(pid int, binaryPath string) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
+		false, uint32(pid),
+	)
+	if err != nil {
+		// Process is gone or inaccessible — nothing we can (or should) kill.
+		return false, nil
+	}
+	defer windows.CloseHandle(handle)
+
+	buf := make([]uint16, windows.MAX_PATH)
+	size := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(handle, 0, &buf[0], &size); err != nil {
+		// Can't confirm identity on this handle — refuse to terminate.
+		return false, nil
+	}
+	exePath := windows.UTF16ToString(buf[:size])
+	if !strings.EqualFold(filepath.Clean(exePath), filepath.Clean(binaryPath)) {
+		return false, nil
+	}
+	if err := windows.TerminateProcess(handle, 0); err != nil {
+		return false, fmt.Errorf("TerminateProcess(%d): %w", pid, err)
+	}
+	return true, nil
+}
+
+func spawnWithConfig(binaryPath, sessionKey, configPath string) (int, error) {
+	sessionNum, err := strconv.ParseUint(sessionKey, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid session key %q: %w", sessionKey, err)
+	}
+
+	dupToken, envBlock, identity, err := acquireSpawnToken(uint32(sessionNum))
+	if err != nil {
+		return 0, err
+	}
+	defer dupToken.Close()
+	if envBlock != nil {
+		defer windows.DestroyEnvironmentBlock(envBlock)
+	}
+
+	// Launch breeze-helper.exe directly so we get the real PID back.
+	// Previously this used cmd.exe /c start "" which returned cmd.exe's PID
+	// instead of the helper's PID, causing isOurProcess() to always return
+	// false and the watcher to respawn infinitely.
+	appName, err := windows.UTF16PtrFromString(binaryPath)
+	if err != nil {
+		return 0, fmt.Errorf("UTF16PtrFromString appName: %w", err)
+	}
+	cmdLine, err := windows.UTF16PtrFromString(
+		fmt.Sprintf(`"%s" --config "%s"`, binaryPath, configPath),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("UTF16PtrFromString cmdLine: %w", err)
+	}
+	desktop, err := windows.UTF16PtrFromString(`winsta0\Default`)
+	if err != nil {
+		return 0, fmt.Errorf("UTF16PtrFromString desktop: %w", err)
+	}
+
+	si := windows.StartupInfo{
+		Cb:      uint32(unsafe.Sizeof(windows.StartupInfo{})),
+		Desktop: desktop,
+	}
+	var pi windows.ProcessInformation
+
+	if err := windows.CreateProcessAsUser(
+		dupToken,
+		appName,
+		cmdLine,
+		nil,
+		nil,
+		false,
+		windows.CREATE_UNICODE_ENVIRONMENT,
+		envBlock,
+		nil,
+		&si,
+		&pi,
+	); err != nil {
+		return 0, fmt.Errorf("CreateProcessAsUser(session=%d, binary=%s): %w", sessionNum, binaryPath, err)
+	}
+
+	windows.CloseHandle(pi.Thread)
+	windows.CloseHandle(pi.Process)
+
+	log.Info("spawned assist in session",
+		"sessionId", sessionNum,
+		"pid", pi.ProcessId,
+		"binary", binaryPath,
+		"configPath", configPath,
+		"identity", identity,
+	)
+	return int(pi.ProcessId), nil
+}
+
+func acquireSpawnToken(sessionID uint32) (windows.Token, *uint16, string, error) {
+	token, envBlock, err := getSpawnTokenViaWTS(sessionID)
+	if err == nil {
+		return token, envBlock, "user (WTS)", nil
+	}
+	wtsErr := err
+	log.Debug("WTSQueryUserToken failed, trying explorer.exe token",
+		"sessionId", sessionID, "error", err.Error())
+
+	token, envBlock, err = getSpawnTokenViaExplorer(sessionID)
+	if err == nil {
+		return token, envBlock, "user (explorer)", nil
+	}
+
+	log.Warn("all user token strategies failed, falling back to SYSTEM",
+		"sessionId", sessionID,
+		"wtsError", wtsErr.Error(),
+		"explorerError", err.Error(),
+	)
+
+	token, _, err = getSystemTokenForSpawn(sessionID)
+	if err != nil {
+		return 0, nil, "", err
+	}
+	return token, nil, "SYSTEM", nil
+}
+
+func getSpawnTokenViaWTS(sessionID uint32) (windows.Token, *uint16, error) {
+	var userToken windows.Token
+	if err := windows.WTSQueryUserToken(sessionID, &userToken); err != nil {
+		return 0, nil, fmt.Errorf("WTSQueryUserToken(session=%d): %w", sessionID, err)
+	}
+	defer userToken.Close()
+
+	var dupToken windows.Token
+	if err := windows.DuplicateTokenEx(
+		userToken,
+		windows.MAXIMUM_ALLOWED,
+		nil,
+		windows.SecurityImpersonation,
+		windows.TokenPrimary,
+		&dupToken,
+	); err != nil {
+		return 0, nil, fmt.Errorf("DuplicateTokenEx (user): %w", err)
+	}
+
+	var envBlock *uint16
+	if err := windows.CreateEnvironmentBlock(&envBlock, dupToken, false); err != nil {
+		dupToken.Close()
+		return 0, nil, fmt.Errorf("CreateEnvironmentBlock: %w", err)
+	}
+
+	return dupToken, envBlock, nil
+}
+
+func getSpawnTokenViaExplorer(sessionID uint32) (windows.Token, *uint16, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return 0, nil, fmt.Errorf("CreateToolhelp32Snapshot: %w", err)
+	}
+	defer windows.CloseHandle(snapshot)
+
+	var pe windows.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	if err := windows.Process32First(snapshot, &pe); err != nil {
+		return 0, nil, fmt.Errorf("Process32First: %w", err)
+	}
+
+	for {
+		name := windows.UTF16ToString(pe.ExeFile[:])
+		if strings.EqualFold(name, "explorer.exe") {
+			var procSessionID uint32
+			if err := windows.ProcessIdToSessionId(pe.ProcessID, &procSessionID); err == nil && procSessionID == sessionID {
+				token, envBlock, err := tokenFromProcessID(pe.ProcessID)
+				if err == nil {
+					return token, envBlock, nil
+				}
+				log.Debug("failed to get token from explorer.exe", "pid", pe.ProcessID, "error", err.Error())
+			}
+		}
+
+		if err := windows.Process32Next(snapshot, &pe); err != nil {
+			break
+		}
+	}
+
+	return 0, nil, fmt.Errorf("no explorer.exe found in session %d", sessionID)
+}
+
+func tokenFromProcessID(pid uint32) (windows.Token, *uint16, error) {
+	proc, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, false, pid)
+	if err != nil {
+		return 0, nil, fmt.Errorf("OpenProcess(%d): %w", pid, err)
+	}
+	defer windows.CloseHandle(proc)
+
+	var procToken windows.Token
+	if err := windows.OpenProcessToken(proc, windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY, &procToken); err != nil {
+		return 0, nil, fmt.Errorf("OpenProcessToken(%d): %w", pid, err)
+	}
+	defer procToken.Close()
+
+	var dupToken windows.Token
+	if err := windows.DuplicateTokenEx(
+		procToken,
+		windows.MAXIMUM_ALLOWED,
+		nil,
+		windows.SecurityImpersonation,
+		windows.TokenPrimary,
+		&dupToken,
+	); err != nil {
+		return 0, nil, fmt.Errorf("DuplicateTokenEx(%d): %w", pid, err)
+	}
+
+	var envBlock *uint16
+	if err := windows.CreateEnvironmentBlock(&envBlock, dupToken, false); err != nil {
+		dupToken.Close()
+		return 0, nil, fmt.Errorf("CreateEnvironmentBlock(%d): %w", pid, err)
+	}
+
+	return dupToken, envBlock, nil
+}
+
+func getSystemTokenForSpawn(sessionID uint32) (windows.Token, bool, error) {
+	proc, err := windows.GetCurrentProcess()
+	if err != nil {
+		return 0, false, fmt.Errorf("GetCurrentProcess: %w", err)
+	}
+
+	var processToken windows.Token
+	if err := windows.OpenProcessToken(proc, windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY, &processToken); err != nil {
+		return 0, false, fmt.Errorf("OpenProcessToken: %w", err)
+	}
+	defer processToken.Close()
+
+	var dupToken windows.Token
+	if err := windows.DuplicateTokenEx(
+		processToken,
+		windows.MAXIMUM_ALLOWED,
+		nil,
+		windows.SecurityImpersonation,
+		windows.TokenPrimary,
+		&dupToken,
+	); err != nil {
+		return 0, false, fmt.Errorf("DuplicateTokenEx: %w", err)
+	}
+
+	if err := windows.SetTokenInformation(
+		dupToken,
+		windows.TokenSessionId,
+		(*byte)(unsafe.Pointer(&sessionID)),
+		uint32(unsafe.Sizeof(sessionID)),
+	); err != nil {
+		dupToken.Close()
+		return 0, false, fmt.Errorf("SetTokenInformation(TokenSessionId=%d): %w", sessionID, err)
+	}
+
+	return dupToken, true, nil
+}

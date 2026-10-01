@@ -1,0 +1,341 @@
+import type { Patch, PatchSeverity, PatchApprovalStatus } from './PatchList';
+import type { UpdateRingItem } from './UpdateRingList';
+
+const severityMap: Record<string, PatchSeverity> = {
+  critical: 'critical',
+  high: 'important',
+  important: 'important',
+  medium: 'moderate',
+  moderate: 'moderate',
+  low: 'low',
+  info: 'low'
+};
+
+const approvalMap: Record<string, PatchApprovalStatus> = {
+  approved: 'approved',
+  approve: 'approved',
+  declined: 'declined',
+  decline: 'declined',
+  rejected: 'declined',
+  reject: 'declined',
+  deferred: 'deferred',
+  defer: 'deferred',
+  pending: 'pending'
+};
+
+const osLabels: Record<string, string> = {
+  windows: 'Windows',
+  macos: 'macOS',
+  linux: 'Linux',
+  // The API's inferPatchOs returns the literal 'unknown' when it can't
+  // resolve an OS — render it with the same casing as the no-value label.
+  unknown: 'Unknown'
+};
+
+function formatSourceLabel(value: unknown): string {
+  if (typeof value !== 'string') {
+    return value ? String(value) : 'Unknown';
+  }
+  if (!value.trim()) return 'Unknown';
+  return value
+    .replace(/_/g, ' ')
+    .split(' ')
+    .map(part => (part ? part[0].toUpperCase() + part.slice(1) : part))
+    .join(' ');
+}
+
+function normalizeSeverity(value?: string): PatchSeverity {
+  if (!value) return 'unrated';
+  const normalized = value.toLowerCase();
+  if (normalized === 'unknown') return 'unrated';
+  return severityMap[normalized] ?? 'unrated';
+}
+
+function normalizeApprovalStatus(value?: string): PatchApprovalStatus {
+  if (!value) return 'pending';
+  return approvalMap[value.toLowerCase()] ?? 'pending';
+}
+
+function normalizeOs(value?: string): string {
+  if (!value) return 'Unknown';
+  return osLabels[value.toLowerCase()] ?? value;
+}
+
+export function normalizePatch(raw: Record<string, unknown>, index: number): Patch {
+  const id = raw.id ?? raw.patchId ?? raw.patch_id ?? `patch-${index}`;
+  const title = raw.title ?? raw.name ?? raw.patchTitle ?? 'Untitled patch';
+  const source = raw.source ?? raw.sourceName ?? raw.source_label;
+  // Prefer a scalar os field; fall back to the first entry of an osTypes
+  // array (the raw patch-catalog shape) so endpoints that omit the derived
+  // scalar don't render every row as "Unknown" (#2215).
+  const osTypesRaw = raw.osTypes ?? raw.os_types;
+  const os = raw.os ?? raw.osType ?? raw.os_type ?? raw.platform
+    ?? (Array.isArray(osTypesRaw) && osTypesRaw.length > 0 ? osTypesRaw[0] : undefined);
+  const releaseDate = raw.releaseDate ?? raw.releasedAt ?? raw.release_date ?? raw.createdAt ?? '';
+  const approvalStatus = raw.approvalStatus ?? raw.approval_status ?? raw.status;
+  const vendor = raw.vendor ?? null;
+  const cveIdsRaw = raw.cveIds ?? raw.cve_ids;
+  const cveIds = Array.isArray(cveIdsRaw)
+    ? cveIdsRaw.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : undefined;
+
+  return {
+    id: String(id),
+    title: String(title),
+    severity: normalizeSeverity(raw.severity ? String(raw.severity) : undefined),
+    source: typeof source === 'string' && source.trim() ? source : 'unknown',
+    os: normalizeOs(os ? String(os) : undefined),
+    releaseDate: String(releaseDate),
+    approvalStatus: normalizeApprovalStatus(approvalStatus ? String(approvalStatus) : undefined),
+    description: raw.description ? String(raw.description) : undefined,
+    vendor: typeof vendor === 'string' && vendor.trim() ? vendor : null,
+    cveIds,
+  };
+}
+
+const RING_SEVERITIES = ['critical', 'important', 'moderate', 'low'] as const;
+type RingSeverity = (typeof RING_SEVERITIES)[number];
+
+const DISABLED_RING_AUTO_APPROVE: NonNullable<UpdateRingItem['autoApprove']> = {
+  enabled: false, severities: [], deferralDays: 0, thirdPartyApps: false, thirdPartyDeferralDays: null,
+  autoApproveUnrated: false,
+};
+
+/**
+ * Normalize a ring's stored `autoApprove` JSONB (#1317) into the typed form
+ * the editor expects. Tolerant of every historical shape the API may have
+ * stored: `{}` / missing → disabled; boolean `true` → enabled with no severity
+ * filter; the typed `{ enabled, severities, deferralDays, thirdPartyApps,
+ * thirdPartyDeferralDays }` object passes through. Mirrors the API-side
+ * `parseRingAutoApprove`, including:
+ *  - the legacy-compat rule for the third-party gate: an absent
+ *    `thirdPartyApps` key derives from whether any severity is selected
+ *    (pre-gate rings auto-approved third-party updates whenever the ring
+ *    auto-approved anything);
+ *  - fail-closed holds: a PRESENT but invalid `deferralDays` or
+ *    `thirdPartyDeferralDays` means the evaluator treats the row as disabled,
+ *    so the editor must show it disabled too — coercing to a valid-looking
+ *    value here would let a save silently resurrect config the evaluator
+ *    fail-closed on. Absent/null `thirdPartyDeferralDays` = inherit (null).
+ *
+ * One deliberate editor-vs-evaluator divergence: a well-formed but DISABLED
+ * row keeps its stored severities/fields here (the evaluator collapses any
+ * disabled row, but the editor must not lose a selection the operator parked
+ * behind the off switch).
+ *
+ * Dropping a field here is a silent policy loss: the editor round-trips this
+ * object straight back into the PATCH body, so anything not carried is written
+ * back as its default.
+ */
+function normalizeRingAutoApprove(raw: unknown): UpdateRingItem['autoApprove'] {
+  if (raw === true) {
+    return { enabled: true, severities: [], deferralDays: 0, thirdPartyApps: false, thirdPartyDeferralDays: null, autoApproveUnrated: false };
+  }
+  if (!raw || typeof raw !== 'object') {
+    return { ...DISABLED_RING_AUTO_APPROVE };
+  }
+  const obj = raw as Record<string, unknown>;
+  const severities = Array.isArray(obj.severities)
+    ? obj.severities.filter((s): s is RingSeverity => RING_SEVERITIES.includes(s as RingSeverity))
+    : [];
+  let deferralDays = 0;
+  if (obj.deferralDays !== undefined) {
+    const rawHold = obj.deferralDays;
+    if (typeof rawHold !== 'number' || !Number.isInteger(rawHold) || rawHold < 0) {
+      return { ...DISABLED_RING_AUTO_APPROVE };
+    }
+    deferralDays = rawHold;
+  }
+  const thirdPartyApps =
+    'thirdPartyApps' in obj ? obj.thirdPartyApps === true : severities.length > 0;
+  let thirdPartyDeferralDays: number | null = null;
+  const rawThirdPartyHold = obj.thirdPartyDeferralDays;
+  if (rawThirdPartyHold !== undefined && rawThirdPartyHold !== null) {
+    if (
+      typeof rawThirdPartyHold !== 'number'
+      || !Number.isInteger(rawThirdPartyHold)
+      || rawThirdPartyHold < 0
+      || rawThirdPartyHold > 365
+    ) {
+      return { ...DISABLED_RING_AUTO_APPROVE };
+    }
+    thirdPartyDeferralDays = rawThirdPartyHold;
+  }
+  const autoApproveUnrated = obj.autoApproveUnrated === true;
+
+  return { enabled: obj.enabled === true, severities, deferralDays, thirdPartyApps, thirdPartyDeferralDays, autoApproveUnrated };
+}
+
+export function normalizeRing(raw: Record<string, unknown>): UpdateRingItem {
+  return {
+    id: String(raw.id ?? ''),
+    name: String(raw.name ?? 'Untitled'),
+    description: raw.description ? String(raw.description) : null,
+    enabled: raw.enabled !== false,
+    ringOrder: Number(raw.ringOrder ?? 0),
+    deferralDays: Number(raw.deferralDays ?? 0),
+    deadlineDays: raw.deadlineDays != null ? Number(raw.deadlineDays) : null,
+    gracePeriodHours: Number(raw.gracePeriodHours ?? 4),
+    autoApprove: normalizeRingAutoApprove(raw.autoApprove),
+    categoryRules: Array.isArray(raw.categoryRules) ? raw.categoryRules as UpdateRingItem['categoryRules'] : [],
+    deviceCount: raw.deviceCount != null ? Number(raw.deviceCount) : undefined,
+    updatedAt: raw.updatedAt ? String(raw.updatedAt) : undefined,
+  };
+}
+
+export type DevicePatchRow = {
+  id: string;
+  hostname: string;
+  osType: string;
+  lastSeenAt?: string;
+  pendingPatches: number;
+  approvedMissing: number;
+  unapprovedMissing: number;
+  criticalMissing: number;
+  importantMissing: number;
+  osMissing: number;
+  thirdPartyMissing: number;
+  lastInstalledAt?: string;
+  lastScannedAt?: string;
+  pendingReboot: boolean;
+  /** Device status from the /devices API ('online' | 'offline' | ...). Used to
+   *  mute the pending-reboot badge for offline devices, whose reboot flag is
+   *  frozen at the last heartbeat and may be stale (#2219). */
+  status?: string;
+  /** The org this device belongs to, as returned by the /devices API. Used to
+   *  derive the true target scope for bulk-action confirmation messages. */
+  orgId?: string;
+};
+
+export function formatRelativeTime(isoString: string): string {
+  const date = new Date(isoString);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return 'just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours}h ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 30) return `${diffDays}d ago`;
+  return date.toLocaleDateString();
+}
+
+export function lastActivity(installed?: string, scanned?: string): { label: string; tooltip: string } {
+  const inst = installed ? new Date(installed).getTime() : 0;
+  const scan = scanned ? new Date(scanned).getTime() : 0;
+  if (!inst && !scan) return { label: '\u2014', tooltip: 'No activity recorded' };
+  if (inst >= scan) {
+    const label = formatRelativeTime(installed!);
+    return { label: `Installed ${label}`, tooltip: scanned ? `Last scanned ${formatRelativeTime(scanned)}` : 'No scan recorded' };
+  }
+  const label = formatRelativeTime(scanned!);
+  return { label: `Scanned ${label}`, tooltip: installed ? `Last installed ${formatRelativeTime(installed)}` : 'No install recorded' };
+}
+
+export function toNumber(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export type PatchSeveritySummary = {
+  total: number;
+  patched: number;
+  pending: number;
+};
+
+export type DevicePatchNeed = {
+  id: string;
+  name: string;
+  os: string;
+  missingCount: number;
+  approvedMissing: number;
+  unapprovedMissing: number;
+  criticalCount: number;
+  importantCount: number;
+  osMissing: number;
+  thirdPartyMissing: number;
+  lastInstalledAt?: string;
+  lastScannedAt?: string;
+  pendingReboot: boolean;
+  lastSeen?: string;
+};
+
+export type PatchComplianceData = {
+  totalDevices: number;
+  compliantDevices: number;
+  criticalSummary: PatchSeveritySummary;
+  importantSummary: PatchSeveritySummary;
+  devicesNeedingPatches: DevicePatchNeed[];
+};
+
+export function normalizeSummary(raw?: Record<string, unknown>): PatchSeveritySummary {
+  if (!raw) {
+    return { total: 0, patched: 0, pending: 0 };
+  }
+
+  return {
+    total: toNumber(raw.total ?? raw.totalCount ?? raw.count),
+    patched: toNumber(raw.patched ?? raw.approved ?? raw.installed),
+    pending: toNumber(raw.pending ?? raw.awaiting)
+  };
+}
+
+export function normalizeDeviceNeed(raw: Record<string, unknown>, index: number): DevicePatchNeed {
+  const id = raw.id ?? raw.deviceId ?? raw.device_id ?? `device-${index}`;
+  const name = raw.name ?? raw.hostname ?? raw.deviceName ?? 'Unknown device';
+  const os = raw.os ?? raw.osName ?? raw.osType ?? raw.platform ?? 'Unknown OS';
+
+  return {
+    id: String(id),
+    name: String(name),
+    os: String(os),
+    missingCount: toNumber(raw.missingCount ?? raw.missing ?? raw.patchesMissing),
+    approvedMissing: toNumber(raw.approvedMissing ?? raw.approved_missing ?? 0),
+    unapprovedMissing: toNumber(raw.unapprovedMissing ?? raw.unapproved_missing ?? 0),
+    criticalCount: toNumber(raw.criticalCount ?? raw.critical ?? raw.criticalMissing),
+    importantCount: toNumber(raw.importantCount ?? raw.important ?? raw.importantMissing),
+    osMissing: toNumber(raw.osMissing ?? raw.os_missing ?? 0),
+    thirdPartyMissing: toNumber(raw.thirdPartyMissing ?? raw.third_party_missing ?? 0),
+    lastInstalledAt: raw.lastInstalledAt ? String(raw.lastInstalledAt) : raw.last_installed_at ? String(raw.last_installed_at) : undefined,
+    lastScannedAt: raw.lastScannedAt ? String(raw.lastScannedAt) : raw.last_scanned_at ? String(raw.last_scanned_at) : undefined,
+    pendingReboot: Boolean(raw.pendingReboot ?? raw.pending_reboot ?? false),
+    lastSeen: raw.lastSeen ? String(raw.lastSeen) : raw.last_seen ? String(raw.last_seen) : undefined
+  };
+}
+
+export function normalizeCompliance(raw: Record<string, unknown>): PatchComplianceData {
+  const summary = raw.summary && typeof raw.summary === 'object' ? (raw.summary as Record<string, unknown>) : undefined;
+  const severitySummary = raw.severitySummary && typeof raw.severitySummary === 'object'
+    ? (raw.severitySummary as Record<string, unknown>)
+    : undefined;
+  const severity = raw.severity && typeof raw.severity === 'object'
+    ? (raw.severity as Record<string, unknown>)
+    : undefined;
+  const totalDevices = toNumber(raw.totalDevices ?? raw.total_devices ?? raw.total ?? summary?.total);
+  const compliantDevices = toNumber(raw.compliantDevices ?? raw.compliant_devices ?? raw.compliant ?? summary?.approved);
+  const criticalSummary = normalizeSummary(
+    (raw.criticalSummary ?? raw.critical_summary ?? severitySummary?.critical ?? severity?.critical) as
+      | Record<string, unknown>
+      | undefined
+  );
+  const importantSummary = normalizeSummary(
+    (raw.importantSummary ?? raw.important_summary ?? severitySummary?.important ?? severity?.important) as
+      | Record<string, unknown>
+      | undefined
+  );
+
+  const deviceList = raw.devicesNeedingPatches ?? raw.devices_needing_patches ?? raw.devices ?? [];
+  const devicesNeedingPatches = Array.isArray(deviceList)
+    ? deviceList.map((device: Record<string, unknown>, index: number) => normalizeDeviceNeed(device, index))
+    : [];
+
+  return {
+    totalDevices,
+    compliantDevices,
+    criticalSummary,
+    importantSummary,
+    devicesNeedingPatches
+  };
+}

@@ -1,0 +1,917 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/breeze-rmm/agent/internal/backup"
+	"github.com/breeze-rmm/agent/internal/backup/bmr"
+	"github.com/breeze-rmm/agent/internal/backup/providers"
+	"github.com/breeze-rmm/agent/internal/backupipc"
+	"github.com/breeze-rmm/agent/internal/ipc"
+)
+
+type encryptionTestProvider struct {
+	algorithm string
+	kmsKeyID  string
+}
+
+func (p *encryptionTestProvider) Upload(_, _ string) error        { return nil }
+func (p *encryptionTestProvider) Download(_, _ string) error      { return nil }
+func (p *encryptionTestProvider) List(_ string) ([]string, error) { return nil, nil }
+func (p *encryptionTestProvider) Delete(_ string) error           { return nil }
+func (p *encryptionTestProvider) SetServerSideEncryption(algorithm, kmsKeyID string) {
+	p.algorithm = algorithm
+	p.kmsKeyID = kmsKeyID
+}
+
+func TestExecBackupRestoreWithProgressNilManager(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"commandId":  "restore-1",
+		"snapshotId": "snap-1",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	result := execBackupRestoreWithProgress(context.Background(), "", payload, nil, nil, nil)
+	if result.Success {
+		t.Fatal("expected restore to fail without a configured backup manager")
+	}
+	if result.Stderr != "backup not configured on this device" {
+		t.Fatalf("unexpected stderr: %q", result.Stderr)
+	}
+}
+
+func TestExecBackupRestoreWithProgressUsesWrapperCommandID(t *testing.T) {
+	originalWorkRoot := backupRestoreWorkRoot
+	backupRestoreWorkRoot = func() string { return t.TempDir() }
+	t.Cleanup(func() { backupRestoreWorkRoot = originalWorkRoot })
+	baseDir := t.TempDir()
+	provider := providers.NewLocalProvider(baseDir)
+	snapshotID := "restore-progress-1"
+	prefix := filepath.Join("snapshots", snapshotID)
+
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "hello.txt")
+	if err := os.WriteFile(srcPath, []byte("hello world"), 0o644); err != nil {
+		t.Fatalf("write source file: %v", err)
+	}
+	backupPath := filepath.ToSlash(filepath.Join(prefix, "files", "hello.txt.gz"))
+	if err := provider.Upload(srcPath, backupPath); err != nil {
+		t.Fatalf("upload source file: %v", err)
+	}
+
+	manifest := backup.Snapshot{
+		ID: snapshotID,
+		Files: []backup.SnapshotFile{
+			{SourcePath: "/original/hello.txt", BackupPath: backupPath, Size: 11},
+		},
+		Size: 11,
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(manifestPath, manifestBytes, 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if err := provider.Upload(manifestPath, filepath.ToSlash(filepath.Join(prefix, "manifest.json"))); err != nil {
+		t.Fatalf("upload manifest: %v", err)
+	}
+
+	mgr := backup.NewBackupManager(backup.BackupConfig{Provider: provider})
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	serverIPC := ipc.NewConn(serverConn)
+	clientIPC := ipc.NewConn(clientConn)
+
+	progressCh := make(chan backupipc.BackupProgress, 1)
+	go func() {
+		for i := 0; i < 2; i++ {
+			clientIPC.SetReadDeadline(time.Now().Add(5 * time.Second))
+			env, recvErr := clientIPC.Recv()
+			if recvErr != nil {
+				t.Errorf("recv progress: %v", recvErr)
+				return
+			}
+			if env.Type != backupipc.TypeBackupProgress {
+				t.Errorf("unexpected message type: %s", env.Type)
+				return
+			}
+			var progress backupipc.BackupProgress
+			if unmarshalErr := json.Unmarshal(env.Payload, &progress); unmarshalErr != nil {
+				t.Errorf("unmarshal progress: %v", unmarshalErr)
+				return
+			}
+			if i == 0 {
+				progressCh <- progress
+			}
+		}
+	}()
+
+	payload, err := json.Marshal(map[string]any{
+		"snapshotId": snapshotID,
+		"targetPath": t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	result := execBackupRestoreWithProgress(context.Background(), "wrapper-cmd-1", payload, mgr, nil, serverIPC)
+	if !result.Success {
+		t.Fatalf("expected restore to succeed, got stderr %q", result.Stderr)
+	}
+
+	select {
+	case progress := <-progressCh:
+		if progress.CommandID != "wrapper-cmd-1" {
+			t.Fatalf("progress CommandID = %q, want wrapper-cmd-1", progress.CommandID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for restore progress")
+	}
+}
+
+func TestApplyCommandStorageEncryptionConfiguresS3SSE(t *testing.T) {
+	provider := &encryptionTestProvider{}
+	payload, err := json.Marshal(map[string]any{
+		"storageEncryption": map[string]any{
+			"required":     true,
+			"mode":         "s3-sse-kms",
+			"keyReference": "arn:aws:kms:us-east-1:123456789012:key/abcd",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	if err := applyCommandStorageEncryption(provider, payload); err != nil {
+		t.Fatalf("apply encryption: %v", err)
+	}
+	if provider.algorithm != "aws:kms" || provider.kmsKeyID != "arn:aws:kms:us-east-1:123456789012:key/abcd" {
+		t.Fatalf("provider encryption = %q/%q", provider.algorithm, provider.kmsKeyID)
+	}
+}
+
+func TestApplyCommandStorageEncryptionFailsClosedForUnsupportedProvider(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"storageEncryption": map[string]any{
+			"required": true,
+			"mode":     "s3-sse-s3",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	err = applyCommandStorageEncryption(providers.NewLocalProvider(t.TempDir()), payload)
+	if err == nil {
+		t.Fatal("expected unsupported provider error")
+	}
+	if err.Error() != "backup storage encryption is required but the configured provider cannot enforce it" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestApplyCommandStorageEncryptionAllowsDisabledPayload(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"storageEncryption": map[string]any{
+			"required": false,
+			"mode":     "disabled",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	if err := applyCommandStorageEncryption(providers.NewLocalProvider(t.TempDir()), payload); err != nil {
+		t.Fatalf("disabled encryption should not fail: %v", err)
+	}
+}
+
+func TestExecBMRRecoverRequiresTokenAndServer(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"snapshotId": "snap-1",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	result := execBMRRecover(context.Background(), payload, nil)
+	if result.Success {
+		t.Fatal("expected BMR recovery to fail without token/server")
+	}
+	if result.Stderr != "bmr recovery requires recoveryToken and serverUrl" {
+		t.Fatalf("unexpected stderr: %q", result.Stderr)
+	}
+}
+
+func TestExecBMRRecoverUsesTokenDrivenRunner(t *testing.T) {
+	origRunner := runBMRRecovery
+	defer func() { runBMRRecovery = origRunner }()
+
+	var gotCfg any
+	runBMRRecovery = func(ctx context.Context, cfg bmr.RecoveryConfig) (*bmr.RecoveryResult, error) {
+		gotCfg = cfg
+		if ctx == nil {
+			t.Fatal("expected context to be provided")
+		}
+		return &bmr.RecoveryResult{Status: "completed"}, nil
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"recoveryToken": "brz_rec_test",
+		"serverUrl":     "https://api.example.com",
+		"targetPaths": map[string]string{
+			"/src": "/dst",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	result := execBMRRecover(context.Background(), payload, nil)
+	if !result.Success {
+		t.Fatalf("expected BMR recovery to succeed, got stderr %q", result.Stderr)
+	}
+	cfg, ok := gotCfg.(bmr.RecoveryConfig)
+	if !ok {
+		t.Fatalf("runner did not receive RecoveryConfig, got %T", gotCfg)
+	}
+	if cfg.RecoveryToken != "brz_rec_test" || cfg.ServerURL != "https://api.example.com" {
+		t.Fatalf("runner cfg = %+v", cfg)
+	}
+}
+
+// defaultVSS's OS decision must be asserted on EVERY platform, not just
+// Windows: the internal/backup package (and this VSS-by-default flip) is
+// excluded from the Windows CI job, so a `runtime.GOOS == "windows"`-based
+// expectation is vacuously true on the Linux runners that actually run these
+// tests. Passing goos explicitly makes windows→true testable everywhere.
+func TestDefaultVSS(t *testing.T) {
+	tests := []struct {
+		name        string
+		goos        string
+		systemImage bool
+		hasPaths    bool
+		want        bool
+	}{
+		{"windows file backup defaults VSS on", "windows", false, false, true},
+		{"windows system_image without paths defaults VSS off", "windows", true, false, false},
+		// #5493: a wholeMachine system_image run (systemImage=true, paths
+		// present) walks the OS root the same as a file-mode run, so it
+		// needs VSS on Windows the same as file mode — VSS must not stay
+		// off just because SystemImage is also true.
+		{"windows system_image WITH paths (wholeMachine) defaults VSS on", "windows", true, true, true},
+		{"linux file backup defaults VSS off", "linux", false, false, false},
+		{"linux system_image without paths defaults VSS off", "linux", true, false, false},
+		{"linux system_image with paths defaults VSS off (non-windows)", "linux", true, true, false},
+		{"darwin file backup defaults VSS off", "darwin", false, false, false},
+		{"darwin system_image defaults VSS off", "darwin", true, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := defaultVSS(tt.goos, tt.systemImage, tt.hasPaths); got != tt.want {
+				t.Fatalf("defaultVSS(%q, %v, %v) = %v, want %v", tt.goos, tt.systemImage, tt.hasPaths, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagerFromBackupRunPayload(t *testing.T) {
+	tests := []struct {
+		name            string
+		payload         string
+		wantNil         bool // manager is nil (fall back to agent.yaml manager)
+		wantErr         bool
+		wantProvider    string   // "s3" | "local" | "" (skip provider assertion)
+		wantBucket      string   // for s3
+		wantBasePath    string   // for local
+		wantPaths       []string // expected manager paths
+		wantExcludes    []string // expected manager excludes (nil unless set)
+		wantSystemImage bool     // expected SystemStateEnabled
+		wantVSS         bool     // expected VSSEnabled
+
+		wantBaseSnapshotID        *string
+		wantPublishLeaseExpiresAt time.Time
+	}{
+		{
+			name:    "empty payload falls back to agent.yaml manager",
+			payload: "",
+			wantNil: true,
+		},
+		{
+			name:    "missing providerConfig falls back",
+			payload: `{"provider":"s3","paths":["/data"]}`,
+			wantNil: true,
+		},
+		{
+			name:    "missing provider falls back",
+			payload: `{"providerConfig":{"bucket":"b"},"paths":["/data"]}`,
+			wantNil: true,
+		},
+		{
+			name:         "s3 provider with paths",
+			payload:      `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1","accessKey":"AK","secretKey":"SK"},"paths":["/etc","/home/user"]}`,
+			wantProvider: "s3",
+			wantBucket:   "my-bucket",
+			wantPaths:    []string{"/etc", "/home/user"},
+			wantVSS:      runtime.GOOS == "windows",
+		},
+		{
+			name:         "local provider with path",
+			payload:      `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"]}`,
+			wantProvider: "local",
+			wantBasePath: filepath.Clean("/var/backups"),
+			wantPaths:    []string{"/data"},
+			wantVSS:      runtime.GOOS == "windows",
+		},
+		{
+			name:         "vss:true forces VSS on for file backups regardless of OS",
+			payload:      `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"],"vss":true}`,
+			wantProvider: "local",
+			wantBasePath: filepath.Clean("/var/backups"),
+			wantPaths:    []string{"/data"},
+			wantVSS:      true,
+		},
+		{
+			name:         "vss:false forces VSS off for file backups regardless of OS",
+			payload:      `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"],"vss":false}`,
+			wantProvider: "local",
+			wantBasePath: filepath.Clean("/var/backups"),
+			wantPaths:    []string{"/data"},
+			wantVSS:      false,
+		},
+		{
+			// system_image mode manages its own consistency (system state
+			// collection), so an absent vss field must not default it on even on
+			// Windows.
+			name:            "system_image mode without vss override defaults to VSS off",
+			payload:         `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1","accessKey":"AK","secretKey":"SK"},"systemImage":true}`,
+			wantProvider:    "s3",
+			wantBucket:      "my-bucket",
+			wantSystemImage: true,
+			wantVSS:         false,
+		},
+		{
+			name:            "vss:true overrides system_image mode's default-off",
+			payload:         `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1","accessKey":"AK","secretKey":"SK"},"systemImage":true,"vss":true}`,
+			wantProvider:    "s3",
+			wantBucket:      "my-bucket",
+			wantSystemImage: true,
+			wantVSS:         true,
+		},
+		{
+			// #5493: a wholeMachine profile fans out systemImage:true WITH
+			// paths + excludes (backupWorker.ts resolveBackupTargets), so ONE
+			// run must walk the OS root AND collect system state — instead
+			// of the pre-#5493 files-less system_image-only snapshot.
+			name:            "systemImage with paths (wholeMachine) sets Paths + Excludes and keeps SystemStateEnabled",
+			payload:         `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1","accessKey":"AK","secretKey":"SK"},"systemImage":true,"wholeMachine":true,"paths":["/"],"excludes":["/proc/**","/sys/**"]}`,
+			wantProvider:    "s3",
+			wantBucket:      "my-bucket",
+			wantPaths:       []string{"/"},
+			wantExcludes:    []string{"/proc/**", "/sys/**"},
+			wantSystemImage: true,
+			wantVSS:         runtime.GOOS == "windows",
+		},
+		{
+			// Without paths, system_image stays exactly as before: Paths nil,
+			// VSS off (its own consistency mechanism is system state, not VSS).
+			name:            "systemImage without paths leaves Paths nil and VSS off",
+			payload:         `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1","accessKey":"AK","secretKey":"SK"},"systemImage":true}`,
+			wantProvider:    "s3",
+			wantBucket:      "my-bucket",
+			wantPaths:       nil,
+			wantSystemImage: true,
+			wantVSS:         false,
+		},
+		{
+			name:    "unsupported provider errors",
+			payload: `{"provider":"dropbox","providerConfig":{"bucket":"b"},"paths":["/data"]}`,
+			wantErr: true,
+		},
+		{
+			name:    "empty paths errors",
+			payload: `{"provider":"s3","providerConfig":{"bucket":"b","region":"r"},"paths":[]}`,
+			wantErr: true,
+		},
+		{
+			name:    "malformed payload errors",
+			payload: `{"provider":`,
+			wantErr: true,
+		},
+		{
+			// The server fans a `system_image` selection out as a backup_run
+			// carrying `systemImage:true` and no `paths` (backupWorker.ts
+			// resolveBackupTargets). Before the fix this tripped the "backup_run
+			// payload has no paths" guard and the job failed outright.
+			name:            "system_image mode needs no paths",
+			payload:         `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1","accessKey":"AK","secretKey":"SK"},"systemImage":true}`,
+			wantProvider:    "s3",
+			wantBucket:      "my-bucket",
+			wantSystemImage: true,
+			wantVSS:         false,
+		},
+		{
+			name:                      "server-owned mode: non-empty baseSnapshotId with a lease",
+			payload:                   `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"],"baseSnapshotId":"snap-123","publishLeaseExpiresAt":"2026-09-16T00:00:00Z"}`,
+			wantProvider:              "local",
+			wantBasePath:              filepath.Clean("/var/backups"),
+			wantPaths:                 []string{"/data"},
+			wantVSS:                   runtime.GOOS == "windows",
+			wantBaseSnapshotID:        strPtr("snap-123"),
+			wantPublishLeaseExpiresAt: time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:                      "server-owned mode: empty baseSnapshotId means full run, lease still set",
+			payload:                   `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"],"baseSnapshotId":"","publishLeaseExpiresAt":"2026-09-16T00:00:00Z"}`,
+			wantProvider:              "local",
+			wantBasePath:              filepath.Clean("/var/backups"),
+			wantPaths:                 []string{"/data"},
+			wantVSS:                   runtime.GOOS == "windows",
+			wantBaseSnapshotID:        strPtr(""),
+			wantPublishLeaseExpiresAt: time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:         "legacy payload: no baseSnapshotId field at all",
+			payload:      `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"]}`,
+			wantProvider: "local",
+			wantBasePath: filepath.Clean("/var/backups"),
+			wantPaths:    []string{"/data"},
+			wantVSS:      runtime.GOOS == "windows",
+			// wantBaseSnapshotID left nil (legacy mode), wantPublishLeaseExpiresAt left zero.
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, err := managerFromBackupRunPayload(json.RawMessage(tt.payload))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got mgr=%v err=nil", mgr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantNil {
+				if mgr != nil {
+					t.Fatalf("expected nil manager (fallback), got %+v", mgr)
+				}
+				return
+			}
+			if mgr == nil {
+				t.Fatal("expected a manager, got nil")
+			}
+
+			// Retention MUST be 0: the server owns retention and the agent must
+			// never prune remote storage (DeleteSnapshotContext no-ops on 0).
+			if got := mgr.GetRetention(); got != 0 {
+				t.Fatalf("retention = %d, want 0 (server owns retention)", got)
+			}
+
+			gotPaths := mgr.GetPaths()
+			if len(gotPaths) != len(tt.wantPaths) {
+				t.Fatalf("paths = %v, want %v", gotPaths, tt.wantPaths)
+			}
+			for i := range tt.wantPaths {
+				if gotPaths[i] != tt.wantPaths[i] {
+					t.Errorf("paths[%d] = %q, want %q", i, gotPaths[i], tt.wantPaths[i])
+				}
+			}
+
+			gotExcludes := mgr.GetExcludes()
+			if len(gotExcludes) != len(tt.wantExcludes) {
+				t.Fatalf("excludes = %v, want %v", gotExcludes, tt.wantExcludes)
+			}
+			for i := range tt.wantExcludes {
+				if gotExcludes[i] != tt.wantExcludes[i] {
+					t.Errorf("excludes[%d] = %q, want %q", i, gotExcludes[i], tt.wantExcludes[i])
+				}
+			}
+
+			if got := mgr.GetSystemStateEnabled(); got != tt.wantSystemImage {
+				t.Fatalf("SystemStateEnabled = %v, want %v", got, tt.wantSystemImage)
+			}
+
+			if got := mgr.GetVSSEnabled(); got != tt.wantVSS {
+				t.Fatalf("VSSEnabled = %v, want %v", got, tt.wantVSS)
+			}
+
+			gotBase := mgr.GetBaseSnapshotID()
+			if (gotBase == nil) != (tt.wantBaseSnapshotID == nil) {
+				t.Fatalf("GetBaseSnapshotID() = %v, want %v", gotBase, tt.wantBaseSnapshotID)
+			}
+			if gotBase != nil && tt.wantBaseSnapshotID != nil && *gotBase != *tt.wantBaseSnapshotID {
+				t.Fatalf("GetBaseSnapshotID() = %q, want %q", *gotBase, *tt.wantBaseSnapshotID)
+			}
+			if !mgr.GetPublishLeaseExpiresAt().Equal(tt.wantPublishLeaseExpiresAt) {
+				t.Fatalf("GetPublishLeaseExpiresAt() = %v, want %v", mgr.GetPublishLeaseExpiresAt(), tt.wantPublishLeaseExpiresAt)
+			}
+
+			provider := mgr.GetProvider()
+			switch tt.wantProvider {
+			case "s3":
+				s3p, ok := provider.(*providers.S3Provider)
+				if !ok {
+					t.Fatalf("provider type = %T, want *providers.S3Provider", provider)
+				}
+				if s3p.Bucket != tt.wantBucket {
+					t.Errorf("bucket = %q, want %q", s3p.Bucket, tt.wantBucket)
+				}
+			case "local":
+				localP, ok := provider.(*providers.LocalProvider)
+				if !ok {
+					t.Fatalf("provider type = %T, want *providers.LocalProvider", provider)
+				}
+				if localP.BasePath != tt.wantBasePath {
+					t.Errorf("basePath = %q, want %q", localP.BasePath, tt.wantBasePath)
+				}
+			}
+		})
+	}
+}
+
+func TestParseBackupRunExcludes(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    []string // nil = fall back to config excludes
+		wantErr bool
+	}{
+		{
+			name:    "empty payload returns nil (config fallback)",
+			payload: "",
+			want:    nil,
+		},
+		{
+			name:    "missing excludes field returns nil (old-server compat)",
+			payload: `{"paths":["/data"],"jobId":"j1"}`,
+			want:    nil,
+		},
+		{
+			name:    "explicit empty list disables exclusions (non-nil empty)",
+			payload: `{"paths":["/data"],"excludes":[]}`,
+			want:    []string{},
+		},
+		{
+			name:    "populated excludes decoded alongside other payload fields",
+			payload: `{"jobId":"j1","paths":["C:\\Users"],"excludes":["*.tmp","node_modules/**"],"storageEncryption":{"required":false,"mode":"disabled"}}`,
+			want:    []string{"*.tmp", "node_modules/**"},
+		},
+		{
+			name:    "malformed payload returns error",
+			payload: `{"excludes":`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseBackupRunExcludes(json.RawMessage(tt.payload))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if (got == nil) != (tt.want == nil) {
+				t.Fatalf("nil-ness mismatch: got %#v, want %#v (nil vs empty is the compat contract)", got, tt.want)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("excludes[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// blockingRunProvider mirrors backup_test.go's blockingUploadProvider
+// (package backup, unreachable from here): it signals once upload has
+// started, then blocks until the context passed to UploadContext is done.
+type blockingRunProvider struct {
+	once    sync.Once
+	started chan struct{}
+}
+
+func newBlockingRunProvider() *blockingRunProvider {
+	return &blockingRunProvider{started: make(chan struct{})}
+}
+
+func (p *blockingRunProvider) Upload(localPath, remotePath string) error {
+	return p.UploadContext(context.Background(), localPath, remotePath)
+}
+
+func (p *blockingRunProvider) UploadContext(ctx context.Context, localPath, remotePath string) error {
+	p.once.Do(func() { close(p.started) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (p *blockingRunProvider) Download(remotePath, localPath string) error { return nil }
+func (p *blockingRunProvider) List(prefix string) ([]string, error)        { return []string{}, nil }
+func (p *blockingRunProvider) Delete(remotePath string) error              { return nil }
+
+// TestBackupStopCancelsPayloadDispatchedBackupRun proves the fix for the bug
+// this task addresses: executeCommand's "backup_run" case builds (or, as
+// here, is handed) an ephemeral BackupManager that never goes through
+// mgr.Stop() — only backup_stop's commandCanceller.cancelAll() can reach it.
+// Before RunBackupContext/commandCanceller.track wiring, cancelAll had
+// nothing tracked for this command and the run kept going.
+func TestBackupStopCancelsPayloadDispatchedBackupRun(t *testing.T) {
+	provider := newBlockingRunProvider()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	mgr := backup.NewBackupManager(backup.BackupConfig{Provider: provider, Paths: []string{dir}})
+	commandCanceller := newActiveCommandCanceller()
+
+	req := backupipc.BackupCommandRequest{
+		CommandID:   "run-1",
+		CommandType: "backup_run",
+	}
+
+	resultCh := make(chan backupipc.BackupCommandResult, 1)
+	go func() {
+		resultCh <- executeCommand(req, mgr, nil, nil, commandCanceller)
+	}()
+
+	select {
+	case <-provider.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for backup upload to start")
+	}
+
+	if !commandCanceller.cancelAll() {
+		t.Fatal("cancelAll should report an active command was cancelled")
+	}
+
+	select {
+	case result := <-resultCh:
+		if result.Success {
+			t.Fatalf("expected backup_run to fail after backup_stop cancelled it, got success: %+v", result)
+		}
+		if result.Stderr != "backup stopped" {
+			t.Fatalf("stderr = %q, want %q", result.Stderr, "backup stopped")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("backup_run did not unwind after backup_stop cancelled it")
+	}
+}
+
+// The incremental dedupe base is selected by BackupIdentity, which includes
+// the device's agent id (D6: without it, previousManifest fails open to a full
+// backup every run — or, before the identity existed, deduped against ANY
+// device's newest manifest in the bucket). Both payload-built managers must
+// carry the helper's agent id.
+func TestManagerFromBackupRunPayload_CarriesHelperAgentID(t *testing.T) {
+	prev := helperAgentID
+	helperAgentID = "agent-abc123"
+	t.Cleanup(func() { helperAgentID = prev })
+	for name, payload := range map[string]string{
+		"file":         `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/srv/data"]}`,
+		"system_image": `{"provider":"local","providerConfig":{"path":"/var/backups"},"systemImage":true}`,
+	} {
+		mgr, err := managerFromBackupRunPayload(json.RawMessage(payload))
+		if err != nil || mgr == nil {
+			t.Fatalf("%s: mgr=%v err=%v", name, mgr, err)
+		}
+		if got := mgr.GetAgentID(); got != "agent-abc123" {
+			t.Fatalf("%s: AgentID = %q, want agent-abc123", name, got)
+		}
+	}
+}
+
+// TestRestoreProviderFromPayload_S3CredentialsAWSSpelling covers the SECOND
+// call site fixed for #6511 (restore/verify/test-restore, and — via
+// rebuild_cmd.go — bare-metal rebuild). managerFromBackupRunPayload's own
+// AWS-spelling test only proves the backup_run dispatch path; this proves
+// restoreProviderFromPayload independently routes through the same
+// credentials() fallback rather than reading the raw AccessKey/SecretKey
+// fields directly.
+func TestRestoreProviderFromPayload_S3CredentialsAWSSpelling(t *testing.T) {
+	payload := `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1","accessKeyId":"AKID","secretAccessKey":"SAK"}}`
+	provider, err := restoreProviderFromPayload(json.RawMessage(payload))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s3p, ok := provider.(*providers.S3Provider)
+	if !ok {
+		t.Fatalf("provider type = %T, want *providers.S3Provider", provider)
+	}
+	if s3p.Bucket != "my-bucket" {
+		t.Errorf("bucket = %q, want %q", s3p.Bucket, "my-bucket")
+	}
+}
+
+// TestManagerFromBackupRunPayload_S3RejectsEmptyCredentials and its restore
+// counterpart below cover the silent-failure-hunter finding on #6511: an S3
+// provider config that resolves to empty credentials under BOTH spellings
+// must be rejected loudly here, rather than constructed and left to fall
+// through to the AWS SDK's default credential chain — the exact "upload
+// stalled" opaque-IMDS/DNS-timeout symptom this issue was filed for.
+func TestManagerFromBackupRunPayload_S3RejectsEmptyCredentials(t *testing.T) {
+	payload := `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1"},"paths":["/data"]}`
+	mgr, err := managerFromBackupRunPayload(json.RawMessage(payload))
+	if err == nil {
+		t.Fatal("expected an error rejecting an s3 config with no credentials under either spelling")
+	}
+	if mgr != nil {
+		t.Fatal("expected a nil manager on rejection")
+	}
+}
+
+func TestRestoreProviderFromPayload_S3RejectsEmptyCredentials(t *testing.T) {
+	payload := `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1"}}`
+	provider, err := restoreProviderFromPayload(json.RawMessage(payload))
+	if err == nil {
+		t.Fatal("expected an error rejecting an s3 config with no credentials under either spelling")
+	}
+	if provider != nil {
+		t.Fatal("expected a nil provider on rejection")
+	}
+}
+
+func TestRestoreProviderFromPayload_EmptyPayloadFallsBack(t *testing.T) {
+	provider, err := restoreProviderFromPayload(json.RawMessage(""))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if provider != nil {
+		t.Fatalf("expected nil provider (fallback), got %+v", provider)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+// TestManagerFromBackupRunPayload_RejectsServerOwnedModeWithoutLease is the
+// D18 §3.1 P1 fix: a present baseSnapshotId (server-owned mode is ON, even
+// when it points at an explicit full run "") with a missing/empty/zero
+// publishLeaseExpiresAt is a protocol violation by the dispatching server —
+// reject the whole payload rather than silently running ungated.
+func TestManagerFromBackupRunPayload_RejectsServerOwnedModeWithoutLease(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "baseSnapshotId present, publishLeaseExpiresAt entirely absent",
+			payload: `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"],"baseSnapshotId":"snap-1"}`,
+		},
+		{
+			name:    "baseSnapshotId present, publishLeaseExpiresAt empty string",
+			payload: `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"],"baseSnapshotId":"snap-1","publishLeaseExpiresAt":""}`,
+		},
+		{
+			name:    "baseSnapshotId is an explicit full-run empty string, lease still required",
+			payload: `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"],"baseSnapshotId":""}`,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, err := managerFromBackupRunPayload(json.RawMessage(tt.payload))
+			if err == nil {
+				t.Fatal("expected an error rejecting a server-owned-mode payload with no publish lease")
+			}
+			if mgr != nil {
+				t.Fatal("expected a nil manager on rejection")
+			}
+		})
+	}
+}
+
+// TestManagerFromBackupRunPayload_RejectsLeaseWithoutBaseSnapshotID is the
+// symmetric case of TestManagerFromBackupRunPayload_RejectsServerOwnedModeWithoutLease
+// (review finding, D18 §3.1): a payload carrying publishLeaseExpiresAt but
+// no baseSnapshotId field at all would otherwise silently fall back to
+// legacy (fully unfenced) mode instead of getting the publish-lease gate
+// its own lease implies it wants.
+func TestManagerFromBackupRunPayload_RejectsLeaseWithoutBaseSnapshotID(t *testing.T) {
+	payload := `{"provider":"local","providerConfig":{"path":"/var/backups"},"paths":["/data"],"publishLeaseExpiresAt":"2026-09-16T00:00:00Z"}`
+	mgr, err := managerFromBackupRunPayload(json.RawMessage(payload))
+	if err == nil {
+		t.Fatal("expected an error rejecting a lease with no baseSnapshotId")
+	}
+	if mgr != nil {
+		t.Fatal("expected a nil manager on rejection")
+	}
+}
+
+// TestBackupRunProviderConfigCredentials_AWSSpellingFallback covers #6511:
+// the API's own S3 config validator and connectivity probe have long
+// accepted the AWS-idiomatic accessKeyId/secretAccessKey spelling
+// (apps/api/src/routes/backup/schemas.ts, services/backupSnapshotStorage.ts)
+// alongside the canonical accessKey/secretKey the agent reads. A config
+// saved under only the AWS spelling validated, persisted, and dispatched —
+// then every upload ran with empty agent-side credentials, falling through
+// to the SDK's default credential chain and stalling on IMDS/DNS. The API
+// now canonicalizes at the write/dispatch boundary, but the agent should
+// tolerate both spellings too as a cheap second line of defense.
+func TestBackupRunProviderConfigCredentials_AWSSpellingFallback(t *testing.T) {
+	tests := []struct {
+		name          string
+		cfg           backupRunProviderConfig
+		wantAccessKey string
+		wantSecretKey string
+	}{
+		{
+			name:          "canonical spelling used directly",
+			cfg:           backupRunProviderConfig{AccessKey: "AK", SecretKey: "SK"},
+			wantAccessKey: "AK",
+			wantSecretKey: "SK",
+		},
+		{
+			name:          "AWS-idiomatic spelling falls back when canonical is empty",
+			cfg:           backupRunProviderConfig{AccessKeyID: "AKID", SecretAccessKey: "SAK"},
+			wantAccessKey: "AKID",
+			wantSecretKey: "SAK",
+		},
+		{
+			name: "canonical spelling wins when both are present",
+			cfg: backupRunProviderConfig{
+				AccessKey: "AK", SecretKey: "SK",
+				AccessKeyID: "AKID", SecretAccessKey: "SAK",
+			},
+			wantAccessKey: "AK",
+			wantSecretKey: "SK",
+		},
+		{
+			name:          "neither spelling present yields empty credentials",
+			cfg:           backupRunProviderConfig{},
+			wantAccessKey: "",
+			wantSecretKey: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAccessKey, gotSecretKey := tt.cfg.credentials()
+			if gotAccessKey != tt.wantAccessKey {
+				t.Errorf("accessKey = %q, want %q", gotAccessKey, tt.wantAccessKey)
+			}
+			if gotSecretKey != tt.wantSecretKey {
+				t.Errorf("secretKey = %q, want %q", gotSecretKey, tt.wantSecretKey)
+			}
+		})
+	}
+}
+
+// TestManagerFromBackupRunPayload_S3CredentialsAWSSpelling is an end-to-end
+// regression for #6511 through managerFromBackupRunPayload: a payload whose
+// providerConfig carries ONLY accessKeyId/secretAccessKey (no accessKey/
+// secretKey) must still resolve to real, non-empty credentials instead of
+// silently falling back to empty strings (S3Provider keeps its resolved
+// credentials unexported, so this asserts what managerFromBackupRunPayload
+// actually decoded and would have passed to NewS3ProviderWithEndpoint).
+func TestManagerFromBackupRunPayload_S3CredentialsAWSSpelling(t *testing.T) {
+	payload := `{"provider":"s3","providerConfig":{"bucket":"my-bucket","region":"us-east-1","accessKeyId":"AKID","secretAccessKey":"SAK"},"paths":["/data"]}`
+	var p struct {
+		ProviderConfig *backupRunProviderConfig `json:"providerConfig"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	gotAccessKey, gotSecretKey := p.ProviderConfig.credentials()
+	if gotAccessKey != "AKID" || gotSecretKey != "SAK" {
+		t.Fatalf("credentials() = (%q, %q), want (%q, %q)", gotAccessKey, gotSecretKey, "AKID", "SAK")
+	}
+
+	mgr, err := managerFromBackupRunPayload(json.RawMessage(payload))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mgr == nil {
+		t.Fatal("expected a manager, got nil")
+	}
+	provider := mgr.GetProvider()
+	s3p, ok := provider.(*providers.S3Provider)
+	if !ok {
+		t.Fatalf("provider type = %T, want *providers.S3Provider", provider)
+	}
+	if s3p.Bucket != "my-bucket" {
+		t.Errorf("bucket = %q, want %q", s3p.Bucket, "my-bucket")
+	}
+}
