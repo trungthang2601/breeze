@@ -8,6 +8,13 @@
 #   (or: docker compose -f docker-compose.yml -f docker-compose.override.yml.selfbuild up --build -d)
 
 services:
+  # Set CADDY_SITE_ADDRESS=:80 in .env when another reverse proxy (e.g. Nginx
+  # Proxy Manager) terminates TLS in front of this host; also set
+  # CADDY_TRUSTED_PROXIES to that proxy's IP so its X-Forwarded-Proto survives.
+  caddy:
+    environment:
+      CADDY_SITE_ADDRESS: "${CADDY_SITE_ADDRESS:-${BREEZE_DOMAIN:-:80}}"
+
   api:
     image: breeze-api:selfbuild
     build:
