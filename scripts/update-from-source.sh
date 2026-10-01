@@ -2,14 +2,17 @@
 #
 # Breeze RMM — update a self-hosted stack from this git checkout
 #
-# Pulls the latest commit of the current branch, backs up the database,
-# rebuilds the api/web/portal images from source and restarts the stack.
+# Pulls the latest commit of the current branch from GitHub, backs up the
+# database, rebuilds the api/web/portal images from source and restarts the
+# stack. Does nothing when GitHub has no new commits (use --force to rebuild).
 # Database migrations run automatically when the API starts (AUTO_MIGRATE).
 #
-# Usage (from anywhere, on the server):
-#   ./scripts/update-from-source.sh               # git pull + backup + rebuild + restart
-#   ./scripts/update-from-source.sh --no-pull     # deploy the checkout as it is now
-#   ./scripts/update-from-source.sh --skip-backup # skip the pg_dump step
+# Usage (on the server):
+#   breeze-update                # pull + backup + rebuild + restart
+#   breeze-update --force        # rebuild and restart even if nothing changed
+#   breeze-update --no-pull      # deploy the checkout as it is now
+#   breeze-update --skip-backup  # skip the pg_dump step
+#   breeze-update --install      # install the `breeze-update` command in /usr/local/bin
 #
 # Environment variables:
 #   BACKUP_DIR              Where database dumps go (default: /var/backups/breeze)
@@ -18,7 +21,8 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/.." && pwd)"
 cd "${REPO_DIR}"
 
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/breeze}"
@@ -29,11 +33,18 @@ BUILD_SERVICES=(api web portal)
 
 DO_PULL=true
 DO_BACKUP=true
+FORCE=false
 for arg in "$@"; do
   case "${arg}" in
     --no-pull) DO_PULL=false ;;
     --skip-backup) DO_BACKUP=false ;;
-    -h|--help) sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --force) FORCE=true ;;
+    --install)
+      ln -sfn "${SCRIPT_PATH}" /usr/local/bin/breeze-update
+      echo "Installed: breeze-update -> ${SCRIPT_PATH}"
+      exit 0
+      ;;
+    -h|--help) sed -n '2,21p' "${SCRIPT_PATH}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: ${arg}" >&2; exit 2 ;;
   esac
 done
@@ -87,10 +98,21 @@ if [[ "${DO_PULL}" == true ]]; then
   if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
     die "There are local edits on the server (git status). Commit or discard them — the server should only run what is on GitHub."
   fi
-  log "Pulling latest code ($(git rev-parse --abbrev-ref HEAD))..."
+  log "Pulling latest code from $(git remote get-url origin) ($(git rev-parse --abbrev-ref HEAD))..."
   git pull --ff-only
 fi
 new_rev="$(git rev-parse --short HEAD)"
+
+if [[ "${old_rev}" == "${new_rev}" ]]; then
+  api_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' breeze-api 2>/dev/null || true)"
+  if [[ "${DO_PULL}" == true && "${FORCE}" == false && "${api_status}" == healthy ]]; then
+    log "Already up to date (${new_rev}); nothing to deploy. Use --force to rebuild anyway."
+    exit 0
+  fi
+else
+  log "New commits:"
+  git log --oneline "${old_rev}..${new_rev}" | sed 's/^/    /'
+fi
 log "Deploying ${new_rev} (was ${old_rev}): $(git log -1 --format=%s)"
 
 # ---------------------------------------------------------------------------
