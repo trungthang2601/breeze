@@ -136,7 +136,7 @@ jobs:
           $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=KResLab" } | Select-Object -First 1
           Export-Certificate -Cert $cert -FilePath kreslab-codesign-public.cer | Out-Null
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: breeze-agent-windows-amd64-signed
           path: |
