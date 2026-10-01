@@ -1,0 +1,38 @@
+# Self-build overrides — run api/worker/web/portal from THIS checkout instead of
+# the published GHCR images. Intended for a fork deployed on an x86_64 host
+# (e.g. a Proxmox VM). binaries-init, caddy, postgres, redis and coturn keep the
+# image refs from .env, so agent binaries still come from the published release
+# matching BREEZE_VERSION.
+#
+# Usage: ./scripts/update-from-source.sh
+#   (or: docker compose -f docker-compose.yml -f docker-compose.override.yml.selfbuild up --build -d)
+
+services:
+  api:
+    image: breeze-api:selfbuild
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+      args:
+        APP_VERSION: ${BREEZE_VERSION:-dev}
+
+  worker:
+    image: breeze-api:selfbuild
+
+  web:
+    image: breeze-web:selfbuild
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+      args:
+        PUBLIC_API_URL: ""
+        PUBLIC_APP_VERSION: ${BREEZE_VERSION:-dev}
+
+  portal:
+    image: breeze-portal:selfbuild
+    build:
+      context: .
+      dockerfile: apps/portal/Dockerfile
+      args:
+        PORTAL_BASE_PATH: ${PORTAL_BASE_PATH:-/portal}
+        PUBLIC_API_URL: ""
