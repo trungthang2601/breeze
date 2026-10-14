@@ -144,3 +144,8 @@ test-results/
 # TURN TLS cert material (Let's Encrypt via lego) — never commit the private key
 .lego/
 coturn-tls/
+
+# local env backups (contain secrets)
+.env.bak*
+.env.*.bak
+*.env.bak
