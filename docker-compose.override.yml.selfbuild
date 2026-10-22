@@ -8,6 +8,9 @@
 #   (or: docker compose -f docker-compose.yml -f docker-compose.override.yml.selfbuild up --build -d)
 
 services:
+  # Dung image binaries co san tren may, khong keo tu ghcr (repo cu khong con quyen)
+  binaries-init:
+    pull_policy: missing
   # Set CADDY_SITE_ADDRESS=:80 in .env when another reverse proxy (e.g. Nginx
   # Proxy Manager) terminates TLS in front of this host; also set
   # CADDY_TRUSTED_PROXIES to that proxy's IP so its X-Forwarded-Proto survives.
