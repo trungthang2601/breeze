@@ -843,6 +843,29 @@ export default function ReportBuilder({
   }, [currentOrgId, reportId, schedule, t]);
 
   const fieldDefinitions = fieldDefinitionsByType[builderType];
+  const [sites, setSites] = useState<{ id: string; name: string }[]>([]);
+  const [selectedSiteIds, setSelectedSiteIds] = useState<string[]>(() => {
+    const f = (defaultValues?.filters ?? {}) as { siteIds?: unknown };
+    return Array.isArray(f.siteIds) ? f.siteIds.filter((x): x is string => typeof x === 'string') : [];
+  });
+
+  useEffect(() => {
+    if (!currentOrgId) return;
+    let alive = true;
+    fetchWithAuth(`/orgs/sites?orgId=${currentOrgId}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(body => {
+        if (!alive || !body) return;
+        const list = Array.isArray(body) ? body : (body.data ?? body.sites ?? []);
+        setSites(list.map((x: { id: string; name: string }) => ({ id: x.id, name: x.name })));
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [currentOrgId]);
+
+  const siteFilter: Record<string, unknown> =
+    dataSource.scope === 'by_site' && selectedSiteIds.length > 0 ? { siteIds: selectedSiteIds } : {};
+
   const dataSourceFields = dataSourceFieldsByType[builderType];
   const numericFields = useMemo(
     () => fieldDefinitions.filter(field => field.dataType === 'number'),
@@ -947,6 +970,7 @@ export default function ReportBuilder({
           }
         });
 
+        Object.assign(inheritedFilters, siteFilter);
         const config: Record<string, unknown> = {};
         if (defaultValues?.dateRange) {
           config.dateRange = defaultValues.dateRange;
@@ -1007,7 +1031,7 @@ export default function ReportBuilder({
       mounted = false;
       window.clearTimeout(timer);
     };
-  }, [builderType, currentOrgId, dataSource, defaultValues?.dateRange, defaultValues?.filters, exportFormats, filterConditions, mode, t]);
+  }, [builderType, currentOrgId, dataSource, defaultValues?.dateRange, defaultValues?.filters, exportFormats, filterConditions, mode, t, selectedSiteIds]);
 
   const normalizedPreviewRows = useMemo(
     () => livePreviewRows.map(row => normalizePreviewRow(builderType, row)),
@@ -1418,6 +1442,10 @@ export default function ReportBuilder({
         saveTemplate,
         templateName: saveTemplate ? templateName : undefined,
         legacyFilters: defaultValues?.filters,
+        filters: {
+          ...((defaultValues?.filters as Record<string, unknown>) ?? {}),
+          ...siteFilter,
+        },
         dateRange: defaultValues?.dateRange
       }
     };
@@ -1785,6 +1813,29 @@ export default function ReportBuilder({
                 )}
               </div>
             ))}
+            {builderType === 'devices' && dataSource.scope === 'by_site' && (
+              <div className="md:col-span-2">
+                <label className="text-sm font-medium">Chi nhánh (site)</label>
+                <div className="mt-2 grid max-h-48 grid-cols-2 gap-2 overflow-auto rounded-md border p-2">
+                  {sites.length === 0 && (
+                    <span className="text-sm text-muted-foreground">Không tải được danh sách site</span>
+                  )}
+                  {sites.map(site => (
+                    <label key={site.id} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={selectedSiteIds.includes(site.id)}
+                        onChange={e =>
+                          setSelectedSiteIds(prev =>
+                            e.target.checked ? [...prev, site.id] : prev.filter(id => id !== site.id))
+                        }
+                      />
+                      {site.name}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
