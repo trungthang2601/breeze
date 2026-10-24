@@ -707,6 +707,13 @@
       "exportLogs": "Export Logs",
       "empty": "No audit logs found.",
       "viewDetails": "View details",
+      "scope": {
+        "label": "Activity scope",
+        "organization": "Organization",
+        "partnerAccounts": "Partner accounts",
+        "partnerHint": "Sign-ins, invitations, MFA and user changes of partner accounts. These events belong to no organization, so the organization view does not show them.",
+        "forbidden": "Viewing partner account activity requires partner access to all organizations."
+      },
       "errors": {
         "fetch": "Failed to fetch audit logs",
         "load": "Failed to load audit logs"

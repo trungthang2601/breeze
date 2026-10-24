@@ -707,6 +707,13 @@
       "exportLogs": "Esporta log",
       "empty": "Nessun log di audit trovato.",
       "viewDetails": "Visualizza dettagli",
+      "scope": {
+        "label": "Ambito dell’attività",
+        "organization": "Organizzazione",
+        "partnerAccounts": "Account partner",
+        "partnerHint": "Accessi, inviti, MFA e modifiche utente degli account partner. Questi eventi non appartengono a nessuna organizzazione, quindi la vista organizzazione non li mostra.",
+        "forbidden": "Per visualizzare l’attività degli account partner serve l’accesso partner a tutte le organizzazioni."
+      },
       "errors": {
         "fetch": "Impossibile recuperare i log di audit",
         "load": "Impossibile caricare i log di audit"

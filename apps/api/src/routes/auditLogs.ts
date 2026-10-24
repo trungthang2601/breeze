@@ -1,8 +1,8 @@
 import { Hono } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
-import { and, desc, eq, gte, lte, ilike, inArray, not, or, sql, SQL } from 'drizzle-orm';
-import { db } from '../db';
+import { and, desc, eq, gte, lte, ilike, inArray, isNull, not, or, sql, SQL } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { auditLogs as auditLogsTable, users, devices } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission } from '../middleware/auth';
 import { writeRouteAudit } from '../services/auditEvents';
@@ -45,7 +45,12 @@ const listLogsSchema = z.object({
   orgId: z.string().guid().optional(),
   // CSV of action codes to exclude (e.g. routine agent telemetry). Applied to
   // both the LATERAL fast-path (RecentActivity) and the standard query path.
-  excludeActions: z.string().optional()
+  excludeActions: z.string().optional(),
+  // 'partner' = partner-level account activity (rows with no org_id written by
+  // or about the caller's partner users: sign-ins, invites, MFA, user admin).
+  // Those rows are invisible to the org-scoped list because RLS
+  // (breeze_has_org_access) rejects a NULL org_id for non-system callers.
+  scope: z.enum(['org', 'partner']).optional()
 });
 
 const searchSchema = listLogsSchema.extend({
@@ -329,6 +334,61 @@ function buildFilterConditions(
   return conditions.length > 0 ? and(...conditions) : undefined;
 }
 
+// ============================================
+// Partner-level account activity (scope=partner)
+// ============================================
+
+type PartnerAccountsAccess =
+  | { ok: true; partnerId: string | null }
+  | { ok: false };
+
+/**
+ * Who may read partner-level account activity. Partner-scope callers need
+ * org_access 'all' (a 'selected' member must not see sign-ins/invites of
+ * colleagues who manage orgs outside their selection); system scope may read
+ * every NULL-org row. Organization-scope callers never qualify.
+ */
+export function resolvePartnerAccountsAccess(auth: {
+  scope: string;
+  partnerId: string | null;
+  partnerOrgAccess?: 'all' | 'selected' | 'none' | null;
+}): PartnerAccountsAccess {
+  if (auth.scope === 'system') return { ok: true, partnerId: null };
+  if (auth.scope === 'partner' && auth.partnerId && auth.partnerOrgAccess === 'all') {
+    return { ok: true, partnerId: auth.partnerId };
+  }
+  return { ok: false };
+}
+
+/**
+ * Rows with no org_id that a member of `partnerId` performed, or that were
+ * written about a member (e.g. a failed sign-in recorded with an anonymous
+ * actor and the target user as the resource). `partnerId` null (system scope)
+ * returns every NULL-org row.
+ */
+export function partnerAccountsCondition(partnerId: string | null): SQL {
+  const noOrg = isNull(auditLogsTable.orgId);
+  if (!partnerId) return noOrg;
+  const members = sql`(SELECT pu.user_id FROM partner_users pu WHERE pu.partner_id = ${partnerId}::uuid)`;
+  return and(
+    noOrg,
+    or(
+      sql`${auditLogsTable.actorId} IN ${members}`,
+      sql`${auditLogsTable.resourceId} IN ${members}`
+    )
+  )!;
+}
+
+/**
+ * RLS hides every NULL-org audit row from partner callers, so the
+ * partner-accounts read runs under a short system context on its own
+ * connection. The WHERE clause above is the only tenant boundary here, so
+ * callers MUST always pass partnerAccountsCondition() through.
+ */
+function withPartnerAccountsRead<T>(fn: () => Promise<T>): Promise<T> {
+  return runOutsideDbContext(() => withSystemDbAccessContext(fn, 'audit-logs.partner-accounts'));
+}
+
 function buildSearchCondition(q: string): SQL {
   const term = `%${escapeIlike(q)}%`;
   return or(
@@ -570,6 +630,28 @@ function paginatedListHandler(
     const query = c.req.valid('query');
     const { page, limit, offset } = getPagination(query);
 
+    if (query.scope === 'partner') {
+      const access = resolvePartnerAccountsAccess(auth);
+      if (!access.ok) {
+        return c.json({ error: 'Partner account activity requires partner access to all organizations' }, 403);
+      }
+      const where = buildFilterConditions(partnerAccountsCondition(access.partnerId), query);
+      const skipCount = query.skipCount === 'true';
+      const [total, rows] = await withPartnerAccountsRead(() => Promise.all([
+        skipCount ? Promise.resolve(-1) : countRows(where),
+        queryRows(where, limit, offset)
+      ]));
+      return c.json({
+        [dataKey]: rows.map(mapFn),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: total < 0 ? -1 : Math.ceil(total / limit)
+        }
+      });
+    }
+
     // Explicit per-request org scope from the org-selector dropdown. If the
     // caller asks for an org they cannot access, return 403 — do NOT silently
     // fall back to the full accessible-org set.
@@ -700,15 +782,28 @@ auditLogRoutes.get(
     const query = c.req.valid('query');
     const { page, limit, offset } = getPagination(query);
 
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    let partnerAccess: PartnerAccountsAccess | null = null;
+    if (query.scope === 'partner') {
+      partnerAccess = resolvePartnerAccountsAccess(auth);
+      if (!partnerAccess.ok) {
+        return c.json({ error: 'Partner account activity requires partner access to all organizations' }, 403);
+      }
+    }
+
+    const orgCond = partnerAccess?.ok
+      ? partnerAccountsCondition(partnerAccess.partnerId)
+      : auth.orgCondition(auditLogsTable.orgId);
     const filterWhere = buildFilterConditions(orgCond, query);
     const searchCond = buildSearchCondition(query.q);
     const where = filterWhere ? and(filterWhere, searchCond) : searchCond;
 
-    const [total, rows] = await Promise.all([
+    const runQueries = () => Promise.all([
       countRows(where),
       queryRows(where, limit, offset)
     ]);
+    const [total, rows] = partnerAccess?.ok
+      ? await withPartnerAccountsRead(runQueries)
+      : await runQueries();
 
     return c.json({
       data: rows.map((row) => toFullEntry(row)),
@@ -775,7 +870,8 @@ auditLogRoutes.post(
 const exportGetSchema = z.object({
   userId: z.string().guid().optional(),
   columns: z.string().optional(),
-  includeDetails: z.enum(['true', 'false']).optional().default('true')
+  includeDetails: z.enum(['true', 'false']).optional().default('true'),
+  scope: z.enum(['org', 'partner']).optional()
 });
 
 auditLogRoutes.get(
@@ -785,9 +881,19 @@ auditLogRoutes.get(
   zValidator('query', exportGetSchema),
   async (c) => {
     const auth = c.get('auth');
-    const orgCond = auth.orgCondition(auditLogsTable.orgId);
+    const { userId, columns, includeDetails: includeDetailsRaw, scope } = c.req.valid('query');
 
-    const { userId, columns, includeDetails: includeDetailsRaw } = c.req.valid('query');
+    let partnerAccess: PartnerAccountsAccess | null = null;
+    if (scope === 'partner') {
+      partnerAccess = resolvePartnerAccountsAccess(auth);
+      if (!partnerAccess.ok) {
+        return c.json({ error: 'Partner account activity requires partner access to all organizations' }, 403);
+      }
+    }
+    const orgCond = partnerAccess?.ok
+      ? partnerAccountsCondition(partnerAccess.partnerId)
+      : auth.orgCondition(auditLogsTable.orgId);
+
     const includeDetails = includeDetailsRaw !== 'false';
     const parsedColumns = columns
       ?.split(',')
@@ -799,7 +905,9 @@ auditLogRoutes.get(
     if (userId) conditions.push(eq(auditLogsTable.actorId, userId));
 
     const where = conditions.length > 0 ? and(...conditions) : undefined;
-    const rows = await queryRows(where, 10000, 0);
+    const rows = partnerAccess?.ok
+      ? await withPartnerAccountsRead(() => queryRows(where, 10000, 0))
+      : await queryRows(where, 10000, 0);
 
     writeRouteAudit(c, {
       orgId: auth.orgId,
@@ -808,7 +916,7 @@ auditLogRoutes.get(
       details: {
         format: 'csv',
         rowCount: rows.length,
-        filters: { userId: userId ?? null },
+        filters: { userId: userId ?? null, scope: scope ?? 'org' },
         columns: exportColumns,
         includeDetails
       }

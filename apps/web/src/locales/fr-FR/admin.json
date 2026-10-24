@@ -707,6 +707,13 @@
       "exportLogs": "Journaux d’exportation",
       "empty": "Aucun journal d’audit trouvé.",
       "viewDetails": "Voir les détails",
+      "scope": {
+        "label": "Portée de l’activité",
+        "organization": "Organisation",
+        "partnerAccounts": "Comptes partenaire",
+        "partnerHint": "Connexions, invitations, MFA et modifications d’utilisateurs des comptes partenaire. Ces événements n’appartiennent à aucune organisation et n’apparaissent donc pas dans la vue organisation.",
+        "forbidden": "L’activité des comptes partenaire nécessite un accès partenaire à toutes les organisations."
+      },
       "errors": {
         "fetch": "Impossible de récupérer les journaux d’audit",
         "load": "Impossible de charger les journaux d’audit"

@@ -14,7 +14,8 @@ import {
   X
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { fetchWithAuth } from '../../stores/auth';
+import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { useJwtClaims } from '@/lib/authScope';
 import AuditLogDetail, { type AuditLogEntry } from './AuditLogDetail';
 import AuditFilters from './AuditFilters';
 import { navigateTo } from '@/lib/navigation';
@@ -33,6 +34,14 @@ type SortConfig = {
 };
 
 type DatePreset = 'today' | '7d' | '30d' | 'custom';
+
+/**
+ * 'org'     = the selected organization's activity (default, OrgSwitcher-scoped).
+ * 'partner' = partner-level account activity: sign-ins, invites, MFA and user
+ *             admin of partner users. Those rows carry no org, so the org view
+ *             never shows them. API: GET /audit-logs?scope=partner.
+ */
+type LogScope = 'org' | 'partner';
 
 type ActiveFilters = {
   datePreset: DatePreset;
@@ -153,6 +162,17 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
   const [error, setError] = useState<string | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [activeFilters, setActiveFilters] = useState<ActiveFilters | null>(null);
+  const [logScope, setLogScope] = useState<LogScope>('org');
+
+  // The partner-accounts view is offered on the standalone Audit Trail page to
+  // system users and to partner users with all-org access (the API 403s
+  // everyone else). An org record's Activity tab (orgId prop) stays org-only.
+  const claims = useJwtClaims();
+  const canManagePartnerWide = useAuthStore(s => s.user?.canManagePartnerWide ?? true);
+  const claimScope = claims.status === 'resolved' ? claims.claims.scope : null;
+  const canViewPartnerAccounts =
+    !orgId && (claimScope === 'system' || (claimScope === 'partner' && canManagePartnerWide));
+  const effectiveScope: LogScope = canViewPartnerAccounts ? logScope : 'org';
 
   const pageSize = 25;
 
@@ -164,6 +184,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
       const params = new URLSearchParams();
       params.set('page', String(page));
       params.set('limit', String(pageSize));
+      if (effectiveScope === 'partner') params.set('scope', 'partner');
 
       if (filters) {
         const { from, to } = computeDateRange(filters);
@@ -184,11 +205,19 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
       }
 
       const endpoint = params.has('q') ? '/audit-logs/search' : '/audit-logs';
-      const response = await fetchWithAuth(`${endpoint}?${params.toString()}`, { orgIdOverride: orgId });
+      // Partner-level rows have no org, so the ambient org must not be injected.
+      const response = await fetchWithAuth(
+        `${endpoint}?${params.toString()}`,
+        effectiveScope === 'partner' ? { skipOrgIdInjection: true } : { orgIdOverride: orgId }
+      );
 
       if (response.status === 401) {
         void navigateTo('/login', { replace: true });
         return;
+      }
+
+      if (response.status === 403 && effectiveScope === 'partner') {
+        throw new Error(t('audit.auditLogViewer.scope.forbidden'));
       }
 
       if (!response.ok) {
@@ -208,7 +237,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
     } finally {
       setIsLoading(false);
     }
-  }, [t, orgId]);
+  }, [t, orgId, effectiveScope]);
 
   useEffect(() => {
     fetchAuditLogs(currentPage, activeFilters);
@@ -246,6 +275,13 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
     setCurrentPage(1);
   };
 
+  const handleScopeChange = (next: LogScope) => {
+    if (next === logScope) return;
+    setLogScope(next);
+    setCurrentPage(1);
+    setExpandedRows(new Set());
+  };
+
   const toggleExpanded = (id: string) => {
     setExpandedRows(prev => {
       const next = new Set(prev);
@@ -271,7 +307,9 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
 
   const handleExportLogs = async () => {
     try {
-      const response = await fetchWithAuth('/audit-logs/export', { orgIdOverride: orgId });
+      const response = effectiveScope === 'partner'
+        ? await fetchWithAuth('/audit-logs/export?scope=partner', { skipOrgIdInjection: true })
+        : await fetchWithAuth('/audit-logs/export', { orgIdOverride: orgId });
 
       if (response.status === 401) {
         void navigateTo('/login', { replace: true });
@@ -292,6 +330,42 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
     }
   };
 
+  const scopeOptions: { value: LogScope; label: string }[] = [
+    { value: 'org', label: t('audit.auditLogViewer.scope.organization') },
+    { value: 'partner', label: t('audit.auditLogViewer.scope.partnerAccounts') }
+  ];
+
+  const scopeToggle = canViewPartnerAccounts ? (
+    <div className="space-y-1.5">
+      <div
+        role="radiogroup"
+        aria-label={t('audit.auditLogViewer.scope.label')}
+        className="inline-flex rounded-md border bg-background p-0.5"
+      >
+        {scopeOptions.map(option => (
+          <button
+            key={option.value}
+            type="button"
+            role="radio"
+            aria-checked={effectiveScope === option.value}
+            onClick={() => handleScopeChange(option.value)}
+            className={cn(
+              'h-8 rounded px-3 text-sm font-medium transition-colors',
+              effectiveScope === option.value
+                ? 'bg-primary text-primary-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            )}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+      {effectiveScope === 'partner' && (
+        <p className="text-xs text-muted-foreground">{t('audit.auditLogViewer.scope.partnerHint')}</p>
+      )}
+    </div>
+  ) : null;
+
   if (isLoading) {
     return (
       <div className="space-y-6">
@@ -303,6 +377,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
             </p>
           </div>
         </div>
+        {scopeToggle}
         <div className="overflow-hidden rounded-lg border bg-card">
           <div className="flex h-48 items-center justify-center">
             <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
@@ -323,6 +398,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
             </p>
           </div>
         </div>
+        {scopeToggle}
         <div className="overflow-hidden rounded-lg border bg-card">
           <div className="flex h-48 flex-col items-center justify-center gap-2 text-muted-foreground">
             <p>{error}</p>
@@ -390,6 +466,8 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
           </button>
         </div>
       </div>
+
+      {scopeToggle}
 
       {showFilters && (
         <AuditFilters

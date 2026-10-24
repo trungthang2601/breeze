@@ -707,6 +707,13 @@
       "exportLogs": "Exportar logs",
       "empty": "Nenhum log de auditoria encontrado.",
       "viewDetails": "Ver detalhes",
+      "scope": {
+        "label": "Escopo da atividade",
+        "organization": "Organização",
+        "partnerAccounts": "Contas do parceiro",
+        "partnerHint": "Logins, convites, MFA e alterações de usuário das contas do parceiro. Esses eventos não pertencem a nenhuma organização, por isso a visão de organização não os mostra.",
+        "forbidden": "Ver a atividade das contas do parceiro exige acesso de parceiro a todas as organizações."
+      },
       "errors": {
         "fetch": "Falha ao buscar logs de auditoria",
         "load": "Falha ao carregar logs de auditoria"

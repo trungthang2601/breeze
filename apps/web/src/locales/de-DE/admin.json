@@ -707,6 +707,13 @@
       "exportLogs": "Protokolle exportieren",
       "empty": "Keine Auditprotokolle gefunden.",
       "viewDetails": "Details anzeigen",
+      "scope": {
+        "label": "Aktivitätsbereich",
+        "organization": "Organisation",
+        "partnerAccounts": "Partnerkonten",
+        "partnerHint": "Anmeldungen, Einladungen, MFA und Benutzeränderungen von Partnerkonten. Diese Ereignisse gehören zu keiner Organisation und erscheinen daher nicht in der Organisationsansicht.",
+        "forbidden": "Für die Aktivität von Partnerkonten ist Partnerzugriff auf alle Organisationen erforderlich."
+      },
       "errors": {
         "fetch": "Auditprotokolle konnten nicht abgerufen werden",
         "load": "Auditprotokolle konnten nicht geladen werden"

@@ -707,6 +707,13 @@
       "exportLogs": "Günlükleri Dışa Aktar",
       "empty": "Denetim günlüğü bulunamadı.",
       "viewDetails": "Ayrıntıları görüntüle",
+      "scope": {
+        "label": "Etkinlik kapsamı",
+        "organization": "Kuruluş",
+        "partnerAccounts": "İş ortağı hesapları",
+        "partnerHint": "İş ortağı hesaplarının oturum açma, davet, MFA ve kullanıcı değişiklikleri. Bu olaylar hiçbir kuruluşa ait olmadığından kuruluş görünümünde yer almaz.",
+        "forbidden": "İş ortağı hesaplarının etkinliğini görmek için tüm kuruluşlara iş ortağı erişimi gerekir."
+      },
       "errors": {
         "fetch": "Denetim günlükleri getirilemedi",
         "load": "Denetim günlükleri yüklenemedi"
