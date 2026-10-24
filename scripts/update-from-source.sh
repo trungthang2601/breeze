@@ -28,7 +28,7 @@ cd "${REPO_DIR}"
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/breeze}"
 BACKUP_KEEP="${BACKUP_KEEP:-10}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-900}"
-COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.override.yml.selfbuild)
+COMPOSE=(docker compose -f docker-compose.yml -f docker-compose.override.yml.podman -f docker-compose.override.yml.selfbuild)
 BUILD_SERVICES=(api web portal)
 
 DO_PULL=true
