@@ -676,7 +676,11 @@
         "identity": "Identität",
         "automation": "Automatisierung",
         "asset": "Asset"
-      }
+      },
+      "site": "Standort",
+      "allSites": "Alle Standorte",
+      "loadingSites": "Standorte werden geladen…",
+      "siteHint": "Aktivität auf Geräten, die diesem Standort zugewiesen sind: Agent-Meldungen und Aktionen von Personen auf diesen Geräten."
     },
     "auditLogDetail": {
       "title": "Auditprotokolldetails",
@@ -714,6 +718,7 @@
         "partnerHint": "Anmeldungen, Einladungen, MFA und Benutzeränderungen von Partnerkonten. Diese Ereignisse gehören zu keiner Organisation und erscheinen daher nicht in der Organisationsansicht.",
         "forbidden": "Für die Aktivität von Partnerkonten ist Partnerzugriff auf alle Organisationen erforderlich."
       },
+      "siteFilter": "Standort:",
       "errors": {
         "fetch": "Auditprotokolle konnten nicht abgerufen werden",
         "load": "Auditprotokolle konnten nicht geladen werden"

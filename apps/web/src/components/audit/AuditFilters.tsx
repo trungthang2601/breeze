@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Calendar, Check, ChevronDown, Loader2, Search, User, X } from 'lucide-react';
+import { Calendar, Check, ChevronDown, Loader2, MapPin, Search, User, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { fetchWithAuth } from '../../stores/auth';
+import { fetchAllSites } from '@/lib/fetchAllSites';
 
 type DatePreset = 'today' | '7d' | '30d' | 'custom';
 
@@ -12,6 +13,8 @@ type AuditFiltersState = {
   endDate?: string;
   userId?: string;
   userEmail?: string;
+  siteId?: string;
+  siteName?: string;
   actions: string[];
   resources: string[];
   search: string;
@@ -20,6 +23,13 @@ type AuditFiltersState = {
 type AuditFiltersProps = {
   onApply?: (filters: AuditFiltersState) => void;
   onClear?: () => void;
+  /** Show the Site (branch) picker. Off for the partner-accounts view, whose rows are not tied to devices. */
+  showSiteFilter?: boolean;
+};
+
+type SiteOption = {
+  id: string;
+  name: string;
 };
 
 type UserOption = {
@@ -31,7 +41,7 @@ type UserOption = {
 const actionOptions = ['login', 'update', 'delete', 'create', 'export', 'access'];
 const resourceOptions = ['policy', 'report', 'dataset', 'identity', 'automation', 'asset'];
 
-export default function AuditFilters({ onApply, onClear }: AuditFiltersProps) {
+export default function AuditFilters({ onApply, onClear, showSiteFilter = true }: AuditFiltersProps) {
   const { t } = useTranslation('admin');
   const [datePreset, setDatePreset] = useState<DatePreset>('7d');
   const presetLabels: Record<DatePreset, string> = {
@@ -66,6 +76,32 @@ export default function AuditFilters({ onApply, onClear }: AuditFiltersProps) {
   const [detailsSearch, setDetailsSearch] = useState('');
   const [users, setUsers] = useState<UserOption[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(false);
+  const [selectedSiteId, setSelectedSiteId] = useState('');
+  const [sites, setSites] = useState<SiteOption[]>([]);
+  const [loadingSites, setLoadingSites] = useState(false);
+
+  // Sites of the organization picked in the switcher (ambient orgId).
+  useEffect(() => {
+    if (!showSiteFilter) return;
+    let cancelled = false;
+    setLoadingSites(true);
+    fetchAllSites<{ id: string; name?: string | null }>('/orgs/sites')
+      .then(list => {
+        if (cancelled) return;
+        setSites(list
+          .filter(site => site.id)
+          .map(site => ({ id: String(site.id), name: String(site.name || site.id) })));
+      })
+      .catch(() => {
+        // Leave the picker on "All sites"; the rest of the filters still work.
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingSites(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showSiteFilter]);
 
   const fetchUsers = useCallback(async () => {
     setLoadingUsers(true);
@@ -115,6 +151,8 @@ export default function AuditFilters({ onApply, onClear }: AuditFiltersProps) {
       endDate: datePreset === 'custom' ? customEnd : undefined,
       userId: selectedUserId,
       userEmail: selectedUser?.email,
+      siteId: showSiteFilter && selectedSiteId ? selectedSiteId : undefined,
+      siteName: showSiteFilter && selectedSiteId ? sites.find(site => site.id === selectedSiteId)?.name : undefined,
       actions: selectedActions,
       resources: selectedResources,
       search: detailsSearch
@@ -127,6 +165,7 @@ export default function AuditFilters({ onApply, onClear }: AuditFiltersProps) {
     setCustomEnd('2024-05-28');
     setUserSearch('');
     setSelectedUserId(undefined);
+    setSelectedSiteId('');
     setSelectedActions([]);
     setSelectedResources([]);
     setDetailsSearch('');
@@ -305,17 +344,46 @@ export default function AuditFilters({ onApply, onClear }: AuditFiltersProps) {
         </div>
       </div>
 
-      <div className="space-y-3">
-        <h3 className="text-sm font-semibold">{t('audit.auditFilters.searchDetails')}</h3>
-        <div className="flex items-center gap-2 rounded-md border bg-background px-3 py-2">
-          <Search className="h-4 w-4 text-muted-foreground" />
-          <input
-            type="text"
-            value={detailsSearch}
-            onChange={event => setDetailsSearch(event.target.value)}
-            placeholder={t('audit.auditFilters.searchDetailsPlaceholder')}
-            className="w-full bg-transparent text-sm text-foreground outline-hidden"
-          />
+      <div className={cn('grid gap-6', showSiteFilter && 'lg:grid-cols-2')}>
+        {showSiteFilter && (
+          <div className="space-y-3">
+            <label htmlFor="audit-filter-site" className="flex items-center gap-2 text-sm font-semibold">
+              <MapPin className="h-4 w-4 text-muted-foreground" />
+              {t('audit.auditFilters.site')}
+            </label>
+            <div className="relative">
+              <select
+                id="audit-filter-site"
+                value={selectedSiteId}
+                onChange={event => setSelectedSiteId(event.target.value)}
+                disabled={loadingSites}
+                className="h-10 w-full appearance-none rounded-md border bg-background px-3 pr-9 text-sm text-foreground disabled:opacity-60"
+              >
+                <option value="">
+                  {loadingSites ? t('audit.auditFilters.loadingSites') : t('audit.auditFilters.allSites')}
+                </option>
+                {sites.map(site => (
+                  <option key={site.id} value={site.id}>{site.name}</option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-3 top-3 h-4 w-4 text-muted-foreground" />
+            </div>
+            <p className="text-xs text-muted-foreground">{t('audit.auditFilters.siteHint')}</p>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          <h3 className="text-sm font-semibold">{t('audit.auditFilters.searchDetails')}</h3>
+          <div className="flex items-center gap-2 rounded-md border bg-background px-3 py-2">
+            <Search className="h-4 w-4 text-muted-foreground" />
+            <input
+              type="text"
+              value={detailsSearch}
+              onChange={event => setDetailsSearch(event.target.value)}
+              placeholder={t('audit.auditFilters.searchDetailsPlaceholder')}
+              className="w-full bg-transparent text-sm text-foreground outline-hidden"
+            />
+          </div>
         </div>
       </div>
 

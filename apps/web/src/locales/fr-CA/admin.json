@@ -676,7 +676,11 @@
         "identity": "Identité",
         "automation": "Automatisation",
         "asset": "Actif"
-      }
+      },
+      "site": "Site",
+      "allSites": "Tous les sites",
+      "loadingSites": "Chargement des sites…",
+      "siteHint": "Activité sur les appareils affectés à ce site : rapports de l’agent et actions effectuées sur ces appareils."
     },
     "auditLogDetail": {
       "title": "Détails du journal d’audit",
@@ -714,6 +718,7 @@
         "partnerHint": "Connexions, invitations, MFA et modifications d’utilisateurs des comptes partenaire. Ces événements n’appartiennent à aucune organisation et n’apparaissent donc pas dans la vue organisation.",
         "forbidden": "L’activité des comptes partenaire exige un accès partenaire à toutes les organisations."
       },
+      "siteFilter": "Site :",
       "errors": {
         "fetch": "Impossible de récupérer les journaux d’audit",
         "load": "Impossible de charger les journaux d’audit"

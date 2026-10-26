@@ -64,6 +64,48 @@ describe('AuditLogViewer', () => {
     });
   });
 
+  describe('site (branch) filter', () => {
+    const SITE_TT = 'site-thanh-thai';
+
+    beforeEach(() => {
+      fetchMock.mockImplementation(async (url: unknown) =>
+        String(url).startsWith('/orgs/sites')
+          ? jsonResponse({ data: [{ id: SITE_TT, name: 'ICOOL Thành Thái' }], pagination: { total: 1, totalPages: 1 } })
+          : jsonResponse({ data: [], pagination: { total: 0, totalPages: 1 } })
+      );
+    });
+
+    it('lists the org sites and sends siteId after Apply, showing the chosen site', async () => {
+      authState.claims = { status: 'resolved', claims: { scope: 'partner' } };
+      render(<AuditLogViewer />);
+
+      fireEvent.click(await screen.findByRole('button', { name: /filters/i }));
+      const select = await screen.findByLabelText(/^site$/i);
+      await screen.findByRole('option', { name: 'ICOOL Thành Thái' });
+      fireEvent.change(select, { target: { value: SITE_TT } });
+
+      fetchMock.mockClear();
+      fireEvent.click(screen.getByRole('button', { name: /apply filters/i }));
+
+      await waitFor(() => {
+        const call = fetchMock.mock.calls.find(([url]) => String(url).startsWith('/audit-logs?'));
+        expect(call).toBeTruthy();
+        expect(String(call![0])).toContain(`siteId=${SITE_TT}`);
+        expect(String(call![0])).not.toContain('skipCount');
+      });
+      expect(await screen.findByText('ICOOL Thành Thái')).toBeTruthy();
+    });
+
+    it('hides the site picker in the partner-accounts view', async () => {
+      authState.claims = { status: 'resolved', claims: { scope: 'partner' } };
+      render(<AuditLogViewer />);
+      fireEvent.click(await screen.findByRole('radio', { name: /partner accounts/i }));
+      fireEvent.click(await screen.findByRole('button', { name: /filters/i }));
+      await screen.findByRole('button', { name: /apply filters/i });
+      expect(screen.queryByLabelText(/^site$/i)).toBeNull();
+    });
+  });
+
   describe('partner accounts scope', () => {
     it('offers the partner-accounts view to a partner user with all-org access and requests scope=partner without org injection', async () => {
       authState.claims = { status: 'resolved', claims: { scope: 'partner' } };

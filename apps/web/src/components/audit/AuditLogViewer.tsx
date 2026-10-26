@@ -49,6 +49,8 @@ type ActiveFilters = {
   endDate?: string;
   userId?: string;
   userEmail?: string;
+  siteId?: string;
+  siteName?: string;
   actions: string[];
   resources: string[];
   search: string;
@@ -120,6 +122,7 @@ function hasActiveFilters(filters: ActiveFilters | null): boolean {
   if (!filters) return false;
   return !!(
     filters.userEmail ||
+    filters.siteId ||
     filters.actions.length > 0 ||
     filters.resources.length > 0 ||
     filters.search
@@ -191,6 +194,8 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
         if (from) params.set('from', from);
         if (to) params.set('to', to);
         if (filters.userEmail) params.set('user', filters.userEmail);
+        // Branch (site) filter: org view only — partner-account rows have no device.
+        if (filters.siteId && effectiveScope === 'org') params.set('siteId', filters.siteId);
         if (filters.actions.length > 0) params.set('action', filters.actions.join(','));
         if (filters.resources.length > 0) params.set('resource', filters.resources.join(','));
         if (filters.search) params.set('q', filters.search);
@@ -442,6 +447,7 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
                 {(activeFilters!.actions.length > 0 ? 1 : 0) +
                   (activeFilters!.resources.length > 0 ? 1 : 0) +
                   (activeFilters!.userEmail ? 1 : 0) +
+                  (activeFilters!.siteId ? 1 : 0) +
                   (activeFilters!.search ? 1 : 0)}
               </span>
             )}
@@ -469,10 +475,18 @@ export default function AuditLogViewer({ timezone, orgId }: AuditLogViewerProps)
 
       {scopeToggle}
 
+      {effectiveScope === 'org' && activeFilters?.siteId && (
+        <div className="inline-flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-1.5 text-sm">
+          <span className="text-muted-foreground">{t('audit.auditLogViewer.siteFilter')}</span>
+          <span className="font-medium text-foreground">{activeFilters.siteName ?? activeFilters.siteId}</span>
+        </div>
+      )}
+
       {showFilters && (
         <AuditFilters
           onApply={handleApplyFilters}
           onClear={handleClearFilters}
+          showSiteFilter={effectiveScope === 'org'}
         />
       )}
 

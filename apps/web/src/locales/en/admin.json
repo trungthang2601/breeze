@@ -676,7 +676,11 @@
         "identity": "identity",
         "automation": "automation",
         "asset": "asset"
-      }
+      },
+      "site": "Site",
+      "allSites": "All sites",
+      "loadingSites": "Loading sites…",
+      "siteHint": "Activity on devices assigned to this site: agent reports and actions people took on those devices."
     },
     "auditLogDetail": {
       "title": "Audit Log Detail",
@@ -714,6 +718,7 @@
         "partnerHint": "Sign-ins, invitations, MFA and user changes of partner accounts. These events belong to no organization, so the organization view does not show them.",
         "forbidden": "Viewing partner account activity requires partner access to all organizations."
       },
+      "siteFilter": "Site:",
       "errors": {
         "fetch": "Failed to fetch audit logs",
         "load": "Failed to load audit logs"

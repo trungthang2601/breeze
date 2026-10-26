@@ -676,7 +676,11 @@
         "identity": "identidade",
         "automation": "automação",
         "asset": "ativo"
-      }
+      },
+      "site": "Site",
+      "allSites": "Todos os sites",
+      "loadingSites": "Carregando sites…",
+      "siteHint": "Atividade nos dispositivos atribuídos a este site: relatórios do agente e ações feitas nesses dispositivos."
     },
     "auditLogDetail": {
       "title": "Detalhe do log de auditoria",
@@ -714,6 +718,7 @@
         "partnerHint": "Logins, convites, MFA e alterações de usuário das contas do parceiro. Esses eventos não pertencem a nenhuma organização, por isso a visão de organização não os mostra.",
         "forbidden": "Ver a atividade das contas do parceiro exige acesso de parceiro a todas as organizações."
       },
+      "siteFilter": "Site:",
       "errors": {
         "fetch": "Falha ao buscar logs de auditoria",
         "load": "Falha ao carregar logs de auditoria"

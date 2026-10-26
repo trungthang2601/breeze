@@ -50,7 +50,10 @@ const listLogsSchema = z.object({
   // or about the caller's partner users: sign-ins, invites, MFA, user admin).
   // Those rows are invisible to the org-scoped list because RLS
   // (breeze_has_org_access) rejects a NULL org_id for non-system callers.
-  scope: z.enum(['org', 'partner']).optional()
+  scope: z.enum(['org', 'partner']).optional(),
+  // Narrow to activity on devices assigned to this site (a branch). Ignored
+  // for scope=partner — partner-level account rows are not tied to devices.
+  siteId: z.string().guid().optional()
 });
 
 const searchSchema = listLogsSchema.extend({
@@ -286,9 +289,29 @@ function parseExcludeActions(raw: string | undefined): string[] {
     .filter((s) => s.length > 0);
 }
 
+/**
+ * Activity on devices assigned to `siteId`, matched the same three ways the
+ * per-device Activity feed (routes/devices/events.ts) attributes a row:
+ *   - resource arm: the row's resource is the device (resource_type 'device'),
+ *   - details arm:  details.deviceId names the device (scripts, commands, ...),
+ *   - agent arm:    the device's own agent wrote it (details.rawActorId).
+ * The devices subqueries run under the caller's RLS, so a site in an org the
+ * caller cannot reach simply matches nothing.
+ */
+export function siteActivityCondition(siteId: string): SQL {
+  const deviceIds = sql`(SELECT d.id FROM devices d WHERE d.site_id = ${siteId}::uuid)`;
+  const deviceIdTexts = sql`(SELECT d.id::text FROM devices d WHERE d.site_id = ${siteId}::uuid)`;
+  const agentIds = sql`(SELECT d.agent_id FROM devices d WHERE d.site_id = ${siteId}::uuid)`;
+  return or(
+    sql`(${auditLogsTable.resourceType} = 'device' AND ${auditLogsTable.resourceId} IN ${deviceIds})`,
+    sql`(${auditLogsTable.details} ? 'deviceId' AND ${auditLogsTable.details}->>'deviceId' IN ${deviceIdTexts})`,
+    sql`(${auditLogsTable.actorType} = 'agent' AND ${auditLogsTable.details}->>'rawActorId' IN ${agentIds})`
+  )!;
+}
+
 function buildFilterConditions(
   orgCond: SQL | undefined,
-  filters: { user?: string; action?: string; resource?: string; from?: string; to?: string; excludeActions?: string }
+  filters: { user?: string; action?: string; resource?: string; from?: string; to?: string; excludeActions?: string; siteId?: string }
 ): SQL | undefined {
   const conditions: SQL[] = [];
 
@@ -296,12 +319,19 @@ function buildFilterConditions(
 
   if (filters.user) {
     const term = `%${escapeIlike(filters.user)}%`;
+    // Name match via subquery, not the `users` join: countRows() selects from
+    // audit_logs alone, so referencing users.name there was a SQL error
+    // ("missing FROM-clause entry") whenever the User filter was applied.
     conditions.push(
       or(
         ilike(auditLogsTable.actorEmail, term),
-        ilike(users.name, term)
+        sql`${auditLogsTable.actorId} IN (SELECT u.id FROM users u WHERE u.name ILIKE ${term})`
       )!
     );
+  }
+
+  if (filters.siteId) {
+    conditions.push(siteActivityCondition(filters.siteId));
   }
 
   if (filters.action) {
@@ -635,7 +665,7 @@ function paginatedListHandler(
       if (!access.ok) {
         return c.json({ error: 'Partner account activity requires partner access to all organizations' }, 403);
       }
-      const where = buildFilterConditions(partnerAccountsCondition(access.partnerId), query);
+      const where = buildFilterConditions(partnerAccountsCondition(access.partnerId), { ...query, siteId: undefined });
       const skipCount = query.skipCount === 'true';
       const [total, rows] = await withPartnerAccountsRead(() => Promise.all([
         skipCount ? Promise.resolve(-1) : countRows(where),
@@ -658,6 +688,9 @@ function paginatedListHandler(
     if (query.orgId && !auth.canAccessOrg(query.orgId)) {
       return c.json({ error: 'Access denied' }, 403);
     }
+    if (query.siteId && auth.canAccessSite && !auth.canAccessSite(query.siteId)) {
+      return c.json({ error: 'Access denied' }, 403);
+    }
     // BY DESIGN: the audit-log list is scoped to the org only, NOT the caller's
     // site allowlist. Audit trails are an org-level compliance record and must
     // stay complete for any org member with audit-read permission; partitioning
@@ -675,7 +708,7 @@ function paginatedListHandler(
     // index. The dashboard widget that calls /logs?limit=5 doesn't need the
     // count — it never displays "X of Y total". Pass skipCount=true there.
     const skipCount = query.skipCount === 'true';
-    const hasFilters = !!(query.user || query.action || query.resource || query.from || query.to);
+    const hasFilters = !!(query.user || query.action || query.resource || query.from || query.to || query.siteId);
     // excludeActions is compatible with the fast path — it's applied inside the
     // LATERAL subquery before the per-org LIMIT. The standard path picks it up
     // via buildFilterConditions(orgCond, query) above.
@@ -790,10 +823,26 @@ auditLogRoutes.get(
       }
     }
 
+    if (!partnerAccess) {
+      if (query.orgId && !auth.canAccessOrg(query.orgId)) {
+        return c.json({ error: 'Access denied' }, 403);
+      }
+      if (query.siteId && auth.canAccessSite && !auth.canAccessSite(query.siteId)) {
+        return c.json({ error: 'Access denied' }, 403);
+      }
+    }
+
+    // Same org pinning as the list: a search must stay inside the org picked
+    // in the switcher instead of spanning every accessible org.
     const orgCond = partnerAccess?.ok
       ? partnerAccountsCondition(partnerAccess.partnerId)
-      : auth.orgCondition(auditLogsTable.orgId);
-    const filterWhere = buildFilterConditions(orgCond, query);
+      : query.orgId
+        ? eq(auditLogsTable.orgId, query.orgId)
+        : auth.orgCondition(auditLogsTable.orgId);
+    const filterWhere = buildFilterConditions(
+      orgCond,
+      partnerAccess?.ok ? { ...query, siteId: undefined } : query
+    );
     const searchCond = buildSearchCondition(query.q);
     const where = filterWhere ? and(filterWhere, searchCond) : searchCond;
 

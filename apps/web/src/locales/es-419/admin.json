@@ -676,7 +676,11 @@
         "identity": "identidad",
         "automation": "automatización",
         "asset": "activo"
-      }
+      },
+      "site": "Sitio",
+      "allSites": "Todos los sitios",
+      "loadingSites": "Cargando sitios…",
+      "siteHint": "Actividad en los dispositivos asignados a este sitio: reportes del agente y acciones de personas sobre esos dispositivos."
     },
     "auditLogDetail": {
       "title": "Detalle del registro de auditoría",
@@ -714,6 +718,7 @@
         "partnerHint": "Inicios de sesión, invitaciones, MFA y cambios de usuario de las cuentas del partner. Estos eventos no pertenecen a ninguna organización, por lo que la vista de organización no los muestra.",
         "forbidden": "Para ver la actividad de las cuentas del partner se requiere acceso de partner a todas las organizaciones."
       },
+      "siteFilter": "Sitio:",
       "errors": {
         "fetch": "No se pudieron recuperar los registros de auditoría",
         "load": "No se pudieron cargar los registros de auditoría"

@@ -676,7 +676,11 @@
         "identity": "kimlik",
         "automation": "otomasyon",
         "asset": "varlık"
-      }
+      },
+      "site": "Konum",
+      "allSites": "Tüm konumlar",
+      "loadingSites": "Konumlar yükleniyor…",
+      "siteHint": "Bu konuma atanmış cihazlardaki etkinlik: agent raporları ve bu cihazlarda yapılan işlemler."
     },
     "auditLogDetail": {
       "title": "Denetim Günlüğü Ayrıntısı",
@@ -714,6 +718,7 @@
         "partnerHint": "İş ortağı hesaplarının oturum açma, davet, MFA ve kullanıcı değişiklikleri. Bu olaylar hiçbir kuruluşa ait olmadığından kuruluş görünümünde yer almaz.",
         "forbidden": "İş ortağı hesaplarının etkinliğini görmek için tüm kuruluşlara iş ortağı erişimi gerekir."
       },
+      "siteFilter": "Konum:",
       "errors": {
         "fetch": "Denetim günlükleri getirilemedi",
         "load": "Denetim günlükleri yüklenemedi"

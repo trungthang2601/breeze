@@ -676,7 +676,11 @@
         "identity": "identità",
         "automation": "automazione",
         "asset": "asset"
-      }
+      },
+      "site": "Sede",
+      "allSites": "Tutte le sedi",
+      "loadingSites": "Caricamento sedi…",
+      "siteHint": "Attività sui dispositivi assegnati a questa sede: report dell’agent e azioni eseguite su quei dispositivi."
     },
     "auditLogDetail": {
       "title": "Dettaglio log di audit",
@@ -714,6 +718,7 @@
         "partnerHint": "Accessi, inviti, MFA e modifiche utente degli account partner. Questi eventi non appartengono a nessuna organizzazione, quindi la vista organizzazione non li mostra.",
         "forbidden": "Per visualizzare l’attività degli account partner serve l’accesso partner a tutte le organizzazioni."
       },
+      "siteFilter": "Sede:",
       "errors": {
         "fetch": "Impossibile recuperare i log di audit",
         "load": "Impossibile caricare i log di audit"
