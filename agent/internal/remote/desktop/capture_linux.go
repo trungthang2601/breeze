@@ -23,6 +23,10 @@ type linuxCapturer struct {
 
 	cursor      *x11.CursorTracker
 	cursorShape atomic.Value // string (CSS cursor)
+
+	// region is the selected monitor on a multi-monitor X screen;
+	// nil means capture the whole root window.
+	region *x11.MonitorGeom
 }
 
 // newPlatformCapturer creates a new Linux screen capturer. It resolves the
@@ -38,6 +42,7 @@ func newPlatformCapturer(config CaptureConfig) (ScreenCapturer, error) {
 		return nil, fmt.Errorf("%w: %v", ErrDisplayNotFound, err)
 	}
 	c := &linuxCapturer{config: config, conn: conn}
+	c.selectRegion()
 	// Cursor tracker is best-effort; capture still works without it.
 	if ct, cerr := x11.NewCursorTracker(target); cerr == nil {
 		c.cursor = ct
@@ -55,7 +60,8 @@ func mapResolveErr(err error) error {
 	}
 }
 
-// Capture returns a full-screen frame as image.RGBA whose Pix is BGRX (see IsBGRA).
+// Capture returns a frame of the selected monitor (or the whole X screen when
+// it has a single monitor) as image.RGBA whose Pix is BGRX (see IsBGRA).
 func (c *linuxCapturer) Capture() (*image.RGBA, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -65,6 +71,23 @@ func (c *linuxCapturer) Capture() (*image.RGBA, error) {
 	pix, w, h, err := c.conn.CaptureBGRX()
 	if err != nil {
 		return nil, err
+	}
+	if r := c.region; r != nil {
+		if r.X+r.Width > w || r.Y+r.Height > h {
+			// Layout changed (xrandr / hotplug): re-resolve for the next frame.
+			c.selectRegionLocked()
+			return nil, fmt.Errorf("monitor region %dx%d+%d+%d outside screen %dx%d", r.Width, r.Height, r.X, r.Y, w, h)
+		}
+		// Crop the selected monitor out of the fast SHM full-screen grab;
+		// the non-SHM GetImage region path is far too slow (~3 fps at 1080p).
+		rowBytes := r.Width * 4
+		srcStride := w * 4
+		out := make([]byte, rowBytes*r.Height)
+		for row := 0; row < r.Height; row++ {
+			src := (r.Y+row)*srcStride + r.X*4
+			copy(out[row*rowBytes:(row+1)*rowBytes], pix[src:src+rowBytes])
+		}
+		return &image.RGBA{Pix: out, Stride: rowBytes, Rect: image.Rect(0, 0, r.Width, r.Height)}, nil
 	}
 	img := &image.RGBA{
 		Pix:    make([]byte, len(pix)),
@@ -96,6 +119,9 @@ func (c *linuxCapturer) GetScreenBounds() (int, int, error) {
 	defer c.mu.Unlock()
 	if c.conn == nil {
 		return 0, 0, ErrNoActiveSession
+	}
+	if r := c.region; r != nil {
+		return r.Width, r.Height, nil
 	}
 	w, h := c.conn.Bounds()
 	return w, h, nil
@@ -150,3 +176,35 @@ var _ ScreenCapturer = (*linuxCapturer)(nil)
 var _ BGRAProvider = (*linuxCapturer)(nil)
 var _ CursorProvider = (*linuxCapturer)(nil)
 var _ CursorShapeProvider = (*linuxCapturer)(nil)
+
+func (c *linuxCapturer) selectRegion() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.selectRegionLocked()
+}
+
+// selectRegionLocked crops capture to config.DisplayIndex when the X screen
+// spans several monitors, so the frame matches the monitor the viewer picked
+// (input already uses the same monitor via applyDisplayOffset) and stays
+// within encoder limits (e.g. OpenH264 rejects a 5760x2160 combined screen).
+// Monitor order matches ListMonitors.
+func (c *linuxCapturer) selectRegionLocked() {
+	c.region = nil
+	if c.conn == nil {
+		return
+	}
+	w, h := c.conn.Bounds()
+	geoms, err := x11.Monitors(c.conn.XConn(), c.conn.Root(), w, h)
+	if err != nil || len(geoms) < 2 {
+		return
+	}
+	idx := c.config.DisplayIndex
+	if idx < 0 || idx >= len(geoms) {
+		idx = 0
+	}
+	g := geoms[idx]
+	if g.Width <= 0 || g.Height <= 0 || g.X < 0 || g.Y < 0 || g.X+g.Width > w || g.Y+g.Height > h {
+		return
+	}
+	c.region = &g
+}
