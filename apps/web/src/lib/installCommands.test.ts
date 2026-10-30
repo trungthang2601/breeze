@@ -140,7 +140,7 @@ describe('buildInstallCommands', () => {
         trustCertUrl: 'https://gh.example.com/dl/trust.cer',
       });
       expect(withCert.windows).toContain('https://gh.example.com/dl/trust.cer');
-      expect(withCert.windows).toContain('certutil -addstore Root breeze-trust.cer');
+      expect(withCert.windows).toContain("certutil -addstore Root (Join-Path $d 'breeze-trust.cer')");
       expect(withCert.windows.indexOf('certutil')).toBeLessThan(withCert.windows.indexOf('service install'));
       expect(buildInstallCommands(base).windows).not.toContain('certutil');
       // macOS/Linux path is untouched by this Windows-only option.
