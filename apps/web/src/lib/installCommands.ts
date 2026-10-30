@@ -133,11 +133,26 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     openh264Url
       ? `curl -fsSL --connect-timeout 10 -o "$HOME/.local/bin/libopenh264-2.4.1-linux64.7.so" "${openh264Url}" || echo "[WARN] Could not fetch OpenH264 from ${openh264Url}. Remote desktop needs libopenh264-2.4.1-linux64.7.so in ~/.local/bin — place it there manually if this machine has no internet." >&2`
       : '',
+    // One-time root prep, only when something is missing: the agent's system
+    // dirs (desktop start fence / state / logs — a per-user agent cannot create
+    // them, and remote desktop refuses to start without the fence), linger (so
+    // the user service survives logout/reboot), and ffmpeg on NVIDIA machines
+    // (the Linux NVENC encoder shells out to ffmpeg h264_nvenc; without it the
+    // agent falls back to OpenH264 capped at 4 Mbps). Uses passwordless sudo
+    // when available, otherwise prompts once for the root password via su.
+    // Failure only warns — the install itself still completes.
+    `U=$(id -un); NEED=""; FF=""`,
+    `for d in /var/lib/breeze /etc/breeze /var/log/breeze; do [ -w "$d" ] || NEED=1; done`,
+    `loginctl show-user "$U" -p Linger 2>/dev/null | grep -q yes || NEED=1`,
+    `if [ -e /proc/driver/nvidia/version ] && ! command -v ffmpeg >/dev/null 2>&1; then NEED=1; FF=1; fi`,
+    `PREP="mkdir -p /var/lib/breeze /etc/breeze /var/log/breeze && chown $U:$U /var/lib/breeze /etc/breeze /var/log/breeze && chmod 700 /var/lib/breeze && loginctl enable-linger $U"`,
+    `[ -z "$FF" ] || PREP="$PREP && apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg"`,
+    `if [ -n "$NEED" ]; then echo "==> Breeze needs ROOT once to prepare this machine (agent dirs, linger\${FF:+, ffmpeg for NVIDIA NVENC})."; if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo sh -c "$PREP" || NEED=fail; else echo "Enter the ROOT password:"; su -c "$PREP" || NEED=fail; fi; fi`,
+    `[ "$NEED" != fail ] || echo "[WARN] Machine prep failed - remote desktop may refuse to start (desktop start fence) or skip the NVIDIA GPU. Re-run as root: $PREP" >&2`,
     `"$BIN" --config "$HOME/.config/breeze/agent.yaml" enroll "${token}" --server "${apiUrl}"${unixSecretFlag}`,
     `printf '[Unit]\\nDescription=Breeze RMM Agent (user)\\nAfter=graphical-session.target\\n\\n[Service]\\nType=simple\\nExecStart=%s --config %%h/.config/breeze/agent.yaml run\\nRestart=always\\nRestartSec=10\\n\\n[Install]\\nWantedBy=default.target\\n' "$BIN" > "$HOME/.config/systemd/user/breeze-agent.service"`,
     `systemctl --user daemon-reload`,
     `systemctl --user enable --now breeze-agent`,
-    `sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true`,
     `echo "Breeze agent installed under $(id -un). Status: systemctl --user status breeze-agent"`,
   ].filter(Boolean).join('\n');
 
@@ -188,8 +203,8 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
   // certutil -addstore requires Administrator, same as `service install`
   // below — no separate elevation prompt beyond what the script already needs.
   const winTrustCert = trustCertUrl
-    ? `Invoke-WebRequest -Uri "${trustCertUrl}" -OutFile breeze-trust.cer; ` +
-      `certutil -addstore Root breeze-trust.cer; ` +
+    ? `Invoke-WebRequest -Uri "${trustCertUrl}" -OutFile (Join-Path $d 'breeze-trust.cer'); ` +
+      `certutil -addstore Root (Join-Path $d 'breeze-trust.cer'); ` +
       `if($LASTEXITCODE){throw "Breeze: installing the trust certificate failed (exit code $LASTEXITCODE)"}; `
     : '';
   // Downloaded as a sibling next to breeze-agent.exe BEFORE `service install`,
