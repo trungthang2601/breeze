@@ -401,6 +401,8 @@ type DeviceInventoryRow = {
   ramTotalMb: number | null;
   diskTotalGb: number | null;
   serialNumber: string | null;
+  /** Branch the device is assigned to; the PDF groups devices by it. */
+  siteName: string | null;
 };
 
 /** Shared row query; callers retain their own authority checks and narrowing. */
@@ -419,12 +421,14 @@ export async function readDeviceInventoryRows(orgId: string, conditions: SQL[]) 
       cpuModel: deviceHardware.cpuModel,
       ramTotalMb: deviceHardware.ramTotalMb,
       diskTotalGb: deviceHardware.diskTotalGb,
-      serialNumber: deviceHardware.serialNumber
+      serialNumber: deviceHardware.serialNumber,
+      siteName: sites.name
     })
     .from(devices)
     .leftJoin(deviceHardware, eq(devices.id, deviceHardware.deviceId))
+    .leftJoin(sites, eq(devices.siteId, sites.id))
     .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), ...conditions))
-    .orderBy(devices.hostname);
+    .orderBy(sites.name, devices.hostname);
 }
 
 export async function generateDeviceInventoryReport(
@@ -500,8 +504,10 @@ export async function generateDeviceInventoryReport(
         name: manualAssets.name,
         serialNumber: manualAssets.serialNumber,
         createdAt: manualAssets.createdAt,
+        siteName: sites.name,
       })
       .from(manualAssets)
+      .leftJoin(sites, eq(manualAssets.siteId, sites.id))
       .where(and(...manualConditions))
       .orderBy(manualAssets.name);
 
@@ -522,10 +528,15 @@ export async function generateDeviceInventoryReport(
         ramTotalMb: null,
         diskTotalGb: null,
         serialNumber: asset.serialNumber,
+        siteName: asset.siteName ?? null,
       });
     }
 
-    rows.sort((a, b) => (a.hostname ?? '').localeCompare(b.hostname ?? ''));
+    // Site first, then hostname — matches the agent-row ORDER BY so the
+    // merged list stays grouped by branch.
+    rows.sort((a, b) =>
+      (a.siteName ?? '').localeCompare(b.siteName ?? '')
+      || (a.hostname ?? '').localeCompare(b.hostname ?? ''));
   }
 
   return { rows, rowCount: rows.length };

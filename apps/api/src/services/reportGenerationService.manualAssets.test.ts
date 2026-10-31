@@ -116,6 +116,9 @@ describe('device_inventory manual-asset union (#4622)', () => {
       ramTotalMb: null,
       diskTotalGb: null,
       serialNumber: 'MANUAL-SN',
+      // Site of the hand-entered asset (none in this fixture) — the PDF
+      // groups inventory rows by it.
+      siteName: null,
     });
     // The agent row keeps exactly the shape it always had.
     expect(report.rows.find((r) => r.serialNumber === 'AGENT-SN')).toEqual(AGENT_ROW);

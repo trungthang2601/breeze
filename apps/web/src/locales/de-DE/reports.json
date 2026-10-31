@@ -721,14 +721,14 @@
           "status": "Status"
         },
         "devices": {
-          "cpu": "CPU-Auslastung",
-          "disk_usage": "Festplattennutzung",
+          "cpu": "CPU",
+          "disk_usage": "Festplatte (GB)",
           "hostname": "Hostname",
           "last_seen": "Zuletzt gesehen",
-          "memory": "Arbeitsspeicherauslastung",
+          "memory": "RAM (MB)",
           "os": "Betriebssystem",
           "owner": "Besitzer",
-          "patch_level": "Patch-Level",
+          "patch_level": "Agent-Version",
           "serial": "Seriell",
           "site": "Standort",
           "status": "Status"

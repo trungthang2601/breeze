@@ -1928,6 +1928,208 @@ function renderGenericReport(doc: jsPDF, rows: Record<string, unknown>[], opts: 
   });
 }
 
+// ----------------------------------------------------------------------------
+// Device inventory: devices grouped by site (branch), curated columns.
+// ----------------------------------------------------------------------------
+
+/**
+ * The built-in Helvetica only covers WinAnsi, so Vietnamese (and other)
+ * diacritics would print as mojibake. Fold to plain ASCII letters instead —
+ * "Xô Viết Nghệ Tĩnh" → "Xo Viet Nghe Tinh" stays readable.
+ */
+export function pdfSafeText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .replace(/[\u2010-\u2015]/g, '-')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/[^\x20-\x7e]/g, '');
+}
+
+const textOrNull = (v: unknown): string | null =>
+  typeof v === 'string' && v.trim() ? v.trim() : null;
+
+/** "Microsoft Windows 11 Pro 24H2" → "Windows 11 Pro 24H2"; falls back to the OS type. */
+export function shortOsLabel(osType: unknown, osVersion: unknown): string {
+  const version = textOrNull(osVersion);
+  if (version) return version.replace(/^Microsoft\s+/i, '');
+  const type = textOrNull(osType);
+  if (!type) return '—';
+  return type === 'macos' ? 'macOS' : type.charAt(0).toUpperCase() + type.slice(1);
+}
+
+/** "12th Gen Intel(R) Core(TM) i7-12700KF" → "Intel Core i7-12700KF". */
+export function shortCpuLabel(cpuModel: unknown): string {
+  const raw = textOrNull(cpuModel);
+  if (!raw) return '—';
+  return raw
+    .replace(/\((R|TM|tm|r)\)/g, '')
+    .replace(/^\d+(st|nd|rd|th)\s+Gen\s+/i, '')
+    .replace(/\s+CPU\s*@.*$/i, '')
+    .replace(/\s+@\s*[\d.]+\s*GHz.*$/i, '')
+    .replace(/\s+\d+-Core Processor$/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+const UNASSIGNED_SITE = 'No site';
+
+export type DeviceInventorySiteGroup = {
+  site: string;
+  rows: Record<string, unknown>[];
+  online: number;
+};
+
+/** Group inventory rows by site name, sites A→Z, hostnames A→Z within a site. */
+export function groupDeviceInventoryBySite(rows: Record<string, unknown>[]): DeviceInventorySiteGroup[] {
+  const groups = new Map<string, Record<string, unknown>[]>();
+  for (const row of rows) {
+    const site = textOrNull(row.siteName) ?? UNASSIGNED_SITE;
+    const list = groups.get(site);
+    if (list) list.push(row);
+    else groups.set(site, [row]);
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => {
+      if (a === UNASSIGNED_SITE) return 1;
+      if (b === UNASSIGNED_SITE) return -1;
+      return a.localeCompare(b);
+    })
+    .map(([site, list]) => {
+      const sorted = [...list].sort((x, y) =>
+        String(x.hostname ?? '').localeCompare(String(y.hostname ?? '')));
+      return {
+        site,
+        rows: sorted,
+        online: sorted.filter((r) => r.status === 'online').length,
+      };
+    });
+}
+
+const DEVICE_INVENTORY_COLUMNS: { header: string; width: number }[] = [
+  { header: 'Hostname', width: 34 },
+  { header: 'Status', width: 18 },
+  { header: 'OS', width: 42 },
+  { header: 'CPU', width: 42 },
+  { header: 'RAM (GB)', width: 17 },
+  { header: 'Disk (GB)', width: 17 },
+  { header: 'Serial', width: 44 },
+  { header: 'Last seen', width: 55 },
+];
+
+function deviceInventoryCells(row: Record<string, unknown>, timezone: string): string[] {
+  const ramMb = num(row.ramTotalMb);
+  const diskGb = num(row.diskTotalGb);
+  return [
+    pdfSafeText(textOrNull(row.hostname) ?? textOrNull(row.displayName) ?? '—'),
+    pdfSafeText(textOrNull(row.status) ?? '—'),
+    pdfSafeText(shortOsLabel(row.osType, row.osVersion)),
+    pdfSafeText(shortCpuLabel(row.cpuModel)),
+    ramMb === null ? '—' : String(Math.round(ramMb / 1024)),
+    diskGb === null ? '—' : String(Math.round(diskGb)),
+    pdfSafeText(textOrNull(row.serialNumber) ?? '—'),
+    formatGenericCell(row.lastSeenAt, timezone),
+  ];
+}
+
+const DEVICE_INVENTORY_BOTTOM = PAGE.footY - 8;
+
+function renderDeviceInventoryReport(doc: jsPDF, rows: Record<string, unknown>[], opts: BuildOpts): void {
+  const groups = groupDeviceInventoryBySite(rows);
+  const online = rows.filter((r) => r.status === 'online').length;
+  const meta = `Generated ${opts.generatedAt}   ·   ${rows.length} device${rows.length === 1 ? '' : 's'}`
+    + `   ·   ${groups.length} site${groups.length === 1 ? '' : 's'}   ·   ${online} online`;
+  let y = drawTitleBlock(doc, 'Device Inventory', '', meta, PAGE.bandH + 8) + 4;
+
+  const chrome = () => {
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+  };
+  const tableBase = {
+    margin: { top: PAGE.bandH + 6, left: PAGE.mx, right: PAGE.mx, bottom: 16 },
+    theme: 'grid' as const,
+    rowPageBreak: 'avoid' as const,
+    styles: { fontSize: 8, cellPadding: 1.6, lineColor: C.rule, lineWidth: 0.1, textColor: C.ink, valign: 'middle' as const, overflow: 'linebreak' as const },
+    headStyles: { fillColor: C.primary, textColor: C.white, fontStyle: 'bold' as const, lineColor: C.primary },
+    alternateRowStyles: { fillColor: C.zebra },
+    didDrawPage: () => chrome(),
+  };
+  const finalY = (fallback: number) => {
+    const t = (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable;
+    return typeof t?.finalY === 'number' ? t.finalY : fallback;
+  };
+
+  if (rows.length === 0) {
+    set.text(doc, C.muted);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(11);
+    doc.text('No data available for the selected filters.', PAGE.mx, y + 8);
+    chrome();
+    return;
+  }
+
+  // Overview: one line per site, so the reader sees every branch on page 1.
+  y = drawSectionHeading(doc, 'Devices per site', y + 2);
+  autoTable(doc, {
+    ...tableBase,
+    startY: y,
+    head: [['Site', 'Devices', 'Online', 'Offline / other']],
+    body: groups.map((g) => [
+      pdfSafeText(g.site),
+      String(g.rows.length),
+      String(g.online),
+      String(g.rows.length - g.online),
+    ]),
+    tableWidth: 150,
+    columnStyles: { 1: { halign: 'right' }, 2: { halign: 'right' }, 3: { halign: 'right' } },
+  });
+  y = finalY(y) + 10;
+
+  // One section per site: heading with counts, then that site's devices.
+  for (const group of groups) {
+    // Keep the heading with at least the table head and a couple of rows.
+    if (y + 30 > DEVICE_INVENTORY_BOTTOM) {
+      doc.addPage();
+      chrome();
+      y = PAGE.bandH + 12;
+    }
+    const heading = `${pdfSafeText(group.site)}   ·   ${group.rows.length} device${group.rows.length === 1 ? '' : 's'}, ${group.online} online`;
+    autoTable(doc, {
+      ...tableBase,
+      startY: y,
+      // The site row is part of the head, so autoTable repeats it on every
+      // page a long site spills onto — a continuation page still says which
+      // branch it belongs to.
+      head: [
+        [{
+          content: heading,
+          colSpan: DEVICE_INVENTORY_COLUMNS.length,
+          styles: { fillColor: C.panel, textColor: C.ink, fontSize: 10, fontStyle: 'bold', halign: 'left', lineColor: C.rule, cellPadding: 2.4 },
+        }],
+        DEVICE_INVENTORY_COLUMNS.map((c) => c.header),
+      ],
+      body: group.rows.map((r) => deviceInventoryCells(r, opts.timezone)),
+      columnStyles: Object.fromEntries(DEVICE_INVENTORY_COLUMNS.map((c, i) => [
+        i,
+        { cellWidth: c.width, ...(c.header.includes('(GB)') ? { halign: 'right' as const } : {}) },
+      ])),
+      didParseCell: (data: CellHookData) => {
+        if (data.section !== 'body') return;
+        const text = data.cell.text.join('');
+        if (text === '—') data.cell.styles.textColor = C.faint;
+        if (data.column.index === 1) {
+          if (text === 'online') data.cell.styles.textColor = C.success;
+          else if (text === 'offline') data.cell.styles.textColor = C.muted;
+        }
+      },
+    });
+    y = finalY(y) + 9;
+  }
+}
+
 /**
  * Build a fully-branded report PDF. The security & compliance posture report
  * leads with a scorecard cover and a curated per-device table; every other
@@ -2162,6 +2364,11 @@ function buildReportPdfWithPalette(rows: unknown[], opts: BuildOpts): jsPDF {
         drawSectionHeading,
       },
     );
+  } else if (opts.reportType === 'device_inventory') {
+    // Grouped by site with curated columns; the generic table dumped every raw
+    // field (device id, enrol date, ...) at ~5 rows a page with no branch view.
+    // Chrome is drawn by the tables' didDrawPage.
+    renderDeviceInventoryReport(doc, records, opts);
   } else {
     renderGenericReport(doc, records, opts);
   }

@@ -487,13 +487,16 @@ const fieldDefinitionsByType: Record<BuilderReportType, FieldDefinition[]> = {
     { id: 'os', label: 'OS', dataType: 'string' },
     { id: 'status', label: 'Status', dataType: 'string' },
     { id: 'site', label: 'Site', dataType: 'string' },
-    { id: 'owner', label: 'Owner', dataType: 'string' },
+    // 'owner' removed: the inventory query has no owner column, so a selected
+    // Owner field was silently dropped from the preview.
     { id: 'serial', label: 'Serial', dataType: 'string' },
     { id: 'last_seen', label: 'Last seen', dataType: 'date' },
-    { id: 'cpu', label: 'CPU usage', dataType: 'number' },
-    { id: 'memory', label: 'Memory usage', dataType: 'number' },
-    { id: 'disk_usage', label: 'Disk usage', dataType: 'number' },
-    { id: 'patch_level', label: 'Patch level', dataType: 'string' }
+    // These are hardware facts, not live usage: cpu = CPU model, memory = total
+    // RAM (MB), disk_usage = total disk (GB), patch_level = agent version.
+    { id: 'cpu', label: 'CPU', dataType: 'string' },
+    { id: 'memory', label: 'RAM (MB)', dataType: 'number' },
+    { id: 'disk_usage', label: 'Disk (GB)', dataType: 'number' },
+    { id: 'patch_level', label: 'Agent version', dataType: 'string' }
   ],
   alerts: [
     { id: 'alert_id', label: 'Alert ID', dataType: 'string' },
@@ -580,6 +583,8 @@ const normalizePreviewRow = (type: BuilderReportType, row: PreviewRow): PreviewR
     const osType = typeof row.osType === 'string' ? row.osType : '';
     const osVersion = typeof row.osVersion === 'string' ? row.osVersion : '';
     normalized.os = [osType, osVersion].filter(Boolean).join(' ').trim();
+    normalized.site = row.site ?? row.siteName ?? null;
+    normalized.cpu = row.cpu ?? row.cpuModel ?? null;
     normalized.serial = row.serial ?? row.serialNumber ?? null;
     normalized.last_seen = row.last_seen ?? row.lastSeenAt ?? null;
     normalized.memory = row.memory ?? row.ramTotalMb ?? null;

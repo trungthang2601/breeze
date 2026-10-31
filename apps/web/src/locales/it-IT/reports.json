@@ -721,14 +721,14 @@
           "status": "Stato"
         },
         "devices": {
-          "cpu": "Utilizzo CPU",
-          "disk_usage": "Utilizzo disco",
+          "cpu": "CPU",
+          "disk_usage": "Disco (GB)",
           "hostname": "Hostname",
           "last_seen": "Ultimo contatto",
-          "memory": "Utilizzo memoria",
+          "memory": "RAM (MB)",
           "os": "OS",
           "owner": "Proprietario",
-          "patch_level": "Livello patch",
+          "patch_level": "Versione agent",
           "serial": "Seriale",
           "site": "Sito",
           "status": "Stato"

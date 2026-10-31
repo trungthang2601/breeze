@@ -721,14 +721,14 @@
           "status": "Statut"
         },
         "devices": {
-          "cpu": "CPU Utilisation",
-          "disk_usage": "Utilisation du disque",
+          "cpu": "CPU",
+          "disk_usage": "Disque (GB)",
           "hostname": "Nom d’hôte",
           "last_seen": "Dernière apparition",
-          "memory": "Utilisation de la mémoire",
+          "memory": "RAM (MB)",
           "os": "OS",
           "owner": "Propriétaire",
-          "patch_level": "Niveau de patch",
+          "patch_level": "Version de l’agent",
           "serial": "Feuilleton",
           "site": "Site",
           "status": "Statut"

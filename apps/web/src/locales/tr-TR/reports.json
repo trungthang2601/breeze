@@ -721,14 +721,14 @@
           "status": "Durum"
         },
         "devices": {
-          "cpu": "CPU kullanımı",
-          "disk_usage": "Disk kullanımı",
+          "cpu": "CPU",
+          "disk_usage": "Disk (GB)",
           "hostname": "Ana Bilgisayar Adı",
           "last_seen": "Son görülme",
-          "memory": "Bellek kullanımı",
+          "memory": "RAM (MB)",
           "os": "İşletim Sistemi",
           "owner": "Sahip",
-          "patch_level": "Yama düzeyi",
+          "patch_level": "Agent sürümü",
           "serial": "Seri",
           "site": "Sitesi",
           "status": "Durum"
