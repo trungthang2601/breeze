@@ -30,7 +30,7 @@ import { useOrgStore } from '../../stores/orgStore';
 import { runAction, ActionError } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import type { FilterConditionGroup } from '@breeze/shared';
-import { memoryModuleLines, memoryModuleSerials, physicalDiskDetailLines } from '@breeze/shared';
+import { memoryModuleLines, physicalDiskDetailLines } from '@breeze/shared';
 import { FilterBuilder, DEFAULT_FILTER_FIELDS } from '../filters/FilterBuilder';
 import { FilterPreview } from '../filters/FilterPreview';
 import { useFilterPreview } from '../../hooks/useFilterPreview';
@@ -514,18 +514,15 @@ const fieldDefinitionsByType: Record<BuilderReportType, FieldDefinition[]> = {
     // Owner field was silently dropped from the preview.
     { id: 'serial', label: 'Serial', dataType: 'string' },
     { id: 'last_seen', label: 'Last seen', dataType: 'date' },
-    // These are hardware facts, not live usage: cpu = CPU model, memory = total
-    // RAM (MB), disk_usage = total disk (GB), patch_level = agent version.
+    // Hardware facts, not live usage; patch_level = agent version.
     { id: 'cpu', label: 'CPU', dataType: 'string' },
     { id: 'gpu', label: 'GPU', dataType: 'string' },
     { id: 'motherboard', label: 'Motherboard', dataType: 'string' },
-    { id: 'memory', label: 'RAM (MB)', dataType: 'number' },
-    // "1 x 8 GB (2666 MHz), 1 x 8 GB (3200 MHz)" — from agents that report RAM sticks.
-    { id: 'ram_modules', label: 'RAM modules', dataType: 'string' },
-    { id: 'ram_serials', label: 'RAM serials', dataType: 'string' },
-    { id: 'disk_usage', label: 'Disk (GB)', dataType: 'number' },
-    // "Samsung SSD 980 500GB (SSD 500 GB, NVMe) - SN: ..." per internal drive.
-    { id: 'disks', label: 'Disks (model + serial)', dataType: 'string' },
+    // One RAM column: each stick with its serial ("1 x 8 GB (2666 MHz) - SN: ..."),
+    // or the total ("16 GB") from agents that do not report sticks yet.
+    { id: 'ram', label: 'RAM', dataType: 'string' },
+    // One disk column: each drive with model and serial, or the total size.
+    { id: 'disks', label: 'Disks', dataType: 'string' },
     { id: 'patch_level', label: 'Agent version', dataType: 'string' }
   ],
   alerts: [
@@ -571,6 +568,25 @@ const fieldDefinitionsByType: Record<BuilderReportType, FieldDefinition[]> = {
     { id: 'duration_seconds', label: 'Duration (sec)', dataType: 'number' }
   ]
 };
+
+// Device fields merged into one RAM and one Disks column; saved reports that
+// picked the old ones get the merged column (once, in the old position).
+const LEGACY_COLUMN_IDS: Record<string, string> = {
+  memory: 'ram',
+  ram_modules: 'ram',
+  ram_serials: 'ram',
+  disk_usage: 'disks',
+};
+
+function migrateLegacyColumns(columns?: string[]): string[] | undefined {
+  if (!columns) return undefined;
+  const out: string[] = [];
+  for (const column of columns) {
+    const id = LEGACY_COLUMN_IDS[column] ?? column;
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
 
 const defaultFieldsByType: Record<BuilderReportType, string[]> = {
   devices: ['hostname', 'os', 'status', 'site', 'last_seen'],
@@ -620,13 +636,12 @@ const normalizePreviewRow = (type: BuilderReportType, row: PreviewRow): PreviewR
       .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
       .join(' ');
     normalized.motherboard = row.motherboard ?? (board || null);
-    normalized.ram_modules = row.ram_modules ?? (memoryModuleLines(row.memoryModules).join(', ') || null);
-    normalized.ram_serials = row.ram_serials ?? memoryModuleSerials(row.memoryModules);
-    normalized.disks = row.disks ?? (physicalDiskDetailLines(row.physicalDisks).join(', ') || null);
+    const ramTotal = typeof row.ramTotalMb === 'number' && row.ramTotalMb > 0 ? `${Math.round(row.ramTotalMb / 1024)} GB` : null;
+    normalized.ram = row.ram ?? (memoryModuleLines(row.memoryModules).join(', ') || ramTotal);
+    const diskTotal = typeof row.diskTotalGb === 'number' && row.diskTotalGb > 0 ? `${Math.round(row.diskTotalGb)} GB` : null;
+    normalized.disks = row.disks ?? (physicalDiskDetailLines(row.physicalDisks).join(', ') || diskTotal);
     normalized.serial = row.serial ?? row.serialNumber ?? null;
     normalized.last_seen = row.last_seen ?? row.lastSeenAt ?? null;
-    normalized.memory = row.memory ?? row.ramTotalMb ?? null;
-    normalized.disk_usage = row.disk_usage ?? row.diskTotalGb ?? null;
     normalized.patch_level = row.patch_level ?? row.agentVersion ?? null;
   } else if (type === 'alerts') {
     normalized.alert_id = row.alert_id ?? row.id ?? row.title ?? null;
@@ -791,7 +806,7 @@ export default function ReportBuilder({
     defaultValues?.dataSource ?? dataSourceDefaultsByType[initialType]
   );
   const [selectedFields, setSelectedFields] = useState<string[]>(
-    defaultValues?.columns ?? defaultFieldsByType[initialType]
+    migrateLegacyColumns(defaultValues?.columns) ?? defaultFieldsByType[initialType]
   );
   const [filterConditions, setFilterConditions] = useState<FilterCondition[]>(
     defaultValues?.filterConditions ?? []
@@ -839,7 +854,7 @@ export default function ReportBuilder({
     setBuilderType(normalizedType);
     setReportName(defaultValues.name ?? '');
     setDataSource(defaultValues.dataSource ?? dataSourceDefaultsByType[normalizedType]);
-    setSelectedFields(defaultValues.columns ?? defaultFieldsByType[normalizedType]);
+    setSelectedFields(migrateLegacyColumns(defaultValues.columns) ?? defaultFieldsByType[normalizedType]);
     setFilterConditions(defaultValues.filterConditions ?? []);
     setGroupBy(defaultValues.groupBy ?? '');
     setAggregation(defaultValues.aggregation ?? { type: 'count' });
