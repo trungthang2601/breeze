@@ -455,7 +455,18 @@
       "templates": "Plantillas",
       "title": "Informes",
       "tryAgain": "Intentar otra vez",
-      "unknownReport": "Informe desconocido"
+      "unknownReport": "Informe desconocido",
+      "runDelete": {
+        "confirmOne": "¿Eliminar esta ejecución? Su resultado guardado también se elimina y no se podrá volver a descargar.",
+        "confirmMany": "¿Eliminar {{count}} ejecuciones? Sus resultados guardados también se eliminan y no se podrán volver a descargar.",
+        "partialFailure": "No se pudieron eliminar {{count}} ejecuciones (en curso, protegidas o sin permiso).",
+        "selected": "{{count}} seleccionadas",
+        "clearSelection": "Quitar selección",
+        "deleteSelected": "Eliminar seleccionadas ({{count}})",
+        "selectAll": "Seleccionar todas las ejecuciones",
+        "selectRun": "Seleccionar ejecución de {{name}}",
+        "deleteOne": "Eliminar ejecución"
+      }
     },
     "reportBuilder": {
       "actions": {

@@ -86,6 +86,7 @@ vi.mock('../../services/permissions', () => ({
     REPORTS_EXPORT: { resource: 'reports', action: 'export' },
     REPORTS_READ: { resource: 'reports', action: 'read' },
     REPORTS_WRITE: { resource: 'reports', action: 'write' },
+    REPORTS_DELETE: { resource: 'reports', action: 'delete' },
   },
 }));
 

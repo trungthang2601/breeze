@@ -455,7 +455,18 @@
       "templates": "Template",
       "title": "Report",
       "tryAgain": "Riprova",
-      "unknownReport": "Report sconosciuto"
+      "unknownReport": "Report sconosciuto",
+      "runDelete": {
+        "confirmOne": "Eliminare questa esecuzione? Anche il risultato salvato verrà eliminato e non potrà più essere scaricato.",
+        "confirmMany": "Eliminare {{count}} esecuzioni? Anche i risultati salvati verranno eliminati e non potranno più essere scaricati.",
+        "partialFailure": "Impossibile eliminare {{count}} esecuzioni (in corso, protette o senza autorizzazione).",
+        "selected": "{{count}} selezionate",
+        "clearSelection": "Deseleziona",
+        "deleteSelected": "Elimina selezionate ({{count}})",
+        "selectAll": "Seleziona tutte le esecuzioni",
+        "selectRun": "Seleziona esecuzione di {{name}}",
+        "deleteOne": "Elimina esecuzione"
+      }
     },
     "reportBuilder": {
       "actions": {

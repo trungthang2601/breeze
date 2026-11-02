@@ -455,7 +455,18 @@
       "templates": "Modelos",
       "title": "Relatórios",
       "tryAgain": "Tentar novamente",
-      "unknownReport": "Relatório Desconhecido"
+      "unknownReport": "Relatório Desconhecido",
+      "runDelete": {
+        "confirmOne": "Excluir esta execução? O resultado salvo também será excluído e não poderá ser baixado novamente.",
+        "confirmMany": "Excluir {{count}} execuções? Os resultados salvos também serão excluídos e não poderão ser baixados novamente.",
+        "partialFailure": "Não foi possível excluir {{count}} execução(ões) (em andamento, protegidas ou sem permissão).",
+        "selected": "{{count}} selecionadas",
+        "clearSelection": "Limpar seleção",
+        "deleteSelected": "Excluir selecionadas ({{count}})",
+        "selectAll": "Selecionar todas as execuções",
+        "selectRun": "Selecionar execução de {{name}}",
+        "deleteOne": "Excluir execução"
+      }
     },
     "reportBuilder": {
       "actions": {

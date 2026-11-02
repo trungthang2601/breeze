@@ -455,7 +455,18 @@
       "templates": "Vorlagen",
       "title": "Berichte",
       "tryAgain": "Versuchen Sie es erneut",
-      "unknownReport": "Unbekannter Bericht"
+      "unknownReport": "Unbekannter Bericht",
+      "runDelete": {
+        "confirmOne": "Diesen Lauf löschen? Das gespeicherte Ergebnis wird ebenfalls gelöscht und kann nicht mehr heruntergeladen werden.",
+        "confirmMany": "{{count}} Läufe löschen? Die gespeicherten Ergebnisse werden ebenfalls gelöscht und können nicht mehr heruntergeladen werden.",
+        "partialFailure": "{{count}} Lauf/Läufe konnten nicht gelöscht werden (läuft noch, geschützt oder keine Berechtigung).",
+        "selected": "{{count}} ausgewählt",
+        "clearSelection": "Auswahl aufheben",
+        "deleteSelected": "Auswahl löschen ({{count}})",
+        "selectAll": "Alle Läufe auswählen",
+        "selectRun": "Lauf von {{name}} auswählen",
+        "deleteOne": "Lauf löschen"
+      }
     },
     "reportBuilder": {
       "actions": {

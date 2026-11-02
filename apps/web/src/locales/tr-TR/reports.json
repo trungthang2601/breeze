@@ -455,7 +455,18 @@
       "templates": "Şablonlar",
       "title": "Raporlar",
       "tryAgain": "Tekrar deneyin",
-      "unknownReport": "Bilinmeyen Rapor"
+      "unknownReport": "Bilinmeyen Rapor",
+      "runDelete": {
+        "confirmOne": "Bu çalıştırma silinsin mi? Kayıtlı sonucu da silinir ve tekrar indirilemez.",
+        "confirmMany": "{{count}} çalıştırma silinsin mi? Kayıtlı sonuçları da silinir ve tekrar indirilemez.",
+        "partialFailure": "{{count}} çalıştırma silinemedi (hâlâ çalışıyor, korumalı veya izin yok).",
+        "selected": "{{count}} seçili",
+        "clearSelection": "Seçimi temizle",
+        "deleteSelected": "Seçilenleri sil ({{count}})",
+        "selectAll": "Tüm çalıştırmaları seç",
+        "selectRun": "{{name}} çalıştırmasını seç",
+        "deleteOne": "Çalıştırmayı sil"
+      }
     },
     "reportBuilder": {
       "actions": {

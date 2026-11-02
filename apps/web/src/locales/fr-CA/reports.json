@@ -455,7 +455,18 @@
       "templates": "Modèles",
       "title": "Rapports",
       "tryAgain": "Réessayer",
-      "unknownReport": "Rapport inconnu"
+      "unknownReport": "Rapport inconnu",
+      "runDelete": {
+        "confirmOne": "Supprimer cette exécution? Son résultat enregistré sera aussi supprimé et ne pourra plus être téléchargé.",
+        "confirmMany": "Supprimer {{count}} exécutions? Leurs résultats enregistrés seront aussi supprimés et ne pourront plus être téléchargés.",
+        "partialFailure": "{{count}} exécution(s) n'ont pas pu être supprimées (en cours, protégées ou sans autorisation).",
+        "selected": "{{count}} sélectionnées",
+        "clearSelection": "Désélectionner",
+        "deleteSelected": "Supprimer la sélection ({{count}})",
+        "selectAll": "Sélectionner toutes les exécutions",
+        "selectRun": "Sélectionner l'exécution de {{name}}",
+        "deleteOne": "Supprimer l'exécution"
+      }
     },
     "reportBuilder": {
       "actions": {

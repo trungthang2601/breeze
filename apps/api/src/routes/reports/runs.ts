@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { and, eq, or, sql, desc, inArray, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
-import { reports, reportRuns } from '../../db/schema';
+import { reports, reportRuns, serviceDeliverableEvidence } from '../../db/schema';
 import { authMiddleware, requirePermission, requireScope } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { auditSensitiveRead } from '../../services/sensitiveReadAudit';
@@ -641,3 +641,134 @@ function runPayloadMatchesAuthority(
     return false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Deleting runs (Recent Runs list: per-row delete and multi-select delete).
+// ---------------------------------------------------------------------------
+
+type RunDeleteOutcome =
+  | { ok: true; id: string; reportName: string | null; orgId: string | null; partnerId: string | null }
+  | { ok: false; id: string; reason: 'not_found' | 'forbidden' | 'in_progress' | 'system_managed' | 'evidence' };
+
+const MAX_BULK_RUN_DELETE = 100;
+
+/**
+ * Delete one run the caller may see. Same tenant/site-scope gate as download
+ * (`getReportRunWithOrgCheck` with the 'delete' action), plus:
+ *  - partner-owned runs need partner-wide management rights;
+ *  - runs still pending/running are left alone (the worker writes into them);
+ *  - runs of system-managed definitions (AI narrative, Fleet Design, managed
+ *    evidence) are kept — other features read their history;
+ *  - a run attached as service-plan evidence is kept (deleting it would
+ *    cascade the evidence away).
+ */
+async function deleteOneReportRun(runId: string, auth: Parameters<typeof getReportRunWithOrgCheck>[1]): Promise<RunDeleteOutcome> {
+  const access = await getReportRunWithOrgCheck(runId, auth, 'delete');
+  if (!access) return { ok: false, id: runId, reason: 'not_found' };
+  if (access.metadata.partnerId && !access.metadata.orgId && !canManagePartnerWidePolicies(auth)) {
+    return { ok: false, id: runId, reason: 'forbidden' };
+  }
+
+  const [row] = await db
+    .select({
+      status: reportRuns.status,
+      reportName: reports.name,
+      type: reports.type,
+      executionScopePrincipalKind: reports.executionScopePrincipalKind,
+      portalSelfService: reports.portalSelfService,
+    })
+    .from(reportRuns)
+    .innerJoin(reports, eq(reportRuns.reportId, reports.id))
+    .where(and(eq(reportRuns.id, runId), access.ownerCondition, access.runScopePredicate))
+    .limit(1);
+  if (!row) return { ok: false, id: runId, reason: 'not_found' };
+  if (row.status === 'pending' || row.status === 'running') return { ok: false, id: runId, reason: 'in_progress' };
+  if (isSystemManagedReportDefinition(row)) return { ok: false, id: runId, reason: 'system_managed' };
+
+  const [evidence] = await db
+    .select({ id: serviceDeliverableEvidence.id })
+    .from(serviceDeliverableEvidence)
+    .where(eq(serviceDeliverableEvidence.reportRunId, runId))
+    .limit(1);
+  if (evidence) return { ok: false, id: runId, reason: 'evidence' };
+
+  const deleted = await db
+    .delete(reportRuns)
+    .where(and(
+      eq(reportRuns.id, runId),
+      access.runScopePredicate,
+      inArray(
+        reportRuns.reportId,
+        db.select({ id: reports.id }).from(reports).where(and(eq(reports.id, access.metadata.reportId), access.ownerCondition)),
+      ),
+    ))
+    .returning({ id: reportRuns.id });
+  if (deleted.length !== 1) return { ok: false, id: runId, reason: 'not_found' };
+
+  return { ok: true, id: runId, reportName: row.reportName, orgId: access.metadata.orgId, partnerId: access.metadata.partnerId };
+}
+
+const RUN_DELETE_STATUS: Record<Exclude<RunDeleteOutcome, { ok: true }>['reason'], 403 | 404 | 409> = {
+  not_found: 404,
+  forbidden: 403,
+  in_progress: 409,
+  system_managed: 409,
+  evidence: 409,
+};
+
+function auditRunDelete(c: Parameters<typeof writeRouteAudit>[0], outcome: Extract<RunDeleteOutcome, { ok: true }>, bulk: boolean) {
+  writeRouteAudit(c, {
+    orgId: outcome.orgId,
+    action: 'report.run.delete',
+    resourceType: 'report_run',
+    resourceId: outcome.id,
+    resourceName: outcome.reportName ?? undefined,
+    details: {
+      ...(outcome.partnerId ? { partnerId: outcome.partnerId } : {}),
+      ...(bulk ? { bulk: true } : {}),
+    },
+  });
+}
+
+// DELETE /reports/runs/:id - Delete one run (its stored result goes with it)
+runsRoutes.delete(
+  '/runs/:id',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_DELETE.resource, PERMISSIONS.REPORTS_DELETE.action),
+  async (c) => {
+    const runId = c.req.param('id')!;
+    if (!z.string().guid().safeParse(runId).success) {
+      return c.json({ error: 'Report run not found' }, 404);
+    }
+    const outcome = await deleteOneReportRun(runId, c.get('auth'));
+    if (!outcome.ok) {
+      return c.json({ error: outcome.reason }, RUN_DELETE_STATUS[outcome.reason]);
+    }
+    auditRunDelete(c, outcome, false);
+    return c.json({ success: true, id: runId });
+  }
+);
+
+// POST /reports/runs/bulk-delete - Delete several runs; per-id results
+runsRoutes.post(
+  '/runs/bulk-delete',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.REPORTS_DELETE.resource, PERMISSIONS.REPORTS_DELETE.action),
+  zValidator('json', z.object({ ids: z.array(z.string().guid()).min(1).max(MAX_BULK_RUN_DELETE) })),
+  async (c) => {
+    const auth = c.get('auth');
+    const ids = [...new Set(c.req.valid('json').ids)];
+    const deleted: string[] = [];
+    const failed: Array<{ id: string; reason: string }> = [];
+    for (const id of ids) {
+      const outcome = await deleteOneReportRun(id, auth);
+      if (outcome.ok) {
+        deleted.push(id);
+        auditRunDelete(c, outcome, true);
+      } else {
+        failed.push({ id, reason: outcome.reason });
+      }
+    }
+    return c.json({ deleted, failed });
+  }
+);

@@ -207,6 +207,50 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
     }
   };
 
+  // Recent Runs: per-row delete and multi-select delete. Runs still being
+  // generated cannot be selected (the API refuses them too).
+  const [selectedRunIds, setSelectedRunIds] = useState<Set<string>>(new Set());
+  const [deletingRuns, setDeletingRuns] = useState(false);
+  const isRunDeletable = (run: ReportRun) => run.status !== 'pending' && run.status !== 'running';
+  const deletableRuns = recentRuns.filter(isRunDeletable);
+  const allRunsSelected = deletableRuns.length > 0 && deletableRuns.every(run => selectedRunIds.has(run.id));
+
+  const toggleRunSelected = (runId: string, checked: boolean) => {
+    setSelectedRunIds(prev => {
+      const next = new Set(prev);
+      if (checked) next.add(runId);
+      else next.delete(runId);
+      return next;
+    });
+  };
+
+  const deleteRuns = async (ids: string[]) => {
+    if (ids.length === 0) return;
+    const message = ids.length === 1
+      ? t('reports.reportsList.runDelete.confirmOne')
+      : t('reports.reportsList.runDelete.confirmMany', { count: ids.length });
+    if (!confirm(message)) return;
+
+    setDeletingRuns(true);
+    setError(undefined);
+    try {
+      const response = ids.length === 1
+        ? await fetchWithAuth(`/reports/runs/${ids[0]}`, { method: 'DELETE' })
+        : await fetchWithAuth('/reports/runs/bulk-delete', { method: 'POST', body: JSON.stringify({ ids }) });
+      const body = await response.json().catch(() => ({})) as { error?: string; failed?: Array<{ id: string; reason: string }> };
+      const failedCount = !response.ok ? ids.length : (body.failed?.length ?? 0);
+      if (failedCount > 0) {
+        setError(t('reports.reportsList.runDelete.partialFailure', { count: failedCount }));
+      }
+      setSelectedRunIds(new Set());
+      await fetchRecentRuns();
+    } catch {
+      setError(t('reports.reportsList.runDelete.partialFailure', { count: ids.length }));
+    } finally {
+      setDeletingRuns(false);
+    }
+  };
+
   const handleDelete = async (report: Report) => {
     if (!confirm(t('reports.reportsList.confirmDelete', { name: report.name }))) {
       return;
@@ -645,9 +689,43 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
             </div>
           ) : (
             <div className="rounded-lg border bg-card shadow-xs overflow-hidden">
+              {selectedRunIds.size > 0 && (
+                <div className="flex items-center justify-between gap-3 border-b bg-muted/30 px-4 py-2 text-sm">
+                  <span>{t('reports.reportsList.runDelete.selected', { count: selectedRunIds.size })}</span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedRunIds(new Set())}
+                      className="h-8 rounded-md border px-3 text-sm hover:bg-muted"
+                    >
+                      {t('reports.reportsList.runDelete.clearSelection')}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void deleteRuns([...selectedRunIds])}
+                      disabled={deletingRuns}
+                      className="flex h-8 items-center gap-1 rounded-md border border-destructive/40 px-3 text-sm text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                      data-testid="delete-selected-runs"
+                    >
+                      {deletingRuns ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                      {t('reports.reportsList.runDelete.deleteSelected', { count: selectedRunIds.size })}
+                    </button>
+                  </div>
+                </div>
+              )}
               <table className="w-full">
                 <thead className="bg-muted/40">
                   <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                    <th className="w-10 px-4 py-3">
+                      <input
+                        type="checkbox"
+                        aria-label={t('reports.reportsList.runDelete.selectAll')}
+                        checked={allRunsSelected}
+                        disabled={deletableRuns.length === 0}
+                        onChange={e => setSelectedRunIds(e.target.checked ? new Set(deletableRuns.map(run => run.id)) : new Set())}
+                        className="h-4 w-4 rounded border"
+                      />
+                    </th>
                     <th className="px-4 py-3">
                       {t('reports.reportsList.runsTable.report')}
                     </th>
@@ -668,6 +746,16 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                 <tbody className="divide-y">
                   {recentRuns.map(run => (
                     <tr key={run.id} className="hover:bg-muted/30">
+                      <td className="w-10 px-4 py-3">
+                        <input
+                          type="checkbox"
+                          aria-label={t('reports.reportsList.runDelete.selectRun', { name: run.reportName || t('reports.reportsList.unknownReport') })}
+                          checked={selectedRunIds.has(run.id)}
+                          disabled={!isRunDeletable(run)}
+                          onChange={e => toggleRunSelected(run.id, e.target.checked)}
+                          className="h-4 w-4 rounded border"
+                        />
+                      </td>
                       <td className="px-4 py-3">
                         <div>
                           <span className="font-medium">{run.reportName || t('reports.reportsList.unknownReport')}</span>
@@ -717,6 +805,19 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
                                 <Download className="h-4 w-4" />
                               )}
                               {t('reports.reportsList.download')}
+                            </button>
+                          )}
+                          {isRunDeletable(run) && (
+                            <button
+                              type="button"
+                              onClick={() => void deleteRuns([run.id])}
+                              disabled={deletingRuns}
+                              title={t('reports.reportsList.runDelete.deleteOne')}
+                              aria-label={t('reports.reportsList.runDelete.deleteOne')}
+                              className="ml-2 flex h-8 w-8 items-center justify-center rounded-md border text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-50"
+                              data-testid={`delete-run-${run.id}`}
+                            >
+                              <Trash2 className="h-4 w-4" />
                             </button>
                           )}
                         </div>

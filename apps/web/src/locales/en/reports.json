@@ -455,7 +455,18 @@
       "templates": "Templates",
       "title": "Reports",
       "tryAgain": "Try again",
-      "unknownReport": "Unknown Report"
+      "unknownReport": "Unknown Report",
+      "runDelete": {
+        "confirmOne": "Delete this run? Its stored result is deleted too and cannot be downloaded again.",
+        "confirmMany": "Delete {{count}} runs? Their stored results are deleted too and cannot be downloaded again.",
+        "partialFailure": "{{count}} run(s) could not be deleted (still running, protected, or no permission).",
+        "selected": "{{count}} selected",
+        "clearSelection": "Clear",
+        "deleteSelected": "Delete selected ({{count}})",
+        "selectAll": "Select all runs",
+        "selectRun": "Select run of {{name}}",
+        "deleteOne": "Delete run"
+      }
     },
     "reportBuilder": {
       "actions": {
