@@ -73,3 +73,18 @@ describe('memoryModules', () => {
     expect(formatModuleSize(1536)).toBe('1.5 GB');
   });
 });
+
+describe('formatInstalledRam', () => {
+  it('snaps the OS-visible total to the installed size', async () => {
+    const { formatInstalledRam } = await import('./memoryModules');
+    expect(formatInstalledRam(16224)).toBe('16 GB'); // Windows
+    expect(formatInstalledRam(15.4 * 1024)).toBe('16 GB'); // Debian MemTotal
+    expect(formatInstalledRam(7.7 * 1024)).toBe('8 GB');
+    expect(formatInstalledRam(3.8 * 1024)).toBe('4 GB');
+    expect(formatInstalledRam(32768)).toBe('32 GB');
+    expect(formatInstalledRam(12 * 1024)).toBe('12 GB');
+    expect(formatInstalledRam(10 * 1024)).toBe('10 GB');
+    expect(formatInstalledRam(null)).toBeNull();
+    expect(formatInstalledRam(0)).toBeNull();
+  });
+});

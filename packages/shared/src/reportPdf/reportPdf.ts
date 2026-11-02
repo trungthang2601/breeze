@@ -5,7 +5,7 @@ import type { ExecutiveSummary } from '../types/executiveSummaryReport';
 import type { HardwareLifecycleSummary } from '../types/hardwareLifecycleReport';
 import { memoryModuleLines } from '../utils/memoryModules';
 import { formatDiskSize, normalizePhysicalDisks, physicalDiskLines } from '../utils/physicalDisks';
-import { formatModuleSize, normalizeMemoryModules } from '../utils/memoryModules';
+import { formatInstalledRam, formatModuleSize, normalizeMemoryModules } from '../utils/memoryModules';
 import { isDeviceDetailSummary, type DeviceDetailRecord, type DeviceDetailSummary } from '../types/deviceDetailReport';
 import { renderHardwareLifecycleReport } from './hardwareLifecyclePdf';
 import type { ThreatDetectionSummary } from '../types/threatDetectionReport';
@@ -2005,8 +2005,7 @@ export function shortGpuLabel(gpuModel: unknown): string {
 export function ramLabel(memoryModules: unknown, ramTotalMb: unknown): string {
   const lines = memoryModuleLines(memoryModules);
   if (lines.length) return lines.join('\n');
-  const total = num(ramTotalMb);
-  return total === null ? '—' : `${Math.round(total / 1024)} GB`;
+  return formatInstalledRam(num(ramTotalMb)) ?? '—';
 }
 
 /**
@@ -2091,7 +2090,7 @@ export function deviceDetailInfoPairs(d: DeviceDetailRecord, timezone: string): 
     ['BIOS', detailText(hw?.biosVersion)],
     ['CPU', cpuDetail(hw)],
     ['GPU', pdfSafeText(shortGpuLabel(hw?.gpuModel))],
-    ['RAM', hw?.ramTotalMb ? `${Math.round(hw.ramTotalMb / 1024)} GB` : '—'],
+    ['RAM', formatInstalledRam(hw?.ramTotalMb) ?? '—'],
     ['Disk total', hw?.diskTotalGb ? `${Math.round(hw.diskTotalGb)} GB` : '—'],
     ['Warranty', pdfSafeText(warrantyDetail(d.warranty, timezone))],
   ];

@@ -111,3 +111,20 @@ export function memoryModuleSerials(value: unknown): string | null {
     .map((m) => (m.slot ? `${m.slot}: ${m.serialNumber}` : `${m.serialNumber}`));
   return parts.length ? parts.join(', ') : null;
 }
+
+const STANDARD_RAM_GB = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048];
+
+/**
+ * Installed RAM from the OS-reported total. The OS sees a little less than
+ * what is installed (firmware/kernel reservations, integrated-GPU memory), so
+ * a 16 GB machine reports ~15.5-15.9 GB — Windows 16224 MB, Linux MemTotal
+ * often ~15.5 GB. Snap to the nearest standard size when within 10% below it:
+ * 15872 MB -> "16 GB", 7.7 GB -> "8 GB"; anything else is rounded as is.
+ */
+export function formatInstalledRam(totalMb: number | null | undefined): string | null {
+  if (typeof totalMb !== 'number' || !Number.isFinite(totalMb) || totalMb <= 0) return null;
+  const gb = totalMb / 1024;
+  const standard = STANDARD_RAM_GB.find((size) => size >= gb - 0.05);
+  if (standard !== undefined && gb >= standard * 0.9) return `${standard} GB`;
+  return `${Math.round(gb)} GB`;
+}

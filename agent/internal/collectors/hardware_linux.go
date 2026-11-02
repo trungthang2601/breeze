@@ -40,6 +40,22 @@ func collectPlatformHardware(hw *HardwareInfo) {
 	hw.MotherboardVersion = cleanHardwareIdentityValue(readDMI("board_version"))
 	hw.BIOSVersion = readDMI("bios_version")
 
+	// RAM sticks (slot, size, speed, vendor, part, serial) from SMBIOS type 17.
+	// dmidecode needs root — the agent service runs as root; when it is missing
+	// or fails the field is omitted and the server keeps the previous list.
+	if memOut, memErr := runCollectorOutput(collectorLongCommandTimeout, "dmidecode", "-t", "17"); memErr != nil {
+		slog.Debug("dmidecode -t 17 failed; RAM sticks not reported", "error", memErr.Error())
+	} else {
+		hw.MemoryModules = parseDmidecodeMemory(string(memOut))
+	}
+
+	// Internal drives with model and serial (USB drives skipped).
+	if diskOut, diskErr := runCollectorOutput(collectorLongCommandTimeout, "lsblk", "-J", "-b", "-d", "-o", "NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,TYPE"); diskErr != nil {
+		slog.Debug("lsblk failed; physical disks not reported", "error", diskErr.Error())
+	} else {
+		hw.PhysicalDisks = parseLsblkDisks(diskOut)
+	}
+
 	// GPU via lspci (with timeout)
 	out, err := runCollectorOutput(collectorLongCommandTimeout, "lspci")
 	if err != nil {

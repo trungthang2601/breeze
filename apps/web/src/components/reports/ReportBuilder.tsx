@@ -30,7 +30,7 @@ import { useOrgStore } from '../../stores/orgStore';
 import { runAction, ActionError } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import type { FilterConditionGroup } from '@breeze/shared';
-import { memoryModuleLines, physicalDiskDetailLines } from '@breeze/shared';
+import { formatInstalledRam, memoryModuleLines, physicalDiskDetailLines } from '@breeze/shared';
 import { FilterBuilder, DEFAULT_FILTER_FIELDS } from '../filters/FilterBuilder';
 import { FilterPreview } from '../filters/FilterPreview';
 import { useFilterPreview } from '../../hooks/useFilterPreview';
@@ -636,7 +636,7 @@ const normalizePreviewRow = (type: BuilderReportType, row: PreviewRow): PreviewR
       .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
       .join(' ');
     normalized.motherboard = row.motherboard ?? (board || null);
-    const ramTotal = typeof row.ramTotalMb === 'number' && row.ramTotalMb > 0 ? `${Math.round(row.ramTotalMb / 1024)} GB` : null;
+    const ramTotal = formatInstalledRam(typeof row.ramTotalMb === 'number' ? row.ramTotalMb : null);
     normalized.ram = row.ram ?? (memoryModuleLines(row.memoryModules).join(', ') || ramTotal);
     const diskTotal = typeof row.diskTotalGb === 'number' && row.diskTotalGb > 0 ? `${Math.round(row.diskTotalGb)} GB` : null;
     normalized.disks = row.disks ?? (physicalDiskDetailLines(row.physicalDisks).join(', ') || diskTotal);
