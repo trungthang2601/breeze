@@ -1098,6 +1098,7 @@
     "cpuModel": "CPU Modèle",
     "coresThreads": "Cœurs / Fils de fil",
     "ramTotal": "RAM totale",
+    "ramModules": "Modules RAM",
     "diskTotal": "Total du disque",
     "motherboard": "Carte mère",
     "biosVersion": "Version du BIOS",

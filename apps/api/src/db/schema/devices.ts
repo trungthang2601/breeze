@@ -2,7 +2,7 @@ import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, intege
 import { ipClassEnum, organizations, sites } from './orgs';
 import { users } from './users';
 import { aiInitiatorKindEnum } from './aiInitiator';
-import type { BatteryStatus, DesktopAccessState, InterfaceBandwidth, TCCPermissions, VpnPresence } from '@breeze/shared';
+import type { BatteryStatus, DesktopAccessState, InterfaceBandwidth, MemoryModule, TCCPermissions, VpnPresence } from '@breeze/shared';
 
 export const osTypeEnum = pgEnum('os_type', ['windows', 'macos', 'linux']);
 export const deviceStatusEnum = pgEnum('device_status', ['online', 'offline', 'maintenance', 'decommissioned', 'quarantined', 'updating', 'pending']);
@@ -319,6 +319,9 @@ export const deviceHardware = pgTable('device_hardware', {
   motherboardProduct: varchar('motherboard_product', { length: 255 }),
   motherboardVersion: varchar('motherboard_version', { length: 255 }),
   biosVersion: varchar('bios_version', { length: 100 }),
+  // Installed RAM sticks reported by the agent (Windows Win32_PhysicalMemory).
+  // NULL = never reported (older agent, non-Windows, WMI failure).
+  memoryModules: jsonb('memory_modules').$type<MemoryModule[]>(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
 });

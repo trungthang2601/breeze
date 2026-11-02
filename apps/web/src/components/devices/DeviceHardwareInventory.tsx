@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Cpu, HardDrive, MemoryStick, Network } from "lucide-react";
 import { fetchWithAuth } from "../../stores/auth";
 import DeviceWarrantyCard from "./DeviceWarrantyCard";
+import { formatModuleSize, normalizeMemoryModules, summarizeMemoryModules } from "@breeze/shared";
 import { formatNumber } from "@/lib/i18n/format";
 import { useTranslation } from "react-i18next";
 import "../../lib/i18n";
@@ -45,6 +46,7 @@ type HardwareInventory = {
   cpuThreads?: number | null;
   ramTotalMb?: number | null;
   diskTotalGb?: number | null;
+  memoryModules?: unknown;
 };
 
 type HardwareInventoryResponse = HardwareInventory & {
@@ -211,6 +213,16 @@ export default function DeviceHardwareInventory({
     return total > 0 ? total : (hardware?.diskTotalGb ?? null);
   }, [disks, hardware?.diskTotalGb]);
 
+  // Installed RAM sticks — only RAM-aware agents report them.
+  const memoryModules = useMemo(
+    () => normalizeMemoryModules(hardware?.memoryModules),
+    [hardware?.memoryModules]
+  );
+  const memorySummary = useMemo(
+    () => summarizeMemoryModules(hardware?.memoryModules),
+    [hardware?.memoryModules]
+  );
+
   if (loading) {
     return (
       <div className="flex items-center justify-center rounded-lg border bg-card py-12 shadow-xs">
@@ -267,8 +279,24 @@ export default function DeviceHardwareInventory({
             {formatRam(hardware?.ramTotalMb)}
           </p>
           <p className="mt-1 text-sm text-muted-foreground">
-            {t("deviceHardwareInventory.totalInstalledRam")}
+            {memorySummary ?? t("deviceHardwareInventory.totalInstalledRam")}
           </p>
+          {memoryModules.length > 0 && (
+            <ul className="mt-2 space-y-0.5 text-xs text-muted-foreground">
+              {memoryModules.map((m, index) => (
+                <li key={`${m.slot ?? "slot"}-${index}`}>
+                  {[
+                    m.slot,
+                    formatModuleSize(m.capacityMb),
+                    m.speedMhz ? `${m.speedMhz} MHz` : null,
+                    [m.manufacturer, m.partNumber].filter(Boolean).join(" ") || null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         <div className="rounded-lg border bg-card p-6 shadow-xs">

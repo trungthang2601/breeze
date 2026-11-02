@@ -23,6 +23,7 @@ export * from './agentOutcome';
 export * from './aiToolHandoff';
 export * from './aiToolLabels';
 export * from './scriptSecurityPatterns';
+export * from './memoryModules';
 // Deliberately NOT `export *`. `compileExcludeMatcher` is a code-point port of
 // the agent's matcher and knowingly diverges from Go on mid-rune byte offsets
 // and Unicode special-casing (see matcherPortLimitations in

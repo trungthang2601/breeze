@@ -1098,6 +1098,7 @@
     "cpuModel": "CPU Model",
     "coresThreads": "Cores / Threads",
     "ramTotal": "RAM Total",
+    "ramModules": "RAM Modules",
     "diskTotal": "Disk Total",
     "motherboard": "Motherboard",
     "biosVersion": "BIOS Version",

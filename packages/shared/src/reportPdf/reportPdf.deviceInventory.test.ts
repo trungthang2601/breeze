@@ -85,3 +85,25 @@ describe('device inventory PDF', () => {
     expect(text).toContain('No data available for the selected filters.');
   });
 });
+
+describe('device inventory GPU and RAM columns', () => {
+  it('keeps the em dash placeholder and shortens GPU names', async () => {
+    const { shortGpuLabel, ramLabel } = await import('./reportPdf');
+    expect(pdfSafeText('—')).toBe('—');
+    expect(shortGpuLabel('Intel(R) UHD Graphics 770; NVIDIA GeForce RTX 3050')).toBe('Intel UHD Graphics 770, NVIDIA GeForce RTX 3050');
+    expect(shortGpuLabel(null)).toBe('—');
+    expect(ramLabel([{ capacityMb: 8192, speedMhz: 3200 }, { capacityMb: 8192, speedMhz: 3200 }], 16224)).toBe('2 x 8 GB @ 3200 MHz');
+    expect(ramLabel(null, 16224)).toBe('16 GB');
+    expect(ramLabel(undefined, null)).toBe('—');
+  });
+
+  it('prints GPU and RAM stick summary in the site tables', () => {
+    const text = buildReportPdf([
+      { ...row('4k-BP-117', 'ICOOL Binh Phu'), gpuModel: 'NVIDIA GeForce RTX 3050', memoryModules: [{ capacityMb: 8192, speedMhz: 3200 }, { capacityMb: 8192, speedMhz: 3200 }] },
+    ], { reportType: 'device_inventory', generatedAt: 'now', timezone: 'UTC' }).output();
+    expect(text).toContain('NVIDIA GeForce RTX 3050');
+    // The RAM cell may wrap inside its column, so check the stick count part.
+    expect(text).toContain('2 x 8 GB');
+    expect(text).toContain('GPU');
+  });
+});

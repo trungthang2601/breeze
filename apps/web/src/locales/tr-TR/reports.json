@@ -722,10 +722,13 @@
         },
         "devices": {
           "cpu": "CPU",
+          "gpu": "GPU",
+          "motherboard": "Anakart",
           "disk_usage": "Disk (GB)",
           "hostname": "Ana Bilgisayar Adı",
           "last_seen": "Son görülme",
           "memory": "RAM (MB)",
+          "ram_modules": "RAM modülleri",
           "os": "İşletim Sistemi",
           "owner": "Sahip",
           "patch_level": "Agent sürümü",

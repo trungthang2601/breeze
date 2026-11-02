@@ -297,3 +297,49 @@ func TestParseHardwareJSON(t *testing.T) {
 		})
 	}
 }
+
+func TestParseHardwareJSONMemoryModules(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{name: "two sticks as array", input: `{"MemoryModules":[{"Slot":"DIMM1","Capacity":8589934592,"Speed":3200,"Manufacturer":"Kingston","PartNumber":"KF432C16BB/8"},{"Slot":"DIMM2","Capacity":8589934592,"Speed":3200,"Manufacturer":"Kingston","PartNumber":"KF432C16BB/8"}]}`, want: 2},
+		{name: "one stick collapsed to an object by PowerShell 5.1", input: `{"MemoryModules":{"Slot":"DIMM1","Capacity":17179869184,"Speed":3200}}`, want: 1},
+		{name: "null", input: `{"MemoryModules":null}`, want: 0},
+		{name: "absent (older script)", input: `{"BiosSerial":"X"}`, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseHardwareJSON([]byte(tt.input))
+			if err != nil {
+				t.Fatalf("parseHardwareJSON() error = %v", err)
+			}
+			if len(got.MemoryModules) != tt.want {
+				t.Fatalf("MemoryModules len = %d, want %d (%+v)", len(got.MemoryModules), tt.want, got.MemoryModules)
+			}
+		})
+	}
+}
+
+func TestToMemoryModules(t *testing.T) {
+	got := toMemoryModules([]wmiMemoryModule{
+		{Slot: " DIMM1 ", Capacity: 8589934592, Speed: 3200, Manufacturer: "Kingston", PartNumber: " KF432C16BB/8  "},
+		{Slot: "DIMM2", Capacity: 0},
+		{Slot: "DIMM3", Capacity: 4294967296, Speed: 0, Manufacturer: "Unknown", PartNumber: "Undefined"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2 (empty slot dropped): %+v", len(got), got)
+	}
+	first := got[0]
+	if first.Slot != "DIMM1" || first.CapacityMB != 8192 || first.SpeedMHz != 3200 || first.Manufacturer != "Kingston" || first.PartNumber != "KF432C16BB/8" {
+		t.Errorf("first = %+v", first)
+	}
+	second := got[1]
+	if second.CapacityMB != 4096 || second.SpeedMHz != 0 || second.Manufacturer != "" || second.PartNumber != "" {
+		t.Errorf("second = %+v (placeholders and unknown speed should be blank)", second)
+	}
+	if toMemoryModules(nil) != nil {
+		t.Errorf("no rows should yield nil so the JSON field is omitted")
+	}
+}

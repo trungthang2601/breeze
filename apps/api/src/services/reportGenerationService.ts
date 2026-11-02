@@ -401,6 +401,11 @@ type DeviceInventoryRow = {
   ramTotalMb: number | null;
   diskTotalGb: number | null;
   serialNumber: string | null;
+  gpuModel: string | null;
+  motherboardManufacturer: string | null;
+  motherboardProduct: string | null;
+  /** Installed RAM sticks (jsonb); null until a RAM-aware agent reports. */
+  memoryModules: unknown;
   /** Branch the device is assigned to; the PDF groups devices by it. */
   siteName: string | null;
 };
@@ -422,6 +427,10 @@ export async function readDeviceInventoryRows(orgId: string, conditions: SQL[]) 
       ramTotalMb: deviceHardware.ramTotalMb,
       diskTotalGb: deviceHardware.diskTotalGb,
       serialNumber: deviceHardware.serialNumber,
+      gpuModel: deviceHardware.gpuModel,
+      motherboardManufacturer: deviceHardware.motherboardManufacturer,
+      motherboardProduct: deviceHardware.motherboardProduct,
+      memoryModules: deviceHardware.memoryModules,
       siteName: sites.name
     })
     .from(devices)
@@ -528,6 +537,10 @@ export async function generateDeviceInventoryReport(
         ramTotalMb: null,
         diskTotalGb: null,
         serialNumber: asset.serialNumber,
+        gpuModel: null,
+        motherboardManufacturer: null,
+        motherboardProduct: null,
+        memoryModules: null,
         siteName: asset.siteName ?? null,
       });
     }

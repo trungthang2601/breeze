@@ -32,6 +32,17 @@ const desktopAccessReasonSchema = z.enum([
   'x11_auth_failed',
 ]);
 
+// One installed RAM stick, as the agent reports it (bytes→MB already done
+// agent-side). Bounded so a misbehaving agent cannot bloat device_hardware.
+const memoryModuleSchema = z.object({
+  slot: z.string().max(64).optional(),
+  capacityMb: z.number().int().nonnegative().max(16 * 1024 * 1024),
+  speedMhz: z.number().int().nonnegative().max(100000).optional(),
+  manufacturer: z.string().max(128).optional(),
+  partNumber: z.string().max(128).optional()
+});
+const memoryModulesSchema = z.array(memoryModuleSchema).max(32);
+
 export const enrollSchema = z.object({
   enrollmentKey: z.string().min(1),
   enrollmentSecret: z.string().min(1).optional(),
@@ -56,7 +67,8 @@ export const enrollSchema = z.object({
     motherboardProduct: z.string().optional(),
     motherboardVersion: z.string().optional(),
     biosVersion: z.string().optional(),
-    gpuModel: z.string().optional()
+    gpuModel: z.string().optional(),
+    memoryModules: memoryModulesSchema.optional()
   }).optional(),
   networkInfo: z.array(z.object({
     name: z.string(),
@@ -698,7 +710,8 @@ export const updateHardwareSchema = z.object({
   motherboardProduct: z.string().optional(),
   motherboardVersion: z.string().optional(),
   biosVersion: z.string().optional(),
-  gpuModel: z.string().optional()
+  gpuModel: z.string().optional(),
+  memoryModules: memoryModulesSchema.optional()
 });
 
 export const updateSoftwareSchema = softwareInventoryReportSchema;

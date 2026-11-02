@@ -722,10 +722,13 @@
         },
         "devices": {
           "cpu": "CPU",
+          "gpu": "GPU",
+          "motherboard": "Placa-mãe",
           "disk_usage": "Disco (GB)",
           "hostname": "Nome do host",
           "last_seen": "Visto por ultimo",
           "memory": "RAM (MB)",
+          "ram_modules": "Módulos de RAM",
           "os": "SO",
           "owner": "Proprietario",
           "patch_level": "Versão do agente",

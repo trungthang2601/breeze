@@ -1098,6 +1098,7 @@
     "cpuModel": "CPU Modeli",
     "coresThreads": "Çekirdekler / Konular",
     "ramTotal": "RAM Toplamı",
+    "ramModules": "RAM modülleri",
     "diskTotal": "Disk Toplamı",
     "motherboard": "Anakart",
     "biosVersion": "BIOS Sürümü",

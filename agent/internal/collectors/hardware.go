@@ -27,6 +27,19 @@ type HardwareInfo struct {
 	MotherboardVersion      string `json:"motherboardVersion,omitempty"`
 	BIOSVersion             string `json:"biosVersion,omitempty"`
 	ChassisType             string `json:"chassisType,omitempty"`
+	// MemoryModules lists the installed RAM sticks (Windows Win32_PhysicalMemory).
+	// Omitted when unknown so the server keeps the last good list instead of
+	// overwriting it with an empty one after a transient WMI failure.
+	MemoryModules []MemoryModule `json:"memoryModules,omitempty"`
+}
+
+// MemoryModule is one installed RAM stick (DIMM/SO-DIMM).
+type MemoryModule struct {
+	Slot         string `json:"slot,omitempty"`
+	CapacityMB   uint64 `json:"capacityMb"`
+	SpeedMHz     uint32 `json:"speedMhz,omitempty"`
+	Manufacturer string `json:"manufacturer,omitempty"`
+	PartNumber   string `json:"partNumber,omitempty"`
 }
 
 type SystemInfo struct {

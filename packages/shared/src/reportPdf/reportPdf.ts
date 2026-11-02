@@ -3,6 +3,7 @@ import autoTable, { type CellHookData } from 'jspdf-autotable';
 import type { PostureControls, PostureProduct, PostureSummary } from '../types/postureReport';
 import type { ExecutiveSummary } from '../types/executiveSummaryReport';
 import type { HardwareLifecycleSummary } from '../types/hardwareLifecycleReport';
+import { summarizeMemoryModules } from '../utils/memoryModules';
 import { renderHardwareLifecycleReport } from './hardwareLifecyclePdf';
 import type { ThreatDetectionSummary } from '../types/threatDetectionReport';
 import type { IdentityAccessSummary } from '../types/identityAccessReport';
@@ -1943,10 +1944,12 @@ export function pdfSafeText(value: string): string {
     .replace(/[̀-ͯ]/g, '')
     .replace(/đ/g, 'd')
     .replace(/Đ/g, 'D')
-    .replace(/[\u2010-\u2015]/g, '-')
+    // Hyphens/en dashes → "-"; the em dash is kept (WinAnsi has it) because
+    // it is the "no value" marker the table greys out.
+    .replace(/[\u2010-\u2013\u2015]/g, '-')
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201c\u201d]/g, '"')
-    .replace(/[^\x20-\x7e]/g, '');
+    .replace(/[^\x20-\x7e\u2014]/g, '');
 }
 
 const textOrNull = (v: unknown): string | null =>
@@ -1973,6 +1976,28 @@ export function shortCpuLabel(cpuModel: unknown): string {
     .replace(/\s+\d+-Core Processor$/i, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+/**
+ * "Intel(R) UHD Graphics 770; NVIDIA GeForce RTX 3050" →
+ * "Intel UHD Graphics 770, NVIDIA GeForce RTX 3050" (agent joins GPUs with "; ").
+ */
+export function shortGpuLabel(gpuModel: unknown): string {
+  const raw = textOrNull(gpuModel);
+  if (!raw) return '—';
+  return raw
+    .split(';')
+    .map((g) => g.replace(/\((R|TM|tm|r)\)/g, '').replace(/\s{2,}/g, ' ').trim())
+    .filter(Boolean)
+    .join(', ') || '—';
+}
+
+/** "2 x 8 GB @ 3200 MHz" when the agent reported sticks, else the total ("16 GB"). */
+export function ramLabel(memoryModules: unknown, ramTotalMb: unknown): string {
+  const sticks = summarizeMemoryModules(memoryModules);
+  if (sticks) return sticks;
+  const total = num(ramTotalMb);
+  return total === null ? '—' : `${Math.round(total / 1024)} GB`;
 }
 
 const UNASSIGNED_SITE = 'No site';
@@ -2009,26 +2034,28 @@ export function groupDeviceInventoryBySite(rows: Record<string, unknown>[]): Dev
     });
 }
 
-const DEVICE_INVENTORY_COLUMNS: { header: string; width: number }[] = [
-  { header: 'Hostname', width: 34 },
-  { header: 'Status', width: 18 },
-  { header: 'OS', width: 42 },
-  { header: 'CPU', width: 42 },
-  { header: 'RAM (GB)', width: 17 },
-  { header: 'Disk (GB)', width: 17 },
-  { header: 'Serial', width: 44 },
-  { header: 'Last seen', width: 55 },
+// Widths sum to the 269 mm printable width of an A4 landscape page.
+const DEVICE_INVENTORY_COLUMNS: { header: string; width: number; align?: 'right' }[] = [
+  { header: 'Hostname', width: 30 },
+  { header: 'Status', width: 15 },
+  { header: 'OS', width: 31 },
+  { header: 'CPU', width: 36 },
+  { header: 'GPU', width: 38 },
+  { header: 'RAM', width: 38 },
+  { header: 'Disk (GB)', width: 13, align: 'right' },
+  { header: 'Serial', width: 33 },
+  { header: 'Last seen', width: 35 },
 ];
 
 function deviceInventoryCells(row: Record<string, unknown>, timezone: string): string[] {
-  const ramMb = num(row.ramTotalMb);
   const diskGb = num(row.diskTotalGb);
   return [
     pdfSafeText(textOrNull(row.hostname) ?? textOrNull(row.displayName) ?? '—'),
     pdfSafeText(textOrNull(row.status) ?? '—'),
     pdfSafeText(shortOsLabel(row.osType, row.osVersion)),
     pdfSafeText(shortCpuLabel(row.cpuModel)),
-    ramMb === null ? '—' : String(Math.round(ramMb / 1024)),
+    pdfSafeText(shortGpuLabel(row.gpuModel)),
+    pdfSafeText(ramLabel(row.memoryModules, row.ramTotalMb)),
     diskGb === null ? '—' : String(Math.round(diskGb)),
     pdfSafeText(textOrNull(row.serialNumber) ?? '—'),
     formatGenericCell(row.lastSeenAt, timezone),
@@ -2114,7 +2141,7 @@ function renderDeviceInventoryReport(doc: jsPDF, rows: Record<string, unknown>[]
       body: group.rows.map((r) => deviceInventoryCells(r, opts.timezone)),
       columnStyles: Object.fromEntries(DEVICE_INVENTORY_COLUMNS.map((c, i) => [
         i,
-        { cellWidth: c.width, ...(c.header.includes('(GB)') ? { halign: 'right' as const } : {}) },
+        { cellWidth: c.width, ...(c.align ? { halign: c.align } : {}) },
       ])),
       didParseCell: (data: CellHookData) => {
         if (data.section !== 'body') return;

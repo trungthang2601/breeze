@@ -75,7 +75,7 @@ func enrichOSInfo(info *SystemInfo) {
 }
 
 // collectPlatformHardware queries Win32_BIOS, Win32_BaseBoard,
-// Win32_ComputerSystem, and Win32_VideoController in a single PowerShell
+// Win32_ComputerSystem, Win32_VideoController and Win32_PhysicalMemory in a single PowerShell
 // invocation (one process spawn instead of ~9) and populates hw with the
 // results. Graceful degradation: a failed or unparseable response leaves the
 // affected fields empty.
@@ -105,6 +105,19 @@ $gpus  = @(@(Get-WmiSafe 'Win32_VideoController') |
   ForEach-Object { ([string]$_).Trim() } |
   Where-Object { $_ -ne '' } |
   Select-Object -Unique)
+$mem   = @(@(Get-WmiSafe 'Win32_PhysicalMemory') |
+  Where-Object { $_ -and $_.Capacity } |
+  ForEach-Object {
+    $speed = 0
+    if ($_.ConfiguredClockSpeed) { $speed = [int]$_.ConfiguredClockSpeed } elseif ($_.Speed) { $speed = [int]$_.Speed }
+    [PSCustomObject]@{
+      Slot         = ([string]$_.DeviceLocator).Trim()
+      Capacity     = [double]$_.Capacity
+      Speed        = $speed
+      Manufacturer = ([string]$_.Manufacturer).Trim()
+      PartNumber   = ([string]$_.PartNumber).Trim()
+    }
+  })
 [PSCustomObject]@{
   BiosSerial        = if ($bios)  { ([string]$bios.SerialNumber).Trim() }      else { '' }
   BiosVersion       = if ($bios)  { ([string]$bios.SMBIOSBIOSVersion).Trim() } else { '' }
@@ -115,7 +128,8 @@ $gpus  = @(@(Get-WmiSafe 'Win32_VideoController') |
   SysManufacturer   = if ($sys)   { ([string]$sys.Manufacturer).Trim() }       else { '' }
   SysModel          = if ($sys)   { ([string]$sys.Model).Trim() }              else { '' }
   GPUNames          = $gpus
-} | ConvertTo-Json -Compress
+  MemoryModules     = $mem
+} | ConvertTo-Json -Compress -Depth 4
 `
 
 	out, err := runCollectorOutput(wmicTimeout, "powershell", "-NoProfile", "-NonInteractive", "-Command", utf8PowerShellCommand(script))
@@ -153,4 +167,8 @@ $gpus  = @(@(Get-WmiSafe 'Win32_VideoController') |
 	if len(gpuParts) > 0 {
 		hw.GPUModel = truncateCollectorString(strings.Join(gpuParts, "; "))
 	}
+
+	// RAM sticks: nil when WMI returned none, so the field is omitted and the
+	// server keeps the previous list.
+	hw.MemoryModules = toMemoryModules(parsed.MemoryModules)
 }

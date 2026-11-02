@@ -37,6 +37,7 @@ import {
   getDeviceRoleSourceColor,
 } from "@/lib/deviceRoles";
 import DeviceFunctionField from "./DeviceFunctionField";
+import { summarizeMemoryModules } from "@breeze/shared";
 import { asList } from '@/lib/asList';
 import { formatDeviceDetailOsVersion } from "./osDisplay";
 import { formatNumber } from "@/lib/i18n/format";
@@ -100,6 +101,7 @@ type DeviceInfo = {
     cpuThreads?: number | null;
     ramTotalMb?: number | null;
     diskTotalGb?: number | null;
+    memoryModules?: unknown;
     motherboardManufacturer?: string | null;
     motherboardProduct?: string | null;
     motherboardVersion?: string | null;
@@ -904,6 +906,10 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         <InfoRow
           label={t("deviceInfoTab.ramTotal")}
           value={formatRam(hw?.ramTotalMb)}
+        />
+        <InfoRow
+          label={t("deviceInfoTab.ramModules")}
+          value={summarizeMemoryModules(hw?.memoryModules) ?? "—"}
         />
         <InfoRow
           label={t("deviceInfoTab.diskTotal")}

@@ -30,6 +30,7 @@ import { useOrgStore } from '../../stores/orgStore';
 import { runAction, ActionError } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import type { FilterConditionGroup } from '@breeze/shared';
+import { summarizeMemoryModules } from '@breeze/shared';
 import { FilterBuilder, DEFAULT_FILTER_FIELDS } from '../filters/FilterBuilder';
 import { FilterPreview } from '../filters/FilterPreview';
 import { useFilterPreview } from '../../hooks/useFilterPreview';
@@ -494,7 +495,11 @@ const fieldDefinitionsByType: Record<BuilderReportType, FieldDefinition[]> = {
     // These are hardware facts, not live usage: cpu = CPU model, memory = total
     // RAM (MB), disk_usage = total disk (GB), patch_level = agent version.
     { id: 'cpu', label: 'CPU', dataType: 'string' },
+    { id: 'gpu', label: 'GPU', dataType: 'string' },
+    { id: 'motherboard', label: 'Motherboard', dataType: 'string' },
     { id: 'memory', label: 'RAM (MB)', dataType: 'number' },
+    // "2 x 8 GB @ 3200 MHz" — from agents that report RAM sticks.
+    { id: 'ram_modules', label: 'RAM modules', dataType: 'string' },
     { id: 'disk_usage', label: 'Disk (GB)', dataType: 'number' },
     { id: 'patch_level', label: 'Agent version', dataType: 'string' }
   ],
@@ -585,6 +590,12 @@ const normalizePreviewRow = (type: BuilderReportType, row: PreviewRow): PreviewR
     normalized.os = [osType, osVersion].filter(Boolean).join(' ').trim();
     normalized.site = row.site ?? row.siteName ?? null;
     normalized.cpu = row.cpu ?? row.cpuModel ?? null;
+    normalized.gpu = row.gpu ?? row.gpuModel ?? null;
+    const board = [row.motherboardManufacturer, row.motherboardProduct]
+      .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
+      .join(' ');
+    normalized.motherboard = row.motherboard ?? (board || null);
+    normalized.ram_modules = row.ram_modules ?? summarizeMemoryModules(row.memoryModules);
     normalized.serial = row.serial ?? row.serialNumber ?? null;
     normalized.last_seen = row.last_seen ?? row.lastSeenAt ?? null;
     normalized.memory = row.memory ?? row.ramTotalMb ?? null;
