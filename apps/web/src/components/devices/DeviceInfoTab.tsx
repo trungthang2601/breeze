@@ -217,9 +217,10 @@ function formatDesktopAccessReason(
 function InfoRow({ label, value }: { label: string; value: string }) {
   const { t } = useTranslation("devices");
   return (
-    <div className="flex justify-between py-2">
-      <dt className="text-sm text-muted-foreground">{label}</dt>
-      <dd className="text-sm font-medium text-right">{value || "—"}</dd>
+    <div className="flex justify-between gap-4 py-2">
+      <dt className="shrink-0 text-sm text-muted-foreground">{label}</dt>
+      {/* pre-line: multi-item values (RAM sticks, disks) put one item per line. */}
+      <dd className="whitespace-pre-line text-sm font-medium text-right">{value || "—"}</dd>
     </div>
   );
 }
@@ -910,7 +911,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         />
         <InfoRow
           label={t("deviceInfoTab.ramModules")}
-          value={memoryModuleLines(hw?.memoryModules).join(", ") || "—"}
+          value={memoryModuleLines(hw?.memoryModules).join("\n") || "—"}
         />
         <InfoRow
           label={t("deviceInfoTab.diskTotal")}
@@ -918,7 +919,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         />
         <InfoRow
           label={t("deviceInfoTab.physicalDisks")}
-          value={physicalDiskDetailLines(hw?.physicalDisks).join(", ") || "—"}
+          value={physicalDiskDetailLines(hw?.physicalDisks).join("\n") || "—"}
         />
         <GpuInfoRow value={hw?.gpuModel} />
         <InfoRow
