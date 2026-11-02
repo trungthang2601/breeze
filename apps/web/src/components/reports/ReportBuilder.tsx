@@ -1922,7 +1922,25 @@ export default function ReportBuilder({
             ))}
             {builderType === 'devices' && dataSource.scope === 'by_site' && (
               <div className="md:col-span-2">
-                <label className="text-sm font-medium">Chi nhánh (site)</label>
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-sm font-medium">
+                    Chi nhánh (site){selectedSiteIds.length > 0 ? ` — đã chọn ${selectedSiteIds.length}/${sites.length}` : ''}
+                  </label>
+                  {sites.length > 0 && (
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        data-testid="select-all-sites"
+                        checked={sites.every(site => selectedSiteIds.includes(site.id))}
+                        ref={el => {
+                          if (el) el.indeterminate = selectedSiteIds.length > 0 && !sites.every(site => selectedSiteIds.includes(site.id));
+                        }}
+                        onChange={e => setSelectedSiteIds(e.target.checked ? sites.map(site => site.id) : [])}
+                      />
+                      Chọn tất cả
+                    </label>
+                  )}
+                </div>
                 <div className="mt-2 grid max-h-48 grid-cols-2 gap-2 overflow-auto rounded-md border p-2">
                   {sites.length === 0 && (
                     <span className="text-sm text-muted-foreground">Không tải được danh sách site</span>
