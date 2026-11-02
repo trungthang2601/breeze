@@ -3362,5 +3362,12 @@
       "created": "Network asset created",
       "createFailed": "Failed to create network asset"
     }
+  },
+  "exportDeviceDetail": {
+    "button": "Export PDF",
+    "includeSoftware": "Include installed software",
+    "download": "Download PDF",
+    "working": "Generating…",
+    "failed": "Could not generate the device PDF."
   }
 }

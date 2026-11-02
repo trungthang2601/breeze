@@ -193,4 +193,53 @@ describe('device_inventory manual-asset union (#4622)', () => {
 
     expect(report.rows.map((r) => r.hostname)).toEqual(['alpha', 'zeta']);
   });
+
+  it('layout "detail" returns one detail record per agent device and no manual assets', async () => {
+    queueSelects(
+      [AGENT_ROW],
+      // deviceDetailReport: devices, hardware, volumes, network, warranty
+      [{ deviceId: AGENT_ROW.deviceId, hostname: 'agent-1', displayName: null, siteName: 'ICOOL To Ky', status: 'online',
+        osType: 'windows', osVersion: '11', osBuild: '26100.1', architecture: 'x64', agentVersion: '0.110.0',
+        lastUser: 'thungan', lastSeenIp: '1.2.3.4', isVirtual: false, lastSeenAt: new Date('2026-11-01T00:00:00Z'), enrolledAt: new Date('2026-01-01T00:00:00Z') }],
+      [{ deviceId: AGENT_ROW.deviceId, orgId: ORG_ID, cpuModel: 'i7', cpuCores: 8, cpuThreads: 16, ramTotalMb: 16384, diskTotalGb: 512,
+        gpuModel: 'GTX 1650', serialNumber: 'SN1', manufacturer: 'Dell', model: 'OptiPlex', motherboardManufacturer: null, motherboardProduct: null,
+        motherboardVersion: null, biosVersion: '1.0', memoryModules: [{ capacityMb: 8192 }], physicalDisks: null }],
+      [{ deviceId: AGENT_ROW.deviceId, mountPoint: 'C:', fsType: 'NTFS', totalGb: 237, usedGb: 100, freeGb: 137, usedPercent: 42 }],
+      [{ deviceId: AGENT_ROW.deviceId, interfaceName: 'Ethernet', macAddress: 'AA:BB', ipAddress: '10.0.0.5', ipType: 'ipv4', isPrimary: true }],
+      [],
+    );
+
+    const report = await generateDeviceInventoryReport(ORG_ID, { layout: 'detail' }, authority('unrestricted'));
+
+    expect(db.select).toHaveBeenCalledTimes(6);
+    expect(report.rows).toEqual([AGENT_ROW]);
+    const summary = (report as { summary?: { layout: string; devices: Array<Record<string, unknown>> } }).summary!;
+    expect(summary.layout).toBe('device_detail');
+    expect(summary.devices).toHaveLength(1);
+    expect(summary.devices[0]).toMatchObject({
+      hostname: 'agent-1',
+      siteName: 'ICOOL To Ky',
+      hardware: { serialNumber: 'SN1', gpuModel: 'GTX 1650' },
+      volumes: [{ mountPoint: 'C:', usedPercent: 42 }],
+      network: [{ macAddress: 'AA:BB', isPrimary: true }],
+      warranty: null,
+    });
+    expect(summary.devices[0]).not.toHaveProperty('software');
+  });
+
+  it('layout "detail" with includeSoftware adds the app list', async () => {
+    queueSelects(
+      [AGENT_ROW],
+      [{ deviceId: AGENT_ROW.deviceId, hostname: 'agent-1', displayName: null, siteName: null, status: 'online', osType: 'windows',
+        osVersion: '11', osBuild: null, architecture: 'x64', agentVersion: '1', lastUser: null, lastSeenIp: null, isVirtual: false,
+        lastSeenAt: null, enrolledAt: null }],
+      [], [], [], [],
+      [{ deviceId: AGENT_ROW.deviceId, name: 'Google Chrome', version: '130', publisher: 'Google LLC', installDate: '2026-10-01' }],
+    );
+
+    const report = await generateDeviceInventoryReport(ORG_ID, { layout: 'detail', includeSoftware: true }, authority('unrestricted'));
+    const device = (report as { summary?: { devices: Array<Record<string, unknown>> } }).summary!.devices[0]!;
+    expect(device.softwareCount).toBe(1);
+    expect(device.software).toEqual([{ name: 'Google Chrome', version: '130', publisher: 'Google LLC', installDate: '2026-10-01' }]);
+  });
 });

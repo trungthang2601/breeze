@@ -618,8 +618,19 @@
             "options": {
               "all_devices": "Alle Geräte",
               "by_site": "Nach Standort",
-              "by_tag": "Nach Tag"
+              "by_tag": "Nach Tag",
+              "by_device": "Geräte auswählen"
             }
+          },
+          "layout": {
+            "label": "PDF-Layout",
+            "options": {
+              "table": "Inventartabelle",
+              "detail": "Gerätedetails (eine Seite pro Gerät)"
+            }
+          },
+          "includeSoftware": {
+            "label": "Installierte Software"
           }
         },
         "patches": {
@@ -902,7 +913,14 @@
         "tuesday": "Dienstag",
         "wednesday": "Mittwoch"
       },
-      "where": "Wo"
+      "where": "Wo",
+      "devicePicker": {
+        "title": "Geräte ({{count}} ausgewählt)",
+        "clear": "Zurücksetzen",
+        "search": "Hostname oder Standort suchen…",
+        "loading": "Geräte werden geladen…",
+        "empty": "Keine Geräte gefunden"
+      }
     },
     "reportTemplates": {
       "blankConfigurationDescription": "Konfigurieren Sie einen Bericht von Grund auf oder beginnen Sie mit einer leeren Konfiguration.",
@@ -993,6 +1011,10 @@
         "endpoint_management_review": {
           "description": "Nachweis aus Microsoft Intune: Registrierungsabdeckung, Compliance-Aufschlüsselung mit 30-Tage-Verlauf, veraltete Registrierungen und Lizenzplätze — jeweils mit Angabe der Aktualität der Synchronisierung.",
           "name": "Intune-Endpunktverwaltungs-Bericht"
+        },
+        "device_detail": {
+          "name": "Gerätedetailbericht",
+          "description": "Eine Seite pro Gerät: Hardware, jedes RAM-Modul und Laufwerk mit Seriennummer, Volumes, Netzwerkadapter, Garantie – optional die installierte Software."
         }
       },
       "title": "Berichtsvorlagen",

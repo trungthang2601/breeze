@@ -618,8 +618,19 @@
             "options": {
               "all_devices": "Tous les appareils",
               "by_site": "Par site",
-              "by_tag": "Par tag"
+              "by_tag": "Par tag",
+              "by_device": "Choisir des appareils"
             }
+          },
+          "layout": {
+            "label": "Mise en page du PDF",
+            "options": {
+              "table": "Tableau d'inventaire",
+              "detail": "Détail de l'appareil (une page par appareil)"
+            }
+          },
+          "includeSoftware": {
+            "label": "Logiciels installés"
           }
         },
         "patches": {
@@ -902,7 +913,14 @@
         "tuesday": "Mardi",
         "wednesday": "Mercredi"
       },
-      "where": "Où"
+      "where": "Où",
+      "devicePicker": {
+        "title": "Appareils ({{count}} sélectionnés)",
+        "clear": "Effacer",
+        "search": "Rechercher un nom d'hôte ou un site…",
+        "loading": "Chargement des appareils…",
+        "empty": "Aucun appareil trouvé"
+      }
     },
     "reportTemplates": {
       "blankConfigurationDescription": "Configurez un rapport à partir de zéro ou commencez avec une configuration vide.",
@@ -993,6 +1011,10 @@
         "endpoint_management_review": {
           "description": "Preuve issue de Microsoft Intune : couverture des inscriptions, répartition de la conformité avec une tendance sur 30 jours, inscriptions obsolètes et sièges de licence, avec la fraîcheur de chaque synchronisation.",
           "name": "Revue de gestion des terminaux Intune"
+        },
+        "device_detail": {
+          "name": "Rapport détaillé par appareil",
+          "description": "Une page par appareil : matériel, chaque barrette de RAM et disque avec numéro de série, volumes, cartes réseau, garantie et, en option, les logiciels installés."
         }
       },
       "title": "Modèles de rapports",

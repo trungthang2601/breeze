@@ -76,9 +76,9 @@ describe('ReportTemplates — saved reports merged into curated cards', () => {
     // Total template count grows by one: 9 curated cards (#5784 W02 added
     // Threat Detection Review, W03 added the Intune endpoint-management
     // card, W04 added the Vulnerability Management card, W06 added Identity &
-    // Access Review), with the hardware-lifecycle slot expanded from 1 card
-    // to 2.
-    expect(screen.getAllByRole('button', { name: 'Use template' })).toHaveLength(10);
+    // Access Review, Device Detail added its own card), with the
+    // hardware-lifecycle slot expanded from 1 card to 2.
+    expect(screen.getAllByRole('button', { name: 'Use template' })).toHaveLength(11);
   });
 
   it('dedupes two saved-report rows that share the same id instead of rendering both', async () => {

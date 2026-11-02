@@ -3362,5 +3362,12 @@
       "created": "Actif réseau créé",
       "createFailed": "Échec de la création de l'actif réseau"
     }
+  },
+  "exportDeviceDetail": {
+    "button": "Exporter en PDF",
+    "includeSoftware": "Inclure les logiciels installés",
+    "download": "Télécharger le PDF",
+    "working": "Génération…",
+    "failed": "Impossible de générer le PDF de l'appareil."
   }
 }

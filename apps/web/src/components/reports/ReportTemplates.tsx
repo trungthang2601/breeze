@@ -106,6 +106,35 @@ const formatValues: ReportFormat[] = ['csv', 'pdf', 'excel'];
 
 const defaultTemplates: ReportTemplate[] = [
   {
+    // Device Inventory with config.layout = 'detail' — one PDF page per device.
+    id: 'device_detail',
+    name: 'Device Detail Report',
+    description:
+      'One page per device: hardware, every RAM stick and drive with serial numbers, volumes, network adapters, warranty — optionally the installed software.',
+    defaults: {
+      name: 'Device Detail Report',
+      type: 'device_inventory',
+      builderType: 'devices',
+      dataSource: {
+        scope: 'by_site',
+        platform: 'all',
+        ownership: 'managed',
+        inventorySource: 'agent',
+        includeInactive: false,
+        layout: 'detail',
+        includeSoftware: false
+      },
+      dateRange: { preset: 'last_30_days' },
+      schedule: 'one_time',
+      format: 'pdf'
+    },
+    icon: Laptop,
+    tone: {
+      iconBg: 'bg-violet-500/15',
+      iconColor: 'text-violet-600'
+    }
+  },
+  {
     id: 'security_compliance_posture',
     name: 'Security & Compliance Posture (Insurance)',
     description:

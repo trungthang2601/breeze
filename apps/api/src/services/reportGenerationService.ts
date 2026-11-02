@@ -168,6 +168,9 @@ export async function previousBaselineFor(
       .orderBy(desc(reportRuns.completedAt))
       .limit(1);
     if (!prior?.summary || typeof prior.summary !== 'object') return undefined;
+    // A Device Detail summary is the full per-device dataset, not a trend
+    // baseline — copying it would double every snapshot for nothing.
+    if (prior.summary.layout === 'device_detail') return undefined;
     return {
       generatedAt: prior.generatedAt ?? prior.completedAt?.toISOString() ?? null,
       summary: prior.summary,
@@ -482,6 +485,20 @@ export async function generateDeviceInventoryReport(
   const data = await readDeviceInventoryRows(orgId, conditions);
 
   const rows: DeviceInventoryRow[] = [...data];
+
+  // Device Detail layout: one PDF page per device. The table rows stay (CSV /
+  // Excel / preview still work); the per-device records ride in `summary`,
+  // which the run snapshot stores and the PDF renderer reads. Hand-entered
+  // assets have no agent data to detail, so they are left out of this layout.
+  if (config.layout === 'detail') {
+    const { buildDeviceDetailSummary } = await import('./deviceDetailReport');
+    const summary = await buildDeviceDetailSummary(
+      orgId,
+      rows.map((r) => r.deviceId).filter((id): id is string => typeof id === 'string'),
+      { includeSoftware: config.includeSoftware === true },
+    );
+    return { rows, rowCount: rows.length, summary };
+  }
 
   // #4622 — hand-entered assets are a third class of inventory and belong in an
   // inventory report. They are projected onto the agent column shape rather

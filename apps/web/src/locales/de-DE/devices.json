@@ -3362,5 +3362,12 @@
       "created": "Netzwerk-Asset erstellt",
       "createFailed": "Netzwerk-Asset konnte nicht erstellt werden"
     }
+  },
+  "exportDeviceDetail": {
+    "button": "PDF exportieren",
+    "includeSoftware": "Installierte Software einschließen",
+    "download": "PDF herunterladen",
+    "working": "Wird erstellt…",
+    "failed": "Das Geräte-PDF konnte nicht erstellt werden."
   }
 }

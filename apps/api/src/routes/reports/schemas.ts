@@ -256,6 +256,13 @@ const reportScheduleDetailSchema = z.object({
   date: z.coerce.string().regex(/^([1-9]|[12]\d|3[01])$/).optional()
 });
 
+/** Device Inventory presentation: 'detail' renders one page per device
+ * (hardware, RAM sticks, drives, network, warranty, optional software). */
+export const deviceInventoryLayoutConfigFields = {
+  layout: z.enum(['table', 'detail']).optional(),
+  includeSoftware: z.boolean().optional(),
+};
+
 const reportConfigFields = {
   dateRange: z.object({
     start: z.string().optional(),
@@ -285,7 +292,8 @@ const reportConfigFields = {
   ...threatDetectionConfigFields,
   ...endpointManagementConfigFields,
   ...vulnerabilityManagementConfigFields,
-  ...identityAccessConfigFields
+  ...identityAccessConfigFields,
+  ...deviceInventoryLayoutConfigFields
 };
 
 // Loose: the builder round-trips presentation metadata (builderType, dataSource,
@@ -350,7 +358,8 @@ export const generateReportSchema = z.object({
     ...threatDetectionConfigFields,
     ...endpointManagementConfigFields,
     ...vulnerabilityManagementConfigFields,
-    ...identityAccessConfigFields
+    ...identityAccessConfigFields,
+    ...deviceInventoryLayoutConfigFields
   }).optional().default({}),
   format: z.enum(['csv', 'pdf', 'excel']).default('csv'),
   ownerScope: ownerScopeSchema,

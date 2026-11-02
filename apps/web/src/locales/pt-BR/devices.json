@@ -3362,5 +3362,12 @@
       "created": "Ativo de rede criado",
       "createFailed": "Falha ao criar o ativo de rede"
     }
+  },
+  "exportDeviceDetail": {
+    "button": "Exportar PDF",
+    "includeSoftware": "Incluir software instalado",
+    "download": "Baixar PDF",
+    "working": "Gerando…",
+    "failed": "Não foi possível gerar o PDF do dispositivo."
   }
 }

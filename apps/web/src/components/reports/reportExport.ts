@@ -1,4 +1,4 @@
-import type { PostureSummary, ExecutiveSummary, OrgNarrativeReportSummary, FleetDesignReportSummary,
+import type { DeviceDetailSummary, PostureSummary, ExecutiveSummary, OrgNarrativeReportSummary, FleetDesignReportSummary,
   EndpointManagementSummary,
   VulnerabilityManagementSummary,
   IdentityAccessSummary,
@@ -9,6 +9,7 @@ import { downloadBlob } from '@/lib/downloadBlob';
 import { sanitizeImageSrc } from '@/lib/safeImageSrc';
 import { fetchWithAuth } from '../../stores/auth';
 import { buildReportPdf, parseHexColor, type ReportBranding } from '@breeze/shared/reportPdf';
+import { isDeviceDetailSummary } from '@breeze/shared';
 
 // Re-export the shared CSV + download helpers so existing importers of these
 // names from './reportExport' keep working; the canonical definitions now live
@@ -51,17 +52,20 @@ export async function exportReport(
     // summary that does not typecheck here gets dropped at the call site, and
     // the PDF silently falls through to the generic renderer, keeping the
     // sign-in rows while losing every limit printed alongside them.
-    summary?: PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary | EndpointManagementSummary | VulnerabilityManagementSummary | IdentityAccessSummary;
+    summary?: DeviceDetailSummary | PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary | EndpointManagementSummary | VulnerabilityManagementSummary | IdentityAccessSummary;
     /** Slim baseline from the previous completed run (report_runs.result.previous),
      * used to draw the scorecard trend chip; ignored by non-cover report types. */
     previous?: { generatedAt?: string | null; summary?: unknown };
     /** Pre-resolved partner branding; loaded automatically for PDFs when omitted. */
     branding?: ReportBranding;
+    /** File name without extension; defaults to "<type>-report-<date>". */
+    filename?: string;
   }
 ): Promise<void> {
   const { format, reportType, timezone, summary, previous } = opts;
   const dateStr = new Date().toISOString().split('T')[0];
-  const baseFilename = `${reportType}-report-${dateStr}`;
+  const fileType = format === 'pdf' && isDeviceDetailSummary(summary) ? 'device-detail' : reportType;
+  const baseFilename = opts.filename ? `${opts.filename}-${dateStr}` : `${fileType}-report-${dateStr}`;
 
   if (format === 'csv') {
     if (rows.length === 0) throw new Error('No data to export');

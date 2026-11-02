@@ -618,8 +618,19 @@
             "options": {
               "all_devices": "All devices",
               "by_site": "By site",
-              "by_tag": "By tag"
+              "by_tag": "By tag",
+              "by_device": "Pick devices"
             }
+          },
+          "layout": {
+            "label": "PDF layout",
+            "options": {
+              "table": "Inventory table",
+              "detail": "Device detail (one page per device)"
+            }
+          },
+          "includeSoftware": {
+            "label": "Installed software"
           }
         },
         "patches": {
@@ -902,7 +913,14 @@
         "tuesday": "Tuesday",
         "wednesday": "Wednesday"
       },
-      "where": "Where"
+      "where": "Where",
+      "devicePicker": {
+        "title": "Devices ({{count}} selected)",
+        "clear": "Clear",
+        "search": "Search hostname or site…",
+        "loading": "Loading devices…",
+        "empty": "No devices found"
+      }
     },
     "reportTemplates": {
       "blankConfigurationDescription": "Configure a report from scratch or start with a blank configuration.",
@@ -993,6 +1011,10 @@
         "endpoint_management_review": {
           "description": "Microsoft Intune evidence: enrolment coverage, compliance breakdown with a 30-day trend, stale enrolments and licence seats, with the freshness of each sync stated.",
           "name": "Intune Endpoint Management Review"
+        },
+        "device_detail": {
+          "name": "Device Detail Report",
+          "description": "One page per device: hardware, every RAM stick and drive with serial numbers, volumes, network adapters, warranty — optionally the installed software."
         }
       },
       "title": "Report Templates",

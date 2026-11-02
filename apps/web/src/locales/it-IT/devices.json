@@ -3362,5 +3362,12 @@
       "created": "Asset di rete creato",
       "createFailed": "Impossibile creare l’asset di rete"
     }
+  },
+  "exportDeviceDetail": {
+    "button": "Esporta PDF",
+    "includeSoftware": "Includi software installato",
+    "download": "Scarica PDF",
+    "working": "Generazione…",
+    "failed": "Impossibile generare il PDF del dispositivo."
   }
 }

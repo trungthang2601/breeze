@@ -42,6 +42,7 @@ import type { Device, DeviceStatus } from "./DeviceList";
 import { formatDeviceSummaryOs } from "./osDisplay";
 import RebootScheduledBadge from "./RebootScheduledBadge";
 import UninstallStateBadge from "./UninstallStateBadge";
+import ExportDeviceDetailButton from "./ExportDeviceDetailButton";
 import DeviceActions from "./DeviceActions";
 import DeviceInfoTab from "./DeviceInfoTab";
 import DeviceHardwareInventory from "./DeviceHardwareInventory";
@@ -784,6 +785,7 @@ export default function DeviceDetails({
             </div>
           </div>
           <div className="flex items-center gap-2">
+            <ExportDeviceDetailButton deviceId={device.id} orgId={device.orgId} hostname={device.hostname} />
             <DeviceActions device={device} onAction={onAction} />
           </div>
         </div>

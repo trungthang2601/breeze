@@ -596,21 +596,22 @@ function mockGenerateDeviceInventoryQuery(
   rows: Array<{ hostname: string; siteId: string }>,
   manualRows: Array<{ name: string; siteId: string; serialNumber?: string | null; createdAt?: Date | null }> = [],
 ) {
+  // Both branches left-join `sites` (the PDF groups inventory by site), the
+  // agent branch after `device_hardware` — so leftJoin chains to itself.
+  const joinable = (where: (condition: unknown) => unknown) => {
+    const node: Record<string, unknown> = { where: vi.fn(where) };
+    node.leftJoin = vi.fn(() => node);
+    return node;
+  };
   vi.mocked(db.select).mockReturnValueOnce({
-    from: vi.fn().mockReturnValue({
-      leftJoin: vi.fn().mockReturnValue({
-        where: vi.fn((condition) => ({
-          orderBy: vi.fn().mockResolvedValue(filterByDeviceSite(rows, condition))
-        }))
-      })
-    })
+    from: vi.fn().mockReturnValue(joinable((condition) => ({
+      orderBy: vi.fn().mockResolvedValue(filterByDeviceSite(rows, condition))
+    })))
   } as any);
   vi.mocked(db.select).mockReturnValueOnce({
-    from: vi.fn().mockReturnValue({
-      where: vi.fn((condition) => ({
-        orderBy: vi.fn().mockResolvedValue(filterByManualAssetSite(manualRows, condition))
-      }))
-    })
+    from: vi.fn().mockReturnValue(joinable((condition) => ({
+      orderBy: vi.fn().mockResolvedValue(filterByManualAssetSite(manualRows, condition))
+    })))
   } as any);
 }
 

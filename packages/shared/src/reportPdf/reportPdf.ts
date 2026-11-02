@@ -4,7 +4,9 @@ import type { PostureControls, PostureProduct, PostureSummary } from '../types/p
 import type { ExecutiveSummary } from '../types/executiveSummaryReport';
 import type { HardwareLifecycleSummary } from '../types/hardwareLifecycleReport';
 import { memoryModuleLines } from '../utils/memoryModules';
-import { physicalDiskLines } from '../utils/physicalDisks';
+import { formatDiskSize, normalizePhysicalDisks, physicalDiskLines } from '../utils/physicalDisks';
+import { formatModuleSize, normalizeMemoryModules } from '../utils/memoryModules';
+import { isDeviceDetailSummary, type DeviceDetailRecord, type DeviceDetailSummary } from '../types/deviceDetailReport';
 import { renderHardwareLifecycleReport } from './hardwareLifecyclePdf';
 import type { ThreatDetectionSummary } from '../types/threatDetectionReport';
 import type { IdentityAccessSummary } from '../types/identityAccessReport';
@@ -154,7 +156,7 @@ export type BuildOpts = {
   generatedAt: string;
   /** IANA timezone for formatting ISO date cells in generic tables. */
   timezone: string;
-  summary?: PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary | HardwareLifecycleSummary | ThreatDetectionSummary | EndpointManagementSummary | VulnerabilityManagementSummary | IdentityAccessSummary;
+  summary?: DeviceDetailSummary | PostureSummary | ExecutiveSummary | OrgNarrativeReportSummary | FleetDesignReportSummary | HardwareLifecycleSummary | ThreatDetectionSummary | EndpointManagementSummary | VulnerabilityManagementSummary | IdentityAccessSummary;
   /** Slim baseline from the previous completed run, when the caller supplied
    * one (report_runs.result.previous) — drives the scorecard trend chip and
    * its "since <date>" label. */
@@ -183,6 +185,7 @@ const REPORT_TYPE_LABELS: Record<string, string> = {
   ai_fleet_design: 'Fleet Design',
   identity_access_review: 'Identity & Access Review',
   hardware_lifecycle: 'Hardware Lifecycle',
+  device_detail: 'Device Detail',
   threat_detection_review: 'Threat Detection Review',
   endpoint_management_review: 'Endpoint Management Review',
   vulnerability_management: 'Vulnerability Management',
@@ -2024,6 +2027,318 @@ export function cpuGpuLabel(cpuModel: unknown, gpuModel: unknown): string {
   return gpu === '—' ? cpu : `${cpu}\n${gpu}`;
 }
 
+// ---------------------------------------------------------------------------
+// Device Detail: one section per device, each starting on a new page.
+// ---------------------------------------------------------------------------
+
+const DETAIL_BOTTOM = PAGE.footY - 8;
+
+const detailText = (value: unknown): string => {
+  if (value == null) return '—';
+  const s = String(value).trim();
+  return s ? pdfSafeText(s) : '—';
+};
+
+function detailNumber(value: unknown, digits = 0): string {
+  const n = num(value);
+  return n === null ? '—' : n.toFixed(digits);
+}
+
+function cpuDetail(hw: DeviceDetailRecord['hardware']): string {
+  if (!hw?.cpuModel) return '—';
+  const cores = hw.cpuCores ? `${hw.cpuCores} cores${hw.cpuThreads ? ` / ${hw.cpuThreads} threads` : ''}` : '';
+  return pdfSafeText(cores ? `${shortCpuLabel(hw.cpuModel)} (${cores})` : shortCpuLabel(hw.cpuModel));
+}
+
+function warrantyDetail(w: DeviceDetailRecord['warranty'], timezone: string): string {
+  if (!w || (!w.status && !w.endDate)) return '—';
+  const status = w.status && w.status !== 'unknown' ? titleCase(w.status) : '';
+  const end = w.endDate ? `until ${formatGenericCell(w.endDate, timezone)}` : '';
+  return [status, end].filter(Boolean).join(', ') || '—';
+}
+
+/** Key/value pairs laid out four columns wide: label, value, label, value. */
+function pairsToRows(pairs: Array<[string, string]>): string[][] {
+  const rows: string[][] = [];
+  for (let i = 0; i < pairs.length; i += 2) {
+    const [l1, v1] = pairs[i]!;
+    const [l2, v2] = pairs[i + 1] ?? ['', ''];
+    rows.push([l1, v1, l2, v2]);
+  }
+  return rows;
+}
+
+export function deviceDetailInfoPairs(d: DeviceDetailRecord, timezone: string): Array<[string, string]> {
+  const hw = d.hardware;
+  const board = [hw?.motherboardManufacturer, hw?.motherboardProduct].filter(Boolean).join(' ');
+  const os = shortOsLabel(d.osType, d.osVersion);
+  return [
+    ['Site', detailText(d.siteName)],
+    ['Status', detailText(d.status)],
+    ['Last seen', formatGenericCell(d.lastSeenAt, timezone)],
+    ['Enrolled', formatGenericCell(d.enrolledAt, timezone)],
+    ['Last user', detailText(d.lastUser)],
+    ['Public IP', detailText(d.lastSeenIp)],
+    ['Operating system', pdfSafeText(os)],
+    ['OS build', detailText(d.osBuild)],
+    ['Architecture', detailText(d.architecture)],
+    ['Agent version', detailText(d.agentVersion)],
+    ['Manufacturer', detailText(hw?.manufacturer)],
+    ['Model', detailText(hw?.model)],
+    ['System serial', detailText(hw?.serialNumber)],
+    ['Virtual machine', d.isVirtual ? 'Yes' : 'No'],
+    ['Motherboard', detailText(board || null)],
+    ['BIOS', detailText(hw?.biosVersion)],
+    ['CPU', cpuDetail(hw)],
+    ['GPU', pdfSafeText(shortGpuLabel(hw?.gpuModel))],
+    ['RAM', hw?.ramTotalMb ? `${Math.round(hw.ramTotalMb / 1024)} GB` : '—'],
+    ['Disk total', hw?.diskTotalGb ? `${Math.round(hw.diskTotalGb)} GB` : '—'],
+    ['Warranty', pdfSafeText(warrantyDetail(d.warranty, timezone))],
+  ];
+}
+
+function renderDeviceDetailReport(doc: jsPDF, summary: DeviceDetailSummary, opts: BuildOpts): void {
+  const chrome = () => {
+    drawHeaderBand(doc, opts);
+    drawFooter(doc, opts);
+  };
+  const tableBase = {
+    margin: { top: PAGE.bandH + 6, left: PAGE.mx, right: PAGE.mx, bottom: 16 },
+    theme: 'grid' as const,
+    rowPageBreak: 'avoid' as const,
+    styles: { fontSize: 8, cellPadding: 1.5, lineColor: C.rule, lineWidth: 0.1, textColor: C.ink, valign: 'middle' as const, overflow: 'linebreak' as const },
+    headStyles: { fillColor: C.primary, textColor: C.white, fontStyle: 'bold' as const, lineColor: C.primary },
+    alternateRowStyles: { fillColor: C.zebra },
+    didDrawPage: () => chrome(),
+  };
+  const finalY = (fallback: number) => {
+    const t = (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable;
+    return typeof t?.finalY === 'number' ? t.finalY : fallback;
+  };
+  const muted = (text: string, y: number): number => {
+    set.text(doc, C.muted);
+    doc.setFont('helvetica', 'italic');
+    doc.setFontSize(8.5);
+    doc.text(text, PAGE.mx + 4, y + 1);
+    return y + 7;
+  };
+
+  const devices = summary.devices;
+  if (devices.length === 0) {
+    chrome();
+    set.text(doc, C.muted);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(11);
+    doc.text('No data available for the selected filters.', PAGE.mx, PAGE.bandH + 16);
+    return;
+  }
+
+  devices.forEach((d, index) => {
+    if (index > 0) doc.addPage();
+    chrome();
+
+    const metaParts = [
+      d.siteName ? pdfSafeText(d.siteName) : null,
+      d.status ? d.status : null,
+      `Generated ${opts.generatedAt}`,
+      `Device ${index + 1} of ${devices.length}${summary.truncated ? '+' : ''}`,
+    ].filter(Boolean);
+    const title = pdfSafeText(d.displayName && d.displayName !== d.hostname ? `${d.hostname} (${d.displayName})` : d.hostname);
+    let y = drawTitleBlock(doc, title, '', metaParts.join('   ·   '), PAGE.bandH + 9) + 2;
+
+    // Section helper: heading kept with at least a few rows of its table.
+    const section = (heading: string, run: (startY: number) => void) => {
+      if (y + 22 > DETAIL_BOTTOM) {
+        doc.addPage();
+        chrome();
+        y = PAGE.bandH + 12;
+      }
+      y = drawSectionHeading(doc, heading, y + 2);
+      run(y);
+    };
+
+    section('Device information', (startY) => {
+      autoTable(doc, {
+        ...tableBase,
+        startY,
+        body: pairsToRows(deviceDetailInfoPairs(d, opts.timezone)),
+        alternateRowStyles: {},
+        columnStyles: {
+          0: { cellWidth: 32, fontStyle: 'bold', textColor: C.muted, fillColor: C.panel },
+          1: { cellWidth: 102.5 },
+          2: { cellWidth: 32, fontStyle: 'bold', textColor: C.muted, fillColor: C.panel },
+          3: { cellWidth: 102.5 },
+        },
+      });
+      y = finalY(startY) + 6;
+    });
+
+    // Two tables per row (RAM | disks, volumes | network) so a device without
+    // the software list fits on one landscape page.
+    const gap = 6;
+    const halfW = (PAGE.w - PAGE.mx * 2 - gap) / 2;
+    const columns = [
+      { left: PAGE.mx, right: PAGE.w - PAGE.mx - halfW },
+      { left: PAGE.mx + halfW + gap, right: PAGE.mx },
+    ];
+    type Half = { heading: string; draw: (startY: number, margin: { left: number; right: number }) => number };
+    const headingAt = (text: string, x: number, at: number): number => {
+      set.fill(doc, C.teal);
+      doc.rect(x, at - 3.4, 1.7, 4.4, 'F');
+      set.text(doc, C.ink);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(11);
+      doc.text(text, x + 4, at);
+      return at + 5;
+    };
+    const mutedAt = (text: string, x: number, at: number): number => {
+      set.text(doc, C.muted);
+      doc.setFont('helvetica', 'italic');
+      doc.setFontSize(8.5);
+      const wrapped = doc.splitTextToSize(text, halfW - 4) as string[];
+      doc.text(wrapped, x + 4, at + 1);
+      return at + 2 + wrapped.length * 4;
+    };
+    const pair = (a: Half, b: Half) => {
+      if (y + 26 > DETAIL_BOTTOM) {
+        doc.addPage();
+        chrome();
+        y = PAGE.bandH + 12;
+      }
+      const top = y + 2;
+      const startPage = doc.getNumberOfPages();
+      // Where the lower of the two halves finished: later page wins, then lower y.
+      let endPage = startPage;
+      let endY = top;
+      [a, b].forEach((half, i) => {
+        doc.setPage(startPage);
+        const margin = columns[i]!;
+        const afterY = half.draw(headingAt(half.heading, margin.left, top), margin);
+        const page = doc.getCurrentPageInfo().pageNumber;
+        if (page > endPage || (page === endPage && afterY > endY)) {
+          endPage = page;
+          endY = afterY;
+        }
+      });
+      doc.setPage(endPage);
+      y = endY + 6;
+    };
+    const halfTable = (startY: number, margin: { left: number; right: number }, table: Record<string, unknown>): number => {
+      autoTable(doc, { ...tableBase, ...table, startY, margin: { ...tableBase.margin, left: margin.left, right: margin.right }, tableWidth: halfW });
+      return finalY(startY);
+    };
+
+    const sticks = normalizeMemoryModules(d.hardware?.memoryModules);
+    const drives = normalizePhysicalDisks(d.hardware?.physicalDisks);
+    pair(
+      {
+        heading: `Memory (RAM)${sticks.length ? ` - ${sticks.length} module${sticks.length === 1 ? '' : 's'}` : ''}`,
+        draw: (startY, margin) => sticks.length === 0
+          ? mutedAt('Per-module details not reported by this agent (Windows agents on the latest version report them).', margin.left, startY)
+          : halfTable(startY, margin, {
+            head: [['Slot', 'Size', 'Speed', 'Manufacturer / part', 'Serial']],
+            body: sticks.map((m) => [
+              detailText(m.slot),
+              formatModuleSize(m.capacityMb),
+              m.speedMhz ? `${m.speedMhz} MHz` : '—',
+              detailText([m.manufacturer, m.partNumber].filter(Boolean).join(' ') || null),
+              detailText(m.serialNumber),
+            ]),
+          }),
+      },
+      {
+        heading: `Physical disks${drives.length ? ` - ${drives.length}` : ''}`,
+        draw: (startY, margin) => drives.length === 0
+          ? mutedAt('Drive models and serials not reported by this agent (Windows agents on the latest version report them).', margin.left, startY)
+          : halfTable(startY, margin, {
+            head: [['Model', 'Type', 'Size', 'Serial']],
+            body: drives.map((x) => [
+              detailText(x.model),
+              detailText([x.mediaType, x.busType].filter(Boolean).join(' / ') || null),
+              formatDiskSize(x.sizeGb),
+              detailText(x.serialNumber),
+            ]),
+          }),
+      },
+    );
+
+    pair(
+      {
+        heading: 'Volumes',
+        draw: (startY, margin) => d.volumes.length === 0
+          ? mutedAt('No volume data reported.', margin.left, startY)
+          : halfTable(startY, margin, {
+            head: [['Drive', 'File system', 'Size (GB)', 'Free (GB)', 'Used %']],
+            body: d.volumes.map((v) => [
+              detailText(v.mountPoint),
+              detailText(v.fsType),
+              detailNumber(v.totalGb, 1),
+              detailNumber(v.freeGb, 1),
+              `${detailNumber(v.usedPercent)}%`,
+            ]),
+            columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' } },
+            didParseCell: (data: CellHookData) => {
+              if (data.section !== 'body' || data.column.index !== 4) return;
+              const pct = num(d.volumes[data.row.index]?.usedPercent);
+              if (pct !== null && pct >= 90) data.cell.styles.textColor = C.danger;
+              else if (pct !== null && pct >= 80) data.cell.styles.textColor = C.warning;
+            },
+          }),
+      },
+      {
+        heading: 'Network adapters',
+        draw: (startY, margin) => d.network.length === 0
+          ? mutedAt('No network adapter data reported.', margin.left, startY)
+          : halfTable(startY, margin, {
+            head: [['Interface', 'MAC address', 'IP address']],
+            body: d.network.map((n) => [
+              pdfSafeText(`${n.interfaceName}${n.isPrimary ? ' (primary)' : ''}`),
+              detailText(n.macAddress),
+              detailText(n.ipAddress),
+            ]),
+          }),
+      },
+    );
+
+    if (summary.includeSoftware) {
+      const apps = d.software ?? [];
+      const total = d.softwareCount ?? apps.length;
+      section(`Installed software - ${total}`, (startY) => {
+        if (apps.length === 0) {
+          y = muted('No installed software reported.', startY);
+          return;
+        }
+        autoTable(doc, {
+          ...tableBase,
+          startY,
+          head: [['Name', 'Version', 'Publisher', 'Installed']],
+          body: apps.map((a) => [
+            detailText(a.name),
+            detailText(a.version),
+            detailText(a.publisher),
+            formatGenericCell(a.installDate, opts.timezone),
+          ]),
+          styles: { ...tableBase.styles, fontSize: 7.5, cellPadding: 1.2 },
+          columnStyles: { 0: { cellWidth: 120 }, 1: { cellWidth: 40 }, 2: { cellWidth: 79 }, 3: { cellWidth: 30 } },
+        });
+        y = finalY(startY) + 4;
+        if (total > apps.length) {
+          y = muted(`Showing the first ${apps.length} of ${total} applications.`, y);
+        }
+      });
+    }
+  });
+
+  if (summary.truncated) {
+    const last = doc.getNumberOfPages();
+    doc.setPage(last);
+    set.text(doc, C.muted);
+    doc.setFont('helvetica', 'italic');
+    doc.setFontSize(8.5);
+    doc.text(`Only the first ${devices.length} devices are included. Narrow the report by site to see the rest.`, PAGE.mx, DETAIL_BOTTOM + 4);
+  }
+}
+
 const UNASSIGNED_SITE = 'No site';
 
 export type DeviceInventorySiteGroup = {
@@ -2203,10 +2518,13 @@ function buildReportPdfWithPalette(rows: unknown[], opts: BuildOpts): jsPDF {
   // language a screen reader announces. Cheap, and the only structure jsPDF
   // can give an assistive reader.
   const orgName = (opts.summary as { org?: { name?: string } } | undefined)?.org?.name?.trim();
+  const docLabel = reportTypeLabel(
+    opts.reportType === 'device_inventory' && isDeviceDetailSummary(opts.summary) ? 'device_detail' : opts.reportType,
+  );
   if (typeof doc.setProperties === 'function') {
     doc.setProperties({
-      title: orgName ? `${reportTypeLabel(opts.reportType)} report for ${orgName}` : `${reportTypeLabel(opts.reportType)} report`,
-      subject: `${reportTypeLabel(opts.reportType)} report prepared ${opts.generatedAt}`,
+      title: orgName ? `${docLabel} report for ${orgName}` : `${docLabel} report`,
+      subject: `${docLabel} report prepared ${opts.generatedAt}`,
       author: opts.branding?.name?.trim() || 'Breeze',
       creator: 'Breeze RMM',
     });
@@ -2415,6 +2733,10 @@ function buildReportPdfWithPalette(rows: unknown[], opts: BuildOpts): jsPDF {
         drawSectionHeading,
       },
     );
+  } else if (opts.reportType === 'device_inventory' && isDeviceDetailSummary(opts.summary)) {
+    // Device Detail layout (config.layout = 'detail'): one page per device.
+    // Chrome is drawn per page by the renderer.
+    renderDeviceDetailReport(doc, opts.summary, { ...opts, reportType: 'device_detail' });
   } else if (opts.reportType === 'device_inventory') {
     // Grouped by site with curated columns; the generic table dumped every raw
     // field (device id, enrol date, ...) at ~5 rows a page with no branch view.

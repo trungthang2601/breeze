@@ -618,8 +618,19 @@
             "options": {
               "all_devices": "Todos os dispositivos",
               "by_site": "Por site",
-              "by_tag": "Por tag"
+              "by_tag": "Por tag",
+              "by_device": "Escolher dispositivos"
             }
+          },
+          "layout": {
+            "label": "Layout do PDF",
+            "options": {
+              "table": "Tabela de inventário",
+              "detail": "Detalhe do dispositivo (uma página por dispositivo)"
+            }
+          },
+          "includeSoftware": {
+            "label": "Software instalado"
           }
         },
         "patches": {
@@ -902,7 +913,14 @@
         "tuesday": "Terca-feira",
         "wednesday": "Quarta-feira"
       },
-      "where": "Onde"
+      "where": "Onde",
+      "devicePicker": {
+        "title": "Dispositivos ({{count}} selecionados)",
+        "clear": "Limpar",
+        "search": "Pesquisar hostname ou site…",
+        "loading": "Carregando dispositivos…",
+        "empty": "Nenhum dispositivo encontrado"
+      }
     },
     "reportTemplates": {
       "blankConfigurationDescription": "Configure um relatório do zero ou comece com uma configuração em branco.",
@@ -993,6 +1011,10 @@
         "endpoint_management_review": {
           "description": "Evidência do Microsoft Intune: cobertura de inscrição, detalhamento de conformidade com tendência de 30 dias, inscrições desatualizadas e licenças, informando a atualidade de cada sincronização.",
           "name": "Revisão de gerenciamento de endpoints do Intune"
+        },
+        "device_detail": {
+          "name": "Relatório de detalhes do dispositivo",
+          "description": "Uma página por dispositivo: hardware, cada pente de RAM e disco com número de série, volumes, adaptadores de rede, garantia e, opcionalmente, o software instalado."
         }
       },
       "title": "Modelos de Relatório",

@@ -618,8 +618,19 @@
             "options": {
               "all_devices": "Tüm cihazlar",
               "by_site": "Siteye göre",
-              "by_tag": "Etikete göre"
+              "by_tag": "Etikete göre",
+              "by_device": "Cihaz seç"
             }
+          },
+          "layout": {
+            "label": "PDF düzeni",
+            "options": {
+              "table": "Envanter tablosu",
+              "detail": "Cihaz ayrıntısı (cihaz başına bir sayfa)"
+            }
+          },
+          "includeSoftware": {
+            "label": "Yüklü yazılımlar"
           }
         },
         "patches": {
@@ -902,7 +913,14 @@
         "tuesday": "Salı",
         "wednesday": "Çarşamba"
       },
-      "where": "Nerede"
+      "where": "Nerede",
+      "devicePicker": {
+        "title": "Cihazlar ({{count}} seçili)",
+        "clear": "Temizle",
+        "search": "Ana bilgisayar adı veya site ara…",
+        "loading": "Cihazlar yükleniyor…",
+        "empty": "Cihaz bulunamadı"
+      }
     },
     "reportTemplates": {
       "blankConfigurationDescription": "Bir raporu sıfırdan yapılandırın veya boş bir yapılandırmayla başlayın.",
@@ -993,6 +1011,10 @@
         "endpoint_management_review": {
           "description": "Microsoft Intune kanıtı: kayıt kapsamı, 30 günlük eğilimle uyumluluk dağılımı, eskimiş kayıtlar ve lisans koltukları; her eşitlemenin güncelliği belirtilir.",
           "name": "Intune Uç Nokta Yönetimi İncelemesi"
+        },
+        "device_detail": {
+          "name": "Cihaz Ayrıntı Raporu",
+          "description": "Cihaz başına bir sayfa: donanım, seri numaralarıyla her RAM modülü ve disk, birimler, ağ bağdaştırıcıları, garanti — isteğe bağlı olarak yüklü yazılımlar."
         }
       },
       "title": "Rapor Şablonları",

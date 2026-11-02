@@ -3362,5 +3362,12 @@
       "created": "Ağ varlığı oluşturuldu",
       "createFailed": "Ağ varlığı oluşturulamadı"
     }
+  },
+  "exportDeviceDetail": {
+    "button": "PDF'e aktar",
+    "includeSoftware": "Yüklü yazılımları ekle",
+    "download": "PDF indir",
+    "working": "Oluşturuluyor…",
+    "failed": "Cihaz PDF’i oluşturulamadı."
   }
 }

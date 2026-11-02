@@ -95,6 +95,9 @@ export type ReportBuilderFormValues = {
   templateName?: string;
   dateRange?: { preset?: string; start?: string; end?: string };
   filters?: Record<string, unknown>;
+  /** Device Inventory only: 'detail' renders one PDF page per device. */
+  layout?: 'table' | 'detail';
+  includeSoftware?: boolean;
 };
 
 type ReportBuilderProps = {
@@ -241,8 +244,25 @@ const dataSourceFieldsByType: Record<BuilderReportType, DataSourceField[]> = {
       options: [
         { value: 'all_devices', label: 'All devices' },
         { value: 'by_site', label: 'By site' },
+        { value: 'by_device', label: 'Pick devices' },
         { value: 'by_tag', label: 'By tag' }
       ]
+    },
+    {
+      // 'detail' = one PDF page per device (hardware, RAM sticks, drives,
+      // network, warranty); 'table' = the per-site inventory table.
+      id: 'layout',
+      label: 'PDF layout',
+      type: 'select',
+      options: [
+        { value: 'table', label: 'Inventory table' },
+        { value: 'detail', label: 'Device detail (one page per device)' }
+      ]
+    },
+    {
+      id: 'includeSoftware',
+      label: 'Installed software',
+      type: 'toggle'
     },
     {
       id: 'platform',
@@ -454,7 +474,9 @@ const dataSourceDefaultsByType: Record<BuilderReportType, Record<string, string 
     platform: 'all',
     ownership: 'managed',
     inventorySource: 'agent',
-    includeInactive: false
+    includeInactive: false,
+    layout: 'table',
+    includeSoftware: false
   },
   alerts: {
     timeWindow: 'last_7d',
@@ -884,8 +906,66 @@ export default function ReportBuilder({
     return () => { alive = false; };
   }, [currentOrgId]);
 
+  // Device picker ("Pick devices" scope) — loaded on demand.
+  const [deviceOptions, setDeviceOptions] = useState<{ id: string; hostname: string; siteName: string | null }[]>([]);
+  const [deviceOptionsLoading, setDeviceOptionsLoading] = useState(false);
+  const [deviceSearch, setDeviceSearch] = useState('');
+  const [selectedDeviceIds, setSelectedDeviceIds] = useState<string[]>(() => {
+    const f = (defaultValues?.filters ?? {}) as { deviceIds?: unknown };
+    return Array.isArray(f.deviceIds) ? f.deviceIds.filter((x): x is string => typeof x === 'string') : [];
+  });
+  const wantsDevicePicker = builderType === 'devices' && dataSource.scope === 'by_device';
+
+  useEffect(() => {
+    if (!wantsDevicePicker || deviceOptions.length > 0) return;
+    let alive = true;
+    setDeviceOptionsLoading(true);
+    (async () => {
+      const found: { id: string; hostname: string; siteName: string | null }[] = [];
+      try {
+        for (let page = 1; page <= 20; page += 1) {
+          const qs = new URLSearchParams({ limit: '100', page: String(page) });
+          if (currentOrgId) qs.set('orgId', currentOrgId);
+          const res = await fetchWithAuth(`/devices?${qs.toString()}`);
+          if (!res.ok) break;
+          const body = await res.json();
+          const list = Array.isArray(body) ? body : (body.data ?? body.devices ?? body.items ?? []);
+          for (const d of Array.isArray(list) ? list : []) {
+            if (d && typeof d.id === 'string') {
+              found.push({ id: d.id, hostname: String(d.displayName || d.hostname || d.id), siteName: d.siteName ?? null });
+            }
+          }
+          const total = Number(body?.pagination?.total ?? found.length);
+          if (!Array.isArray(list) || list.length < 100 || found.length >= total) break;
+        }
+      } catch {
+        // Picker stays empty; the message below says so.
+      }
+      if (!alive) return;
+      found.sort((a, b) => (a.siteName ?? '').localeCompare(b.siteName ?? '') || a.hostname.localeCompare(b.hostname));
+      setDeviceOptions(found);
+      setDeviceOptionsLoading(false);
+    })();
+    return () => { alive = false; };
+  }, [currentOrgId, deviceOptions.length, wantsDevicePicker]);
+
+  const visibleDeviceOptions = useMemo(() => {
+    const q = deviceSearch.trim().toLowerCase();
+    if (!q) return deviceOptions;
+    return deviceOptions.filter(d => d.hostname.toLowerCase().includes(q) || (d.siteName ?? '').toLowerCase().includes(q));
+  }, [deviceOptions, deviceSearch]);
+
   const siteFilter: Record<string, unknown> =
-    dataSource.scope === 'by_site' && selectedSiteIds.length > 0 ? { siteIds: selectedSiteIds } : {};
+    dataSource.scope === 'by_site' && selectedSiteIds.length > 0
+      ? { siteIds: selectedSiteIds }
+      : dataSource.scope === 'by_device' && selectedDeviceIds.length > 0
+        ? { deviceIds: selectedDeviceIds }
+        : {};
+  // Device Detail layout: rides in config so saved / scheduled runs keep it.
+  const layoutConfig: Record<string, unknown> =
+    builderType === 'devices' && dataSource.layout === 'detail'
+      ? { layout: 'detail', includeSoftware: dataSource.includeSoftware === true }
+      : {};
 
   const dataSourceFields = dataSourceFieldsByType[builderType];
   const numericFields = useMemo(
@@ -1052,7 +1132,7 @@ export default function ReportBuilder({
       mounted = false;
       window.clearTimeout(timer);
     };
-  }, [builderType, currentOrgId, dataSource, defaultValues?.dateRange, defaultValues?.filters, exportFormats, filterConditions, mode, t, selectedSiteIds]);
+  }, [builderType, currentOrgId, dataSource, defaultValues?.dateRange, defaultValues?.filters, exportFormats, filterConditions, mode, t, selectedDeviceIds, selectedSiteIds]);
 
   const normalizedPreviewRows = useMemo(
     () => livePreviewRows.map(row => normalizePreviewRow(builderType, row)),
@@ -1394,8 +1474,9 @@ export default function ReportBuilder({
       emailRecipients,
       saveTemplate,
       templateName: saveTemplate ? templateName : undefined,
-      filters: defaultValues?.filters,
-      dateRange: defaultValues?.dateRange
+      filters: { ...((defaultValues?.filters as Record<string, unknown>) ?? {}), ...siteFilter },
+      dateRange: defaultValues?.dateRange,
+      ...layoutConfig
     };
   };
 
@@ -1467,7 +1548,10 @@ export default function ReportBuilder({
           ...((defaultValues?.filters as Record<string, unknown>) ?? {}),
           ...siteFilter,
         },
-        dateRange: defaultValues?.dateRange
+        dateRange: defaultValues?.dateRange,
+        // Explicit so switching back to the table layout clears a stored 'detail'.
+        layout: layoutConfig.layout ?? 'table',
+        includeSoftware: layoutConfig.includeSoftware ?? false
       }
     };
 
@@ -1796,7 +1880,9 @@ export default function ReportBuilder({
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">
-            {dataSourceFields.map(field => (
+            {dataSourceFields
+              .filter(field => field.id !== 'includeSoftware' || dataSource.layout === 'detail')
+              .map(field => (
               <div key={field.id} className="space-y-2">
                 <label className="text-xs font-medium text-muted-foreground">{getDataSourceFieldLabel(field.id)}</label>
                 {field.type === 'toggle' ? (
@@ -1852,6 +1938,51 @@ export default function ReportBuilder({
                         }
                       />
                       {site.name}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+            {wantsDevicePicker && (
+              <div className="md:col-span-2">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-sm font-medium">
+                    {t('reports.reportBuilder.devicePicker.title', { count: selectedDeviceIds.length })}
+                  </label>
+                  {selectedDeviceIds.length > 0 && (
+                    <button type="button" className="text-xs text-primary hover:underline" onClick={() => setSelectedDeviceIds([])}>
+                      {t('reports.reportBuilder.devicePicker.clear')}
+                    </button>
+                  )}
+                </div>
+                <input
+                  type="search"
+                  value={deviceSearch}
+                  onChange={e => setDeviceSearch(e.target.value)}
+                  placeholder={t('reports.reportBuilder.devicePicker.search')}
+                  className="mt-2 h-9 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                />
+                <div className="mt-2 grid max-h-56 grid-cols-1 gap-1 overflow-auto rounded-md border p-2 sm:grid-cols-2">
+                  {deviceOptionsLoading && (
+                    <span className="text-sm text-muted-foreground">{t('reports.reportBuilder.devicePicker.loading')}</span>
+                  )}
+                  {!deviceOptionsLoading && visibleDeviceOptions.length === 0 && (
+                    <span className="text-sm text-muted-foreground">{t('reports.reportBuilder.devicePicker.empty')}</span>
+                  )}
+                  {visibleDeviceOptions.map(device => (
+                    <label key={device.id} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={selectedDeviceIds.includes(device.id)}
+                        onChange={e =>
+                          setSelectedDeviceIds(prev =>
+                            e.target.checked ? [...prev, device.id] : prev.filter(id => id !== device.id))
+                        }
+                      />
+                      <span className="truncate">
+                        {device.hostname}
+                        {device.siteName && <span className="text-muted-foreground"> · {device.siteName}</span>}
+                      </span>
                     </label>
                   ))}
                 </div>

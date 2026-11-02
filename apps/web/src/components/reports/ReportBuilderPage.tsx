@@ -5,6 +5,7 @@ import ReportPreview from './ReportPreview';
 import type { ReportType } from './ReportsList';
 import { exportReport, getBrowserTimezone } from './reportExport';
 import { fetchWithAuth } from '../../stores/auth';
+import { isDeviceDetailSummary } from '@breeze/shared';
 import { useTranslation } from 'react-i18next';
 
 type ReportData = {
@@ -35,7 +36,10 @@ export default function ReportBuilderPage({ timezone }: ReportBuilderPageProps =
           type: values.type,
           config: {
             dateRange: values.dateRange,
-            filters: values.filters
+            filters: values.filters,
+            ...(values.layout === 'detail'
+              ? { layout: 'detail', includeSoftware: values.includeSoftware === true }
+              : {})
           },
           format: values.format
         })
@@ -63,8 +67,12 @@ export default function ReportBuilderPage({ timezone }: ReportBuilderPageProps =
     if (!previewData) return;
 
     try {
-      const rows = (previewData.data as { rows?: unknown[] })?.rows ?? [];
-      await exportReport(rows, { format, reportType: previewData.type, timezone: effectiveTimezone });
+      const data = previewData.data as { rows?: unknown[]; summary?: unknown };
+      const rows = data?.rows ?? [];
+      // The Device Detail layout lives in `summary`; without it the PDF would
+      // fall back to the inventory table.
+      const summary = isDeviceDetailSummary(data?.summary) ? data.summary : undefined;
+      await exportReport(rows, { format, reportType: previewData.type, timezone: effectiveTimezone, summary });
     } catch (err) {
       setError(err instanceof Error ? err.message : t('reports.reportBuilderPage.errors.exportFailed'));
     }

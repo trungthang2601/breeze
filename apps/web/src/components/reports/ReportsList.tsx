@@ -24,6 +24,7 @@ import {
   formatNextOccurrence,
   type ScheduleCadence,
   type ScheduleConfig,
+  type DeviceDetailSummary,
   type ExecutiveSummary,
   type OrgNarrativeReportSummary,
   type FleetDesignReportSummary,
@@ -282,6 +283,7 @@ export default function ReportsList({ onEdit, onGenerate, onDelete, timezone }: 
           // The posture / executive-summary covers and the AI org narrative
           // body consume this snapshot; ignored by other report types.
           summary: data?.summary as
+            | DeviceDetailSummary
             | PostureSummary
             | ExecutiveSummary
             | OrgNarrativeReportSummary
