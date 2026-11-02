@@ -1219,8 +1219,12 @@ export default function ReportBuilder({
     }
     const isAvailable = (field: string) =>
       filteredRows.some(row => row[field] !== undefined && row[field] !== null);
+    // A field the user picked for THIS report type always gets its column,
+    // even when every row is empty (e.g. "Disks (model + serial)" before the
+    // agents report drives) — hiding it read as "the field does nothing".
+    const knownFields = new Set(fieldDefinitions.map(field => field.id));
 
-    const safeSelected = selectedFields.filter(isAvailable);
+    const safeSelected = selectedFields.filter(field => knownFields.has(field) || isAvailable(field));
     if (safeSelected.length) return safeSelected;
 
     const safeDefaults = defaultFieldsByType[builderType].filter(isAvailable);
@@ -1229,7 +1233,14 @@ export default function ReportBuilder({
     const firstRow = filteredRows[0];
     if (!firstRow) return [];
     return Object.keys(firstRow).slice(0, 6);
-  }, [builderType, filteredRows, groupBy, groupedMetricKey, selectedFields]);
+  }, [builderType, fieldDefinitions, filteredRows, groupBy, groupedMetricKey, selectedFields]);
+
+  // Picked columns with no value on any row — said out loud under the table.
+  const emptyPreviewColumns = useMemo(() => {
+    if (groupBy || filteredRows.length === 0) return [];
+    return previewColumns.filter(column =>
+      !filteredRows.some(row => row[column] !== undefined && row[column] !== null && row[column] !== ''));
+  }, [filteredRows, groupBy, previewColumns]);
 
   const previewRows = useMemo(() => {
     const baseRows = groupBy ? groupedRows : filteredRows;
@@ -1648,6 +1659,13 @@ export default function ReportBuilder({
             ))}
           </tbody>
         </table>
+        {emptyPreviewColumns.length > 0 && (
+          <p className="border-t bg-muted/20 px-3 py-2 text-xs text-muted-foreground" data-testid="preview-empty-columns">
+            {t('reports.reportBuilder.previewTable.emptyColumns', {
+              fields: emptyPreviewColumns.map(column => getFieldLabel(column)).join(', ')
+            })}
+          </p>
+        )}
       </div>
     );
   };

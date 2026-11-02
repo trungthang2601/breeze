@@ -830,7 +830,8 @@
         "loadFailed": "Could not load the report recipients"
       },
       "previewTable": {
-        "selectFields": "Select fields to populate the preview table."
+        "selectFields": "Select fields to populate the preview table.",
+        "emptyColumns": "No data yet for: {{fields}}. RAM sticks and drive serials come from the latest Windows agent; devices still on an older agent show \"-\"."
       },
       "reportTypes": {
         "activity": {

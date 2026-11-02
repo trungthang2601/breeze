@@ -830,7 +830,8 @@
         "loadFailed": "Não foi possível carregar os destinatários do relatório"
       },
       "previewTable": {
-        "selectFields": "Selecione campos para preencher a tabela de pre-visualização."
+        "selectFields": "Selecione campos para preencher a tabela de pre-visualização.",
+        "emptyColumns": "Ainda sem dados para: {{fields}}. Os pentes de RAM e os números de série dos discos vêm do agente Windows mais recente; dispositivos com agente antigo mostram \"-\"."
       },
       "reportTypes": {
         "activity": {

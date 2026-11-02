@@ -830,7 +830,8 @@
         "loadFailed": "No se pudieron cargar los destinatarios del informe"
       },
       "previewTable": {
-        "selectFields": "Seleccione campos para completar la tabla de vista previa."
+        "selectFields": "Seleccione campos para completar la tabla de vista previa.",
+        "emptyColumns": "Aún no hay datos para: {{fields}}. Los módulos de RAM y los números de serie de discos provienen del agente de Windows más reciente; los dispositivos con un agente anterior muestran \"-\"."
       },
       "reportTypes": {
         "activity": {

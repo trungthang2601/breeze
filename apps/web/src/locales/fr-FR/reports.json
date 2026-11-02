@@ -830,7 +830,8 @@
         "loadFailed": "Impossible de charger les destinataires du rapport"
       },
       "previewTable": {
-        "selectFields": "Sélectionnez les champs pour remplir la table d’aperçu."
+        "selectFields": "Sélectionnez les champs pour remplir la table d’aperçu.",
+        "emptyColumns": "Aucune donnée pour le moment : {{fields}}. Les barrettes de RAM et les numéros de série des disques proviennent du dernier agent Windows ; les appareils avec un agent plus ancien affichent « - »."
       },
       "reportTypes": {
         "activity": {

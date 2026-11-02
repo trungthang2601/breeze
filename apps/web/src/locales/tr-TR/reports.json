@@ -830,7 +830,8 @@
         "loadFailed": "Rapor alıcıları yüklenemedi"
       },
       "previewTable": {
-        "selectFields": "Önizleme tablosunun doldurulacağı alanları seçin."
+        "selectFields": "Önizleme tablosunun doldurulacağı alanları seçin.",
+        "emptyColumns": "Henüz veri yok: {{fields}}. RAM modülleri ve disk seri numaraları en yeni Windows ajanından gelir; eski ajandaki cihazlar \"-\" gösterir."
       },
       "reportTypes": {
         "activity": {

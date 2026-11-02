@@ -830,7 +830,8 @@
         "loadFailed": "Die Berichtsempfänger konnten nicht geladen werden"
       },
       "previewTable": {
-        "selectFields": "Wählen Sie Felder aus, um die Vorschautabelle zu füllen."
+        "selectFields": "Wählen Sie Felder aus, um die Vorschautabelle zu füllen.",
+        "emptyColumns": "Noch keine Daten für: {{fields}}. RAM-Module und Laufwerks-Seriennummern liefert der aktuelle Windows-Agent; Geräte mit älterem Agent zeigen „-“."
       },
       "reportTypes": {
         "activity": {

@@ -830,7 +830,8 @@
         "loadFailed": "Impossibile caricare i destinatari del report"
       },
       "previewTable": {
-        "selectFields": "Seleziona campi per popolare la tabella di anteprima."
+        "selectFields": "Seleziona campi per popolare la tabella di anteprima.",
+        "emptyColumns": "Ancora nessun dato per: {{fields}}. I moduli RAM e i seriali dei dischi arrivano dall’agente Windows più recente; i dispositivi con un agente precedente mostrano \"-\"."
       },
       "reportTypes": {
         "activity": {
