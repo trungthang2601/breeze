@@ -4,7 +4,7 @@ import type { DeviceDetailSummary, PostureSummary, ExecutiveSummary, OrgNarrativ
   IdentityAccessSummary,
 } from '@breeze/shared';
 import { formatDateTime } from '@/lib/dateTimeFormat';
-import { escapeCsvCell, escapeTsvCell, neutralizeSpreadsheetFormula, rowsToCsv, rowsToTsv } from '@/lib/csvExport';
+import { escapeCsvCell, escapeTsvCell, neutralizeSpreadsheetFormula, rowsToCsv, rowsToTsv, toUtf16LeWithBom, withUtf8Bom } from '@/lib/csvExport';
 import { downloadBlob } from '@/lib/downloadBlob';
 import { sanitizeImageSrc } from '@/lib/safeImageSrc';
 import { fetchWithAuth } from '../../stores/auth';
@@ -69,15 +69,17 @@ export async function exportReport(
 
   if (format === 'csv') {
     if (rows.length === 0) throw new Error('No data to export');
-    const csvContent = rowsToCsv(rows);
+    // BOM so Excel reads Vietnamese site names as UTF-8, not the ANSI code page.
+    const csvContent = withUtf8Bom(rowsToCsv(rows));
     downloadBlob(new Blob([csvContent], { type: 'text/csv;charset=utf-8;' }), `${baseFilename}.csv`);
     return;
   }
 
   if (format === 'excel') {
     if (rows.length === 0) throw new Error('No data to export');
-    const tsvContent = rowsToTsv(rows);
-    downloadBlob(new Blob([tsvContent], { type: 'application/vnd.ms-excel' }), `${baseFilename}.xls`);
+    // UTF-16LE + BOM: the tab-separated "Unicode Text" Excel opens with accents intact.
+    const tsvContent = toUtf16LeWithBom(rowsToTsv(rows));
+    downloadBlob(new Blob([tsvContent as BlobPart], { type: 'application/vnd.ms-excel' }), `${baseFilename}.xls`);
     return;
   }
 

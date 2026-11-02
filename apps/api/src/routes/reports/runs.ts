@@ -18,7 +18,7 @@ import {
   UnsupportedReportScopeError,
   type ReportResult,
 } from '../../services/reportGenerationService';
-import { rowsToCsv, rowsToTsv } from '@breeze/shared';
+import { rowsToCsv, rowsToTsv, toUtf16LeWithBom, withUtf8Bom } from '@breeze/shared';
 import {
   getPagination, getReportWithOrgCheck, getReportRunWithOrgCheck, isPortalSelfServiceLocked,
   isSystemManagedReportDefinition, PARTNER_OWNED_REPORT, partnerOwnedReportVisibility,
@@ -455,7 +455,8 @@ runsRoutes.get(
     }
 
     if (format === 'excel') {
-      const body = rowsToTsv(rows);
+      // UTF-16LE + BOM ("Unicode Text"): Excel opens it with Vietnamese intact.
+      const body = toUtf16LeWithBom(rowsToTsv(rows));
       c.header('Content-Type', 'application/vnd.ms-excel');
       c.header('Content-Disposition', `attachment; filename="${baseName}.xls"`);
       auditSensitiveRead(c, {
@@ -466,12 +467,13 @@ runsRoutes.get(
         resourceId: runId,
         format,
         rowCount: rows.length,
-        byteCount: Buffer.byteLength(body, 'utf8'),
+        byteCount: body.byteLength,
       });
-      return c.body(body);
+      return c.body(body as Uint8Array<ArrayBuffer>);
     }
 
-    const body = rowsToCsv(rows);
+    // BOM so Excel reads the CSV as UTF-8 rather than the ANSI code page.
+    const body = withUtf8Bom(rowsToCsv(rows));
     c.header('Content-Type', 'text/csv;charset=utf-8;');
     c.header('Content-Disposition', `attachment; filename="${baseName}.csv"`);
     auditSensitiveRead(c, {

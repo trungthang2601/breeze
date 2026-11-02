@@ -4,10 +4,10 @@ exports[`report email rendering is pinned before the reportDelivery extraction (
 {
   "attachments": [
     {
-      "bytes": 81,
+      "bytes": 84,
       "contentType": "text/csv",
       "filename": "device_inventory-report-2026-07-25.csv",
-      "sha256": "b403b7f192d483019c3f3f2ef5d2cbc6a66d642cfd67f94dfc8999682736be3d",
+      "sha256": "05e71599c45a414148b2bb74d48b639fdf55098c5be1ba121525d9ceffa1369e",
     },
   ],
   "html": "<!doctype html>
@@ -61,10 +61,10 @@ exports[`report email rendering is pinned before the reportDelivery extraction (
 {
   "attachments": [
     {
-      "bytes": 81,
+      "bytes": 84,
       "contentType": "text/csv",
       "filename": "device_inventory-report-2026-07-25.csv",
-      "sha256": "b403b7f192d483019c3f3f2ef5d2cbc6a66d642cfd67f94dfc8999682736be3d",
+      "sha256": "05e71599c45a414148b2bb74d48b639fdf55098c5be1ba121525d9ceffa1369e",
     },
   ],
   "html": "<!doctype html>

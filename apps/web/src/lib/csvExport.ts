@@ -13,4 +13,6 @@ export {
   toCsv,
   rowsToCsv,
   rowsToTsv,
+  withUtf8Bom,
+  toUtf16LeWithBom,
 } from '@breeze/shared';

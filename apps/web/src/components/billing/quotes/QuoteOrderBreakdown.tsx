@@ -16,7 +16,7 @@ import {
   type QuoteLineFulfillmentStatus,
 } from '@breeze/shared';
 import { formatPercent } from '@/lib/i18n/format';
-import { rowsToCsv, rowsToTsv } from '@/lib/csvExport';
+import { rowsToCsv, rowsToTsv, withUtf8Bom } from '@/lib/csvExport';
 import { downloadBlob } from '@/lib/downloadBlob';
 import { usePermissions } from '../../../lib/permissions';
 import { showToast } from '../../shared/Toast';
@@ -278,7 +278,7 @@ export default function QuoteOrderBreakdown({ lines, currency, showCost, quoteId
   const handleExportCsv = useCallback(() => {
     const csv = rowsToCsv(exportRows(lines, showCost, currency));
     downloadBlob(
-      new Blob([csv], { type: 'text/csv;charset=utf-8;' }),
+      new Blob([withUtf8Bom(csv)], { type: 'text/csv;charset=utf-8;' }),
       `quote-${quoteNumber ?? 'draft'}-to-be-ordered.csv`,
     );
   }, [lines, showCost, currency, quoteNumber]);

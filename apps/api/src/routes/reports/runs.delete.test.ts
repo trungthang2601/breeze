@@ -136,7 +136,9 @@ vi.mock('./helpers', () => ({
   getPagination: vi.fn(),
 }));
 
-vi.mock('@breeze/shared', () => ({
+vi.mock('@breeze/shared', async (importOriginal) => ({
+  withUtf8Bom: (await importOriginal<typeof import('@breeze/shared')>()).withUtf8Bom,
+  toUtf16LeWithBom: (await importOriginal<typeof import('@breeze/shared')>()).toUtf16LeWithBom,
   rowsToCsv: rowsToCsvMock,
   rowsToTsv: rowsToTsvMock,
 }));

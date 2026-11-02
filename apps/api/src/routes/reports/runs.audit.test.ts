@@ -122,7 +122,9 @@ vi.mock('./helpers', () => ({
   getPagination: vi.fn(),
 }));
 
-vi.mock('@breeze/shared', () => ({
+vi.mock('@breeze/shared', async (importOriginal) => ({
+  withUtf8Bom: (await importOriginal<typeof import('@breeze/shared')>()).withUtf8Bom,
+  toUtf16LeWithBom: (await importOriginal<typeof import('@breeze/shared')>()).toUtf16LeWithBom,
   rowsToCsv: rowsToCsvMock,
   rowsToTsv: rowsToTsvMock,
 }));
@@ -181,10 +183,12 @@ describe('report run sensitive-read audit', () => {
     }]);
 
     const res = await app().request(`/reports/runs/${RUN_ID}/download`);
-    const body = await res.text();
+    const bytes = new Uint8Array(await res.arrayBuffer());
 
     expect(res.status).toBe(200);
-    expect(body).toBe(`csv:${JSON.stringify(rows)}`);
+    // UTF-8 BOM first, so Excel does not read Vietnamese as ANSI.
+    expect(Array.from(bytes.slice(0, 3))).toEqual([0xef, 0xbb, 0xbf]);
+    expect(new TextDecoder().decode(bytes)).toBe(`csv:${JSON.stringify(rows)}`);
     expect(auditSensitiveReadMock).toHaveBeenCalledWith(expect.anything(), {
       action: 'report.run.download',
       orgId: ORG_ID,
@@ -192,7 +196,7 @@ describe('report run sensitive-read audit', () => {
       resourceId: RUN_ID,
       format: 'csv',
       rowCount: 2,
-      byteCount: Buffer.byteLength(body, 'utf8'),
+      byteCount: bytes.byteLength,
     });
   });
 
@@ -241,14 +245,16 @@ describe('report run sensitive-read audit', () => {
     }]);
 
     const res = await app().request(`/reports/runs/${RUN_ID}/download?format=excel`);
-    const body = await res.text();
+    const bytes = new Uint8Array(await res.arrayBuffer());
 
     expect(res.status).toBe(200);
-    expect(body).toBe(`tsv:${JSON.stringify(rows)}`);
+    // UTF-16LE with BOM — Excel's "Unicode Text".
+    expect(Array.from(bytes.slice(0, 2))).toEqual([0xff, 0xfe]);
+    expect(new TextDecoder('utf-16le').decode(bytes.slice(2))).toBe(`tsv:${JSON.stringify(rows)}`);
     expect(auditSensitiveReadMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       format: 'excel',
       rowCount: 1,
-      byteCount: Buffer.byteLength(body, 'utf8'),
+      byteCount: bytes.byteLength,
     }));
   });
 

@@ -90,3 +90,34 @@ export function rowsToTsv(rows: unknown[]): string {
   const { headers, body } = extractTable(rows);
   return [tsvRow(headers), ...body.map(tsvRow)].join('\n');
 }
+
+/**
+ * Excel guesses the encoding of a CSV/TSV it opens. Without a byte-order mark
+ * it assumes the Windows ANSI code page, so UTF-8 Vietnamese ("ICOOL BÌNH PHÚ")
+ * turns into mojibake ("ICOOL BÃŒNH PHÃš"). These helpers make the bytes say
+ * what they are.
+ */
+export const UTF8_BOM = '\uFEFF';
+
+/** CSV text with a UTF-8 BOM (idempotent). Encode the result as UTF-8. */
+export function withUtf8Bom(text: string): string {
+  return text.startsWith(UTF8_BOM) ? text : UTF8_BOM + text;
+}
+
+/**
+ * Tab-separated text as UTF-16LE with a BOM — the "Unicode Text" format Excel
+ * opens directly, tabs split into columns and every accent intact (Excel
+ * ignores a UTF-8 BOM on tab-separated files served as .xls).
+ */
+export function toUtf16LeWithBom(text: string): Uint8Array {
+  const body = text.startsWith(UTF8_BOM) ? text.slice(1) : text;
+  const out = new Uint8Array(2 + body.length * 2);
+  out[0] = 0xff;
+  out[1] = 0xfe;
+  for (let i = 0; i < body.length; i += 1) {
+    const code = body.charCodeAt(i);
+    out[2 + i * 2] = code & 0xff;
+    out[3 + i * 2] = code >> 8;
+  }
+  return out;
+}

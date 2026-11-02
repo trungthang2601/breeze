@@ -17,7 +17,7 @@
 
 import { getEmailService } from './email';
 import { renderLayout, renderButton, renderParagraph, escapeHtml } from './emailLayout';
-import { rowsToCsv } from '@breeze/shared';
+import { rowsToCsv, withUtf8Bom } from '@breeze/shared';
 import type { PostureSummary, ExecutiveSummary } from '@breeze/shared';
 import { buildReportPdf, type ReportBranding } from '@breeze/shared/reportPdf';
 import type { ReportResult } from './reportGenerationService';
@@ -130,7 +130,8 @@ export async function emailReportRun(opts: {
       console.error('[ReportScheduleWorker] PDF render failed; sending link-only email:', err);
     }
   } else if (opts.rows.length > 0) {
-    const csv = rowsToCsv(opts.rows);
+    // BOM: Excel otherwise opens the attachment as ANSI and garbles Vietnamese.
+    const csv = withUtf8Bom(rowsToCsv(opts.rows));
     const content = Buffer.from(csv, 'utf8');
     if (content.byteLength <= MAX_ATTACHMENT_BYTES) {
       attachments.push({ filename: `${opts.reportType}-report-${dateStr}.csv`, content, contentType: 'text/csv' });
