@@ -1099,6 +1099,7 @@
     "coresThreads": "Núcleos / threads",
     "ramTotal": "RAM total",
     "ramModules": "Módulos de RAM",
+    "ramSerials": "Números de série da RAM",
     "diskTotal": "Disco total",
     "motherboard": "Placa-mãe",
     "biosVersion": "Versão do BIOS",

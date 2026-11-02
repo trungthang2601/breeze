@@ -729,6 +729,7 @@
           "last_seen": "Zuletzt gesehen",
           "memory": "RAM (MB)",
           "ram_modules": "RAM-Module",
+          "ram_serials": "RAM-Seriennummern",
           "os": "Betriebssystem",
           "owner": "Besitzer",
           "patch_level": "Agent-Version",

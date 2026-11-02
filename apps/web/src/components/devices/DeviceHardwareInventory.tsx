@@ -290,6 +290,7 @@ export default function DeviceHardwareInventory({
                     formatModuleSize(m.capacityMb),
                     m.speedMhz ? `${m.speedMhz} MHz` : null,
                     [m.manufacturer, m.partNumber].filter(Boolean).join(" ") || null,
+                    m.serialNumber ? `SN ${m.serialNumber}` : null,
                   ]
                     .filter(Boolean)
                     .join(" · ")}

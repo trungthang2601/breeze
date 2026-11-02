@@ -3,7 +3,7 @@ import autoTable, { type CellHookData } from 'jspdf-autotable';
 import type { PostureControls, PostureProduct, PostureSummary } from '../types/postureReport';
 import type { ExecutiveSummary } from '../types/executiveSummaryReport';
 import type { HardwareLifecycleSummary } from '../types/hardwareLifecycleReport';
-import { summarizeMemoryModules } from '../utils/memoryModules';
+import { normalizeMemoryModules, summarizeMemoryModules } from '../utils/memoryModules';
 import { renderHardwareLifecycleReport } from './hardwareLifecyclePdf';
 import type { ThreatDetectionSummary } from '../types/threatDetectionReport';
 import type { IdentityAccessSummary } from '../types/identityAccessReport';
@@ -1949,7 +1949,8 @@ export function pdfSafeText(value: string): string {
     .replace(/[\u2010-\u2013\u2015]/g, '-')
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201c\u201d]/g, '"')
-    .replace(/[^\x20-\x7e\u2014]/g, '');
+    // \n survives so a cell can hold several lines (RAM sticks + serials).
+    .replace(/[^\n\x20-\x7e\u2014]/g, '');
 }
 
 const textOrNull = (v: unknown): string | null =>
@@ -1992,10 +1993,21 @@ export function shortGpuLabel(gpuModel: unknown): string {
     .join(', ') || '—';
 }
 
-/** "2 x 8 GB @ 3200 MHz" when the agent reported sticks, else the total ("16 GB"). */
+/**
+ * One line per stick group ("1 x 8 GB (2666 MHz)" / "1 x 8 GB (3200 MHz)")
+ * plus an "SN: ..." line with the module serials when the agent reported
+ * sticks; else the total ("16 GB").
+ */
 export function ramLabel(memoryModules: unknown, ramTotalMb: unknown): string {
   const sticks = summarizeMemoryModules(memoryModules);
-  if (sticks) return sticks;
+  if (sticks) {
+    const serials = normalizeMemoryModules(memoryModules)
+      .map((m) => m.serialNumber)
+      .filter((sn): sn is string => Boolean(sn));
+    const lines = sticks.split(', ');
+    if (serials.length) lines.push(`SN: ${serials.join(', ')}`);
+    return lines.join('\n');
+  }
   const total = num(ramTotalMb);
   return total === null ? '—' : `${Math.round(total / 1024)} GB`;
 }

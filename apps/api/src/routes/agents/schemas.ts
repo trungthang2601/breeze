@@ -39,7 +39,8 @@ const memoryModuleSchema = z.object({
   capacityMb: z.number().int().nonnegative().max(16 * 1024 * 1024),
   speedMhz: z.number().int().nonnegative().max(100000).optional(),
   manufacturer: z.string().max(128).optional(),
-  partNumber: z.string().max(128).optional()
+  partNumber: z.string().max(128).optional(),
+  serialNumber: z.string().max(128).optional()
 });
 const memoryModulesSchema = z.array(memoryModuleSchema).max(32);
 

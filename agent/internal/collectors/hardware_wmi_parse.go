@@ -64,6 +64,7 @@ type wmiMemoryModule struct {
 	Speed        float64 `json:"Speed"`
 	Manufacturer string  `json:"Manufacturer"`
 	PartNumber   string  `json:"PartNumber"`
+	SerialNumber string  `json:"SerialNumber"`
 }
 
 // memoryModuleList tolerates the same PowerShell 5.1 array-collapse as
@@ -110,6 +111,7 @@ func toMemoryModules(rows []wmiMemoryModule) []MemoryModule {
 			CapacityMB:   uint64(r.Capacity) / (1024 * 1024),
 			Manufacturer: cleanMemoryVendorValue(r.Manufacturer),
 			PartNumber:   cleanMemoryVendorValue(r.PartNumber),
+			SerialNumber: cleanMemoryVendorValue(r.SerialNumber),
 		}
 		if mod.CapacityMB == 0 {
 			continue
@@ -133,7 +135,7 @@ func toMemoryModules(rows []wmiMemoryModule) []MemoryModule {
 func cleanMemoryVendorValue(value string) string {
 	value = cleanHardwareIdentityValue(value)
 	switch strings.ToLower(value) {
-	case "undefined", "0000", "00000000", "manufacturer00", "modulepartnumber00", "partnum0":
+	case "undefined", "0000", "00000000", "ffffffff", "manufacturer00", "modulepartnumber00", "partnum0", "serialnum0", "sernum0":
 		return ""
 	}
 	return truncateCollectorString(value)

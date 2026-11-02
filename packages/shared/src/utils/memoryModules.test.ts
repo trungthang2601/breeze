@@ -1,26 +1,30 @@
 import { describe, expect, it } from 'vitest';
-import { formatModuleSize, normalizeMemoryModules, summarizeMemoryModules } from './memoryModules';
+import { formatModuleSize, memoryModuleSerials, normalizeMemoryModules, summarizeMemoryModules } from './memoryModules';
 
 describe('memoryModules', () => {
-  it('summarizes matched pairs with their speed', () => {
+  it('groups a matched pair with its speed', () => {
     expect(summarizeMemoryModules([
       { slot: 'DIMM1', capacityMb: 8192, speedMhz: 3200, manufacturer: 'Kingston' },
       { slot: 'DIMM2', capacityMb: 8192, speedMhz: 3200, manufacturer: 'Kingston' },
-    ])).toBe('2 x 8 GB @ 3200 MHz');
+    ])).toBe('2 x 8 GB (3200 MHz)');
   });
 
   it('summarizes a single stick', () => {
-    expect(summarizeMemoryModules([{ capacityMb: 16384, speedMhz: 3200 }])).toBe('1 x 16 GB @ 3200 MHz');
+    expect(summarizeMemoryModules([{ capacityMb: 16384, speedMhz: 3200 }])).toBe('1 x 16 GB (3200 MHz)');
   });
 
-  it('lists mixed sizes largest first and drops a speed that differs', () => {
+  it('keeps sticks of the same size but different bus apart, slower first', () => {
     expect(summarizeMemoryModules([
-      { capacityMb: 4096, speedMhz: 2400 },
+      { capacityMb: 8192, speedMhz: 3200 },
       { capacityMb: 8192, speedMhz: 2666 },
-    ])).toBe('1 x 8 GB + 1 x 4 GB');
+    ])).toBe('1 x 8 GB (2666 MHz), 1 x 8 GB (3200 MHz)');
   });
 
-  it('omits an unknown speed', () => {
+  it('lists mixed sizes largest first and omits an unknown speed', () => {
+    expect(summarizeMemoryModules([
+      { capacityMb: 4096, speedMhz: 0 },
+      { capacityMb: 16384, speedMhz: 3200 },
+    ])).toBe('1 x 16 GB (3200 MHz), 1 x 4 GB');
     expect(summarizeMemoryModules([{ capacityMb: 8192 }, { capacityMb: 8192, speedMhz: 0 }])).toBe('2 x 8 GB');
   });
 
@@ -31,9 +35,19 @@ describe('memoryModules', () => {
     expect(summarizeMemoryModules([{ capacityMb: 0 }, { slot: 'x' }])).toBeNull();
   });
 
+  it('lists module serials in slot order', () => {
+    expect(memoryModuleSerials([
+      { slot: 'DIMM1', capacityMb: 8192, serialNumber: '1A2B3C4D' },
+      { slot: 'DIMM2', capacityMb: 8192, serialNumber: '5E6F7A8B' },
+    ])).toBe('DIMM1: 1A2B3C4D, DIMM2: 5E6F7A8B');
+    expect(memoryModuleSerials([{ capacityMb: 8192, serialNumber: 'ABC' }, { capacityMb: 8192 }])).toBe('ABC');
+    expect(memoryModuleSerials([{ capacityMb: 8192 }])).toBeNull();
+    expect(memoryModuleSerials(null)).toBeNull();
+  });
+
   it('normalizes untrusted jsonb', () => {
     expect(normalizeMemoryModules([{ capacityMb: 8192, slot: ' DIMM1 ', speedMhz: -1, manufacturer: '' }, 'junk', null]))
-      .toEqual([{ slot: 'DIMM1', capacityMb: 8192, speedMhz: null, manufacturer: null, partNumber: null }]);
+      .toEqual([{ slot: 'DIMM1', capacityMb: 8192, speedMhz: null, manufacturer: null, partNumber: null, serialNumber: null }]);
   });
 
   it('formats sizes', () => {

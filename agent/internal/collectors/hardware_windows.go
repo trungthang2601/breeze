@@ -116,6 +116,7 @@ $mem   = @(@(Get-WmiSafe 'Win32_PhysicalMemory') |
       Speed        = $speed
       Manufacturer = ([string]$_.Manufacturer).Trim()
       PartNumber   = ([string]$_.PartNumber).Trim()
+      SerialNumber = ([string]$_.SerialNumber).Trim()
     }
   })
 [PSCustomObject]@{

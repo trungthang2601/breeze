@@ -92,7 +92,12 @@ describe('device inventory GPU and RAM columns', () => {
     expect(pdfSafeText('—')).toBe('—');
     expect(shortGpuLabel('Intel(R) UHD Graphics 770; NVIDIA GeForce RTX 3050')).toBe('Intel UHD Graphics 770, NVIDIA GeForce RTX 3050');
     expect(shortGpuLabel(null)).toBe('—');
-    expect(ramLabel([{ capacityMb: 8192, speedMhz: 3200 }, { capacityMb: 8192, speedMhz: 3200 }], 16224)).toBe('2 x 8 GB @ 3200 MHz');
+    expect(ramLabel([{ capacityMb: 8192, speedMhz: 3200 }, { capacityMb: 8192, speedMhz: 3200 }], 16224)).toBe('2 x 8 GB (3200 MHz)');
+    expect(ramLabel([
+      { slot: 'DIMM1', capacityMb: 8192, speedMhz: 2666, serialNumber: '1A2B3C4D' },
+      { slot: 'DIMM2', capacityMb: 8192, speedMhz: 3200, serialNumber: '5E6F7A8B' },
+    ], 16224)).toBe('1 x 8 GB (2666 MHz)\n1 x 8 GB (3200 MHz)\nSN: 1A2B3C4D, 5E6F7A8B');
+    expect(pdfSafeText('a\nb')).toBe('a\nb');
     expect(ramLabel(null, 16224)).toBe('16 GB');
     expect(ramLabel(undefined, null)).toBe('—');
   });

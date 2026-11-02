@@ -324,19 +324,19 @@ func TestParseHardwareJSONMemoryModules(t *testing.T) {
 
 func TestToMemoryModules(t *testing.T) {
 	got := toMemoryModules([]wmiMemoryModule{
-		{Slot: " DIMM1 ", Capacity: 8589934592, Speed: 3200, Manufacturer: "Kingston", PartNumber: " KF432C16BB/8  "},
+		{Slot: " DIMM1 ", Capacity: 8589934592, Speed: 3200, Manufacturer: "Kingston", PartNumber: " KF432C16BB/8  ", SerialNumber: " 1A2B3C4D "},
 		{Slot: "DIMM2", Capacity: 0},
-		{Slot: "DIMM3", Capacity: 4294967296, Speed: 0, Manufacturer: "Unknown", PartNumber: "Undefined"},
+		{Slot: "DIMM3", Capacity: 4294967296, Speed: 0, Manufacturer: "Unknown", PartNumber: "Undefined", SerialNumber: "00000000"},
 	})
 	if len(got) != 2 {
 		t.Fatalf("len = %d, want 2 (empty slot dropped): %+v", len(got), got)
 	}
 	first := got[0]
-	if first.Slot != "DIMM1" || first.CapacityMB != 8192 || first.SpeedMHz != 3200 || first.Manufacturer != "Kingston" || first.PartNumber != "KF432C16BB/8" {
+	if first.Slot != "DIMM1" || first.CapacityMB != 8192 || first.SpeedMHz != 3200 || first.Manufacturer != "Kingston" || first.PartNumber != "KF432C16BB/8" || first.SerialNumber != "1A2B3C4D" {
 		t.Errorf("first = %+v", first)
 	}
 	second := got[1]
-	if second.CapacityMB != 4096 || second.SpeedMHz != 0 || second.Manufacturer != "" || second.PartNumber != "" {
+	if second.CapacityMB != 4096 || second.SpeedMHz != 0 || second.Manufacturer != "" || second.PartNumber != "" || second.SerialNumber != "" {
 		t.Errorf("second = %+v (placeholders and unknown speed should be blank)", second)
 	}
 	if toMemoryModules(nil) != nil {

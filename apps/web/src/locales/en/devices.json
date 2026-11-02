@@ -1099,6 +1099,7 @@
     "coresThreads": "Cores / Threads",
     "ramTotal": "RAM Total",
     "ramModules": "RAM Modules",
+    "ramSerials": "RAM Serials",
     "diskTotal": "Disk Total",
     "motherboard": "Motherboard",
     "biosVersion": "BIOS Version",

@@ -729,6 +729,7 @@
           "last_seen": "Son görülme",
           "memory": "RAM (MB)",
           "ram_modules": "RAM modülleri",
+          "ram_serials": "RAM seri numaraları",
           "os": "İşletim Sistemi",
           "owner": "Sahip",
           "patch_level": "Agent sürümü",

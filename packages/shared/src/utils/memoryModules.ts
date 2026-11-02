@@ -13,6 +13,8 @@ export type MemoryModule = {
   speedMhz?: number | null;
   manufacturer?: string | null;
   partNumber?: string | null;
+  /** Module serial from SPD; null when the vendor leaves it blank/zeroed. */
+  serialNumber?: string | null;
 };
 
 const asText = (v: unknown): string | null =>
@@ -40,6 +42,7 @@ export function normalizeMemoryModules(value: unknown): MemoryModule[] {
       speedMhz: asPositiveNumber(rec.speedMhz),
       manufacturer: asText(rec.manufacturer),
       partNumber: asText(rec.partNumber),
+      serialNumber: asText(rec.serialNumber),
     });
   }
   return out;
@@ -53,23 +56,38 @@ export function formatModuleSize(capacityMb: number): string {
 }
 
 /**
- * One-line summary: "2 x 8 GB @ 3200 MHz", "1 x 16 GB",
- * "1 x 8 GB + 1 x 4 GB @ 2666 MHz". Largest modules first; the speed is shown
- * only when every module reports the same one. Returns null when there is
+ * One-line summary, one group per (size, speed):
+ *   "2 x 8 GB (3200 MHz)"                     matched pair
+ *   "1 x 8 GB (2666 MHz), 1 x 8 GB (3200 MHz)" same size, different bus
+ *   "1 x 16 GB (3200 MHz), 1 x 8 GB"           mixed, one speed unknown
+ * Largest modules first, then slower first. Returns null when there is
  * nothing to describe (older agents, non-Windows hosts, WMI failure).
  */
 export function summarizeMemoryModules(value: unknown): string | null {
   const modules = normalizeMemoryModules(value);
   if (modules.length === 0) return null;
 
-  const counts = new Map<number, number>();
-  for (const m of modules) counts.set(m.capacityMb, (counts.get(m.capacityMb) ?? 0) + 1);
-  const sizes = [...counts.entries()]
-    .sort(([a], [b]) => b - a)
-    .map(([capacityMb, count]) => `${count} x ${formatModuleSize(capacityMb)}`)
-    .join(' + ');
+  const groups = new Map<string, { capacityMb: number; speed: number; count: number }>();
+  for (const m of modules) {
+    const speed = m.speedMhz ?? 0;
+    const key = `${m.capacityMb}:${speed}`;
+    const g = groups.get(key);
+    if (g) g.count += 1;
+    else groups.set(key, { capacityMb: m.capacityMb, speed, count: 1 });
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.capacityMb - a.capacityMb || a.speed - b.speed)
+    .map((g) => `${g.count} x ${formatModuleSize(g.capacityMb)}${g.speed > 0 ? ` (${g.speed} MHz)` : ''}`)
+    .join(', ');
+}
 
-  const speeds = new Set(modules.map((m) => m.speedMhz ?? 0));
-  const speed = speeds.size === 1 ? [...speeds][0]! : 0;
-  return speed > 0 ? `${sizes} @ ${speed} MHz` : sizes;
+/**
+ * Module serials in slot order, "DIMM1: 1A2B3C4D, DIMM2: 5E6F7A8B" (slot
+ * label omitted when unknown). Null when no module reported a serial.
+ */
+export function memoryModuleSerials(value: unknown): string | null {
+  const parts = normalizeMemoryModules(value)
+    .filter((m) => m.serialNumber)
+    .map((m) => (m.slot ? `${m.slot}: ${m.serialNumber}` : `${m.serialNumber}`));
+  return parts.length ? parts.join(', ') : null;
 }

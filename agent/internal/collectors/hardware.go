@@ -40,6 +40,7 @@ type MemoryModule struct {
 	SpeedMHz     uint32 `json:"speedMhz,omitempty"`
 	Manufacturer string `json:"manufacturer,omitempty"`
 	PartNumber   string `json:"partNumber,omitempty"`
+	SerialNumber string `json:"serialNumber,omitempty"`
 }
 
 type SystemInfo struct {
