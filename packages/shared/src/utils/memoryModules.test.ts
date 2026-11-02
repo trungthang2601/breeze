@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatModuleSize, memoryModuleSerials, normalizeMemoryModules, summarizeMemoryModules } from './memoryModules';
+import { formatModuleSize, memoryModuleLines, memoryModuleSerials, normalizeMemoryModules, summarizeMemoryModules } from './memoryModules';
 
 describe('memoryModules', () => {
   it('groups a matched pair with its speed', () => {
@@ -43,6 +43,22 @@ describe('memoryModules', () => {
     expect(memoryModuleSerials([{ capacityMb: 8192, serialNumber: 'ABC' }, { capacityMb: 8192 }])).toBe('ABC');
     expect(memoryModuleSerials([{ capacityMb: 8192 }])).toBeNull();
     expect(memoryModuleSerials(null)).toBeNull();
+  });
+
+  it('writes each serial next to its own stick', () => {
+    expect(memoryModuleLines([
+      { slot: 'DIMM1', capacityMb: 8192, speedMhz: 2666, serialNumber: '1A2B3C4D' },
+      { slot: 'DIMM2', capacityMb: 8192, speedMhz: 3200, serialNumber: '5E6F7A8B' },
+      { slot: 'DIMM3', capacityMb: 8192, speedMhz: 3200 },
+    ])).toEqual([
+      '1 x 8 GB (2666 MHz) - SN: 1A2B3C4D',
+      '1 x 8 GB (3200 MHz) - SN: 5E6F7A8B',
+      '1 x 8 GB (3200 MHz)',
+    ]);
+    // No serials at all: grouped like the summary.
+    expect(memoryModuleLines([{ capacityMb: 8192, speedMhz: 3200 }, { capacityMb: 8192, speedMhz: 3200 }]))
+      .toEqual(['2 x 8 GB (3200 MHz)']);
+    expect(memoryModuleLines(null)).toEqual([]);
   });
 
   it('normalizes untrusted jsonb', () => {

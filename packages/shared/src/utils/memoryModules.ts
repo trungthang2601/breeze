@@ -82,6 +82,26 @@ export function summarizeMemoryModules(value: unknown): string | null {
 }
 
 /**
+ * RAM described line by line, the serial written right next to its stick:
+ *   ["1 x 8 GB (2666 MHz) - SN: 1A2B3C4D", "1 x 8 GB (3200 MHz) - SN: 5E6F7A8B"]
+ * When no stick reported a serial the matching sticks are grouped instead
+ * ("2 x 8 GB (3200 MHz)"), same as summarizeMemoryModules. Empty when the
+ * agent sent nothing.
+ */
+export function memoryModuleLines(value: unknown): string[] {
+  const modules = normalizeMemoryModules(value);
+  if (modules.length === 0) return [];
+  if (!modules.some((m) => m.serialNumber)) {
+    return (summarizeMemoryModules(modules) ?? '').split(', ').filter(Boolean);
+  }
+  return modules.map((m) => {
+    const speed = m.speedMhz ? ` (${m.speedMhz} MHz)` : '';
+    const sn = m.serialNumber ? ` - SN: ${m.serialNumber}` : '';
+    return `1 x ${formatModuleSize(m.capacityMb)}${speed}${sn}`;
+  });
+}
+
+/**
  * Module serials in slot order, "DIMM1: 1A2B3C4D, DIMM2: 5E6F7A8B" (slot
  * label omitted when unknown). Null when no module reported a serial.
  */

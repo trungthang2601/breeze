@@ -30,7 +30,7 @@ import { useOrgStore } from '../../stores/orgStore';
 import { runAction, ActionError } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import type { FilterConditionGroup } from '@breeze/shared';
-import { memoryModuleSerials, summarizeMemoryModules } from '@breeze/shared';
+import { memoryModuleLines, memoryModuleSerials } from '@breeze/shared';
 import { FilterBuilder, DEFAULT_FILTER_FIELDS } from '../filters/FilterBuilder';
 import { FilterPreview } from '../filters/FilterPreview';
 import { useFilterPreview } from '../../hooks/useFilterPreview';
@@ -596,7 +596,7 @@ const normalizePreviewRow = (type: BuilderReportType, row: PreviewRow): PreviewR
       .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
       .join(' ');
     normalized.motherboard = row.motherboard ?? (board || null);
-    normalized.ram_modules = row.ram_modules ?? summarizeMemoryModules(row.memoryModules);
+    normalized.ram_modules = row.ram_modules ?? (memoryModuleLines(row.memoryModules).join(', ') || null);
     normalized.ram_serials = row.ram_serials ?? memoryModuleSerials(row.memoryModules);
     normalized.serial = row.serial ?? row.serialNumber ?? null;
     normalized.last_seen = row.last_seen ?? row.lastSeenAt ?? null;

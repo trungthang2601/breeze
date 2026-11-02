@@ -3,7 +3,7 @@ import autoTable, { type CellHookData } from 'jspdf-autotable';
 import type { PostureControls, PostureProduct, PostureSummary } from '../types/postureReport';
 import type { ExecutiveSummary } from '../types/executiveSummaryReport';
 import type { HardwareLifecycleSummary } from '../types/hardwareLifecycleReport';
-import { normalizeMemoryModules, summarizeMemoryModules } from '../utils/memoryModules';
+import { memoryModuleLines } from '../utils/memoryModules';
 import { renderHardwareLifecycleReport } from './hardwareLifecyclePdf';
 import type { ThreatDetectionSummary } from '../types/threatDetectionReport';
 import type { IdentityAccessSummary } from '../types/identityAccessReport';
@@ -1994,20 +1994,13 @@ export function shortGpuLabel(gpuModel: unknown): string {
 }
 
 /**
- * One line per stick group ("1 x 8 GB (2666 MHz)" / "1 x 8 GB (3200 MHz)")
- * plus an "SN: ..." line with the module serials when the agent reported
- * sticks; else the total ("16 GB").
+ * One line per stick with its serial beside it
+ * ("1 x 8 GB (2666 MHz) - SN: 1A2B3C4D"), grouped per size/speed when no
+ * serials were reported; else the total ("16 GB").
  */
 export function ramLabel(memoryModules: unknown, ramTotalMb: unknown): string {
-  const sticks = summarizeMemoryModules(memoryModules);
-  if (sticks) {
-    const serials = normalizeMemoryModules(memoryModules)
-      .map((m) => m.serialNumber)
-      .filter((sn): sn is string => Boolean(sn));
-    const lines = sticks.split(', ');
-    if (serials.length) lines.push(`SN: ${serials.join(', ')}`);
-    return lines.join('\n');
-  }
+  const lines = memoryModuleLines(memoryModules);
+  if (lines.length) return lines.join('\n');
   const total = num(ramTotalMb);
   return total === null ? '—' : `${Math.round(total / 1024)} GB`;
 }
@@ -2048,15 +2041,16 @@ export function groupDeviceInventoryBySite(rows: Record<string, unknown>[]): Dev
 
 // Widths sum to the 269 mm printable width of an A4 landscape page.
 const DEVICE_INVENTORY_COLUMNS: { header: string; width: number; align?: 'right' }[] = [
-  { header: 'Hostname', width: 30 },
-  { header: 'Status', width: 15 },
-  { header: 'OS', width: 31 },
-  { header: 'CPU', width: 36 },
-  { header: 'GPU', width: 38 },
-  { header: 'RAM', width: 38 },
-  { header: 'Disk (GB)', width: 13, align: 'right' },
-  { header: 'Serial', width: 33 },
-  { header: 'Last seen', width: 35 },
+  { header: 'Hostname', width: 28 },
+  { header: 'Status', width: 14 },
+  { header: 'OS', width: 30 },
+  { header: 'CPU', width: 30 },
+  { header: 'GPU', width: 39 },
+  // Wide enough for "1 x 16 GB (3200 MHz) - SN: 1A2B3C4D" on one line.
+  { header: 'RAM', width: 50 },
+  { header: 'Disk (GB)', width: 12, align: 'right' },
+  { header: 'Serial', width: 34 },
+  { header: 'Last seen', width: 32 },
 ];
 
 function deviceInventoryCells(row: Record<string, unknown>, timezone: string): string[] {
@@ -2151,6 +2145,7 @@ function renderDeviceInventoryReport(doc: jsPDF, rows: Record<string, unknown>[]
         DEVICE_INVENTORY_COLUMNS.map((c) => c.header),
       ],
       body: group.rows.map((r) => deviceInventoryCells(r, opts.timezone)),
+      styles: { ...tableBase.styles, fontSize: 7.5 },
       columnStyles: Object.fromEntries(DEVICE_INVENTORY_COLUMNS.map((c, i) => [
         i,
         { cellWidth: c.width, ...(c.align ? { halign: c.align } : {}) },
