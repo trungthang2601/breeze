@@ -1099,6 +1099,7 @@
     "coresThreads": "Cœurs / Fils de fil",
     "ramTotal": "RAM totale",
     "ramModules": "Modules RAM",
+    "physicalDisks": "Disques physiques",
     "ramSerials": "Numéros de série RAM",
     "diskTotal": "Total du disque",
     "motherboard": "Carte mère",

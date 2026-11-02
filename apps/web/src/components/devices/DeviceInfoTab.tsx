@@ -37,7 +37,7 @@ import {
   getDeviceRoleSourceColor,
 } from "@/lib/deviceRoles";
 import DeviceFunctionField from "./DeviceFunctionField";
-import { memoryModuleLines } from "@breeze/shared";
+import { memoryModuleLines, physicalDiskDetailLines } from "@breeze/shared";
 import { asList } from '@/lib/asList';
 import { formatDeviceDetailOsVersion } from "./osDisplay";
 import { formatNumber } from "@/lib/i18n/format";
@@ -102,6 +102,7 @@ type DeviceInfo = {
     ramTotalMb?: number | null;
     diskTotalGb?: number | null;
     memoryModules?: unknown;
+    physicalDisks?: unknown;
     motherboardManufacturer?: string | null;
     motherboardProduct?: string | null;
     motherboardVersion?: string | null;
@@ -914,6 +915,10 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         <InfoRow
           label={t("deviceInfoTab.diskTotal")}
           value={formatDisk(hw?.diskTotalGb)}
+        />
+        <InfoRow
+          label={t("deviceInfoTab.physicalDisks")}
+          value={physicalDiskDetailLines(hw?.physicalDisks).join(", ") || "—"}
         />
         <GpuInfoRow value={hw?.gpuModel} />
         <InfoRow

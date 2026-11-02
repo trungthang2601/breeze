@@ -112,3 +112,18 @@ describe('device inventory GPU and RAM columns', () => {
     expect(text).toContain('GPU');
   });
 });
+
+describe('device inventory disk column', () => {
+  it('lists each drive with its serial, else the total', async () => {
+    const { diskLabel, cpuGpuLabel } = await import('./reportPdf');
+    expect(diskLabel([
+      { model: 'Samsung SSD 980 500GB', sizeGb: 500, mediaType: 'SSD', serialNumber: 'S4EWNX0R123456' },
+      { model: 'ST1000DM010', sizeGb: 1000, mediaType: 'HDD', serialNumber: 'ZN1ABCDE' },
+    ], 1465)).toBe('SSD 500 GB - SN: S4EWNX0R123456\nHDD 1 TB - SN: ZN1ABCDE');
+    expect(diskLabel(null, 238)).toBe('238 GB');
+    expect(diskLabel(null, null)).toBe('—');
+    expect(cpuGpuLabel('Intel(R) Core(TM) i5-10400 CPU @ 2.90GHz', 'NVIDIA GeForce GTX 1050 Ti'))
+      .toBe('Intel Core i5-10400\nNVIDIA GeForce GTX 1050 Ti');
+    expect(cpuGpuLabel('Intel(R) Core(TM) i5-10400 CPU @ 2.90GHz', null)).toBe('Intel Core i5-10400');
+  });
+});

@@ -4,6 +4,7 @@ import type { PostureControls, PostureProduct, PostureSummary } from '../types/p
 import type { ExecutiveSummary } from '../types/executiveSummaryReport';
 import type { HardwareLifecycleSummary } from '../types/hardwareLifecycleReport';
 import { memoryModuleLines } from '../utils/memoryModules';
+import { physicalDiskLines } from '../utils/physicalDisks';
 import { renderHardwareLifecycleReport } from './hardwareLifecyclePdf';
 import type { ThreatDetectionSummary } from '../types/threatDetectionReport';
 import type { IdentityAccessSummary } from '../types/identityAccessReport';
@@ -2005,6 +2006,24 @@ export function ramLabel(memoryModules: unknown, ramTotalMb: unknown): string {
   return total === null ? '—' : `${Math.round(total / 1024)} GB`;
 }
 
+/**
+ * One line per internal drive with its serial beside it
+ * ("SSD 500 GB - SN: S4EWNX0R123456"); else the total ("238 GB").
+ */
+export function diskLabel(physicalDisks: unknown, diskTotalGb: unknown): string {
+  const lines = physicalDiskLines(physicalDisks);
+  if (lines.length) return lines.join('\n');
+  const total = num(diskTotalGb);
+  return total === null ? '—' : `${Math.round(total)} GB`;
+}
+
+/** CPU on the first line, GPU(s) under it — one column instead of two. */
+export function cpuGpuLabel(cpuModel: unknown, gpuModel: unknown): string {
+  const gpu = shortGpuLabel(gpuModel);
+  const cpu = shortCpuLabel(cpuModel);
+  return gpu === '—' ? cpu : `${cpu}\n${gpu}`;
+}
+
 const UNASSIGNED_SITE = 'No site';
 
 export type DeviceInventorySiteGroup = {
@@ -2041,28 +2060,26 @@ export function groupDeviceInventoryBySite(rows: Record<string, unknown>[]): Dev
 
 // Widths sum to the 269 mm printable width of an A4 landscape page.
 const DEVICE_INVENTORY_COLUMNS: { header: string; width: number; align?: 'right' }[] = [
-  { header: 'Hostname', width: 28 },
+  { header: 'Hostname', width: 25 },
   { header: 'Status', width: 14 },
   { header: 'OS', width: 30 },
-  { header: 'CPU', width: 30 },
-  { header: 'GPU', width: 39 },
+  // CPU on top, GPU underneath, to leave room for the RAM and disk serials.
+  { header: 'CPU / GPU', width: 39 },
   // Wide enough for "1 x 16 GB (3200 MHz) - SN: 1A2B3C4D" on one line.
   { header: 'RAM', width: 50 },
-  { header: 'Disk (GB)', width: 12, align: 'right' },
-  { header: 'Serial', width: 34 },
+  { header: 'Disks', width: 53 },
+  { header: 'Serial', width: 26 },
   { header: 'Last seen', width: 32 },
 ];
 
 function deviceInventoryCells(row: Record<string, unknown>, timezone: string): string[] {
-  const diskGb = num(row.diskTotalGb);
   return [
     pdfSafeText(textOrNull(row.hostname) ?? textOrNull(row.displayName) ?? '—'),
     pdfSafeText(textOrNull(row.status) ?? '—'),
     pdfSafeText(shortOsLabel(row.osType, row.osVersion)),
-    pdfSafeText(shortCpuLabel(row.cpuModel)),
-    pdfSafeText(shortGpuLabel(row.gpuModel)),
+    pdfSafeText(cpuGpuLabel(row.cpuModel, row.gpuModel)),
     pdfSafeText(ramLabel(row.memoryModules, row.ramTotalMb)),
-    diskGb === null ? '—' : String(Math.round(diskGb)),
+    pdfSafeText(diskLabel(row.physicalDisks, row.diskTotalGb)),
     pdfSafeText(textOrNull(row.serialNumber) ?? '—'),
     formatGenericCell(row.lastSeenAt, timezone),
   ];

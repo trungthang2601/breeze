@@ -31,6 +31,18 @@ type HardwareInfo struct {
 	// Omitted when unknown so the server keeps the last good list instead of
 	// overwriting it with an empty one after a transient WMI failure.
 	MemoryModules []MemoryModule `json:"memoryModules,omitempty"`
+	// PhysicalDisks lists the internal drives (Windows Win32_DiskDrive, USB
+	// excluded). Omitted when unknown, same as MemoryModules.
+	PhysicalDisks []PhysicalDisk `json:"physicalDisks,omitempty"`
+}
+
+// PhysicalDisk is one internal drive (SSD/HDD/NVMe), not a partition/volume.
+type PhysicalDisk struct {
+	Model        string `json:"model,omitempty"`
+	SizeGB       uint64 `json:"sizeGb"`
+	MediaType    string `json:"mediaType,omitempty"` // "SSD", "HDD" or ""
+	BusType      string `json:"busType,omitempty"`   // "NVMe", "SATA", ...
+	SerialNumber string `json:"serialNumber,omitempty"`
 }
 
 // MemoryModule is one installed RAM stick (DIMM/SO-DIMM).

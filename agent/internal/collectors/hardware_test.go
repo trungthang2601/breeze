@@ -343,3 +343,50 @@ func TestToMemoryModules(t *testing.T) {
 		t.Errorf("no rows should yield nil so the JSON field is omitted")
 	}
 }
+
+func TestParseHardwareJSONPhysicalDisks(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{name: "two drives", input: `{"PhysicalDisks":[{"Model":"Samsung SSD 980 500GB","Size":500107862016,"MediaType":"SSD","BusType":"NVMe","SerialNumber":"0025_38B1_1150_8E2C."},{"Model":"ST1000DM010-2EP102","Size":1000204886016,"MediaType":"HDD","BusType":"SATA","SerialNumber":"  ZN1ABCDE"}]}`, want: 2},
+		{name: "one drive collapsed to an object", input: `{"PhysicalDisks":{"Model":"KINGSTON SA400S37240G","Size":240057409536,"SerialNumber":"50026B7782A1B2C3"}}`, want: 1},
+		{name: "null", input: `{"PhysicalDisks":null}`, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseHardwareJSON([]byte(tt.input))
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			if len(got.PhysicalDisks) != tt.want {
+				t.Fatalf("PhysicalDisks len = %d, want %d", len(got.PhysicalDisks), tt.want)
+			}
+		})
+	}
+}
+
+func TestToPhysicalDisks(t *testing.T) {
+	got := toPhysicalDisks([]wmiPhysicalDisk{
+		{Model: "Samsung SSD 980 500GB", Size: 500107862016, MediaType: "SSD", BusType: "NVMe", SerialNumber: "0025_38B1_1150_8E2C."},
+		{Model: "ST1000DM010-2EP102", Size: 1000204886016, MediaType: "HDD", BusType: "SATA", SerialNumber: "  ZN1ABCDE  "},
+		{Model: "Virtual", Size: 0},
+		{Model: "Generic", Size: 256060514304, SerialNumber: "00000000"},
+	})
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3 (%+v)", len(got), got)
+	}
+	if got[0].SizeGB != 500 || got[0].SerialNumber != "0025_38B1_1150_8E2C" || got[0].MediaType != "SSD" {
+		t.Fatalf("nvme = %+v", got[0])
+	}
+	if got[1].SizeGB != 1000 || got[1].SerialNumber != "ZN1ABCDE" {
+		t.Fatalf("hdd = %+v", got[1])
+	}
+	if got[2].SerialNumber != "" {
+		t.Fatalf("placeholder serial kept: %+v", got[2])
+	}
+	if toPhysicalDisks(nil) != nil {
+		t.Fatal("nil rows should give nil")
+	}
+}

@@ -406,6 +406,8 @@ type DeviceInventoryRow = {
   motherboardProduct: string | null;
   /** Installed RAM sticks (jsonb); null until a RAM-aware agent reports. */
   memoryModules: unknown;
+  /** Internal drives with serials (jsonb); null until a disk-aware agent reports. */
+  physicalDisks: unknown;
   /** Branch the device is assigned to; the PDF groups devices by it. */
   siteName: string | null;
 };
@@ -431,6 +433,7 @@ export async function readDeviceInventoryRows(orgId: string, conditions: SQL[]) 
       motherboardManufacturer: deviceHardware.motherboardManufacturer,
       motherboardProduct: deviceHardware.motherboardProduct,
       memoryModules: deviceHardware.memoryModules,
+      physicalDisks: deviceHardware.physicalDisks,
       siteName: sites.name
     })
     .from(devices)
@@ -541,6 +544,7 @@ export async function generateDeviceInventoryReport(
         motherboardManufacturer: null,
         motherboardProduct: null,
         memoryModules: null,
+        physicalDisks: null,
         siteName: asset.siteName ?? null,
       });
     }

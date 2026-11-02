@@ -30,7 +30,7 @@ import { useOrgStore } from '../../stores/orgStore';
 import { runAction, ActionError } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import type { FilterConditionGroup } from '@breeze/shared';
-import { memoryModuleLines, memoryModuleSerials } from '@breeze/shared';
+import { memoryModuleLines, memoryModuleSerials, physicalDiskDetailLines } from '@breeze/shared';
 import { FilterBuilder, DEFAULT_FILTER_FIELDS } from '../filters/FilterBuilder';
 import { FilterPreview } from '../filters/FilterPreview';
 import { useFilterPreview } from '../../hooks/useFilterPreview';
@@ -502,6 +502,8 @@ const fieldDefinitionsByType: Record<BuilderReportType, FieldDefinition[]> = {
     { id: 'ram_modules', label: 'RAM modules', dataType: 'string' },
     { id: 'ram_serials', label: 'RAM serials', dataType: 'string' },
     { id: 'disk_usage', label: 'Disk (GB)', dataType: 'number' },
+    // "Samsung SSD 980 500GB (SSD 500 GB, NVMe) - SN: ..." per internal drive.
+    { id: 'disks', label: 'Disks (model + serial)', dataType: 'string' },
     { id: 'patch_level', label: 'Agent version', dataType: 'string' }
   ],
   alerts: [
@@ -598,6 +600,7 @@ const normalizePreviewRow = (type: BuilderReportType, row: PreviewRow): PreviewR
     normalized.motherboard = row.motherboard ?? (board || null);
     normalized.ram_modules = row.ram_modules ?? (memoryModuleLines(row.memoryModules).join(', ') || null);
     normalized.ram_serials = row.ram_serials ?? memoryModuleSerials(row.memoryModules);
+    normalized.disks = row.disks ?? (physicalDiskDetailLines(row.physicalDisks).join(', ') || null);
     normalized.serial = row.serial ?? row.serialNumber ?? null;
     normalized.last_seen = row.last_seen ?? row.lastSeenAt ?? null;
     normalized.memory = row.memory ?? row.ramTotalMb ?? null;

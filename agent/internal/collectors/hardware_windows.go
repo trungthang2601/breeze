@@ -75,7 +75,7 @@ func enrichOSInfo(info *SystemInfo) {
 }
 
 // collectPlatformHardware queries Win32_BIOS, Win32_BaseBoard,
-// Win32_ComputerSystem, Win32_VideoController and Win32_PhysicalMemory in a single PowerShell
+// Win32_ComputerSystem, Win32_VideoController, Win32_PhysicalMemory and Win32_DiskDrive in a single PowerShell
 // invocation (one process spawn instead of ~9) and populates hw with the
 // results. Graceful degradation: a failed or unparseable response leaves the
 // affected fields empty.
@@ -119,6 +119,35 @@ $mem   = @(@(Get-WmiSafe 'Win32_PhysicalMemory') |
       SerialNumber = ([string]$_.SerialNumber).Trim()
     }
   })
+# Physical drives. MSFT_PhysicalDisk (Win8+) gives SSD/HDD and bus type,
+# matched to Win32_DiskDrive by disk number; USB drives are skipped.
+$pd = @{}
+try {
+  @(Get-CimInstance -Namespace 'root\Microsoft\Windows\Storage' -ClassName MSFT_PhysicalDisk -ErrorAction Stop) |
+    ForEach-Object { $pd[[string]$_.DeviceId] = $_ }
+} catch {}
+$mediaNames = @{ 3 = 'HDD'; 4 = 'SSD' }
+$busNames = @{ 1 = 'SCSI'; 3 = 'ATA'; 7 = 'USB'; 8 = 'RAID'; 10 = 'SAS'; 11 = 'SATA'; 17 = 'NVMe' }
+$disks = @(@(Get-WmiSafe 'Win32_DiskDrive') |
+  Where-Object { $_ -and $_.Size -and $_.InterfaceType -ne 'USB' -and ([string]$_.MediaType) -notmatch 'Removable|External' } |
+  ForEach-Object {
+    $m = $pd[[string]$_.Index]
+    $media = ''; $bus = ''
+    if ($m) {
+      if ($mediaNames.ContainsKey([int]$m.MediaType)) { $media = $mediaNames[[int]$m.MediaType] }
+      if ($busNames.ContainsKey([int]$m.BusType)) { $bus = $busNames[[int]$m.BusType] }
+    }
+    if ($bus -eq 'USB') { return }
+    $sn = ([string]$_.SerialNumber).Trim()
+    if ($m -and ([string]$m.SerialNumber).Trim()) { $sn = ([string]$m.SerialNumber).Trim() }
+    [PSCustomObject]@{
+      Model        = ([string]$_.Model).Trim()
+      Size         = [double]$_.Size
+      MediaType    = $media
+      BusType      = $bus
+      SerialNumber = $sn
+    }
+  })
 [PSCustomObject]@{
   BiosSerial        = if ($bios)  { ([string]$bios.SerialNumber).Trim() }      else { '' }
   BiosVersion       = if ($bios)  { ([string]$bios.SMBIOSBIOSVersion).Trim() } else { '' }
@@ -130,6 +159,7 @@ $mem   = @(@(Get-WmiSafe 'Win32_PhysicalMemory') |
   SysModel          = if ($sys)   { ([string]$sys.Model).Trim() }              else { '' }
   GPUNames          = $gpus
   MemoryModules     = $mem
+  PhysicalDisks     = $disks
 } | ConvertTo-Json -Compress -Depth 4
 `
 
@@ -172,4 +202,5 @@ $mem   = @(@(Get-WmiSafe 'Win32_PhysicalMemory') |
 	// RAM sticks: nil when WMI returned none, so the field is omitted and the
 	// server keeps the previous list.
 	hw.MemoryModules = toMemoryModules(parsed.MemoryModules)
+	hw.PhysicalDisks = toPhysicalDisks(parsed.PhysicalDisks)
 }

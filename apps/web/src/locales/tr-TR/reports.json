@@ -730,6 +730,7 @@
           "memory": "RAM (MB)",
           "ram_modules": "RAM modülleri",
           "ram_serials": "RAM seri numaraları",
+          "disks": "Diskler (model + seri no)",
           "os": "İşletim Sistemi",
           "owner": "Sahip",
           "patch_level": "Agent sürümü",

@@ -120,6 +120,7 @@ describe('device_inventory manual-asset union (#4622)', () => {
       motherboardManufacturer: null,
       motherboardProduct: null,
       memoryModules: null,
+      physicalDisks: null,
       // Site of the hand-entered asset (none in this fixture) — the PDF
       // groups inventory rows by it.
       siteName: null,

@@ -53,6 +53,7 @@ type windowsHardwareJSON struct {
 	SysModel          string           `json:"SysModel"`
 	GPUNames          gpuNameList      `json:"GPUNames"`
 	MemoryModules     memoryModuleList `json:"MemoryModules"`
+	PhysicalDisks     physicalDiskList `json:"PhysicalDisks"`
 }
 
 // wmiMemoryModule is one Win32_PhysicalMemory row as the batched query emits it.
@@ -139,6 +140,82 @@ func cleanMemoryVendorValue(value string) string {
 		return ""
 	}
 	return truncateCollectorString(value)
+}
+
+// wmiPhysicalDisk is one Win32_DiskDrive row (Size in bytes) enriched with
+// MSFT_PhysicalDisk media/bus type by the batched query.
+type wmiPhysicalDisk struct {
+	Model        string  `json:"Model"`
+	Size         float64 `json:"Size"`
+	MediaType    string  `json:"MediaType"`
+	BusType      string  `json:"BusType"`
+	SerialNumber string  `json:"SerialNumber"`
+}
+
+// physicalDiskList tolerates the PowerShell 5.1 single-element collapse
+// (one-drive PCs emit an object instead of an array).
+type physicalDiskList []wmiPhysicalDisk
+
+// UnmarshalJSON accepts a JSON array, a bare object, or null/empty.
+func (d *physicalDiskList) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*d = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		var many []wmiPhysicalDisk
+		if err := json.Unmarshal(trimmed, &many); err != nil {
+			return err
+		}
+		*d = many
+		return nil
+	}
+	var one wmiPhysicalDisk
+	if err := json.Unmarshal(trimmed, &one); err != nil {
+		return err
+	}
+	*d = []wmiPhysicalDisk{one}
+	return nil
+}
+
+// maxPhysicalDisks caps the list sent to the server.
+const maxPhysicalDisks = 32
+
+// toPhysicalDisks converts the WMI rows into the payload shape: drops
+// zero-size entries, converts bytes to (decimal) GB the way drives are sold,
+// and blanks placeholder serials.
+func toPhysicalDisks(rows []wmiPhysicalDisk) []PhysicalDisk {
+	out := make([]PhysicalDisk, 0, len(rows))
+	for _, r := range rows {
+		sizeGB := uint64(r.Size / 1e9)
+		if sizeGB == 0 {
+			continue
+		}
+		out = append(out, PhysicalDisk{
+			Model:        truncateCollectorString(strings.TrimSpace(r.Model)),
+			SizeGB:       sizeGB,
+			MediaType:    truncateCollectorString(strings.TrimSpace(r.MediaType)),
+			BusType:      truncateCollectorString(strings.TrimSpace(r.BusType)),
+			SerialNumber: cleanDiskSerial(r.SerialNumber),
+		})
+		if len(out) == maxPhysicalDisks {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// cleanDiskSerial trims the padding some controllers add, drops a trailing
+// "." (NVMe serials are often reported as "0025_38B1_..._8E2C.") and blanks
+// vendor placeholders.
+func cleanDiskSerial(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimSuffix(value, ".")
+	return cleanMemoryVendorValue(value)
 }
 
 // parseHardwareJSON decodes the JSON output from the batched WMI query.

@@ -730,6 +730,7 @@
           "memory": "RAM (MB)",
           "ram_modules": "RAM modules",
           "ram_serials": "RAM serials",
+          "disks": "Disks (model + serial)",
           "os": "OS",
           "owner": "Owner",
           "patch_level": "Agent version",

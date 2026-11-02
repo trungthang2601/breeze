@@ -1099,6 +1099,7 @@
     "coresThreads": "Kerne / Threads",
     "ramTotal": "RAM gesamt",
     "ramModules": "RAM-Module",
+    "physicalDisks": "Physische Laufwerke",
     "ramSerials": "RAM-Seriennummern",
     "diskTotal": "Festplattenspeicher gesamt",
     "motherboard": "Hauptplatine",

@@ -44,6 +44,16 @@ const memoryModuleSchema = z.object({
 });
 const memoryModulesSchema = z.array(memoryModuleSchema).max(32);
 
+// One internal drive (SSD/HDD/NVMe), sizes already in decimal GB.
+const physicalDiskSchema = z.object({
+  model: z.string().max(256).optional(),
+  sizeGb: z.number().int().nonnegative().max(10_000_000),
+  mediaType: z.string().max(32).optional(),
+  busType: z.string().max(32).optional(),
+  serialNumber: z.string().max(128).optional()
+});
+const physicalDisksSchema = z.array(physicalDiskSchema).max(32);
+
 export const enrollSchema = z.object({
   enrollmentKey: z.string().min(1),
   enrollmentSecret: z.string().min(1).optional(),
@@ -69,7 +79,8 @@ export const enrollSchema = z.object({
     motherboardVersion: z.string().optional(),
     biosVersion: z.string().optional(),
     gpuModel: z.string().optional(),
-    memoryModules: memoryModulesSchema.optional()
+    memoryModules: memoryModulesSchema.optional(),
+    physicalDisks: physicalDisksSchema.optional()
   }).optional(),
   networkInfo: z.array(z.object({
     name: z.string(),
@@ -712,7 +723,8 @@ export const updateHardwareSchema = z.object({
   motherboardVersion: z.string().optional(),
   biosVersion: z.string().optional(),
   gpuModel: z.string().optional(),
-  memoryModules: memoryModulesSchema.optional()
+  memoryModules: memoryModulesSchema.optional(),
+  physicalDisks: physicalDisksSchema.optional()
 });
 
 export const updateSoftwareSchema = softwareInventoryReportSchema;

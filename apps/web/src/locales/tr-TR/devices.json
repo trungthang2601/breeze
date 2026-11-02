@@ -1099,6 +1099,7 @@
     "coresThreads": "Çekirdekler / Konular",
     "ramTotal": "RAM Toplamı",
     "ramModules": "RAM modülleri",
+    "physicalDisks": "Fiziksel diskler",
     "ramSerials": "RAM seri numaraları",
     "diskTotal": "Disk Toplamı",
     "motherboard": "Anakart",
