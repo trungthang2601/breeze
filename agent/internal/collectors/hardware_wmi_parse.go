@@ -101,13 +101,13 @@ const maxMemoryModules = 32
 // toMemoryModules converts the WMI rows into the payload shape: drops empty
 // slots (capacity 0), converts bytes to MB, and blanks vendor placeholders
 // ("Unknown", "Undefined", "0000", ...).
-func toMemoryModules(rows []wmiMemoryModule) []MemoryModule {
-	out := make([]MemoryModule, 0, len(rows))
+func toMemoryModules(rows []wmiMemoryModule) []RAMStick {
+	out := make([]RAMStick, 0, len(rows))
 	for _, r := range rows {
 		if r.Capacity <= 0 {
 			continue
 		}
-		mod := MemoryModule{
+		mod := RAMStick{
 			Slot:         truncateCollectorString(strings.TrimSpace(r.Slot)),
 			CapacityMB:   uint64(r.Capacity) / (1024 * 1024),
 			Manufacturer: cleanMemoryVendorValue(r.Manufacturer),

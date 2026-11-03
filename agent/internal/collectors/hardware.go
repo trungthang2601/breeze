@@ -30,7 +30,7 @@ type HardwareInfo struct {
 	// MemoryModules lists the installed RAM sticks (Windows Win32_PhysicalMemory).
 	// Omitted when unknown so the server keeps the last good list instead of
 	// overwriting it with an empty one after a transient WMI failure.
-	MemoryModules []MemoryModule `json:"memoryModules,omitempty"`
+	MemoryModules []RAMStick `json:"memoryModules,omitempty"`
 	// PhysicalDisks lists the internal drives (Windows Win32_DiskDrive, USB
 	// excluded). Omitted when unknown, same as MemoryModules.
 	PhysicalDisks []PhysicalDisk `json:"physicalDisks,omitempty"`
@@ -45,8 +45,10 @@ type PhysicalDisk struct {
 	SerialNumber string `json:"serialNumber,omitempty"`
 }
 
-// MemoryModule is one installed RAM stick (DIMM/SO-DIMM).
-type MemoryModule struct {
+// RAMStick is one installed RAM stick (DIMM/SO-DIMM) — the fork's WMI /
+// dmidecode report (memoryModules). Not upstream's per-slot MemoryModule
+// (memory.go, sent as the separate `memory` block).
+type RAMStick struct {
 	Slot         string `json:"slot,omitempty"`
 	CapacityMB   uint64 `json:"capacityMb"`
 	SpeedMHz     uint32 `json:"speedMhz,omitempty"`

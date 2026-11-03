@@ -13,8 +13,8 @@ import (
 
 // parseDmidecodeMemory turns `dmidecode -t 17` (Memory Device) output into RAM
 // sticks. Empty slots ("No Module Installed") are dropped.
-func parseDmidecodeMemory(out string) []MemoryModule {
-	var modules []MemoryModule
+func parseDmidecodeMemory(out string) []RAMStick {
+	var modules []RAMStick
 	var cur map[string]string
 	flush := func() {
 		if cur == nil {
@@ -50,12 +50,12 @@ func parseDmidecodeMemory(out string) []MemoryModule {
 	return modules
 }
 
-func dmidecodeModule(f map[string]string) (MemoryModule, bool) {
+func dmidecodeModule(f map[string]string) (RAMStick, bool) {
 	sizeMB := dmidecodeSizeMB(f["Size"])
 	if sizeMB == 0 {
-		return MemoryModule{}, false
+		return RAMStick{}, false
 	}
-	mod := MemoryModule{
+	mod := RAMStick{
 		Slot:         truncateCollectorString(strings.TrimSpace(f["Locator"])),
 		CapacityMB:   sizeMB,
 		Manufacturer: cleanMemoryVendorValue(f["Manufacturer"]),

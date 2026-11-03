@@ -1,0 +1,66 @@
+# TEMPORARY — verification for the upstream merge branch only (the fork's CI
+# workflow is disabled). Remove before merging merge/upstream-v0.125 into main.
+name: Merge check (upstream v0.125)
+
+on:
+  push:
+    branches: [merge/upstream-v0.125]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PNPM_VERSION: '10.34.5'
+
+jobs:
+  typecheck:
+    name: Type check (api + shared + web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      NODE_OPTIONS: --max-old-space-size=12288
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .node-version
+      - run: pnpm install --frozen-lockfile
+      - name: API type check
+        run: pnpm exec tsc --build apps/api/tsconfig.tests.json
+      - name: Shared type check
+        run: pnpm --filter @breeze/shared typecheck
+      - name: Astro check
+        working-directory: apps/web
+        run: pnpm exec astro check
+
+  agent:
+    name: Agent build + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: agent/go.mod
+      - name: Build linux / windows / darwin
+        working-directory: agent
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -e
+          for os in linux windows darwin; do
+            echo "== GOOS=$os"
+            GOOS=$os GOARCH=amd64 go build ./...
+            GOOS=$os GOARCH=amd64 go vet ./internal/collectors/... ./internal/agentapp/... ./cmd/...
+          done
+      - name: Tests (touched packages)
+        working-directory: agent
+        run: go test ./internal/collectors/... ./internal/agentapp/... ./internal/remote/desktop/x11/... ./internal/branding/... ./cmd/breeze-watchdog/...
