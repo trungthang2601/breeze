@@ -36,7 +36,7 @@ concurrency:
 
 env:
   PNPM_VERSION: '10.34.5'
-  GO_VERSION: '1.26.6'
+  GO_VERSION: '1.26.10'
 
 # SR-007: least-privilege default. CI runs on every PR (including forks) and
 # only needs to read the repo. Any job needing more must opt in per-job.
@@ -73,13 +73,23 @@ jobs:
   # `true` → success, `false` → skipped, anything else → red. lint, typecheck,
   # security-audit and the agent/mobile/viewer jobs are never area-gated.
   # Contract: .github/scripts/ci-area-gating.test.mjs.
+  #
+  # `integration` (#5936) is narrower than `api` and gates only integration-test:
+  # on `pull_request` it is false for agent/web/portal/viewer/helper/mobile/
+  # add-in/M365-only diffs (paths the real-Postgres suite provably cannot read;
+  # ci-area-gating.test.mjs re-derives that from the suite's sources). On
+  # `merge_group` it is NOT path-gated — true for every code entry — so the
+  # queue always runs the full integration suite.
   changes:
     name: Detect Code Changes
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     outputs:
+      selection_mode: ${{ steps.queue_shadow.outputs.selection_mode || (github.event_name == 'pull_request' && 'pr' || 'full') }}
+      selection_reason: ${{ steps.queue_shadow.outputs.selection_reason || (steps.queue_shadow.outcome == 'failure' && 'shadow_step_failed') || '' }}
       code: ${{ steps.classify.outputs.code }}
       docs: ${{ steps.classify.outputs.docs }}
       agent: ${{ steps.classify.outputs.agent }}
@@ -94,6 +104,20 @@ jobs:
       # the production web bundle and drives it in a real Chromium. Same
       # fail-safe shape as `code` — anything unresolvable turns it on.
       topology_browser: ${{ steps.classify.outputs.topology_browser }}
+      # Agent area: agent/**, shared/global inputs and files read by Go tests.
+      # Separate from the QEMU gate above; gates seven agent jobs. Unknown
+      # paths and unresolved change lists fail open to include this area.
+      agent_code: ${{ steps.classify.outputs.agent_code }}
+      # Gate for the 16-shard `integration-test` job (#5936). Path-gated on
+      # `pull_request` ONLY (the classifier gets `--pull-request` there and
+      # nowhere else); the merge queue and every other event report `true` for
+      # any code change, so the queue always runs the full integration suite.
+      # Fail-safe like the rest: anything unresolvable turns it on.
+      integration: ${{ steps.classify.outputs.integration }}
+      # Docs-only PRs can break tests reading docs by path; the map declares them.
+      # path_readers=true with an empty reader_tests list runs every mapped test.
+      path_readers: ${{ steps.classify.outputs.path_readers }}
+      reader_tests: ${{ steps.classify.outputs.reader_tests }}
     steps:
       - name: Checkout (classifier script only)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -126,15 +150,18 @@ jobs:
           # a code change through as docs-only.
           full_suite() {
             echo "$1" >&2
-            printf 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\n' | tee -a "${GITHUB_OUTPUT}"
+            printf 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nagent_code=true\nintegration=true\npath_readers=true\nreader_tests=\n' | tee -a "${GITHUB_OUTPUT}"
           }
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
             # The PR files API needs no checkout and sees renames/deletes too; a
             # rename also lists its previous path (and merge_group diffs with
             # --no-renames), so moving a file OUT of an area still runs that area.
             # Any failure here aborts the job (set -e), which fails closed above.
+            # `--pull-request` path-gates the `integration` output (#5936). It is
+            # passed HERE ONLY: the merge_group call below omits it, so the queue
+            # always runs the full integration suite for a code change.
             gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)' \
-              | bash .github/scripts/classify-pr-paths.sh \
+              | bash .github/scripts/classify-pr-paths.sh --pull-request \
               | tee -a "${GITHUB_OUTPUT}"
             exit 0
           fi
@@ -159,6 +186,21 @@ jobs:
           fi
           printf '%s\n' "${classified}" | tee -a "${GITHUB_OUTPUT}"
 
+      - name: Queue selection shadow
+        id: queue_shadow
+        if: github.event_name == 'merge_group'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          node .github/scripts/queue-selection.mjs shadow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          FULL_SELECTION: ${{ toJSON(steps.classify.outputs) }}
+
   # ─── Docs check ─────────────────────────────────────────────────────
   # Was `docs-ci.yml`, whose job was ALSO named `CI Success` — the third
   # reporter of that check name. It is now a plain job here, gated on the
@@ -182,10 +224,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: pnpm
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -231,10 +275,12 @@ jobs:
           bash scripts/check-guided-setup-default-project.sh
           bash scripts/check-selfhost-db-urls.sh
           bash scripts/check-guided-setup-env-roundtrip.sh
+          bash scripts/check-guided-setup-key-id.sh
           bash scripts/check-guided-setup-local-certs-backfill.sh
           bash scripts/check-guided-setup-placeholders.sh
           bash scripts/check-guided-setup-systemd-unit.sh
           bash scripts/check-guided-setup-signed-image-floor.sh
+          bash scripts/check-guided-setup-upgrade.sh
 
       # docker/Caddyfile.prod is shared by hosted production and every
       # self-hosted install, so the CADDY_LOCAL_CERTS opt-in must be a strict
@@ -243,6 +289,10 @@ jobs:
       # set and diffs the results. Skips itself if Docker is unavailable.
       - name: Guard Caddyfile internal-CA opt-in
         run: bash scripts/check-caddyfile-local-certs.sh
+
+      - name: Network Proxy tunnel site routing (real Caddy)
+        timeout-minutes: 10
+        run: bash scripts/check-tunnel-site-routing.sh
 
       # The quickstart tells self-hosters to `cp .env.example .env` and bring the
       # stack up, so a BREEZE_VERSION whose images were never published breaks
@@ -258,13 +308,30 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Test community README automation
         run: pnpm test:community-readme
+
+      # AGENTS.md (Codex and other agents) is generated from CLAUDE.md so the two
+      # cannot drift; this fails when a CLAUDE.md edit was not regenerated.
+      - name: AGENTS.md matches CLAUDE.md
+        run: pnpm test:agents-md
+
+      # The Tauri CLI refuses to build when the `tauri` / `tauri-plugin-*`
+      # crates and their `@tauri-apps/*` npm packages differ in major.minor.
+      # Dependabot bumps cargo and npm in separate PRs, so a crate-only bump
+      # merged green and broke the v0.121.0 helper release build. Compares
+      # each app's Cargo.lock with pnpm-lock.yaml; needs no install.
+      - name: Guard Tauri crate/npm version parity
+        run: |
+          node --test scripts/check-tauri-versions.test.mjs
+          node scripts/check-tauri-versions.mjs
 
       - name: Test mobile native CI contract
         run: node --test .github/scripts/mobile-native-ci.test.mjs
@@ -280,6 +347,35 @@ jobs:
 
       - name: Test per-area job gating contract
         run: node --test .github/scripts/ci-area-gating.test.mjs
+
+      - name: Test reader-test runner
+        run: node --test .github/scripts/run-reader-tests.test.mjs
+
+      - name: Test PR selection contract (W3)
+        run: node --test .github/scripts/ci-pr-selection.test.mjs
+
+      - name: Test queue selection contract (W4)
+        run: node --test .github/scripts/queue-selection.test.mjs
+
+      - name: CI cache policy contract
+        run: node --test .github/scripts/ci-cache-policy.test.mjs
+
+      - name: Test shard retry wrapper
+        run: node --test .github/scripts/retry-shard.test.mjs
+
+      # Also validates the committed .github/flaky-tests.json (W1, #10744).
+      - name: Test flaky-test ledger
+        run: node --test .github/scripts/flaky-ledger.test.mjs
+
+      # security-audit's base/head advisory comparison (W1, #10744).
+      - name: Test dependency audit comparison
+        run: node --test .github/scripts/new-findings.test.mjs .github/scripts/security-audit-compare.test.mjs
+
+      # The Windows viewer update bundle must be a STORED zip — the updater
+      # cannot decompress Deflate, so a compressed one never installs (#7681).
+      # release.yml only runs for releases, so this is the PR-time check.
+      - name: Test viewer Windows updater packaging
+        run: node --test scripts/release/package-viewer-windows-updater.test.mjs
 
       # The classifier fast-tracks changes to OTHER workflow files (app=false), and
       # security.yml — which also runs this suite — does not report `CI Success`, so
@@ -306,10 +402,9 @@ jobs:
       - name: Test dev tooling scripts (wt-stack / test-stack)
         run: pnpm test:dev-scripts
 
-      - name: Check for schema drift
-        working-directory: apps/api
-        continue-on-error: true
-        run: pnpm db:check-drift
+      # The schema-drift check runs in `check-migrations` below, against the
+      # database that job just migrated. It used to sit here with no database
+      # and continue-on-error, so it could only exit 2 unseen (#10357).
 
   typecheck:
     name: Type Check
@@ -317,10 +412,10 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
     env:
-      # tsc on the full apps/api project (dense Drizzle types) + astro check
-      # exceed Node's default heap on the type-heaviest branches. Give the
-      # type checker a larger old-space so it does not OOM. 8 GB started OOMing
-      # on 2026-09-18 (three runs in one day); 12 GB fits the 16 GB runner.
+      # tsc on apps/api (dense Drizzle types) + astro check exceed Node's
+      # default heap. The old single api program needed ~9.9 GB and OOMed at
+      # 8 GB (2026-09-18); since #6270 it is split into two project-reference
+      # programs of ~7.2 GB each, which also pass at 8 GB. 12 GB is headroom.
       NODE_OPTIONS: --max-old-space-size=12288
     steps:
       - name: Checkout
@@ -334,16 +429,23 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Build mode checks apps/api src once (tsconfig.src.json, emits .d.ts
+      # into apps/api/.tsbuild) and then the test files against those
+      # declarations (tsconfig.tests.json), instead of one program holding
+      # both (#6270). Together the two cover every file the old
+      # `tsc --noEmit -p apps/api/tsconfig.json` did.
       - name: Run TypeScript type check
-        run: pnpm exec tsc --noEmit --project apps/api/tsconfig.json
+        run: pnpm exec tsc --build apps/api/tsconfig.tests.json
 
       # packages/shared is consumed through source imports, so apps/api's tsc
       # only reaches the files it happens to import; its own test files were
@@ -369,12 +471,39 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    timeout-minutes: 30
+    # Room for a whole-shard retry (W1, #10744): the "Run API tests" step
+    # measured 10.5 min median / 11.7 max, setup + post steps ≤ 2.5 min
+    # (shard 1), across six CI runs 2026-10-29..30. 2 × 11.7 + 5 ≈ 28.
+    # retry-shard's --budget-minutes is this minus a 5-min setup allowance.
+    timeout-minutes: 40
+    # The flaky ledger is read from the BASE commit, never the PR head
+    # (retry-shard + flaky-ledger.mjs, W1 #10744). Empty for other events →
+    # nothing quarantined.
+    env:
+      CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      # The depth-1 checkout lacks the base commit that retry-shard reads the
+      # flaky ledger from and diffs against (W1, #10744). Bounded retry; a
+      # failed fetch only disables quarantine (fail closed), never the job.
+      - name: Fetch base commit for the flaky ledger
+        if: env.CI_BASE_SHA != ''
+        run: |
+          for attempt in 1 2 3; do
+            if git fetch --no-tags --depth=1 origin "${CI_BASE_SHA}"; then
+              exit 0
+            fi
+            echo "git fetch of the base commit failed (attempt ${attempt}/3)" >&2
+            # No sleep after the final attempt — there is no fourth.
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $(( attempt * 5 ))
+            fi
+          done
+          echo "::warning title=Quarantine disabled::Could not fetch base ${CI_BASE_SHA}; no flaky-ledger test is quarantined in this job."
 
       - name: Setup pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -382,10 +511,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -416,7 +547,21 @@ jobs:
         # pnpm forwards args after the script name to the script itself (no
         # bare `--`, which would make vitest ignore --shard and run
         # everything — see integration-test's identical --shard usage).
-        run: pnpm --filter=@breeze/api test:run --shard=${{ matrix.shard }}/8
+        # retry-shard re-runs the whole shard once when it failed with visible
+        # test failures, and writes flake-report-<label>.json (W1, #10744).
+        run: node .github/scripts/retry-shard.mjs --runner vitest --label api-${{ matrix.shard }} --budget-minutes 35 -- pnpm --filter=@breeze/api test:run --shard=${{ matrix.shard }}/8
+
+      # Retry wrapper report (W1, #10744): written only when attempt 1 failed.
+      - name: Upload flake report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: flake-report-api-${{ matrix.shard }}
+          path: flake-report-*.json
+          if-no-files-found: ignore
+          retention-days: 14
+          # A "re-run failed jobs" attempt uploads under the same name.
+          overwrite: true
 
       # Timezone-correctness regression gate (#4046): GitHub-hosted runners
       # default to UTC, and nothing else in this job or in vitest.config.ts
@@ -513,10 +658,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -541,10 +688,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -583,10 +732,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'pnpm'
+          node-version-file: .node-version
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -643,10 +794,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -665,8 +818,32 @@ jobs:
       - name: Migration filename convention guard
         run: bash scripts/check-migration-naming.sh
 
+      # Non-bypassable backstop for the pre-push hook (`--against-ref`): the
+      # migrations this PR / queue entry ADDS must sort after the newest one
+      # on its base, and it must not delete or rename a migration that exists
+      # on its base (a shipped file's ledger row is keyed on its filename —
+      # #10015, where #9997 renamed one to appease the commit hook). Files the
+      # base already has — e.g. main's migrations a branch merged in — are
+      # never judged. pull_request checks out the merge commit, so HEAD^1 is
+      # the base it was built on; a queue entry names its base explicitly.
+      - name: Migration order and shipped-rename guard vs base
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          base_ref="${MERGE_GROUP_BASE_SHA:-HEAD^1}"
+          echo "Base for this check: $base_ref = $(git rev-parse --short "$base_ref")"
+          bash scripts/check-migration-naming.sh --against-ref "$base_ref"
+
       - name: Apply migrations against empty Postgres
         run: pnpm --filter @breeze/api run check:migrations
+
+      # Ledger-vs-disk drift on the database the step above just migrated:
+      # every core migration file must have a ledger row and vice versa
+      # (apps/api/scripts/check-drift.ts). Blocking; exit 2 (no database) is a
+      # failure here, never a silent pass (#10357).
+      - name: Check for schema drift
+        run: pnpm --filter @breeze/api run db:check-drift
 
   # Real-Postgres apply of every migration as a NON-SUPERUSER role that mirrors
   # a managed-Postgres admin (DigitalOcean doadmin / AWS RDS). The class-complete
@@ -726,10 +903,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -750,11 +929,39 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4]
+    # Room for a whole-shard retry (W1, #10744): "Run Web tests" measured
+    # 10.7 min median / 11.9 max, setup ≤ 1 min, across six CI runs
+    # 2026-10-29..30. Explicit so retry-shard's --budget-minutes (this minus a
+    # 5-min setup allowance) has a real ceiling to fit a retry inside.
+    timeout-minutes: 40
+    # The flaky ledger is read from the BASE commit, never the PR head
+    # (retry-shard + flaky-ledger.mjs, W1 #10744). Empty for other events →
+    # nothing quarantined.
+    env:
+      CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      # The depth-1 checkout lacks the base commit that retry-shard reads the
+      # flaky ledger from and diffs against (W1, #10744). Bounded retry; a
+      # failed fetch only disables quarantine (fail closed), never the job.
+      - name: Fetch base commit for the flaky ledger
+        if: env.CI_BASE_SHA != ''
+        run: |
+          for attempt in 1 2 3; do
+            if git fetch --no-tags --depth=1 origin "${CI_BASE_SHA}"; then
+              exit 0
+            fi
+            echo "git fetch of the base commit failed (attempt ${attempt}/3)" >&2
+            # No sleep after the final attempt — there is no fourth.
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $(( attempt * 5 ))
+            fi
+          done
+          echo "::warning title=Quarantine disabled::Could not fetch base ${CI_BASE_SHA}; no flaky-ledger test is quarantined in this job."
 
       - name: Setup pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -762,10 +969,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -773,7 +982,20 @@ jobs:
       - name: Run Web tests
         # Source aliases in vitest.config.ts avoid a production Astro build.
         # build-web still runs prebuild (checksums/Monaco assets) and Astro.
-        run: pnpm --filter=@breeze/web test --run --shard=${{ matrix.shard }}/4
+        # Whole-shard retry once on visible test failures (W1, #10744).
+        run: node .github/scripts/retry-shard.mjs --runner vitest --label web-${{ matrix.shard }} --budget-minutes 35 -- pnpm --filter=@breeze/web test --run --shard=${{ matrix.shard }}/4
+
+      # Retry wrapper report (W1, #10744): written only when attempt 1 failed.
+      - name: Upload flake report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: flake-report-web-${{ matrix.shard }}
+          path: flake-report-*.json
+          if-no-files-found: ignore
+          retention-days: 14
+          # A "re-run failed jobs" attempt uploads under the same name.
+          overwrite: true
 
   # REQUIRED check: asserted in ci-success (see #3941, and #3139 for the
   # original gap).
@@ -794,10 +1016,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -866,7 +1090,10 @@ jobs:
           filters: |
             mobile:
               - 'apps/mobile/**'
-              - 'packages/**'
+              # No 'packages/**': breeze-mobile has no workspace dependency
+              # (it mirrors shared constants on purpose for Metro), so a
+              # packages/ change cannot alter the native build. Pinned both
+              # ways by mobile-native-ci.test.mjs.
               - 'pnpm-workspace.yaml'
               - '.npmrc'
               - '.node-version'
@@ -927,10 +1154,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install mobile dependencies
         run: pnpm install --filter breeze-mobile... --frozen-lockfile
@@ -943,6 +1172,20 @@ jobs:
       - name: Generate iOS project
         working-directory: apps/mobile
         run: pnpm exec expo prebuild --platform ios --no-install
+
+      # iOS 27 refuses to launch an app linked against the iOS 27 SDK without
+      # the UIScene lifecycle (App Review 2.1(a) on 1.0.1 (84)). The simulator
+      # build below runs on an older iOS runtime and cannot detect the
+      # omission, and the app.json unit test only proves the flag is set, not
+      # that prebuild honoured it. Check the generated project directly.
+      - name: Assert UIScene lifecycle adoption in the generated project
+        working-directory: apps/mobile/ios
+        run: |
+          set -euo pipefail
+          plutil -extract UIApplicationSceneManifest.UISceneConfigurations.UIWindowSceneSessionRoleApplication.0.UISceneDelegateClassName raw BreezeRMM/Info.plist | grep -qx EXExpoAppSceneDelegate \
+            || { echo "::error::Info.plist has no UIApplicationSceneManifest pointing at EXExpoAppSceneDelegate — iOS 27 will refuse to launch this build (see STORE_SUBMISSION.md)"; exit 1; }
+          grep -q 'class AppDelegate: ExpoAppDelegate, ExpoReactNativeFactoryProvider' BreezeRMM/AppDelegate.swift \
+            || { echo "::error::AppDelegate.swift does not conform to ExpoReactNativeFactoryProvider — scene support was not applied by expo-build-properties"; exit 1; }
 
       - name: Install CocoaPods
         working-directory: apps/mobile/ios
@@ -965,7 +1208,7 @@ jobs:
 
       - name: Upload native build log
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: mobile-ios-build-log
           path: ${{ runner.temp }}/breeze-ios-build.log
@@ -989,10 +1232,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1024,10 +1269,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1038,6 +1285,41 @@ jobs:
       - name: Run Viewer type check
         working-directory: apps/viewer
         run: pnpm exec tsc --noEmit
+
+  # packages/shared's own vitest suite (the zod validators the API and web
+  # share). The typecheck job only type-checks it; before #8373 the 4.6k tests
+  # ran nowhere in CI, so a red shared test landed silently. App-gated, not
+  # area-gated: any packages/** diff classifies as code+app (and sets every
+  # area), and shared is a dependency of every area.
+  test-shared:
+    name: Test Shared
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .node-version
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run shared tests
+        run: pnpm --filter @breeze/shared exec vitest run
 
   test-office-addin-core:
     name: Test Office Add-in Core
@@ -1056,10 +1338,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1069,6 +1353,42 @@ jobs:
 
       - name: Typecheck Office Add-in Core
         run: pnpm --filter=@breeze/office-addin-core typecheck
+
+  # @breeze/document-ui (#9414): the shared customer-document renderer web and
+  # portal consume. App-gated like test-shared, not area-gated: any packages/**
+  # diff classifies as code+app, and both web and portal depend on it.
+  test-document-ui:
+    name: Test Document UI
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .node-version
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Document UI tests
+        run: pnpm --filter @breeze/document-ui exec vitest run
+
+      - name: Typecheck Document UI
+        run: pnpm --filter=@breeze/document-ui typecheck
 
   test-excel-addin:
     name: Test Excel Add-in
@@ -1087,10 +1407,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1115,10 +1437,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1146,10 +1470,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1186,10 +1512,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1200,16 +1528,81 @@ jobs:
       - name: Typecheck Outlook Add-in
         run: pnpm --filter=@breeze/outlook-addin exec tsc --noEmit
 
+  # ─── Release ledger + release script suites ───────────────────────────
+  # Runs every scripts/release suite and, for any change to the server-only
+  # release ledger (.github/release-provenance/server-only-tags.tsv), the
+  # eligibility guard EXECUTED FROM EACH ROW'S BASE RELEASE TREE (offline), so
+  # an ineligible row is refused on its PR before any release minutes are
+  # spent. Tagged rows are append-only. Code-gated only — never api- or
+  # app-gated — so a ledger-only PR still runs it.
+  release-ledger:
+    name: Release Ledger
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    steps:
+      - name: Checkout full history and tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .node-version
+
+      - name: Release script tests
+        run: node --test scripts/release/*.test.mjs
+
+      - name: Validate the server-only ledger
+        run: node scripts/release/server-only-ledger.mjs validate --ref HEAD
+
+      - name: Guard new server-only ledger rows
+        run: |
+          set -euo pipefail
+          git rev-parse --verify 'origin/main^{commit}' >/dev/null
+          base=$(git merge-base HEAD origin/main)
+          bash scripts/release/check-server-only-ledger-change.sh \
+            --base-ref "$base" \
+            --head-ref HEAD \
+            --main-ref origin/main
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
+    # The dependency audit compares head against the BASE commit and blocks
+    # only on advisories the change introduces (W1, #10744). Empty for other
+    # events (workflow_dispatch) → every blocking advisory blocks.
+    env:
+      CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      # The depth-1 checkout lacks the base commit whose lockfile and
+      # exceptions file the dependency audit compares against (W1, #10744).
+      # Bounded retry; a failed fetch only disables the comparison (fail
+      # closed: every blocking advisory blocks), never the job.
+      - name: Fetch base commit for the dependency audit comparison
+        if: env.CI_BASE_SHA != ''
+        run: |
+          for attempt in 1 2 3; do
+            if git fetch --no-tags --depth=1 origin "${CI_BASE_SHA}"; then
+              exit 0
+            fi
+            echo "git fetch of the base commit failed (attempt ${attempt}/3)" >&2
+            # No sleep after the final attempt — there is no fourth.
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $(( attempt * 5 ))
+            fi
+          done
+          echo "::warning title=Audit comparison disabled::Could not fetch base ${CI_BASE_SHA}; every blocking advisory blocks this run."
 
       - name: Setup pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -1217,10 +1610,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1230,20 +1625,32 @@ jobs:
       # pnpm has not migrated to the bulk advisory endpoint at any version, so
       # `pnpm audit` now fails closed everywhere.
       #
-      # Gate stays at `critical`, matching the previous `--audit-level=critical`.
-      # The earlier `--prod` scoping existed to dodge a HIGH `ip@<=2.0.1`
-      # (GHSA-2p57-rm9w-gvfp) pulled in by apps/mobile dev tooling; the
-      # `ip@<=2.0.1: npm:neoip@^3.1.0` override in package.json has since
-      # resolved that, and the tree is now clean at every severity, so the scan
-      # covers dev dependencies too.
+      # The scan covers dev dependencies too. An earlier `--prod` scoping existed
+      # to dodge a HIGH `ip@<=2.0.1` (GHSA-2p57-rm9w-gvfp) pulled in by
+      # apps/mobile dev tooling; the `ip@<=2.0.1: npm:neoip@^3.1.0` override in
+      # package.json resolved that.
       #
       # Gate is HIGH+CRITICAL as of 2026-09-03 (SOC 2 CC7.1). A new dev-only
-      # HIGH advisory blocks PRs until patched or an exception is recorded.
+      # HIGH advisory blocks PRs until patched or until a reviewed, expiring
+      # entry is added to scripts/security/npm-audit-exceptions.json (the bar
+      # and the enforced rules are in that file's header).
       - name: Install osv-scanner
         run: bash scripts/security/install-osv-scanner.sh
 
-      - name: Run dependency audit (high+critical gate)
-        run: bash scripts/security/check-npm-audit.sh
+      # The exceptions logic is tested first, deliberately: a regression in it
+      # could suppress a real advisory and still read as a passing audit.
+      - name: Test npm-audit exceptions logic
+        run: pnpm test:npm-audit-exceptions
+
+      # Same reason: a regression in the base/head comparison could wave a
+      # new advisory through.
+      - name: Test dependency audit base/head comparison
+        run: node --test .github/scripts/new-findings.test.mjs .github/scripts/security-audit-compare.test.mjs
+
+      # Blocks only on advisories the change introduces (W1, #10744); the
+      # decision tree is in the script header and its test.
+      - name: Run dependency audit (high+critical gate, new advisories only)
+        run: bash .github/scripts/security-audit-compare.sh
 
       - name: Run supply-chain hardening guard
         run: bash scripts/security/check-supply-chain-hardening.sh
@@ -1261,6 +1668,42 @@ jobs:
 
       - name: Run release trust allowlist drift guard
         run: node scripts/security/check-release-trust-allowlist.mjs
+
+      # Built-in YARA pack (#6263 W03b). The API replaces the built-in rule set
+      # only with a NEWER pack version, so a pack input change without a
+      # version bump would never reach the fleet: the lock check blocks that.
+      # The clean-corpus false-positive scan lives in yara-pack.yml (non-blocking).
+      - name: Test built-in YARA pack build gates
+        run: node --test scripts/security/yara-pack/build-pack.test.mjs
+
+      # Against main's lock too: the version may never go backwards, and
+      # changed inputs need a strictly higher version. A failed fetch fails the
+      # step; only a main that has no pack.lock yet skips the comparison.
+      - name: Check built-in YARA pack version lock
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          base="$RUNNER_TEMP/base-pack.lock"
+          if git cat-file -e origin/main:scripts/security/yara-pack/pack.lock 2>/dev/null; then
+            git show origin/main:scripts/security/yara-pack/pack.lock > "$base"
+            bash scripts/security/yara-pack/build-pack.sh --check-lock --base-lock "$base"
+          else
+            echo "::notice::main has no scripts/security/yara-pack/pack.lock yet; checking the lock against its inputs only"
+            bash scripts/security/yara-pack/build-pack.sh --check-lock
+          fi
+
+      - name: Setup Go (YARA pack filter)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Test built-in YARA pack filter (race)
+        working-directory: scripts/security/yara-pack
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+      - name: Test YARA pack clean-corpus checker
+        run: node --test scripts/security/yara-pack/check-scan.test.mjs
 
       - name: Run M365 signing secret runtime smoke
         run: bash scripts/security/check-m365-graph-read-runtime.sh
@@ -1312,10 +1755,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1335,7 +1780,7 @@ jobs:
           echo "All expected dist artefacts present"
 
       - name: Upload API artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: api-dist
           path: apps/api/dist
@@ -1358,10 +1803,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1392,10 +1839,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1428,10 +1877,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'pnpm'
+          node-version-file: .node-version
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1464,10 +1915,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1484,7 +1937,7 @@ jobs:
         run: pnpm --filter @breeze/web run csp:guard
 
       - name: Upload Web artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: web-dist
           path: apps/web/dist
@@ -1507,10 +1960,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -1523,7 +1978,7 @@ jobs:
         run: pnpm build --filter=@breeze/portal
 
       - name: Upload Portal artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: portal-dist
           path: apps/portal/dist
@@ -1533,7 +1988,7 @@ jobs:
     name: Build Agent (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ${{ matrix.runner }}
     needs: [lint, changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.agent_code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1569,7 +2024,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: agent/go.sum
+          cache: false
+
+      - name: Restore Go cache
+        uses: ./.github/actions/restore-go-cache
 
       - name: Download Go dependencies
         working-directory: agent
@@ -1614,19 +2072,33 @@ jobs:
             --goos "$GOOS" --goarch "$GOARCH" --version "$BUILD_VERSION" --windowsgui \
             --out "breeze-user-helper-${GOOS}-${GOARCH}${{ matrix.suffix }}"
 
+      # #6263 W02: breeze-yarac (YARA compile policy CLI — W03 server
+      # pre-check, lab benchmark). Not a release artifact; built here so a
+      # cross-compile break and any plaintext signature in the embedded
+      # engine are caught on every platform the agent ships to.
+      - name: Build breeze-yarac
+        shell: bash
+        working-directory: agent
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: go build -trimpath -o "breeze-yarac-${GOOS}-${GOARCH}${{ matrix.suffix }}" ./cmd/breeze-yarac
+
       # Regression guard (#2797): built agent binaries must not contain
       # plaintext threat-signature strings — AV engines flag them as malware
       # (VT-confirmed Elastic Multi.EICAR on shipped exes).
       - name: Scan built binaries for plaintext threat signatures (#2797)
         run: |
           bins=("agent/breeze-agent-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}")
+          bins+=("agent/breeze-yarac-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}")
           if [ "${{ matrix.goos }}" = "windows" ]; then
             bins+=("agent/breeze-user-helper-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}")
           fi
           bash scripts/security/check-agent-binary-signatures.sh "${bins[@]}"
 
       - name: Upload Agent artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: breeze-agent-${{ matrix.goos }}-${{ matrix.goarch }}
           path: agent/breeze-agent-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
@@ -1634,7 +2106,7 @@ jobs:
 
       - name: Upload user-helper artifact (Windows only)
         if: matrix.goos == 'windows'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: breeze-user-helper-${{ matrix.goos }}-${{ matrix.goarch }}
           path: agent/breeze-user-helper-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
@@ -1652,7 +2124,7 @@ jobs:
     name: Agent Windows manifest guard
     runs-on: ubuntu-latest
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.agent_code == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1663,7 +2135,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: agent/go.sum
+          cache: false
+
+      - name: Restore Go cache
+        uses: ./.github/actions/restore-go-cache
 
       - name: Assert Windows manifests
         working-directory: agent
@@ -1682,32 +2157,87 @@ jobs:
           if echo "$uh" | grep -q 'requireAdministrator'; then echo "::error::breeze-user-helper is requireAdministrator (#949)"; exit 1; fi
           echo "$ag" | grep -q 'requireAdministrator' || { echo "::error::breeze-agent lost its requireAdministrator manifest"; exit 1; }
           if echo "$ag" | grep -q 'asInvoker'; then echo "::error::breeze-agent became asInvoker — lost requireAdministrator (#949)"; exit 1; fi
-          echo "Manifest guard OK: user-helper=asInvoker, agent=requireAdministrator"
+          # Both binaries host the remote-desktop capture/input path (the agent
+          # is the fallback when breeze-user-helper.exe is missing). A manifest
+          # fixes the process DPI mode before any code runs, so go-winres'
+          # default <dpiAware>true</dpiAware> (system) overrides the
+          # per-monitor-v2 elevation in internal/remote/desktop/dpi_windows.go
+          # and clicks land off-target on mixed-scale monitors.
+          for exe in /tmp/breeze-user-helper.exe /tmp/breeze-agent.exe; do
+            dpi=$(grep -a -o '<dpiAwareness[^<]*</dpiAwareness>' "$exe" | head -1 || true)
+            echo "$(basename "$exe") dpiAwareness: ${dpi:-<none>}"
+            echo "$dpi" | grep -qi 'permonitorv2' || { echo "::error::$(basename "$exe") manifest is not per-monitor-v2 DPI aware — remote-desktop clicks misalign on mixed-scale monitors"; exit 1; }
+          done
+          echo "Manifest guard OK: user-helper=asInvoker, agent=requireAdministrator, both per-monitor-v2"
 
   test-agent:
     name: Test Agent
     runs-on: ubuntu-latest
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.agent_code == 'true'
+    # Room for a package retry (W1, #10744): "Run Go tests" measured 5.8 min
+    # median / 5.9 max, setup + loopback/edition steps ≤ 1.5 min, across six
+    # CI runs 2026-10-29..30. Explicit so retry-shard's --budget-minutes (this
+    # minus a 5-min setup allowance) has a real ceiling.
+    timeout-minutes: 30
+    # The flaky ledger is read from the BASE commit, never the PR head
+    # (retry-shard + flaky-ledger.mjs, W1 #10744). Empty for other events →
+    # nothing quarantined.
+    env:
+      CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
+      # The depth-1 checkout lacks the base commit that retry-shard reads the
+      # flaky ledger from and diffs against (W1, #10744). Bounded retry; a
+      # failed fetch only disables quarantine (fail closed), never the job.
+      - name: Fetch base commit for the flaky ledger
+        if: env.CI_BASE_SHA != ''
+        run: |
+          for attempt in 1 2 3; do
+            if git fetch --no-tags --depth=1 origin "${CI_BASE_SHA}"; then
+              exit 0
+            fi
+            echo "git fetch of the base commit failed (attempt ${attempt}/3)" >&2
+            # No sleep after the final attempt — there is no fourth.
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $(( attempt * 5 ))
+            fi
+          done
+          echo "::warning title=Quarantine disabled::Could not fetch base ${CI_BASE_SHA}; no flaky-ledger test is quarantined in this job."
+
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: agent/go.sum
+          cache: false
+
+      - name: Restore Go cache
+        uses: ./.github/actions/restore-go-cache
 
       - name: Download Go dependencies
         working-directory: agent
         run: go mod download
 
+      # retry-shard runs `go test -json` (re-printing human output) and re-runs
+      # a failed shard once, uncached, overwriting coverage.out (W1, #10744).
       - name: Run Go tests
-        working-directory: agent
-        run: CGO_ENABLED=0 go test -v -coverprofile=coverage.out ./...
+        run: CGO_ENABLED=0 node .github/scripts/retry-shard.mjs --runner go --go-dir agent --label agent --budget-minutes 25 -- go test -v -coverprofile=coverage.out ./...
+
+      # Retry wrapper report (W1, #10744): written only when attempt 1 failed.
+      - name: Upload flake report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: flake-report-agent
+          path: flake-report-*.json
+          if-no-files-found: ignore
+          retention-days: 14
+          # A "re-run failed jobs" attempt uploads under the same name.
+          overwrite: true
 
       - name: Rebuild engine loopback test (root)
         if: runner.os == 'Linux'
@@ -1738,7 +2268,7 @@ jobs:
         run: agent/scripts/build-edition_test.sh
 
       - name: Upload coverage
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: agent-coverage
           path: agent/coverage.out
@@ -1748,7 +2278,7 @@ jobs:
     name: Test Agent (Windows)
     runs-on: windows-latest
     needs: [lint, changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.agent_code == 'true'
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -1760,7 +2290,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: agent/go.sum
+          cache: false
+
+      - name: Restore Go cache
+        uses: ./.github/actions/restore-go-cache
 
       - name: Download Go dependencies
         working-directory: agent
@@ -1868,11 +2401,54 @@ jobs:
       # and ipc: with GOOS=windows GOARCH=amd64 CGO_ENABLED=0 the package vets,
       # its test binary compiles, and its Windows dependency graph contains no
       # remote/desktop, no cgo, and no other first-party package.
+      # ./internal/backup/rebuild and ./internal/backup/winhive carry the W06
+      # Windows bare-metal engine (#5499): the real WinSystem (virtdisk VHDX,
+      # disk/volume IOCTLs, format/mount, hives) and its engine phases. Both
+      # were run natively on a Windows Server 2022 host before being added:
+      # rebuild green with 12 skips — the 11 TestRun_* Linux-engine round trips
+      # (they need bmr.RestoreSystemStateOffline, which is Linux-only) and
+      # TestRun_WindowsVhdxRealSystem, which runs in its own must-not-skip step
+      # below; winhive green with no skips. ./internal/backup/bmr joined here
+      # in 18b (#5499 W06d) once its one pre-existing native red,
+      # TestApplySystemState_SymlinkArtifact_NoDownloadCreatesSymlink
+      # (asserted a POSIX symlink target; Windows' os.Symlink itself converts
+      # the "/"-separated target to "\" on write, so os.Readlink then
+      # faithfully reads it back with backslashes), was fixed to compare
+      # after filepath.ToSlash on Windows — the Linux assertion is unchanged.
+      # ./internal/backup/hosttool resolves the host System32 tools that bmr
+      # and hyperv run (pnputil, powershell, bcdboot); its windows-tagged test proves the
+      # real GetSystemWindowsDirectory seam, which no other job exercises.
+      # Verified like winsvcinstall: with GOOS=windows GOARCH=amd64
+      # CGO_ENABLED=0 it vets, its test binary compiles, and its Windows
+      # dependency graph contains no cgo and no other first-party package.
+      #
+      # ./internal/svcquery (#7967) carries windows-tagged tests for the
+      # least-privilege service open (query-only access mask, not-found vs
+      # access-denied classification, WinDefend query). Verified with
+      # GOOS=windows GOARCH=amd64 CGO_ENABLED=0: vets and its test binary
+      # compiles; no cgo and no remote/desktop in its dependency graph.
+      #
+      # ./internal/collectors/timesync (#7452) carries windows-tagged tests
+      # that run nowhere else: the unsafe struct sizes/offsets the DsRole,
+      # DsGetDcNameW and GetDynamicTimeZoneInformation syscalls write into, the
+      # SCM state mapping, the Get-WinEvent script shape, and the PowerShell
+      # stderr surfacing on a failed event query. It was run natively on a
+      # Windows Server 2022 host before being added (green; TestLiveTimeSyncFacts
+      # skips unless TIMESYNC_LIVE=1, as it needs a described lab scenario). Its
+      # GOOS=windows CGO_ENABLED=0 test dependency graph contains no
+      # remote/desktop and no cgo.
+      #
+      # ./internal/pamdecline (#8971) is the durable record of the end user's
+      # PAM answer. Its tests are untagged; the Windows-sensitive part is the
+      # write path (atomicrename.Replace over an existing file, Chmod, the
+      # directory sync) and the corrupt-file quarantine rename. Its
+      # GOOS=windows CGO_ENABLED=0 test binary compiles and its dependency
+      # graph is atomicrename and logging only.
       - name: Run Windows Go tests
         working-directory: agent
         env:
           CGO_ENABLED: "0"
-        run: go test ./internal/sessionbroker ./internal/eventlog ./internal/elevaccount ./internal/ipc ./internal/logging ./internal/state ./internal/watchdog ./internal/backup/vss ./internal/executor ./internal/securefs ./internal/winsvcinstall ./cmd/breeze-watchdog
+        run: go test ./internal/sessionbroker ./internal/eventlog ./internal/elevaccount ./internal/ipc ./internal/logging ./internal/state ./internal/watchdog ./internal/backup/vss ./internal/backup/wingpt ./internal/backup/layout ./internal/backup/windisks ./internal/recoveryconsole ./internal/backup/rebuild ./internal/backup/winhive ./internal/backup/bmr ./internal/backup/hosttool ./internal/collectors/timesync ./internal/executor ./internal/securefs ./internal/winsvcinstall ./internal/svcquery ./internal/pamdecline ./cmd/breeze-watchdog
 
       # The step above runs without -v, so a t.Skip is indistinguishable from a
       # pass in its output. That matters here more than usual: elevaccount's two
@@ -1898,7 +2474,199 @@ jobs:
           if ($skips -ne 0) { throw "$skips of the absent-account tests SKIPPED - the runner could not reach the never-provisioned state they assert against, so the #4587 netapi32 fix has no live coverage here" }
           if ($passes -ne 2) { throw "expected exactly 2 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
 
-      # securefs's Windows implementation is the SEC-121 privileged-staging
+      # #9253: the YARA-X engine never started under a Windows service because
+      # yaraxwasm hands os.Stderr (an invalid handle without a console) to the
+      # wasm guest. yarac.EnsureEngine swaps an unusable stderr for NUL. These
+      # are the only tests that exercise NUL as the guest's stderr on Windows;
+      # assert all three ran and passed rather than trusting the exit code.
+      - name: Run Windows YARA-X unusable-stderr tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/yarascan/yarac -run '^Test(EngineStartsWithUnusableStderr|EnsureUsableStderrKeepsAWorkingStderr|EnsureUsableStderrReplacesAnUnusableStderr)$' -timeout 8m -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          $skips = @($out | Select-String -Pattern '^--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the unusable-stderr tests SKIPPED" }
+          if ($passes -ne 3) { throw "expected exactly 3 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # #9597: the Windows password-policy collector queried Win32_AccountPolicy,
+      # a WMI class that exists on no Windows build, so every device reported
+      # no policy. These run the real secedit export and NetUserModalsGet on
+      # this elevated runner and require the two sources to agree. Only these
+      # tests run: internal/security's other tests have never been verified on
+      # Windows. The secedit test skips on a filtered token, so assert no skips.
+      - name: Run Windows password policy reader tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/security -run '^TestLivePasswordPolicy' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          $skips = @($out | Select-String -Pattern '^--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the password policy tests SKIPPED - the runner token is not elevated, so secedit has no live coverage here" }
+          if ($passes -ne 2) { throw "expected exactly 2 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # internal/config's Windows owner/DACL code had never run in CI, which is
+      # how #7394 shipped: an elevated administrator running
+      # `breeze-agent enroll` was refused SYSTEM as the ProgramData owner
+      # (ERROR_INVALID_OWNER) and the device was left half-enrolled. The two
+      # RealToken tests drive the real SetNamedSecurityInfo from this elevated
+      # runner with SeRestorePrivilege disabled (the interactive admin-prompt
+      # state); they skip on a filtered token, so assert zero skips. Only these
+      # tests run, not the whole package: its serverurl TTL test is flaky on
+      # Windows (1ns TTL vs the Windows clock).
+      # The eight TestUserWorkspace* tests are the #7620 regression: Quick
+      # Support run by a standard user. They impersonate a filtered token
+      # (Administrators deny-only, no privileges) to secure the support
+      # workspace and run SaveEnrollment as that user, refuse a planted
+      # junction, file or foreign-owned directory, and check the machine-wide
+      # config policy is unchanged. The foreign-owner test plants its owner
+      # with SeRestorePrivilege, so it too needs this elevated runner.
+      # Nine more TestUserWorkspace* tests are the #7629 regression: support
+      # sessions keep all files in their private folder. The config, data and
+      # log dirs resolve there; once the session binds its agent.yaml, token
+      # rotation, mTLS renewal and every other config persist land there (also
+      # as a standard user); an installed agent's config at the default path
+      # is untouched; an outside-path persist is refused; and the H.264 codec
+      # in the folder passes the trust check with real ACLs as a standard
+      # user, but not once BUILTIN\Users can write it, and not in an elevated
+      # session (needs this elevated runner).
+      - name: Run Windows config owner/DACL tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/config -run '^Test(ApplyWindowsDACL|AssignOwnerWithFallback|UserWorkspace)' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          $skips = @($out | Select-String -Pattern '^--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the config owner/DACL tests SKIPPED - the runner token is not elevated, so the #7394 owner path has no live coverage here" }
+          if ($passes -ne 24) { throw "expected exactly 24 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # #7629: a support session's executable and private folder are removed
+      # after it exits, even when it still held files in the folder when it
+      # ended (technician End, closed console window). Runs the real cmd.exe
+      # cleanup against a running copy of the test binary; heartbeat is not
+      # in the Windows package list above, so only this test runs.
+      - name: Run Windows support-session cleanup test (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/heartbeat -run '^TestSupportSelfCleanupRemovesExecutableAndFolderAfterExit$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 1) { throw "expected exactly 1 top-level PASS line, got $passes - the test was renamed or removed" }
+
+      # #7765: the heartbeat DHCP check reads adapter flags in-process
+      # (GetAdaptersAddresses) instead of spawning powershell Get-NetIPInterface
+      # per adapter IP. This compares the two sources on a real Windows host;
+      # heartbeat is not in the Windows package list above, so only this runs.
+      - name: Run Windows DHCP state test (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/heartbeat -run '^TestReadDHCPEnabledAliasesIPHelperMatchesGetNetIPInterface$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 1) { throw "expected exactly 1 top-level PASS line, got $passes - the test was renamed or removed" }
+
+      # #9091: the user-helper's Windows toast tests had only ever compiled.
+      # internal/userhelper is not in the package list above (its other
+      # Windows-tagged tests have never been run natively), so these run by
+      # name: toast backend routing, including no PowerShell retry when
+      # toasts are disabled (so FallbackDialog fires); the NotificationSetting
+      # mapping; the hidden PowerShell fallback command and its own Setting
+      # check; and the real WinRT sequence, which must read get_Setting and
+      # fail no earlier than IToastNotifier::Show, judged by the rule
+      # TestWinRTSequenceVerdict pins. Show may be refused without an
+      # interactive desktop, but in run 39156151658 it returned S_OK while
+      # get_Setting returned ERROR_NOT_FOUND (0x80070490); that exact
+      # get_Setting failure is accepted next to a successful Show, any other
+      # is not.
+      # TestShowToastWinRTLive raises a visible toast and stays unselected.
+      - name: Run Windows user-helper toast tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/userhelper -run '^Test(ShowNotificationOS|NotificationSettingError|ToastPowerShellCommandIsHidden|ToastPowerShellScriptRefusesDisabledNotifier|WinRTSequenceVerdict|ShowToastWinRTFailsNoEarlierThanShow)$' -timeout 5m -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $skips = @($out | Select-String -Pattern '^\s*--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the user-helper toast tests SKIPPED" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 6) { throw "expected exactly 6 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+          $subPasses = @($out | Select-String -Pattern '^\s+--- PASS: Test').Count
+          if ($subPasses -ne 21) { throw "expected exactly 21 subtest PASS lines, got $subPasses - a table case was renamed, removed, or added without updating this count" }
+
+      # #7629: the agent re-secures its config folder if another account
+      # created it, before reading anything from it. The tests plant
+      # C:\ProgramData\Breeze-shaped folders as a simulated standard user
+      # (filtered token) and take them back with this elevated runner's token,
+      # as SYSTEM or an elevated `breeze-agent enroll` would. The
+      # MachineConfigTrust tests check that the shared config loader refuses
+      # a machine config another account could have written. They skip on a
+      # non-elevated token, so assert zero skips. A separate step (not the -run
+      # filter above) so it does not collide with other changes to that one.
+      - name: Run Windows config folder reclaim tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/config -run '^Test(ReclaimConfigDir|AdminGroupMember|MachineConfigTrust)' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          $skips = @($out | Select-String -Pattern '^--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the reclaim tests SKIPPED - the runner token is not elevated" }
+          if ($passes -ne 19) { throw "expected exactly 19 top-level PASS lines, got $passes - a reclaim test was renamed, removed, or added without updating this count" }
+
+      # The helper-scoped token must never sit in a file a standard Windows user
+      # can read: it reaches the console-session Breeze Assist over IPC only,
+      # and a token an older agent left in agent.yaml is scrubbed and rotated.
+      # The owner/DACL step above runs only its own tests, so none of these —
+      # including the platform-neutral ones that encode the Windows behaviour —
+      # ran on Windows before. Assert every one of them actually PASSED.
+      - name: Run Windows helper token tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/config -run '^Test(WindowsHelperToken|IsSecretYAMLKey$|HelperTokensAreNeverExemptedFromStripping$|PersistSettersNeverWriteLoadedSecretsBack$|FixAgentYAMLPermissionsRecordsRotationOwedForLegacyHelperToken$|RotationOwedSurvivesAnUnwritableMarker$|PromotePendingCredentialsClearsRotationOwed$|SaveToKeepsFullAgentTokensOutOfAgentYAML$|MigrateInlineSecretsToSecretFileScrubsAgentYAML$|FixConfigPermissionsScrubsActiveNonDefaultConfig$|UnparsableAgentYAMLOwesRotationOnlyForARealHelperToken$|PromotePendingCredentialsSucceedsWhenMarkerCannotBeCleared$|ScrubOwesRotationOnlyForAStillValidHelperToken$|StartupLogsAreHeldUntilLoggingIsInitialized$)' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          $skips = @($out | Select-String -Pattern '^--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the helper token tests SKIPPED" }
+          if ($passes -ne 15) { throw "expected exactly 15 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # securefs's Windows implementation is the privileged-staging
       # boundary: handle-relative NtCreateFile walks, reparse-point rejection at
       # every component, the atomic FILE_RENAME_INFO publish, and symlink entry
       # restore. Its reparse-point cases plant a junction with `mklink /J` and
@@ -1913,14 +2681,209 @@ jobs:
           CGO_ENABLED: "0"
         shell: pwsh
         run: |
-          $out = go test ./internal/securefs -run '^Test(InstallFileRejectsReparsePointAtEveryDepth|InstallFileResistsConcurrentComponentSwap|RenameRelativePublishesUnderThePinnedParent|InstallDirOnWindows|InstallSymlinkOnWindows|InstallSymlinkRefusesToReplaceAJunction|BuildSymlinkReparseBufferLayout|TargetIsDirectoryRefusesToProbeRemoteShapes|VerifyPrivateDirRejectsAReparsePoint|EnsurePrivateDirRepairsAnExistingInheritedDACL|EnsurePrivateDirTightensAPermissiveProtectedDACL|VerifyPrivateDirRejectsAnInheritedDACL)$' -v 2>&1
+          $out = go test ./internal/securefs -run '^Test(InstallFileRejectsReparsePointAtEveryDepth|InstallFileResistsConcurrentComponentSwap|RenameRelativePublishesUnderThePinnedParent|InstallDirOnWindows|InstallSymlinkOnWindows|InstallSymlinkRefusesToReplaceAJunction|BuildSymlinkReparseBufferLayout|TargetIsDirectoryRefusesToProbeRemoteShapes|VerifyPrivateDirRejectsAReparsePoint|EnsurePrivateDirRepairsAnExistingInheritedDACL|EnsurePrivateDirTightensAPermissiveProtectedDACL|VerifyPrivateDirRejectsAnInheritedDACL|InstallJunctionOnWindows|InstallJunctionRefusesToReplaceOnWindows|InstallJunctionRefusesReparseAncestorOnWindows|EnsureNoReparsePointsAlongOnWindows)$' -v 2>&1
           $exit = $LASTEXITCODE
           $out | ForEach-Object { Write-Host $_ }
           if ($exit -ne 0) { throw "go test failed (exit $exit)" }
           $skips = @($out | Select-String -Pattern '^\s*--- SKIP: Test').Count
-          if ($skips -ne 0) { throw "$skips of the secure-staging boundary tests SKIPPED - the SEC-121 Windows reparse-point/DACL boundary has no live coverage here" }
+          if ($skips -ne 0) { throw "$skips of the secure-staging boundary tests SKIPPED - the Windows reparse-point/DACL boundary has no live coverage here" }
           $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
-          if ($passes -ne 12) { throw "expected exactly 12 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+          if ($passes -ne 16) { throw "expected exactly 16 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # Grant-mode diagnostic reads (diag_file_list / diag_file_read) refuse any
+      # path whose final, handle-resolved location differs from the requested
+      # one: junctions, 8.3 short names, stream and namespace spellings, and a
+      # root swapped for a junction after approval. internal/remote/tools as a
+      # whole is excluded from the package list above (#2523), so these run by
+      # name. Only one skip is tolerated: the POSIX symlink test (Windows
+      # symlinks need a privilege; junctions are covered instead). The 8.3 test
+      # must PASS: short-name generation is switched on for the temp volume first.
+      - name: Run Windows diagnostic-access containment tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          # 8.3 names must exist for the short-name test to prove anything:
+          # enable generation on the temp volume (runners are admin).
+          $tempVolume = (Split-Path -Qualifier $env:TEMP)
+          fsutil 8dot3name set $tempVolume 0 | Out-Null
+          $out = go test ./internal/remote/tools -run '^Test(Diag|ClassifyDiagnosticPath|SensitiveReadPathsAreAllClassified)' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $skips = @($out | Select-String -Pattern '^\s*--- SKIP: (Test\S+)' | ForEach-Object { $_.Matches[0].Groups[1].Value })
+          $unexpected = @($skips | Where-Object { $_ -notin @('TestDiagnosticLinkEscapesRefused') })
+          if ($unexpected.Count -ne 0) { throw "unexpected skips: $($unexpected -join ', ') - Windows diagnostic-access containment has no live coverage for them" }
+          # Every containment, token and classifier test must PASS by name, so
+          # deleting or renaming one fails this step instead of shrinking it.
+          $required = @(
+            'TestClassifyDiagnosticPathSharedFixture',
+            'TestDiagInteropAPISignedAuthorizationVerifiesOnAgent',
+            'TestDiagInteropSealedVectorOpensWithServerKey',
+            'TestDiagnosticHardDeniedEvenIfNamed',
+            'TestDiagnosticHardLinkRefused',
+            'TestDiagnosticListPagination',
+            'TestDiagnosticListWithholdsCredentialMaterial',
+            'TestDiagnosticOutOfScopeAndPrefixSibling',
+            'TestDiagnosticPathFormsRejected',
+            'TestDiagnosticReadAuthorizedPaginatedAndSealed',
+            'TestDiagnosticRecursiveVsFlat',
+            'TestDiagnosticCredentialMaterialIsNeverReadable',
+            'TestDiagnosticAuthorizationNamingAClassIsRefused',
+            'TestDiagnosticTokenFailures',
+            'TestDiagnosticTraversalSpellingsRefused',
+            'TestDiagWindowsAlternatePathFormsRefused',
+            'TestDiagWindowsCaseInsensitiveContainment',
+            'TestDiagWindowsJunctionEscapesRefused',
+            'TestDiagWindowsShortNameRefused',
+            'TestSensitiveReadPathsAreAllClassified'
+          )
+          foreach ($must in $required) {
+            if (-not ($out | Select-String -SimpleMatch "--- PASS: $must ")) { throw "$must did not PASS" }
+          }
+
+      # sd_windows.go/winpriv_windows.go are the HiveNightmare-class fix
+      # (CVE-2021-36934) this wave depends on: a rebuilt C:\ with no
+      # captured security descriptors gives Authenticated Users Modify on
+      # System32\config (see Part 0 D-ACL). internal/backup as a whole is
+      # excluded from the bare package list above (inherited backlog,
+      # #2523), so these seven tests — the only live proof
+      # GetFileSecurityW/SetFileSecurityW round-trip on a real NTFS volume,
+      # that privilege scopes release cleanly, that restore reapplies a
+      # captured descriptor to a file and to a directory, and that a failed
+      # apply degrades to a warning rather than failing the restore — would
+      # otherwise run on no CI job at all. The three securefs-side
+      # counterparts (InstallFileWithSecurity applying to the pinned
+      # temporary before publish, its apply-error-as-warning path, and
+      # ApplyDirSecurity refusing a junction) already run above as part of
+      # ./internal/securefs in the bare package list, since that package is
+      # not excluded — no separate step needed for those. Same must-not-skip
+      # pattern as the elevaccount/securefs steps above: assert PASS count
+      # and zero skips, not just a zero exit code.
+      # The two hive-privilege tests (W06, #5499) prove AcquireHivePrivileges
+      # enables SeBackup/SeRestore only inside its scope and that a partial
+      # AcquirePrivileges failure releases what it already enabled — the
+      # scope every offline hive load in the rebuild engine runs under.
+      # The restricted-descriptor tests read principals from real
+      # descriptors, resolve the local account domain, read back the
+      # restrictive ACL a restore applies to an entry whose descriptor names
+      # unknown principals or cannot be read, and refuse stream and alias
+      # names in a restore.
+      - name: Run Windows security-descriptor capture/apply tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/backup -run '^Test(FileSecurityReturnsSelfRelativeSD|FileSecurityRoundTrip|ApplySecurityRefusesMalformedDescriptor|SDPrivilegeScopesRelease|Restore_AppliesSecurityDescriptor|Restore_AppliesDirectorySecurityDescriptor|Restore_InvalidSecurityDescriptorIsQuarantined|SecurityDescriptorPrincipalsFromRealDescriptor|SecurityDescriptorLocalKnownDomains|SecurityDescriptorQuarantineOnRealRestore|SecurityDescriptorSACLOnlyUnknownDropsTheSACL|RestoreFromSnapshot_RefusesInvalidWindowsNames|AcquireHivePrivileges_ScopesRelease|AcquirePrivileges_PartialFailureReleasesEarlier)$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $skips = @($out | Select-String -Pattern '^\s*--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the security-descriptor / hive-privilege tests SKIPPED - the HiveNightmare-class fix or the hive privilege scope has no live coverage here" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 14) { throw "expected exactly 14 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # Whole-machine Windows capture path. internal/backup and
+      # internal/backup/systemstate are both excluded from the bare package
+      # list above: run natively on Server 2022 (Defender on) each has
+      # pre-existing failures unrelated to this path — internal/backup 9
+      # (mode/mtime/contract-matcher tests written against POSIX semantics),
+      # systemstate 4 (TestHelper* assert POSIX modes/mtimes). So,
+      # like the steps above, name the tests and assert they PASSED.
+      # cleanBackupRoot: a VSS whole-machine root (`C:\` rewritten to
+      # \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN\) must keep its
+      # trailing separator — filepath.Clean strips it only under Windows path
+      # semantics, and the bare device does not stat, which failed every
+      # whole-machine backup. The systemstate tests pin the #5397 follow-up:
+      # under VSS the registry hive files are copied from the shadow copy
+      # (CreateFile with backup semantics) and reg.exe is never spawned; a run
+      # with no run-wide VSS session (pathless system_image, IPC
+      # system_state_collect) takes its own system-volume snapshot, and only a
+      # VSS failure reaches reg.exe. The #7367 tests pin that the loaded hives
+      # are flushed right before either snapshot (never when none is taken),
+      # that a stuck or failing flush never holds up the backup, and that the
+      # real RegFlushKey call flushes a loaded hive. The
+      # live counterparts (TestLive_WholeMachineShadowRootIsWalkable,
+      # TestLive_CollectRegistryFromRealShadowCopy) stay opt-in behind
+      # BREEZE_VSS_LIVE like the other live VSS suites.
+      - name: Run Windows whole-machine capture path tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/backup ./internal/backup/systemstate -run '^Test(ShadowDeviceRoot_Classification|CleanBackupRoot_BareShadowDeviceGetsSeparator|CleanBackupRoot_ShadowDeviceRootKeepsItsSeparator|CleanBackupRoot_ChildrenMapBackThroughOriginalPathsForVSS|ShadowConfigDir|ShadowConfigDir_WindowsDevicePath|CollectRegistryHivesForRun_UnderVSSCopiesFromShadowWithoutRegExe|CollectRegistryHivesFromShadow_MissingLogsAreNotAFailure|CollectRegistryHivesForRun_MissingShadowHiveFailsAndIsNamed|CollectRegistryHivesFromShadow_UnreadableLogFailsTheWholeHive|CollectRegistryHivesForRun_WithoutShadowUsesRegSave|CollectRegistryHivesForRun_PrivilegeFailureIsNotFatal|WindowsCollectRegistry_UnderVSSCopiesFromShadowNotRegExe|CollectRegistryHivesForRun_NoRunShadowTakesOwnSystemVolumeSnapshot|CollectRegistryHivesForRun_RunShadowCoveringSystemVolumeTakesNoSnapshot|CollectRegistryHivesForRun_OwnSnapshotFailureFallsBackToRegSave|CollectRegistryHivesForRun_OwnSnapshotMissingSystemVolumeIsReleased|CollectRegistryHivesForRun_SkipSystemVolumeSnapshot|CollectRegistryHivesFromShadow_MissingDefaultIsBestEffort|NewCollector_DefaultsToOwnSystemVolumeSnapshot|RunBackupContext_FlushesRegistryBeforeTheRunsSnapshot|RunBackupContext_NoVSSNoRegistryFlush|CollectRegistryHivesForRun_OwnSnapshotFlushesHivesFirst|CollectRegistryHivesForRun_NoOwnSnapshotNoFlush|FlushRegistryHives_StuckFlushDoesNotBlockTheCaller|FlushRegistryHives_FailureAndPanicAreContained|FlushHiveKey_FlushesALoadedHive|FlushHiveKey_UnloadedHiveIsErrHiveNotLoaded|LoadedUserHives_ListsDefault)$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $skips = @($out | Select-String -Pattern '^\s*--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the whole-machine capture path tests SKIPPED" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 29) { throw "expected exactly 29 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # The real WinSystem (internal/backup/rebuild/winsystem_windows.go) and
+      # winhive's RegLoadKeyW/RegUnLoadKeyW are the W06 Windows engine's only
+      # contact with the host: VHDX create/attach/detach, GPT write/read,
+      # format.com, folder mounts, drive letters, hive load/unload. Every one
+      # of these tests skips loudly when the token is not elevated (the
+      # assertions would be vacuous), and the bare package run above has no
+      # -v, so a skip there reads as a pass. windows-latest runners are
+      # elevated; assert all eleven actually PASSED.
+      # W06c (#5499) adds two: TestControlSetsAndMountedDevices_RealHive
+      # proves winhive's offline edits (control sets, MountedDevices) round-
+      # trip through a real reg-save SYSTEM hive load/unload, and
+      # TestLoadReadOnly_ReadsAnAdminReadOnlyBCDStore proves
+      # WinSystem.LoadHiveReadOnly can read a BCD-Template-derived store,
+      # which denies KEY_ALL_ACCESS to Administrators even with
+      # SeBackup/SeRestore held (a lab-found production defect, see the W06c
+      # PR).
+      - name: Run Windows rebuild-engine host seam tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/backup/rebuild ./internal/backup/winhive -run '^Test(WinSystem_VolumesOnDiskSystemDisk|WinSystem_FreeSpaceWalksUpToAnExistingDir|WinSystem_CreateAttachVHDXSectorSizes|WinSystem_VHDXProvisionRoundTrip|WinSystem_DetachVHDXByPathFromAnotherInstance|WinSystem_DetachVHDXByPathForeignAttaches|WinSystem_LoadHiveRoundTripAndStaleSweep|UnloadStale_NoMatches|Load_MissingFileFailsWithoutMount|ControlSetsAndMountedDevices_RealHive|LoadReadOnly_ReadsAnAdminReadOnlyBCDStore)$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $skips = @($out | Select-String -Pattern '^\s*--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the rebuild-engine host seam tests SKIPPED - the real WinSystem/winhive have no live coverage on this runner (not elevated?)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 11) { throw "expected exactly 11 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # TestRun_WindowsVhdxRealSystem (internal/backup/rebuild) is the W06
+      # Windows engine's one end-to-end real-hardware proof: create/attach a
+      # 2 GiB dynamic VHDX, provision GPT partitions with the recorded GUIDs,
+      # format, restore files (including real SYSTEM/SOFTWARE/BCD hives)
+      # through the root volume's \\?\Volume{GUID}\ path, apply the offline
+      # system-state edits, run with SkipBoot:false so it drives the host's
+      # own bcdboot.exe to regenerate the ESP (/f UEFI /v /p) and identity
+      # (-RESTORED, MachineGuid, enrollment strip), validate (BCD default
+      # entry read back through a read-only hive load, checksum sample,
+      # flush, unmount, no-letter bit cleared, GUIDs read back), detach —
+      # then re-attach and read the restored bytes back. windows-latest
+      # runners are elevated and ship virtdisk.dll (no Hyper-V role needed —
+      # VHDX create/attach works without it), so this has no reason to skip
+      # here; a skip must fail the job, exactly like the Linux loopback
+      # step's own must-not-skip assertion.
+      - name: Run Windows real-VHDX rebuild engine test — bcdboot + identity (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+          BREEZE_REBUILD_VHDX_TEST: "1"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/backup/rebuild -run '^TestRun_WindowsVhdxRealSystem$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $skips = @($out | Select-String -Pattern '^\s*--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "TestRun_WindowsVhdxRealSystem SKIPPED - the W06 Windows engine has no real-VHDX coverage on this runner" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 1) { throw "expected exactly 1 PASS line, got $passes - the test was renamed or another test matched the -run filter" }
 
       # The policy-state registry collector decides whether a batch uploads with
       # `replace: true` — which deletes every prior row for the device. That
@@ -1970,6 +2933,40 @@ jobs:
           CGO_ENABLED: "0"
         run: go test ./internal/collectors -run '^TestCollectorCommand|^TestCappedBuffer' -v
 
+      # The VPN collector's Windows service query (#8763) is a PowerShell
+      # pipeline that looks up Zscaler drivers by name; a non-zero exit when
+      # they are absent would silently drop every provider's service signal.
+      # Only a real Windows host can prove it exits 0 and emits Name<TAB>DisplayName.
+      - name: Run Windows VPN service query test
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/collectors -run '^TestWindowsVPNServiceQuery$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: TestWindowsVPNServiceQuery').Count
+          if ($passes -ne 1) { throw "TestWindowsVPNServiceQuery did not run - renamed or removed without updating this step" }
+
+      # #9267: link speed is read in-process via GetIfTable2Ex. These are the
+      # only tests that exercise the real Windows getLinkSpeed (it must never
+      # spawn PowerShell again) and the real MIB_IF_TABLE2 read; elsewhere
+      # they only compile.
+      - name: Run Windows link-speed tests
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/collectors -run '^(TestGetLinkSpeedWindowsNeverSpawnsProcess|TestReadIfTable2LinkSpeedsLive)$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 2) { throw "expected exactly 2 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
       # internal/backup is the third instance of the same gap: its
       # upload_error_class_codes_windows_test.go pins the Win32 permanent-error
       # codes (#2997) against golang.org/x/sys/windows, and those codes drive
@@ -1993,7 +2990,10 @@ jobs:
       # minutes), but the path-rewrite seam that decides whether a backup reads
       # the shadow copy or the live volume is pure string logic, and it is only
       # meaningful on Windows because filepath.VolumeName returns "" everywhere
-      # else. Without this it has no CI coverage at all.
+      # else. Without this it has no CI coverage at all. That includes
+      # TestRewritePathsForVSS_DriveRelativePathIsNotRewritten (`C:foo` must
+      # not be glued onto a shadow device root), counted here, not in the
+      # whole-machine capture path step below.
       - name: Run Windows backup error-classification and VSS path-rewrite tests
         working-directory: agent
         env:
@@ -2005,7 +3005,27 @@ jobs:
           $out | ForEach-Object { Write-Host $_ }
           if ($exit -ne 0) { throw "go test failed (exit $exit)" }
           $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
-          if ($passes -ne 13) { throw "expected exactly 13 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+          if ($passes -ne 14) { throw "expected exactly 14 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
+
+      # Junctions backed up as links and recreated on restore (#7325). These
+      # plant real junctions with `mklink /J` and restore one to another
+      # location; the rest of the junction logic is covered by the portable
+      # tests in test-agent. internal/backup is excluded from the bare package
+      # list above, so name the tests and assert they PASSED.
+      - name: Run Windows junction backup/restore tests (must not skip)
+        working-directory: agent
+        env:
+          CGO_ENABLED: "0"
+        shell: pwsh
+        run: |
+          $out = go test ./internal/backup -run '^Test(PlatformSkippedReparsePoint_ClassifiesRealJunction|CollectBackupFiles_JunctionCapturedNotTraversed|Junction_BackupRestoreRoundTripOnWindows)$' -v 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($exit -ne 0) { throw "go test failed (exit $exit)" }
+          $skips = @($out | Select-String -Pattern '^\s*--- SKIP: Test').Count
+          if ($skips -ne 0) { throw "$skips of the junction tests SKIPPED - junction capture/restore has no live coverage here" }
+          $passes = @($out | Select-String -Pattern '^--- PASS: Test').Count
+          if ($passes -ne 3) { throw "expected exactly 3 top-level PASS lines, got $passes - a test in the -run filter was renamed, removed, or added without updating this count" }
 
       # -race requires cgo, which remote/desktop cannot satisfy on Windows, so
       # this covers only packages that do not import it (heartbeat, agentapp and
@@ -2069,7 +3089,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: agent/go.sum
+          cache: false
+
+      - name: Restore Go cache
+        uses: ./.github/actions/restore-go-cache
 
       - name: Toolchain
         run: |
@@ -2095,7 +3118,14 @@ jobs:
       - name: Build helper + ISO
         run: |
           cd agent
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o breeze-backup-linux-amd64 ./cmd/breeze-backup
+          # -X recoveryconsole.unattendedCmdlineEnabled=1: this ISO is the
+          # ONLY place in the whole pipeline that opts into honoring
+          # breeze.ci=1 from the kernel cmdline (see
+          # internal/recoveryconsole/buildflags.go) — the QEMU boot below
+          # needs it to drive the recovery console unattended. Every
+          # release/self-host build (scripts/build-edition.sh) omits this
+          # flag, so breeze.ci=1 is inert on real recovery media.
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/breeze-rmm/agent/internal/recoveryconsole.unattendedCmdlineEnabled=1" -o breeze-backup-linux-amd64 ./cmd/breeze-backup
           go build -o breeze-recovery-fakeserver ./cmd/breeze-recovery-fakeserver
           # ubuntu-latest's `live-build` is Ubuntu's own old fork
           # (3.0~a57-based, not Debian's) and rejects flags Debian's
@@ -2107,12 +3137,10 @@ jobs:
           # inside a real debian:bookworm container instead of directly on
           # the runner.
           # This job only ever builds the amd64 leg, so only
-          # grub-efi-amd64-bin is needed — grub-efi-arm64-bin is a
-          # foreign-architecture package (Debian ships it under an arm64
-          # apt architecture, not as arch-agnostic content) that needs
-          # `dpkg --add-architecture arm64` before apt can even see it;
-          # see release.yml's build-recovery-media job, which builds both
-          # legs and does need it.
+          # grub-efi-amd64-bin is needed. The arm64 leg is built only by
+          # release.yml's build-recovery-media job, on a native arm64
+          # runner (live-build cannot bootstrap a foreign architecture
+          # without qemu configuration — see #6731).
           docker run --rm --privileged -v "$PWD":/src -w /src debian:bookworm bash -c '
             apt-get update -qq &&
             apt-get install -y -qq --no-install-recommends live-build debootstrap squashfs-tools xorriso grub-efi-amd64-bin mtools dosfstools ca-certificates cpio >/dev/null &&
@@ -2135,7 +3163,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: recovery-media-e2e-logs
           path: |
@@ -2157,7 +3185,7 @@ jobs:
     name: Lint Agent (Go)
     runs-on: ubuntu-latest
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.agent_code == 'true'
     # CGO off (matches test-agent): the agent's only cgo files are the linux
     # X11/pcap capture backends, whose C headers are not on the runner. vet +
     # lint cover the CGO-off build; the cgo backends are compiled by build-agent.
@@ -2174,7 +3202,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: agent/go.sum
+          cache: false
+
+      - name: Restore Go cache
+        uses: ./.github/actions/restore-go-cache
 
       - name: go vet
         working-directory: agent
@@ -2210,7 +3241,7 @@ jobs:
       # skips the install (and its network calls) entirely.
       - name: Cache golangci-lint binary
         id: golangci-lint-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/go/bin/golangci-lint
           key: golangci-lint-v2.12.2-${{ runner.os }}
@@ -2254,29 +3285,71 @@ jobs:
     name: Test Agent (race)
     runs-on: macos-latest
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
-    timeout-minutes: 15
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.agent_code == 'true'
+    # Room for a package retry (W1, #10744): "go test -race" measured 16.5 min
+    # median / 19.2 max, setup ≤ 2.1 min, across six CI runs 2026-10-29..30
+    # (macOS runners vary ~2×). 2 × 19.2 + 5 ≈ 43. retry-shard's
+    # --budget-minutes is this minus a 5-min setup allowance.
+    timeout-minutes: 50
+    # The flaky ledger is read from the BASE commit, never the PR head
+    # (retry-shard + flaky-ledger.mjs, W1 #10744). Empty for other events →
+    # nothing quarantined.
+    env:
+      CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
+      # The depth-1 checkout lacks the base commit that retry-shard reads the
+      # flaky ledger from and diffs against (W1, #10744). Bounded retry; a
+      # failed fetch only disables quarantine (fail closed), never the job.
+      - name: Fetch base commit for the flaky ledger
+        if: env.CI_BASE_SHA != ''
+        run: |
+          for attempt in 1 2 3; do
+            if git fetch --no-tags --depth=1 origin "${CI_BASE_SHA}"; then
+              exit 0
+            fi
+            echo "git fetch of the base commit failed (attempt ${attempt}/3)" >&2
+            # No sleep after the final attempt — there is no fourth.
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $(( attempt * 5 ))
+            fi
+          done
+          echo "::warning title=Quarantine disabled::Could not fetch base ${CI_BASE_SHA}; no flaky-ledger test is quarantined in this job."
+
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: agent/go.sum
+          cache: false
+
+      - name: Restore Go cache
+        uses: ./.github/actions/restore-go-cache
 
       - name: Download Go dependencies
         working-directory: agent
         run: go mod download
 
+      # A failed shard re-runs once, uncached, via retry-shard (W1, #10744).
       - name: go test -race ./...
-        working-directory: agent
         env:
           CGO_LDFLAGS_ALLOW: '-weak_framework|ScreenCaptureKit'
-        run: CGO_ENABLED=1 go test -race -count=1 ./...
+        run: CGO_ENABLED=1 node .github/scripts/retry-shard.mjs --runner go --go-dir agent --label agent-race --budget-minutes 45 -- go test -race -count=1 -timeout 20m ./...
+
+      # Retry wrapper report (W1, #10744): written only when attempt 1 failed.
+      - name: Upload flake report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: flake-report-agent-race
+          path: flake-report-*.json
+          if-no-files-found: ignore
+          retention-days: 14
+          # A "re-run failed jobs" attempt uploads under the same name.
+          overwrite: true
 
   # ─── Windows runtime smoke (#1000) ────────────────────────────────────
   # CI cross-compiles the Windows agent (build-agent matrix) but never RAN
@@ -2305,7 +3378,7 @@ jobs:
     name: Windows Runtime Smoke
     runs-on: windows-latest
     needs: [lint, changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.agent_code == 'true'
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -2317,7 +3390,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: agent/go.sum
+          cache: false
+
+      - name: Restore Go cache
+        uses: ./.github/actions/restore-go-cache
 
       - name: Download Go dependencies
         working-directory: agent
@@ -2461,35 +3537,70 @@ jobs:
         with:
           persist-credentials: false
 
+      # Restore the cached .deb closure so a normal run never touches the Ubuntu
+      # mirror (#9753). The key lives in the shared composite action. Caches
+      # are ref-scoped and CI does not run on push to main, so this job only
+      # READS what `ci-cache-seed.yml` saves from main; a run that
+      # misses falls back to the network path below (and its own save is
+      # visible only to that ref).
+      - name: Cache Tauri apt packages
+        id: tauri-apt-cache
+        uses: ./.github/actions/tauri-apt-cache
+
       - name: Install Tauri system dependencies
-        # Bound the STEP, not just the commands inside it. The per-command
-        # deadlines below sum to ~27.75m worst case (3 attempts x 8m, plus two
-        # 90s dpkg recoveries, plus 45s of backoff), and the job budget is 35m
-        # JOB-wide — so a worst-case apt would leave ~7m for Rust toolchain
-        # setup, a cold `cargo check` on two webkit2gtk-linked crates, and the
-        # viewer tests. On a cache miss that is not enough, and the job would
-        # die on GitHub's generic "job timed out" with no diagnostic: the exact
-        # failure #3730 reported and this step exists to prevent, merely
-        # relocated from apt to whatever ran last.
+        # Bound the STEP, not just the commands inside it. The old network path
+        # retried 3 times (~27.75m worst case) under a step with no timeout, which
+        # on a 35m JOB-wide budget left ~7m for Rust toolchain setup, a cold
+        # `cargo check` on two webkit2gtk-linked crates, and the viewer tests. On a
+        # cache miss that is not enough, and the job would die on GitHub's generic
+        # "job timed out" with no diagnostic: the exact failure #3730 reported and
+        # this step exists to prevent, merely relocated from apt to whatever ran
+        # last.
+        #
+        # Worst case inside the 12m step: a failed cached `dpkg -i` (<= 1m45s +
+        # 45s recovery = 2.5m), then ONE network attempt (2m update + 5m install,
+        # +15s/30s kill-after = ~8m) = ~10.5m. The network path is a single attempt
+        # (#9847): attempt 2 of the old loop could never complete inside 12m, so
+        # the retries were dead weight. It fails fast with a real error; re-run to
+        # land on a fresh runner. The cache (keyed on distro + package list) is
+        # what keeps normal runs off this path.
         #
         # 12m caps apt at roughly a third of the budget and fires as a labelled
         # step timeout, leaving 23m for the Rust work regardless of how badly
         # the mirror behaves.
         timeout-minutes: 12
+        env:
+          TAURI_DEBS_DIR: ${{ steps.tauri-apt-cache.outputs.dir }}
+          TAURI_CACHE_HIT: ${{ steps.tauri-apt-cache.outputs.cache-hit }}
         run: |
+          # Cache hit: install the saved .deb closure with dpkg. No apt-get
+          # update, no mirror traffic (#9753). Any failure here falls through to
+          # the network path below, which is also the cache-miss path.
+          if [ "${TAURI_CACHE_HIT}" = "true" ] && ls "${TAURI_DEBS_DIR}"/*.deb >/dev/null 2>&1; then
+            if sudo timeout --kill-after=15s 90s dpkg -i "${TAURI_DEBS_DIR}"/*.deb; then
+              echo "Tauri system dependencies installed from cache (no mirror access)."
+              exit 0
+            fi
+            echo "::warning::cached .deb install failed; falling back to the network install"
+            sudo timeout --kill-after=15s 30s dpkg --configure -a || true
+          fi
+          # Network path. Download into a private archives dir so the .debs can
+          # be copied into the cache dir once the install succeeds.
+          TAURI_PKGS=($(grep -v '^#' .github/tauri-apt-packages.txt))
+          TAURI_ARCHIVES=$(mktemp -d)
+          chmod 755 "$TAURI_ARCHIVES"  # let apt's sandbox user traverse it
           # The Azure apt mirror (azure.archive.ubuntu.com) is intermittently
           # degraded and can crawl at 1-4 min/package, blowing this job's
           # timeout before Rust ever compiles — a transient infra flake that
           # reds `main` and fires main-red-alert with zero code signal (#1605).
-          # Switch to the canonical mirror and retry update+install with
-          # backoff so a slow mirror doesn't masquerade as a build failure.
+          # Switch to the canonical mirror so a slow mirror doesn't masquerade as
+          # a build failure.
           #
-          # The retry loop above only helps when apt EXITS non-zero. Observed
-          # failures instead STALL: apt stops emitting output right after the
-          # InRelease fetches and never returns, so no attempt ever completes
-          # and the job burns its full 35-minute budget without logging a single
-          # retry warning (#3730). Give each phase its own deadline so a stall
-          # fails fast and the retry logic can actually run.
+          # Observed failures STALL rather than exit non-zero: apt stops
+          # emitting output right after the InRelease fetches and never
+          # returns, and the job burns its full 35-minute budget without
+          # logging anything (#3730). Give each phase its own deadline so a
+          # stall fails fast with a real error.
           #
           # `timeout` is invoked under sudo (not `timeout sudo ...`) so it
           # signals apt-get itself as root; wrapping sudo would kill the wrapper
@@ -2498,11 +3609,10 @@ jobs:
           # Deadlines bound each apt phase so a stall fails fast with a real
           # message instead of consuming the job. Counting the --kill-after
           # grace on every bound (each deadline can run to deadline + 30s),
-          # three attempts plus two recovery runs plus the sleeps come to
-          # ~27.75m — which is why the step-level timeout above exists: sized
-          # against the job budget alone, that worst case starves everything
-          # after it. Normal runs finish in well under a minute, so these are
-          # roughly 10x headroom rather than tight.
+          # the single network attempt comes to ~8m (~10.5m after a failed cached
+          # install), inside the 12m step timeout above.
+          # Normal runs finish in well under a minute, so these are roughly
+          # 10x headroom rather than tight.
           sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' \
             /etc/apt/sources.list \
             /etc/apt/sources.list.d/*.list \
@@ -2517,28 +3627,23 @@ jobs:
               -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 && \
             sudo timeout --kill-after=30s 5m apt-get install -y --no-install-recommends "${APT_SOURCES[@]}" \
               -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 \
-              libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+              -o "Dir::Cache::archives=$TAURI_ARCHIVES" "${TAURI_PKGS[@]}"
           }
-          attempts=3
-          for attempt in $(seq 1 "${attempts}"); do
-            if install_deps; then
-              echo "Tauri system dependencies installed (attempt ${attempt})."
-              exit 0
+          if install_deps; then
+            echo "Tauri system dependencies installed."
+            # Seed the cache (saved by the post step only on a cache miss).
+            # Never leave a partial/empty dir behind: cache keys are immutable,
+            # so saving one would poison every later run for this key.
+            rm -rf "${TAURI_DEBS_DIR}"; mkdir -p "${TAURI_DEBS_DIR}"
+            if ! { ls "$TAURI_ARCHIVES"/*.deb >/dev/null 2>&1 \
+                   && sudo cp "$TAURI_ARCHIVES"/*.deb "${TAURI_DEBS_DIR}"/ \
+                   && sudo chown -R "$(id -u):$(id -g)" "${TAURI_DEBS_DIR}"; }; then
+              echo "::warning::could not seed the Tauri apt cache; next run will use the network path"
+              sudo rm -rf "${TAURI_DEBS_DIR}"
             fi
-            if [ "${attempt}" -eq "${attempts}" ]; then
-              break
-            fi
-            echo "::warning::apt install failed (attempt ${attempt}/${attempts}); retrying in $((attempt * 15))s"
-            # A killed apt can leave the dpkg lock held or a package
-            # half-configured; clear that or the retry just fails on the lock.
-            # Bounded too: dpkg runs maintainer scripts and can block on its
-            # own, and an unbounded recovery would reintroduce the very stall
-            # this step exists to prevent.
-            sudo timeout --kill-after=30s 60s dpkg --configure -a || \
-              echo "::warning::dpkg --configure -a recovery failed after attempt ${attempt}; this can mean a genuinely broken runner (corrupted dpkg state, disk full) rather than a slow mirror — check this run's logs if all ${attempts} attempts fail."
-            sleep $((attempt * 15))
-          done
-          echo "::error::Failed to install Tauri system dependencies after ${attempts} attempts."
+            exit 0
+          fi
+          echo "::error::Failed to install Tauri system dependencies (apt error or phase deadline); re-run to land on a fresh runner (#9847)."
           exit 1
 
       - name: Setup Rust
@@ -2547,8 +3652,11 @@ jobs:
           toolchain: stable
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Restore only: PR/queue refs cannot share caches and would evict
+          # main's (W1, #10744).
+          save-if: false
           workspaces: |
             apps/helper/src-tauri -> target
             apps/viewer/src-tauri -> target
@@ -2616,8 +3724,11 @@ jobs:
 
       - name: Rust cache
         if: steps.changes.outputs.cargo == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Restore only: PR/queue refs cannot share caches and would evict
+          # main's (W1, #10744).
+          save-if: false
           workspaces: |
             apps/helper/src-tauri -> target
             apps/viewer/src-tauri -> target
@@ -2662,7 +3773,11 @@ jobs:
     # it only means an integration run against code that also fails lint
     # runs to completion in parallel instead of being blocked behind it.
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.api == 'true'
+    # Gated on its own `integration` output (#5936), not the `api` area: a
+    # web/portal/viewer/agent-only PR sets `api` (test-api reads those files)
+    # but cannot affect this suite. PR-only — the merge queue reports
+    # integration=true for every code entry, so the queue always runs it.
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.integration == 'true'
     strategy:
       # Report every shard's result — a red shard must not cancel the others
       # (same rationale as the no-bail rule inside the suite: masking stacked
@@ -2670,24 +3785,47 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-    # ~1/16 of the suite + env/container setup + one autoMigrate pass. Raised
-    # 25→40 on 2026-09-14 (back when this was 4-way): shard 3 hit exactly
-    # 25:00 on three consecutive merge-group runs (shards 1 and 4 at 23-24)
-    # after the day's integration suites landed, and a job timeout reports as
-    # `cancelled`, so every queue entry was silently dequeued with
-    # `failed_checks`. Before sharding this ceiling had been raised twice
-    # (30→40→55) as the sequential runtime grew; going 4→8→16 shards roughly
-    # halves each shard's share of the suite again (measured ~13.7 min/shard
-    # of tests at 8-way → ~7 min/shard at 16-way), so the 40-minute ceiling is
-    # kept as-is for now — when a shard passes ~32 min again, add more shards
-    # instead of raising it.
-    timeout-minutes: 40
+    # ~1/16 of the suite + env/container setup + one autoMigrate pass. A job
+    # timeout reports as `cancelled`, so every queue entry is silently
+    # dequeued with `failed_checks` (25→40 on 2026-09-14 after shard 3 hit
+    # exactly 25:00 three times running). Raised 40→55 for the whole-shard
+    # retry (W1, #10744): the "Run integration tests" step measured 17.6 min
+    # median / 24.3 max (whole job ≤ 26.7, setup + post steps ≤ 2.4) across
+    # six CI runs 2026-10-29..30 — the suite has grown well past the ~7
+    # min/shard measured when it went 16-way — so two attempts plus setup need
+    # ~54 min. retry-shard's --budget-minutes is this minus a 5-min setup
+    # allowance; a retry that would not fit is skipped, not started. When the
+    # slowest shard's step passes ~25 min, add shards rather than raise this.
+    timeout-minutes: 55
 
+    # The flaky ledger is read from the BASE commit, never the PR head
+    # (retry-shard + flaky-ledger.mjs, W1 #10744). Empty for other events →
+    # nothing quarantined.
+    env:
+      CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      # The depth-1 checkout lacks the base commit that retry-shard reads the
+      # flaky ledger from and diffs against (W1, #10744). Bounded retry; a
+      # failed fetch only disables quarantine (fail closed), never the job.
+      - name: Fetch base commit for the flaky ledger
+        if: env.CI_BASE_SHA != ''
+        run: |
+          for attempt in 1 2 3; do
+            if git fetch --no-tags --depth=1 origin "${CI_BASE_SHA}"; then
+              exit 0
+            fi
+            echo "git fetch of the base commit failed (attempt ${attempt}/3)" >&2
+            # No sleep after the final attempt — there is no fourth.
+            if [ "${attempt}" -lt 3 ]; then
+              sleep $(( attempt * 5 ))
+            fi
+          done
+          echo "::warning title=Quarantine disabled::Could not fetch base ${CI_BASE_SHA}; no flaky-ledger test is quarantined in this job."
 
       - name: Setup pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -2695,10 +3833,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -2753,7 +3893,22 @@ jobs:
         # pnpm forwards args after the script name to the script itself, so
         # --shard reaches vitest. Sharding only splits the file list; files
         # within a shard still run sequentially (fileParallelism: false).
-        run: pnpm --filter=@breeze/api test:integration --shard=${{ matrix.shard }}/16
+        # Whole-shard retry once on visible test failures (W1, #10744). A re-run
+        # starts from the same DB state: globalSetup runs once per `vitest run`
+        # and setup.ts TRUNCATEs around every test.
+        run: node .github/scripts/retry-shard.mjs --runner vitest --label integration-${{ matrix.shard }} --budget-minutes 50 -- pnpm --filter=@breeze/api test:integration --shard=${{ matrix.shard }}/16
+
+      # Retry wrapper report (W1, #10744): written only when attempt 1 failed.
+      - name: Upload flake report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: flake-report-integration-${{ matrix.shard }}
+          path: flake-report-*.json
+          if-no-files-found: ignore
+          retention-days: 14
+          # A "re-run failed jobs" attempt uploads under the same name.
+          overwrite: true
 
       # ee/workspace's integration suite expects its own tables
       # (workspace_sources, workspace_file_index, ...) to already exist on
@@ -2949,10 +4104,9 @@ jobs:
           build-args: ${{ matrix.build-args }}
           outputs: type=docker,dest=${{ runner.temp }}/${{ matrix.image }}.tar
           cache-from: type=gha,scope=ci-smoke-${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=ci-smoke-${{ matrix.image }}
 
       - name: Upload smoke image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ci-smoke-image-${{ matrix.image }}
           path: ${{ runner.temp }}/${{ matrix.image }}.tar
@@ -3461,10 +4615,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
@@ -3546,10 +4702,12 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
-          cache: 'pnpm'
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
 
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
@@ -3575,7 +4733,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: topology-browser-gate-report
           path: |
@@ -3583,6 +4741,39 @@ jobs:
             e2e-tests/test-results
           if-no-files-found: ignore
           retention-days: 7
+
+  path-read-contracts:
+    name: Path-read contracts
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.path_readers == 'true'
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .node-version
+
+      - name: Restore pnpm cache
+        uses: ./.github/actions/restore-pnpm-cache
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run reader tests
+        env:
+          READER_TESTS: ${{ needs.changes.outputs.reader_tests }}
+        run: node .github/scripts/run-reader-tests.mjs
 
   # ─── Portal dev-mode hydration guard (#3906) ─────────────────────────────
   # Regression cover for #3906: every portal React island SSR'd correctly
@@ -3624,7 +4815,7 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .node-version
 
@@ -3678,6 +4869,11 @@ jobs:
           # tests/ai-agents.spec.ts (#5048) needs the AI agents page enabled;
           # the spec skips itself when GET /ai/agents/tool-catalog is not 200.
           BREEZE_AI_AGENTS_ENABLED=true
+          # #5786 — tests/ai-operator-approve-after-browser-close.spec.ts
+          # delegates through POST /ai/operator/tasks, which 422s unless BOTH
+          # flags are on (default false in docker-compose.yml).
+          AI_OPERATOR_TASKS_ENABLED=true
+          AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED=true
           # This job tests portal hydration and billing UI, not MFA enrollment.
           # Keep the stored forced-MFA flag; suppress only its role component.
           MFA_FORCE_FOR_PARTNER_ADMIN=false
@@ -3787,11 +4983,47 @@ jobs:
       - name: Run the portal hydration specs
         run: ./e2e-tests/node_modules/.bin/tsx scripts/dev/wt-stack/cli.ts test -- tests/multi-currency.spec.ts tests/portal-visibility.spec.ts tests/ai-agents.spec.ts tests/partner-sending-domains.spec.ts
 
-      - name: Upload Playwright report
+      # Playwright replaces both output directories on each invocation. Upload
+      # this slice before the approval run can erase its failed traces.
+      - name: Upload portal hydration Playwright report
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: portal-dev-e2e-playwright-report
+          path: |
+            e2e-tests/playwright-report
+            e2e-tests/test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # #5786 — the two WebAuthn approval specs (real ceremonies via Chrome's
+      # virtual authenticator). A spec no job runs cannot go red; #5273 stayed
+      # stale for weeks that way. What they need from the stack is already
+      # provided: `wt-stack up` pins WEBAUTHN_ORIGIN / WEBAUTHN_RP_ID to caddy's
+      # published port (#6443), so the production-valued PUBLIC_APP_URL RP-ID
+      # trap in e2e-tests/README.md does not apply; both specs self-seed over
+      # `docker exec psql` using pgContainer from .breeze-stack.json; and
+      # `wt-stack test` forwards REDIS_PASSWORD to globalSetup. The operator spec
+      # additionally needs AI_OPERATOR_TASKS_ENABLED and
+      # AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED (set in the .env above).
+      # --workers=1: both specs enrol an approver on the same admin and that
+      # ceremony rotates the refresh token (README), so they must not overlap.
+      # E2E_MACOS_DEVICE_ID is also supplied here: the operator spec
+      # `test.skip`s without it and a skipped spec reports green. It is the
+      # fixed id of the macOS device in e2e-tests/seed-fixtures.sql (pinned by
+      # portalDevE2eWorkflowContract.test.ts). `!cancelled()` so a red hydration
+      # spec above cannot hide these.
+      - name: Run the WebAuthn approval specs
+        if: ${{ !cancelled() }}
+        env:
+          E2E_MACOS_DEVICE_ID: 42fc7de0-48f5-48f2-846b-6dd95924baf9
+        run: ./e2e-tests/node_modules/.bin/tsx scripts/dev/wt-stack/cli.ts test -- tests/intent-self-approve.spec.ts tests/ai-operator-approve-after-browser-close.spec.ts --workers=1
+
+      - name: Upload WebAuthn approval Playwright report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: portal-dev-e2e-approval-playwright-report
           path: |
             e2e-tests/playwright-report
             e2e-tests/test-results
@@ -3847,7 +5079,6 @@ jobs:
           load: true
           tags: breeze-ai-workspace:ci
           cache-from: type=gha,scope=workspace-runtime
-          cache-to: type=gha,mode=max,scope=workspace-runtime
 
       - name: Verify non-root offline document round trips
         run: |
@@ -3863,7 +5094,7 @@ jobs:
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
-    needs: [changes, workspace-runtime, docs-check, lint, typecheck, check-migrations, test-api, test-m365-graph-read-executor, test-m365-graph-actions-executor, test-m365-communications-executor, test-web, test-mobile, mobile-native-changes, build-mobile-ios, test-portal, test-viewer, test-office-addin-core, test-excel-addin, test-word-addin, test-powerpoint-addin, test-outlook-addin, security-audit, build-api, build-m365-graph-read-executor, build-m365-graph-actions-executor, build-m365-communications-executor, build-web, build-portal, build-agent, test-agent, test-agent-windows, recovery-media-e2e, windows-runtime-smoke, integration-test, check-migrations-nonsuperuser, rust-check, build-smoke-images, smoke-test, guided-setup-smoke, auth-browser-transition-browser-contract, topology-browser-gate]
+    needs: [path-read-contracts, changes, workspace-runtime, docs-check, lint, release-ledger, typecheck, check-migrations, test-api, test-m365-graph-read-executor, test-m365-graph-actions-executor, test-m365-communications-executor, test-web, test-mobile, mobile-native-changes, build-mobile-ios, test-portal, test-viewer, test-shared, test-document-ui, test-office-addin-core, test-excel-addin, test-word-addin, test-powerpoint-addin, test-outlook-addin, security-audit, build-api, build-m365-graph-read-executor, build-m365-graph-actions-executor, build-m365-communications-executor, build-web, build-portal, build-agent, lint-agent, test-agent, agent-windows-manifest-guard, test-agent-windows, recovery-media-e2e, windows-runtime-smoke, integration-test, check-migrations-nonsuperuser, rust-check, build-smoke-images, smoke-test, guided-setup-smoke, auth-browser-transition-browser-contract, topology-browser-gate]
     if: ${{ !cancelled() }}
     steps:
       - name: Check all jobs passed
@@ -3882,6 +5113,7 @@ jobs:
           DOCS_CHECK_RESULT: ${{ needs.docs-check.result }}
           WORKSPACE_RUNTIME_RESULT: ${{ needs.workspace-runtime.result }}
           LINT_RESULT: ${{ needs.lint.result }}
+          RELEASE_LEDGER_RESULT: ${{ needs.release-ledger.result }}
           CHECK_MIGRATIONS_RESULT: ${{ needs.check-migrations.result }}
           TYPECHECK_RESULT: ${{ needs.typecheck.result }}
           TEST_API_RESULT: ${{ needs.test-api.result }}
@@ -3895,6 +5127,8 @@ jobs:
           BUILD_MOBILE_IOS_RESULT: ${{ needs.build-mobile-ios.result }}
           TEST_PORTAL_RESULT: ${{ needs.test-portal.result }}
           TEST_VIEWER_RESULT: ${{ needs.test-viewer.result }}
+          TEST_SHARED_RESULT: ${{ needs.test-shared.result }}
+          TEST_DOCUMENT_UI_RESULT: ${{ needs.test-document-ui.result }}
           TEST_OFFICE_ADDIN_CORE_RESULT: ${{ needs.test-office-addin-core.result }}
           TEST_EXCEL_ADDIN_RESULT: ${{ needs.test-excel-addin.result }}
           TEST_WORD_ADDIN_RESULT: ${{ needs.test-word-addin.result }}
@@ -3908,7 +5142,9 @@ jobs:
           BUILD_WEB_RESULT: ${{ needs.build-web.result }}
           BUILD_PORTAL_RESULT: ${{ needs.build-portal.result }}
           BUILD_AGENT_RESULT: ${{ needs.build-agent.result }}
+          LINT_AGENT_RESULT: ${{ needs.lint-agent.result }}
           TEST_AGENT_RESULT: ${{ needs.test-agent.result }}
+          AGENT_WINDOWS_MANIFEST_GUARD_RESULT: ${{ needs.agent-windows-manifest-guard.result }}
           TEST_AGENT_WINDOWS_RESULT: ${{ needs.test-agent-windows.result }}
           RECOVERY_MEDIA_E2E_RESULT: ${{ needs.recovery-media-e2e.result }}
           WINDOWS_RUNTIME_SMOKE_RESULT: ${{ needs.windows-runtime-smoke.result }}
@@ -3921,6 +5157,10 @@ jobs:
           AUTH_BROWSER_TRANSITION_BROWSER_CONTRACT_RESULT: ${{ needs.auth-browser-transition-browser-contract.result }}
           TOPOLOGY_BROWSER_GATE_RESULT: ${{ needs.topology-browser-gate.result }}
           TOPOLOGY_BROWSER_CHANGED: ${{ needs.changes.outputs.topology_browser }}
+          AGENT_CODE_CHANGED: ${{ needs.changes.outputs.agent_code }}
+          INTEGRATION_CHANGED: ${{ needs.changes.outputs.integration }}
+          PATH_READERS_CHANGED: ${{ needs.changes.outputs.path_readers }}
+          PATH_READ_CONTRACTS_RESULT: ${{ needs.path-read-contracts.result }}
           IS_PR: ${{ github.event_name == 'pull_request' }}
         run: |
           # Fail closed: only a successful path check may skip native compilation. The
@@ -3944,8 +5184,12 @@ jobs:
           esac
           if [[ "${CHANGES_RESULT}" != "success" ]] || \
              { [[ "${DOCS_CHANGED}" != "false" ]] && [[ "${DOCS_CHECK_RESULT}" != "success" ]]; } || \
+             { [[ "${PATH_READERS_CHANGED}" == "true" ]] && [[ "${PATH_READ_CONTRACTS_RESULT}" != "success" ]]; } || \
+             { [[ "${PATH_READERS_CHANGED}" != "true" ]] && [[ "${PATH_READERS_CHANGED}" != "false" ]]; } || \
+             { [[ "${PATH_READERS_CHANGED}" == "false" ]] && [[ "${PATH_READ_CONTRACTS_RESULT}" != "skipped" ]]; } || \
              { [[ "${CODE_CHANGED}" != "false" ]] && { \
              [[ "${LINT_RESULT}" != "success" ]] || \
+             [[ "${RELEASE_LEDGER_RESULT}" != "success" ]] || \
              [[ "${SECURITY_AUDIT_RESULT}" != "success" ]] || \
              { [[ "${APP_CHANGED}" == "true" ]] && { \
              [[ "${TYPECHECK_RESULT}" != "success" ]] || \
@@ -3973,6 +5217,8 @@ jobs:
              { [[ "${PORTAL_CHANGED}" != "true" ]] && [[ "${PORTAL_CHANGED}" != "false" ]]; } || \
              { [[ "${PORTAL_CHANGED}" == "false" ]] && [[ "${TEST_PORTAL_RESULT}" != "skipped" ]]; } || \
              [[ "${TEST_VIEWER_RESULT}" != "success" ]] || \
+             [[ "${TEST_SHARED_RESULT}" != "success" ]] || \
+             [[ "${TEST_DOCUMENT_UI_RESULT}" != "success" ]] || \
              { [[ "${ADDINS_CHANGED}" == "true" ]] && [[ "${TEST_OFFICE_ADDIN_CORE_RESULT}" != "success" ]]; } || \
              { [[ "${ADDINS_CHANGED}" != "true" ]] && [[ "${ADDINS_CHANGED}" != "false" ]]; } || \
              { [[ "${ADDINS_CHANGED}" == "false" ]] && [[ "${TEST_OFFICE_ADDIN_CORE_RESULT}" != "skipped" ]]; } || \
@@ -4006,17 +5252,33 @@ jobs:
              { [[ "${PORTAL_CHANGED}" == "true" ]] && [[ "${BUILD_PORTAL_RESULT}" != "success" ]]; } || \
              { [[ "${PORTAL_CHANGED}" != "true" ]] && [[ "${PORTAL_CHANGED}" != "false" ]]; } || \
              { [[ "${PORTAL_CHANGED}" == "false" ]] && [[ "${BUILD_PORTAL_RESULT}" != "skipped" ]]; } || \
-             [[ "${BUILD_AGENT_RESULT}" != "success" ]] || \
-             [[ "${TEST_AGENT_RESULT}" != "success" ]] || \
-             [[ "${TEST_AGENT_WINDOWS_RESULT}" != "success" ]] || \
-             [[ "${WINDOWS_RUNTIME_SMOKE_RESULT}" != "success" ]] || \
-             { [[ "${API_CHANGED}" == "true" ]] && [[ "${INTEGRATION_TEST_RESULT}" != "success" ]]; } || \
-             { [[ "${API_CHANGED}" != "true" ]] && [[ "${API_CHANGED}" != "false" ]]; } || \
-             { [[ "${API_CHANGED}" == "false" ]] && [[ "${INTEGRATION_TEST_RESULT}" != "skipped" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "true" ]] && [[ "${BUILD_AGENT_RESULT}" != "success" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" != "true" ]] && [[ "${AGENT_CODE_CHANGED}" != "false" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "false" ]] && [[ "${BUILD_AGENT_RESULT}" != "skipped" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "true" ]] && [[ "${LINT_AGENT_RESULT}" != "success" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" != "true" ]] && [[ "${AGENT_CODE_CHANGED}" != "false" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "false" ]] && [[ "${LINT_AGENT_RESULT}" != "skipped" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "true" ]] && [[ "${TEST_AGENT_RESULT}" != "success" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" != "true" ]] && [[ "${AGENT_CODE_CHANGED}" != "false" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "false" ]] && [[ "${TEST_AGENT_RESULT}" != "skipped" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "true" ]] && [[ "${AGENT_WINDOWS_MANIFEST_GUARD_RESULT}" != "success" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" != "true" ]] && [[ "${AGENT_CODE_CHANGED}" != "false" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "false" ]] && [[ "${AGENT_WINDOWS_MANIFEST_GUARD_RESULT}" != "skipped" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "true" ]] && [[ "${TEST_AGENT_WINDOWS_RESULT}" != "success" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" != "true" ]] && [[ "${AGENT_CODE_CHANGED}" != "false" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "false" ]] && [[ "${TEST_AGENT_WINDOWS_RESULT}" != "skipped" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "true" ]] && [[ "${WINDOWS_RUNTIME_SMOKE_RESULT}" != "success" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" != "true" ]] && [[ "${AGENT_CODE_CHANGED}" != "false" ]]; } || \
+             { [[ "${AGENT_CODE_CHANGED}" == "false" ]] && [[ "${WINDOWS_RUNTIME_SMOKE_RESULT}" != "skipped" ]]; } || \
+             { [[ "${INTEGRATION_CHANGED}" == "true" ]] && [[ "${INTEGRATION_TEST_RESULT}" != "success" ]]; } || \
+             { [[ "${INTEGRATION_CHANGED}" != "true" ]] && [[ "${INTEGRATION_CHANGED}" != "false" ]]; } || \
+             { [[ "${INTEGRATION_CHANGED}" == "false" ]] && [[ "${INTEGRATION_TEST_RESULT}" != "skipped" ]]; } || \
              { [[ "${API_CHANGED}" == "true" ]] && [[ "${CHECK_MIGRATIONS_NONSUPERUSER_RESULT}" != "success" ]]; } || \
              { [[ "${API_CHANGED}" != "true" ]] && [[ "${API_CHANGED}" != "false" ]]; } || \
              { [[ "${API_CHANGED}" == "false" ]] && [[ "${CHECK_MIGRATIONS_NONSUPERUSER_RESULT}" != "skipped" ]]; } || \
              [[ "${AUTH_BROWSER_TRANSITION_BROWSER_CONTRACT_RESULT}" != "success" ]] || \
+             { [[ "${API_CHANGED}" == "true" ]] && [[ "${CHECK_MIGRATIONS_RESULT}" != "success" ]]; } || \
+             { [[ "${API_CHANGED}" != "true" ]] && [[ "${API_CHANGED}" != "false" ]]; } || \
              { [[ "${API_CHANGED}" == "false" ]] && [[ "${CHECK_MIGRATIONS_RESULT}" != "skipped" ]]; } || \
              { [[ "${STACK_CHANGED}" == "false" ]] && [[ "${BUILD_SMOKE_IMAGES_RESULT}" != "skipped" ]]; } || \
              { [[ "${STACK_CHANGED}" == "false" ]] && [[ "${SMOKE_TEST_RESULT}" != "skipped" ]]; } || \
@@ -4042,6 +5304,8 @@ jobs:
              [[ "${BUILD_MOBILE_IOS_RESULT}" != "skipped" ]] || \
              [[ "${TEST_PORTAL_RESULT}" != "skipped" ]] || \
              [[ "${TEST_VIEWER_RESULT}" != "skipped" ]] || \
+             [[ "${TEST_SHARED_RESULT}" != "skipped" ]] || \
+             [[ "${TEST_DOCUMENT_UI_RESULT}" != "skipped" ]] || \
              [[ "${TEST_OFFICE_ADDIN_CORE_RESULT}" != "skipped" ]] || \
              [[ "${TEST_EXCEL_ADDIN_RESULT}" != "skipped" ]] || \
              [[ "${TEST_WORD_ADDIN_RESULT}" != "skipped" ]] || \
@@ -4054,7 +5318,9 @@ jobs:
              [[ "${BUILD_WEB_RESULT}" != "skipped" ]] || \
              [[ "${BUILD_PORTAL_RESULT}" != "skipped" ]] || \
              [[ "${BUILD_AGENT_RESULT}" != "skipped" ]] || \
+             [[ "${LINT_AGENT_RESULT}" != "skipped" ]] || \
              [[ "${TEST_AGENT_RESULT}" != "skipped" ]] || \
+             [[ "${AGENT_WINDOWS_MANIFEST_GUARD_RESULT}" != "skipped" ]] || \
              [[ "${TEST_AGENT_WINDOWS_RESULT}" != "skipped" ]] || \
              [[ "${WINDOWS_RUNTIME_SMOKE_RESULT}" != "skipped" ]] || \
              [[ "${INTEGRATION_TEST_RESULT}" != "skipped" ]] || \
@@ -4233,3 +5499,48 @@ jobs:
               echo "ci-success result is '$RESULT' (cancelled/skipped) — no signal about main health, doing nothing."
               ;;
           esac
+
+  # W4 (#10748): advisory provenance for the PR-gated suites in this attempt.
+  provenance-record:
+    name: Record CI Provenance
+    runs-on: ubuntu-latest
+    needs: [changes, ci-success]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.ci-success.result == 'success' }}
+    continue-on-error: true
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout tested merge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            .github/workflows
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22.23.4'
+
+      - name: Record successful PR attempt
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CI_SUCCESS_RESULT: ${{ needs.ci-success.result }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FULL_SELECTION: ${{ toJSON(needs.changes.outputs) }}
+        run: node .github/scripts/queue-selection.mjs record
+
+      - name: Upload provenance
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ci-provenance-attempt-${{ github.run_attempt }}
+          path: provenance.json
+          retention-days: 7
+          if-no-files-found: error

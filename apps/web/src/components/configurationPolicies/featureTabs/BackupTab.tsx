@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   HardDrive,
   Plus,
@@ -14,9 +14,11 @@ import type { FeatureTabProps } from "./types";
 import { FEATURE_META } from "./types";
 import { useFeatureLink } from "./useFeatureLink";
 import FeatureTabShell from "./FeatureTabShell";
+import StorageKeyRevocationCard from "./StorageKeyRevocationCard";
 import BackupDestinationSection, {
   emptyConfigForm,
   capabilitySummary,
+  destinationPrefixError,
   supportsProviderImmutability,
 } from "./BackupDestinationSection";
 import type {
@@ -512,6 +514,13 @@ export default function BackupTab({
   // Partner-wide ("all organizations") policy: destinations are per-org, so
   // the link always resolves each device org's default at job time.
   const isPartnerWide = orgId === null;
+  // Destinations/profiles belong to the org that OWNS the policy, which is not
+  // necessarily the org selected in the header. Pin every backup request to it
+  // (a partner-wide policy has no owner org, so it keeps the ambient scope).
+  const ownerOrg = useMemo(
+    () => (typeof orgId === "string" ? { orgIdOverride: orgId } : {}),
+    [orgId],
+  );
 
   // Source mode: profile-linked (backup_profiles selection) vs custom
   // (legacy per-policy backupMode/paths/targets).
@@ -602,7 +611,7 @@ export default function BackupTab({
     setConfigsLoading(true);
     setConfigsError("none");
     try {
-      const response = await fetchWithAuth(meta.fetchUrl);
+      const response = await fetchWithAuth(meta.fetchUrl, ownerOrg);
       // Terminal for this user — not something a Retry can clear. Kept out of
       // the throw path so the status is not flattened into a message. (#2429)
       if (response.status === 403) {
@@ -629,7 +638,7 @@ export default function BackupTab({
     } finally {
       setConfigsLoading(false);
     }
-  }, [meta.fetchUrl]);
+  }, [meta.fetchUrl, ownerOrg]);
 
   useEffect(() => {
     fetchConfigs();
@@ -640,7 +649,7 @@ export default function BackupTab({
     (async () => {
       setProfilesLoading(true);
       try {
-        const response = await fetchWithAuth("/backup/profiles");
+        const response = await fetchWithAuth("/backup/profiles", ownerOrg);
         if (!response.ok) {
           throw new Error(`Failed to load backup profiles (${response.status})`);
         }
@@ -666,7 +675,7 @@ export default function BackupTab({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [ownerOrg]);
 
   useEffect(() => {
     const link = existingLink ?? parentLink;
@@ -787,6 +796,7 @@ export default function BackupTab({
         `/backup/configs/${selectedConfigId}/test`,
         {
           method: "POST",
+          ...ownerOrg,
         },
       );
       const data = await response.json().catch(() => ({}));
@@ -849,6 +859,7 @@ export default function BackupTab({
       const details = buildProviderDetails();
       const response = await fetchWithAuth("/backup/configs", {
         method: "POST",
+        ...ownerOrg,
         body: JSON.stringify({
           name: configForm.name,
           provider: configForm.provider,
@@ -936,6 +947,7 @@ export default function BackupTab({
         `/backup/configs/${editingConfigId}`,
         {
           method: "PATCH",
+          ...ownerOrg,
           body: JSON.stringify({
             name: configForm.name,
             encryption: configForm.encryption,
@@ -984,6 +996,10 @@ export default function BackupTab({
           "policies:configurationPolicies.featureTabs.backupTab.s3BucketNameIsRequired",
         );
       }
+      // Rendered inline by BackupDestinationSection; recorded here so a save
+      // that slips past the disabled button still stops.
+      const prefixError = destinationPrefixError(configForm);
+      if (prefixError) errors.prefix = prefixError;
       if (
         !configForm.region.trim() &&
         !deriveS3RegionFromEndpoint(configForm.endpoint)
@@ -1224,6 +1240,12 @@ export default function BackupTab({
       ? defaultConfig
       : configs.find((c) => c.id === selectedConfigId);
   const isSaving = saving || configSaving;
+  // #7081: the destination form shows the key-prefix error inline; Save waits
+  // until it is fixed (the API would refuse the destination anyway).
+  const destinationPrefixInvalid =
+    !isPartnerWide &&
+    (mode === "create" || mode === "edit") &&
+    destinationPrefixError(configForm) !== null;
   const combinedError = configError || error;
   const retentionInfo = retentionPresets.find(
     (p) => p.value === settings.retentionPreset,
@@ -1289,6 +1311,7 @@ export default function BackupTab({
       icon={<HardDrive className="h-5 w-5" />}
       isConfigured={!!existingLink || isInherited}
       saving={isSaving}
+      saveDisabled={destinationPrefixInvalid}
       error={combinedError}
       onSave={handleSave}
       onRemove={existingLink && !linkedPolicyId ? handleRemove : undefined}
@@ -1929,6 +1952,7 @@ export default function BackupTab({
             </div>
           ) : (
             <>
+              <StorageKeyRevocationCard orgId={orgId ?? null} />
               <BackupDestinationSection
                 configs={configs}
                 configsLoading={configsLoading}

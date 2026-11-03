@@ -387,6 +387,9 @@ func (p *cancelAfterFirstUploadProvider) Upload(localPath, remotePath string) er
 // foreign, already-published sibling prefix, and only the former may be
 // deleted.
 func TestAbortCleanup_OnlyDeletesOwnUnpublishedPrefix_NeverAForeignPublishedPrefix(t *testing.T) {
+	// One worker: the fake gates on upload call order, which the pool (#8381)
+	// does not fix. upload_pool_test.go covers the pooled stop/abort paths.
+	defer setUploadConcurrencyForTest(1)()
 	tmpDir := t.TempDir()
 	file1 := createTempFile(t, tmpDir, "file1.txt", "content-one")
 	file2 := createTempFile(t, tmpDir, "file2.txt", "content-two")
@@ -958,6 +961,9 @@ func (p *blockAfterNProvider) Delete(remotePath string) error       { return p.b
 // CreateSnapshotContext callers, which never pass a journal): a stopped run
 // still cleans up its partial remote prefix, exactly as before this task.
 func TestCreateSnapshotWithProgress_StopWithoutJournal_CleansUpPrefix(t *testing.T) {
+	// One worker: the fake gates on upload call order, which the pool (#8381)
+	// does not fix. upload_pool_test.go covers the pooled stop/abort paths.
+	defer setUploadConcurrencyForTest(1)()
 	backing := newMockProvider()
 	provider := newBlockAfterNProvider(backing, 1) // 1st file succeeds, 2nd blocks
 	files := []backupFile{
@@ -998,6 +1004,9 @@ func TestCreateSnapshotWithProgress_StopWithoutJournal_CleansUpPrefix(t *testing
 // leaves the partial remote prefix AND the journal in place — together they
 // are the resume state for the next run.
 func TestCreateSnapshotWithProgress_StopWithJournal_PreservesPrefixAndJournal(t *testing.T) {
+	// One worker: the fake gates on upload call order, which the pool (#8381)
+	// does not fix. upload_pool_test.go covers the pooled stop/abort paths.
+	defer setUploadConcurrencyForTest(1)()
 	backing := newMockProvider()
 	provider := newBlockAfterNProvider(backing, 1) // 1st file succeeds, 2nd blocks
 	files := []backupFile{
@@ -1065,6 +1074,9 @@ func TestCreateSnapshotWithProgress_StopWithJournal_PreservesPrefixAndJournal(t 
 // exactly the 2 missing files, produce a manifest listing all 4, and reuse
 // run 1's snapshot ID.
 func TestCreateSnapshotWithProgress_ResumeAfterInterruption(t *testing.T) {
+	// One worker: the fake gates on upload call order, which the pool (#8381)
+	// does not fix. upload_pool_test.go covers the pooled stop/abort paths.
+	defer setUploadConcurrencyForTest(1)()
 	backing := newMockProvider()
 	provider := newBlockAfterNProvider(backing, 2) // 1st 2 files succeed, 3rd blocks
 	tmpDir := t.TempDir()
@@ -1151,7 +1163,8 @@ func TestCreateSnapshotWithProgress_ResumeAfterInterruption(t *testing.T) {
 	}
 	uploadedBases := map[string]bool{}
 	for _, c := range recording.uploadCalls {
-		uploadedBases[pathpkg.Base(c.localPath)] = true
+		// Keyed on the object key: the local path may be a staged copy.
+		uploadedBases[strings.TrimSuffix(pathpkg.Base(c.remotePath), ".gz")] = true
 	}
 	if uploadedBases["f1.txt"] || uploadedBases["f2.txt"] {
 		t.Errorf("f1/f2 should have been resumed, not re-uploaded: %v", recording.uploadCalls)
@@ -1187,7 +1200,9 @@ func TestSnapshotRegistrationEmissionReportsResumedCounters(t *testing.T) {
 	resumedPath := createTempFile(t, tmpDir, "resumed.txt", "already-uploaded")
 	resumedSize := int64(len("already-uploaded"))
 	if err := journal.Record(SnapshotFile{
-		SourcePath: resumedPath, Size: resumedSize, ModTime: modTime, Checksum: "resumed",
+		// A journaled entry carries the digest of the uploaded bytes, which
+		// the resume check compares with the current source.
+		SourcePath: resumedPath, Size: resumedSize, ModTime: modTime, Checksum: digestBytes([]byte("already-uploaded")).SHA256,
 	}); err != nil {
 		t.Fatalf("Record failed: %v", err)
 	}
@@ -1313,6 +1328,10 @@ func TestCreateSnapshotWithProgress_VSSOriginalPathResumeMatch(t *testing.T) {
 	provider := newMockProvider()
 	modTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	journalDir := t.TempDir()
+	// Run 2's shadow copy exposes the same content at a different path;
+	// the resume check hashes it against the journaled digest.
+	shadow2 := createTempFileIn(t, pathpkg.Join(t.TempDir(), "SHADOW-RUN2", "data"), "f.txt", "hello world")
+	run1Checksum := digestBytes([]byte("hello world")).SHA256
 
 	journal1, _, err := openSnapshotJournal(journalDir, "test-vss-identity", journalMaxAge)
 	if err != nil {
@@ -1328,7 +1347,7 @@ func TestCreateSnapshotWithProgress_VSSOriginalPathResumeMatch(t *testing.T) {
 		BackupPath:   "snap/f.txt.gz",
 		Size:         11,
 		ModTime:      modTime,
-		Checksum:     "run1-checksum",
+		Checksum:     run1Checksum,
 	}); err != nil {
 		t.Fatalf("Record failed: %v", err)
 	}
@@ -1345,8 +1364,8 @@ func TestCreateSnapshotWithProgress_VSSOriginalPathResumeMatch(t *testing.T) {
 	// Run 2 walks a DIFFERENT (fresh) shadow-copy device path for the same
 	// logical file, but the same OriginalPath.
 	run2File := backupFile{
-		sourcePath:   "SHADOW-RUN2/data/f.txt", // different from run 1's
-		originalPath: "/data/f.txt",            // same as run 1's
+		sourcePath:   shadow2,       // different from run 1's
+		originalPath: "/data/f.txt", // same as run 1's
 		snapshotPath: "path_0/f.txt",
 		size:         11,
 		modTime:      modTime,
@@ -1359,7 +1378,7 @@ func TestCreateSnapshotWithProgress_VSSOriginalPathResumeMatch(t *testing.T) {
 	if len(snapshot.Files) != 1 {
 		t.Fatalf("expected 1 file, got %d", len(snapshot.Files))
 	}
-	if snapshot.Files[0].Checksum != "run1-checksum" {
+	if snapshot.Files[0].Checksum != run1Checksum {
 		t.Errorf("expected the resumed (run 1) entry to be carried forward, got %+v", snapshot.Files[0])
 	}
 	// Only the manifest should have uploaded — the data file itself must be
@@ -1879,7 +1898,8 @@ func TestCreateSnapshotWithProgress_IncrementalTwoRun_ReferencesUnchangedFiles(t
 	}
 	uploadedBases := map[string]bool{}
 	for _, c := range provider.uploadCalls {
-		uploadedBases[pathpkg.Base(c.localPath)] = true
+		// Keyed on the object key: the local path may be a staged copy.
+		uploadedBases[strings.TrimSuffix(pathpkg.Base(c.remotePath), ".gz")] = true
 	}
 	if !uploadedBases["f2.txt"] {
 		t.Errorf("f2 (changed) should have been uploaded: %v", provider.uploadCalls)
@@ -1993,7 +2013,7 @@ func TestCreateSnapshotWithProgress_JournalResumeWinsOverReference(t *testing.T)
 		BackupPath: path.Join(snapshotRootDir, journal.snapshotID, snapshotFilesDir, "path_0/f.txt.gz"),
 		Size:       int64(len("content")),
 		ModTime:    modTime,
-		Checksum:   "journal-checksum",
+		Checksum:   digestBytes([]byte("content")).SHA256,
 	}); err != nil {
 		t.Fatalf("Record failed: %v", err)
 	}
@@ -2017,8 +2037,8 @@ func TestCreateSnapshotWithProgress_JournalResumeWinsOverReference(t *testing.T)
 	if len(snapshot.Files) != 1 {
 		t.Fatalf("expected 1 file, got %d", len(snapshot.Files))
 	}
-	if snapshot.Files[0].Checksum != "journal-checksum" {
-		t.Errorf("expected the journal's entry to win over the reference, got checksum %q (want journal-checksum)", snapshot.Files[0].Checksum)
+	if want := digestBytes([]byte("content")).SHA256; snapshot.Files[0].Checksum != want {
+		t.Errorf("expected the journal's entry to win over the reference, got checksum %q (want %s)", snapshot.Files[0].Checksum, want)
 	}
 	if len(provider.uploadCalls) != 1 { // only the manifest uploads
 		t.Fatalf("expected only the manifest to upload (file resumed via journal), got %d upload calls: %v", len(provider.uploadCalls), provider.uploadCalls)
@@ -2205,51 +2225,126 @@ func setUploadLeaseIntervalForTest(d time.Duration) (restore func()) {
 	return func() { uploadLeaseInterval = old }
 }
 
-// slowFirstUploadProvider wraps mockProvider and sleeps for `delay` on the
-// FIRST call to Upload/UploadContext only (the real file, not the
-// upload.lease refreshes or the final manifest), so a test can force the
-// upload loop to sit still long enough for the lease-refresh ticker to fire
-// at least once without depending on real wall-clock file I/O.
-type slowFirstUploadProvider struct {
+// useManualLeaseTicksForTest swaps newUploadLeaseTicker for a clock the test
+// drives: refreshes happen only when the test sends on the returned channel.
+// It returns that channel and a func reporting the interval the run asked
+// for. It swaps a package var, so a test that calls it must not run in
+// parallel with other tests in this package.
+func useManualLeaseTicksForTest(t *testing.T) (ticks chan time.Time, requested func() time.Duration) {
+	t.Helper()
+	ticks = make(chan time.Time)
+	var mu sync.Mutex
+	var asked time.Duration
+	orig := newUploadLeaseTicker
+	newUploadLeaseTicker = func(d time.Duration) (<-chan time.Time, func()) {
+		mu.Lock()
+		asked = d
+		mu.Unlock()
+		return ticks, func() {}
+	}
+	t.Cleanup(func() { newUploadLeaseTicker = orig })
+	return ticks, func() time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		return asked
+	}
+}
+
+// leaseTickDuringUploadProvider wraps mockProvider. On the FIRST upload that
+// is not an upload.lease refresh (the data file, in a one-file run) it sends one lease tick and waits until the refresh that tick
+// triggers has reached the backing store, then finishes the data upload. The
+// refresh therefore lands inside the upload however the scheduler interleaves
+// the goroutines: a 50 ms sleep raced against a 10 ms ticker here failed
+// under -race on a loaded runner (#8828).
+type leaseTickDuringUploadProvider struct {
 	*mockProvider
-	delay    time.Duration
-	slowOnce sync.Once
+	t             *testing.T
+	ticks         chan<- time.Time
+	leaseUploaded chan struct{}
+	leaseOnce     sync.Once
+	dataOnce      sync.Once
+	// tickedPath is the data upload the tick was delivered inside; written
+	// once inside dataOnce, read after createSnapshotWithProgress returns.
+	tickedPath string
 }
 
-func (p *slowFirstUploadProvider) Upload(localPath, remotePath string) error {
-	p.slowOnce.Do(func() { time.Sleep(p.delay) })
+func newLeaseTickDuringUploadProvider(t *testing.T, backing *mockProvider, ticks chan<- time.Time) *leaseTickDuringUploadProvider {
+	return &leaseTickDuringUploadProvider{mockProvider: backing, t: t, ticks: ticks, leaseUploaded: make(chan struct{})}
+}
+
+func (p *leaseTickDuringUploadProvider) upload(localPath, remotePath string) error {
+	if strings.HasSuffix(remotePath, "/upload.lease") {
+		err := p.mockProvider.Upload(localPath, remotePath)
+		p.leaseOnce.Do(func() { close(p.leaseUploaded) })
+		return err
+	}
+	p.dataOnce.Do(func() {
+		p.tickedPath = remotePath
+		// t.Errorf, not t.Fatalf: this can run off the test goroutine.
+		select {
+		case p.ticks <- time.Now():
+		case <-time.After(10 * time.Second):
+			p.t.Errorf("lease-refresh goroutine never took a tick while %s was uploading", remotePath)
+			return
+		}
+		select {
+		case <-p.leaseUploaded:
+		case <-time.After(10 * time.Second):
+			p.t.Errorf("a lease tick during the upload of %s produced no upload.lease refresh", remotePath)
+		}
+	})
 	return p.mockProvider.Upload(localPath, remotePath)
 }
 
-func (p *slowFirstUploadProvider) UploadContext(ctx context.Context, localPath, remotePath string) error {
-	p.slowOnce.Do(func() { time.Sleep(p.delay) })
-	return p.mockProvider.Upload(localPath, remotePath)
+func (p *leaseTickDuringUploadProvider) Upload(localPath, remotePath string) error {
+	return p.upload(localPath, remotePath)
+}
+
+func (p *leaseTickDuringUploadProvider) UploadContext(_ context.Context, localPath, remotePath string) error {
+	return p.upload(localPath, remotePath)
 }
 
 func TestCreateSnapshot_UploadLease_RefreshedDuringUploadThenDeletedAfterPublish(t *testing.T) {
-	restore := setUploadLeaseIntervalForTest(10 * time.Millisecond)
-	defer restore()
+	ticks, requestedInterval := useManualLeaseTicksForTest(t)
 
 	tmpDir := t.TempDir()
 	file1 := createTempFile(t, tmpDir, "file1.txt", "content")
 	backing := newMockProvider()
-	provider := &slowFirstUploadProvider{mockProvider: backing, delay: 50 * time.Millisecond}
+	provider := newLeaseTickDuringUploadProvider(t, backing, ticks)
 
 	files := []backupFile{{sourcePath: file1, snapshotPath: "path_0/file1.txt", size: 7, modTime: time.Now()}}
 	snap, err := createSnapshotWithProgress(context.Background(), provider, files, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if got := requestedInterval(); got != uploadLeaseInterval {
+		t.Fatalf("lease ticker interval = %v, want uploadLeaseInterval (%v)", got, uploadLeaseInterval)
+	}
 
 	leaseKey := "snapshots/" + snap.ID + "/upload.lease"
-	sawLeaseUpload := false
-	for _, call := range backing.uploadCalls {
-		if call.remotePath == leaseKey {
-			sawLeaseUpload = true
+	dataKey := provider.tickedPath
+	if dataKey == "" {
+		t.Fatal("no data-file upload happened, so no lease tick was delivered")
+	}
+	leaseIdx, dataIdx := -1, -1
+	for i, call := range backing.uploadCalls {
+		switch call.remotePath {
+		case leaseKey:
+			if leaseIdx < 0 {
+				leaseIdx = i
+			}
+		case dataKey:
+			dataIdx = i
 		}
 	}
-	if !sawLeaseUpload {
-		t.Error("expected at least one upload.lease refresh during a slow upload")
+	if leaseIdx < 0 {
+		t.Error("expected at least one upload.lease refresh during the data upload")
+	}
+	if dataIdx < 0 {
+		t.Fatalf("expected the data file to be uploaded to %s, got %+v", dataKey, backing.uploadCalls)
+	}
+	if leaseIdx > dataIdx {
+		t.Errorf("upload.lease refresh (call %d) landed after the data upload finished (call %d), want during it", leaseIdx, dataIdx)
 	}
 	if _, stillThere := backing.files[leaseKey]; stillThere {
 		t.Error("expected upload.lease to be deleted after a successful publish")
@@ -2353,8 +2448,8 @@ func TestAbortSourceGone_StopsLeaseRefreshBeforeCleanup_NoOrphanLeaseAfterAbort(
 	// even once before stopLeaseRefresh stops it — that's a CORRECT outcome
 	// of the fix, not a broken heartbeat. The heartbeat firing at all is
 	// separately proven by TestCreateSnapshot_UploadLease_RefreshedDuring
-	// UploadThenDeletedAfterPublish (which uses a slow provider precisely
-	// so the ticker gets a chance to tick). leaseUploads() is logged here
+	// UploadThenDeletedAfterPublish (which delivers a manual lease tick
+	// mid-upload, #8828). leaseUploads() is logged here
 	// purely as a diagnostic (0 or 1 is both a legitimate outcome, so it is
 	// not asserted on) rather than left as dead instrumentation.
 	t.Logf("lease-key uploads observed during this run: %d", provider.leaseUploads())
@@ -2397,7 +2492,7 @@ func TestPublishSystemState_SkipsUploadingSymlinkArtifacts(t *testing.T) {
 
 	provider := newMockProvider()
 	snapshotID := "snap-1"
-	if err := publishSystemState(context.Background(), provider, snapshotID, stagingDir, manifest); err != nil {
+	if _, err := publishSystemState(context.Background(), provider, "", nil, snapshotID, stagingDir, manifest); err != nil {
 		t.Fatalf("publishSystemState: %v", err)
 	}
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
+import { ERROR_CODES } from '@breeze/shared';
 import { getTableName, is, Table } from 'drizzle-orm';
 
 const { evaluateCapability, requireCapability } = vi.hoisted(() => {
@@ -160,6 +161,10 @@ vi.mock('../../services/auditEvents', () => ({
 vi.mock('../../services/sentry', () => ({
   captureException: vi.fn()
 }));
+vi.mock('../../services/unassignedPool/deliveryEligibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/unassignedPool/deliveryEligibility')>()),
+  isParkedDevice: vi.fn(async () => false),
+}));
 
 import { coreRoutes } from './core';
 import { getDeviceWithOrgCheck, getDeviceWithOrgAndSiteCheck } from './helpers';
@@ -167,6 +172,7 @@ import { writeRouteAudit } from '../../services/auditEvents';
 import { captureException } from '../../services/sentry';
 import { requirePermission, requireMfa } from '../../middleware/auth';
 import { decryptForColumn } from '../../services/secretCrypto';
+import { isParkedDevice } from '../../services/unassignedPool/deliveryEligibility';
 
 // Snapshot mock.calls captured at module-load time (i.e. when core.ts ran its
 // route registrations). beforeEach() clears mock state, so we cannot read these
@@ -325,6 +331,40 @@ describe('POST /devices/:id/remote-access-launch', () => {
     expect(detailsStr).not.toContain('rustdesk://');
   });
 
+  it('refuses a device parked in a holding org before resolving any provider credential', async () => {
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({
+      id: deviceId,
+      orgId: 'org-123',
+      hostname: 'host-1',
+      siteId: 'site-1',
+      customFields: { rustdesk_id: '294064193' }
+    } as never);
+    setPartnerSettings({
+      remoteAccessProviders: {
+        defaultProviderId: 'rustdesk',
+        providers: [{
+          id: 'rustdesk', name: 'RustDesk', urlTemplate: 'rustdesk://{id}?password={password}',
+          customFieldKey: 'rustdesk_id', password: 'p#x', enabled: true,
+        }],
+      },
+    });
+    vi.mocked(isParkedDevice).mockResolvedValueOnce(true);
+
+    const res = await app.request(`/devices/${deviceId}/remote-access-launch`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' }
+    });
+    expect(res.status).toBe(403);
+    const body = await res.json() as { code?: string; launchUrl?: string };
+    expect(body.code).toBe('DEVICE_PENDING_ASSIGNMENT');
+    expect(body.launchUrl).toBeUndefined();
+    expect(isParkedDevice).toHaveBeenCalledWith(expect.anything(), deviceId);
+    expect(decryptForColumn).not.toHaveBeenCalled();
+    expect(writeRouteAudit).not.toHaveBeenCalledWith(
+      expect.anything(), expect.objectContaining({ action: 'device.remote_access_launch_url.issued' }),
+    );
+  });
+
   it('returns 422 + audit event + Sentry capture when scheme rejected at substitution', async () => {
     vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({
       id: deviceId,
@@ -360,7 +400,7 @@ describe('POST /devices/:id/remote-access-launch', () => {
     });
     expect(res.status).toBe(422);
     const body = await res.json() as { code?: string };
-    expect(body.code).toBe('scheme_not_allowed');
+    expect(body.code).toBe(ERROR_CODES.SCHEME_NOT_ALLOWED);
 
     expect(writeRouteAudit).toHaveBeenCalledOnce();
     const auditCall = vi.mocked(writeRouteAudit).mock.calls[0]![1];

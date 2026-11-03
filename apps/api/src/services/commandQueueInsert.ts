@@ -1,5 +1,6 @@
 import { deviceCommands } from '../db/schema';
 import { aiOriginColumns } from './aiOriginColumns';
+import { assertCommandDeliverable } from './unassignedPool/deliveryEligibility';
 import type { AiOriginRef } from '@breeze/shared';
 // TYPE-ONLY, and load-bearing that it stays that way: `commandQueue.ts`
 // statically imports `routes/agentWs.ts`, and a RUNTIME edge from this module
@@ -52,8 +53,18 @@ export async function insertQueuedCommandInTransaction(
      * instead — see `aiDispatch.contract.test.ts`.
      */
     targetRole?: 'agent' | 'watchdog';
+    /**
+     * Delivery deadline (the instant by which an agent must have CLAIMED the
+     * row) and the device's org at submission — the same two columns
+     * `queueCommand` stamps (#5128). Omitted, they keep their column defaults.
+     */
+    deliverBy?: Date | null;
+    submittedOrgId?: string;
   },
 ): Promise<QueuedCommand> {
+  // A device parked in a holding org receives lifecycle removal only. Read on
+  // the caller's transaction, so the check and the insert share a snapshot.
+  await assertCommandDeliverable(tx, { deviceId: input.deviceId, commandType: input.type });
   const [command] = await tx
     .insert(deviceCommands)
     .values({
@@ -64,6 +75,8 @@ export async function insertQueuedCommandInTransaction(
       status: 'pending',
       createdBy: input.createdBy,
       ...(input.targetRole ? { targetRole: input.targetRole } : {}),
+      ...(input.deliverBy ? { deliverBy: input.deliverBy } : {}),
+      ...(input.submittedOrgId ? { submittedOrgId: input.submittedOrgId } : {}),
       ...aiOriginColumns(input.aiOrigin),
     })
     .returning();

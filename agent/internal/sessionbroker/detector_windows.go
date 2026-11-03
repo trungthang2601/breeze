@@ -78,10 +78,11 @@ type wtsInfoEx struct {
 }
 
 // querySessionLastInput returns the time of last user input for a session via
-// WTSSessionInfoEx. ok=false when the query fails or returns a short/unknown
-// payload. A zero LastInputTime yields the zero time (treated as unknown by
-// idleSince) — this is the documented console-session quirk.
-func (d *windowsDetector) querySessionLastInput(sessionID uint32) (time.Time, bool) {
+// WTSSessionInfoEx, and the session's lock flags. ok=false when the query
+// fails or returns a short/unknown payload. A zero LastInputTime yields the
+// zero time (treated as unknown by idleSince) — this is the documented
+// console-session quirk.
+func (d *windowsDetector) querySessionLastInput(sessionID uint32) (time.Time, int32, bool) {
 	var buf *wtsInfoEx
 	var bytesReturned uint32
 
@@ -93,17 +94,24 @@ func (d *windowsDetector) querySessionLastInput(sessionID uint32) (time.Time, bo
 		uintptr(unsafe.Pointer(&bytesReturned)),
 	)
 	if r1 == 0 || buf == nil {
-		return time.Time{}, false
+		return time.Time{}, -1, false
 	}
 	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(buf)))
 
 	if uintptr(bytesReturned) < unsafe.Sizeof(wtsInfoEx{}) || buf.Level != 1 {
-		return time.Time{}, false
+		return time.Time{}, -1, false
 	}
-	return filetimeToTime(uint64(buf.Data.LastInputTime)), true
+	return filetimeToTime(uint64(buf.Data.LastInputTime)), buf.Data.SessionFlags, true
 }
 
 func (d *windowsDetector) ListSessions() ([]DetectedSession, error) {
+	sessions, _, err := d.listSessionsCounted()
+	return sessions, err
+}
+
+// listSessionsCounted also reports how many sessions it skipped because a
+// field could not be read safely; see ListSessionsComplete.
+func (d *windowsDetector) listSessionsCounted() ([]DetectedSession, int, error) {
 	var sessionInfo *wtsSessionInfo
 	var count uint32
 
@@ -115,11 +123,12 @@ func (d *windowsDetector) ListSessions() ([]DetectedSession, error) {
 		uintptr(unsafe.Pointer(&count)),
 	)
 	if r1 == 0 {
-		return nil, fmt.Errorf("WTSEnumerateSessions: %w", err)
+		return nil, 0, fmt.Errorf("WTSEnumerateSessions: %w", err)
 	}
 	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(sessionInfo)))
 
 	var sessions []DetectedSession
+	skipped := 0
 	size := unsafe.Sizeof(wtsSessionInfo{})
 
 	for i := uint32(0); i < count; i++ {
@@ -138,7 +147,7 @@ func (d *windowsDetector) ListSessions() ([]DetectedSession, error) {
 			continue
 		}
 
-		username := d.querySessionString(info.SessionID, wtsUserName)
+		username, usernameKnown := d.querySessionString(info.SessionID, wtsUserName)
 
 		sessionType := "console"
 		if info.SessionID == 0 {
@@ -148,36 +157,43 @@ func (d *windowsDetector) ListSessions() ([]DetectedSession, error) {
 		}
 
 		session := DetectedSession{
-			Username: username,
-			Session:  fmt.Sprintf("%d", info.SessionID),
-			State:    wtsStateString(info.State),
-			Display:  "windows",
-			Type:     sessionType,
+			Username:        username,
+			UsernameUnknown: !usernameKnown,
+			Session:         fmt.Sprintf("%d", info.SessionID),
+			State:           wtsStateString(info.State),
+			Display:         "windows",
+			Type:            sessionType,
 		}
 		if sessionType != "services" {
-			if lastInput, ok := d.querySessionLastInput(info.SessionID); ok {
+			if lastInput, flags, ok := d.querySessionLastInput(info.SessionID); ok {
 				session.IdleFor, session.IdleKnown = idleSince(time.Now(), lastInput)
+				session.Locked, session.LockKnown = wtsLockState(flags)
 			}
 		}
 		var err error
 		session.Session, err = sanitizeDetectedField(session.Session, true)
 		if err != nil {
+			skipped++
 			continue
 		}
 		session.Display, err = sanitizeDetectedField(session.Display, true)
 		if err != nil {
+			skipped++
 			continue
 		}
 		session.State, err = sanitizeDetectedField(session.State, true)
 		if err != nil {
+			skipped++
 			continue
 		}
 		session.Type, err = sanitizeDetectedField(session.Type, true)
 		if err != nil {
+			skipped++
 			continue
 		}
 		session.Username, err = sanitizeDetectedField(session.Username, false)
 		if err != nil {
+			skipped++
 			continue
 		}
 
@@ -187,7 +203,7 @@ func (d *windowsDetector) ListSessions() ([]DetectedSession, error) {
 		}
 	}
 
-	return sessions, nil
+	return sessions, skipped, nil
 }
 
 func (d *windowsDetector) WatchSessions(ctx context.Context) <-chan SessionEvent {
@@ -250,7 +266,11 @@ func (d *windowsDetector) WatchSessions(ctx context.Context) <-chan SessionEvent
 	return ch
 }
 
-func (d *windowsDetector) querySessionString(sessionID uint32, infoClass uint32) string {
+// querySessionString returns the string value and whether the query
+// succeeded. A successful query can still return "" (WTSUserName for a
+// session nobody is signed in to), so callers that need to tell "empty" from
+// "unknown" must check ok.
+func (d *windowsDetector) querySessionString(sessionID uint32, infoClass uint32) (string, bool) {
 	var buf *uint16
 	var bytesReturned uint32
 
@@ -261,12 +281,15 @@ func (d *windowsDetector) querySessionString(sessionID uint32, infoClass uint32)
 		uintptr(unsafe.Pointer(&buf)),
 		uintptr(unsafe.Pointer(&bytesReturned)),
 	)
-	if r1 == 0 || buf == nil {
-		return ""
+	if r1 == 0 {
+		return "", false
+	}
+	if buf == nil {
+		return "", true
 	}
 	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(buf)))
 
-	return windows.UTF16PtrToString(buf)
+	return windows.UTF16PtrToString(buf), true
 }
 
 func (d *windowsDetector) querySessionUint32(sessionID uint32, infoClass uint32) (uint32, bool) {

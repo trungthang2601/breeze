@@ -2,6 +2,7 @@ package helper
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -29,7 +30,12 @@ func uninstallPackage() error {
 	if productCode == "" {
 		return nil // not installed
 	}
+	return uninstallProductCode(productCode)
+}
 
+// uninstallProductCode runs msiexec /x for one ProductCode. Exit 3010 (reboot
+// required) counts as success.
+func uninstallProductCode(productCode string) error {
 	cmd := exec.Command("msiexec", "/x", productCode, "/qn", "/norestart")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -43,9 +49,17 @@ func uninstallPackage() error {
 	return nil
 }
 
-// findHelperProductCode walks the standard 64-bit and 32-bit Uninstall keys
-// looking for a ProductCode-style subkey whose DisplayName matches displayName.
+// findHelperProductCode returns the registered helper ProductCode, or "" when
+// the product is not registered.
 func findHelperProductCode(displayName string) (string, error) {
+	product, err := findHelperProduct(displayName)
+	return product.code, err
+}
+
+// findHelperProduct walks the standard 64-bit and 32-bit Uninstall keys
+// looking for a ProductCode-style subkey whose DisplayName matches displayName,
+// and returns its ProductCode and DisplayVersion.
+func findHelperProduct(displayName string) (msiProduct, error) {
 	roots := []string{
 		`SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`,
 		`SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall`,
@@ -69,18 +83,44 @@ func findHelperProductCode(displayName string) (string, error) {
 				continue
 			}
 			name, _, _ := child.GetStringValue("DisplayName")
-			child.Close()
-			if name == displayName {
-				return sk, nil
+			if name != displayName {
+				child.Close()
+				continue
 			}
+			// An unreadable DisplayVersion leaves version "", which never
+			// matches a target, so installMSI falls back to a plain install.
+			version, _, verErr := child.GetStringValue("DisplayVersion")
+			child.Close()
+			if verErr != nil {
+				log.Warn("helper MSI DisplayVersion unreadable; a same-version reinstall cannot be detected",
+					"productCode", sk, "key", root+`\`+sk, "error", verErr.Error())
+			}
+			return msiProduct{code: sk, version: version}, nil
 		}
 	}
-	return "", nil
+	return msiProduct{}, nil
 }
 
-// installPackage runs the MSI installer silently.
+// installPackage installs the helper MSI for version. installMSI picks the
+// msiexec mode: remove an orphaned registration first when the binary is
+// missing (#6927), force a file reinstall when the product is already
+// registered at version (#6868), otherwise a plain install.
+func installPackage(msiPath, binaryPath, version string) error {
+	return installMSI(msiPath, binaryPath, version, msiOps{
+		binaryExists: func(path string) bool {
+			_, err := os.Stat(path)
+			return err == nil
+		},
+		findProduct: func() (msiProduct, error) { return findHelperProduct(helperDisplayName) },
+		uninstall:   uninstallProductCode,
+		install:     runMSIInstall,
+		reinstall:   runMSIReinstall,
+	})
+}
+
+// runMSIInstall runs the MSI installer silently.
 // Exit code 3010 means success but reboot required — treated as success.
-func installPackage(msiPath, _ string) error {
+func runMSIInstall(msiPath string) error {
 	cmd := exec.Command("msiexec", "/i", msiPath, "/qn", "/norestart")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -92,6 +132,43 @@ func installPackage(msiPath, _ string) error {
 		return fmt.Errorf("msiexec: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	log.Info("MSI installed successfully", "msi", msiPath)
+	return nil
+}
+
+// msiReinstallArgs is the msiexec command line that repairs the product
+// identified by msiPath with every file rewritten:
+//
+//	v  run from the package and re-cache it (the cached copy may be the one
+//	   whose install was deferred or rolled back)
+//	a  reinstall all files regardless of version or checksum
+//	m  rewrite machine registry entries
+//	u  rewrite user registry entries
+//	s  reinstall shortcuts
+//
+// "a" rather than "o" (older-only) keeps the outcome independent of what file
+// version the stale exe happens to carry.
+func msiReinstallArgs(msiPath string) []string {
+	return []string{"/fvamus", msiPath, "/qn", "/norestart"}
+}
+
+// runMSIReinstall forces a file reinstall of the registered product from
+// msiPath (#6868). The caller's on-disk version check still decides whether
+// the files were actually replaced.
+func runMSIReinstall(msiPath string) error {
+	cmd := exec.Command("msiexec", msiReinstallArgs(msiPath)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
+			return fmt.Errorf("msiexec /f: %w (output: %s)", err, strings.TrimSpace(string(out)))
+		}
+		if err := msiReinstallExitError(exitErr.ExitCode(), err, string(out)); err != nil {
+			return err
+		}
+		log.Info("MSI reinstalled successfully (reboot required)", "msi", msiPath)
+		return nil
+	}
+	log.Info("MSI reinstalled successfully", "msi", msiPath)
 	return nil
 }
 
@@ -142,7 +219,7 @@ func stopByPIDIfOurs(pid int, binaryPath string) (bool, error) {
 		return false, nil
 	}
 	handle, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
+		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE|windows.SYNCHRONIZE,
 		false, uint32(pid),
 	)
 	if err != nil {
@@ -164,8 +241,21 @@ func stopByPIDIfOurs(pid int, binaryPath string) (bool, error) {
 	if err := windows.TerminateProcess(handle, 0); err != nil {
 		return false, fmt.Errorf("TerminateProcess(%d): %w", pid, err)
 	}
+	// TerminateProcess only starts teardown. Wait (bounded) for the process to
+	// actually exit so its handles — including the helper's per-session
+	// single-instance mutex (#6251) — are released before a caller respawns.
+	// A timeout is not an error: the process is already being torn down.
+	_, _ = windows.WaitForSingleObject(handle, stopExitWait)
 	return true, nil
 }
+
+// stopExitWait bounds how long stopByPIDIfOurs waits for a terminated helper
+// to finish exiting. Callers stop helpers one after another while holding
+// Manager.mu on the heartbeat goroutine, so this stays short: a normal
+// TerminateProcess finishes well inside it, and the cost only adds up for a
+// process wedged in teardown. If a respawn still races the old mutex, the new
+// instance exits and the session watcher respawns on its next tick.
+const stopExitWait = 250 // milliseconds
 
 func spawnWithConfig(binaryPath, sessionKey, configPath string) (int, error) {
 	sessionNum, err := strconv.ParseUint(sessionKey, 10, 32)

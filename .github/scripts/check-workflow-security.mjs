@@ -18,12 +18,12 @@ const WINDOWS_SIGNING_PUBLISHER_RULE = 'windows-signing-must-assert-publisher';
 const WINDOWS_SIGNING_RELEASE_GATE_RULE = 'windows-signing-gate-must-block-release';
 const WINDOWS_SIGNING_ARTIFACT_PARITY_RULE = 'windows-signing-providers-must-cover-same-artifacts';
 const SSLCOM_SIGNING_TOOLCHAIN_RULE = 'sslcom-signing-must-pin-toolchain';
+const SIGNING_ENVIRONMENT_RULE = 'signing-secrets-must-use-signing-environment';
 const TAURI_SIGNED_ARTIFACT_MARKER = 'breeze-viewer-windows.msi';
 const TAURI_SIGNED_ARTIFACT_RE = /breeze-[a-z0-9-]+-windows\.msi/gu;
 const PROVIDER_RESOLVER_SCRIPT = '.github/scripts/resolve-windows-signing-provider.mjs';
 const CONVERGENCE_SCRIPT = '.github/scripts/assert-windows-signing-convergence.mjs';
 const SHARED_SIGNATURE_VERIFIER = '.github/scripts/Verify-WindowsSignature.ps1';
-const AZURE_SIGNING_ACTION_PREFIX = 'azure/artifact-signing-action@';
 const SSLCOM_ACTION_PREFIX = 'SSLcom/esigner-codesign@';
 const PINNED_EXTERNAL_USES = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$/u;
 const PUBLIC_AGENT_WINDOWS_ASSETS = [
@@ -42,6 +42,31 @@ const SSLCOM_SECRETS = [
   'SSLCOM_CERT_SHA256',
   'SSLCOM_ENVIRONMENT_LABEL',
 ];
+// Secrets that sign, or let a job sign, a released artifact. They live only in
+// the signing-production / signing-prerelease environments, whose deployment
+// policy admits v* tags alone, so every job that names one must declare one of
+// those environments. Public keys are deliberately absent: verification jobs on
+// branches and in promotion workflows read them.
+const PROTECTED_SIGNING_SECRET_RE = new RegExp(
+  '\\bsecrets\\.('
+  + [
+    'RELEASE_MANIFEST_ED25519_PRIVATE_KEY',
+    'RELEASE_MANIFEST_MINISIGN_PRIVATE_KEY',
+    'TAURI_SIGNING_PRIVATE_KEY(?:_PASSWORD)?',
+    'APPLE_[A-Za-z0-9_]+',
+    'SSLCOM_[A-Za-z0-9_]+',
+  ].join('|')
+  + ')\\b',
+  // GitHub resolves secret names case-insensitively.
+  'giu',
+);
+// Access that can reach any secret, including the protected ones: the whole
+// context, an object filter over it, or a computed index.
+const WHOLE_SECRET_CONTEXT_RE = /\btojson\(secrets\)|\bsecrets\.\*|\bsecrets\[/iu;
+const SIGNING_ENVIRONMENTS = new Set(['signing-production', 'signing-prerelease']);
+// The release workflow's selector: prerelease tags (with a '-') sign in
+// signing-prerelease, every other tag in signing-production.
+const SIGNING_ENVIRONMENT_SELECTOR = "${{contains(github.ref_name,'-')&&'signing-prerelease'||'signing-production'}}";
 
 function stripInlineComment(line) {
   let quote = null;
@@ -1072,12 +1097,12 @@ function artifactsMatching(job, lineFilter) {
   return [...found].sort(codePointCompare);
 }
 
-// Artifacts handed to a signing action, via azure `files:` or eSigner
-// `file_path:`. Deliberately NOT every MSI named in the job — download and
-// upload steps name them too, so a deleted sign step would go unnoticed while
-// the unsigned file was re-uploaded over the signed artifact name.
+// Artifacts handed to the eSigner action via `file_path:`. Deliberately NOT
+// every MSI named in the job — download and upload steps name them too, so a
+// deleted sign step would go unnoticed while the unsigned file was re-uploaded
+// over the signed artifact name.
 function signedWindowsArtifacts(job) {
-  return artifactsMatching(job, (trimmed) => /^(?:files|file_path):/u.test(trimmed));
+  return artifactsMatching(job, (trimmed) => /^file_path:/u.test(trimmed));
 }
 
 // Artifacts passed to the shared verifier.
@@ -1096,10 +1121,11 @@ function publicReleaseSigningViolations(file, lines) {
   }
 
   const jobs = workflowJobs(lines);
-  // Each provider is located by the action or script that defines it, so the
-  // rules survive any renaming of the jobs themselves.
+  // Each job is located by the action or script that defines it, so the rules
+  // survive any renaming of the jobs themselves. SSL.com eSigner is the only
+  // signing provider: the Azure Artifact Signing lane was retired, so there is
+  // no second signing job to find.
   const resolver = findJobByShape(jobs, PROVIDER_RESOLVER_SCRIPT);
-  const azure = findJobByShape(jobs, AZURE_SIGNING_ACTION_PREFIX);
   const sslcom = findJobByShape(jobs, SSLCOM_ACTION_PREFIX);
   const gate = findJobByShape(jobs, CONVERGENCE_SCRIPT);
   const integrityGate = findJobByShape(jobs, 'require_success');
@@ -1107,7 +1133,6 @@ function publicReleaseSigningViolations(file, lines) {
   const violations = [];
   const structural = [
     [resolver, 'a provider resolution job', WINDOWS_SIGNING_PROVIDER_FAIL_CLOSED_RULE],
-    [azure, 'an Azure signing job', WINDOWS_SIGNING_PUBLISHER_RULE],
     [sslcom, 'an SSL.com signing job', SSLCOM_SIGNING_CERTIFICATE_PIN_RULE],
     [gate, 'a provider convergence gate', WINDOWS_SIGNING_PROVIDER_CONVERGENCE_RULE],
     [integrityGate, 'a release integrity gate', WINDOWS_SIGNING_RELEASE_GATE_RULE],
@@ -1132,14 +1157,8 @@ function publicReleaseSigningViolations(file, lines) {
     file,
   );
 
-  // Only the Azure signer may hold OIDC.
-  requirePattern(
-    azure,
-    /id-token:\s*write/u,
-    WINDOWS_SIGNING_PROVIDER_LEAST_PRIVILEGE_RULE,
-    violations,
-    file,
-  );
+  // No Windows signing job holds OIDC. Only the retired Azure signer ever
+  // needed it; eSigner authenticates with environment-scoped credentials.
   for (const section of [resolver, sslcom, gate]) {
     forbidPattern(
       section,
@@ -1150,25 +1169,23 @@ function publicReleaseSigningViolations(file, lines) {
     );
   }
 
-  // Both providers must assert the publisher through the shared verifier. The
-  // Azure path previously verified only that *some* signature existed, so a
-  // mis-set endpoint or certificate profile shipped under any identity.
-  for (const section of [azure, sslcom]) {
-    requirePattern(
-      section,
-      new RegExp(escapeRegExp(SHARED_SIGNATURE_VERIFIER), 'u'),
-      WINDOWS_SIGNING_TIMESTAMP_RULE,
-      violations,
-      file,
-    );
-    requirePattern(
-      section,
-      /-ExpectedSubject\s+\$env:EXPECTED_SUBJECT/u,
-      WINDOWS_SIGNING_PUBLISHER_RULE,
-      violations,
-      file,
-    );
-  }
+  // The signing job must assert the publisher through the shared verifier. An
+  // inline check once verified only that *some* signature existed, so a
+  // mis-set credential or certificate shipped under any identity.
+  requirePattern(
+    sslcom,
+    new RegExp(escapeRegExp(SHARED_SIGNATURE_VERIFIER), 'u'),
+    WINDOWS_SIGNING_TIMESTAMP_RULE,
+    violations,
+    file,
+  );
+  requirePattern(
+    sslcom,
+    /-ExpectedSubject\s+\$env:EXPECTED_SUBJECT/u,
+    WINDOWS_SIGNING_PUBLISHER_RULE,
+    violations,
+    file,
+  );
 
   // SSL.com credential + certificate pinning.
   requirePattern(
@@ -1194,21 +1211,13 @@ function publicReleaseSigningViolations(file, lines) {
     violations,
     file,
   );
-  // -AllowUnpinnedLeaf turns the certificate pin off. It is correct on the
-  // Azure path, whose leaves rotate, and never on the pinned one.
+  // -AllowUnpinnedLeaf turns the certificate pin off. It existed for a
+  // provider whose leaf certificates rotated automatically; the pinned path
+  // must never carry it.
   forbidPattern(
     sslcom,
     /-AllowUnpinnedLeaf/u,
     SSLCOM_SIGNING_CERTIFICATE_PIN_RULE,
-    violations,
-    file,
-  );
-  // Verifying without a pin has to be an explicit, reviewable choice rather
-  // than the silent consequence of an empty secret.
-  requirePattern(
-    azure,
-    /-AllowUnpinnedLeaf/u,
-    WINDOWS_SIGNING_PUBLISHER_RULE,
     violations,
     file,
   );
@@ -1244,72 +1253,44 @@ function publicReleaseSigningViolations(file, lines) {
     );
   }
 
-  // Agent-family artifacts stay unsigned in the public pipeline — on BOTH
-  // providers, not just SSL.com.
-  for (const section of [azure, sslcom]) {
-    for (const asset of PUBLIC_AGENT_WINDOWS_ASSETS) {
-      forbidPattern(
-        section,
-        new RegExp(escapeRegExp(asset), 'u'),
-        SSLCOM_SIGNING_AGENT_ISOLATION_RULE,
-        violations,
-        file,
-      );
-    }
-    // A directory-wide batch sign would pick up whatever is staged without
-    // naming any forbidden file.
+  // Agent-family artifacts stay unsigned in the public pipeline.
+  for (const asset of PUBLIC_AGENT_WINDOWS_ASSETS) {
     forbidPattern(
-      section,
-      /(?:command:\s*batch_sign|dir_path:)/u,
+      sslcom,
+      new RegExp(escapeRegExp(asset), 'u'),
       SSLCOM_SIGNING_AGENT_ISOLATION_RULE,
       violations,
       file,
     );
   }
+  // A directory-wide batch sign would pick up whatever is staged without
+  // naming any forbidden file.
+  forbidPattern(
+    sslcom,
+    /(?:command:\s*batch_sign|dir_path:)/u,
+    SSLCOM_SIGNING_AGENT_ISOLATION_RULE,
+    violations,
+    file,
+  );
 
-  // Both providers must cover exactly the same artifact set, or one of them can
-  // quietly leave a file unsigned while overwriting the signed artifact name.
-  // Every artifact a provider verifies must also have been signed by it, and
-  // both providers must cover the same set.
-  for (const section of [azure, sslcom]) {
-    if (!section) {
-      continue;
-    }
-    const signed = signedWindowsArtifacts(section);
-    const verified = verifiedWindowsArtifacts(section);
+  // Every artifact the signing job verifies must also have been signed by it,
+  // or a deleted sign step can quietly leave a file unsigned while the job
+  // still overwrites the signed artifact name.
+  if (sslcom) {
+    const signed = signedWindowsArtifacts(sslcom);
+    const verified = verifiedWindowsArtifacts(sslcom);
     if (signed.join(',') !== verified.join(',')) {
-      violations.push({
-        file,
-        line: section.lines[0].line,
-        rule: WINDOWS_SIGNING_ARTIFACT_PARITY_RULE,
-        message: `signing job "${section.name}" signs [${signed.join(' ')}] but verifies [${verified.join(' ')}]`,
-      });
-    }
-  }
-  if (azure && sslcom) {
-    const azureArtifacts = signedWindowsArtifacts(azure);
-    const sslcomArtifacts = signedWindowsArtifacts(sslcom);
-    if (azureArtifacts.join(',') !== sslcomArtifacts.join(',')) {
       violations.push({
         file,
         line: sslcom.lines[0].line,
         rule: WINDOWS_SIGNING_ARTIFACT_PARITY_RULE,
-        message: `Windows signing providers must cover the same artifacts; azure=[${azureArtifacts.join(' ')}] sslcom=[${sslcomArtifacts.join(' ')}]`,
+        message: `signing job "${sslcom.name}" signs [${signed.join(' ')}] but verifies [${verified.join(' ')}]`,
       });
     }
   }
 
-  // Convergence gate: exactly one provider ran, and it succeeded.
+  // Convergence gate: the selected provider ran, and it succeeded.
   requirePattern(gate, /!cancelled\(\)/u, WINDOWS_SIGNING_PROVIDER_CONVERGENCE_RULE, violations, file);
-  if (azure) {
-    requirePattern(
-      gate,
-      new RegExp(`needs\\.${escapeRegExp(azure.name)}\\.result`, 'u'),
-      WINDOWS_SIGNING_PROVIDER_CONVERGENCE_RULE,
-      violations,
-      file,
-    );
-  }
   if (sslcom) {
     requirePattern(
       gate,
@@ -1321,7 +1302,7 @@ function publicReleaseSigningViolations(file, lines) {
   }
   requirePattern(
     gate,
-    /node\s+\.github\/scripts\/assert-windows-signing-convergence\.mjs\s+"\$PROVIDER"\s+"\$AZURE_RESULT"\s+"\$SSLCOM_RESULT"/u,
+    /node\s+\.github\/scripts\/assert-windows-signing-convergence\.mjs\s+"\$PROVIDER"\s+"\$SSLCOM_RESULT"/u,
     WINDOWS_SIGNING_PROVIDER_CONVERGENCE_RULE,
     violations,
     file,
@@ -1338,6 +1319,140 @@ function publicReleaseSigningViolations(file, lines) {
       violations,
       file,
     );
+  }
+
+  return violations;
+}
+
+// The job-level `environment:` name, in any of its three spellings: a scalar,
+// a block mapping with `name:`, or a flow mapping. A `url:`-only mapping has no
+// name and returns null.
+function jobEnvironmentName(job) {
+  const { lines } = job;
+  for (const [index, line] of lines.entries()) {
+    if (line.isBlockScalarContent || parentLineIndex(lines, index) !== 0) {
+      continue;
+    }
+    const entry = mappingEntry(line.trimmed);
+    if (entry?.key !== 'environment') {
+      continue;
+    }
+    if (entry.value.startsWith('{')) {
+      const name = flowMappingEntries(entry.value).find(({ key }) => key === 'name');
+      return name ? unquote(name.value) : null;
+    }
+    if (entry.value !== '') {
+      return unquote(entry.value);
+    }
+    for (let nestedIndex = index + 1; nestedIndex < lines.length; nestedIndex += 1) {
+      const nested = lines[nestedIndex];
+      if (nested.indent <= line.indent) {
+        break;
+      }
+      if (nested.isBlockScalarContent || parentLineIndex(lines, nestedIndex) !== index) {
+        continue;
+      }
+      const child = mappingEntry(nested.trimmed);
+      if (child?.key === 'name') {
+        return /^[>|][0-9+-]*$/u.test(child.value)
+          ? blockScalarValue(lines, nestedIndex)
+          : unquote(child.value);
+      }
+    }
+    return null;
+  }
+  return null;
+}
+
+function isSigningEnvironment(name) {
+  if (name === null) {
+    return false;
+  }
+  return (
+    SIGNING_ENVIRONMENTS.has(name.trim())
+    || name.replace(/\s+/gu, '') === SIGNING_ENVIRONMENT_SELECTOR
+  );
+}
+
+// Protected secret names (or a whole-context marker) referenced on one line,
+// folding a block scalar into its opening line so a reference split across
+// folded lines is still seen.
+function protectedSigningReferences(lines, index) {
+  const line = lines[index];
+  const scalar = normalizePropertyAccess(
+    line.isBlockScalarContent
+      ? line.content
+      : `${line.content} ${blockScalarValue(lines, index)}`,
+  );
+  const found = new Set(
+    [...scalar.matchAll(PROTECTED_SIGNING_SECRET_RE)].map((match) => match[1].toUpperCase()),
+  );
+  if (WHOLE_SECRET_CONTEXT_RE.test(scalar)) {
+    found.add('the whole secrets context');
+  }
+  return found;
+}
+
+function signingEnvironmentViolations(file, lines) {
+  const violations = [];
+  const jobLineNumbers = new Set();
+
+  for (const job of workflowJobs(lines)) {
+    for (const line of job.lines) {
+      jobLineNumbers.add(line.line);
+    }
+    if (isSigningEnvironment(jobEnvironmentName(job))) {
+      continue;
+    }
+
+    const names = new Set();
+    let firstLine = null;
+    for (const [index, line] of job.lines.entries()) {
+      const found = protectedSigningReferences(job.lines, index);
+      const entry = line.isBlockScalarContent ? null : mappingEntry(line.trimmed);
+      // A reusable-workflow call cannot declare an environment, and `inherit`
+      // hands it every repository secret.
+      if (
+        entry?.key === 'secrets'
+        && unquote(entry.value) === 'inherit'
+        && parentLineIndex(job.lines, index) === 0
+      ) {
+        found.add('the whole secrets context');
+      }
+      if (found.size === 0) {
+        continue;
+      }
+      firstLine ??= line.line;
+      for (const name of found) {
+        names.add(name);
+      }
+    }
+    if (firstLine === null) {
+      continue;
+    }
+    violations.push({
+      file,
+      line: firstLine,
+      rule: SIGNING_ENVIRONMENT_RULE,
+      message: `job "${job.name}" reads ${[...names].sort(codePointCompare).join(', ')} but does not declare environment signing-production or signing-prerelease`,
+    });
+  }
+
+  // Workflow-level env (or anything else outside a job) reaches every job.
+  for (const [index, line] of lines.entries()) {
+    if (jobLineNumbers.has(line.line)) {
+      continue;
+    }
+    const found = protectedSigningReferences(lines, index);
+    if (found.size === 0) {
+      continue;
+    }
+    violations.push({
+      file,
+      line: line.line,
+      rule: SIGNING_ENVIRONMENT_RULE,
+      message: `${[...found].sort(codePointCompare).join(', ')} must be read inside a job that declares environment signing-production or signing-prerelease, not at workflow level`,
+    });
   }
 
   return violations;
@@ -1406,6 +1521,7 @@ export function inspectWorkflowText(file, text) {
 
   violations.push(...developerSigningViolations(file, lines));
   violations.push(...publicReleaseSigningViolations(file, lines));
+  violations.push(...signingEnvironmentViolations(file, lines));
 
   return violations.sort(compareViolations);
 }

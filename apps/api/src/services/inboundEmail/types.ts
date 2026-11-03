@@ -8,7 +8,7 @@ export type InboundParseStatus = 'matched' | 'created' | 'quarantined' | 'failed
 
 // Inbound provider identity. The mailgun impl reports 'mailgun'; 'resend' is
 // reserved for the planned second provider.
-export type InboundProviderName = 'mailgun' | 'resend' | 'm365';
+export type InboundProviderName = 'mailgun' | 'resend' | 'm365' | 'gmail';
 
 // A single sender-authentication verdict, normalized to lowercase. 'pass'/'fail'
 // are the meaningful states; 'none'/'neutral'/'unknown' are all treated as NOT a
@@ -19,14 +19,25 @@ export type SenderAuthVerdict = 'pass' | 'fail' | 'neutral' | 'none' | 'unknown'
 // Sender-authentication summary for the From domain (R4). The From header is
 // spoofable, so identity/state actions (treating a sender as a known portal user,
 // or threading a reply by ticket token) must gate on `verified`. `verified` is the
-// derived trust decision: aligned SPF+DKIM pass, OR a DMARC pass. When the provider
-// omits all verdicts, `verified` is false (fail closed) — mail is quarantined for
-// human review, never auto-trusted and never hard-dropped.
+// derived trust decision: a trusted DMARC pass, or (Microsoft 365 mailbox only)
+// Exchange's intra-tenant stamp — see `source`. When the provider omits all
+// verdicts, `verified` is false (fail closed) — mail is quarantined for human
+// review, never auto-trusted and never hard-dropped.
 export interface SenderAuth {
   spf: SenderAuthVerdict;
   dkim: SenderAuthVerdict;
   dmarc: SenderAuthVerdict;
   verified: boolean;
+  /**
+   * Set only when `verified` came from something other than the provider's
+   * Authentication-Results verdicts. 'exchange-internal': a Microsoft 365 mailbox
+   * received mail that the tenant's own Exchange stamped as sent from inside the
+   * tenant (normalizeGraphMessage, #8299). That proves the message originated
+   * inside the tenant, not that the From address is the real sender: a tenant user
+   * or connector allowed to send as another address passes too. Absent: `verified`
+   * is the DMARC result.
+   */
+  source?: 'exchange-internal';
 }
 
 // Why a message ended up WITHOUT a usable provider sender-auth verdict, as opposed to a
@@ -51,6 +62,12 @@ export interface NormalizedInboundEmail {
   fromName?: string;
   subject: string;
   text: string;          // plain body
+  /** The message's provider-supplied text/plain body, unstripped, for staff-forward
+   *  detection only. Set only by the Gmail normalizer, and only when the message
+   *  has a real text/plain part and a single From mailbox. Absent otherwise, or
+   *  when the producer predates this field; detection then does not run (fail
+   *  closed). Staff-forward routing also requires provider 'gmail'. */
+  forwardScanText?: string;
   html?: string;         // retained raw, not rendered in v1
   messageId?: string;
   inReplyTo?: string;
@@ -115,7 +132,9 @@ export type InboundAttachmentSkipReason =
   | 'unsupported_type'
   | 'too_many'
   | 'fetch_failed'
-  | 'storage_failed';
+  | 'storage_failed'
+  // The provider's attachment import is not implemented yet (Gmail).
+  | 'provider_unsupported';
 
 /** Bytes already written to attachment storage, awaiting their `ticket_attachments` row. */
 export interface StoredInboundAttachment {

@@ -154,8 +154,17 @@ describe('ConnectDesktopButton — disabled prop gating (issue #2013)', () => {
         />,
       );
 
-      const btn = screen.getByRole('button');
-      expect(btn).toBeDisabled();
+      // The compact menuitem (#9025) and the full header button (#9026) use
+      // aria-disabled so their reason stays keyboard-reachable; iconOnly keeps
+      // native disabled.
+      const btn = screen.getByRole(variant === 'compact' ? 'menuitem' : 'button');
+      if (variant === 'iconOnly') expect(btn).toBeDisabled();
+      else expect(btn).toHaveAttribute('aria-disabled', 'true');
+      if (variant === 'full') {
+        expect(btn).not.toHaveAttribute('disabled');
+        const reason = document.getElementById(btn.getAttribute('aria-describedby') ?? '');
+        expect(reason).toHaveTextContent('Device is offline');
+      }
       expect(btn).toHaveAttribute('title', 'Device is offline');
     });
 
@@ -170,7 +179,7 @@ describe('ConnectDesktopButton — disabled prop gating (issue #2013)', () => {
         />,
       );
 
-      fireEvent.click(screen.getByRole('button'));
+      fireEvent.click(screen.getByRole(variant === 'compact' ? 'menuitem' : 'button'));
       expect(fetchMock).not.toHaveBeenCalled();
     });
   }
@@ -194,7 +203,7 @@ describe('ConnectDesktopButton — disabled prop gating (issue #2013)', () => {
       />,
     );
     const btn = screen.getByRole('button');
-    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute('aria-disabled', 'true');
     expect(btn.getAttribute('title')).toMatch(/no active graphical session|log in/i);
   });
 
@@ -220,7 +229,7 @@ describe('ConnectDesktopButton — disabled prop gating (issue #2013)', () => {
     // tooltip is visible rather than the leftover "Connection failed" title.
     rerender(<ConnectDesktopButton deviceId="dev-x" disabled disabledTitle="Device is offline" />);
     const btn = screen.getByRole('button');
-    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute('aria-disabled', 'true');
     expect(btn).toHaveAttribute('title', 'Device is offline');
     expect(screen.queryByText(/connection failed/i)).toBeNull();
   });
@@ -446,5 +455,59 @@ describe('ConnectDesktopButton — agent upgrade required', () => {
     });
     const calledPaths = fetchMock.mock.calls.map((call) => String(call[0]));
     expect(calledPaths.some((path) => path.includes('desktop-connect-code'))).toBe(false);
+  });
+});
+
+// D13: runAction swaps in the generic errors:<CODE> catalog text whenever one
+// exists (runAction.ts), which would otherwise replace this route's specific
+// prose ("Device not found or access denied" -> "Not found",
+// "Access to this site denied" -> "Access denied"). The per-call `friendly`
+// hook must restore the specific text for these two coded POST
+// /remote/sessions failures.
+describe('ConnectDesktopButton — session creation errors keep specific prose (sweep D13)', () => {
+  beforeEach(() => {
+    _resetToastQueueForTests();
+    fetchMock.mockReset();
+    toastMock.mockReset();
+  });
+
+  function rigSessionCreateFailure(status: number, code: string, error: string) {
+    fetchMock.mockResolvedValueOnce(jsonRes({
+      desktopAccess: null,
+      hasRemoteAccessLauncher: false,
+      remoteAccessLaunchSkipReason: null,
+    }));
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status,
+      statusText: 'Error',
+      json: vi.fn().mockResolvedValue({ error, code }),
+    } as unknown as Response);
+  }
+
+  it('shows the specific device-not-found prose, not the generic "Not found" catalog text', async () => {
+    rigSessionCreateFailure(404, 'NOT_FOUND', 'Device not found or access denied');
+
+    render(<ConnectDesktopButton deviceId="dev-1" />);
+    fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
+
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error', message: expect.stringContaining('Device not found or access denied') }),
+      );
+    });
+  });
+
+  it('shows the specific site-access-denied prose, not the generic "Access denied" catalog text', async () => {
+    rigSessionCreateFailure(403, 'ACCESS_DENIED', 'Access to this site denied');
+
+    render(<ConnectDesktopButton deviceId="dev-1" />);
+    fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
+
+    await waitFor(() => {
+      expect(toastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error', message: expect.stringContaining('Access to this site denied') }),
+      );
+    });
   });
 });

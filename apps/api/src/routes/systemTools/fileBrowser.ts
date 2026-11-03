@@ -1,12 +1,15 @@
 import { Hono } from 'hono';
+import { ERROR_CODES } from '@breeze/shared';
 import { basename } from 'node:path';
 import { zValidator } from '../../lib/validation';
-import { authMiddleware, requireScope } from '../../middleware/auth';
+import { authMiddleware, requirePermission, requireScope } from '../../middleware/auth';
+import { PERMISSIONS } from '../../services/permissions';
 import { executeCommand, CommandTypes } from '../../services/commandQueue';
 import { createAuditLog } from '../../services/auditService';
 import { getTrustedClientIpOrUndefined } from '../../services/clientIp';
 import { auditSensitiveRead } from '../../services/sensitiveReadAudit';
-import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './helpers';
+import { getDeviceWithOrgAndSiteCheck, requireDevicesExecute, SITE_ACCESS_DENIED } from './helpers';
+import { isAgentConfigPath } from './sensitiveTargets';
 import {
   isCommandFailure,
   mapCommandFailure,
@@ -17,6 +20,16 @@ import {
 import { deviceIdParamSchema, fileListQuerySchema, fileDownloadQuerySchema, fileCopyBodySchema, fileMoveBodySchema, fileDeleteBodySchema, fileTrashRestoreBodySchema, fileTrashPurgeBodySchema, fileUploadBodySchema } from './schemas';
 
 export const fileBrowserRoutes = new Hono();
+
+// Upload, copy and move write files with the agent's own privileges, so they
+// need the grant script execution needs (scripts:execute) on top of the
+// router-wide devices:execute (index.ts). Trash restore returns an item to the
+// path it was deleted from and stays at devices:execute. aiGuardrails.ts holds
+// file_operations write/rename to the same grant.
+const requireScriptsExecute = requirePermission(
+  PERMISSIONS.SCRIPTS_EXECUTE.resource,
+  PERMISSIONS.SCRIPTS_EXECUTE.action,
+);
 
 // GET /devices/:deviceId/files - List files for a path
 fileBrowserRoutes.get(
@@ -123,6 +136,20 @@ fileBrowserRoutes.get(
       return c.json({ error: 'Device not found or access denied' }, 404);
     }
 
+    // Reading file content back off the device is a privileged operation —
+    // require devices:execute, matching the AI tool path (see
+    // requireDevicesExecute for the parity rationale).
+    if (!(await requireDevicesExecute(c, auth))) {
+      return c.json({ error: 'Permission denied' }, 403);
+    }
+
+    // Deny the agent's own config/secrets directory outright, regardless of
+    // the caller's permission — this is the file that holds the agent's
+    // bearer and mTLS credentials.
+    if (isAgentConfigPath(path)) {
+      return c.json({ error: 'Access to this path is not permitted', code: 'sensitive_path_denied' }, 403);
+    }
+
     const result = await executeCommand(deviceId, CommandTypes.FILE_READ, {
       path,
       encoding: 'base64'
@@ -187,6 +214,7 @@ fileBrowserRoutes.post(
   '/devices/:deviceId/files/upload',
   authMiddleware,
   requireScope('system', 'partner', 'organization'),
+  requireScriptsExecute,
   zValidator('param', deviceIdParamSchema),
   zValidator('json', fileUploadBodySchema),
   async (c) => {
@@ -202,6 +230,12 @@ fileBrowserRoutes.post(
     }
 
     const body = c.req.valid('json');
+
+    // Deny overwriting the agent's own config/secrets directory outright,
+    // regardless of the caller's permission.
+    if (isAgentConfigPath(body.path)) {
+      return c.json({ error: 'Access to this path is not permitted', code: 'sensitive_path_denied' }, 403);
+    }
 
     // Large files (base64-encoded) need more time to transit DB → WS → agent → disk.
     const sizeBytes = Buffer.byteLength(body.content, 'utf8');
@@ -261,6 +295,7 @@ fileBrowserRoutes.post(
   '/devices/:deviceId/files/copy',
   authMiddleware,
   requireScope('system', 'partner', 'organization'),
+  requireScriptsExecute,
   zValidator('param', deviceIdParamSchema),
   zValidator('json', fileCopyBodySchema),
   async (c) => {
@@ -278,6 +313,20 @@ fileBrowserRoutes.post(
 
     const results = [];
     for (const item of items) {
+      // Deny the agent's own config/secrets directory outright as either
+      // endpoint, regardless of the caller's permission — otherwise a copy
+      // to an ordinary-looking path is an easy way to route around the
+      // download route's deny on the literal requested path.
+      if (isAgentConfigPath(item.sourcePath) || isAgentConfigPath(item.destPath)) {
+        results.push({
+          sourcePath: item.sourcePath,
+          destPath: item.destPath,
+          status: 'failure',
+          error: 'Access to this path is not permitted',
+          code: 'sensitive_path_denied',
+        });
+        continue;
+      }
       try {
         const result = await executeCommand(deviceId, CommandTypes.FILE_COPY, {
           sourcePath: item.sourcePath,
@@ -316,7 +365,7 @@ fileBrowserRoutes.post(
           destPath: item.destPath,
           status: 'failure',
           error: err instanceof Error ? err.message : 'Unexpected error',
-          code: 'agent_execution_failed',
+          code: ERROR_CODES.AGENT_EXECUTION_FAILED,
         });
       }
     }
@@ -334,6 +383,7 @@ fileBrowserRoutes.post(
   '/devices/:deviceId/files/move',
   authMiddleware,
   requireScope('system', 'partner', 'organization'),
+  requireScriptsExecute,
   zValidator('param', deviceIdParamSchema),
   zValidator('json', fileMoveBodySchema),
   async (c) => {
@@ -351,6 +401,18 @@ fileBrowserRoutes.post(
 
     const results = [];
     for (const item of items) {
+      // Deny the agent's own config/secrets directory outright as either
+      // endpoint, regardless of the caller's permission.
+      if (isAgentConfigPath(item.sourcePath) || isAgentConfigPath(item.destPath)) {
+        results.push({
+          sourcePath: item.sourcePath,
+          destPath: item.destPath,
+          status: 'failure',
+          error: 'Access to this path is not permitted',
+          code: 'sensitive_path_denied',
+        });
+        continue;
+      }
       try {
         const result = await executeCommand(deviceId, CommandTypes.FILE_RENAME, {
           oldPath: item.sourcePath,
@@ -389,7 +451,7 @@ fileBrowserRoutes.post(
           destPath: item.destPath,
           status: 'failure',
           error: err instanceof Error ? err.message : 'Unexpected error',
-          code: 'agent_execution_failed',
+          code: ERROR_CODES.AGENT_EXECUTION_FAILED,
         });
       }
     }
@@ -424,6 +486,17 @@ fileBrowserRoutes.post(
 
     const results = [];
     for (const path of paths) {
+      // Deny deleting the agent's own config/secrets directory outright,
+      // regardless of the caller's permission.
+      if (isAgentConfigPath(path)) {
+        results.push({
+          path,
+          status: 'failure',
+          error: 'Access to this path is not permitted',
+          code: 'sensitive_path_denied',
+        });
+        continue;
+      }
       try {
         const result = await executeCommand(deviceId, CommandTypes.FILE_DELETE, {
           path,
@@ -462,7 +535,7 @@ fileBrowserRoutes.post(
           path,
           status: 'failure',
           error: err instanceof Error ? err.message : 'Unexpected error',
-          code: 'agent_execution_failed',
+          code: ERROR_CODES.AGENT_EXECUTION_FAILED,
         });
       }
     }
@@ -579,7 +652,7 @@ fileBrowserRoutes.post(
           trashId,
           status: 'failure',
           error: err instanceof Error ? err.message : 'Unexpected error',
-          code: 'agent_execution_failed',
+          code: ERROR_CODES.AGENT_EXECUTION_FAILED,
         });
       }
     }

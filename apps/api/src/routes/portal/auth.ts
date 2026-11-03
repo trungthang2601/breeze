@@ -5,12 +5,13 @@ import { and, eq, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { db, withDbAccessContext, withSystemDbAccessContext } from '../../db';
-import { organizations, portalBranding, portalUsers } from '../../db/schema';
+import { organizations, partners, portalBranding, portalUsers } from '../../db/schema';
 import { hashPassword, isPasswordStrong, verifyPassword } from '../../services/password';
 import { getEmailService } from '../../services/email';
 import { getRedis } from '../../services/redis';
 import { getActiveOrgTenant } from '../../services/tenantStatus';
 import { rateLimitIpKey } from '../../services/clientIp';
+import { portalAccountRateLimitKey } from '../../services/portal/rateLimit';
 import { resolveOrgTimezone } from '../../services/portal/timezone';
 import {
   loginSchema,
@@ -49,7 +50,9 @@ import {
   purgePortalSessionsForUsers,
 } from './helpers';
 import { isSelfManagedDbContextRoute } from '../../middleware/selfManagedDbContextRoutes';
+import { portalOrgDbAccessContext } from './portalDbContext';
 import { purgeClientAiSessionsForUsers } from '../../services/clientAiSessionStore';
+import { portalSessionRevokedSql, revokePortalSessionDurably } from '../../services/portal/sessionRevocation';
 import { ANONYMOUS_ACTOR_ID, writeAuditEventAsync } from '../../services/auditEvents';
 
 export const authRoutes = new Hono();
@@ -134,6 +137,14 @@ async function isPortalPasswordResetEnabled(orgId: string): Promise<boolean> {
 // ============================================
 // Auth middleware
 // ============================================
+
+/**
+ * Scalar subquery for the organization's display name, folded into the portal
+ * user selects so login, session hydration and invite-accept all carry it
+ * without an extra round trip. A genuinely missing org yields null and
+ * buildPortalUserPayload falls back to the generic label.
+ */
+const portalOrgNameSql = () => sql<string | null>`(select o.name from organizations o where o.id = ${portalUsers.orgId})`;
 
 export async function portalAuthMiddleware(c: Context, next: Next) {
   sweepPortalState();
@@ -221,6 +232,9 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
+        orgName: portalOrgNameSql(),
+        // Signed out at logout (durable record, see sessionRevocation.ts).
+        sessionRevoked: portalSessionRevokedSql(token),
       })
       .from(portalUsers)
       .where(and(eq(portalUsers.id, sessionData.portalUserId), eq(portalUsers.orgId, sessionData.orgId)))
@@ -261,6 +275,30 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
       if (redis) {
         await redis.del(PORTAL_REDIS_KEYS.session(token));
         await redis.srem(PORTAL_REDIS_KEYS.userSessions(user.id), token);
+      }
+    }
+    if (ALLOW_IN_MEMORY_PORTAL_STATE) portalSessions.delete(token);
+    if (cookieToken) clearPortalSessionCookies(c);
+    return c.json({ error: 'Invalid or expired session' }, 401);
+  }
+
+  // A token signed out at logout stays refused even if the cache still holds
+  // it (failed delete, lagging replica, Redis restored from an older
+  // snapshot). Checked before the account/org gates, the sliding-expiry write
+  // and any route work. Cache removal here is cleanup only.
+  if (user.sessionRevoked === true) {
+    if (PORTAL_USE_REDIS) {
+      const redis = getRedis();
+      if (redis) {
+        try {
+          await redis
+            .multi()
+            .del(PORTAL_REDIS_KEYS.session(token))
+            .srem(PORTAL_REDIS_KEYS.userSessions(user.id), token)
+            .exec();
+        } catch (error) {
+          console.warn('[portal] Failed to drop a signed-out session from the cache:', error instanceof Error ? error.message : error);
+        }
       }
     }
     if (ALLOW_IN_MEMORY_PORTAL_STATE) portalSessions.delete(token);
@@ -383,20 +421,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   // system-scoped sub-query must do runOutsideDbContext(() =>
   // withSystemDbAccessContext(...)) explicitly. Likewise, any un-awaited db.*
   // side effect must not capture this txn (mirror auditService's pattern).
-  return withDbAccessContext(
-    {
-      scope: 'organization',
-      orgId: user.orgId,
-      accessibleOrgIds: [user.orgId],
-      accessiblePartnerIds: [],
-      userId: null,
-      // Generic portal routes intentionally do not receive the partner-wide
-      // SELECT branch. Self-managed routes that explicitly need it (for
-      // example Network Visibility) opt in with the validated owning partner.
-      currentPartnerId: null,
-    },
-    () => next()
-  );
+  return withDbAccessContext(portalOrgDbAccessContext(user.orgId), () => next());
 }
 
 // ============================================
@@ -410,7 +435,7 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
   const normalizedEmail = normalizeEmail(email);
   const clientIp = getClientIp(c);
   const ipRateKey = `portal:login:ip:${rateLimitIpKey(clientIp)}`;
-  const accountRateKey = `portal:login:account:${orgId ?? 'any'}:${normalizedEmail}`;
+  const accountRateKey = portalAccountRateLimitKey('login', normalizedEmail);
 
   for (const rateKey of [ipRateKey, accountRateKey]) {
     const rate = await checkRateLimit(rateKey, LOGIN_RATE_LIMIT);
@@ -435,6 +460,7 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
+        orgName: portalOrgNameSql(),
       })
       .from(portalUsers)
       .where(
@@ -522,8 +548,9 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
       .where(eq(portalUsers.id, user.id))
   );
 
-  const resolvedAccountRateKey = `portal:login:account:${user.orgId}:${normalizedEmail}`;
-  await clearRateLimitKeys([ipRateKey, accountRateKey, resolvedAccountRateKey]);
+  // accountRateKey is now keyed on email alone, so it already covers every
+  // org this address might belong to — nothing further to resolve/clear here.
+  await clearRateLimitKeys([ipRateKey, accountRateKey]);
 
   setPortalSessionCookies(c, token);
 
@@ -545,7 +572,7 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
   const normalizedEmail = normalizeEmail(email);
   const clientIp = getClientIp(c);
   const ipRateKey = `portal:forgot:ip:${rateLimitIpKey(clientIp)}`;
-  const accountRateKey = `portal:forgot:account:${orgId ?? 'any'}:${normalizedEmail}`;
+  const accountRateKey = portalAccountRateLimitKey('forgot', normalizedEmail);
 
   for (const rateKey of [ipRateKey, accountRateKey]) {
     const rate = await checkRateLimit(rateKey, FORGOT_PASSWORD_RATE_LIMIT);
@@ -583,9 +610,11 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
         // no auth context and asserts the envelope that reaches the transport:
         // __tests__/integration/portalPasswordResetPartnerLane.integration.test.ts.
         partnerId: organizations.partnerId,
+        partnerName: partners.name,
       })
       .from(portalUsers)
       .innerJoin(organizations, eq(organizations.id, portalUsers.orgId))
+      .leftJoin(partners, eq(partners.id, organizations.partnerId))
       .where(
         orgId
           ? and(eq(portalUsers.orgId, orgId), eq(portalUsers.email, normalizedEmail), eq(portalUsers.authMethod, 'password'))
@@ -623,7 +652,8 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
           to: user.email,
           resetUrl,
           purpose: 'portal.password_reset',
-          partnerId: user.partnerId ?? null
+          partnerId: user.partnerId ?? null,
+          partnerName: user.partnerName ?? null,
         });
       } catch (error) {
         console.error('[portal] Failed to send password reset email:', error);
@@ -793,6 +823,7 @@ authRoutes.post('/auth/accept-invite', zValidator('json', acceptInviteSchema), a
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
+        orgName: portalOrgNameSql(),
       })
       .from(portalUsers)
       .where(eq(portalUsers.id, portalUserId))
@@ -865,6 +896,12 @@ authRoutes.post('/auth/accept-invite', zValidator('json', acceptInviteSchema), a
   });
 });
 
+// Logout ends the presented session, and only that one: other sessions of the
+// same portal user keep working. The durable record is written first and is
+// what refuses the token from now on; deleting the cache entry afterwards is
+// cleanup, so a Redis fault after that point cannot reopen the session.
+// Runs outside the portal request transaction (selfManagedDbContextRoutes.ts):
+// the record commits in its own short system transaction.
 authRoutes.post('/auth/logout', portalAuthMiddleware, async (c) => {
   const csrfError = validatePortalCookieCsrfRequest(c);
   if (csrfError) {
@@ -873,20 +910,42 @@ authRoutes.post('/auth/logout', portalAuthMiddleware, async (c) => {
 
   const auth = c.get('portalAuth');
 
+  // The browser drops its credential whatever happens next.
+  clearPortalSessionCookies(c);
+
+  let recorded = true;
+  try {
+    await revokePortalSessionDurably(auth.token, auth.user.id);
+  } catch (error) {
+    recorded = false;
+    console.error('[portal] Logout could not record the session as signed out:', error instanceof Error ? error.message : error);
+  }
+
+  // Cache cleanup runs even when the record failed: it still ends the session
+  // for every reader of this cache, it just is not durable on its own.
   if (ALLOW_IN_MEMORY_PORTAL_STATE) {
     portalSessions.delete(auth.token);
   }
-  clearPortalSessionCookies(c);
 
   if (PORTAL_USE_REDIS) {
     const redis = getRedis();
     if (!redis) {
-      console.warn('[portal] Redis unavailable during logout; cannot clear distributed portal session state for user:', auth.user.id);
-      return c.json({ success: true });
+      console.warn('[portal] Redis unavailable during logout; only the durable record ends the session');
+    } else {
+      try {
+        await redis
+          .multi()
+          .del(PORTAL_REDIS_KEYS.session(auth.token))
+          .srem(PORTAL_REDIS_KEYS.userSessions(auth.user.id), auth.token)
+          .exec();
+      } catch (error) {
+        console.warn('[portal] Failed to drop a signed-out session from the cache:', error instanceof Error ? error.message : error);
+      }
     }
-    await redis.del(PORTAL_REDIS_KEYS.session(auth.token));
-    await redis.srem(PORTAL_REDIS_KEYS.userSessions(auth.user.id), auth.token);
   }
 
+  if (!recorded) {
+    return c.json({ error: 'Logout could not be fully completed. Please try again.' }, 500);
+  }
   return c.json({ success: true });
 });

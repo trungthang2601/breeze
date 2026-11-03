@@ -9,12 +9,20 @@ import { recordBackupDispatchFailure } from '../../services/backupMetrics';
 import { CommandTypes, queueBackupStopCommand, queueCommandForExecution } from '../../services/commandQueue';
 import { PERMISSIONS } from '../../services/permissions';
 import { resolveBackupProviderConfig, resolveBackupDestinationError } from '../../services/backupProviderConfig';
+import { backupReadCredentialPayload } from '../../services/backupCommandCredentials';
 import { resolveScopedOrgId } from './helpers';
+import { attachDeviceNames, restoreModeFromTargetConfig } from './deviceNames';
 import { restoreListSchema, restoreSchema } from './schemas';
+import { resolveSelectedSnapshotPaths, selectedSnapshotPathError } from '../../services/backupSelectedPaths';
 import {
   authorizeRouteResilienceResources,
   resolveRouteAuthorizedDeviceIds,
 } from './resilienceAuthorization';
+import { BareMetalRecoveryError, cancelBareMetalRecovery } from '../../services/bareMetalRecoveryService';
+import { isBackupHelperUpdateRequiredError } from '../../services/backupReadHelperGate';
+import { isRestoreHelperUpdateRequiredError } from '../../services/backupRestoreGate';
+import { randomUUID } from 'node:crypto';
+import { checkRestoreIntegrityRequest, recordRequestAuthorization, restoreIntegrityResponse } from './restoreIntegrityGate';
 
 export const restoreRoutes = new Hono();
 
@@ -27,11 +35,18 @@ function runInOrg<T>(orgId: string, fn: () => Promise<T>): Promise<T> {
   );
 }
 
+function isHelperUpdateRequired(error: string): boolean {
+  return isBackupHelperUpdateRequiredError(error) || isRestoreHelperUpdateRequiredError(error);
+}
+
 function mapDispatchErrorStatus(error: string): number {
-  return error.startsWith('Device is ') ? 409 : 502;
+  // Both are states of the target device the operator can act on, not
+  // dispatch failures.
+  return error.startsWith('Device is ') || isHelperUpdateRequired(error) ? 409 : 502;
 }
 
 function dispatchFailureReason(error: string): string {
+  if (isHelperUpdateRequired(error)) return 'helper_update_required';
   return error.startsWith('Device is ') ? 'device_offline' : 'enqueue_failed';
 }
 
@@ -149,7 +164,7 @@ restoreRoutes.get(
       .orderBy(desc(restoreJobs.createdAt))
       .limit(query.limit);
 
-    return c.json({ data: rows.map(toRestoreResponse) });
+    return c.json({ data: await attachDeviceNames(orgId, rows.map(toRestoreResponse)) });
   }
 );
 
@@ -180,7 +195,8 @@ restoreRoutes.get(
       return c.json({ error: 'Restore job not found' }, 404);
     }
 
-    return c.json({ data: toRestoreResponse(row) });
+    const [withName] = await attachDeviceNames(orgId, [toRestoreResponse(row)]);
+    return c.json({ data: withName });
   }
 );
 
@@ -224,6 +240,7 @@ restoreRoutes.post(
       return c.json({ error: 'Snapshot not found' }, 404);
     }
 
+    let selectedPaths: string[] = [];
     if (payload.restoreType === 'selective') {
       const snapshotFiles = await db
         .select({ id: backupSnapshotFiles.id, sourcePath: backupSnapshotFiles.sourcePath })
@@ -234,11 +251,16 @@ restoreRoutes.post(
         return c.json({ error: 'Selective restore is unavailable for snapshots without indexed files' }, 409);
       }
 
-      const availablePaths = new Set(snapshotFiles.map((row) => row.sourcePath));
-      const invalidPath = payload.selectedPaths?.find((path) => !availablePaths.has(path));
-      if (invalidPath) {
-        return c.json({ error: `Selected path is not available in this snapshot: ${invalidPath}` }, 400);
+      // The browse tree shows forward-slash paths; map each selection back to
+      // the stored original the agent indexed (and matches against).
+      const resolution = resolveSelectedSnapshotPaths(
+        payload.selectedPaths ?? [],
+        snapshotFiles.map((row) => row.sourcePath)
+      );
+      if (!resolution.ok) {
+        return c.json({ error: selectedSnapshotPathError(resolution) }, 400);
       }
+      selectedPaths = resolution.paths;
     }
 
     const now = new Date();
@@ -278,6 +300,33 @@ restoreRoutes.post(
       return c.json({ error: message, reason }, 422);
     }
 
+    // Integrity (routes/backup/restoreIntegrityGate.ts): decided before
+    // anything is created. A restore of a snapshot without a usable
+    // attestation needs a step-up; once consumed, its authorization is
+    // recorded bound to the command id reserved here, before the command
+    // exists, so delivery can find it.
+    const integrityRequest = {
+      orgId,
+      snapshotDbId: snapshot.id,
+      targetDeviceId: resolvedTargetDeviceId,
+      commandType: CommandTypes.BACKUP_RESTORE,
+      stepUpGrant: payload.stepUpGrant,
+      confirmUnattestedRestore: payload.confirmUnattestedRestore,
+      executingDeviceId: resolvedTargetDeviceId,
+    };
+    const integrityCheck = await checkRestoreIntegrityRequest(c, integrityRequest);
+    if (!integrityCheck.ok) {
+      recordBackupDispatchFailure('manual_restore', 'integrity_refused');
+      return restoreIntegrityResponse(c, integrityCheck);
+    }
+    let reservedCommandId: string | undefined;
+    if (integrityCheck.authorizationReason) {
+      reservedCommandId = randomUUID();
+      await recordRequestAuthorization(c, integrityRequest, integrityCheck.authorizationReason, { commandId: reservedCommandId }, {
+        confirmationMethod: integrityCheck.confirmationMethod,
+      });
+    }
+
     const [row] = await runInOrg(orgId, async () =>
       db
         .insert(restoreJobs)
@@ -287,7 +336,7 @@ restoreRoutes.post(
           deviceId: resolvedTargetDeviceId,
           restoreType: payload.restoreType,
           targetPath: payload.targetPath ?? null,
-          selectedPaths: payload.restoreType === 'selective' ? (payload.selectedPaths ?? []) : [],
+          selectedPaths,
           status: 'pending',
           initiatedBy: c.get('auth')?.user?.id ?? null,
           createdAt: now,
@@ -311,11 +360,15 @@ restoreRoutes.post(
             restoreJobId: row.id,
             snapshotId: snapshot.snapshotId,
             targetPath: row.targetPath ?? '',
-            selectedPaths: payload.restoreType === 'selective' ? (payload.selectedPaths ?? []) : [],
-            provider: backupProviderConfig.provider,
-            providerConfig: backupProviderConfig.providerConfig,
+            selectedPaths,
+            // A reference only: the destination is resolved when the command
+            // is delivered, so it is never written to the command row.
+            ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
           },
-          { userId: auth?.user?.id ?? undefined }
+          {
+            userId: auth?.user?.id ?? undefined,
+            ...(reservedCommandId ? { commandId: reservedCommandId } : {}),
+          }
         )
       );
 
@@ -444,6 +497,33 @@ restoreRoutes.post(
       return c.json({ error: 'Restore job is not cancelable' }, 409);
     }
 
+    // A rebuild-engine job owns a bare-metal recovery that holds the device's
+    // "one non-terminal recovery" slot. backup_stop does not stop a rebuild, so
+    // only a rebuild still queued (command not yet delivered) can be cancelled;
+    // once running the host is mid-rebuild and cancelling would be a lie.
+    const config = current.targetConfig as Record<string, unknown> | null;
+    const rebuildRecoveryId =
+      config && config.engine === 'rebuild' && typeof config.recoveryId === 'string'
+        ? config.recoveryId
+        : null;
+    let rebuildDispatchRemoved = false;
+    if (rebuildRecoveryId) {
+      if (current.status === 'running') {
+        return c.json({ error: 'A rebuild that is already running cannot be cancelled' }, 409);
+      }
+      if (current.commandId) {
+        try {
+          rebuildDispatchRemoved = await removeQueuedRestoreDispatch(current.commandId);
+        } catch (err) {
+          console.error(`[BackupRestore] Failed to remove queued rebuild dispatch for restore ${current.id}:`, err);
+          return c.json({ error: 'Could not remove the queued rebuild command; try again' }, 503);
+        }
+        if (!rebuildDispatchRemoved) {
+          return c.json({ error: 'The rebuild command was already delivered and cannot be cancelled' }, 409);
+        }
+      }
+    }
+
     const reason = 'Cancelled by user';
     const now = new Date();
     const [row] = await runInOrg(orgId, async () =>
@@ -472,8 +552,27 @@ restoreRoutes.post(
       return c.json({ error: 'Restore job is not cancelable' }, 409);
     }
 
-    let dispatchRemoved = false;
-    if (current.commandId) {
+    let recoveryCloseFailed = false;
+    if (rebuildRecoveryId) {
+      // Free the device's recovery slot so the next rebuild isn't refused.
+      try {
+        await cancelBareMetalRecovery({
+          recoveryId: rebuildRecoveryId,
+          orgId,
+          userId: auth?.user?.id ?? null,
+          reason,
+        });
+      } catch (err) {
+        // invalid_state = recovery already terminal, which is the goal state.
+        if (!(err instanceof BareMetalRecoveryError && err.code === 'invalid_state')) {
+          recoveryCloseFailed = true;
+          console.error(`[BackupRestore] Failed to close bare-metal recovery ${rebuildRecoveryId} for restore ${row.id}:`, err);
+        }
+      }
+    }
+
+    let dispatchRemoved = rebuildDispatchRemoved;
+    if (current.commandId && !rebuildRecoveryId) {
       try {
         dispatchRemoved = await removeQueuedRestoreDispatch(current.commandId);
       } catch (err) {
@@ -482,7 +581,7 @@ restoreRoutes.post(
     }
 
     let stopQueued = false;
-    if (current.status === 'running' || (current.status === 'pending' && !dispatchRemoved)) {
+    if (!rebuildRecoveryId && (current.status === 'running' || (current.status === 'pending' && !dispatchRemoved))) {
       try {
         const { error } = await queueBackupStopCommand(row.deviceId, {
           userId: auth?.user?.id ?? undefined,
@@ -505,16 +604,31 @@ restoreRoutes.post(
         deviceId: row.deviceId,
         dispatchRemoved,
         stopQueued,
+        ...(rebuildRecoveryId ? { recoveryClosed: !recoveryCloseFailed } : {}),
       },
     });
 
     const data = toRestoreResponse(row);
+    if (recoveryCloseFailed) {
+      return c.json({ data, warning: 'Rebuild cancelled but its bare-metal recovery could not be closed; the device may refuse a new rebuild until it is cancelled from Recoveries.' });
+    }
     if (current.status === 'running' && !stopQueued) {
       return c.json({ data, warning: 'Restore marked as cancelled but the stop signal could not be delivered to the agent. The restore may still be running on the device.' });
     }
     return c.json({ data });
   }
 );
+
+// Advisory restore warnings describe how a restore ran rather than why it
+// failed. Mirrors isAdvisoryRestoreWarning in the web RestoreResultNotices.
+function isAdvisoryRestoreWarning(warning: string): boolean {
+  const trimmed = warning.trim();
+  return (
+    trimmed.startsWith('system_state_requires_rebuild:') ||
+    trimmed.includes('unattested snapshot: files were not checked against a snapshot attestation') ||
+    trimmed.startsWith('vault copy differs from backup; restored from primary storage')
+  );
+}
 
 function toRestoreResponse(row: typeof restoreJobs.$inferSelect) {
   const targetConfig =
@@ -534,13 +648,21 @@ function toRestoreResponse(row: typeof restoreJobs.$inferSelect) {
             error: targetError,
           }
         : null;
+  // Warnings on a completed restore, and advisory warnings on any restore
+  // (e.g. an unattested snapshot), are shown as warnings, never as the error
+  // summary.
+  const summaryWarning = row.status !== 'completed' && Array.isArray(resultDetails?.warnings)
+    ? resultDetails.warnings.find(
+        (warning): warning is string => typeof warning === 'string' && warning.trim() !== '' && !isAdvisoryRestoreWarning(warning)
+      ) ?? null
+    : null;
   const errorSummary = resultDetails
     ? typeof resultDetails.error === 'string' && resultDetails.error.trim()
       ? resultDetails.error
       : typeof resultDetails.stderr === 'string' && resultDetails.stderr.trim()
         ? resultDetails.stderr
-        : Array.isArray(resultDetails.warnings) && resultDetails.warnings.length > 0
-          ? String(resultDetails.warnings[0])
+        : summaryWarning
+          ? summaryWarning
           : targetError
             ? targetError
             : null
@@ -551,6 +673,9 @@ function toRestoreResponse(row: typeof restoreJobs.$inferSelect) {
     snapshotId: row.snapshotId,
     deviceId: row.deviceId,
     restoreType: row.restoreType,
+    // Restore-as-VM / instant boot persist restoreType 'full'; expose the mode so
+    // the UI does not label them "full restore" (#7213).
+    restoreMode: restoreModeFromTargetConfig(row.targetConfig),
     selectedPaths: row.selectedPaths ?? [],
     status: row.status,
     targetPath: row.targetPath ?? null,

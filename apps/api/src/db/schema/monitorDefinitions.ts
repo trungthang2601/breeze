@@ -54,6 +54,14 @@ export const monitorKindEnum = pgEnum('monitor_kind', [
   'network_check',
   // W05c1 — 2026-10-23-103000-monitor-kind-composite.sql
   'composite',
+  // W03 (hardware & RAID monitoring) —
+  // 2026-10-30-110200-monitor-kind-hardware-health.sql
+  'hardware_health',
+  // W02 (time sync) — 2026-11-10-110100-monitor-kind-time-sync.sql
+  'time_sync',
+  // W06 (workload inventory) —
+  // 2026-12-26-180000-container-image-currency-monitor.sql
+  'container_image_currency',
 ]);
 
 export const monitorDefinitions = pgTable(
@@ -95,6 +103,12 @@ export const monitorDefinitions = pgTable(
     // builtInMonitors.ts ('cpu_high' | 'memory_high' | 'disk_full'). NULL for
     // every user-authored monitor. CHECK: builtin_key IS NULL OR partner_id IS NOT NULL.
     builtinKey: varchar('builtin_key', { length: 64 }),
+    // Alert → PSA ticket (#10499 W2-A, #10528): the PSA board this monitor's
+    // alert tickets go to, overriding the bound connection's
+    // alert_ticketing.boardId. NULL = connection default. Partner-level config:
+    // only callers who can manage partner-wide config may set it (route gate).
+    // CHECK psa_board_id IS NULL OR psa_board_id > 0.
+    psaBoardId: integer('psa_board_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },

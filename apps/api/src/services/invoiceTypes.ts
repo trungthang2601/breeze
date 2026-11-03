@@ -25,7 +25,7 @@ export interface InvoiceActor {
 }
 
 export type InvoiceServiceErrorCode =
-  // SEC-150: a Checkout session for this invoice is still being revoked.
+  // A Checkout session for this invoice is still being revoked.
   // 503 from a transition (reset/pay/void), 409 from a producer that was
   // asked to mint another session while the revocation is in flight.
   | 'STRIPE_REVOCATION_PENDING'
@@ -77,6 +77,12 @@ export type InvoiceServiceErrorCode =
   | 'ALL_MISSING_RATE'
   | 'NO_VISIBLE_LINES'
   | 'SOURCE_ALREADY_BILLED'
+  /** 409 — #4617: a draft's source time is now held for customer approval; it cannot be invoiced until released. */
+  | 'SOURCE_AWAITING_APPROVAL'
+  /** 409 — #8970: a draft's time entry is held for a block of hours (inside a
+   *  hold window, contractHourBlockHolds.ts); the period close bills it, so the
+   *  draft cannot bill it hourly. Carries `details.heldEntryIds`. */
+  | 'SOURCE_HELD_FOR_HOUR_BLOCK'
   // B10 (#3774): a line's source row no longer exists (or belongs to another
   // org) when re-validated under lock at issue time.
   | 'SOURCE_NOT_FOUND'
@@ -86,15 +92,16 @@ export type InvoiceServiceErrorCode =
   | 'OVERPAYMENT'
   | 'INVALID_STATE'
   | 'INVALID_AMOUNT'
+  | 'COLLECTION_IN_PROGRESS'
   | 'LINE_NOT_FOUND'
   | 'PAYMENT_NOT_FOUND'
-  // QuickBooks Phase D2 (spec decision 15): the payment came from QuickBooks,
-  // which is its system of record. A Breeze-side void would not touch the books
-  // and the next CDC sweep would pull the payment straight back in, so the void
-  // is refused at the service layer rather than only hidden in the UI. Raised
+  // The payment came from the connected accounting provider, which is its
+  // system of record. A Breeze-side void would not touch the books and the
+  // next CDC sweep would pull the payment straight back in, so the void is
+  // refused at the service layer rather than only hidden in the UI. Raised
   // ONLY while such a sweep would actually run — see voidPayment's connection
   // probe (review wave 2, finding 8).
-  | 'QUICKBOOKS_OWNED_PAYMENT'
+  | 'PROVIDER_OWNED_PAYMENT'
   // The caller cannot SEE `accounting_entity_mappings`: it is partner-axis under
   // RLS and this is an organization-scoped principal, so the QuickBooks-origin
   // probe would read empty and pass a payment it should refuse. Fails closed
@@ -115,7 +122,7 @@ export type InvoiceServiceErrorCode =
 export class InvoiceServiceError extends Error {
   constructor(
     message: string,
-    // 503 (SEC-150 STRIPE_REVOCATION_PENDING): the transition was REFUSED
+    // 503 (STRIPE_REVOCATION_PENDING): the transition was REFUSED
     // because Stripe has not yet confirmed an open Checkout session is dead.
     // Retryable by definition — a 4xx would tell the caller to stop trying.
     public status: 400 | 403 | 404 | 409 | 500 | 503 = 400,

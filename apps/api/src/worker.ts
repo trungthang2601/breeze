@@ -91,10 +91,13 @@
  */
 import { config as loadDotenv } from 'dotenv';
 loadDotenv({ quiet: true });
+// An empty CLAUDE_CONFIG_DIR (compose `${VAR:-}`) must read as unset for the Agent SDK. #9133.
+import './config/normalizeClaudeConfigDir';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { sql } from 'drizzle-orm';
 import { AI_AGENTS_ENABLED, abuseSignalsEnabled, breezeRole, eventDispatchMode } from './config/env';
 import { logAiAgentsSubsystemState } from './services/aiAgents/subsystemState';
+import { startPlatformModelSnapshotRefresher } from './services/aiModels/platformModels';
 import { partnerTrustMode } from './config/partnerTrustMode';
 import { isPartnerLaneConfigured } from './services/emailDomains/config';
 import { auditChainVerifyEnabled } from './config/auditChainVerify';
@@ -437,6 +440,7 @@ export async function bootWorker(): Promise<void> {
   const { extensionContributionRegistry } = await import('./extensions/contributionRegistry');
   const { createExtensionStateStore } = await import('./extensions/stateStore');
   const { registerAiAgentEnqueuer } = await import('./jobs/aiAgentEnqueuer');
+  const { registerGatewayConnectionCheck } = await import('./services/aiModels/gatewayConnectionState');
   const { registerAllEventSubscribers } = await import('./services/eventSubscribers');
   const { buildWebhookFanoutDeps } = await import('./services/webhookFanoutDeps');
   const { startRegisteredWorkers, buildWorkerShutdownTasks } = await import('./services/workerRegistry');
@@ -455,6 +459,7 @@ export async function bootWorker(): Promise<void> {
     stopWedgedBackendMonitor,
   } = await import('./db/dbPoolHealthMonitor');
   const { getWedgedBackendMinAgeMs } = await import('./db/wedgedBackends');
+  const { startRedisMemoryMonitor, stopRedisMemoryMonitor } = await import('./services/redisMemoryMonitor');
   // Registers the role-agnostic runtime series onto the shared registry and
   // binds the CONNECT_TIMEOUT counter recorder. Dynamic because its graph
   // reaches `db/dbPoolHealthMonitor` -> `postgres`; the health server above is
@@ -497,6 +502,19 @@ export async function bootWorker(): Promise<void> {
       `[worker][db-wedged-backend] Detector started (interval ${wedgedBackendIntervalMs}ms, `
       + `threshold ${getWedgedBackendMinAgeMs()}ms)`,
     );
+  }
+
+  // #6452 — Redis memory watchdog. Runs in the worker role too: BullMQ shares
+  // the same noeviction instance, and a wedged/stuck queue is exactly the
+  // failure this watchdog exists to give advance warning of.
+  const redisMemoryIntervalMs = startRedisMemoryMonitor();
+  if (redisMemoryIntervalMs === null) {
+    console.warn(
+      '[worker][redis-memory] Watchdog DISABLED via REDIS_MEMORY_MONITOR_DISABLED — a full '
+      + 'noeviction Redis instance will surface only as a stuck queue (#6452).',
+    );
+  } else {
+    console.log(`[worker][redis-memory] Watchdog started (interval ${redisMemoryIntervalMs}ms)`);
   }
 
   const { db, withSystemDbAccessContext } = dbModule;
@@ -587,6 +605,10 @@ export async function bootWorker(): Promise<void> {
   // event published during it) always finds a registered enqueuer/subscriber.
   registerAiAgentEnqueuer();
   registerAllEventSubscribers(buildWebhookFanoutDeps());
+  // Agent runs and offering verification dial through this process's model
+  // gateway: refuse a grant whose connection changed on any replica since it
+  // was issued. Before step 8, so no job can dial without it.
+  registerGatewayConnectionCheck();
 
   // Step 8: the registry's `global`-placement workers, then the event-dispatch
   // consumer (its own phase-2 special, mirroring index.ts). No relay consumer
@@ -659,6 +681,9 @@ export async function bootWorker(): Promise<void> {
     });
   }, 30_000);
   auditRetryInterval.unref?.();
+  // AI model registry W01 (#7599): same snapshot as the API process. Agent
+  // runs and the cost tracker run here too.
+  startPlatformModelSnapshotRefresher();
 
   // Step 9: signal handlers → phased shutdown.
   let shutdownStarted = false;
@@ -676,6 +701,7 @@ export async function bootWorker(): Promise<void> {
     stopEventLoopMonitor();
     stopDbPoolHealthMonitor();
     stopWedgedBackendMonitor();
+    stopRedisMemoryMonitor();
 
     if (auditRetryInterval) {
       clearInterval(auditRetryInterval);

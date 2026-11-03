@@ -22,7 +22,7 @@ import type { IdentityAccessSummary } from '@breeze/shared';
 import { db } from '../db';
 import { generateIdentityAccessReport } from './identityAccessReport';
 import type { EvidenceRunContext, ReportResult } from './reportGenerationService';
-import type { ReportGenerationAuthority } from './siteScope';
+import type { OrgReportGenerationAuthority } from './siteScope';
 
 const ORG_ID = '11111111-1111-4111-8111-111111111111';
 const USER_ID = '33333333-3333-4333-8333-333333333333';
@@ -56,7 +56,7 @@ function queueSelects(...resultSets: unknown[][]) {
 function authority(
   kind: 'unrestricted' | 'restricted' = 'unrestricted',
   siteIds: string[] = [],
-): ReportGenerationAuthority {
+): OrgReportGenerationAuthority {
   return {
     principalKind: 'user',
     scope: kind === 'restricted'
@@ -454,6 +454,22 @@ describe('generateIdentityAccessReport', () => {
     const s = summaryOf(await generateIdentityAccessReport(ORG_ID, {}, authority(), PERIOD_SEP));
     expect(s.coverage?.periodStart).toBe('2026-09-01');
     expect(s.coverage?.generatedAt).toBe('2026-09-30T05:18:00.000Z');
+  });
+
+  it.each([
+    ['last_7_days', '2026-10-14'],
+    ['last_90_days', '2026-07-23'],
+  ])('honours a %s dateRange preset on an ad-hoc run (#9562)', async (preset, expectedStart) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'));
+    try {
+      queueHappyPath();
+      const s = summaryOf(await generateIdentityAccessReport(ORG_ID, { dateRange: { preset } }, authority()));
+      expect(s.coverage?.periodStart).toBe(expectedStart);
+      expect(s.coverage?.periodEnd).toBe('2026-10-21');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reads freshness from last_complete_snapshot_at, exposed as coverage.asOf', async () => {

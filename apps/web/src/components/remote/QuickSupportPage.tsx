@@ -9,6 +9,21 @@ import { useHashState } from '@/lib/useHashState';
 import { useTranslation } from 'react-i18next';
 import '@/lib/i18n';
 import ConnectDesktopButton from './ConnectDesktopButton';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { replaceUrl } from '../../lib/replaceUrl';
+
+/**
+ * The copied link is pasted into email/chat, so it must be absolute. An API
+ * without a configured public base returns a bare `/quick?code=…` path (#10508);
+ * resolve it against this page's origin, which serves `/quick`.
+ */
+function toAbsoluteUrl(url: string): string {
+  try {
+    return new URL(url, window.location.origin).toString();
+  } catch {
+    return url;
+  }
+}
 
 export type SupportSessionStatus =
   | 'pending'
@@ -78,6 +93,9 @@ const POLL_INTERVAL_MS = 3000;
  */
 export default function QuickSupportPage() {
   const { t } = useTranslation('remote');
+  // Effects use the stable translator so a locale change does not re-run them
+  // (#3632); JSX keeps the plain `t` so rendered text still re-translates.
+  const stableT = useStableT(t);
   const { organizations } = useOrgStore();
 
   const [sessions, setSessions] = useState<SupportSessionView[]>([]);
@@ -104,9 +122,9 @@ export default function QuickSupportPage() {
       setSessions(Array.isArray(data?.sessions) ? data.sessions : []);
       setListError(null);
     } catch {
-      setListError(t('quickSupport.errors.list'));
+      setListError(stableT('quickSupport.errors.list'));
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => {
     loadSessions();
@@ -123,7 +141,7 @@ export default function QuickSupportPage() {
     setSelectedId(null);
     // Strip the fragment without leaving a bare "#" (and without a hashchange
     // round-trip — the state is already cleared above).
-    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    replaceUrl(`${window.location.pathname}${window.location.search}`);
   }, [setSelectedId]);
 
   // Poll the selected session until it reaches a terminal state. The first pass
@@ -160,7 +178,7 @@ export default function QuickSupportPage() {
           if (cancelled) return;
           stopTimer();
           closeDetail();
-          showToast({ message: t('quickSupport.errors.notFound'), type: 'warning' });
+          showToast({ message: stableT('quickSupport.errors.notFound'), type: 'warning' });
           return;
         }
       } catch {
@@ -182,7 +200,7 @@ export default function QuickSupportPage() {
       cancelled = true;
       stopTimer();
     };
-  }, [selectedId, loadSessions, closeDetail, t]);
+  }, [selectedId, loadSessions, closeDetail, stableT]);
 
   const openSession = useCallback(
     (session: SupportSessionView) => {
@@ -478,7 +496,7 @@ export default function QuickSupportPage() {
                 <button
                   type="button"
                   data-testid="quick-support-copy-link"
-                  onClick={() => copy(createdCode.landingUrl, t('quickSupport.code.copiedLink'))}
+                  onClick={() => copy(toAbsoluteUrl(createdCode.landingUrl), t('quickSupport.code.copiedLink'))}
                   className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm transition hover:bg-muted"
                 >
                   <Link2 className="h-4 w-4" />

@@ -14,6 +14,7 @@ import (
 func TestRequiresElevationTrueForElevatedCommands(t *testing.T) {
 	elevated := []string{
 		tools.CmdReboot,
+		tools.CmdForceReboot,
 		tools.CmdShutdown,
 		tools.CmdLock,
 		tools.CmdStartService,
@@ -143,5 +144,13 @@ func TestSystemCleanupRunRequiresElevation(t *testing.T) {
 	// Listing is a read: probes and simulations only.
 	if RequiresElevation(tools.CmdSystemCleanupList) {
 		t.Fatal("system_cleanup_list must not require elevation")
+	}
+}
+
+func TestContainmentCommandsRequireElevation(t *testing.T) {
+	for _, cmd := range []string{"execute_containment", "release_containment"} {
+		if !RequiresElevation(cmd) {
+			t.Errorf("%s must require elevation", cmd)
+		}
 	}
 }

@@ -2,9 +2,9 @@ import { Hono } from 'hono';
 import type { Context, MiddlewareHandler, Next } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { eq, sql, desc, and } from 'drizzle-orm';
+import { eq, sql, desc, and, isNull } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
-import { db } from '../../db';
+import { db, runAfterDbContextCommit } from '../../db';
 import { deviceCommands, devices } from '../../db/schema';
 import { authMiddleware, requireInteractiveSession, requireMfa, requireScope, requirePermission, type AuthContext } from '../../middleware/auth';
 import { PERMISSIONS, type UserPermissions } from '../../services/permissions';
@@ -16,7 +16,7 @@ import {
   applyMaintenanceEntry,
   clearMaintenanceLease,
 } from '../../services/deviceMaintenanceLease';
-import { consumeStepUpGrant, maintenanceResourceDigest, validateStepUpGrant, type StepUpGrantBinding } from '../../services/mfaStepUpGrant';
+import { canonicalIds, consumeStepUpGrant, maintenanceResourceDigest, validateStepUpGrant, type StepUpGrantBinding } from '../../services/mfaStepUpGrant';
 import { getUserEpochs } from '../../services/authEpochs';
 import { lockActorAssurance } from '../../services/stepUpActorAssurance';
 import { ENABLE_2FA } from '../auth/schemas';
@@ -26,10 +26,15 @@ import { dispatchWake, type WakeFailureCode } from '../../services/wakeOnLan';
 import { dispatchDeviceCommand } from '../../services/dispatchDeviceCommand';
 import type { QueuedCommand } from '../../services/commandQueue';
 import { terminalPayloadErasureSet } from '../../services/sensitiveCommandPayload';
-import { propagateCancelledDeviceCommand } from '../../services/commandCancelPropagation';
+import { cancelDeviceCommands } from '../../services/commandCancelPropagation';
 import { getTrustedClientIpOrUndefined } from '../../services/clientIp';
 import { assertDeviceExecuteAllowed, TrustDeniedError } from '../../services/partnerTrust.commands';
 import { trustDenyBody, type TrustDenyCode } from '../../services/partnerTrust';
+import { cancelledCommandError } from '../../services/commandCancelMessage';
+import { applyAutomationActionTerminal } from '../../services/automationActionResults';
+import { SERVER_TIMEOUT_RESULT_STATUS } from '../../services/commandResultAcceptance';
+import { captureException } from '../../services/sentry';
+import { isNetworkIsolationCommand, USE_NETWORK_ISOLATION_ROUTES } from '../../services/networkIsolation/bypass';
 
 export const commandsRoutes = new Hono();
 
@@ -42,12 +47,27 @@ const LISTABLE_COMMAND_STATUSES = ['pending', 'sent', 'completed', 'failed', 'ca
 type ListableCommandStatus = (typeof LISTABLE_COMMAND_STATUSES)[number];
 const COMMAND_WAKE_ON_LAN = 'wake_on_lan';
 
+// Run before schema validation too: release_containment is deliberately absent from the
+// generic schemas, but must receive the same actionable refusal as isolation starts.
+const refuseIsolationCommand: MiddlewareHandler = async (c, next) => {
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return next(); }
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    const { type, payload } = body as Record<string, unknown>;
+    if (typeof type === 'string' && isNetworkIsolationCommand(type, payload)) {
+      return c.json({ error: USE_NETWORK_ISOLATION_ROUTES }, 400);
+    }
+  }
+  return next();
+};
+
 // POST /devices/bulk/commands - Queue a command for multiple devices
 commandsRoutes.post(
   '/bulk/commands',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
   requireMfa(),
+  refuseIsolationCommand,
   zValidator('json', bulkCommandSchema),
   async (c) => {
     const auth = c.get('auth');
@@ -162,6 +182,8 @@ commandsRoutes.post(
       | 'SITE_ACCESS_DENIED'
       | 'DECOMMISSIONED'
       | 'INSERT_FAILED'
+      // Created, then cancelled by the push's claim-time check before delivery.
+      | 'CANCELLED'
       | TrustDenyCode;
     const failed: Array<{ deviceId: string; code: BulkFailureCode; message: string }> = [];
     // Devices that completed successfully on a prior call and would queue
@@ -230,7 +252,7 @@ commandsRoutes.post(
       // records as INSERT_FAILED for that device rather than 500-ing the whole
       // batch and losing every prior success.
       let command: QueuedCommand | undefined;
-      let delivery: 'delivered' | 'queued_offline' | 'queued_live' | undefined;
+      let delivery: 'delivered' | 'queued_offline' | 'queued_live' | 'cancelled' | undefined;
       try {
         // `wake` never reaches here — it returns from its own relay path above.
         const res = await dispatchDeviceCommand({ deviceId, type: data.type, payload: data.payload || {}, userId: auth.user.id });
@@ -244,6 +266,12 @@ commandsRoutes.post(
               message: res.error,
             });
           }
+          continue;
+        }
+        if (res.delivery === 'cancelled') {
+          // The row exists but will never run: report it as a failure with the
+          // reason, not as a queued command.
+          failed.push({ deviceId, code: 'CANCELLED', message: cancelledCommandError(res.cancelReason) });
           continue;
         }
         command = res.command;
@@ -326,7 +354,11 @@ commandsRoutes.post(
     const data = c.req.valid('json');
     const now = new Date();
     const permissions = c.get('permissions') as UserPermissions | undefined;
-    const deviceIds = [...new Set(data.deviceIds)].sort();
+    // Canonical, deduplicated and sorted through the same helper the digest
+    // uses, so the set the route acts on is exactly the set the grant covers.
+    // A case-sensitive `new Set` here would keep two spellings of one device as
+    // two entries, apply the lease twice and write two audit rows (#10119).
+    const deviceIds = canonicalIds(data.deviceIds);
 
     type BulkMaintenanceFailureCode = 'TARGET_NOT_FOUND' | 'SITE_ACCESS_DENIED' | 'DECOMMISSIONED' | 'STATE_CONFLICT';
     const failed: Array<{ deviceId: string; code: BulkMaintenanceFailureCode; message: string }> = [];
@@ -462,6 +494,7 @@ commandsRoutes.post(
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
   requireMfa(),
+  refuseIsolationCommand,
   zValidator('json', createCommandSchema),
   async (c) => {
     const auth = c.get('auth');
@@ -604,9 +637,11 @@ commandsRoutes.post(
       createdAt: command.createdAt,
       // #5128: how the command was handed over, and when it expires if the
       // device never comes back. 'queued_offline' is what the UI renders as
-      // "Runs when the device is online — expires <date>".
+      // "Runs when the device is online — expires <date>". 'cancelled' means
+      // the push's claim-time check refused it; `cancelReason` says why.
       delivery: res.delivery,
       deliverBy: res.deliverBy,
+      ...(res.cancelReason ? { cancelReason: res.cancelReason } : {}),
     }, 201);
   }
 );
@@ -652,14 +687,17 @@ commandsRoutes.post(
   requireMaintenanceEntryMfa(),
   async (c) => {
     const auth = c.get('auth') as AuthContext;
-    const deviceId = c.req.param('id')!;
     const data = c.req.valid('json');
     const now = new Date();
 
-    const device = await getDeviceWithOrgCheck(deviceId, auth);
+    const device = await getDeviceWithOrgCheck(c.req.param('id')!, auth);
     if (!device) {
       return c.json({ error: 'Device not found' }, 404);
     }
+    // From here on, the device's canonical id, never the raw path segment: an
+    // uppercase uuid in the URL finds the same device, and the step-up binding,
+    // the lease and the audit rows must all use one spelling (#10119).
+    const deviceId = device.id;
     if (!canAccessDeviceSite(device, c.get('permissions') as UserPermissions | undefined)) {
       return c.json({ error: 'Access to this site denied' }, 403);
     }
@@ -877,6 +915,7 @@ commandsRoutes.post(
       createdAt: command.createdAt,
       delivery: res.delivery,
       deliverBy: res.deliverBy,
+      ...(res.cancelReason ? { cancelReason: res.cancelReason } : {}),
     }, 201);
   }
 );
@@ -1021,45 +1060,38 @@ commandsRoutes.post(
         .limit(1);
 
       if (!existing) return { kind: 'not_found' } as const;
+      if (existing.type === 'execute_containment') {
+        const { findEpisodeByCommand } = await import('../../services/networkIsolation/episodeStore');
+        if (await findEpisodeByCommand(tx, commandId)) return { kind: 'isolation_owned' } as const;
+      }
+
       if (existing.status !== 'pending') {
         return { kind: 'not_pending' as const, status: existing.status };
       }
 
-      const completedAt = new Date();
-      const [row] = await tx
-        .update(deviceCommands)
-        .set({
-          status: 'cancelled',
-          completedAt,
-          result: { status: 'cancelled', reason: 'user_cancelled', cancelledBy: auth.user.id },
-          ...terminalPayloadErasureSet(),
-        })
-        .where(
-          and(
-            eq(deviceCommands.id, commandId),
-            eq(deviceCommands.deviceId, deviceId),
-            eq(deviceCommands.status, 'pending'),
-          ),
-        )
-        .returning({ id: deviceCommands.id });
+      // Same helper the bulk paths use (#9719): CAS UPDATE on `pending`, then
+      // the per-type hooks for the rows it flipped, in THIS transaction.
+      const [row] = await cancelDeviceCommands({
+        executor: tx,
+        result: { status: 'cancelled', reason: 'user_cancelled', cancelledBy: auth.user.id },
+        where: and(
+          eq(deviceCommands.id, commandId),
+          eq(deviceCommands.deviceId, deviceId),
+          eq(deviceCommands.status, 'pending'),
+        )!,
+      });
 
       // Lost the CAS race — the agent claimed it between the SELECT and here.
       if (!row) return { kind: 'cas_lost' } as const;
-
-      await propagateCancelledDeviceCommand({
-        commandId: row.id,
-        type: existing.type,
-        payload: existing.payload as Record<string, unknown> | null,
-        completedAt,
-        cancelledBy: auth.user.id,
-        executor: tx,
-      });
 
       return { kind: 'cancelled' as const, id: row.id, type: existing.type };
     });
 
     if (outcome.kind === 'not_found') {
       return c.json({ error: 'Command not found' }, 404);
+    }
+    if (outcome.kind === 'isolation_owned') {
+      return c.json({ error: 'Use Release to release this network isolation' }, 409);
     }
     if (outcome.kind === 'not_pending') {
       return c.json({ error: 'Command is not pending', status: outcome.status }, 409);
@@ -1078,5 +1110,195 @@ commandsRoutes.post(
     });
 
     return c.json({ id: outcome.id, status: 'cancelled' });
+  }
+);
+
+/**
+ * #8296 — how long a delivered (`sent`) command must have been running before
+ * an operator may mark it failed. Long enough that a click can't race the
+ * normal result of a quick command; well short of the reaper's per-type
+ * budgets (services/commandTimeouts.ts), which run up to two hours.
+ */
+export const MARK_FAILED_MIN_AGE_MS = 10 * 60 * 1000;
+
+// POST /devices/:id/commands/:commandId/mark-failed — operator force-fail of a
+// delivered command that never answered (#8296).
+//
+// A `sent` row counts as in flight, and the claim-time power-state barrier
+// (commandClaimEligibility.ts) holds every reboot/shutdown behind it until the
+// stale-command reaper's budget runs out — two hours for install_patches. This
+// does the reaper's timeout early, on request: same result shape, same
+// propagation. The result keeps `status:'timeout'` + `timedOutBy`, the marker
+// `commandAcceptsAgentResultCondition` reopens on, so if the agent's real
+// result arrives later it still overwrites this one. The held reboot is
+// released at its next claim, since the row no longer counts as in flight.
+//
+// Same permission as issuing or cancelling a command. CAS on the observed
+// (status='sent', executed_at) so a result landing between the read and the
+// write is a 409, never overwritten.
+//
+// Deliberately NOT limited to the types the reaper times out: the reaper
+// skips EXCLUDED_COMMAND_TYPES (terminal_*) entirely, so a reboot held behind
+// one of those has no other way out.
+commandsRoutes.post(
+  '/:id/commands/:commandId/mark-failed',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const deviceId = c.req.param('id')!;
+    const commandId = c.req.param('commandId')!;
+
+    const device = await getDeviceWithOrgCheck(deviceId, auth);
+    if (!device) {
+      return c.json({ error: 'Device not found' }, 404);
+    }
+    if (!canAccessDeviceSite(device, c.get('permissions') as UserPermissions | undefined)) {
+      return c.json({ error: 'Access to this site denied' }, 403);
+    }
+
+    const outcome = await db.transaction(async (tx) => {
+      // Payload is read BEFORE the update: terminalPayloadErasureSet() strips
+      // it, and the propagation keys on payload.executionId / patchJobId / ….
+      const [existing] = await tx
+        .select({
+          id: deviceCommands.id,
+          type: deviceCommands.type,
+          payload: deviceCommands.payload,
+          status: deviceCommands.status,
+          executedAt: deviceCommands.executedAt,
+          createdAt: deviceCommands.createdAt,
+        })
+        .from(deviceCommands)
+        .where(and(eq(deviceCommands.id, commandId), eq(deviceCommands.deviceId, deviceId)))
+        .limit(1);
+
+      if (!existing) return { kind: 'not_found' } as const;
+      if (existing.status !== 'sent') {
+        return { kind: 'not_sent' as const, status: existing.status };
+      }
+      // Aged from delivery. A legacy `sent` row with no executed_at is aged
+      // from creation instead — the reaper's own fallback for that shape, and
+      // what the device page shows — so its eligibility is always reachable.
+      const executedAt = existing.executedAt;
+      const startedAt = executedAt ?? existing.createdAt;
+      const now = Date.now();
+      if (now - startedAt.getTime() < MARK_FAILED_MIN_AGE_MS) {
+        const eligibleAt = new Date(startedAt.getTime() + MARK_FAILED_MIN_AGE_MS);
+        return { kind: 'too_recent' as const, eligibleAt };
+      }
+
+      const ageMs = now - startedAt.getTime();
+      const errorMsg = `Marked failed by an operator: no response from agent after ${Math.floor(ageMs / 60000)} minutes`;
+      const completedAt = new Date(now);
+      const [row] = await tx
+        .update(deviceCommands)
+        .set({
+          status: 'failed',
+          completedAt,
+          result: {
+            status: SERVER_TIMEOUT_RESULT_STATUS,
+            reason: 'operator_marked_failed',
+            error: errorMsg,
+            timedOutBy: 'server',
+            markedFailedBy: auth.user.id,
+          },
+          ...terminalPayloadErasureSet(),
+        })
+        .where(
+          and(
+            eq(deviceCommands.id, commandId),
+            eq(deviceCommands.deviceId, deviceId),
+            eq(deviceCommands.status, 'sent'),
+            executedAt ? eq(deviceCommands.executedAt, executedAt) : isNull(deviceCommands.executedAt),
+          ),
+        )
+        .returning({ id: deviceCommands.id });
+
+      // Lost the CAS: the agent's result (or the reaper) got there first.
+      if (!row) return { kind: 'cas_lost' } as const;
+
+      return {
+        kind: 'failed' as const,
+        id: row.id,
+        type: existing.type,
+        payload: (existing.payload as Record<string, unknown> | null) ?? null,
+        ageMs,
+        errorMsg,
+        completedAt,
+      };
+    });
+
+    if (outcome.kind === 'not_found') {
+      return c.json({ error: 'Command not found' }, 404);
+    }
+    if (outcome.kind === 'not_sent') {
+      return c.json({ error: 'Command is not running', code: 'NOT_SENT', status: outcome.status }, 409);
+    }
+    if (outcome.kind === 'too_recent') {
+      return c.json(
+        {
+          error: `A running command can be marked failed once it has run for ${MARK_FAILED_MIN_AGE_MS / 60000} minutes`,
+          code: 'TOO_RECENT',
+          eligibleAt: outcome.eligibleAt.toISOString(),
+        },
+        409,
+      );
+    }
+    if (outcome.kind === 'cas_lost') {
+      return c.json({ error: 'Command is not running', code: 'NOT_SENT' }, 409);
+    }
+
+    // The reaper's timeout follow-through, so the script execution / patch job /
+    // deployment / restore row that owns this command is failed with it. NOT
+    // caught: it writes through the request's transaction, so a SQL fault here
+    // must roll the status flip back with it (a caught one would leave the
+    // transaction aborted and still answer 200).
+    // Imported lazily: the reaper module carries BullMQ and the command-queue
+    // graph, which every importer of this route file would otherwise load.
+    const { propagateTimedOutDeviceCommand } = await import('../../jobs/staleCommandReaper');
+    await propagateTimedOutDeviceCommand({
+      commandId: outcome.id,
+      payload: outcome.payload,
+      errorMsg: outcome.errorMsg,
+      completedAt: outcome.completedAt,
+      kind: 'timeout',
+      commandType: outcome.type,
+      deviceId,
+    });
+    // The automation ledger writes on its own system-scope connection
+    // (automationActionResults.ts `inDeliberateSystemContext`). Opening that
+    // second pooled connection while this request still holds its transaction
+    // deadlocks the pool under load (#1105 — the cancel path defers it for the
+    // same reason), and a mark that rolls back must not time the action out.
+    // So it runs once the request's transaction has committed, contained like
+    // the reaper's. Recorded as a reaper timeout on purpose: that is the
+    // transition a late real agent result is allowed to repair.
+    const { id: markedId, errorMsg, completedAt } = outcome;
+    runAfterDbContextCommit('commands.markFailed.automationActionTerminal', async () => {
+      try {
+        await applyAutomationActionTerminal({
+          source: 'reaper',
+          commandId: markedId,
+          terminalStatus: 'timed_out',
+          error: errorMsg,
+          completedAt,
+        });
+      } catch (error) {
+        console.error(`[commands] mark-failed: automation action terminal failed for ${markedId}:`, error);
+        captureException(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+
+    writeRouteAudit(c, {
+      orgId: device.orgId,
+      action: 'device.command.mark_failed',
+      resourceType: 'device_command',
+      resourceId: outcome.id,
+      resourceName: outcome.type,
+      details: { deviceId, commandType: outcome.type, ageMs: outcome.ageMs },
+    });
+
+    return c.json({ id: outcome.id, status: 'failed' });
   }
 );

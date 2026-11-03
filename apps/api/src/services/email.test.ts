@@ -73,6 +73,18 @@ describe('email service', () => {
     process.env = originalEnv;
   });
 
+  it.each([true, false])('renders the alert subject in email (workload=%s)', async (workload) => {
+    process.env.RESEND_API_KEY = 're_test_123';
+    process.env.EMAIL_FROM = 'noreply@example.com';
+    const { getEmailService } = await import('./email');
+    await getEmailService()!.sendAlertNotification({ to: 'ops@example.com', alertName: 'Alert', severity: 'high', summary: 'Failed', subjectName: workload ? 'Microsoft 365 mail backup · Example customer' : 'Server-1', ownerKind: workload ? 'backup_workload' : 'device', deviceName: workload ? undefined : 'Server-1' });
+    const sent = resendSendMock.mock.calls[0]?.[0];
+    const line = workload ? 'Subject: Microsoft 365 mail backup · Example customer' : 'Device: Server-1';
+    expect(sent.text).toContain(line);
+    expect(sent.html).toContain(line);
+    expect(sent.html).not.toContain('Device: undefined');
+  });
+
   it('uses Resend in auto mode when resend config is present', async () => {
     process.env.RESEND_API_KEY = 're_test_123';
     process.env.EMAIL_FROM = 'noreply@example.com';
@@ -323,6 +335,35 @@ describe('buildInvoiceTemplate', () => {
     const t = buildInvoiceTemplate({ ...base, amountDueNow: '$10,000.00' });
     expect(t.html).not.toContain('Paid to date');
     expect(t.text).not.toContain('Paid to date');
+  });
+
+  it('uses a saved subject and fills the invoice fields', async () => {
+    const { buildInvoiceTemplate } = await import('./email');
+    const t = buildInvoiceTemplate({
+      ...base,
+      custom: {
+        subject: 'Please pay {{invoice_number}} by {{due_date}} ({{total}})',
+        heading: null,
+        buttonLabel: null,
+        html: null,
+      },
+    });
+    expect(t.subject).toBe('Please pay INV-0001 by 2026-09-01 ($10,000.00)');
+  });
+
+  it('a subject typed in the send box wins over the saved template subject', async () => {
+    const { buildInvoiceTemplate } = await import('./email');
+    const t = buildInvoiceTemplate({
+      ...base,
+      subject: 'Copy of INV-0001',
+      custom: {
+        subject: 'Saved {{invoice_number}}',
+        heading: null,
+        buttonLabel: null,
+        html: null,
+      },
+    });
+    expect(t.subject).toBe('Copy of INV-0001');
   });
 
   it('null custom keeps current wording and the server pay URL', async () => {
@@ -580,7 +621,7 @@ describe('email service — the partner lane (spec §8.3, §8.4)', () => {
     resetEmailEnv();
     process.env.EMAIL_PROVIDER = 'resend';
     process.env.RESEND_API_KEY = 're_test_123';
-    process.env.EMAIL_FROM = 'Breeze <no-reply@2breeze.app>';
+    process.env.EMAIL_FROM = 'no-reply@2breeze.app';
     resendSendMock.mockResolvedValue({ id: 'resend-1' });
     laneSend.mockResolvedValue({ providerMessageId: 'partner-1' });
     lookup.mockResolvedValue(IDENTITY);
@@ -626,12 +667,12 @@ describe('email service — the partner lane (spec §8.3, §8.4)', () => {
     await (await service()).sendEmail({ ...BASE, purpose: 'auth.password_reset' });
     expect(laneSend).not.toHaveBeenCalled();
     expect(lookup).not.toHaveBeenCalled();
-    expect(resendSendMock.mock.calls[0]![0].from).toBe('Breeze <no-reply@2breeze.app>');
+    expect(resendSendMock.mock.calls[0]![0].from).toBe('no-reply@2breeze.app');
   });
 
   it.each([
-    ['domain_unusable', '"Acme MSP via Breeze" <no-reply@2breeze.app>'],
-    ['lane_unavailable', '"Acme MSP via Breeze" <no-reply@2breeze.app>'],
+    ['domain_unusable', '"Acme MSP" <no-reply@2breeze.app>'],
+    ['lane_unavailable', '"Acme MSP" <no-reply@2breeze.app>'],
   ] as const)('falls back to the platform lane on %s, with the purpose fallback From', async (kind, expectedFrom) => {
     const { PartnerLaneSendFailure } = await import('./emailDomains/provider');
     laneSend.mockRejectedValue(new PartnerLaneSendFailure({ kind }));
@@ -677,7 +718,7 @@ describe('email service — the partner lane (spec §8.3, §8.4)', () => {
     await (await service()).sendEmail({ ...BASE, purpose: 'report.delivery', partnerId: null });
     expect(laneSend).not.toHaveBeenCalled();
     expect(lookup).not.toHaveBeenCalled();
-    expect(resendSendMock.mock.calls[0]![0].from).toBe('Breeze <no-reply@2breeze.app>');
+    expect(resendSendMock.mock.calls[0]![0].from).toBe('no-reply@2breeze.app');
   });
 
   it('an over-cap send goes out on the platform lane, exactly once', async () => {
@@ -685,6 +726,6 @@ describe('email service — the partner lane (spec §8.3, §8.4)', () => {
     await (await service()).sendEmail({ ...BASE, purpose: 'invoice.sent', partnerId: PARTNER, partnerName: 'Acme MSP' });
     expect(laneSend).not.toHaveBeenCalled();
     expect(resendSendMock).toHaveBeenCalledTimes(1);
-    expect(resendSendMock.mock.calls[0]![0].from).toBe('"Acme MSP via Breeze" <no-reply@2breeze.app>');
+    expect(resendSendMock.mock.calls[0]![0].from).toBe('"Acme MSP" <no-reply@2breeze.app>');
   });
 });

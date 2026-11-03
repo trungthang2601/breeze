@@ -52,23 +52,72 @@ func NewScreenCapturer(config CaptureConfig) (ScreenCapturer, error) {
 	return newPlatformCapturer(config)
 }
 
-// ProbeCaptureAccess performs a single real capture attempt using the
-// platform backend selected by config.
-func ProbeCaptureAccess(config CaptureConfig) (bool, error) {
-	capturer, err := NewScreenCapturer(config)
-	if err != nil {
-		return false, err
-	}
-	defer capturer.Close()
+// CaptureProbeOptions selects what a capability probe may do.
+type CaptureProbeOptions struct {
+	// AllowScreenCaptureKit lets the macOS 14+ user-session probe try
+	// ScreenCaptureKit, once, before CoreGraphics. Leave it false for every
+	// permission check: on Sequoia a ScreenCaptureKit call can raise macOS's
+	// own screen-recording consent dialog, and for the bare helper binary
+	// that approval does not persist, so a check that touches it re-prompts
+	// the user on every run (#8058). Only an explicit operator probe (the
+	// desktop helper CLI's `probe --sck`) sets it; a real capture session
+	// picks its backend in newPlatformCapturer instead. Ignored elsewhere.
+	AllowScreenCaptureKit bool
+}
 
-	img, err := capturer.Capture()
+// CaptureProbeReport is the outcome of ProbeCapture.
+type CaptureProbeReport struct {
+	// Granted is true when a backend produced a frame.
+	Granted bool
+	// Backend names the backend that produced it ("screencapturekit",
+	// "coregraphics", or "platform" where the OS has one backend).
+	Backend string
+	// ScreenCaptureKitCalls counts how many times the probe opened a
+	// ScreenCaptureKit capturer.
+	ScreenCaptureKitCalls int
+}
+
+// ProbeCapture performs a real capture attempt and reports which backend, if
+// any, produced a frame. Only the CLI probe calls it: the helper's permission
+// checks use CheckCaptureAccess, which never captures (#8390).
+//
+// By default that is a single attempt with the backend NewScreenCapturer
+// selects. A platform can install platformCaptureProbePlan to choose the
+// backends: macOS does, to keep permission checks off ScreenCaptureKit and to
+// fall back to CoreGraphics when ScreenCaptureKit cannot capture (#6105).
+func ProbeCapture(config CaptureConfig, opts CaptureProbeOptions) (CaptureProbeReport, error) {
+	plan := defaultCaptureProbePlan(config)
+	if platformCaptureProbePlan != nil {
+		plan = platformCaptureProbePlan(config, opts)
+	}
+	res, err := probeCaptureBackends(plan)
+	report := CaptureProbeReport{Granted: err == nil, Backend: res.backend}
+	if plan.primary.name == captureBackendScreenCaptureKit {
+		report.ScreenCaptureKitCalls = res.primaryOpens
+	}
 	if err != nil {
-		return false, err
+		return report, err
 	}
-	if img == nil || img.Rect.Empty() {
-		return false, fmt.Errorf("capture probe returned no frame")
+	if plan.onSuccess != nil {
+		plan.onSuccess(res)
 	}
-	return true, nil
+	return report, nil
+}
+
+// platformCaptureProbePlan, when non-nil, supplies the backend ordering for
+// ProbeCapture. Installed from init() by platforms that need more than one
+// backend (capture_darwin.go).
+var platformCaptureProbePlan func(CaptureConfig, CaptureProbeOptions) captureProbePlan
+
+// defaultCaptureProbePlan is the historical probe: one attempt, no fallback.
+func defaultCaptureProbePlan(config CaptureConfig) captureProbePlan {
+	return captureProbePlan{
+		primary: captureProbeBackend{
+			name: "platform",
+			open: func() (ScreenCapturer, error) { return NewScreenCapturer(config) },
+		},
+		primaryAttempts: 1,
+	}
 }
 
 // BGRAProvider is implemented by capturers that produce BGRA pixel data
@@ -86,6 +135,16 @@ type BGRAProvider interface {
 // mode (e.g. DXGI capturer falling back to GDI) to avoid busy loops.
 type TightLoopHint interface {
 	TightLoop() bool
+}
+
+// LatestFrameProvider is implemented by capturers whose Capture() reports an
+// unchanged screen as (nil, nil) and so cannot serve a one-shot consumer that
+// shares the capturer with the streaming loop (the loop may already have taken
+// the frame). CaptureLatest always returns the current frame, changed or not,
+// and does not affect what the next Capture() returns. The macOS SCStream
+// capturer implements it (#5928).
+type LatestFrameProvider interface {
+	CaptureLatest() (*image.RGBA, error)
 }
 
 // FrameChangeHint is implemented by capturers that can report whether new

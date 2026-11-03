@@ -20,6 +20,7 @@ type fakeLifecycle struct {
 	mu            sync.Mutex
 	mode          string
 	acquired      []sessionbroker.HelperKey
+	acquiredTTLs  []time.Duration
 	released      []sessionbroker.HelperKey
 	renewed       int
 	waited        []sessionbroker.HelperKey
@@ -27,6 +28,28 @@ type fakeLifecycle struct {
 	acquireErr    error
 	renewErr      error
 	modeOverrides []string
+	// unavailable marks keys whose session cannot host that helper role
+	// (HelperRoleAvailable -> false); availableErr makes the check fail.
+	unavailable  map[sessionbroker.HelperKey]bool
+	availableErr error
+	checked      []sessionbroker.HelperKey
+	// blockWait makes WaitForHelperReady behave like the real manager for a
+	// helper that never comes up: it returns only when ctx ends.
+	blockWait bool
+	// pamHolds records every SetPAMHelperHold call in order.
+	pamHolds []bool
+}
+
+func (f *fakeLifecycle) SetPAMHelperHold(enabled bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pamHolds = append(f.pamHolds, enabled)
+}
+
+func (f *fakeLifecycle) pamHoldCalls() []bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]bool(nil), f.pamHolds...)
 }
 
 func (f *fakeLifecycle) Stop()                 {}
@@ -46,6 +69,7 @@ func (f *fakeLifecycle) AcquireLease(id uint32, role ipc.HelperRole, opID string
 		return f.acquireErr
 	}
 	f.acquired = append(f.acquired, sessionbroker.HelperKey{WindowsSessionID: id, Role: role})
+	f.acquiredTTLs = append(f.acquiredTTLs, ttl)
 	return nil
 }
 
@@ -62,10 +86,27 @@ func (f *fakeLifecycle) ReleaseLease(id uint32, role ipc.HelperRole, opID string
 	f.released = append(f.released, sessionbroker.HelperKey{WindowsSessionID: id, Role: role})
 }
 
-func (f *fakeLifecycle) WaitForHelperReady(ctx context.Context, key sessionbroker.HelperKey) sessionbroker.HelperWaitResult {
+func (f *fakeLifecycle) HelperRoleAvailable(key sessionbroker.HelperKey) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.checked = append(f.checked, key)
+	if f.availableErr != nil {
+		return false, f.availableErr
+	}
+	return !f.unavailable[key], nil
+}
+
+func (f *fakeLifecycle) WaitForHelperReady(ctx context.Context, key sessionbroker.HelperKey) sessionbroker.HelperWaitResult {
+	f.mu.Lock()
 	f.waited = append(f.waited, key)
+	block := f.blockWait
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return sessionbroker.HelperWaitResult{Status: sessionbroker.HelperWaitTimeout}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if r, ok := f.waitResults[key]; ok {
 		return r
 	}
@@ -337,6 +378,7 @@ func TestDesktopLeaseRenewalStopsAfterTwoGoneTicks(t *testing.T) {
 // startDesktopViaHelper, takes system+user leases (a consent prompt is
 // configured), and releases everything when consent is denied.
 func TestHandleStartDesktopOnDemandDefaultsTargetAndReleasesOnConsentDenied(t *testing.T) {
+	withConsentSeams(t, occupancyOccupied, true)
 	f := &fakeLifecycle{mode: "on-demand"}
 	h := &Heartbeat{
 		helperLifecycle: f,
@@ -351,7 +393,7 @@ func TestHandleStartDesktopOnDemandDefaultsTargetAndReleasesOnConsentDenied(t *t
 
 	cmd := startDesktopCmd("sess-ondemand", consentModePrompt("block", 10))
 	result := handleStartDesktop(h, cmd)
-	assertConsentDenied(t, result, "helper_absent")
+	assertConsentDenied(t, result, "helper_unreachable")
 
 	acquired, released, waited, _ := f.snapshot()
 	if len(acquired) != 2 {

@@ -1,35 +1,74 @@
 import { i18n } from '@/lib/i18n';
 import type { TFunction } from 'i18next';
-import { useTranslation } from 'react-i18next';
+import { Trans, useTranslation } from 'react-i18next';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
+import { isMfaRecoveryCode } from '@breeze/shared';
 import { zodResolver } from '@hookform/resolvers/zod';
 import ChangePasswordForm from './ChangePasswordForm';
 import ConnectSsoCard from './ConnectSsoCard';
-import MFASettings from './MFASettings';
+import MFASettings, { IssuedRecoveryCodes } from './MFASettings';
 import RemoteToolSettings from './RemoteToolSettings';
+import TicketPushoverSettings from './TicketPushoverSettings';
+import EmailNotificationSettings from './EmailNotificationSettings';
 import ApproverDevicesSection from './ApproverDevicesSection';
 import ThemingSettings from './ThemingSettings';
+import CharacterKeyShortcutsSettings from './CharacterKeyShortcutsSettings';
 import { pickReauthTier, type ReauthTier } from './StepUpPrompt';
 import { mintStepUpGrant, StepUpMintError } from '../../lib/mfaStepUp';
 import { createPasskeyCredential, fetchWithAuth, getPasskeyCredential, useAuthStore } from '../../stores/auth';
-import type { MfaMethod, PasskeyAuthenticationOptions, PasskeyRegistrationOptions, UserPreferences } from '../../stores/auth';
+import type { MfaMethod, PasskeyAuthenticationOptions, PasskeyRegistrationOptions, Tokens, UserPreferences } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { useAvatarBlobUrl } from '@/lib/avatarBlobCache';
 import { formatNumber } from '@/lib/i18n/format';
 import { runAction } from '@/lib/runAction';
 import { showToast } from '../shared/Toast';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
+import { Dialog } from '../shared/Dialog';
 import {
   stashSsoReauthIntent,
   takeSsoReauthIntent,
   type SsoReauthIntent,
+  type SsoReauthManageIntent,
 } from '@/lib/ssoReauthIntent';
+import { clearSsoReauthGrant, readSsoReauthGrant, stashSsoReauthGrant } from '@/lib/ssoReauthGrant';
+import { replaceUrl } from '../../lib/replaceUrl';
+
+/**
+ * #4045: the API's two factor-management rejections that mean "the SSO re-auth
+ * grant you hold (or do not hold) cannot confirm this" — see
+ * SSO_REAUTH_REQUIRED_CODE / SSO_REAUTH_GRANT_EXPIRED_CODE in
+ * apps/api/src/routes/auth/helpers.ts. Branch on the code, never the text.
+ */
+const SSO_REAUTH_MANAGE_DEAD_GRANT_CODES = new Set(['sso_reauth_required', 'sso_reauth_grant_expired']);
 
 const createProfileSchema = (t: TFunction) => z.object({
   name: z.string().min(2, t('profilePage.nameMustBeAtLeast2Characters')),
 });
+
+const passkeyMfaStateSchema = z.discriminatedUnion('mfaEnabled', [
+  z.object({ mfaEnabled: z.literal(true), mfaMethod: z.enum(['totp', 'sms', 'passkey']) }),
+  z.object({ mfaEnabled: z.literal(false), mfaMethod: z.null() }),
+]);
+
+// The passkey change is already committed server-side when this runs, so a
+// response without `mfaState` (an older API during a deploy) must not throw.
+// The replacement session is still adopted. Only the badge update is skipped.
+function adoptPasskeyMutationSession(generation: number, body: { tokens?: Tokens }) {
+  const parsed = passkeyMfaStateSchema.safeParse(body);
+  const mfaState = parsed.success ? parsed.data : null;
+  const store = useAuthStore.getState();
+  let adopted: boolean;
+  if (mfaState) {
+    adopted = store.commitMfaStateIfCurrent(generation, mfaState, body.tokens);
+  } else if (body.tokens) {
+    adopted = store.commitReissuedSessionIfCurrent(generation, body.tokens);
+  } else {
+    adopted = store.sessionGeneration === generation;
+  }
+  return { adopted, mfaState };
+}
 
 type ProfileFormValues = z.infer<ReturnType<typeof createProfileSchema>>;
 
@@ -69,6 +108,9 @@ const SSO_REAUTH_ERROR_KEYS: Record<string, string> = {
   provider_inactive: 'profilePage.ssoReauthProviderInactive',
   config_changed: 'profilePage.ssoReauthConfigChanged',
   email_unverified: 'profilePage.ssoReauthEmailUnverified',
+  // #8862: the IdP's id_token failed verification (signature/issuer/expiry).
+  // The API logs the token's timing claims, so the copy points there.
+  idp_verify_failed: 'profilePage.ssoReauthIdpVerifyFailed',
 };
 
 /**
@@ -104,13 +146,11 @@ function takeSsoReauthErrorFromQuery(): string | null {
   if (!code) return null;
   params.delete(SSO_REAUTH_ERROR_PARAM);
   const qs = params.toString();
-  window.history.replaceState(
-    null,
-    '',
-    `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`,
-  );
+  replaceUrl(`${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`);
   return code;
 }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Reads and CONSUMES the `#ssoReauthGrant=<id>` fragment the SSO callback
  *  redirects back with. The grant is single-use, so the fragment is stripped in
@@ -122,9 +162,16 @@ function takeSsoReauthGrantFromHash(): string | null {
   if (typeof window === 'undefined') return null;
   const match = /^#ssoReauthGrant=(.+)$/.exec(window.location.hash);
   if (!match) return null;
-  const grantId = decodeURIComponent(match[1]);
-  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
-  return grantId;
+  let grantId: string | null;
+  try {
+    grantId = decodeURIComponent(match[1]);
+  } catch {
+    grantId = null;
+  }
+  replaceUrl(`${window.location.pathname}${window.location.search}`);
+  // A hand-edited or mangled fragment is not a grant: the server would 400 it
+  // ("Invalid UUID") and the user would see that raw. Ignore it.
+  return grantId && UUID_RE.test(grantId) ? grantId : null;
 }
 
 type PasskeySummary = {
@@ -174,6 +221,7 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
   const [passkeyName, setPasskeyName] = useState('');
   const [passkeyPassword, setPasskeyPassword] = useState('');
   const [passkeyFactorCode, setPasskeyFactorCode] = useState('');
+  const [usePasskeyRecovery, setUsePasskeyRecovery] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | undefined>();
   const [passkeySuccess, setPasskeySuccess] = useState<string | undefined>();
   const [isLoadingPasskeys, setIsLoadingPasskeys] = useState(false);
@@ -188,9 +236,8 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
   const [editingPasskeyId, setEditingPasskeyId] = useState<string | null>(null);
   const [editingPasskeyName, setEditingPasskeyName] = useState('');
   const [mutatingPasskeyId, setMutatingPasskeyId] = useState<string | null>(null);
-  // #5314: deleting a passkey removes an MFA factor and bumps `mfa_epoch`,
-  // signing the account's OTHER sessions out. Ask before doing that.
-  const [passkeyPendingDelete, setPasskeyPendingDelete] = useState<PasskeySummary | null>(null);
+  const [passkeyDialog, setPasskeyDialog] = useState<{ kind: 'add' } | { kind: 'recovery'; codes: string[] } | { kind: 'delete'; passkey: PasskeySummary } | null>(null);
+  const [passkeyDeleteRetryGrant, setPasskeyDeleteRetryGrant] = useState<{ passkeyId: string; grantId: string; sessionGeneration: number } | null>(null);
   const [isUpdatingProfile, setIsUpdatingProfile] = useState(false);
   const [isChangingPassword, setIsChangingPassword] = useState(false);
   const [mfaLoading, setMfaLoading] = useState(false);
@@ -198,7 +245,20 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
   // the rest of the enrollment flow because /mfa/setup consumes it
   // non-destructively and the terminal /mfa/enable burns it — one IdP
   // round-trip covers both calls.
+  //
+  // #8862: mirrored into sessionStorage (`lib/ssoReauthGrant.ts`) so a second
+  // mount of this page — which no longer has the fragment — can pick it back
+  // up. Never call the raw setter to drop it: `dropSsoReauthGrant` clears both
+  // halves, so a spent or dead grant can never be restored by a later mount.
   const [ssoReauthGrantId, setSsoReauthGrantId] = useState<string | null>(null);
+  const dropSsoReauthGrant = useCallback(() => {
+    setSsoReauthGrantId(null);
+    clearSsoReauthGrant();
+  }, []);
+  // One routing pass per component instance. A real remount gets a fresh ref
+  // (and so restores from the stash); React StrictMode's dev-only effect replay
+  // keeps the ref, so it cannot re-fire /mfa/setup on the TOTP road.
+  const ssoGrantRoutedRef = useRef(false);
   const [ssoSetupReady, setSsoSetupReady] = useState(false);
   const [isStartingSsoReauth, setIsStartingSsoReauth] = useState(false);
   // #4055: this page load IS the return leg of a round-trip the PASSKEY card
@@ -206,8 +266,13 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
   // put down. Distinct from `hasSsoReauthGrant`, which only says a grant is in
   // hand and stays true for the rest of the flow: this fires the one-shot
   // "bring the card to the user" landing and then stops mattering.
-  const [passkeyReauthReturn, setPasskeyReauthReturn] = useState(false);
+  // #4045: 'delete' is the same landing for the delete-passkey action, which
+  // puts the user on a Delete action instead of the name field.
+  const [passkeyReauthReturn, setPasskeyReauthReturn] = useState<'add' | 'delete' | null>(null);
   const passkeyNameRef = useRef<HTMLInputElement | null>(null);
+  // #4045: the management view (recovery codes / disable) the user left from
+  // for the IdP, to be reopened on return.
+  const [mfaResumeView, setMfaResumeView] = useState<'recovery' | 'disable' | undefined>();
   const passkeyLandingDone = useRef(false);
 
   // Avatar upload state
@@ -323,7 +388,11 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       }
 
       const updatedUser = await response.json();
-      setUser(updatedUser);
+      setUser(prev => (prev ? {
+        ...prev,
+        ...updatedUser,
+        ...(updatedUser.mfaEnabled === false ? { mfaMethod: null } : {}),
+      } : updatedUser));
       reset({
         name: updatedUser.name ?? '',
       });
@@ -523,7 +592,7 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
           // the "Invalid credentials" copy this code replaced. Deliberately NOT
           // clearing `ssoSetupReady`: the enrollment view should stay put and
           // swap its submit button, not collapse to the status card.
-            setSsoReauthGrantId(null);
+            dropSsoReauthGrant();
             throw new Error(t('profilePage.ssoReauthProofExpired'));
           }
           throw new Error(
@@ -542,7 +611,7 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         setMfaLoading(false);
       }
     },
-    [t]
+    [t, dropSsoReauthGrant]
   );
 
   const handleMfaRequestSetup = (currentPassword: string): Promise<boolean> =>
@@ -554,7 +623,8 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
   // password road, which is the fail-safe direction: the server rejects a wrong
   // password, whereas wrongly hiding the prompt strands a password user.
   const isPasswordless = user?.hasPassword === false;
-  // The grant is minted by the SSO re-auth callback and held only here. Both
+  // The grant is minted by the SSO re-auth callback and held here (mirrored to
+  // sessionStorage for remounts, #8862). Both
   // register/options (validate, non-consuming) and register/verify (consume)
   // take the SAME id, so one IdP round-trip installs exactly one factor —
   // whichever road spends it first.
@@ -567,10 +637,21 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
     () => pickReauthTier(passkeys.length, user?.mfaMethod ?? null),
     [passkeys.length, user?.mfaMethod],
   );
+  const deletePasskeyMethod = user?.mfaMethod
+    ?? (user?.mfaEnabled ? 'totp' : passkeys.length > 0 ? 'passkey' : null);
 
   // Consume an `#ssoReauthGrant=<id>` handed back by the SSO callback: the user
-  // has just re-proved their identity at the IdP. Mount-only by design — the
-  // fragment is stripped as it is read, so this can never fire twice.
+  // has just re-proved their identity at the IdP. The fragment is stripped as
+  // it is read, so it can only ever be seen by the first mount.
+  //
+  // #8862: a SECOND mount of the page (reload, soft navigation back, an island
+  // re-hydrating) used to find no fragment and drop the grant on the floor — the
+  // passkey card then fell back to "Verify with your identity provider" and the
+  // round-trip the user just finished was wasted. The grant and the intent that
+  // routed it are now stashed together on arrival and restored here when the
+  // fragment is absent. The stash is removed wherever the grant is spent or
+  // rejected (`dropSsoReauthGrant`), expires before the server's 300 s TTL, and
+  // is bound to the signed-in user; the server still validates every use.
   //
   // #4055: BOTH the TOTP card and the passkey card start the same round-trip
   // and the callback returns everyone to the same fragment, so the return leg
@@ -580,18 +661,56 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
   // Redis under `mfa:setup:<userId>` until its TTL expires, because only the
   // TOTP confirm step clears it.
   useEffect(() => {
-    const grantId = takeSsoReauthGrantFromHash();
+    if (ssoGrantRoutedRef.current) return;
+    const fragmentGrantId = takeSsoReauthGrantFromHash();
     // Consumed unconditionally, grant or not: an error return
     // (`?ssoReauthError=`) has nothing to route, and an intent left behind
     // would misroute the NEXT round-trip instead.
-    const intent = takeSsoReauthIntent();
-    if (!grantId) return;
+    const takenIntent = takeSsoReauthIntent();
+    // The persisted auth store is the live page's only source at this point
+    // (`<ProfilePage client:load />` has no initialUser, and /users/me is still
+    // in flight); `initialUser` covers callers that pass the user in.
+    const viewerId = useAuthStore.getState().user?.id ?? initialUser?.id ?? null;
+    let grantId: string;
+    let intent: SsoReauthIntent | null;
+    if (fragmentGrantId) {
+      grantId = fragmentGrantId;
+      intent = takenIntent;
+      stashSsoReauthGrant(grantId, intent, viewerId);
+    } else {
+      const restored = readSsoReauthGrant(viewerId);
+      if (!restored) return;
+      // Replaying the routing is what a remount needs: the passkey card is
+      // landed on again, a management view reopened, and the TOTP road
+      // re-issues /mfa/setup (non-consuming) because the QR the first mount
+      // showed died with it.
+      ({ grantId, intent } = restored);
+    }
+    ssoGrantRoutedRef.current = true;
     setSsoReauthGrantId(grantId);
+    // #4045: a factor-MANAGEMENT trip. The grant stands in for the password on
+    // that one action; nothing is spent here — the user still has to supply
+    // the existing-factor proof on the view they are put back on.
+    if (intent === 'recovery_codes') {
+      setMfaResumeView('recovery');
+      return;
+    }
+    if (intent === 'disable_mfa') {
+      setMfaResumeView('disable');
+      return;
+    }
+    if (intent === 'delete_passkey') {
+      setPasskeySuccess(t('profilePage.deletePasskeySsoVerified'));
+      setPasskeyReauthReturn('delete');
+      return;
+    }
     if (intent === 'passkey') {
       // Deliberately NO /mfa/setup here. The passkey road spends the same grant
       // on register/options + register/verify, which the card below already
       // knows how to do once `hasSsoReauthGrant` is true.
-      setPasskeyReauthReturn(true);
+      setPasskeyReauthReturn('add');
+      setPasskeyName('');
+      setPasskeyDialog({ kind: 'add' });
       return;
     }
     // `null` (nothing recorded — storage blocked, or a link from before #4055)
@@ -604,34 +723,33 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       if (ok) setSsoSetupReady(true);
     });
     // Empty deps ON PURPOSE: `requestMfaSetup` is deliberately excluded so a
-    // re-created callback identity can never re-fire this. It is safe either
-    // way — the fragment is stripped as it is read — but re-running would burn
-    // a second /mfa/setup call for nothing.
+    // re-created callback identity can never re-fire this; the routed ref
+    // makes it one pass per mounted instance regardless.
   }, []);
 
   // #4055: the IdP trip is a full-page navigation, so the browser puts the user
   // back at the TOP of a long settings page while the passkey card they left
   // from sits below the fold. Routing them back to it means actually taking
   // them there. Focus does the same job for keyboard and screen-reader users,
-  // and lands on the one field they still have to fill in.
+  // lands on the next action or field.
   //
-  // A CALLBACK ref, keyed on the flag, rather than an effect over an object
-  // ref. The real page is `<ProfilePage client:load />` with no `initialUser`,
-  // so the component sits behind the `isLoadingUser` early return below while
-  // GET /users/me is in flight — the card does not exist in the DOM at the
-  // moment the mount effect sets the flag, and an effect keyed only on the flag
-  // would find a null ref and never run again. React re-invokes a callback ref
-  // whose identity changed, so this fires whichever way the race lands: card
-  // already mounted (identity change re-invokes it) or card mounted later (the
-  // attach invokes it). Child refs attach before parents, so the name input is
-  // already populated by the time this runs. The latch keeps it one-shot.
+  // The callback ref handles scroll/focus whether the profile card mounts
+  // before or after the SSO return state arrives.
   const passkeyCardRef = useCallback((node: HTMLDivElement | null) => {
     if (!node || !passkeyReauthReturn || passkeyLandingDone.current) return;
     passkeyLandingDone.current = true;
     // jsdom has no layout and so no `scrollIntoView`; optional-call it.
     node.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
-    passkeyNameRef.current?.focus?.();
+    if (passkeyReauthReturn === 'delete') {
+      node.querySelector<HTMLButtonElement>('[data-testid="passkey-delete"]')?.focus();
+    }
   }, [passkeyReauthReturn]);
+
+  useEffect(() => {
+    if (passkeyDialog?.kind === 'add' && passkeyReauthReturn === 'add') {
+      passkeyNameRef.current?.focus();
+    }
+  }, [passkeyDialog, passkeyReauthReturn]);
 
   // Surface the callback's failure codes
   // (`/settings/profile?ssoReauthError=<code>`), exactly once.
@@ -676,6 +794,9 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         // leaves the page, so writing it earlier would just leave a stale value
         // for a trip that did not happen.
         stashSsoReauthIntent(intent);
+        // #8862: any grant still stashed belongs to an earlier trip. Drop it so
+        // this trip's return — success or error — can only ever see its own.
+        clearSsoReauthGrant();
         // External IdP URL — a full-page navigation, not the SPA router (which
         // rejects an off-origin path as an open redirect).
         window.location.assign(body.authUrl);
@@ -715,6 +836,7 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         : ssoReauthGrantId
           ? { ssoReauthGrantId }
           : {};
+      const generation = useAuthStore.getState().sessionGeneration;
       // runaction-exempt: inline-feedback handler. Failures land in `mfaError`; the caller
       // (MFASettings) also keys off the returned boolean, so a toast would double
       // up on the banner the enrollment step already shows.
@@ -732,7 +854,7 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         const errorData = await response.json().catch(() => ({}));
         if (errorData.code === ENROLLMENT_GRANT_EXPIRED_CODE) {
           // See requestMfaSetup — same dead-grant handling on the terminal write.
-          setSsoReauthGrantId(null);
+          dropSsoReauthGrant();
           throw new Error(t('profilePage.ssoReauthProofExpired'));
         }
         throw new Error(
@@ -741,14 +863,20 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       }
 
       const data = await response.json();
-      setUser(prev => (prev ? { ...prev, mfaEnabled: true } : null));
+      const enrollmentStateCommitted = useAuthStore.getState().commitMfaEnrollmentIfCurrent(
+        generation,
+        'totp',
+        data.tokens?.accessToken ? data.tokens : undefined,
+      );
+      const enrollmentReplacementAdopted = Boolean(data.tokens?.accessToken) && enrollmentStateCommitted;
+      setUser(prev => (prev ? { ...prev, mfaEnabled: true, mfaMethod: 'totp' } : null));
       setRecoveryCodes(data.recoveryCodes);
-      setMfaSuccess(t('profilePage.multiFactorAuthenticationEnabledSuccessfully'));
+      setMfaSuccess(withReauthNotice(t('profilePage.multiFactorAuthenticationEnabledSuccessfully'), enrollmentReplacementAdopted));
       setQrCodeDataUrl(undefined);
       // /mfa/enable is the terminal write that BURNS the grant. Drop it so a
       // later action on this page can't retry with a proof the server has
       // already spent.
-      setSsoReauthGrantId(null);
+      dropSsoReauthGrant();
       setSsoSetupReady(false);
       return true;
     } catch (error) {
@@ -767,11 +895,40 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
    * success message rather than letting the user discover it as a disconnected
    * /login?reason=session-expired on some later screen.
    *
-   * A REFUSED commit is different and needs no notice: the store refuses only on
-   * a stale generation, which means a logout already moved the session on.
+   * A response from an older generation needs no notice because the newer
+   * session owns its own authentication state.
    */
-  const withReauthNotice = (message: string, replacementAdopted: boolean) =>
-    (replacementAdopted ? message : `${message}. ${t('profilePage.signInAgainToContinue')}`);
+  const withReauthNotice = (message: string, requiresReauth: boolean) =>
+    (requiresReauth ? `${message}. ${t('profilePage.signInAgainToContinue')}` : message);
+
+  /**
+   * #4045: the "user at the keyboard" proof a factor-MANAGEMENT request sends —
+   * the password a password account typed, or the SSO re-auth grant a
+   * passwordless account brought back from its IdP. Exactly one, never both.
+   */
+  const manageProof = (currentPassword: string): { currentPassword: string } | { ssoReauthGrantId: string } | Record<string, never> => {
+    if (currentPassword) return { currentPassword };
+    if (isPasswordless && ssoReauthGrantId) return { ssoReauthGrantId };
+    return {};
+  };
+
+  /**
+   * #4045: the API rejected (or never had) the SSO grant for a management
+   * action. Drop it — that is what swaps the submit back to the "Verify with
+   * your identity provider" button — and say so in the user's language rather
+   * than rendering the server's English. Returns the message to throw, or null
+   * when the rejection is not about the grant.
+   */
+  const deadManageGrantMessage = (errorData: { code?: unknown }): string | null => {
+    if (typeof errorData.code !== 'string' || !SSO_REAUTH_MANAGE_DEAD_GRANT_CODES.has(errorData.code)) return null;
+    dropSsoReauthGrant();
+    return t('profilePage.ssoReauthManageProofExpired');
+  };
+
+  /** A passwordless account's grant is single-use: once spent, forget it. */
+  const forgetSpentManageGrant = (currentPassword: string) => {
+    if (!currentPassword && isPasswordless) dropSsoReauthGrant();
+  };
 
   const handleMfaDisable = async (code: string, currentPassword: string): Promise<boolean> => {
     setMfaError(undefined);
@@ -785,15 +942,17 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       // composed by withReauthNotice above.
       const response = await fetchWithAuth('/auth/mfa/disable', {
         method: 'POST',
-        body: JSON.stringify({ code, currentPassword })
+        body: JSON.stringify({ code, ...manageProof(currentPassword) })
       });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(
-          errorData.error ?? errorData.message ?? t('profilePage.failedToDisableMfaHttp', { status: response.status })
+          deadManageGrantMessage(errorData)
+            ?? errorData.error ?? errorData.message ?? t('profilePage.failedToDisableMfaHttp', { status: response.status })
         );
       }
+      forgetSpentManageGrant(currentPassword);
 
       const data = await response.json();
       // #4934: disabling MFA rotates the SESSION too — the API advances mfa_epoch
@@ -805,11 +964,12 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       // /login?reason=session-expired by the very action they just took.
       // A refused commit (a logout raced the request) is not an error: MFA is
       // already off, so the success message still has to be shown.
-      const disableReplacementAdopted = Boolean(data.tokens?.accessToken);
-      if (disableReplacementAdopted) {
-        useAuthStore.getState().commitReissuedSessionIfCurrent(generation, data.tokens);
-      }
-      setUser(prev => (prev ? { ...prev, mfaEnabled: false } : null));
+      const disableStateCommitted = useAuthStore.getState().commitMfaDisableIfCurrent(
+        generation,
+        data.tokens?.accessToken ? data.tokens : undefined,
+      );
+      const disableReplacementAdopted = Boolean(data.tokens?.accessToken) && disableStateCommitted;
+      setUser(prev => (prev ? { ...prev, mfaEnabled: false, mfaMethod: null } : null));
       setRecoveryCodes(undefined);
       setMfaSuccess(withReauthNotice(t('profilePage.multiFactorAuthenticationDisabled'), disableReplacementAdopted));
       return true;
@@ -828,6 +988,13 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
    * re-display the previous set as though it were the new one.
    */
   const handleSendRecoveryStepUpCode = async (): Promise<boolean> => {
+    if (passkeyDialog?.kind === 'delete') {
+      setPasskeyError(undefined);
+      setPasskeySuccess(undefined);
+    } else {
+      setMfaError(undefined);
+      setMfaSuccess(undefined);
+    }
     try {
       // runaction-exempt: inline-feedback handler. Failures land in `mfaError` and the boolean
       // return withholds the code entry step.
@@ -838,12 +1005,13 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
           defaultValue: 'Failed to send verification code',
         }));
       }
-      setMfaSuccess(t('profilePage.verificationCodeSent', { defaultValue: 'Verification code sent' }));
+      if (passkeyDialog?.kind === 'delete') setPasskeySuccess(t('profilePage.verificationCodeSent', { defaultValue: 'Verification code sent' }));
+      else setMfaSuccess(t('profilePage.verificationCodeSent', { defaultValue: 'Verification code sent' }));
       return true;
     } catch (error) {
-      setMfaError(error instanceof Error ? error.message : t('profilePage.failedToSendVerificationCode', {
-        defaultValue: 'Failed to send verification code',
-      }));
+      const message = error instanceof Error ? error.message : t('profilePage.failedToSendVerificationCode', { defaultValue: 'Failed to send verification code' });
+      if (passkeyDialog?.kind === 'delete') setPasskeyError(message);
+      else setMfaError(message);
       return false;
     }
   };
@@ -906,15 +1074,17 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       // can never re-display the previous set as though it were the new one.
       const response = await fetchWithAuth('/auth/mfa/recovery-codes', {
         method: 'POST',
-        body: JSON.stringify({ currentPassword, stepUpGrantId: stepUpData.stepUpGrantId })
+        body: JSON.stringify({ ...manageProof(currentPassword), stepUpGrantId: stepUpData.stepUpGrantId })
       });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(
-          errorData.error ?? errorData.message ?? t('profilePage.failedToGenerateRecoveryCodes')
+          deadManageGrantMessage(errorData)
+            ?? errorData.error ?? errorData.message ?? t('profilePage.failedToGenerateRecoveryCodes')
         );
       }
+      forgetSpentManageGrant(currentPassword);
 
       const data = await response.json();
       // #4480: rotating the codes rotates the SESSION too — the API advances
@@ -1094,7 +1264,7 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         if (optionsData.code === ENROLLMENT_GRANT_EXPIRED_CODE) {
           // The passkey road calls the SAME resolveEnrollmentStepUp as the TOTP
           // road above, so it can receive this code too — see requestMfaSetup.
-          setSsoReauthGrantId(null);
+          dropSsoReauthGrant();
           throw new Error(t('profilePage.ssoReauthProofExpired'));
         }
         throw new Error(
@@ -1119,7 +1289,7 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       if (!verifyResponse.ok) {
         if (verifyData.code === ENROLLMENT_GRANT_EXPIRED_CODE) {
           // See requestMfaSetup — same dead-grant handling on the terminal write.
-          setSsoReauthGrantId(null);
+          dropSsoReauthGrant();
           throw new Error(t('profilePage.ssoReauthProofExpired'));
         }
         throw new Error(
@@ -1136,29 +1306,23 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       // bounced to /login?reason=session-expired by the very action they just
       // took. A refused commit (a logout raced the request) is not an error —
       // the passkey is already registered, so success still has to be shown.
-      const registerReplacementAdopted = Boolean(verifyData.tokens?.accessToken);
-      if (registerReplacementAdopted) {
-        useAuthStore.getState().commitReissuedSessionIfCurrent(generation, verifyData.tokens);
-      }
-      // G4-14: a first-factor enrollment (`prev.mfaMethod` unset) makes this the
-      // account's MFA method. Leave an existing method alone for a second
-      // passkey added to an already-enrolled account. MFASettings reads this to
-      // decide whether the recovery-codes panel below just became relevant.
-      setUser(prev => (prev ? { ...prev, mfaEnabled: true, mfaMethod: prev.mfaMethod ?? 'passkey' } : null));
+      const { adopted: mfaStateCommitted, mfaState } = adoptPasskeyMutationSession(generation, verifyData);
+      const sessionStillCurrent = useAuthStore.getState().sessionGeneration === generation;
+      const registerRequiresReauth = sessionStillCurrent
+        && !(verifyData.tokens?.accessToken && mfaStateCommitted);
+      if (mfaStateCommitted && mfaState) setUser(prev => (prev ? { ...prev, ...mfaState } : null));
+      setPasskeyDialog(mfaStateCommitted && Array.isArray(verifyData.recoveryCodes) && verifyData.recoveryCodes.length ? { kind: 'recovery', codes: verifyData.recoveryCodes } : null);
       setPasskeyName('');
       setPasskeyPassword('');
       // register/verify is the terminal write that BURNS the grant. Drop it so
       // a later action on this page can't retry with a proof the server has
       // already spent — same rule as the TOTP terminal write.
-      setSsoReauthGrantId(null);
+      dropSsoReauthGrant();
       setSsoSetupReady(false);
       setPasskeyStepUpNeeded(false);
       setPasskeyStepUpCode('');
-      if (Array.isArray(verifyData.recoveryCodes)) {
-        setRecoveryCodes(verifyData.recoveryCodes);
-      }
-      setPasskeySuccess(withReauthNotice(t('profilePage.passkeyAdded'), registerReplacementAdopted));
-      await loadPasskeys();
+      setPasskeySuccess(withReauthNotice(t('profilePage.passkeyAdded'), registerRequiresReauth));
+      if (mfaStateCommitted) await loadPasskeys();
     } catch (error) {
       if (error instanceof Error && error.name === 'NotAllowedError') {
         setPasskeyError(t('profilePage.passkeySetupWasCanceledOrTimedOut'));
@@ -1200,83 +1364,186 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
     }
   };
 
+  /** Why a delete cannot start yet (null = it can): no password, or (#4045) no SSO grant. */
+  const deletePasskeyProofMissing = (): string | null => {
+    if (isPasswordless) return ssoReauthGrantId ? null : t('profilePage.verifyWithIdpToDeletePasskey');
+    return passkeyPassword ? null : t('profilePage.currentPasswordIsRequiredToDeleteAPasskey');
+  };
+
   const handleDeletePasskey = async (passkeyId: string) => {
     if (mutatingPasskeyId) return;
     setPasskeyError(undefined);
     setPasskeySuccess(undefined);
-    if (!passkeyPassword) {
-      setPasskeyError(t('profilePage.currentPasswordIsRequiredToDeleteAPasskey'));
+    // #4045: a passwordless account has no password field to fill (it is
+    // hidden) — its proof is the SSO re-auth grant. Asking it for a password
+    // was a dead end; point it at the one action that can unblock it.
+    const deleteProofMissing = deletePasskeyProofMissing();
+    if (deleteProofMissing) {
+      setPasskeyError(deleteProofMissing);
       return;
     }
-    const method = user?.mfaMethod ?? 'totp';
-    if ((method === 'totp' || method === 'sms') && !passkeyFactorCode.trim()) {
+    const method = deletePasskeyMethod;
+    const factorCode = passkeyFactorCode.trim();
+    const recoveryCode = isMfaRecoveryCode(factorCode);
+    // Captured before the request so a logout that races it is detectable.
+    const generation = useAuthStore.getState().sessionGeneration;
+    const retryGrant = passkeyDeleteRetryGrant?.passkeyId === passkeyId
+      && passkeyDeleteRetryGrant.sessionGeneration === generation
+      ? passkeyDeleteRetryGrant
+      : null;
+    if ((method === 'totp' || method === 'sms') && !factorCode && !retryGrant) {
       setPasskeyError(t('mFASettings.currentMfaCodeRequired', {
         defaultValue: 'Enter a current MFA code before deleting a passkey',
       }));
       return;
     }
-    // Captured before the request so a logout that races it is detectable.
-    const generation = useAuthStore.getState().sessionGeneration;
+    let stepUpGrantId: string | undefined;
+    let deleteRequestPending = false;
     try {
       setMutatingPasskeyId(passkeyId);
-      let stepUpBody: Record<string, unknown>;
-      if (method === 'passkey') {
-        // runaction-exempt: inline-feedback handler, step 1 of 3 (options -> step-up -> delete).
-        // Same single-catch shape as the recovery-code rotation above.
-        const optionsResponse = await fetchWithAuth('/auth/mfa/step-up/options', { method: 'POST' });
-        const optionsData = await optionsResponse.json().catch(() => ({}));
-        if (!optionsResponse.ok) {
-          throw new Error(optionsData.error ?? optionsData.message ?? t('profilePage.failedToVerifyCurrentFactor', {
+      stepUpGrantId = retryGrant?.grantId;
+      if (!retryGrant) {
+        setPasskeyDeleteRetryGrant(null);
+        let stepUpBody: Record<string, unknown>;
+        if (method === 'passkey') {
+          if (recoveryCode) {
+            stepUpBody = { method: 'recovery', code: factorCode, operation: 'delete_passkey', passkeyId };
+          } else {
+            // runaction-exempt: inline-feedback handler, step 1 of 3 (options -> step-up -> delete).
+            const optionsResponse = await fetchWithAuth('/auth/mfa/step-up/options', { method: 'POST' });
+            const optionsData = await optionsResponse.json().catch(() => ({}));
+            if (!optionsResponse.ok) {
+              throw new Error(optionsData.error ?? optionsData.message ?? t('profilePage.failedToVerifyCurrentFactor', {
+                defaultValue: 'Failed to verify current MFA factor',
+              }));
+            }
+            const optionsJSON = (optionsData.options ?? optionsData.optionsJSON ?? optionsData) as PasskeyAuthenticationOptions;
+            const credential = await getPasskeyCredential(optionsJSON);
+            stepUpBody = { method: 'passkey', credential, operation: 'delete_passkey', passkeyId };
+          }
+        } else if (method === 'totp' || method === 'sms') {
+          stepUpBody = recoveryCode
+            ? { method: 'recovery', code: factorCode, operation: 'delete_passkey', passkeyId }
+            : { method, code: factorCode, operation: 'delete_passkey', passkeyId };
+        } else {
+          throw new Error(t('profilePage.failedToVerifyCurrentFactor', {
             defaultValue: 'Failed to verify current MFA factor',
           }));
         }
-        const optionsJSON = (optionsData.options ?? optionsData.optionsJSON ?? optionsData) as PasskeyAuthenticationOptions;
-        const credential = await getPasskeyCredential(optionsJSON);
-        stepUpBody = { method: 'passkey', credential, operation: 'delete_passkey', passkeyId };
-      } else if (method === 'totp' || method === 'sms') {
-        stepUpBody = { method, code: passkeyFactorCode.trim(), operation: 'delete_passkey', passkeyId };
-      } else {
+
+        // runaction-exempt: inline-feedback handler, step 2 of 3 — see the options call above.
+        const stepUpResponse = await fetchWithAuth('/auth/mfa/step-up', {
+          method: 'POST',
+          body: JSON.stringify(stepUpBody),
+        });
+        const stepUpData = await stepUpResponse.json().catch(() => ({}));
+        if (!stepUpResponse.ok || typeof stepUpData.stepUpGrantId !== 'string' || !stepUpData.stepUpGrantId) {
+          throw new Error(stepUpData.error ?? stepUpData.message ?? t('profilePage.failedToVerifyCurrentFactor', {
+            defaultValue: 'Failed to verify current MFA factor',
+          }));
+        }
+        stepUpGrantId = stepUpData.stepUpGrantId;
+      }
+      if (!stepUpGrantId) {
         throw new Error(t('profilePage.failedToVerifyCurrentFactor', {
           defaultValue: 'Failed to verify current MFA factor',
         }));
       }
 
-      // runaction-exempt: inline-feedback handler, step 2 of 3 — see the options call above.
-      const stepUpResponse = await fetchWithAuth('/auth/mfa/step-up', {
-        method: 'POST',
-        body: JSON.stringify(stepUpBody),
-      });
-      const stepUpData = await stepUpResponse.json().catch(() => ({}));
-      if (!stepUpResponse.ok || typeof stepUpData.stepUpGrantId !== 'string' || !stepUpData.stepUpGrantId) {
-        throw new Error(stepUpData.error ?? stepUpData.message ?? t('profilePage.failedToVerifyCurrentFactor', {
-          defaultValue: 'Failed to verify current MFA factor',
-        }));
-      }
-
+      deleteRequestPending = true;
       // runaction-exempt: inline-feedback handler, step 3 of 3 — see the options call above.
       const response = await fetchWithAuth(`/auth/passkeys/${encodeURIComponent(passkeyId)}`, {
         method: 'DELETE',
-        body: JSON.stringify({ currentPassword: passkeyPassword, stepUpGrantId: stepUpData.stepUpGrantId })
+        body: JSON.stringify({ ...manageProof(passkeyPassword), stepUpGrantId })
       });
+      deleteRequestPending = false;
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(data.error ?? data.message ?? t('profilePage.failedToDeletePasskeyHttp', { status: response.status }));
+        const grantWasNotConsumed = data.stepUpGrantConsumed !== true;
+        const retryableFailure = (data.code === 'invalid_credentials' && grantWasNotConsumed)
+          || (data.code === 'last_mfa_factor_required' && grantWasNotConsumed)
+          || (response.status === 409 && grantWasNotConsumed);
+        setPasskeyDeleteRetryGrant(retryableFailure && stepUpGrantId
+          ? { passkeyId, grantId: stepUpGrantId, sessionGeneration: generation }
+          : null);
+        throw new Error(
+          deadManageGrantMessage(data)
+            ?? data.error ?? data.message ?? t('profilePage.failedToDeletePasskeyHttp', { status: response.status })
+        );
       }
+      setPasskeyDeleteRetryGrant(null);
+      forgetSpentManageGrant(passkeyPassword);
       // #5038: same contract as registration above — deleting a factor rotates
       // the caller's session rather than evicting it.
-      const deleteReplacementAdopted = Boolean(data.tokens?.accessToken);
-      if (deleteReplacementAdopted) {
-        useAuthStore.getState().commitReissuedSessionIfCurrent(generation, data.tokens);
-      }
-      setPasskeys(prev => prev.filter(passkey => passkey.id !== passkeyId));
+      const { adopted: mfaStateCommitted, mfaState } = adoptPasskeyMutationSession(generation, data);
+      const sessionStillCurrent = useAuthStore.getState().sessionGeneration === generation;
+      const deleteRequiresReauth = sessionStillCurrent
+        && !(data.tokens?.accessToken && mfaStateCommitted);
+      setPasskeyDialog(null);
+      if (mfaStateCommitted) setPasskeys(prev => prev.filter(passkey => passkey.id !== passkeyId));
       setPasskeyPassword('');
       setPasskeyFactorCode('');
-      setPasskeySuccess(withReauthNotice(t('profilePage.passkeyDeleted'), deleteReplacementAdopted));
+      if (mfaStateCommitted && mfaState) setUser(prev => (prev ? { ...prev, ...mfaState } : null));
+      setPasskeySuccess(withReauthNotice(t('profilePage.passkeyDeleted'), deleteRequiresReauth));
     } catch (error) {
+      if (deleteRequestPending && stepUpGrantId) {
+        setPasskeyDeleteRetryGrant({ passkeyId, grantId: stepUpGrantId, sessionGeneration: generation });
+      }
       setPasskeyError(error instanceof Error ? error.message : t('profilePage.failedToDeletePasskey'));
     } finally {
       setMutatingPasskeyId(null);
     }
+  };
+
+  const passkeyStepUpFields = (
+    <>
+      {passkeyStepUpNeeded && (
+        <div className="space-y-2 rounded-md border p-3" data-testid="passkey-stepup-section">
+          <p className="text-sm font-medium">{t('profilePage.passkeyStepUpHeading')}</p>
+          <p className="text-xs text-muted-foreground">
+            {t('profilePage.passkeyStepUpIntro')}
+          </p>
+          {passkeyStepUpTier === 'passkey' ? (
+            <p className="text-xs text-muted-foreground" data-testid="passkey-stepup-passkey-note">
+              {t('stepUpPrompt.youWillConfirmWithYourPasskey')}
+            </p>
+          ) : passkeyStepUpTier === 'totp' ? (
+            <>
+              <label className="text-sm font-medium" htmlFor="passkey-stepup-code">
+                {t('stepUpPrompt.authenticatorCode')}
+              </label>
+              <input
+                id="passkey-stepup-code"
+                data-testid="passkey-stepup-code"
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={6}
+                value={passkeyStepUpCode}
+                onChange={event => setPasskeyStepUpCode(event.target.value.replace(/\D/g, ''))}
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                disabled={isAddingPasskey}
+              />
+            </>
+          ) : (
+            <p className="text-xs text-muted-foreground" data-testid="passkey-stepup-no-factor">
+              {t('profilePage.passkeyStepUpNoUsableFactor')}
+            </p>
+          )}
+        </div>
+      )}
+    </>
+  );
+
+  const closePasskeyDialog = () => {
+    if (isAddingPasskey || mutatingPasskeyId) return;
+    setPasskeyDialog(null);
+    setPasskeyName('');
+    setPasskeyPassword('');
+    setPasskeyFactorCode('');
+    setPasskeyStepUpCode('');
+    setPasskeyStepUpNeeded(false);
+    setPasskeyError(undefined);
   };
 
   if (isLoadingUser) {
@@ -1442,12 +1709,22 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
       </form>
 
       {/* Change Password */}
-      <ChangePasswordForm
-        onSubmit={handlePasswordChange}
-        errorMessage={passwordError}
-        successMessage={passwordSuccess}
-        loading={isChangingPassword}
-      />
+      {isPasswordless ? (
+        <section
+          data-testid="change-password-unavailable"
+          className="space-y-1 rounded-lg border bg-card p-6 shadow-xs"
+        >
+          <h2 className="text-lg font-semibold">{t('changePasswordForm.changePassword')}</h2>
+          <p className="text-sm text-muted-foreground">{t('changePasswordForm.noPasswordNotice')}</p>
+        </section>
+      ) : (
+        <ChangePasswordForm
+          onSubmit={handlePasswordChange}
+          errorMessage={passwordError}
+          successMessage={passwordSuccess}
+          loading={isChangingPassword}
+        />
+      )}
 
       {/* MFA Settings */}
       <MFASettings
@@ -1455,7 +1732,9 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         mfaMethod={user?.mfaMethod}
         hasPassword={user?.hasPassword}
         onSsoReauth={() => handleSsoReauthStart('totp')}
+        onSsoReauthManage={(intent) => handleSsoReauthStart(intent)}
         ssoSetupReady={ssoSetupReady}
+        ssoResumeView={mfaResumeView}
         ssoReauthGrantAvailable={hasSsoReauthGrant}
         qrCodeDataUrl={qrCodeDataUrl}
         totpSecret={totpSecret}
@@ -1468,21 +1747,46 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         errorMessage={mfaError}
         successMessage={mfaSuccess}
         loading={mfaLoading || isStartingSsoReauth}
-      />
-
-      {/* Connect SSO (self-service identity linking, #2183) */}
-      <ConnectSsoCard />
-
+      >
       {/* Passkeys */}
       <div
         ref={passkeyCardRef}
         data-testid="passkey-card"
-        className="space-y-6 rounded-lg border bg-card p-6 shadow-xs"
+        className="space-y-4 rounded-md border bg-muted/30 p-4"
       >
-        <div className="space-y-1">
-          <h2 className="text-lg font-semibold">{t('profilePage.passkeys')}</h2>
-          <p className="text-sm text-muted-foreground">
-            {t('profilePage.managePasskeysThatCanBeUsedAsMultiFactorAuthenticationFo')}</p>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+        <h3 className="text-sm font-medium">{t('profilePage.passkeys')}</h3>
+        <div>
+          {isPasswordless && !hasSsoReauthGrant ? (
+            <button
+              type="button"
+              data-testid="passkey-sso-reauth"
+              onClick={() => { void handleSsoReauthStart('passkey'); }}
+              disabled={isAddingPasskey || isStartingSsoReauth}
+              className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {t('profilePage.verifyWithYourIdentityProvider')}
+            </button>
+          ) : (
+            <button
+              type="button"
+              data-testid="passkey-add"
+              onClick={() => {
+                setPasskeyPassword('');
+                setPasskeyError(undefined);
+                setPasskeySuccess(undefined);
+                setPasskeyDialog({ kind: 'add' });
+              }}
+              disabled={
+                isAddingPasskey
+                || !!mutatingPasskeyId
+              }
+              className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-60"
+            >
+              {t('profilePage.addPasskey')}
+            </button>
+          )}
+        </div>
         </div>
 
         <div className="space-y-3">
@@ -1548,19 +1852,14 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
                           {t('profilePage.rename')}</button>
                         <button
                           type="button"
+                          data-testid="passkey-delete"
                           onClick={() => {
                             setPasskeyError(undefined);
                             setPasskeySuccess(undefined);
-                            // Surface the missing-password error BEFORE the
-                            // confirmation rather than after it — otherwise the
-                            // user reads and accepts an alarming "other sessions
-                            // will be signed out" dialog only to be told the
-                            // password field is empty.
-                            if (!passkeyPassword) {
-                              setPasskeyError(t('profilePage.currentPasswordIsRequiredToDeleteAPasskey'));
-                              return;
-                            }
-                            setPasskeyPendingDelete(passkey);
+                            setPasskeyPassword('');
+                            setPasskeyFactorCode('');
+                            setUsePasskeyRecovery(false);
+                            setPasskeyDialog({ kind: 'delete', passkey });
                           }}
                           disabled={!!mutatingPasskeyId}
                           className="h-9 rounded-md border border-destructive/40 px-3 text-sm font-medium text-destructive transition hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-60"
@@ -1579,175 +1878,24 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
           )}
         </div>
 
-        {/* sweep paper cut #13: this field proves the account's existing MFA
-            factor for the DELETE flow only (see handleDeletePasskey) — it has
-            no effect whatsoever on handleAddPasskey / the Add passkey button
-            below, which is gated purely by `passkeyStepUpCode` in the
-            separate SR2-20 step-up block. Rendering it inside the "Add a
-            passkey" card made it look like part of that flow, so a code typed
-            here left Add permanently (and inexplicably) disabled. Giving it
-            its own section, clearly scoped to deleting, removes the
-            ambiguity without touching either ceremony. */}
-        {!isPasswordless && (user?.mfaMethod === 'totp' || user?.mfaMethod === 'sms') && (
-          <div className="space-y-2 rounded-md border p-4">
-            <div className="space-y-1">
-              <h3 className="text-sm font-medium">{t('profilePage.deletePasskeyVerifyHeading')}</h3>
-              <p className="text-xs text-muted-foreground">
-                {t('profilePage.deletePasskeyVerifyHint')}
-              </p>
-            </div>
-            <label className="text-sm font-medium" htmlFor="passkey-factor-code">
-              {t('mFASettings.currentMfaCode', { defaultValue: 'Current MFA code' })}
-            </label>
-            <div className="flex gap-2">
-              <input
-                id="passkey-factor-code"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                value={passkeyFactorCode}
-                onChange={event => setPasskeyFactorCode(event.target.value)}
-                className="h-10 min-w-0 flex-1 rounded-md border bg-background px-3 text-sm"
-                disabled={isAddingPasskey || !!mutatingPasskeyId}
-              />
-              {user.mfaMethod === 'sms' && (
-                <button
-                  type="button"
-                  onClick={() => { void handleSendRecoveryStepUpCode(); }}
-                  disabled={isAddingPasskey || !!mutatingPasskeyId}
-                  className="h-10 rounded-md border px-3 text-sm font-medium"
-                >
-                  {t('mFASettings.sendCode', { defaultValue: 'Send code' })}
-                </button>
-              )}
-            </div>
-          </div>
-        )}
 
-        <div className="space-y-4 rounded-md border p-4">
-          <div className="space-y-1">
-            <h3 className="text-sm font-medium">{t('profilePage.addPasskey')}</h3>
-            <p className="text-xs text-muted-foreground">
-              {/* #4055: "re-verify BEFORE adding a passkey" is stale the moment
-                  the grant lands — saying it to someone who just completed the
-                  round-trip reads as a failed trip. */}
-              {isPasswordless
-                ? hasSsoReauthGrant
-                  ? t('profilePage.yourIdentityIsVerifiedNameThisPasskeyAndContinue')
-                  : t('profilePage.thisAccountSignsInThroughAnIdentityProviderVerifyBeforeAddingAPasskey')
-                : t('profilePage.reEnterYourAccountPasswordBeforeAddingOrDeletingAPasskey')}</p>
-          </div>
-          <div className="space-y-2">
-            <label className="text-sm font-medium" htmlFor="passkey-name">
-              {t('profilePage.passkeyName')}</label>
-            <input
-              id="passkey-name"
-              ref={passkeyNameRef}
-              type="text"
-              value={passkeyName}
-              onChange={event => setPasskeyName(event.target.value)}
-              placeholder={t('profilePage.macBookTouchID')}
-              className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-              disabled={isAddingPasskey}
-            />
-          </div>
-          {/* #4018: no password field for an account that has no password —
-              the proof is a fresh IdP round-trip instead. */}
-          {!isPasswordless && (
-            <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="passkey-password">
-                {t('profilePage.currentPassword')}</label>
-              <input
-                id="passkey-password"
-                type="password"
-                autoComplete="current-password"
-                value={passkeyPassword}
-                onChange={event => setPasskeyPassword(event.target.value)}
-                className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-                disabled={isAddingPasskey}
-              />
-            </div>
-          )}
-          {/* SR2-20: revealed only once the FIRST submit 403s
-              existing_factor_step_up_required — an account with no existing
-              factor never sees this (paper cut G4-7). A locally-scoped prompt
-              rather than <StepUpPrompt>: ApproverDevicesSection below already
-              renders one on this same page, and that component's ids
-              (`approver-stepup-*`) are not unique per instance. */}
-          {passkeyStepUpNeeded && (
-            <div className="space-y-2 rounded-md border p-3" data-testid="passkey-stepup-section">
-              <p className="text-sm font-medium">{t('profilePage.passkeyStepUpHeading')}</p>
-              <p className="text-xs text-muted-foreground">
-                {t('profilePage.passkeyStepUpIntro')}
-              </p>
-              {passkeyStepUpTier === 'passkey' ? (
-                <p className="text-xs text-muted-foreground" data-testid="passkey-stepup-passkey-note">
-                  {t('stepUpPrompt.youWillConfirmWithYourPasskey')}
-                </p>
-              ) : passkeyStepUpTier === 'totp' ? (
-                <>
-                  <label className="text-sm font-medium" htmlFor="passkey-stepup-code">
-                    {t('stepUpPrompt.authenticatorCode')}
-                  </label>
-                  <input
-                    id="passkey-stepup-code"
-                    data-testid="passkey-stepup-code"
-                    type="text"
-                    inputMode="numeric"
-                    autoComplete="one-time-code"
-                    maxLength={6}
-                    value={passkeyStepUpCode}
-                    onChange={event => setPasskeyStepUpCode(event.target.value.replace(/\D/g, ''))}
-                    className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-                    disabled={isAddingPasskey}
-                  />
-                </>
-              ) : (
-                <p className="text-xs text-muted-foreground" data-testid="passkey-stepup-no-factor">
-                  {t('profilePage.passkeyStepUpNoUsableFactor')}
-                </p>
-              )}
-            </div>
-          )}
-          {isPasswordless && !hasSsoReauthGrant ? (
-            <button
-              type="button"
-              data-testid="passkey-sso-reauth"
-              onClick={() => { void handleSsoReauthStart('passkey'); }}
-              disabled={isAddingPasskey || isStartingSsoReauth}
-              className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {t('profilePage.verifyWithYourIdentityProvider')}
-            </button>
-          ) : (
-            <button
-              type="button"
-              data-testid="passkey-add"
-              onClick={handleAddPasskey}
-              disabled={
-                isAddingPasskey
-                || (!isPasswordless && !passkeyPassword)
-                || (passkeyStepUpNeeded
-                  && (passkeyStepUpTier === 'password'
-                    || (passkeyStepUpTier === 'totp' && passkeyStepUpCode.length !== 6)))
-              }
-              className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {isAddingPasskey ? t('profilePage.adding') : t('profilePage.addPasskey')}
-            </button>
-          )}
-        </div>
 
         {passkeySuccess && (
           <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600">
             {passkeySuccess}
           </div>
         )}
-        {passkeyError && (
+        {passkeyError && !passkeyDialog && (
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {passkeyError}
           </div>
         )}
       </div>
+
+      </MFASettings>
+
+      {/* Connect SSO (self-service identity linking, #2183) */}
+      <ConnectSsoCard />
 
       {/* Approval security (Breeze Authenticator) */}
       <ApproverDevicesSection passkeyCount={passkeys.length} mfaMethod={user?.mfaMethod ?? null} />
@@ -1755,10 +1903,16 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
         preferences={user?.preferences}
         onSaved={(preferences) => setUser(prev => (prev ? { ...prev, preferences } : prev))}
       />
+      <CharacterKeyShortcutsSettings
+        preferences={user?.preferences}
+        onSaved={(preferences) => setUser(prev => (prev ? { ...prev, preferences } : prev))}
+      />
       <RemoteToolSettings
         preferences={user?.preferences}
         onSaved={(preferences) => setUser(prev => (prev ? { ...prev, preferences } : prev))}
       />
+      <TicketPushoverSettings />
+      <EmailNotificationSettings />
 
       {/* Onboarding */}
       <div className="rounded-lg border bg-card p-6 shadow-xs">
@@ -1784,21 +1938,167 @@ export default function ProfilePage({ initialUser }: ProfilePageProps) {
           {t('profilePage.restartTour')}</button>
       </div>
 
-      <ConfirmDialog
-        open={passkeyPendingDelete !== null}
-        onClose={() => setPasskeyPendingDelete(null)}
-        onConfirm={() => {
-          const target = passkeyPendingDelete;
-          setPasskeyPendingDelete(null);
-          if (target) void handleDeletePasskey(target.id);
-        }}
-        title={t('profilePage.deletePasskeyConfirmTitle')}
-        message={t('profilePage.deletePasskeyConfirmMessage', {
-          name: passkeyPendingDelete?.name || 'Passkey',
-        })}
-        confirmLabel={t('profilePage.delete')}
-        confirmTestId="passkey-delete-confirm"
-      />
+      <Dialog
+        open={passkeyDialog?.kind === 'add'}
+        onClose={closePasskeyDialog}
+        title={t('profilePage.addPasskey')}
+        labelledBy="passkey-add-dialog-title"
+        className="space-y-4 p-6"
+      >
+        <h3 id="passkey-add-dialog-title" className="text-lg font-semibold">
+          {t('profilePage.addPasskey')}
+        </h3>
+        <form className="space-y-4" onSubmit={event => { event.preventDefault(); void handleAddPasskey(); }}>
+          <div className="space-y-2">
+            <label className="text-sm font-medium" htmlFor="passkey-name">
+              {t('profilePage.passkeyName')}
+            </label>
+            <input
+              id="passkey-name"
+              ref={passkeyNameRef}
+              type="text"
+              value={passkeyName}
+              onChange={event => setPasskeyName(event.target.value)}
+              placeholder={t('profilePage.macBookTouchID')}
+              className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+              disabled={isAddingPasskey}
+            />
+          </div>
+          {!isPasswordless && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="passkey-password">
+                {t('profilePage.currentPassword')}
+              </label>
+              <input
+                id="passkey-password"
+                type="password"
+                autoComplete="current-password"
+                value={passkeyPassword}
+                onChange={event => setPasskeyPassword(event.target.value)}
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                disabled={isAddingPasskey}
+              />
+            </div>
+          )}
+          {passkeyStepUpFields}
+          {passkeyError && <p role="alert" className="text-sm text-destructive">{passkeyError}</p>}
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={closePasskeyDialog} disabled={isAddingPasskey} className="h-10 rounded-md border px-4 text-sm font-medium">
+              {t('common:actions.cancel')}
+            </button>
+            <button
+              type="submit"
+              data-testid="passkey-add-confirm"
+              disabled={
+                isAddingPasskey
+                || (!isPasswordless && !passkeyPassword)
+                || (passkeyStepUpNeeded
+                  && (passkeyStepUpTier === 'password'
+                    || (passkeyStepUpTier === 'totp' && passkeyStepUpCode.length !== 6)))
+              }
+              className="inline-flex h-10 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isAddingPasskey ? t('profilePage.adding') : t('profilePage.addPasskey')}
+            </button>
+          </div>
+        </form>
+      </Dialog>
+      {passkeyDialog?.kind === 'recovery' && (
+        <Dialog open onClose={() => {}} title={t('mFASettings.saveRecoveryCodes', { defaultValue: 'Save your recovery codes' })} labelledBy="passkey-recovery-title" className="p-6">
+          <IssuedRecoveryCodes passkey codes={passkeyDialog.codes} onDone={() => setPasskeyDialog(null)} />
+        </Dialog>
+      )}
+      {passkeyDialog?.kind === 'delete' && (
+        <ConfirmDialog
+          open
+          onClose={closePasskeyDialog}
+          onConfirm={() => { void handleDeletePasskey(passkeyDialog.passkey.id); }}
+          title={t('profilePage.deletePasskeyConfirmTitle')}
+          message={<Trans i18nKey="profilePage.deletePasskeyConfirmMessage" ns="settings" values={{ name: passkeyDialog.passkey.name || 'Passkey' }} components={{ strong: <strong className="font-semibold text-foreground" /> }} />}
+          confirmLabel={t('profilePage.delete')}
+          confirmTestId="passkey-delete-confirm"
+          isLoading={mutatingPasskeyId === passkeyDialog.passkey.id}
+          confirmDisabled={(!isPasswordless && !passkeyPassword) || (isPasswordless && !hasSsoReauthGrant) || ((deletePasskeyMethod === 'totp' || deletePasskeyMethod === 'sms') && !passkeyFactorCode.trim()) || (deletePasskeyMethod === 'passkey' && usePasskeyRecovery && !isMfaRecoveryCode(passkeyFactorCode))}
+        >
+          <div className="space-y-4">
+            {!isPasswordless && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium" htmlFor="passkey-password">
+                  {t('profilePage.currentPassword')}
+                </label>
+                <input
+                  id="passkey-password"
+                  type="password"
+                  autoComplete="current-password"
+                  value={passkeyPassword}
+                  onChange={event => setPasskeyPassword(event.target.value)}
+                  className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                  disabled={!!mutatingPasskeyId}
+                />
+              </div>
+            )}
+            {isPasswordless && !hasSsoReauthGrant && (
+              <div className="space-y-2">
+                <p className="text-xs text-muted-foreground">{t('profilePage.verifyWithIdpToDeletePasskey')}</p>
+                <button
+                  type="button"
+                  data-testid="passkey-delete-sso-reauth"
+                  onClick={() => { void handleSsoReauthStart('delete_passkey'); }}
+                  disabled={isStartingSsoReauth || !!mutatingPasskeyId}
+                  className="h-9 rounded-md border px-3 text-sm font-medium text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {t('profilePage.deletePasskeySsoReauth')}
+                </button>
+              </div>
+            )}
+            {(deletePasskeyMethod === 'totp' || deletePasskeyMethod === 'sms' || (deletePasskeyMethod === 'passkey' && usePasskeyRecovery)) && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium" htmlFor="passkey-factor-code">
+                  {deletePasskeyMethod === 'passkey'
+                    ? t('profilePage.recoveryCode', { defaultValue: 'Recovery code' })
+                    : t('profilePage.factorProofLabel', { defaultValue: 'Current MFA code or recovery code' })}
+                </label>
+                {deletePasskeyMethod === 'passkey' && (
+                  <p className="text-xs text-muted-foreground">
+                    {t('profilePage.passkeyRecoveryCodeHint', {
+                      defaultValue: 'Enter an unused recovery code.',
+                    })}
+                  </p>
+                )}
+                <div className="flex gap-2">
+                  <input
+                    id="passkey-factor-code"
+                    data-testid="passkey-factor-code"
+                    inputMode="text"
+                    autoComplete="one-time-code"
+                    value={passkeyFactorCode}
+                    onChange={event => setPasskeyFactorCode(event.target.value)}
+                    className="h-10 min-w-0 flex-1 rounded-md border bg-background px-3 text-sm"
+                    disabled={!!mutatingPasskeyId}
+                  />
+                  {deletePasskeyMethod === 'sms' && (
+                    <button
+                      type="button"
+                      onClick={() => { void handleSendRecoveryStepUpCode(); }}
+                      disabled={!!mutatingPasskeyId}
+                      className="h-10 rounded-md border px-3 text-sm font-medium"
+                    >
+                      {t('mFASettings.sendCode', { defaultValue: 'Send code' })}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            {deletePasskeyMethod === 'passkey' && (
+              <button type="button" className="text-sm text-primary underline underline-offset-4" disabled={!!mutatingPasskeyId} onClick={() => { setUsePasskeyRecovery(!usePasskeyRecovery); setPasskeyFactorCode(''); setPasskeyError(undefined); }}>
+                {usePasskeyRecovery ? t('profilePage.usePasskeyVerification', { defaultValue: 'Use passkey verification instead' }) : t('profilePage.useRecoveryCode', { defaultValue: 'Can’t access your passkey? Use a recovery code' })}
+              </button>
+            )}
+            {passkeySuccess && <p role="status" className="text-sm text-emerald-600">{passkeySuccess}</p>}
+            {passkeyError && <p role="alert" className="text-sm text-destructive">{passkeyError}</p>}
+          </div>
+        </ConfirmDialog>
+      )}
     </div>
   );
 }

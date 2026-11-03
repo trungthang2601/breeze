@@ -7,7 +7,7 @@ package mgmtdetect
 func AllSignatures() []Signature {
 	return []Signature{
 		// =====================================================================
-		// RMM — Remote Monitoring & Management (11 tools)
+		// RMM — Remote Monitoring & Management (12 tools)
 		// =====================================================================
 
 		// ConnectWise Automate (LabTech)
@@ -94,8 +94,9 @@ func AllSignatures() []Signature {
 			OS: []string{"windows", "darwin"},
 			Checks: []Check{
 				{Type: CheckServiceRunning, Value: "Windows Agent Service", OS: "windows"},
-				{Type: CheckProcessRunning, Value: "agent.exe", OS: "windows"},
-				{Type: CheckProcessRunning, Value: "agent", OS: "darwin"},
+				// No process checks: "agent.exe" / "agent" are generic names and
+				// process matching has no path check (#8084). Detect by service,
+				// install path and launch daemon only.
 				{Type: CheckFileExists, Value: `C:\Program Files (x86)\N-able Technologies\Windows Agent\bin\agent.exe`, OS: "windows"},
 				{Type: CheckLaunchDaemon, Value: "com.n-able.agent", OS: "darwin"},
 			},
@@ -153,8 +154,19 @@ func AllSignatures() []Signature {
 			},
 		},
 
+		// OpenFrame
+		{
+			Name: "OpenFrame", Category: CategoryRMM,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "com.openframe.client", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "openframe-client.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\OpenFrame\bin\openframe-client.exe`, OS: "windows"},
+			},
+		},
+
 		// =====================================================================
-		// Remote Access (7 tools)
+		// Remote Access (12 tools)
 		// =====================================================================
 
 		// TeamViewer
@@ -190,8 +202,10 @@ func AllSignatures() []Signature {
 			Checks: []Check{
 				{Type: CheckServiceRunning, Value: "SplashtopRemoteService", OS: "windows"},
 				{Type: CheckProcessRunning, Value: "SRService.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "SRManager.exe", OS: "windows"},
 				{Type: CheckProcessRunning, Value: "SplashtopStreamer", OS: "darwin"},
 				{Type: CheckFileExists, Value: `C:\Program Files (x86)\Splashtop\Splashtop Remote\Server\SRService.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\Splashtop\Splashtop Remote\Server\SRService.exe`, OS: "windows"},
 				{Type: CheckFileExists, Value: "/Applications/Splashtop Streamer.app", OS: "darwin"},
 			},
 		},
@@ -248,8 +262,71 @@ func AllSignatures() []Signature {
 			},
 		},
 
+		// SimpleHelp (JWrapper-packaged; the install directory carries the
+		// deployment brand, so only the reported default path is probed).
+		{
+			Name: "SimpleHelp", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "Remote Access Service", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "SimpleService.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\ProgramData\JWrapper-Remote Access\JWAppsSharedConfig\restricted\SimpleService.exe`, OS: "windows"},
+			},
+		},
+
+		// MeshCentral (Mesh Agent). Tactical RMM bundles the stock Mesh Agent,
+		// so Tactical hosts report both rows; that is accurate, not a dupe.
+		{
+			Name: "MeshCentral", Category: CategoryRemoteAccess,
+			OS: []string{"windows", "darwin"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "Mesh Agent", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "MeshAgent.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "meshagent", OS: "darwin"},
+				{Type: CheckFileExists, Value: `C:\Program Files\Mesh Agent\MeshAgent.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: "/usr/local/mesh_services/meshagent/meshagent", OS: "darwin"},
+			},
+		},
+
+		// TightVNC
+		{
+			Name: "TightVNC", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "tvnserver", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "tvnserver.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\TightVNC\tvnserver.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\TightVNC\tvnserver.exe`, OS: "windows"},
+			},
+		},
+
+		// RealVNC (VNC Server)
+		{
+			Name: "RealVNC", Category: CategoryRemoteAccess,
+			OS: []string{"windows", "darwin"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "vncserver", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "vncserver.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "vncserver", OS: "darwin"},
+				{Type: CheckFileExists, Value: `C:\Program Files\RealVNC\VNC Server\vncserver.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: "/Library/vnc/vncserver", OS: "darwin"},
+			},
+		},
+
+		// UltraVNC
+		{
+			Name: "UltraVNC", Category: CategoryRemoteAccess,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "uvnc_service", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "winvnc.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\uvnc bvba\UltraVNC\winvnc.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\uvnc bvba\UltraVNC\winvnc.exe`, OS: "windows"},
+			},
+		},
+
 		// =====================================================================
-		// Endpoint Security — AV/EDR (8 tools)
+		// Endpoint Security — AV/EDR (13 tools)
 		// =====================================================================
 
 		// CrowdStrike Falcon
@@ -315,6 +392,75 @@ func AllSignatures() []Signature {
 				{Type: CheckProcessRunning, Value: "RTProtectionDaemon", OS: "darwin"},
 				{Type: CheckFileExists, Value: `C:\Program Files\Malwarebytes\Anti-Malware\MBAMService.exe`, OS: "windows"},
 				{Type: CheckFileExists, Value: "/Library/Application Support/Malwarebytes/MBAM/Engine/RTProtectionDaemon", OS: "darwin"},
+			},
+		},
+
+		// ThreatDown (Malwarebytes' business brand — Nebula / OneView). The cloud
+		// Endpoint Agent is what distinguishes a managed ThreatDown endpoint; it
+		// also runs MBAMService as its protection engine, so the Malwarebytes
+		// signature above matches on these devices too (#7551).
+		{
+			Name: "ThreatDown", Category: CategoryEndpointSecurity,
+			OS: []string{"windows", "darwin"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "MBEndpointAgent", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "MBCloudEA.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "EndpointAgentDaemon", OS: "darwin"},
+				{Type: CheckFileExists, Value: `C:\Program Files\Malwarebytes Endpoint Agent\MBCloudEA.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: "/Library/Application Support/Malwarebytes/Malwarebytes Endpoint Agent", OS: "darwin"},
+			},
+		},
+
+		// ESET Endpoint Security / Endpoint Antivirus (ESET PROTECT managed)
+		{
+			Name: "ESET", Category: CategoryEndpointSecurity,
+			OS: []string{"windows", "darwin"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "ekrn", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "ekrn.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "esets_daemon", OS: "darwin"},
+				{Type: CheckFileExists, Value: `C:\Program Files\ESET\ESET Security\ekrn.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: "/Library/Application Support/ESET", OS: "darwin"},
+			},
+		},
+
+		// Emsisoft Anti-Malware / Enterprise Security / Business Security
+		// (Windows only — Emsisoft ships no macOS endpoint agent).
+		{
+			Name: "Emsisoft", Category: CategoryEndpointSecurity,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "a2AntiMalware", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "a2service.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\Emsisoft Anti-Malware\a2service.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\Emsisoft Anti-Malware\a2service.exe`, OS: "windows"},
+			},
+		},
+
+		// Webroot SecureAnywhere (OpenText)
+		{
+			Name: "Webroot SecureAnywhere", Category: CategoryEndpointSecurity,
+			OS: []string{"windows", "darwin"},
+			Checks: []Check{
+				{Type: CheckServiceRunning, Value: "WRSVC", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "WRSA.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files\Webroot\WRSA.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\Webroot\WRSA.exe`, OS: "windows"},
+				{Type: CheckFileExists, Value: "/Applications/Webroot SecureAnywhere.app", OS: "darwin"},
+			},
+		},
+
+		// WithSecure Elements (formerly F-Secure Elements / Computer Protection).
+		// Service names changed in Elements Agent 22.7, so detection keys on the
+		// plugin-host process and the install folder, which kept the F-Secure
+		// name. macOS omitted until verified on a lab host.
+		{
+			Name: "WithSecure Elements", Category: CategoryEndpointSecurity,
+			OS: []string{"windows"},
+			Checks: []Check{
+				{Type: CheckProcessRunning, Value: "fshoster64.exe", OS: "windows"},
+				{Type: CheckProcessRunning, Value: "fshoster32.exe", OS: "windows"},
+				{Type: CheckFileExists, Value: `C:\Program Files (x86)\F-Secure\PSB`, OS: "windows"},
 			},
 		},
 

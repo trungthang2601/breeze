@@ -88,3 +88,12 @@ describe('formatInstalledRam', () => {
     expect(formatInstalledRam(0)).toBeNull();
   });
 });
+
+describe('upstream per-slot rows', () => {
+  it('reads device_memory_modules rows (locator, MT/s, empty slots)', () => {
+    expect(memoryModuleLines([
+      { locator: 'DIMM1', populated: true, capacityMb: 8192, configuredSpeedMts: 2666, speedMts: 3200, serialNumber: 'AA11' },
+      { locator: 'DIMM2', populated: false, capacityMb: null },
+    ])).toEqual(['1 x 8 GB (2666 MHz) - SN: AA11']);
+  });
+});

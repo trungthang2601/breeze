@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { reportRunOwnerColumns } from '../reportRunOwner';
 import { and, count, desc, eq, ne, sql } from 'drizzle-orm';
 import { buildReportPdf, type BuildOpts } from '@breeze/shared/reportPdf';
 import {
+  POSTURE_DEVICE_ROW_CSV_LABELS,
   rowsToCsv,
   type HardwareLifecycleSummary,
   type PortalRunDto,
@@ -17,7 +19,12 @@ import {
   previousBaselineFor,
   type ReportResult,
 } from '../reportGenerationService';
+import { organizationScope } from '../reportScope';
 import { getReportBranding } from '../reportBranding';
+import {
+  reportAudienceCondition,
+  reportTypePermissionCondition,
+} from '../reportTypePermissions';
 import {
   persistedSiteScopeValues,
   portalUserReportAuthority,
@@ -369,6 +376,29 @@ function lifecycleExclusion(lifecycleEnabled: boolean) {
  * Fail-closed: a run referenced only by non-delivered occurrences is hidden.
  * `sd_evidence_report_run_idx` (report_run_id) serves both sub-queries.
  */
+/**
+ * #6941 (defense in depth): `portal_self_service` alone must not admit a run
+ * into the portal. Portal users are customers — the same audience as an
+ * organization-scope caller — so msp_staff-audience types (AR aging, margin,
+ * SLA attainment) are excluded here with the very predicate the staff report
+ * routes use for org-scope callers. Neither writer of the marker can set it on
+ * an msp_staff type today; this keeps a hand edit or a future writer from
+ * turning into a portal disclosure.
+ *
+ * Ruling P8b: every scope applying `reportAudienceCondition` must also apply
+ * the per-type permission filter. A portal customer never has a resolved
+ * report-permission set (`granted: null`), so `reportTypePermissionCondition`
+ * excludes every permission-gated (business) report type here too — those
+ * types are already outside the three fixed portal definitions, so this is
+ * belt-and-suspenders, not a behavior change.
+ */
+function customerAudienceOnly() {
+  return and(
+    reportAudienceCondition({ scope: 'organization' }, reports.type),
+    reportTypePermissionCondition(null, reports.type),
+  );
+}
+
 export function deliveredEvidenceOnly() {
   return sql`(
     NOT EXISTS (
@@ -393,6 +423,7 @@ export function portalRunPredicate(
     eq(reportRuns.id, runId),
     eq(reports.orgId, orgId),
     eq(reports.portalSelfService, true),
+    customerAudienceOnly(),
     lifecycleExclusion(lifecycleEnabled),
     deliveredEvidenceOnly(),
   )!;
@@ -406,6 +437,7 @@ export function portalRunListPredicate(
     eq(reports.orgId, orgId),
     eq(reports.portalSelfService, true),
     eq(reportRuns.status, 'completed'),
+    customerAudienceOnly(),
     lifecycleExclusion(lifecycleEnabled),
     deliveredEvidenceOnly(),
   )!;
@@ -416,7 +448,8 @@ function toDto(row: {
   reportId: string;
   name: string;
   // The DTO's own union, NOT PortalReportType: portalRunListPredicate has no
-  // type filter, so a managed-evidence run of a type outside the three
+  // portal-type filter (only the msp_staff audience exclusion, #6941), so a
+  // managed-evidence run of a type outside the three
   // self-service ones legitimately flows through here. Typing it as
   // PortalReportType was a lie the compiler could not see, because the value
   // comes from the database (#5784 W02, W03, W04).
@@ -425,6 +458,8 @@ function toDto(row: {
   startedAt: Date | null;
   completedAt: Date | null;
   rowCount: number | null;
+  // Mirrors renderRunCsv's gate: CSV renders only from an array `rows`.
+  csvAvailable?: boolean;
   createdAt: Date;
 }): PortalRunDto {
   return {
@@ -436,6 +471,7 @@ function toDto(row: {
     startedAt: row.startedAt?.toISOString() ?? null,
     completedAt: row.completedAt?.toISOString() ?? null,
     rowCount: row.rowCount,
+    csvAvailable: row.csvAvailable === true,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -500,6 +536,8 @@ export async function listPortalRuns(
     startedAt: reportRuns.startedAt,
     completedAt: reportRuns.completedAt,
     rowCount: reportRuns.rowCount,
+    // Computed in SQL so the (large) result blob is not shipped to list runs.
+    csvAvailable: sql<boolean>`coalesce(jsonb_typeof(${reportRuns.result} -> 'rows') = 'array', false)`,
     createdAt: reportRuns.createdAt,
   }).from(reportRuns)
     .innerJoin(reports, eq(reportRuns.reportId, reports.id))
@@ -529,6 +567,7 @@ export async function generatePortalReport(args: {
   const [definition] = await db.select({
     id: reports.id,
     orgId: reports.orgId,
+    partnerId: reports.partnerId,
     name: reports.name,
     type: reports.type,
     config: reports.config,
@@ -575,6 +614,7 @@ export async function generatePortalReport(args: {
     const authority = portalUserReportAuthority(args.orgId, startedAt);
     const [run] = await db.insert(reportRuns).values({
       reportId: definition.id,
+      ...reportRunOwnerColumns(definition),
       status: 'running',
       startedAt,
       requestedByKind: 'portal_user',
@@ -588,7 +628,7 @@ export async function generatePortalReport(args: {
     try {
       const result = await generateReport(
         definition.type,
-        args.orgId,
+        organizationScope(args.orgId),
         effectiveConfig,
         authority,
       );
@@ -617,6 +657,7 @@ export async function generatePortalReport(args: {
 
       return toDto({
         ...completed!,
+        csvAvailable: Array.isArray(result.rows),
         name: definition.name,
         type: definition.type as PortalReportType,
       });
@@ -771,6 +812,14 @@ export async function renderRunPdf(
   return Buffer.from(document.output('arraybuffer'));
 }
 
+/**
+ * Customer-facing header labels per report type for the portal CSV (#9964). A
+ * type without an entry keeps its row keys as the header.
+ */
+const PORTAL_CSV_HEADER_LABELS: Partial<Record<string, Readonly<Record<string, string>>>> = {
+  security_compliance_posture: POSTURE_DEVICE_ROW_CSV_LABELS,
+};
+
 export async function renderRunCsv(
   runId: string,
   orgId: string,
@@ -780,5 +829,5 @@ export async function renderRunCsv(
   if (!result || !Array.isArray(result.rows)) {
     throw new PortalReportNoTabularDataError();
   }
-  return rowsToCsv(result.rows);
+  return rowsToCsv(result.rows, { headerLabels: PORTAL_CSV_HEADER_LABELS[row.type] });
 }

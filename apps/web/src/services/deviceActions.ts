@@ -1,5 +1,6 @@
 import { fetchWithAuth } from '@/stores/auth';
 import { extractApiError } from '../lib/apiError';
+import { createCancellableRequest } from '../lib/cancellableRequest';
 import type { ScriptAdmissionResult } from '@breeze/shared';
 
 export interface CommandResult {
@@ -10,15 +11,20 @@ export interface CommandResult {
   createdAt: string;
   // #5128 W2 — present on the single-command POST response: how the command
   // was handed over, and (for a queued one) when it expires undelivered.
-  delivery?: 'delivered' | 'queued_offline' | 'queued_live';
+  // 'cancelled' = the server's claim-time check refused the command before it
+  // reached the agent; it will never run. `cancelReason` says why.
+  delivery?: 'delivered' | 'queued_offline' | 'queued_live' | 'cancelled';
   deliverBy?: string | null;
+  cancelReason?: string;
 }
 
 export type BulkCommandFailureCode =
   | 'TARGET_NOT_FOUND'
   | 'SITE_ACCESS_DENIED'
   | 'DECOMMISSIONED'
-  | 'INSERT_FAILED';
+  | 'INSERT_FAILED'
+  // The command was created but cancelled before delivery; `message` carries the reason.
+  | 'CANCELLED';
 
 export interface BulkCommandFailed {
   deviceId: string;
@@ -83,21 +89,27 @@ async function getErrorMessage(response: Response, fallback: string): Promise<st
   }
 }
 
+export function requestDeviceCommand(
+  deviceId: string,
+  type: string,
+  payload?: Record<string, unknown>,
+): Promise<Response> {
+  const body = payload ? { type, payload } : { type };
+  return fetchWithAuth(`/devices/${deviceId}/commands`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
 export async function sendDeviceCommand(
   deviceId: string,
   type: string,
-  payload?: Record<string, unknown>
+  payload?: Record<string, unknown>,
 ): Promise<CommandResult> {
-  const body = payload ? { type, payload } : { type };
-  const response = await fetchWithAuth(`/devices/${deviceId}/commands`, {
-    method: 'POST',
-    body: JSON.stringify(body)
-  });
-
-  if (!response.ok) {
-    throw new Error(await getErrorMessage(response, 'Failed to send device command'));
-  }
-
+  const response = await requestDeviceCommand(deviceId, type, payload);
+  if (!response.ok)
+    throw new Error(
+      await getErrorMessage(response, 'Failed to send device command'),
+    );
   const data = await response.json();
   return data.command ?? data.data ?? data;
 }
@@ -472,19 +484,6 @@ export async function linkDevicesVmHost(
   return data.data ?? data;
 }
 
-export async function restoreDevice(deviceId: string): Promise<{ success: boolean }> {
-  const response = await fetchWithAuth(`/devices/${deviceId}/restore`, {
-    method: 'POST'
-  });
-
-  if (!response.ok) {
-    throw new Error(await getErrorMessage(response, 'Failed to restore device'));
-  }
-
-  const data = await response.json();
-  return data.data ?? data;
-}
-
 /**
  * Permanently delete a REMOVED device.
  *
@@ -615,22 +614,35 @@ export class DeviceActionError extends Error {
 export const MaintenanceActionError = DeviceActionError;
 export type MaintenanceActionError = DeviceActionError;
 
-async function gatedRequest(path: string, body: unknown, fallback: string): Promise<any> {
-  const response = await fetchWithAuth(path, {
-    method: 'POST',
-    body: JSON.stringify(body)
-  });
-  if (!response.ok) {
-    const parsed = await response.json().catch(() => null);
-    throw new DeviceActionError(
-      (parsed as { error?: string } | null)?.error ?? fallback,
-      response.status,
-      (parsed as { code?: string } | null)?.code,
-      (parsed as { details?: unknown } | null)?.details
-    );
+async function gatedRequest(
+  path: string,
+  body: unknown,
+  fallback: string,
+  options: { timeoutMs?: number } = {}
+): Promise<any> {
+  // A caller-supplied signal replaces fetchWithAuth's 30s default, so a
+  // long-running gated action gets its own (still bounded) ceiling this way.
+  const request = options.timeoutMs !== undefined ? createCancellableRequest(options.timeoutMs) : null;
+  try {
+    const response = await fetchWithAuth(path, {
+      method: 'POST',
+      body: JSON.stringify(body),
+      ...(request ? { signal: request.signal } : {})
+    });
+    if (!response.ok) {
+      const parsed = await response.json().catch(() => null);
+      throw new DeviceActionError(
+        (parsed as { error?: string } | null)?.error ?? fallback,
+        response.status,
+        (parsed as { code?: string } | null)?.code,
+        (parsed as { details?: unknown } | null)?.details
+      );
+    }
+    const data = await response.json();
+    return data.data ?? data;
+  } finally {
+    request?.settle();
   }
-  const data = await response.json();
-  return data.data ?? data;
 }
 
 async function maintenanceRequest(path: string, body: unknown): Promise<any> {
@@ -647,6 +659,7 @@ export type BulkLifecycleFailureCode =
   | 'UNINSTALL_PENDING'
   | 'SITE_ACCESS_DENIED'
   | 'STATE_CHANGED'
+  | 'DEVICE_LIMIT_REACHED'
   | 'ERROR';
 
 export interface BulkLifecycleFailure {
@@ -799,6 +812,19 @@ export async function enterMaintenanceMode(
 }
 
 /**
+ * "Force reboot now" (#8729): POST /devices/:id/force-reboot. The body is
+ * `.strict()` on the server — only the step-up grant, when the server asked for
+ * one. Errors arrive as DeviceActionError with the route's `code`
+ * (STEP_UP_REQUIRED, MFA_REQUIRED, DEVICE_OFFLINE, AGENT_UPGRADE_REQUIRED).
+ */
+export async function forceRebootDevice(
+  deviceId: string,
+  body: { stepUpGrant?: string }
+): Promise<any> {
+  return gatedRequest(`/devices/${deviceId}/force-reboot`, body, 'Failed to force reboot the device');
+}
+
+/**
  * Exit. The route's exit branch is `.strict()` — send exactly this. Exit is
  * un-gated but liveness-truthful: the server returns the device to its REAL
  * status (online/offline by last-seen), never a blind 'online', so callers must
@@ -850,5 +876,15 @@ export interface MoveDeviceOrgResult {
  * the device rather than trusting the echoed row.
  */
 export async function moveDeviceOrg(deviceId: string, body: MoveDeviceOrgBody): Promise<MoveDeviceOrgResult> {
-  return gatedRequest(`/devices/${deviceId}/move-org`, body, 'Failed to move device');
+  return gatedRequest(`/devices/${deviceId}/move-org`, body, 'Failed to move device', {
+    timeoutMs: MOVE_DEVICE_ORG_TIMEOUT_MS
+  });
 }
+
+/**
+ * The move re-stamps org_id on every device-scoped table in one transaction,
+ * which for a device with a lot of telemetry can outlast the 30s default
+ * (#7988). The server finishes the move whether or not the browser is still
+ * waiting, so a client abort only loses the answer, not the move.
+ */
+export const MOVE_DEVICE_ORG_TIMEOUT_MS = 5 * 60_000;

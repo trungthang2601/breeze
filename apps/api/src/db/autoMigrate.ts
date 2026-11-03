@@ -61,6 +61,44 @@ export function partitionLedgerRows(
   return { verify, skip };
 }
 
+// One `<extension>/<file>` segment: no separators, no `..`, ends in `.sql`.
+const EXTENSION_LEDGER_ROW_PATTERN = /^([A-Za-z0-9][A-Za-z0-9_-]*)\/([^/\\]+\.sql)$/;
+
+/**
+ * Split namespaced extension ledger rows (the `skip` half of
+ * {@link partitionLedgerRows}) into rows whose migration file is still on disk
+ * and rows whose file is genuinely gone (#10357).
+ *
+ * `scripts/check-drift.ts` used to report every `<extension>/<file>` row as
+ * "belongs to an extension not present on disk" and exit 1 under strict mode,
+ * even when the extension's migrations directory was right there — so it
+ * failed on every dev DB with the workspace extension. `extensionFileExists`
+ * maps a row to its file the way the extension migrator does
+ * (`ledgerName = \`${name}/${file.filename}\``). A row that does not parse as
+ * exactly one `<extension>/<file>.sql` pair, or tries to escape its directory,
+ * is never probed and counts as absent.
+ */
+export function classifyExtensionLedgerRows(
+  extensionRows: string[],
+  extensionFileExists: (extension: string, filename: string) => boolean,
+): { present: string[]; absent: string[] } {
+  const present: string[] = [];
+  const absent: string[] = [];
+
+  for (const row of extensionRows) {
+    const match = EXTENSION_LEDGER_ROW_PATTERN.exec(row);
+    const filename = match?.[2];
+    if (!match || !filename || filename.startsWith('..')) {
+      absent.push(row);
+      continue;
+    }
+    if (extensionFileExists(match[1]!, filename)) present.push(row);
+    else absent.push(row);
+  }
+
+  return { present, absent };
+}
+
 /**
  * Compute a SHA-256 hex hash of SQL content for checksum tracking.
  */
@@ -175,6 +213,12 @@ export const CHECKSUM_RECONCILIATIONS: Record<
     to: 'e586cb0f8474e3a84d06638def12268896bba260d3c4568679e90935cc6e1a52',
     reason:
       "#3316: bound the two backfill projections with left(...) at the destination column widths. The original raises 22001 on a sites.contact / organizations.billing_contact value longer than varchar(255)/(320)/(64), which aborts the whole migration run. Equivalent for any DB that already applied the original: applying it successfully proves no value exceeded a limit, so left(...) would have returned those same strings unchanged — heal the recorded checksum rather than crashing the upgrade.",
+  },
+  '2026-12-12-120100-security-quarantine-execution-authority.sql': {
+    from: '1a2b018b817bf5e8a10b2b9efc02e68fec7d4f729a6fb1f6b0b2518a388386cc',
+    to: '70abfb92fbf75b96d5ed7788fdac76218403a71032ced4a4da853e7749641500',
+    reason:
+      'v0.122.1: SET CONSTRAINTS ALL IMMEDIATE after the grandfathering UPDATE. The UPDATE queues events on the deferred backup-settings parity trigger, so the ALTER TABLEs after it fail with "pending trigger events" on any DB with security feature links (v0.122.0 crash-looped there). The original only completed on DBs where the UPDATE matched no row, where firing zero pending events changes nothing; the hosted EU DB had the fixed file applied by hand under the original checksum. Heal the recorded checksum rather than crashing the upgrade.',
   },
 };
 
@@ -583,7 +627,23 @@ async function releaseCoreMigrationLock(client: postgres.Sql): Promise<void> {
  * unified system.  All migrations live in `apps/api/migrations/` as numbered
  * SQL files (0001-baseline.sql through 0065-xxx.sql and beyond).
  */
-export async function autoMigrate(): Promise<void> {
+/**
+ * Test-harness hooks. Production callers pass nothing; the only consumer is
+ * CI's `check:migrations` replay (#5361), which seeds multi-tenant fixture
+ * rows between migrations so set-based DML in a LATER migration runs against
+ * rows spread over several partners — the state that broke v0.111.0 on US
+ * and that an empty CI database never exercises.
+ */
+export interface AutoMigrateOptions {
+  /**
+   * Runs after each pending migration commits (its ledger row included), on
+   * the same pinned migration connection, outside any transaction. A throw
+   * aborts the run like a failing migration would.
+   */
+  afterMigration?: (client: postgres.Sql, filename: string) => Promise<void>;
+}
+
+export async function autoMigrate(options: AutoMigrateOptions = {}): Promise<void> {
   const connectionString =
     process.env.DATABASE_URL || 'postgresql://breeze:breeze@localhost:5432/breeze';
 
@@ -592,7 +652,7 @@ export async function autoMigrate(): Promise<void> {
   try {
     await acquireCoreMigrationLock(client);
     try {
-      await runCoreMigrations(client);
+      await runCoreMigrations(client, options);
     } finally {
       await releaseCoreMigrationLock(client);
     }
@@ -601,7 +661,10 @@ export async function autoMigrate(): Promise<void> {
   }
 }
 
-async function runCoreMigrations(client: postgres.Sql): Promise<void> {
+async function runCoreMigrations(
+  client: postgres.Sql,
+  options: AutoMigrateOptions,
+): Promise<void> {
   const migrationsDir = resolveMigrationsDir();
   console.log(`[auto-migrate] Migrations directory: ${migrationsDir}`);
 
@@ -813,6 +876,7 @@ async function runCoreMigrations(client: postgres.Sql): Promise<void> {
       });
     }
     appliedCount++;
+    await options.afterMigration?.(client, filename);
   }
 
   if (appliedCount > 0) {

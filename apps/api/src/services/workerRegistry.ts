@@ -54,12 +54,24 @@ export type WorkerPlacement = 'global' | 'socket-owner';
 export interface WorkerModule {
   init: () => Promise<void> | void;
   shutdown?: () => Promise<void>;
+  /**
+   * Redis-less degraded mode (#7105). Called INSTEAD of `init` when the
+   * process booted without Redis and skipped every BullMQ worker. Required
+   * when the registration sets `runsWithoutRedis`.
+   */
+  startWithoutRedis?: () => Promise<void> | void;
 }
 
 export interface WorkerRegistration {
   name: string;
   placement: WorkerPlacement;
   load: () => Promise<WorkerModule>;
+  /**
+   * #7105: this entry does work that must not stop just because Redis was
+   * down at boot, and its module exports `startWithoutRedis`. Only these
+   * entries are loaded by `startRedisIndependentWorkers`.
+   */
+  runsWithoutRedis?: true;
 }
 
 export interface StartWorkersHooks {
@@ -74,6 +86,20 @@ export interface StartWorkersHooks {
  * runs concurrently via `Promise.allSettled`, same as today.
  */
 export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
+  {
+    name: 'psaTicketingWorker', placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/psaTicketingWorker');
+      return { init: m.initializePsaTicketingWorker, shutdown: m.shutdownPsaTicketingWorker };
+    },
+  },
+  {
+    name: 'psaTicketingReconciler', placement: 'global', runsWithoutRedis: true,
+    load: async () => {
+      const m = await import('../jobs/psaTicketingReconciler');
+      return { init: m.initializePsaTicketingReconciler, startWithoutRedis: m.initializePsaTicketingReconciler, shutdown: m.shutdownPsaTicketingReconciler };
+    },
+  },
   {
     name: 'topologyReconcileWorker', placement: 'global',
     load: async () => {
@@ -113,11 +139,37 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'topologyMonitoringWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/topologyMonitoringWorker');
+      return { init: m.initializeTopologyMonitoringWorker, shutdown: m.shutdownTopologyMonitoringWorker };
+    },
+  },
+  {
     name: 'topologyDiagnosticSweeper',
     placement: 'global',
     load: async () => {
       const m = await import('../jobs/topologyDiagnosticSweeper');
       return { init: m.initializeTopologyDiagnosticSweeper, shutdown: m.shutdownTopologyDiagnosticSweeper };
+    },
+  },
+  {
+    // M3 Task 5 — interface sample partitions, retention and rollups.
+    name: 'topologyTelemetryMaintenance',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/topologyTelemetryMaintenance');
+      return { init: m.initializeTopologyTelemetryMaintenanceWorker, shutdown: m.shutdownTopologyTelemetryMaintenanceWorker };
+    },
+  },
+  {
+    // Site location W2 (#7886) — presence read-model evaluation (never moves a device).
+    name: 'topologyPresenceWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/topologyPresenceWorker');
+      return { init: m.initializeTopologyPresenceWorker, shutdown: m.shutdownTopologyPresenceWorker };
     },
   },
   {
@@ -177,11 +229,53 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'connectionHealthReconcileWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/connectionHealthReconcile');
+      return { init: m.initializeConnectionHealthReconcileWorker, shutdown: m.shutdownConnectionHealthReconcileWorker };
+    },
+  },
+  {
+    name: 'connectionHealthDigestWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/connectionHealthDigest');
+      return { init: m.initializeConnectionHealthDigestWorker, shutdown: m.shutdownConnectionHealthDigestWorker };
+    },
+  },
+  {
     name: 'aiArtifactSweeper',
     placement: 'global',
     load: async () => {
       const m = await import('../jobs/aiArtifactSweeper');
       return { init: m.initializeAiArtifactSweeper, shutdown: m.shutdownAiArtifactSweeper };
+    },
+  },
+  {
+    name: 'helperScreenshotRetentionWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/helperScreenshotRetention');
+      return {
+        init: m.initializeHelperScreenshotRetentionWorker,
+        shutdown: m.shutdownHelperScreenshotRetentionWorker,
+      };
+    },
+  },
+  {
+    // #8742 W02: endpoint message body purge, expiry close-out, history delete.
+    // #8743 W03: also the live-chat idle close, which tells the agent
+    // (chat_close) — command dispatch reaches socket-local delivery, so this
+    // entry is socket-owner (workerEntrypointClosure.contract.test.ts).
+    name: 'endpointMessageRetention',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/endpointMessageRetention');
+      return {
+        init: m.initializeEndpointMessageRetentionWorker,
+        shutdown: m.shutdownEndpointMessageRetentionWorker,
+      };
     },
   },
   {
@@ -209,6 +303,28 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // #8852 W03 (#8855): nightly AI tool output retention. db + services only.
+    name: 'aiToolOutputRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/aiToolOutputRetention');
+      return { init: m.initializeAiToolOutputRetention, shutdown: m.shutdownAiToolOutputRetention };
+    },
+  },
+  {
+    // #9050: nightly sweep of orphaned SDK transcripts on this container's own
+    // disk. socket-owner ON PURPOSE (not the mechanical `global` its closure
+    // would classify it as): transcripts are written by the API role, so it
+    // must run there and not on a `worker`. The contract test only forbids a
+    // `global` entry from reaching socket dispatch, not the reverse.
+    name: 'aiTranscriptSweeper',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/aiTranscriptSweeper');
+      return { init: m.initializeAiTranscriptSweeper, shutdown: m.shutdownAiTranscriptSweeper };
+    },
+  },
+  {
     name: 'offlineDetector',
     placement: 'global',
     load: async () => {
@@ -228,15 +344,8 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     name: 'webhookDelivery',
     placement: 'global',
     load: async () => {
-      // Wraps `getWebhookWorker()` + the delivery-claim/outcome callback
-      // wiring that used to be a local `initializeWebhookDeliveryWorker`
-      // function in index.ts (moved to services/webhookDeliveryInit.ts so
-      // the registry can load it standalone — see that module's header
-      // comment for why it isn't just added to workers/webhookDelivery.ts).
-      // `index.ts` ALSO calls `getWebhookWorker().stop()` directly in its
-      // shutdown preamble (must run before the HTTP server stops accepting
-      // requests) — this entry's `shutdown` calling `stop()` again is a
-      // harmless no-op (see the module's own doc comment).
+      // Separate wiring avoids the worker/record-service import cycle; this
+      // registry entry owns both the BullMQ worker and queue shutdown.
       const m = await import('../services/webhookDeliveryInit');
       return { init: m.initializeWebhookDeliveryWorker, shutdown: m.shutdownWebhookDeliveryWorker };
     },
@@ -348,6 +457,15 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // Hourly trust-page snapshot refresh + serving-set self-heal + snapshot prune.
+    name: 'trustPageSnapshotWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/trustPageSnapshotWorker');
+      return { init: m.initializeTrustPageSnapshotWorker, shutdown: m.shutdownTrustPageSnapshotWorker };
+    },
+  },
+  {
     name: 'reliabilityWorker',
     placement: 'global',
     load: async () => {
@@ -396,6 +514,25 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'hardwareHealthRetention',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/hardwareHealthRetention');
+      return { init: m.initializeHardwareHealthRetention, shutdown: m.shutdownHardwareHealthRetention };
+    },
+  },
+  {
+    name: 'timeSyncRetention',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/timeSyncRetention');
+      return {
+        init: m.initializeTimeSyncRetention,
+        shutdown: m.shutdownTimeSyncRetention,
+      };
+    },
+  },
+  {
     name: 'logCorrelationWorker',
     placement: 'global',
     load: async () => {
@@ -441,6 +578,27 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
         init: m.initializeMetricAnomalyIncidentRetention,
         shutdown: m.shutdownMetricAnomalyIncidentRetention,
       };
+    },
+  },
+  {
+    // Wisp W05 (#9917): daily concern retention + concern_outcome memory
+    // retention; returns zeros while BREEZE_WISP_ENABLED is off.
+    name: 'wispConcernRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/wispConcernRetention');
+      return { init: m.initializeWispConcernRetention, shutdown: m.shutdownWispConcernRetention };
+    },
+  },
+  {
+    // Wisp W06a (#9912): 15-minute digest + morning-brief sweep; the Worker is
+    // constructed unconditionally and each sweep returns zeros while
+    // BREEZE_WISP_ENABLED is off.
+    name: 'wispNudgeDigest',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/wispNudgeDigest');
+      return { init: m.initializeWispNudgeDigestWorker, shutdown: m.shutdownWispNudgeDigestWorker };
     },
   },
   {
@@ -508,6 +666,43 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
       return {
         init: m.initializeFilesystemCleanupRunRetention,
         shutdown: m.shutdownFilesystemCleanupRunRetention,
+      };
+    },
+  },
+  {
+    // #8581 — daily prune of device_restore_point_attempts.
+    name: 'restorePointAttemptRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/restorePointAttemptRetention');
+      return {
+        init: m.initializeRestorePointAttemptRetention,
+        shutdown: m.shutdownRestorePointAttemptRetention,
+      };
+    },
+  },
+  {
+    // #9128 — daily prune of terminal webhook_deliveries rows.
+    name: 'webhookDeliveryRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/webhookDeliveryRetention');
+      return {
+        init: m.initializeWebhookDeliveryRetention,
+        shutdown: m.shutdownWebhookDeliveryRetention,
+      };
+    },
+  },
+  {
+    // #10019/#10020 — daily prune of DNS security events + aggregations, and
+    // the background delete of a DNS filter integration.
+    name: 'dnsSecurityRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/dnsSecurityRetention');
+      return {
+        init: m.initializeDnsSecurityRetention,
+        shutdown: m.shutdownDnsSecurityRetention,
       };
     },
   },
@@ -587,11 +782,37 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'migrationWindowSweep',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/migrationWindowSweep');
+      return { init: m.initializeMigrationWindowSweepWorker, shutdown: m.shutdownMigrationWindowSweepWorker };
+    },
+  },
+  {
+    name: 'partnerApiIdempotencyRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/partnerApiIdempotencyRetention');
+      return { init: m.initializePartnerApiIdempotencyRetentionWorker, shutdown: m.shutdownPartnerApiIdempotencyRetentionWorker };
+    },
+  },
+  {
     name: 'quickSupportReaper',
     placement: 'socket-owner',
     load: async () => {
       const m = await import('../jobs/quickSupportReaper');
       return { init: m.initializeQuickSupportReaper, shutdown: m.shutdownQuickSupportReaper };
+    },
+  },
+  {
+    // Wisp W02 (#9908): 5-minute grant standing sweep; skips every tick while
+    // BREEZE_WISP_ENABLED is off.
+    name: 'wispGrantReconciler',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/wispGrantReconciler');
+      return { init: m.initializeWispGrantReconciler, shutdown: m.shutdownWispGrantReconciler };
     },
   },
   {
@@ -616,6 +837,14 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/auditRetention');
       return { init: m.initializeAuditRetentionWorker, shutdown: m.shutdownAuditRetentionWorker };
+    },
+  },
+  {
+    name: 'pamEvidenceRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/pamEvidenceRetention');
+      return { init: m.initializePamEvidenceRetentionWorker, shutdown: m.shutdownPamEvidenceRetentionWorker };
     },
   },
   {
@@ -685,6 +914,42 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/removedDevicePurge');
       return { init: m.initializeRemovedDevicePurge, shutdown: m.shutdownRemovedDevicePurge };
+    },
+  },
+  {
+    // Pre-assignment holding area: hourly expiry of devices parked past the
+    // window. socket-owner: it disconnects the expired agent's socket
+    // (routes/agentWs.ts), so it must run where the sockets live.
+    name: 'parkedDeviceExpiry',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/parkedDeviceExpiry');
+      return { init: m.initializeParkedDeviceExpiry, shutdown: m.shutdownParkedDeviceExpiry };
+    },
+  },
+  {
+    // Pre-assignment holding area: daily hard purge of expired parked
+    // devices. socket-owner for the same reason as removedDevicePurge above:
+    // services/deviceLifecycle -> services/deviceDeletion reaches
+    // routes/agentWs.ts.
+    name: 'parkedDevicePurge',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/parkedDevicePurge');
+      return { init: m.initializeParkedDevicePurge, shutdown: m.shutdownParkedDevicePurge };
+    },
+  },
+  {
+    // #8318 reinstall reattach: every minute, expires reattach intents past
+    // their deadline (discarding the staged set, revoking the pending
+    // certificate) and prunes terminal ones older than 30 days. `global`: its
+    // closure is db + the certificate lifecycle + the audit service, never
+    // routes/agentWs.ts.
+    name: 'deviceReattachIntentSweep',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/deviceReattachIntentSweep');
+      return { init: m.initializeDeviceReattachIntentSweep, shutdown: m.shutdownDeviceReattachIntentSweep };
     },
   },
   {
@@ -793,6 +1058,14 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'patchReportRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/patchReportRetention');
+      return { init: m.initializePatchReportRetentionWorker, shutdown: m.shutdownPatchReportRetentionWorker };
+    },
+  },
+  {
     name: 'reportScheduleWorker',
     placement: 'global',
     load: async () => {
@@ -858,6 +1131,28 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/backupProviderSync');
       return { init: m.initializeBackupProviderSyncJob, shutdown: m.shutdownBackupProviderSyncJob };
+    },
+  },
+  {
+    // EDR provider framework (#8164). 'global': its import closure reaches no socket-local
+    // dispatch. Re-verified in W02 (#8166) after the Phase 4 notifier added alertService +
+    // eventBus imports: workerEntrypointClosure.contract.test.ts stays green.
+    name: 'edrProviderSyncWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/edrProviderSync');
+      return { init: m.initializeEdrProviderSyncJob, shutdown: m.shutdownEdrProviderSyncJob };
+    },
+  },
+  {
+    // Security agent coverage reconciliation (#6960 W03). 'global': its import
+    // closure reaches alertService + eventBus (createSourcedAlert) but no
+    // socket-local dispatch, the same shape as edrProviderSyncWorker.
+    name: 'securityAgentCoverageWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/securityAgentCoverageWorker');
+      return { init: m.initializeSecurityAgentCoverageWorker, shutdown: m.shutdownSecurityAgentCoverageWorker };
     },
   },
   {
@@ -940,6 +1235,24 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'backupSnapshotAttestationWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/backupSnapshotAttestationWorker');
+      return { init: m.initializeBackupSnapshotAttestationWorker, shutdown: m.shutdownBackupSnapshotAttestationWorker };
+    },
+  },
+  {
+    // Brokered backup writes: durable multipart aborts, sealing completion
+    // and abandonment of snapshot id reservations (every 5 minutes).
+    name: 'backupWriteSessionJanitor',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/backupWriteSessionJanitor');
+      return { init: m.initializeBackupWriteSessionJanitor, shutdown: m.shutdownBackupWriteSessionJanitor };
+    },
+  },
+  {
     name: 'sensitiveDataWorker',
     placement: 'socket-owner',
     load: async () => {
@@ -977,6 +1290,15 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/deviceGroupJobs');
       return { init: m.initializeDeviceGroupJobs, shutdown: m.shutdownDeviceGroupJobs };
+    },
+  },
+  {
+    // Socket-owner: groupMembership reaches peripheralJobs and socket-local dispatch.
+    name: 'partnerGroupEvaluationJobs',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/partnerGroupEvaluationJobs');
+      return { init: m.initializePartnerGroupEvaluationJobs, shutdown: m.shutdownPartnerGroupEvaluationJobs };
     },
   },
   {
@@ -1062,9 +1384,16 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
   {
     name: 'staleCommandReaper',
     placement: 'socket-owner',
+    // #7105: the reaper needs only Postgres, and without it silent commands
+    // and backup jobs never terminalise — keep it running when Redis is down.
+    runsWithoutRedis: true,
     load: async () => {
       const m = await import('../jobs/staleCommandReaper');
-      return { init: m.initializeStaleCommandReaper, shutdown: m.shutdownStaleCommandReaper };
+      return {
+        init: m.initializeStaleCommandReaper,
+        shutdown: m.shutdownStaleCommandReaper,
+        startWithoutRedis: m.startStaleCommandReaperWithoutRedis,
+      };
     },
   },
   {
@@ -1081,6 +1410,14 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/pamJobs');
       return { init: m.initializePamJobs, shutdown: m.shutdownPamJobs };
+    },
+  },
+  {
+    name: 'networkIsolationSweeper',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/networkIsolationSweeper');
+      return { init: m.initializeNetworkIsolationSweeper, shutdown: m.shutdownNetworkIsolationSweeper };
     },
   },
   {
@@ -1167,7 +1504,10 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
   },
   {
     name: 'pamActuationWorker',
-    placement: 'global',
+    // Immediate delivery uses the canonical command claim, whose cancellation
+    // propagation reaches socket-local command services. Keep that closure on
+    // API processes; the relay still delivers to agents owned by another API.
+    placement: 'socket-owner',
     load: async () => {
       const m = await import('../jobs/pamActuationWorker');
       return { init: m.initializePamActuationWorker, shutdown: m.shutdownPamActuationWorker };
@@ -1222,6 +1562,23 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'agreementRequestExpiryReaper',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/agreementRequestExpiryReaper');
+      return { init: m.initializeAgreementRequestExpiryReaper, shutdown: m.shutdownAgreementRequestExpiryReaper };
+    },
+  },
+  {
+    // #9075 W4a (OD8 B): automatic agreement-request reminders (hourly sweep).
+    name: 'agreementRequestAutoReminder',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/agreementRequestAutoReminder');
+      return { init: m.initializeAgreementRequestAutoReminder, shutdown: m.shutdownAgreementRequestAutoReminder };
+    },
+  },
+  {
     name: 'suppressionExpiryReaper',
     placement: 'global',
     load: async () => {
@@ -1251,13 +1608,28 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
   {
     // Caller verification (#6354 W01) — post-commit publisher: rejection
     // notifications (in-app + email) and W02/W03 challenge delivery/timeouts,
-    // driven off scalar markers on the verification row. 'global': no
-    // agent-socket-local dependency.
+    // driven off scalar markers on the verification row. 'socket-owner'
+    // since W02: workstation delivery claims the pre-created caller_verify
+    // command through the same claim-time eligibility as the heartbeat
+    // (commandDispatch), whose closure reaches socket-local dispatch.
     name: 'callerVerificationPublisher',
-    placement: 'global',
+    placement: 'socket-owner',
     load: async () => {
       const m = await import('../jobs/callerVerificationPublisher');
       return { init: m.initializeCallerVerificationPublisher, shutdown: m.shutdownCallerVerificationPublisher };
+    },
+  },
+  {
+    // Caller verification (#6354 W02) — repairs workstation decisions the
+    // transports could not finish (terminal command results, late "not me"
+    // receipts) through the same leaf result handler. 'socket-owner': the
+    // caller-verification service graph includes workstation delivery, which
+    // claims commands through commandDispatch (same as the publisher).
+    name: 'callerVerificationReconciliation',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/callerVerificationReconciliation');
+      return { init: m.initializeCallerVerificationReconciliation, shutdown: m.shutdownCallerVerificationReconciliation };
     },
   },
   {
@@ -1269,11 +1641,29 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // #8973 W4: one-shot holiday recompute of business-calendar SLA deadlines.
+    name: 'businessCalendarRecomputeWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/businessCalendarRecomputeWorker');
+      return { init: m.initializeBusinessCalendarRecomputeWorker, shutdown: m.shutdownBusinessCalendarRecomputeWorker };
+    },
+  },
+  {
     name: 'inboundEmailWorker',
     placement: 'global',
     load: async () => {
       const m = await import('../jobs/inboundEmailWorker');
       return { init: m.initializeInboundEmailWorker, shutdown: m.shutdownInboundEmailWorker };
+    },
+  },
+  {
+    // Gmail mark-handled (#7949): its own queue so ticket intake never waits on Gmail.
+    name: 'gmailMarkHandledWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/gmailMarkHandledWorker');
+      return { init: m.initializeGmailMarkHandledWorker, shutdown: m.shutdownGmailMarkHandledWorker };
     },
   },
   {
@@ -1290,6 +1680,14 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/invoiceWorker');
       return { init: m.initializeInvoiceWorkers, shutdown: m.shutdownInvoiceWorkers };
+    },
+  },
+  {
+    name: 'autopayWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/autopayWorker');
+      return { init: m.initializeAutopayWorkers, shutdown: m.shutdownAutopayWorkers };
     },
   },
   {
@@ -1340,6 +1738,36 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // #7600 W02: daily prune of the append-only `ai_invocations` ledger as
+    // breeze_audit_admin. No route graph / socket import in its closure.
+    name: 'aiInvocationRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/aiInvocationRetention');
+      return { init: m.initializeAiInvocationRetention, shutdown: m.shutdownAiInvocationRetention };
+    },
+  },
+  {
+    // #4120: daily fold of expired `llm_egress_events` rows into
+    // `llm_egress_daily_rollups`. db + services only — `global`.
+    name: 'llmEgressRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/llmEgressRetention');
+      return { init: m.initializeLlmEgressRetention, shutdown: m.shutdownLlmEgressRetention };
+    },
+  },
+  {
+    // #7608 W10: daily AI chargeback close. Its closure is db + services only
+    // (no route graph, no socket import) — `global`, like the retention workers.
+    name: 'aiChargebackWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/aiChargebackWorker');
+      return { init: m.initializeAiChargebackWorker, shutdown: m.shutdownAiChargebackWorker };
+    },
+  },
+  {
     // Phase 2 wave P2-1 (alert verdicts), task 13: delayed BullMQ job that
     // admits a verdict run for an alert that stays open and uncorrelated for
     // UNGROUPED_VERDICT_DELAY_MINUTES. Its closure reaches
@@ -1378,6 +1806,21 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/aiAgentSweepScheduler');
       return { init: m.initializeAiAgentSweepScheduler, shutdown: m.shutdownAiAgentSweepScheduler };
+    },
+  },
+  {
+    // Wisp W05b Task 9 (#9917): the 5-minute wake tick (entitlement
+    // reconcile, watch stop, floor-tick round-robin, due watches, pollers)
+    // plus the debounced per-(grant, org) assess jobs. Registered
+    // unconditionally; the tick and the job return at once when Wisp is off.
+    // `global`, verified by workerEntrypointClosure.contract.test.ts: like
+    // aiAgentSweepScheduler, its deepest AI dependency is
+    // runService.createAndEnqueueAgentRun (insert + enqueue only).
+    name: 'wispWakeScheduler',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/wispWakeScheduler');
+      return { init: m.initializeWispWakeScheduler, shutdown: m.shutdownWispWakeScheduler };
     },
   },
   {
@@ -1471,7 +1914,7 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
-    // SEC-142/143 (review B3): reclaims durable AI budget reservations whose
+    // Reclaims durable AI budget reservations whose
     // TTL passed without settling. `global` — the sweep is one UPDATE with no
     // socket-local state, and leaving it to the socket owner would mean a
     // worker-only deployment never reclaims a held cap. Its module closure
@@ -1514,6 +1957,19 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // #8164 (EDR provider framework, W02) — daily prune of terminal
+    // edr_detections rows past the 180-day retention window.
+    name: 'edrDetectionRetentionWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/edrDetectionRetention');
+      return {
+        init: m.initializeEdrDetectionRetention,
+        shutdown: m.shutdownEdrDetectionRetention,
+      };
+    },
+  },
+  {
     // #4248 W03 (AI Scorecard #5757) — 15-minute sweep over unsettled
     // report_run_deliveries: re-attempts pending narrative emails the
     // finalizer never reached, marks stale claims `unknown` (never resends).
@@ -1539,6 +1995,55 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // Tool catalog W04 (#5219), Task A8 — executes flow run slices
+    // (flow-runs queue). socket-owner: a step dispatches device commands
+    // (run_script), like automationWorker and aiAgentRunner. Runs with the
+    // flag off too, so a queued run ends `flows_disabled` instead of waiting.
+    name: 'flowRunner',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/flowRunner');
+      return { init: m.initializeFlowRunner, shutdown: m.shutdownFlowRunner };
+    },
+  },
+  {
+    // Task A8 — 60 s sweep re-enqueueing runs whose wake was lost and
+    // pausing event flows when event delivery stops being durable.
+    // socket-owner, not the plan's `global`: clause (e) calls pauseFlow
+    // (services/flows/versions.ts), whose runtime closure reaches
+    // routes/agentWs.ts through the guardrails/tool catalog
+    // (workerEntrypointClosure.contract.test.ts).
+    name: 'flowRunReconciler',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/flowRunReconciler');
+      return { init: m.initializeFlowRunReconciler, shutdown: m.shutdownFlowRunReconciler };
+    },
+  },
+  {
+    // Task A8 — daily flow run body pruning (rows are kept).
+    name: 'flowRunRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/flowRunRetention');
+      return { init: m.initializeFlowRunRetention, shutdown: m.shutdownFlowRunRetention };
+    },
+  },
+  {
+    // Task A9 — 60 s schedule-trigger tick (one global repeatable over the
+    // enabled schedule flows; partner-wide flows fan out per live org).
+    // socket-owner, not `global`: createFlowRun's module (runService.ts)
+    // imports the rule-7 helper and intent cancel from versions.ts, whose
+    // runtime closure reaches routes/agentWs.ts (the flowRunReconciler note
+    // above; workerEntrypointClosure.contract.test.ts).
+    name: 'flowScheduleTick',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/flowScheduleTick');
+      return { init: m.initializeFlowScheduleTick, shutdown: m.shutdownFlowScheduleTick };
+    },
+  },
+  {
     // Partner sending domains W03. The ONE place that calls the email-domain
     // provider (spec §2). `initializeSendingDomainsWorker` returns before
     // constructing anything when EMAIL_DOMAINS_PROVIDER is unset, which is the
@@ -1552,6 +2057,37 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/sendingDomainsWorker');
       return { init: m.initializeSendingDomainsWorker, shutdown: m.shutdownSendingDomainsWorker };
+    },
+  },
+  {
+    // AI Suggested Fixes W1 — 5-minute fix-outcome sweeper. `global`: its
+    // closure is db + fixMemory services + outcomeProbes, never routes or
+    // socket-local dispatch (workerEntrypointClosure.contract.test.ts).
+    name: 'fixOutcomeWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/fixOutcomeWorker');
+      return { init: m.initializeFixOutcomeWorker, shutdown: m.shutdownFixOutcomeWorker };
+    },
+  },
+  // AI model registry W01 (#7599): platform model discovery (ai-model-discovery queue).
+  {
+    name: 'aiModelDiscoveryWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/aiModelDiscoveryWorker');
+      return { init: m.initializeAiModelDiscoveryWorker, shutdown: m.shutdownAiModelDiscoveryWorker };
+    },
+  },
+  // Workload image currency W05 (#8194): 30-minute registry pass. `global`:
+  // its closure is db + services/imageCurrency (urlSafety), never routes or
+  // socket-local dispatch (workerEntrypointClosure.contract.test.ts).
+  {
+    name: 'imageCurrencyWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/imageCurrencyWorker');
+      return { init: m.initializeImageCurrencyWorker, shutdown: m.shutdownImageCurrencyWorker };
     },
   },
 ];
@@ -1629,6 +2165,45 @@ export async function startRegisteredWorkers(
   await runEntries(selectWorkers(role), hooks);
 }
 
+async function runRedisIndependentEntries(
+  entries: readonly WorkerRegistration[],
+  hooks: StartWorkersHooks,
+): Promise<void> {
+  await Promise.allSettled(
+    entries
+      .filter((entry) => entry.runsWithoutRedis)
+      .map(async (entry) => {
+        try {
+          const mod = await entry.load();
+          // Registered before the start call, for the same reason as runEntries.
+          if (mod.shutdown) {
+            loadedShutdowns.set(entry.name, mod.shutdown);
+          }
+          if (!mod.startWithoutRedis) {
+            throw new Error(`${entry.name} is flagged runsWithoutRedis but exports no startWithoutRedis`);
+          }
+          await mod.startWithoutRedis();
+          hooks.onResult(entry.name, true);
+        } catch (error) {
+          hooks.onResult(entry.name, false, error);
+        }
+      }),
+  );
+}
+
+/**
+ * #7105 — the Redis-down-at-boot path. `index.ts` skips `startRegisteredWorkers`
+ * entirely when Redis is unavailable; this starts the `runsWithoutRedis`
+ * subset (selected for `role`) through their `startWithoutRedis` fallbacks
+ * instead, and registers their shutdowns so SIGTERM still stops them.
+ */
+export async function startRedisIndependentWorkers(
+  role: BreezeRole,
+  hooks: StartWorkersHooks,
+): Promise<void> {
+  await runRedisIndependentEntries(selectWorkers(role), hooks);
+}
+
 /**
  * Returns the shutdown functions for every entry selected for `role` whose
  * module was actually loaded (by a prior `startRegisteredWorkers` call —
@@ -1664,6 +2239,15 @@ export async function _startWorkersForTest(
   hooks: StartWorkersHooks,
 ): Promise<void> {
   await runEntries(filterByRole(entries, role), hooks);
+}
+
+/** @internal test seam */
+export async function _startRedisIndependentWorkersForTest(
+  entries: readonly WorkerRegistration[],
+  role: BreezeRole,
+  hooks: StartWorkersHooks,
+): Promise<void> {
+  await runRedisIndependentEntries(filterByRole(entries, role), hooks);
 }
 
 /** @internal test seam */

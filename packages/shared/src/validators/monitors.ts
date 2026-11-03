@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { automationActionSchema } from './automationActions';
+import { TIME_SYNC_FINDING_CODES } from '../constants/timeSync';
 
 /**
  * Monitor definitions (#5287 W02).
@@ -27,6 +28,15 @@ export const MONITOR_KINDS = [
   // monitorCompiler.ts), so a composite child of those kinds would never
   // receive evidence.
   'composite',
+  // W03 (hardware & RAID monitoring): root-only, evaluates fresh component
+  // evidence supplied by the hardware health leaf handler. Not a legal
+  // composite child — see `compositeChildSchema` below.
+  'hardware_health',
+  // W02 (time sync): root-only, evaluates accepted time-sync snapshot findings.
+  'time_sync',
+  // W06 (workload inventory, #8195): root-only, server-evaluated from the
+  // upstream_* columns the image-currency pass writes on device_workloads.
+  'container_image_currency',
 ] as const;
 export type MonitorKind = (typeof MONITOR_KINDS)[number];
 export const monitorKindSchema = z.enum(MONITOR_KINDS);
@@ -50,6 +60,16 @@ const percentThresholdCondition = z
   })
   .strict();
 
+export type NetworkCheckType = 'icmp_ping' | 'tcp_port' | 'http_check' | 'dns_check';
+/** Per-type authoring options retained in compiled network configuration. */
+export const NETWORK_CHECK_OPTION_KEYS: Record<NetworkCheckType, readonly string[]> = {
+  icmp_ping: ['count', 'packetSize'],
+  tcp_port: ['port', 'expectBanner'],
+  http_check: ['expectStatus', 'method', 'expectedBody', 'headers', 'followRedirects', 'verifySsl'],
+  dns_check: ['recordType', 'expectedValue', 'nameserver'],
+};
+const NETWORK_CHECK_ALL_OPTION_KEYS = [...new Set(Object.values(NETWORK_CHECK_OPTION_KEYS).flat())];
+
 const leafConditionSchemas = {
   cpu: percentThresholdCondition,
   memory: percentThresholdCondition,
@@ -60,7 +80,9 @@ const leafConditionSchemas = {
   event_log: z
     .object({
       category: z.enum(['security', 'hardware', 'application', 'system']),
-      level: z.enum(['warning', 'error', 'critical']),
+      // 'info' (#8174): Information-level Application events are collected only
+      // from the provider allowlist in ./eventLogProviders.ts; saves warn otherwise.
+      level: z.enum(['info', 'warning', 'error', 'critical']),
       sourcePattern: z.string().max(200).optional(),
       messagePattern: z.string().max(500).optional(),
       countThreshold: z.number().int().min(1).default(1),
@@ -142,7 +164,9 @@ const leafConditionSchemas = {
     }),
   backup_continuity: z
     .object({
-      check: z.enum(['no_successful_backup', 'consecutive_failures']),
+      // completed_with_errors (#5396): newest terminal run had file failures
+      // under the partial threshold. Takes no extra fields.
+      check: z.enum(['no_successful_backup', 'consecutive_failures', 'completed_with_errors']),
       maxAgeHours: z.number().int().min(1).max(8760).optional(), // 'no_successful_backup' only
       failureCount: z.number().int().min(1).max(50).optional(), // 'consecutive_failures' only
     })
@@ -173,22 +197,68 @@ const leafConditionSchemas = {
       // compiler adapter never maps a vocabulary.
       checkType: z.enum(['icmp_ping', 'tcp_port', 'http_check', 'dns_check']),
       target: z.string().min(1).max(500),
+      // Asset binding is ownership-sensitive and cannot be overridden by policy.
+      assetId: z.string().uuid().optional(),
       port: z.number().int().min(1).max(65535).optional(), // tcp_port
+      count: z.number().int().min(1).max(20).optional(),
+      // packetSize and headers preserve legacy configuration; agents currently ignore them.
+      packetSize: z.number().int().min(16).max(65535).optional(),
+      expectBanner: z.string().max(500).optional(),
+      method: z.enum(['GET', 'HEAD', 'POST', 'PUT', 'OPTIONS']).optional(),
+      expectedBody: z.string().max(2000).optional(),
+      headers: z.record(z.string(), z.string()).optional(),
+      verifySsl: z.boolean().optional(),
+      recordType: z.enum(['A', 'AAAA', 'MX', 'CNAME', 'TXT', 'NS']).optional(),
+      expectedValue: z.string().max(500).optional(),
+      nameserver: z.string().max(255).optional(),
       expectStatus: z.number().int().min(100).max(599).optional(), // http_check
       // http_check only. Left unset, the compiler picks a default: false when
       // `expectStatus` is itself a 3xx (following the redirect would evaluate
       // the FINAL hop's status instead of the one being asserted, #6510), true
       // otherwise (matches the agent's own default).
       followRedirects: z.boolean().optional(),
-      pollingIntervalSeconds: z.number().int().min(30).max(3600).default(60),
-      timeoutSeconds: z.number().int().min(1).max(120).default(5),
+      degradedIsFailure: z.boolean().default(false),
+      maxResponseMs: z.number().int().min(1).max(600000).optional(),
+      pollingIntervalSeconds: z.number().int().min(10).max(86400).default(60),
+      timeoutSeconds: z.number().int().min(1).max(300).default(5),
       consecutiveFailures: z.number().int().min(1).max(100).default(2),
     })
     .strict()
     .refine((v) => v.checkType !== 'tcp_port' || v.port != null, {
       message: 'port required for tcp_port',
       path: ['port'],
+    })
+    .superRefine((value, ctx) => {
+      const allowed = new Set(NETWORK_CHECK_OPTION_KEYS[value.checkType]);
+      for (const key of NETWORK_CHECK_ALL_OPTION_KEYS) {
+        if ((value as Record<string, unknown>)[key] !== undefined && !allowed.has(key)) {
+          ctx.addIssue({ code: 'custom', path: [key], message: `${key} is not an option of ${value.checkType}` });
+        }
+      }
     }),
+  hardware_health: z
+    .object({
+      componentTypes: z
+        .array(z.enum(['controller', 'virtual_disk', 'physical_disk', 'cache_battery', 'enclosure', 'collector']))
+        .min(1),
+      minHealth: z.enum(['warning', 'critical']),
+      includePredictiveFailure: z.boolean().default(true),
+      consecutiveSnapshots: z.number().int().min(1).max(10).default(2),
+    })
+    .strict(),
+  time_sync: z
+    .object({
+      findings: z.array(z.enum(TIME_SYNC_FINDING_CODES)).min(1),
+      consecutiveSnapshots: z.number().int().min(1).max(10).default(2),
+    })
+    .strict(),
+  // One subject per image repository:tag on the device; breaching once the
+  // image has been `behind` for at least `minDaysBehind` days (behind_since).
+  container_image_currency: z
+    .object({
+      minDaysBehind: z.number().int().min(0).max(365).default(7),
+    })
+    .strict(),
 } satisfies Record<Exclude<MonitorKind, 'composite'>, z.ZodTypeAny>;
 
 const compositeChildSchema = z
@@ -232,6 +302,7 @@ export const monitorConditionSchemas = {
 
 
 export type MonitorConditionSchemas = typeof monitorConditionSchemas;
+export type NetworkCheckMonitorCondition = z.infer<typeof monitorConditionSchemas.network_check>;
 
 /** Responses reuse the automation action vocabulary verbatim. */
 export const monitorResponsesSchema = z.array(automationActionSchema).max(10);
@@ -243,24 +314,44 @@ const monitorDefinitionFields = {
   name: z.string().min(1).max(200),
   description: z.string().max(2000).optional(),
   kind: monitorKindSchema,
-  enabled: z.boolean().default(true),
+  enabled: z.boolean(),
   condition: z.record(z.string(), z.unknown()),
   severity: monitorSeveritySchema,
-  cooldownMinutes: z.number().int().min(0).max(1440).default(5),
-  autoResolve: z.boolean().default(false),
+  cooldownMinutes: z.number().int().min(0).max(1440),
+  autoResolve: z.boolean(),
   autoResolveConditions: z.record(z.string(), z.unknown()).nullable().optional(),
-  responses: monitorResponsesSchema.default([]),
-  deliveryMode: monitorDeliveryModeSchema.default('inherit'),
-  deliveryChannelIds: z.array(z.string().uuid()).max(20).default([]),
+  responses: monitorResponsesSchema,
+  deliveryMode: monitorDeliveryModeSchema,
+  deliveryChannelIds: z.array(z.string().uuid()).max(20),
   escalationPolicyId: z.string().uuid().nullable().optional(),
   recurrenceThreshold: z.number().int().min(2).max(100).nullable().optional(),
   recurrenceWindowHours: z.number().int().min(1).max(8760).nullable().optional(),
-  recurrenceActions: monitorResponsesSchema.default([]),
-  pauseResponsesOnEscalation: z.boolean().default(true),
+  recurrenceActions: monitorResponsesSchema,
+  pauseResponsesOnEscalation: z.boolean(),
   aiAgentId: z.string().uuid().nullable().optional(),
+  // Alert → PSA ticket (#10528): the PSA board this monitor's tickets go to,
+  // overriding the bound connection's board. Partner-level config: the API
+  // refuses a change from a caller who cannot manage partner-wide config.
+  psaBoardId: z.number().int().positive().max(2_147_483_647).nullable().optional(),
 };
 
 const baseDefinition = z.object(monitorDefinitionFields);
+
+/**
+ * Defaults belong to CREATE only. Zod's `.partial()` still applies a field's
+ * `.default()` to an omitted key, so a default in `monitorDefinitionFields`
+ * would make every PATCH overwrite that stored setting.
+ */
+const createOnlyDefaults = {
+  enabled: monitorDefinitionFields.enabled.default(true),
+  cooldownMinutes: monitorDefinitionFields.cooldownMinutes.default(5),
+  autoResolve: monitorDefinitionFields.autoResolve.default(false),
+  responses: monitorDefinitionFields.responses.default([]),
+  deliveryMode: monitorDefinitionFields.deliveryMode.default('inherit'),
+  deliveryChannelIds: monitorDefinitionFields.deliveryChannelIds.default([]),
+  recurrenceActions: monitorDefinitionFields.recurrenceActions.default([]),
+  pauseResponsesOnEscalation: monitorDefinitionFields.pauseResponsesOnEscalation.default(true),
+};
 
 interface MonitorDefinitionShape {
   kind?: MonitorKind;
@@ -279,7 +370,9 @@ interface MonitorDefinitionShape {
  * The condition check is skipped when `kind` is absent, which only happens on a
  * PATCH that does not change the kind — the service re-validates the MERGED
  * definition against the stored kind, so a partial update can never persist a
- * condition that does not match.
+ * condition that does not match. The delivery check skips an absent
+ * `deliveryChannelIds` for the same reason: create always has it from its
+ * default, and an absent list on a PATCH means the stored channels stay.
  */
 function refineDefinition<T extends z.ZodType<MonitorDefinitionShape>>(schema: T) {
   return schema
@@ -295,7 +388,7 @@ function refineDefinition<T extends z.ZodType<MonitorDefinitionShape>>(schema: T
       message: 'recurrenceThreshold and recurrenceWindowHours must be set together',
       path: ['recurrenceThreshold'],
     })
-    .refine((v) => v.deliveryMode !== 'channels' || (v.deliveryChannelIds?.length ?? 0) > 0, {
+    .refine((v) => v.deliveryMode !== 'channels' || v.deliveryChannelIds === undefined || v.deliveryChannelIds.length > 0, {
       message: 'deliveryChannelIds required when deliveryMode is channels',
       path: ['deliveryChannelIds'],
     })
@@ -312,6 +405,7 @@ function refineDefinition<T extends z.ZodType<MonitorDefinitionShape>>(schema: T
  */
 export const createMonitorDefinitionSchema = refineDefinition(
   baseDefinition.extend({
+    ...createOnlyDefaults,
     ownerScope: z.enum(['organization', 'partner']).default('organization'),
     orgId: z.string().uuid().optional(),
   }),
@@ -350,6 +444,8 @@ export type MonitorsInheritance = z.infer<typeof monitorsInheritanceSchema>;
  *    what a converted policy needs to reproduce its inline behaviour.
  */
 export const monitorsInlineSettingsSchema = z.object({
+  // A settings row represents an explicit interval; omission inherits the parent.
+  checkIntervalSeconds: z.number().int().min(10).max(3600).optional(),
   items: z.array(monitorAttachmentItemSchema).max(200).default([]),
   inheritance: monitorsInheritanceSchema.default('cumulative'),
 });

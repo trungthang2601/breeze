@@ -18,8 +18,11 @@ import {
 } from '../db/schema';
 import { asRecord, getStringValue, resolveSnapshotProviderConfig } from './recoveryBootstrap';
 import { normalizeStorageIdentity } from '../jobs/backupRetention';
-import { backupSnapshotManifestKey, fetchBackupObjectBytes, isBackupObjectNotFound } from './backupSnapshotStorage';
+import { backupSnapshotManifestKey, fetchBackupObjectBytes, isBackupObjectNotFound, isBackupObjectTooLarge, MANIFEST_FETCH_MAX_BYTES } from './backupSnapshotStorage';
 import { parseBackupObjectKey } from './backupObjectKey';
+import { backupSnapshotAttestations } from '../db/schema/backupSnapshotAttestations';
+import { indexMatchesAttestation } from './backupRestoreIntegrity';
+import { physicalKeyFor, sameKeyRoot, snapshotKeyRootOf, type SnapshotKeyRoot } from './backupKeyLayout';
 
 export type FileIndexStatus = 'none' | 'agent' | 'hydrating' | 'complete' | 'failed';
 
@@ -28,14 +31,26 @@ export type HydrationFailure =
   | 'storage_identity_drift'
   | 'manifest_missing'
   | 'manifest_invalid'
+  | 'manifest_too_large'
   | 'manifest_key_invalid'
   | 'origin_unverifiable'
   | 'origin_identity_pending'
-  | 'provider_error';
+  | 'provider_error'
+  // The manifest bytes read from storage are not the ones the snapshot's
+  // attestation names.
+  | 'manifest_differs_from_attestation'
+  // The snapshot's attestation did not match its stored objects.
+  | 'attestation_failed'
+  // The snapshot records a key root this server cannot read (#7081).
+  | 'key_root_invalid'
+  // An origin the manifest references lives under another key root than the
+  // snapshot (#7081 I4): a dedupe chain never spans roots.
+  | 'origin_key_root_mismatch';
 
 const HYDRATION_FAILURES: readonly HydrationFailure[] = [
   'storage_identity_unknown', 'storage_identity_drift', 'manifest_missing', 'manifest_invalid',
-  'manifest_key_invalid', 'origin_unverifiable', 'origin_identity_pending', 'provider_error',
+  'manifest_too_large', 'manifest_key_invalid', 'origin_unverifiable', 'origin_identity_pending', 'provider_error',
+  'manifest_differs_from_attestation', 'attestation_failed', 'key_root_invalid', 'origin_key_root_mismatch',
 ];
 
 // Retryability is a pure function of the failure code so that the route glue
@@ -137,8 +152,56 @@ function summarizeManifestIssues(error: z.ZodError, json: unknown): string {
 
 function defaultDeps(): HydrationDeps {
   return {
-    fetchManifestBytes: (args) => fetchBackupObjectBytes(args),
+    fetchManifestBytes: (args) => fetchBackupObjectBytes({ ...args, maxBytes: MANIFEST_FETCH_MAX_BYTES }),
   };
+}
+
+/**
+ * The snapshot's attestation as far as its file index is concerned: its status
+ * and the manifest digest it names (see indexMatchesAttestation). Null when
+ * the snapshot has none (a LEFT JOIN yields all-null columns).
+ */
+type IndexAttestation = { status: string; manifestSha256: string } | null;
+
+const indexAttestationColumns = () => ({
+  status: backupSnapshotAttestations.status,
+  manifestSha256: backupSnapshotAttestations.manifestSha256,
+});
+
+function indexAttestationOf(value: unknown): IndexAttestation {
+  if (!value || typeof value !== 'object') return null;
+  const { status, manifestSha256 } = value as { status?: unknown; manifestSha256?: unknown };
+  return typeof status === 'string' && typeof manifestSha256 === 'string' ? { status, manifestSha256 } : null;
+}
+
+/**
+ * Why an index built from manifest bytes with `manifestSha256` must not be
+ * published for a snapshot with `attestation`, or null when it may. Any
+ * attestation binds the index to the manifest bytes it names, whatever its
+ * status; a mismatched attestation refuses every index.
+ */
+function attestationRefusal(
+  attestation: IndexAttestation,
+  manifestSha256: string | null,
+  integrityStatus?: string | null,
+): { failure: 'attestation_failed' | 'manifest_differs_from_attestation'; reason: string } | null {
+  if (!attestation) {
+    // A statement refused when it was reported leaves no row, only the
+    // projection: treated exactly like a mismatched attestation.
+    return integrityStatus === 'attestation_failed'
+      ? { failure: 'attestation_failed', reason: "the snapshot's attestation was refused when it was reported" }
+      : null;
+  }
+  if (attestation.status === 'mismatch') {
+    return { failure: 'attestation_failed', reason: "the snapshot's attestation does not match its stored objects" };
+  }
+  if (manifestSha256 !== null && manifestSha256 !== attestation.manifestSha256) {
+    return {
+      failure: 'manifest_differs_from_attestation',
+      reason: `manifest digest ${manifestSha256} is not the attested ${attestation.manifestSha256}`,
+    };
+  }
+  return null;
 }
 
 async function loadSnapshotForHydration(snapshotDbId: string) {
@@ -149,16 +212,22 @@ async function loadSnapshotForHydration(snapshotDbId: string) {
       deviceId: backupSnapshots.deviceId,
       snapshotId: backupSnapshots.snapshotId,
       storageIdentity: backupSnapshots.storageIdentity,
+      keyLayout: backupSnapshots.keyLayout,
+      keyPrefix: backupSnapshots.keyPrefix,
       // consumed by loadReferencedFiles below — without it hydration is a
       // permanent no-op.
       jobId: backupSnapshots.jobId,
       fileIndexStatus: backupSnapshots.fileIndexStatus,
+      fileIndexManifestSha256: backupSnapshots.fileIndexManifestSha256,
       fileIndexHydratedAt: backupSnapshots.fileIndexHydratedAt,
+      integrityStatus: backupSnapshots.integrityStatus,
+      attestation: indexAttestationColumns(),
     })
     .from(backupSnapshots)
+    .leftJoin(backupSnapshotAttestations, eq(backupSnapshotAttestations.snapshotDbId, backupSnapshots.id))
     .where(eq(backupSnapshots.id, snapshotDbId))
     .limit(1);
-  return row ?? null;
+  return row ? { ...row, attestation: indexAttestationOf(row.attestation) } : null;
 }
 
 async function loadReferencedFiles(jobId: string | null | undefined): Promise<number | null> {
@@ -183,34 +252,80 @@ async function fail(
   return { status: 'failed', failure, reason, retryable: isRetryableHydrationFailure(failure) };
 }
 
-export async function hydrateSnapshotFileIndex(
+// Failure paths reached while no DB context is held (the manifest
+// fetch/parse phase below, and the outer catch-all once the final write
+// transaction has already closed) need to open their own short context —
+// `fail` itself assumes an ambient one, which is correct for every call site
+// still inside a transaction (see below) but would hit the contextless-write
+// guard here.
+async function failOutsideContext(
   snapshotDbId: string,
-  opts?: { force?: boolean; deps?: HydrationDeps },
+  failure: HydrationFailure,
+  reason: string,
 ): Promise<HydrationOutcome> {
-  const deps = opts?.deps ?? defaultDeps();
-  const now = deps.now?.() ?? new Date();
+  return runOutsideDbContext(() => withSystemDbAccessContext(() => fail(snapshotDbId, failure, reason)));
+}
 
+type LoadedSnapshot = NonNullable<Awaited<ReturnType<typeof loadSnapshotForHydration>>>;
+// Once claimSnapshotForHydration's own storage_identity_unknown check has run,
+// storageIdentity is verified non-null for the rest of the pipeline — phases 2
+// and 3 read it unconditionally (origin verification, SQL equality checks). The
+// null check and its use live in different functions, so a plain narrowed
+// re-read of `snapshot.storageIdentity` at the return site doesn't survive the
+// function boundary; this type carries the guarantee across it instead.
+type ClaimedSnapshot = Omit<LoadedSnapshot, 'storageIdentity'> & { storageIdentity: string; keyRoot: SnapshotKeyRoot };
+
+/**
+ * Phase 1 (short transaction): load the snapshot, apply the skip checks,
+ * CAS-claim it into 'hydrating', and resolve/verify its provider config and
+ * storage identity. Every statement here is a small, bounded read or a
+ * single-row write — nothing here waits on the network.
+ */
+async function claimSnapshotForHydration(
+  snapshotDbId: string,
+  now: Date,
+  force: boolean,
+  includeUnreferenced: boolean,
+): Promise<
+  | { outcome: HydrationOutcome }
+  | { snapshot: ClaimedSnapshot; providerType: string; providerConfig: Record<string, unknown> }
+> {
   return runOutsideDbContext(() =>
     withSystemDbAccessContext(async () => {
       const snapshot = await loadSnapshotForHydration(snapshotDbId);
       if (!snapshot) {
-        return { status: 'failed', failure: 'manifest_missing', reason: 'snapshot not found', retryable: false } as const;
+        return { outcome: { status: 'failed', failure: 'manifest_missing', reason: 'snapshot not found', retryable: false } as const };
       }
 
       const referencedFiles = await loadReferencedFiles(snapshot.jobId);
 
-      if ((referencedFiles ?? 0) === 0) {
-        return { status: 'skipped', reason: 'not_referenced' } as const;
+      if ((referencedFiles ?? 0) === 0 && !includeUnreferenced) {
+        return { outcome: { status: 'skipped', reason: 'not_referenced' } as const };
       }
-      if (snapshot.fileIndexStatus === 'complete' && !opts?.force) {
-        return { status: 'skipped', reason: 'already_complete' } as const;
+      // A complete index counts as done only when it was built from the
+      // manifest bytes the snapshot's attestation names; any other one is
+      // rebuilt (or refused below), so an index built before an attestation
+      // existed, or from other bytes, is repaired on its next use.
+      if (
+        snapshot.fileIndexStatus === 'complete'
+        && !force
+        && indexMatchesAttestation(
+          {
+            fileIndexStatus: snapshot.fileIndexStatus,
+            fileIndexManifestSha256: snapshot.fileIndexManifestSha256 ?? null,
+            integrityStatus: snapshot.integrityStatus ?? null,
+          },
+          snapshot.attestation,
+        )
+      ) {
+        return { outcome: { status: 'skipped', reason: 'already_complete' } as const };
       }
       if (
         snapshot.fileIndexStatus === 'hydrating' &&
         snapshot.fileIndexHydratedAt &&
         now.getTime() - snapshot.fileIndexHydratedAt.getTime() < HYDRATING_STALE_MS
       ) {
-        return { status: 'skipped', reason: 'in_progress' } as const;
+        return { outcome: { status: 'skipped', reason: 'in_progress' } as const };
       }
 
       // CAS to 'hydrating' — the predicate itself expresses staleness so a
@@ -219,6 +334,16 @@ export async function hydrateSnapshotFileIndex(
       // whose status IS 'hydrating', no matter how old, which made the
       // stale-reclaim path dead code. 0 rows means a concurrent (non-stale)
       // claim won the race.
+      //
+      // #6488: hydration pins the snapshot's org/device into every
+      // backup_snapshot_origins row, so it must use the row AS CLAIMED, not
+      // the pre-claim read above. A concurrent org-move holding this row's
+      // lock makes the claim wait for it; under READ COMMITTED the UPDATE
+      // then re-evaluates against the committed (moved) row, and RETURNING
+      // yields its org/device — while `snapshot` still holds the source
+      // org, whose origin lookups would miss and terminally fail the index
+      // as origin_unverifiable. The move's own trigger
+      // (backup_snapshots_file_index_tenancy_reset) covers the other order.
       const staleBefore = new Date(now.getTime() - HYDRATING_STALE_MS);
       const [claimed] = await db
         .update(backupSnapshots)
@@ -233,110 +358,191 @@ export async function hydrateSnapshotFileIndex(
             ),
           ),
         )
-        .returning({ id: backupSnapshots.id });
+        .returning({
+          id: backupSnapshots.id,
+          orgId: backupSnapshots.orgId,
+          deviceId: backupSnapshots.deviceId,
+          snapshotId: backupSnapshots.snapshotId,
+          storageIdentity: backupSnapshots.storageIdentity,
+        });
       if (!claimed) {
-        return { status: 'skipped', reason: 'in_progress' } as const;
+        return { outcome: { status: 'skipped', reason: 'in_progress' } as const };
       }
 
-      try {
-        return await hydrateClaimedSnapshot(snapshotDbId, snapshot, now, deps);
-      } catch (err) {
-        await fail(snapshotDbId, 'provider_error', err instanceof Error ? err.message : String(err));
-        throw err;
+      // Everything below pins the row AS CLAIMED (see the note above the CAS),
+      // not the pre-claim read.
+      const claimedRow = { ...snapshot, ...claimed };
+
+      // Nothing an index could be built from is trustworthy for a snapshot
+      // whose attestation did not match; storage is not read at all.
+      const failedIntegrity = attestationRefusal(snapshot.attestation, null, snapshot.integrityStatus ?? null);
+      if (failedIntegrity) {
+        return { outcome: await fail(snapshotDbId, failedIntegrity.failure, failedIntegrity.reason) };
       }
+      // The manifest is read under the snapshot's recorded key root (#7081),
+      // never a guessed one; storage is not read for a root this server
+      // cannot read. (The root is immutable, so the pre-claim read is exact.)
+      const keyRoot = snapshotKeyRootOf(snapshot);
+      if (!keyRoot) {
+        return { outcome: await fail(snapshotDbId, 'key_root_invalid', `unreadable key root (${String(snapshot.keyLayout)})`) };
+      }
+
+      const resolved = await resolveSnapshotProviderConfig(snapshotDbId);
+      const providerType = resolved?.providerType ?? null;
+      const providerConfig = asRecord(resolved?.providerConfig);
+      if (!claimedRow.storageIdentity) {
+        return { outcome: await fail(snapshotDbId, 'storage_identity_unknown', 'snapshot has no pinned storage identity') };
+      }
+      if (!providerType) {
+        return { outcome: await fail(snapshotDbId, 'storage_identity_unknown', 'could not resolve a provider for this snapshot') };
+      }
+      const resolvedIdentity = normalizeStorageIdentity(providerType, providerConfig);
+      if (resolvedIdentity !== claimedRow.storageIdentity) {
+        return { outcome: await fail(snapshotDbId, 'storage_identity_drift', `resolved identity ${resolvedIdentity} does not match pinned ${claimedRow.storageIdentity}`) };
+      }
+
+      return {
+        // Rebuilt (not the bare narrowed variable) so the object literal's own
+        // storageIdentity field carries the non-null type this scope just
+        // proved, across the function boundary into ClaimedSnapshot.
+        snapshot: { ...claimedRow, storageIdentity: claimedRow.storageIdentity, keyRoot },
+        providerType,
+        providerConfig,
+      };
     }),
   );
 }
 
-async function hydrateClaimedSnapshot(
+type ParsedManifest = {
+  manifestSha256: string;
+  fileRows: Array<{ snapshotDbId: string; sourcePath: string; backupPath: string; size: number | null; modifiedAt: Date | null }>;
+  originCounts: Map<string, number>;
+};
+
+/**
+ * Phase 2 (no DB context held): fetch and parse the manifest. This is the
+ * network round trip and the CPU-bound hash/parse step — sized only by
+ * MANIFEST_FETCH_MAX_BYTES — and it must not pin a pooled connection idle
+ * for however long it takes.
+ */
+async function fetchAndParseManifest(
   snapshotDbId: string,
-  snapshot: NonNullable<Awaited<ReturnType<typeof loadSnapshotForHydration>>>,
-  now: Date,
+  snapshot: ClaimedSnapshot,
+  providerType: string,
+  providerConfig: Record<string, unknown>,
   deps: HydrationDeps,
+): Promise<{ outcome: HydrationOutcome } | { manifest: ParsedManifest }> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await deps.fetchManifestBytes({
+      provider: providerType,
+      providerConfig,
+      key: physicalKeyFor(snapshot.keyRoot, backupSnapshotManifestKey(snapshot.snapshotId)),
+    });
+  } catch (err) {
+    if (isBackupObjectNotFound(err)) {
+      return { outcome: await failOutsideContext(snapshotDbId, 'manifest_missing', 'manifest object not found in storage') };
+    }
+    if (isBackupObjectTooLarge(err)) {
+      return { outcome: await failOutsideContext(snapshotDbId, 'manifest_too_large', err.message) };
+    }
+    return { outcome: await failOutsideContext(snapshotDbId, 'provider_error', err instanceof Error ? err.message : String(err)) };
+  }
+
+  const manifestSha256 = createHash('sha256').update(bytes).digest('hex');
+  // Checked again under the snapshot row lock when the index is published; this
+  // early check only avoids writing rows that could never be published.
+  const refusal = attestationRefusal(snapshot.attestation, manifestSha256);
+  if (refusal) {
+    return { outcome: await failOutsideContext(snapshotDbId, refusal.failure, refusal.reason) };
+  }
+
+  let parsed: z.infer<typeof hydrationManifestSchema>;
+  try {
+    const json = JSON.parse(Buffer.from(bytes).toString('utf8'));
+    const result = hydrationManifestSchema.safeParse(json);
+    if (!result.success) {
+      return { outcome: await failOutsideContext(snapshotDbId, 'manifest_invalid', summarizeManifestIssues(result.error, json)) };
+    }
+    parsed = result.data;
+    if (parsed.id !== snapshot.snapshotId) {
+      throw new Error(`manifest id ${parsed.id} does not match snapshot ${snapshot.snapshotId}`);
+    }
+  } catch (err) {
+    return { outcome: await failOutsideContext(snapshotDbId, 'manifest_invalid', err instanceof Error ? err.message : String(err)) };
+  }
+
+  const files = parsed.files ?? [];
+  const ownPrefix = `snapshots/${snapshot.snapshotId}/`;
+  const originCounts = new Map<string, number>();
+  const fileRows: ParsedManifest['fileRows'] = [];
+
+  for (const file of files) {
+    // Content-less entries (dir/symlink) upload nothing — the schema above
+    // guarantees an empty backupPath only ever appears on one.
+    if (!file.backupPath) continue;
+    const parsedKey = parseBackupObjectKey(file.backupPath);
+    if (!parsedKey) {
+      return { outcome: await failOutsideContext(snapshotDbId, 'manifest_key_invalid', `unparseable backupPath: ${file.backupPath}`) };
+    }
+    if (!file.backupPath.startsWith(ownPrefix)) {
+      originCounts.set(parsedKey.snapshotId, (originCounts.get(parsedKey.snapshotId) ?? 0) + 1);
+    }
+    fileRows.push({
+      snapshotDbId,
+      sourcePath: file.originalPath ?? file.sourcePath,
+      backupPath: file.backupPath,
+      size: file.size ?? null,
+      modifiedAt: file.modTime ? new Date(file.modTime) : null,
+    });
+  }
+
+  return { manifest: { manifestSha256, fileRows, originCounts } };
+}
+
+/**
+ * Phase 3 (short transaction, opened fresh — no connection was held across
+ * the fetch in phase 2): verify each referenced origin against current DB
+ * state and write the file/origin rows plus the completion status.
+ */
+async function verifyOriginsAndWrite(
+  snapshotDbId: string,
+  snapshot: ClaimedSnapshot,
+  manifest: ParsedManifest,
 ): Promise<HydrationOutcome> {
-  {
-      const resolved = await resolveSnapshotProviderConfig(snapshotDbId);
-      const providerType = resolved?.providerType ?? null;
-      const providerConfig = asRecord(resolved?.providerConfig);
-      if (!snapshot.storageIdentity) {
-        return fail(snapshotDbId, 'storage_identity_unknown', 'snapshot has no pinned storage identity');
-      }
-      if (!providerType) {
-        return fail(snapshotDbId, 'storage_identity_unknown', 'could not resolve a provider for this snapshot');
-      }
-      const resolvedIdentity = normalizeStorageIdentity(providerType, providerConfig);
-      if (resolvedIdentity !== snapshot.storageIdentity) {
-        return fail(snapshotDbId, 'storage_identity_drift', `resolved identity ${resolvedIdentity} does not match pinned ${snapshot.storageIdentity}`);
-      }
+  const { manifestSha256, fileRows, originCounts } = manifest;
 
-      let bytes: Uint8Array;
-      try {
-        bytes = await deps.fetchManifestBytes({
-          provider: providerType,
-          providerConfig,
-          key: backupSnapshotManifestKey(snapshot.snapshotId),
-        });
-      } catch (err) {
-        if (isBackupObjectNotFound(err)) {
-          return fail(snapshotDbId, 'manifest_missing', 'manifest object not found in storage');
-        }
-        return fail(snapshotDbId, 'provider_error', err instanceof Error ? err.message : String(err));
-      }
-
-      const manifestSha256 = createHash('sha256').update(bytes).digest('hex');
-
-      let parsed: z.infer<typeof hydrationManifestSchema>;
-      try {
-        const json = JSON.parse(Buffer.from(bytes).toString('utf8'));
-        const result = hydrationManifestSchema.safeParse(json);
-        if (!result.success) {
-          return fail(snapshotDbId, 'manifest_invalid', summarizeManifestIssues(result.error, json));
-        }
-        parsed = result.data;
-        if (parsed.id !== snapshot.snapshotId) {
-          throw new Error(`manifest id ${parsed.id} does not match snapshot ${snapshot.snapshotId}`);
-        }
-      } catch (err) {
-        return fail(snapshotDbId, 'manifest_invalid', err instanceof Error ? err.message : String(err));
-      }
-
-      const files = parsed.files ?? [];
-      const ownPrefix = `snapshots/${snapshot.snapshotId}/`;
-      const originCounts = new Map<string, number>();
-      const fileRows: Array<{ snapshotDbId: string; sourcePath: string; backupPath: string; size: number | null; modifiedAt: Date | null }> = [];
-
-      for (const file of files) {
-        // Content-less entries (dir/symlink) upload nothing — the schema
-        // above guarantees an empty backupPath only ever appears on one.
-        if (!file.backupPath) continue;
-        const parsedKey = parseBackupObjectKey(file.backupPath);
-        if (!parsedKey) {
-          return fail(snapshotDbId, 'manifest_key_invalid', `unparseable backupPath: ${file.backupPath}`);
-        }
-        if (!file.backupPath.startsWith(ownPrefix)) {
-          originCounts.set(parsedKey.snapshotId, (originCounts.get(parsedKey.snapshotId) ?? 0) + 1);
-        }
-        fileRows.push({
-          snapshotDbId,
-          sourcePath: file.originalPath ?? file.sourcePath,
-          backupPath: file.backupPath,
-          size: file.size ?? null,
-          modifiedAt: file.modTime ? new Date(file.modTime) : null,
-        });
-      }
-
+  return runOutsideDbContext(() =>
+    withSystemDbAccessContext(async () => {
       type OriginRow = {
         originSnapshotId: string; originOrgId: string; originDeviceId: string;
         originStorageIdentity: string; originStoragePrefix: string | null; provenance: 'live' | 'retired'; objectCount: number;
       };
       const originRows: OriginRow[] = [];
+      // An origin is verified only under the snapshot's own key root (#7081
+      // I4): its external refs are later served under that root.
+      const originRootMatches = (row: { keyLayout: unknown; keyPrefix: unknown }) => {
+        const originRoot = snapshotKeyRootOf(row);
+        return originRoot !== null && sameKeyRoot(originRoot, snapshot.keyRoot);
+      };
+      const rootMismatch = (originId: string) =>
+        fail(snapshotDbId, 'origin_key_root_mismatch', `origin ${originId}: recorded under another key root than this snapshot`);
       for (const [originId, objectCount] of originCounts) {
         const [live] = await db
-          .select({ id: backupSnapshots.id, orgId: backupSnapshots.orgId, deviceId: backupSnapshots.deviceId, storageIdentity: backupSnapshots.storageIdentity, metadata: backupSnapshots.metadata })
+          .select({
+            id: backupSnapshots.id,
+            orgId: backupSnapshots.orgId,
+            deviceId: backupSnapshots.deviceId,
+            storageIdentity: backupSnapshots.storageIdentity,
+            keyLayout: backupSnapshots.keyLayout,
+            keyPrefix: backupSnapshots.keyPrefix,
+            metadata: backupSnapshots.metadata,
+          })
           .from(backupSnapshots)
           .where(and(eq(backupSnapshots.snapshotId, originId), eq(backupSnapshots.orgId, snapshot.orgId), eq(backupSnapshots.deviceId, snapshot.deviceId)))
           .limit(1);
         if (live && live.storageIdentity === snapshot.storageIdentity) {
+          if (!originRootMatches(live)) return rootMismatch(originId);
           originRows.push({
             originSnapshotId: originId, originOrgId: snapshot.orgId, originDeviceId: snapshot.deviceId,
             originStorageIdentity: snapshot.storageIdentity, originStoragePrefix: getStringValue(asRecord(live.metadata), 'storagePrefix'),
@@ -345,11 +551,18 @@ async function hydrateClaimedSnapshot(
           continue;
         }
         const [retired] = await db
-          .select({ orgId: backupSnapshotRetirements.orgId, deviceId: backupSnapshotRetirements.deviceId, storageIdentity: backupSnapshotRetirements.storageIdentity })
+          .select({
+            orgId: backupSnapshotRetirements.orgId,
+            deviceId: backupSnapshotRetirements.deviceId,
+            storageIdentity: backupSnapshotRetirements.storageIdentity,
+            keyLayout: backupSnapshotRetirements.keyLayout,
+            keyPrefix: backupSnapshotRetirements.keyPrefix,
+          })
           .from(backupSnapshotRetirements)
           .where(and(eq(backupSnapshotRetirements.snapshotId, originId), eq(backupSnapshotRetirements.storageIdentity, snapshot.storageIdentity), eq(backupSnapshotRetirements.orgId, snapshot.orgId), eq(backupSnapshotRetirements.deviceId, snapshot.deviceId)))
           .limit(1);
         if (retired) {
+          if (!originRootMatches(retired)) return rootMismatch(originId);
           originRows.push({
             originSnapshotId: originId, originOrgId: snapshot.orgId, originDeviceId: snapshot.deviceId,
             originStorageIdentity: snapshot.storageIdentity, originStoragePrefix: null, provenance: 'retired', objectCount,
@@ -366,8 +579,7 @@ async function hydrateClaimedSnapshot(
         return fail(snapshotDbId, 'origin_unverifiable', `origin ${originId}: no live snapshot or retirement record for this device/destination`);
       }
 
-      // Write file rows in 1,000-row batches, each its own transaction —
-      // storage I/O already happened above, outside any DB transaction.
+      // Write file rows in 1,000-row batches, each its own transaction.
       // The delete rides in the SAME transaction as the first insert batch so a
       // crash between them cannot leave a snapshot with zero rows; every later
       // batch is its own short transaction. Status stays 'hydrating' until the
@@ -385,12 +597,37 @@ async function hydrateClaimedSnapshot(
       }
 
       const externalCount = [...originCounts.values()].reduce((a, b) => a + b, 0);
-      await db.transaction(async (tx) => {
+      const refused = await db.transaction(async (tx) => {
+        // The snapshot row lock serializes publication with the attestation
+        // verifier (backupAttestationVerify.ts finish) and with an attestation
+        // being recorded (backupAttestation.ts), which take the same lock
+        // first. The attestation is read by a LATER statement: under READ
+        // COMMITTED a statement's snapshot is taken before it waits for a
+        // lock, so only a statement issued after the lock is held sees the
+        // attestation in force when the index becomes visible.
+        const [current] = await tx
+          .select({ metadata: backupSnapshots.metadata, integrityStatus: backupSnapshots.integrityStatus })
+          .from(backupSnapshots)
+          .where(eq(backupSnapshots.id, snapshotDbId))
+          .limit(1)
+          .for('update');
+        const [attestationRow] = await tx
+          .select(indexAttestationColumns())
+          .from(backupSnapshotAttestations)
+          .where(eq(backupSnapshotAttestations.snapshotDbId, snapshotDbId))
+          .limit(1);
+        const refusal = attestationRefusal(indexAttestationOf(attestationRow), manifestSha256, current?.integrityStatus ?? null);
+        if (refusal) {
+          await tx
+            .update(backupSnapshots)
+            .set({ fileIndexStatus: 'failed', fileIndexError: `${refusal.failure}: ${refusal.reason}` })
+            .where(eq(backupSnapshots.id, snapshotDbId));
+          return refusal;
+        }
         await tx.delete(backupSnapshotOrigins).where(eq(backupSnapshotOrigins.snapshotDbId, snapshotDbId));
         if (originRows.length > 0) {
           await tx.insert(backupSnapshotOrigins).values(originRows.map((o) => ({ snapshotDbId, ...o })));
         }
-        const [current] = await tx.select({ metadata: backupSnapshots.metadata }).from(backupSnapshots).where(eq(backupSnapshots.id, snapshotDbId)).limit(1);
         await tx
           .update(backupSnapshots)
           .set({
@@ -402,7 +639,11 @@ async function hydrateClaimedSnapshot(
             metadata: { ...asRecord(current?.metadata), hasIndexedFiles: true, fileIndexVersion: 2 },
           })
           .where(eq(backupSnapshots.id, snapshotDbId));
+        return null;
       });
+      if (refused) {
+        return { status: 'failed', failure: refused.failure, reason: refused.reason, retryable: false };
+      }
 
       return {
         status: 'complete',
@@ -411,7 +652,72 @@ async function hydrateClaimedSnapshot(
         externalCount,
         originSnapshotIds: [...originCounts.keys()],
       };
+    }),
+  );
+}
+
+export async function hydrateSnapshotFileIndex(
+  snapshotDbId: string,
+  opts?: {
+    force?: boolean;
+    deps?: HydrationDeps;
+    /**
+     * Also hydrate a snapshot whose job referenced no older snapshots. The
+     * brokered storage-read path authorizes objects by EXACT index
+     * membership, so it needs a server-verified index for full snapshots
+     * too, not only for incrementals with external references.
+     */
+    includeUnreferenced?: boolean;
+  },
+): Promise<HydrationOutcome> {
+  const deps = opts?.deps ?? defaultDeps();
+  const now = deps.now?.() ?? new Date();
+
+  const claim = await claimSnapshotForHydration(
+    snapshotDbId,
+    now,
+    opts?.force ?? false,
+    opts?.includeUnreferenced ?? false,
+  );
+  if ('outcome' in claim) {
+    return claim.outcome;
   }
+  const { snapshot, providerType, providerConfig } = claim;
+
+  // No DB context is held across this step — see fetchAndParseManifest.
+  const parsedManifest = await fetchAndParseManifest(snapshotDbId, snapshot, providerType, providerConfig, deps);
+  if ('outcome' in parsedManifest) {
+    return parsedManifest.outcome;
+  }
+
+  try {
+    return await verifyOriginsAndWrite(snapshotDbId, snapshot, parsedManifest.manifest);
+  } catch (err) {
+    await failOutsideContext(snapshotDbId, 'provider_error', err instanceof Error ? err.message : String(err));
+    throw err;
+  }
+}
+
+/**
+ * The index state as readers must see it: a complete index that was not built
+ * from the manifest bytes the snapshot's attestation names is reported as not
+ * built yet ('none': hydration rebuilds it), or as failed when the attestation
+ * did not match. Only a bound index is ever reported complete.
+ */
+function boundIndexState<T extends { status: string; manifestSha256: string | null; error: string | null }>(
+  row: T,
+  attestation: IndexAttestation,
+  integrityStatus: string | null,
+): T {
+  if (row.status !== 'complete') return row;
+  if (indexMatchesAttestation({ fileIndexStatus: row.status, fileIndexManifestSha256: row.manifestSha256, integrityStatus }, attestation)) {
+    return row;
+  }
+  const refusal = attestationRefusal(attestation, row.manifestSha256, integrityStatus);
+  if (refusal?.failure === 'attestation_failed') {
+    return { ...row, status: 'failed', manifestSha256: null, error: `${refusal.failure}: ${refusal.reason}` };
+  }
+  return { ...row, status: 'none', manifestSha256: null, error: null };
 }
 
 export async function readSnapshotFileIndexState(snapshotDbId: string): Promise<{
@@ -424,7 +730,7 @@ export async function readSnapshotFileIndexState(snapshotDbId: string): Promise<
   referencedFiles: number | null;
   storageIdentity: string | null;
 } | null> {
-  const [row] = await db
+  const [raw] = await db
     .select({
       status: backupSnapshots.fileIndexStatus,
       manifestSha256: backupSnapshots.fileIndexManifestSha256,
@@ -432,11 +738,15 @@ export async function readSnapshotFileIndexState(snapshotDbId: string): Promise<
       error: backupSnapshots.fileIndexError,
       jobId: backupSnapshots.jobId,
       storageIdentity: backupSnapshots.storageIdentity,
+      integrityStatus: backupSnapshots.integrityStatus,
+      attestation: indexAttestationColumns(),
     })
     .from(backupSnapshots)
+    .leftJoin(backupSnapshotAttestations, eq(backupSnapshotAttestations.snapshotDbId, backupSnapshots.id))
     .where(eq(backupSnapshots.id, snapshotDbId))
     .limit(1);
-  if (!row) return null;
+  if (!raw) return null;
+  const row = boundIndexState(raw, indexAttestationOf(raw.attestation), raw.integrityStatus ?? null);
   const referencedFiles = await loadReferencedFiles(row.jobId);
   const status = row.status as FileIndexStatus;
   const originSnapshotIds =

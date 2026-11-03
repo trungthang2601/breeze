@@ -11,6 +11,9 @@ import { asList } from '@/lib/asList';
 import {
   SOFTWARE_FILE_TYPES,
   deriveSoftwareFileTypeFromUrl,
+  parseSuccessExitCodesText,
+  validateSoftwareVersionInstallSpec,
+  type InstallSpecIssue,
   type DetectionRule,
   type SoftwareFileType,
 } from "@breeze/shared";
@@ -29,6 +32,7 @@ import { applyOsHint } from "@/lib/installerPackageHints";
 import { findUnknownTokens } from "@/lib/installerVariables";
 import { uploadPackageVersion } from "../../lib/softwarePackageUpload";
 import DetectionRulesEditor from "./DetectionRulesEditor";
+import InstallScriptsFields from "./InstallScriptsFields";
 import PackageManagerPicker, {
   type SelectedPackageMethod,
 } from "./PackageManagerPicker";
@@ -67,6 +71,7 @@ const CATEGORIES = [
   "security",
 ] as const;
 const OS_OPTIONS = ["Windows", "macOS", "Linux"] as const;
+
 /**
  * Server-acknowledged bytes → a percentage safe to render as a CSS width.
  *
@@ -97,7 +102,13 @@ const blankForm = {
   supportedOs: [] as string[],
   silentInstallArgs: "",
   silentUninstallArgs: "",
+  preInstallScript: "",
+  postInstallScript: "",
   detectionRules: [] as DetectionRule[],
+  // Raw free text (issue #7038); parsed with parseSuccessExitCodesText at
+  // submit time. Codes here ADD to the agent's built-in success codes (0
+  // always; 3010/1641 for exe/msi) — they never replace them.
+  successExitCodesRaw: "",
   notes: "",
   file: null as File | null,
   fileName: "",
@@ -296,7 +307,41 @@ export default function AddPackageModal({
     knownKeys,
     knownVariableKeys,
   ]);
+  const successExitCodesResult = useMemo(
+    () => parseSuccessExitCodesText(form.successExitCodesRaw),
+    [form.successExitCodesRaw],
+  );
+  const successExitCodesError = successExitCodesResult.ok
+    ? null
+    : "invalidToken" in successExitCodesResult
+      ? i18n.t(
+          "policies:software.addPackageModal.invalidSuccessExitCode",
+          { token: successExitCodesResult.invalidToken },
+        )
+      : i18n.t(
+          "policies:software.addPackageModal.tooManySuccessExitCodes",
+        );
   const isManager = form.source === "manager";
+  // The type the server will end up with: the file source derives it from the
+  // uploaded filename; the URL source honors the selector, else the URL.
+  const effectiveFileType: SoftwareFileType | null =
+    form.source === "file"
+      ? deriveSoftwareFileTypeFromUrl(form.fileName)
+      : form.fileType || inferredFileType;
+  const argsHidden =
+    effectiveFileType === "zip" ||
+    effectiveFileType === "pkg" ||
+    effectiveFileType === "dmg" ||
+    effectiveFileType === "deb";
+  const installSpecIssues: InstallSpecIssue[] = isManager
+    ? []
+    : validateSoftwareVersionInstallSpec({
+        fileType: effectiveFileType,
+        supportedOs: form.supportedOs,
+        silentInstallArgs: argsHidden ? null : form.silentInstallArgs,
+        preInstallScript: form.preInstallScript,
+        postInstallScript: form.postInstallScript,
+      });
   const hasSource =
     form.source === "url"
       ? form.downloadUrl.trim() !== ""
@@ -310,6 +355,8 @@ export default function AddPackageModal({
     (isManager || form.version.trim() !== "") &&
     hasSource &&
     tokenErrors.length === 0 &&
+    successExitCodesResult.ok &&
+    installSpecIssues.length === 0 &&
     !saving;
   /** Prefill identity from the first pick, but never overwrite what the user
    *  typed. */
@@ -333,11 +380,18 @@ export default function AddPackageModal({
       version: form.version.trim(),
       architecture: form.architecture,
       releaseNotes: form.notes || undefined,
-      silentInstallArgs: form.silentInstallArgs || undefined,
+      silentInstallArgs:
+        argsHidden || !form.silentInstallArgs ? undefined : form.silentInstallArgs,
+      preInstallScript: form.preInstallScript.trim() ? form.preInstallScript : undefined,
+      postInstallScript: form.postInstallScript.trim() ? form.postInstallScript : undefined,
       silentUninstallArgs: form.silentUninstallArgs || undefined,
       supportedOs: form.supportedOs.length > 0 ? form.supportedOs : undefined,
       detectionRules:
         form.detectionRules.length > 0 ? form.detectionRules : undefined,
+      successExitCodes:
+        successExitCodesResult.ok && successExitCodesResult.codes.length > 0
+          ? successExitCodesResult.codes
+          : undefined,
     };
     if (form.source === "file" && form.file) {
       const file = form.file;
@@ -963,7 +1017,7 @@ export default function AddPackageModal({
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept=".msi,.exe,.dmg,.deb,.pkg"
+                    accept=".msi,.exe,.dmg,.deb,.pkg,.zip"
                     onChange={handleFile}
                     className="hidden"
                   />
@@ -1023,7 +1077,13 @@ export default function AddPackageModal({
             </div>
             )}
 
-            {!isManager && (
+            {!isManager && argsHidden && (
+              <p className="text-xs text-muted-foreground">
+                {i18n.t("policies:software.addPackageModal.silentArgsNotUsedForType")}
+              </p>
+            )}
+
+            {!isManager && !argsHidden && (
             <div>
               <label className={labelCls} htmlFor="pkg-install">
                 {i18n.t("policies:software.addPackageModal.silentInstallArgs")}
@@ -1041,6 +1101,17 @@ export default function AddPackageModal({
                 />
               </div>
             </div>
+            )}
+
+            {!isManager && (
+              <InstallScriptsFields
+                idPrefix="pkg"
+                preInstallScript={form.preInstallScript}
+                postInstallScript={form.postInstallScript}
+                onPreInstallScriptChange={(v) => update("preInstallScript", v)}
+                onPostInstallScriptChange={(v) => update("postInstallScript", v)}
+                issues={installSpecIssues}
+              />
             )}
           </section>
 
@@ -1094,6 +1165,38 @@ export default function AddPackageModal({
                     update("detectionRules", detectionRules)
                   }
                 />
+
+                <div>
+                  <label className={labelCls} htmlFor="pkg-success-exit-codes">
+                    {i18n.t(
+                      "policies:software.addPackageModal.additionalSuccessExitCodes",
+                    )}
+                  </label>
+                  <input
+                    id="pkg-success-exit-codes"
+                    type="text"
+                    value={form.successExitCodesRaw}
+                    onChange={(e) =>
+                      update("successExitCodesRaw", e.target.value)
+                    }
+                    placeholder={i18n.t(
+                      "policies:software.addPackageModal.eG10001101",
+                    )}
+                    aria-invalid={successExitCodesError != null}
+                    className={inputCls}
+                  />
+                  {successExitCodesError ? (
+                    <p className="mt-1 text-xs text-destructive">
+                      {successExitCodesError}
+                    </p>
+                  ) : (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {i18n.t(
+                        "policies:software.addPackageModal.successExitCodesHelp",
+                      )}
+                    </p>
+                  )}
+                </div>
 
                 <div>
                   <label className={labelCls} htmlFor="pkg-notes">

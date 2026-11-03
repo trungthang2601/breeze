@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useId } from 'react';
 import { Monitor, MonitorOff, ExternalLink, Download, X, Globe } from 'lucide-react';
 import * as Sentry from '@sentry/astro';
 import type { DesktopAccessState, RemoteAccessPolicy } from '@breeze/shared';
@@ -65,6 +65,15 @@ function canFallbackToVNC(
   return VNC_FALLBACK_REASONS.has(desktopAccess.reason ?? '');
 }
 
+// Reason code the agent puts in a start_desktop refusal when the Mac is at the
+// login window (agent/internal/heartbeat/desktop_login_window_gate.go). The API
+// stores the agent's text as the session's errorMessage.
+const LOGIN_WINDOW_REFUSAL_CODE = '(login_window)';
+
+function isLoginWindowRefusal(errorMessage: string | null | undefined): boolean {
+  return typeof errorMessage === 'string' && errorMessage.includes(LOGIN_WINDOW_REFUSAL_CODE);
+}
+
 function desktopAccessUnavailableReason(
   desktopAccess: DesktopAccessState | null | undefined,
   remoteAccessPolicy?: RemoteAccessPolicy | null,
@@ -107,7 +116,14 @@ function desktopAccessUnavailableReason(
 
 export default function ConnectDesktopButton({ deviceId, className = '', compact = false, iconOnly = false, disabled = false, disabledTitle, isHeadless = false, desktopAccess = null, remoteAccessPolicy = null, helperLifecycleMode = null }: Props) {
   const { t } = useTranslation('remote');
-  const [status, setStatus] = useState<'idle' | 'creating' | 'launching' | 'fallback' | 'denied' | 'ending' | 'revoked'>('idle');
+  // #9026: the full-size button stays focusable while unavailable
+  // (aria-disabled) and points at this visually-hidden reason.
+  const reasonId = useId();
+  const [status, setStatus] = useState<'idle' | 'creating' | 'launching' | 'fallback' | 'denied' | 'ending' | 'revoked' | 'loginWindow' | 'unavailable' | 'startFailed'>('idle');
+  // #7335: the agent's (server-redacted) reason for a failed start_desktop.
+  const [startFailedReason, setStartFailedReason] = useState<string | null>(null);
+  // The reason shown when the click-time desktop state refused the connect.
+  const [unavailableMessage, setUnavailableMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Populated when the server-side revocation lease killed the session before
   // the viewer connected (#6120) — the raw RevocationReason parsed from the
@@ -142,9 +158,91 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
     fetchWithAuth(`/remote/sessions/${sessionId}/end`, { method: 'POST' }).catch(() => {});
   }, []);
 
+  // Open a VNC Relay session through the existing tunnel plumbing: create the
+  // tunnel, hand a one-time connect code to the Breeze Viewer, and fall back to
+  // the "Open in Browser" card if the viewer does not pick it up. Throws on a
+  // failed tunnel or code request so the caller owns the error surface.
+  const connectViaVnc = useCallback(async () => {
+    // Create VNC tunnel — user provides their macOS credentials in the noVNC prompt
+    const tunnelRes = await fetchWithAuth('/tunnels', {
+      method: 'POST',
+      body: JSON.stringify({ deviceId, type: 'vnc' }),
+    });
+
+    if (!tunnelRes.ok) {
+      const err = await tunnelRes.json().catch(() => ({ error: t('connectDesktopButton.errors.createVncTunnel') }));
+      throw new Error(err.error || t('connectDesktopButton.errors.createVncTunnel'));
+    }
+
+    const tunnel = await tunnelRes.json();
+
+    // Issue a short-lived connect code for the Tauri viewer deep link (keeps JWT out of URL)
+    const codeRes = await fetchWithAuth(`/tunnels/${tunnel.id}/connect-code`, { method: 'POST' });
+    if (!codeRes.ok) {
+      fetchWithAuth(`/tunnels/${tunnel.id}`, { method: 'DELETE' }).catch(() => {});
+      throw new Error(t('connectDesktopButton.errors.issueVncCode'));
+    }
+    const { code } = await codeRes.json();
+
+    const apiUrl = import.meta.env.PUBLIC_API_URL || window.location.origin;
+    const deepLink = `breeze://vnc?tunnel=${encodeURIComponent(tunnel.id)}` +
+      `&device=${encodeURIComponent(deviceId)}` +
+      `&api=${encodeURIComponent(apiUrl)}` +
+      `&code=${encodeURIComponent(code)}`;
+
+    setStatus('launching');
+
+    // Try to hand off to the Breeze Viewer first
+    tryDeepLink(deepLink);
+
+    // Poll the tunnel to detect whether the viewer picked it up.
+    // Tunnel moves from 'pending' → 'active' once the viewer connects.
+    // If it stays pending after ~7.5 s, show the "Open in Browser" card.
+    let vncPollCount = 0;
+    const vncMaxPolls = 5;
+
+    const pollVnc = async () => {
+      vncPollCount++;
+      try {
+        const res = await fetchWithAuth(`/tunnels/${tunnel.id}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === 'active') {
+            setStatus((cur) => cur === 'launching' || cur === 'fallback' ? 'idle' : cur);
+            return;
+          }
+          if (data.status === 'failed') {
+            setError(extractApiError(data, t('connectDesktopButton.errors.vncTunnelFailed')));
+            setStatus('idle');
+            return;
+          }
+        }
+      } catch { /* network error — keep polling */ }
+
+      if (vncPollCount >= vncMaxPolls) {
+        // Viewer didn't pick it up in time — show the fallback card so the
+        // user can choose to open noVNC in the browser instead.
+        setVncFallback({ tunnelId: tunnel.id });
+        setStatus((cur) => cur === 'launching' ? 'fallback' : cur);
+
+        if (autoDismissTimerRef.current) clearTimeout(autoDismissTimerRef.current);
+        autoDismissTimerRef.current = setTimeout(() => {
+          setStatus((cur) => cur === 'fallback' ? 'idle' : cur);
+          setVncFallback(null);
+        }, 30000);
+        return;
+      }
+
+      pollTimerRef.current = setTimeout(pollVnc, 1500);
+    };
+
+    pollTimerRef.current = setTimeout(pollVnc, 1500);
+  }, [deviceId, t]);
+
   const startConnect = useCallback(async (targetSessionId?: number) => {
     setStatus('creating');
     setError(null);
+    setStartFailedReason(null);
 
     try {
       // The `desktopAccess` prop is fetched once when the Remote Tools page mounts
@@ -296,80 +394,19 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
       const needsVNC = canFallbackToVNC(liveDesktopAccess, remoteAccessPolicy);
 
       if (needsVNC) {
-        // Create VNC tunnel — user provides their macOS credentials in the noVNC prompt
-        const tunnelRes = await fetchWithAuth('/tunnels', {
-          method: 'POST',
-          body: JSON.stringify({ deviceId, type: 'vnc' }),
-        });
+        await connectViaVnc();
+        return;
+      }
 
-        if (!tunnelRes.ok) {
-          const err = await tunnelRes.json().catch(() => ({ error: t('connectDesktopButton.errors.createVncTunnel') }));
-          throw new Error(err.error || t('connectDesktopButton.errors.createVncTunnel'));
-        }
-
-        const tunnel = await tunnelRes.json();
-
-        // Issue a short-lived connect code for the Tauri viewer deep link (keeps JWT out of URL)
-        const codeRes = await fetchWithAuth(`/tunnels/${tunnel.id}/connect-code`, { method: 'POST' });
-        if (!codeRes.ok) {
-          fetchWithAuth(`/tunnels/${tunnel.id}`, { method: 'DELETE' }).catch(() => {});
-          throw new Error(t('connectDesktopButton.errors.issueVncCode'));
-        }
-        const { code } = await codeRes.json();
-
-        const apiUrl = import.meta.env.PUBLIC_API_URL || window.location.origin;
-        const deepLink = `breeze://vnc?tunnel=${encodeURIComponent(tunnel.id)}` +
-          `&device=${encodeURIComponent(deviceId)}` +
-          `&api=${encodeURIComponent(apiUrl)}` +
-          `&code=${encodeURIComponent(code)}`;
-
-        setStatus('launching');
-
-        // Try to hand off to the Breeze Viewer first
-        tryDeepLink(deepLink);
-
-        // Poll the tunnel to detect whether the viewer picked it up.
-        // Tunnel moves from 'pending' → 'active' once the viewer connects.
-        // If it stays pending after ~7.5 s, show the "Open in Browser" card.
-        let vncPollCount = 0;
-        const vncMaxPolls = 5;
-
-        const pollVnc = async () => {
-          vncPollCount++;
-          try {
-            const res = await fetchWithAuth(`/tunnels/${tunnel.id}`);
-            if (res.ok) {
-              const data = await res.json();
-              if (data.status === 'active') {
-                setStatus((cur) => cur === 'launching' || cur === 'fallback' ? 'idle' : cur);
-                return;
-              }
-              if (data.status === 'failed') {
-                setError(extractApiError(data, t('connectDesktopButton.errors.vncTunnelFailed')));
-                setStatus('idle');
-                return;
-              }
-            }
-          } catch { /* network error — keep polling */ }
-
-          if (vncPollCount >= vncMaxPolls) {
-            // Viewer didn't pick it up in time — show the fallback card so the
-            // user can choose to open noVNC in the browser instead.
-            setVncFallback({ tunnelId: tunnel.id });
-            setStatus((cur) => cur === 'launching' ? 'fallback' : cur);
-
-            if (autoDismissTimerRef.current) clearTimeout(autoDismissTimerRef.current);
-            autoDismissTimerRef.current = setTimeout(() => {
-              setStatus((cur) => cur === 'fallback' ? 'idle' : cur);
-              setVncFallback(null);
-            }, 30000);
-            return;
-          }
-
-          pollTimerRef.current = setTimeout(pollVnc, 1500);
-        };
-
-        pollTimerRef.current = setTimeout(pollVnc, 1500);
+      // #7047: the fresh state says WebRTC desktop cannot work here and VNC
+      // Relay is not an option, so refuse now — the same verdict the button
+      // renders from the page-load snapshot, applied to the live state. Without
+      // this a stale "available" snapshot (page loaded before the Mac rebooted
+      // to its login window) started a video-only session that looked usable.
+      const liveUnavailable = desktopAccessUnavailableReason(liveDesktopAccess, remoteAccessPolicy, (key) => t(/* i18n-dynamic */ key));
+      if (liveUnavailable) {
+        setUnavailableMessage(liveUnavailable);
+        setStatus('unavailable');
         return;
       }
 
@@ -391,10 +428,16 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
             body: JSON.stringify({ deviceId, type: 'desktop' }),
           }),
         errorFallback: t('connectDesktopButton.errors.createDesktopSession'),
-        friendly: (code) =>
-          code === 'agent_upgrade_required'
-            ? t('connectDesktopButton.errors.agentUpgradeRequired')
-            : undefined,
+        // D13: runAction swaps in the generic errors:<CODE> catalog text
+        // (e.g. "Not found", "Access denied") whenever one exists, which
+        // would otherwise bury the specific server prose this route already
+        // carries. Restore it for the two coded failures this endpoint sends.
+        friendly: (code) => {
+          if (code === 'agent_upgrade_required') return t('connectDesktopButton.errors.agentUpgradeRequired');
+          if (code === 'NOT_FOUND') return t('connectDesktopButton.errors.deviceNotFoundOrAccessDenied');
+          if (code === 'ACCESS_DENIED') return t('connectDesktopButton.errors.siteAccessDenied');
+          return undefined;
+        },
         parseSuccess: (data) => data as { id: string },
       });
       sessionIdRef.current = session.id;
@@ -441,7 +484,7 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
             const sessionStatus = data.status ?? data.data?.status;
             const terminationPhase = data.terminationPhase ?? data.data?.terminationPhase;
             if (terminationPhase === 'pending') {
-              // SEC-038 W06: the server has already ended this session but the
+              // The server has already ended this session but the
               // agent has not yet acknowledged the stop. This is NOT "viewer
               // connected" — say so, and stop polling.
               setStatus('ending');
@@ -458,6 +501,20 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
             // generic "connected" branch below and the technician gets no
             // explanation — the viewer just silently reverts to idle.
             const revokedMessage = typeof data.errorMessage === 'string' ? data.errorMessage : undefined;
+            // #7047: the agent refused the start because the Mac is at the
+            // login window, where macOS drops remote input. Say so and point
+            // to VNC Relay instead of reverting to idle as if it connected.
+            if (sessionStatus === 'failed' && isLoginWindowRefusal(revokedMessage)) {
+              setStatus('loginWindow');
+              return;
+            }
+            // #7335: any other failed start (fence refusal, capture/encoder
+            // failure, …) must surface its reason, not read as "connected".
+            if (sessionStatus === 'failed') {
+              setStartFailedReason(revokedMessage?.trim() ? revokedMessage : null);
+              setStatus('startFailed');
+              return;
+            }
             if (sessionStatus === 'disconnected' && revokedMessage?.startsWith('revoked:')) {
               setRevokedReason(revokedMessage.slice('revoked:'.length));
               setStatus('revoked');
@@ -500,17 +557,18 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
       );
       setStatus('idle');
     }
-  }, [deviceId, desktopAccess, remoteAccessPolicy, endSession, t]);
+  }, [deviceId, desktopAccess, remoteAccessPolicy, endSession, connectViaVnc, t]);
 
   // Entry point for a connect click. RDS hosts open the session picker first;
   // everything else connects immediately (unchanged behavior).
   const handleClick = useCallback(() => {
+    if (disabled) return;
     if (helperLifecycleMode === 'on-demand') {
       setPickerOpen(true);
       return;
     }
     void startConnect();
-  }, [helperLifecycleMode, startConnect]);
+  }, [disabled, helperLifecycleMode, startConnect]);
 
   const handleDismiss = useCallback(() => {
     setVncFallback(null);
@@ -553,12 +611,35 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
     setStatus('idle');
   }, []);
 
+  const handleDismissStartFailed = useCallback(() => {
+    setStartFailedReason(null);
+    setStatus('idle');
+  }, []);
+
+  const handleDismissLoginWindow = useCallback(() => {
+    setUnavailableMessage(null);
+    setStatus('idle');
+  }, []);
+
+  // From the login-window card: open VNC Relay through the same path the
+  // automatic fallback uses.
+  const handleConnectVncFromLoginWindow = useCallback(async () => {
+    setStatus('creating');
+    setError(null);
+    try {
+      await connectViaVnc();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('connectDesktopButton.errors.createVncTunnel'));
+      setStatus('idle');
+    }
+  }, [connectViaVnc, t]);
+
   const handleDismissRevoked = useCallback(() => {
     setRevokedReason(null);
     setStatus('idle');
   }, []);
 
-  // SEC-038 W06: shown when the session was ended server-side before the
+  // Shown when the session was ended server-side before the
   // viewer connected and the device has not yet confirmed the teardown.
   // Deliberately not the connected/idle state and not the denied card.
   const endingContent = status === 'ending' ? (
@@ -589,6 +670,102 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
           className="flex h-5 w-5 items-center justify-center rounded hover:bg-amber-200 dark:hover:bg-amber-800"
         >
           <X className="h-3 w-3 text-amber-600 dark:text-amber-400" />
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  // #7047: the Mac is at the login window, where macOS drops remote keyboard
+  // and mouse input. Shown when the agent refused the start ('loginWindow') or
+  // when the click-time desktop state already said WebRTC cannot work
+  // ('unavailable', with that state's reason). Points to VNC Relay: a button
+  // when the device policy allows it, otherwise how to enable it.
+  const vncRelayAllowed = remoteAccessPolicy?.vncRelay === true;
+  const loginWindowContent = status === 'loginWindow' || status === 'unavailable' ? (
+    <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm shadow-lg dark:border-amber-800 dark:bg-amber-950">
+      <div className="flex items-start gap-2.5">
+        <MonitorOff className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+        <div className="flex-1">
+          <p className="font-medium text-amber-800 dark:text-amber-300">
+            {status === 'loginWindow'
+              ? t('connectDesktopButton.loginWindow.title')
+              : t('connectDesktopButton.loginWindow.unavailableTitle')}
+          </p>
+          <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+            {status === 'loginWindow'
+              ? t('connectDesktopButton.loginWindow.description')
+              : unavailableMessage}
+          </p>
+          {status === 'loginWindow' && (
+            <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+              {vncRelayAllowed
+                ? t('connectDesktopButton.loginWindow.useVncRelay')
+                : t('connectDesktopButton.loginWindow.enableVncRelay')}
+            </p>
+          )}
+          <div className="mt-2.5 flex items-center gap-3">
+            {status === 'loginWindow' && vncRelayAllowed && (
+              <button
+                type="button"
+                onClick={() => { void handleConnectVncFromLoginWindow(); }}
+                className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-blue-700"
+              >
+                <Monitor className="h-3.5 w-3.5" />
+                {t('connectDesktopButton.loginWindow.connectVnc')}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleDismissLoginWindow}
+              className="text-xs text-muted-foreground transition hover:text-foreground"
+            >
+              {t('connectDesktopButton.dismiss')}
+            </button>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleDismissLoginWindow}
+          aria-label={t('connectDesktopButton.dismiss')}
+          className="flex h-5 w-5 items-center justify-center rounded hover:bg-amber-200 dark:hover:bg-amber-800"
+        >
+          <X className="h-3 w-3 text-amber-600 dark:text-amber-400" />
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  // #7335: the agent failed the start for a reason other than the login window.
+  // The button stays enabled (status is neither creating nor launching), so the
+  // technician can retry straight away.
+  const startFailedContent = status === 'startFailed' ? (
+    <div role="alert" className="absolute right-0 top-full z-50 mt-2 w-72 rounded-lg border border-red-200 bg-red-50 p-3 text-sm shadow-lg dark:border-red-800 dark:bg-red-950">
+      <div className="flex items-start gap-2.5">
+        <MonitorOff className="mt-0.5 h-4 w-4 shrink-0 text-red-600 dark:text-red-400" />
+        <div className="flex-1">
+          <p className="font-medium text-red-800 dark:text-red-300">
+            {t('connectDesktopButton.startFailed.title')}
+          </p>
+          <p className="mt-1 break-words text-xs text-red-700 dark:text-red-400">
+            {startFailedReason ?? t('connectDesktopButton.startFailed.description')}
+          </p>
+          <div className="mt-2.5">
+            <button
+              type="button"
+              onClick={handleDismissStartFailed}
+              className="text-xs text-muted-foreground transition hover:text-foreground"
+            >
+              {t('connectDesktopButton.dismiss')}
+            </button>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleDismissStartFailed}
+          aria-label={t('connectDesktopButton.dismiss')}
+          className="flex h-5 w-5 items-center justify-center rounded hover:bg-red-200 dark:hover:bg-red-800"
+        >
+          <X className="h-3 w-3 text-red-600 dark:text-red-400" />
         </button>
       </div>
     </div>
@@ -873,13 +1050,15 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
       <div className={`relative ${className}`}>
         <button
           type="button"
-          disabled
+          aria-disabled="true"
           title={unavailableTitle}
-          className="flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium text-muted-foreground cursor-not-allowed opacity-50"
+          aria-describedby={unavailableTitle ? reasonId : undefined}
+          className="flex h-9 items-center gap-2 rounded-md border bg-background px-4 text-sm font-medium text-muted-foreground cursor-not-allowed"
         >
-          <MonitorOff className="h-4 w-4" />
+          <MonitorOff className="h-4 w-4" aria-hidden="true" />
           {t('connectDesktopButton.desktopUnavailable')}
         </button>
+        {unavailableTitle && <span id={reasonId} className="sr-only">{unavailableTitle}</span>}
       </div>
     );
   }
@@ -916,6 +1095,8 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
         {deniedContent}
       {endingContent}
         {revokedContent}
+        {loginWindowContent}
+        {startFailedContent}
         {pickerModal}
       </div>
     );
@@ -926,21 +1107,28 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
       <div className="relative">
         <button
           type="button"
+          role="menuitem"
+          tabIndex={-1}
           onClick={handleClick}
-          disabled={disabled || status === 'creating' || status === 'launching'}
+          aria-disabled={disabled || status === 'creating' || status === 'launching' ? true : undefined}
           title={error || (disabled ? disabledTitle : undefined)}
-          className={`flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 ${error ? 'text-red-500' : ''}`}
+          className={`flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted aria-disabled:cursor-not-allowed aria-disabled:opacity-50 ${error ? 'text-red-500' : ''}`}
         >
           <Monitor className="h-4 w-4" />
           {error ? t('connectDesktopButton.errors.connectionFailed') :
            status === 'creating' ? t('connectDesktopButton.connecting') :
            status === 'launching' ? t('connectDesktopButton.launching') :
            t('connectDesktopButton.connectDesktop')}
+          {status === 'idle' && !error && (
+            <span className="sr-only"> {t('connectDesktopButton.opensNewWindow')}</span>
+          )}
         </button>
         {fallbackContent}
         {deniedContent}
       {endingContent}
         {revokedContent}
+        {loginWindowContent}
+        {startFailedContent}
         {pickerModal}
       </div>
     );
@@ -951,22 +1139,36 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
       <button
         type="button"
         onClick={handleClick}
-        disabled={disabled || status === 'creating' || status === 'launching'}
+        // #9026: `disabled` (offline etc.) keeps the button in the Tab order so
+        // its reason is reachable; handleClick already ignores the click. Only
+        // the in-flight states use the native attribute.
+        disabled={status === 'creating' || status === 'launching'}
+        aria-disabled={disabled || undefined}
         title={error || (disabled ? disabledTitle : undefined)}
-        className={`flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 ${error ? 'border-red-300 bg-red-50 text-red-600 hover:bg-red-100 dark:border-red-800 dark:bg-red-950 dark:text-red-400 dark:hover:bg-red-900' : 'bg-background hover:bg-muted'}`}
+        aria-describedby={disabled && disabledTitle ? reasonId : undefined}
+        className={`flex h-9 items-center gap-2 rounded-md border px-4 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60 aria-disabled:cursor-not-allowed aria-disabled:text-muted-foreground ${error ? 'border-red-300 bg-red-50 text-red-600 hover:bg-red-100 dark:border-red-800 dark:bg-red-950 dark:text-red-400 dark:hover:bg-red-900' : 'bg-background hover:bg-muted aria-disabled:hover:bg-background'}`}
       >
         <Monitor className="h-4 w-4" />
         {error ? t('connectDesktopButton.errors.connectionFailed') :
          status === 'creating' ? t('connectDesktopButton.creatingSession') :
          status === 'launching' ? t('connectDesktopButton.launchingViewer') :
          t('connectDesktopButton.connectDesktop')}
-        {status === 'idle' && !error && <ExternalLink className="w-3.5 h-3.5 opacity-60" />}
+        {/* #9030: the icon is decorative, so the label itself says where it goes. */}
+        {status === 'idle' && !error && (
+          <>
+            <span className="sr-only"> {t('connectDesktopButton.opensNewWindow')}</span>
+            <ExternalLink className="w-3.5 h-3.5 opacity-60" aria-hidden="true" />
+          </>
+        )}
       </button>
+      {disabled && disabledTitle && <span id={reasonId} className="sr-only">{disabledTitle}</span>}
 
       {fallbackContent}
       {deniedContent}
       {endingContent}
       {revokedContent}
+        {loginWindowContent}
+        {startFailedContent}
       {pickerModal}
     </div>
   );

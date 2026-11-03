@@ -35,8 +35,18 @@ function project(columns: Record<string, unknown>): Array<Record<string, unknown
   return [out];
 }
 
+// Logout's durable signed-out record commits in its own system transaction;
+// this suite exercises the route around it, so the write itself is stubbed
+// (auth.logout.test.ts and portalLogoutRevocation.integration.test.ts cover it).
+const revokePortalSessionDurably = vi.hoisted(() => vi.fn(async (_token: string, _userId: string) => undefined));
+vi.mock('../../services/portal/sessionRevocation', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/portal/sessionRevocation')>()),
+  revokePortalSessionDurably,
+}));
+
 vi.mock('../../db', () => ({
   db: {
+    update: () => ({ set: () => ({ where: () => Promise.resolve([]) }) }),
     select: (columns: Record<string, unknown>) => ({
       from: () => ({
         where: () => ({ limit: () => Promise.resolve(project(columns)) }),
@@ -59,6 +69,10 @@ vi.mock('../../db/schema', () => ({
     status: 'status',
   },
   portalBranding: { orgId: 'orgId', enablePasswordReset: 'enablePasswordReset' },
+}));
+vi.mock('../../services/password', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/password')>()),
+  verifyPassword: vi.fn(async () => true),
 }));
 vi.mock('../../services/email', () => ({ getEmailService: () => null }));
 vi.mock('../../services/tenantStatus', () => ({
@@ -204,5 +218,40 @@ describe('POST /auth/logout — disabled portal user', () => {
     });
 
     expect(res.status).toBe(200);
+  });
+});
+
+// The projection mock serves every select from portalUserRow, so `orgName`
+// on the row models the organizations.name the route must look up.
+describe('POST /auth/login — organization name in the user payload', () => {
+  it('carries the organization name, not the generic fallback', async () => {
+    portalUserRow.current = {
+      ...portalUserRow.current,
+      passwordHash: 'stored-hash',
+      orgName: 'Default Organization',
+    };
+    const app = new Hono();
+    app.route('/', authRoutes);
+
+    const res = await app.request('/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'cust@acme.example', password: 'pw', orgId: ORG_ID }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.user.orgName).toBe('Default Organization');
+    expect(body.user.organizationName).toBe('Default Organization');
+  });
+
+  it('surfaces the organization name on portalAuth for /profile and /me', async () => {
+    seedSession();
+    portalUserRow.current = { ...portalUserRow.current, orgName: 'Default Organization' };
+    const app = new Hono();
+    app.use('*', portalAuthMiddleware);
+    app.get('/p', (c) => c.json({ orgName: c.get('portalAuth').user.orgName }));
+    const res = await app.request('/p', { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(await res.json()).toEqual({ orgName: 'Default Organization' });
   });
 });

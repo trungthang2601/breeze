@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, normalize } from 'node:path';
@@ -22,6 +22,15 @@ import { fileURLToPath } from 'node:url';
 //     files change (the cross-area scan below keeps that list honest).
 
 const REPO_ROOT = normalize(join(dirname(fileURLToPath(import.meta.url)), '..', '..'));
+// Deliberately omit the QEMU list: these harnesses retain its fail-closed behavior.
+function copyPolicyFiles(dir) {
+  mkdirSync(join(dir, '.github/scripts'), { recursive: true });
+  for (const file of ['classify-pr-paths.sh', 'integration-floor-paths.txt', 'path-reader-map.txt']) {
+    const source = new URL(`./${file}`, import.meta.url);
+    if (existsSync(source)) copyFileSync(source, join(dir, '.github/scripts', file));
+  }
+}
+
 const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
 const job = (name) => {
   const match = workflow.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-z][\\w-]*:|$(?![\\s\\S]))`, 'm'));
@@ -43,7 +52,7 @@ const areasOf = (out) => Object.fromEntries(AREAS.map((a) => [a, out[a]]));
 const expectAreas = (on) => Object.fromEntries(AREAS.map((a) => [a, on === 'all' || on.includes(a) ? 'true' : 'false']));
 
 // ─── Classifier: per-area rules ─────────────────────────────────────────
-test('classifier: emits every area output, in order, after code/docs/agent/app, then topology_browser', () => {
+test('classifier: emits every area output, in order, after code/docs/agent/app, then topology_browser, agent_code, integration', () => {
   const run = spawnSync('bash', [new URL('./classify-pr-paths.sh', import.meta.url).pathname], {
     encoding: 'utf8', input: 'apps/api/src/index.ts\n',
   });
@@ -51,7 +60,8 @@ test('classifier: emits every area output, in order, after code/docs/agent/app, 
   assert.deepEqual(
     run.stdout.trim().split('\n').map((l) => l.split('=')[0]),
     // topology_browser (#6117) is a single-job gate, not an area; it trails the areas.
-    ['code', 'docs', 'agent', 'app', ...AREAS, 'topology_browser'],
+    // integration (#5936) gates one job, not an area; it trails everything.
+    ['code', 'docs', 'agent', 'app', ...AREAS, 'topology_browser', 'agent_code', 'integration', 'path_readers', 'reader_tests'],
   );
 });
 
@@ -59,6 +69,8 @@ for (const [paths, on] of [
   // api-only. apps/api/** is read by nothing outside the api area except the
   // portal's visibility-gate test (apps/api/src/routes/portal/**), below.
   [['apps/api/src/services/foo.ts'], ['api']],
+  [['apps/api/src/routes/devices/networkIsolation.ts'], ['api']],
+  [['apps/api/src/routes/agents/isolationVerify.ts'], ['api']],
   [['apps/api/migrations/2026-10-01-x.sql'], ['api']],
   [['apps/api/src/routes/devices/core.ts', 'apps/api/package.json'], ['api']],
   // web — test-api's repo-wide contract suites (exchangeRateBoundary,
@@ -102,6 +114,12 @@ for (const [paths, on] of [
   });
 }
 
+test('classifier: a packages/shared-only diff is code+app, so it reaches test-shared (#8373)', () => {
+  const out = classify(['packages/shared/src/validators/timeSync.settings.test.ts']);
+  assert.equal(out.code, 'true');
+  assert.equal(out.app, 'true');
+});
+
 test('classifier: shared/global inputs set every area', () => {
   for (const path of [
     'packages/shared/src/types/device.ts',
@@ -132,7 +150,6 @@ test('classifier: shared/global inputs set every area', () => {
 
 test('classifier: FAIL OPEN — a code path matching no area rule sets every area', () => {
   for (const path of [
-    'agent/internal/heartbeat/heartbeat.go',
     'e2e-tests/tests/login.spec.ts',
     'load-tests/k6/devices.js',
     'deploy/docker-compose.prod.yml',
@@ -180,6 +197,7 @@ test('classifier: a tooling-only (app=false) change always sets api, so check-mi
 // is a test that would be silently skipped. Directory enumeration
 // (readdirSync over apps/*) cannot be found this way; those are pinned below.
 const AREA_DIRS = {
+  agent: ['agent'],
   api: ['apps/api'],
   web: ['apps/web'],
   portal: ['apps/portal'],
@@ -189,13 +207,18 @@ const AREA_DIRS = {
 };
 const OWNED_DIRS = [...Object.values(AREA_DIRS).flat(), 'apps/mobile'];
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'target', 'coverage', 'gen', 'locales', 'build']);
-const SOURCE_EXT = /\.(ts|tsx|mts|cts|js|mjs|cjs|astro|json|toml|rs|sh|ya?ml)$/u;
+const SOURCE_EXT = /\.(ts|tsx|mts|cts|js|mjs|cjs|astro|json|toml|rs|go|sh|ya?ml)$/u;
+// Generated data that embeds documentation prose verbatim. A quoted repo path
+// in it (e.g. the docs mentioning `'apps/mobile'`) is text served to the AI
+// search tool, not a path the code reads.
+const SKIP_FILES = new Set(['apps/api/src/data/docsIndex.json']);
 function* walk(dir) {
   let entries;
   try { entries = readdirSync(join(REPO_ROOT, dir), { withFileTypes: true }); } catch { return; }
   for (const e of entries) {
     if (SKIP_DIRS.has(e.name) || e.name.startsWith('.')) continue;
     const p = `${dir}/${e.name}`;
+    if (SKIP_FILES.has(p)) continue;
     if (e.isDirectory()) yield* walk(p);
     else if (SOURCE_EXT.test(e.name)) yield p;
   }
@@ -209,28 +232,60 @@ const crossAreaRefs = () => {
           if (/^\s*(\/\/|\*|\/\*|#)/u.test(line)) return;
           const targets = [];
           for (const m of line.matchAll(/['"`]((?:\.\.\/)+[^'"`$\s]*)/gu)) targets.push(normalize(join(dirname(file), m[1])));
-          for (const m of line.matchAll(/['"`](apps\/[a-z0-9-]+(?:\/[^'"`$\s:]*)?)/gu)) targets.push(normalize(m[1]));
-          for (const m of line.matchAll(/['"`]apps['"`]\s*,\s*['"`]([a-z0-9-]+)['"`]/gu)) targets.push(`apps/${m[1]}`);
-          for (const target of targets) {
-            const owner = OWNED_DIRS.find((d) => target === d || target.startsWith(`${d}/`));
-            if (!owner || AREA_DIRS[area].includes(owner)) continue;
-            refs.push({ area, target: target.replace(/\/$/u, ''), at: `${file}:${i + 1}` });
-          }
+          for (const m of line.matchAll(/['"`]((?:apps|agent|packages)\/[a-z0-9-]+(?:\/[^'"`$\s:]*)?)/gu)) targets.push(normalize(m[1]));
+          // The `'apps', '<x>'` join form is apps-only: `'agent'`/`'packages'` are
+          // ordinary words in string arrays (`['agent', 'linux']`). Go joins are
+          // handled whole-file below (they span lines).
+          if (!file.endsWith('.go')) for (const m of line.matchAll(/['"`]apps['"`]\s*,\s*['"`]([a-z0-9-]+)['"`]/gu)) targets.push(`apps/${m[1]}`);
+          pushRefs(area, targets, `${file}:${i + 1}`);
         });
+        if (file.endsWith('.go')) {
+          // filepath.Join("..", "..", "apps", "api", ...) — collect every quoted
+          // segment of the call, across lines, and resolve it from the file's dir.
+          const text = readFileSync(join(REPO_ROOT, file), 'utf8');
+          for (const m of text.matchAll(/filepath\.Join\(([^)]*)\)/gu)) {
+            const segs = [...m[1].matchAll(/"([^"]+)"/gu)].map((s) => s[1]);
+            if (!segs.length) continue;
+            const line = text.slice(0, m.index).split('\n').length;
+            pushRefs(area, [normalize(join(dirname(file), ...segs))], `${file}:${line}`);
+          }
+        }
       }
     }
   }
   return refs;
+  function pushRefs(area, targets, at) {
+    for (const target of targets) {
+      // A literal that happens to start with agent/ or packages/ but names
+      // nothing in the tree (`'agent/linux'`, `"../packages/dpkg"`) is not a read.
+      if ((target.startsWith('agent/') || target.startsWith('packages/')) && !existsSync(join(REPO_ROOT, target))) continue;
+      const owner = OWNED_DIRS.find((d) => target === d || target.startsWith(`${d}/`));
+      if (!(area === 'agent' && target.startsWith('packages/')) && (!owner || AREA_DIRS[area].includes(owner))) continue;
+      refs.push({ area, target: target.replace(/\/$/u, ''), at });
+    }
+  }
 };
 
 test('cross-area scan finds the known references (guards against a vacuous scan)', () => {
   const refs = crossAreaRefs();
   const seen = new Set(refs.map((r) => `${r.area} ${r.target}`));
   for (const known of [
+    'agent apps/api/src/routes/agents/schemas.ts',
+    'agent apps/api/src/routes/agentWs.ts',
+    'agent apps/web/public/scripts/uninstall.sh',
+    'agent packages/shared/src/testing/topology-unifi-v1.json',
+    // Go filepath.Join across two lines (budget_contract_test.go:23-24).
+    'agent apps/api/src/__tests__/integration/agentHotPathQueryBudget.integration.test.ts',
+    // The reverse direction: API tests that parse agent sources.
+    'api agent/internal/heartbeat/heartbeat.go',
+    'api agent/installer',
+    'api agent/installer/breeze.wxs',
     'api apps/web/src/components/ai-risk/tierConfig',
     'api apps/viewer/src',
     'api apps/portal/src',
     'portal apps/api/src/routes/portal/tickets.ts',
+    'web apps/api/src/services/accounting/types.ts',
+    'web apps/api/src/services/monitors',
   ]) {
     assert.ok(seen.has(known), `scanner no longer finds "${known}" — it is stale, or the reference moved`);
   }
@@ -248,7 +303,7 @@ test('every cross-area reference sets the reading area when the referenced path 
       : existsSync(abs) ? [target] : ['.ts', '.tsx', '.js', '.mjs'].map((ext) => `${target}${ext}`).filter((p) => existsSync(join(REPO_ROOT, p)));
     if (probes.length === 0) missing.push(`${area} ← ${target} (${at}): referenced path does not exist; fix the scanner`);
     for (const probe of probes) {
-      if (classify([probe])[area] !== 'true') missing.push(`${area} ← ${probe} (${at})`);
+      if (classify([probe])[area === 'agent' ? 'agent_code' : area] !== 'true') missing.push(`${area} ← ${probe} (${at})`);
     }
   }
   assert.deepEqual(missing, [], 'add a cross-area rule to classify-pr-paths.sh for each of these');
@@ -260,7 +315,6 @@ test('every app Dockerfile and package.json sets api (test-api enumerates them)'
   for (const app of apps) {
     for (const file of ['Dockerfile', 'package.json']) {
       if (!existsSync(join(REPO_ROOT, 'apps', app, file))) continue;
-      if (app === 'docs') continue; // docs-only classification owns apps/docs/**
       assert.equal(classify([`apps/${app}/${file}`]).api, 'true', `apps/${app}/${file}`);
     }
   }
@@ -303,13 +357,17 @@ test('merge_group: an unresolvable entry and a non-PR event set every area (full
     const out = runChangesStep(env);
     assert.equal(out.code, 'true', JSON.stringify(env));
     assert.deepEqual(areasOf(out), expectAreas('all'), JSON.stringify(env));
+    assert.equal(out.integration, 'true', JSON.stringify(env));
   }
 });
 
 // ─── Job gating ─────────────────────────────────────────────────────────
 const APP_IF = "needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'";
 const AREA_JOBS = {
-  api: ['test-api', 'integration-test', 'check-migrations-nonsuperuser', 'build-api'],
+  agent_code: ['build-agent', 'lint-agent', 'test-agent', 'agent-windows-manifest-guard', 'test-agent-windows', 'windows-runtime-smoke'],
+  // integration-test is NOT here: it has its own, narrower `integration` output
+  // (#5936), asserted at the bottom of this file and in classify-pr-paths.test.mjs.
+  api: ['test-api', 'check-migrations-nonsuperuser', 'build-api'],
   web: ['test-web', 'build-web'],
   portal: ['test-portal', 'build-portal'],
   addins: ['test-office-addin-core', 'test-excel-addin', 'test-word-addin', 'test-powerpoint-addin', 'test-outlook-addin'],
@@ -339,15 +397,44 @@ for (const name of STACK_JOBS) {
     assert.match(job(name), new RegExp(`^    if: ${escape(STACK_IF)}$`, 'mu'));
   });
 }
+// #8373: packages/shared's vitest suite (4.6k tests) used to run nowhere in CI.
+// It is an app-gated job (any packages/** diff sets code+app), not area-gated:
+// shared is a dependency of every area.
+test('test-shared runs the packages/shared vitest suite, gated on code AND app (#8373)', () => {
+  assert.match(job('test-shared'), new RegExp(`^    if: ${escape(APP_IF)}$`, 'mu'));
+  assert.match(job('test-shared'), /^        run: pnpm --filter @breeze\/shared exec vitest run$/mu);
+  assert.doesNotMatch(job('test-shared'), /^    if: .*outputs\.(api|web|portal|addins|m365|rust) ==/mu);
+});
+test('ci-success needs test-shared and asserts it in both the app and non-app branches (#8373)', () => {
+  assert.match(workflow, /^  ci-success:\n(?:.*\n)*?    needs: \[[^\]]*\btest-shared\b[^\]]*\]/mu);
+  assert.match(summary, /^          TEST_SHARED_RESULT: \$\{\{ needs\.test-shared\.result \}\}$/mu);
+  assert.match(summary, /\[\[ "\$\{TEST_SHARED_RESULT\}" != "success" \]\]/u);
+  assert.match(summary, /\[\[ "\$\{TEST_SHARED_RESULT\}" != "skipped" \]\]/u);
+});
+// #9414 W1a: @breeze/document-ui is consumed by web and portal; its own suite and
+// typecheck run in an app-gated job (any packages/** diff sets code+app), not
+// area-gated, like test-shared.
+test('test-document-ui runs the package suite and typecheck, gated on code AND app (#9414)', () => {
+  assert.match(job('test-document-ui'), new RegExp(`^    if: ${escape(APP_IF)}$`, 'mu'));
+  assert.match(job('test-document-ui'), /^        run: pnpm --filter @breeze\/document-ui exec vitest run$/mu);
+  assert.match(job('test-document-ui'), /^        run: pnpm --filter=@breeze\/document-ui typecheck$/mu);
+  assert.doesNotMatch(job('test-document-ui'), /^    if: .*outputs\.(api|web|portal|addins|m365|rust) ==/mu);
+});
+test('ci-success needs test-document-ui and asserts it in both branches (#9414)', () => {
+  assert.match(workflow, /^  ci-success:\n(?:.*\n)*?    needs: \[[^\]]*\btest-document-ui\b[^\]]*\]/mu);
+  assert.match(summary, /^          TEST_DOCUMENT_UI_RESULT: \$\{\{ needs\.test-document-ui\.result \}\}$/mu);
+  assert.match(summary, /\[\[ "\$\{TEST_DOCUMENT_UI_RESULT\}" != "success" \]\]/u);
+  assert.match(summary, /\[\[ "\$\{TEST_DOCUMENT_UI_RESULT\}" != "skipped" \]\]/u);
+});
 test('jobs that must never be area-gated are not', () => {
   for (const name of ['changes', 'lint', 'typecheck', 'security-audit', 'workspace-runtime', 'docs-check', 'ci-success',
-    'auth-browser-transition-browser-contract', 'test-viewer', 'test-mobile', 'test-agent', 'build-agent']) {
+    'auth-browser-transition-browser-contract', 'test-document-ui', 'test-viewer', 'test-mobile']) {
     assert.doesNotMatch(job(name), /^    if: .*outputs\.(api|web|portal|addins|m365|rust) ==/mu, name);
   }
 });
 
 // ─── ci-success tri-state ───────────────────────────────────────────────
-const FLAG = { api: 'API_CHANGED', web: 'WEB_CHANGED', portal: 'PORTAL_CHANGED', addins: 'ADDINS_CHANGED', m365: 'M365_CHANGED', rust: 'RUST_CHANGED' };
+const FLAG = { agent_code: 'AGENT_CODE_CHANGED', api: 'API_CHANGED', web: 'WEB_CHANGED', portal: 'PORTAL_CHANGED', addins: 'ADDINS_CHANGED', m365: 'M365_CHANGED', rust: 'RUST_CHANGED' };
 const resultVar = (name) => `${name.toUpperCase().replace(/-/gu, '_')}_RESULT`;
 const triState = (flag, rv) => new RegExp(
   `\\{ \\[\\[ "\\$\\{${flag}\\}" == "true" \\]\\] && \\[\\[ "\\$\\{${rv}\\}" != "success" \\]\\]; \\} \\|\\| \\\\\\n\\s*`
@@ -372,6 +459,14 @@ for (const [area, jobs] of Object.entries(AREA_JOBS)) {
   }
 }
 
+// check-migrations (#7032): gated on code AND api, so it is outside AREA_JOBS, but
+// an api change must still REQUIRE it green. It used to be asserted only when
+// app=false, so a red migration-naming/replay/immutability guard passed CI Success
+// on every API PR.
+test('ci-success asserts check-migrations with the three-branch API_CHANGED pattern (#7032)', () => {
+  assert.match(summary, triState('API_CHANGED', 'CHECK_MIGRATIONS_RESULT'));
+});
+
 // Execute the real summary shell.
 const summaryScript = summary.split('        run: |\n')[1]
   .split('\n').filter((line) => line.startsWith('          '))
@@ -384,23 +479,29 @@ const STACK_VARS = STACK_JOBS.map(resultVar);
 // jobs skipped, exactly as their `if:` would leave them.
 const onlyAreas = (on, { isPr = 'true' } = {}) => {
   const env = {
-    ...allResults('success'),
+    ...allResults('success'), PATH_READERS_CHANGED: 'true',
     CHANGES_RESULT: 'success', CODE_CHANGED: 'true', DOCS_CHANGED: 'false', DOCS_CHECK_RESULT: 'skipped',
     APP_CHANGED: 'true', AGENT_CHANGED: 'false', RECOVERY_MEDIA_E2E_RESULT: 'skipped',
     MOBILE_NATIVE_REQUIRED: 'false', BUILD_MOBILE_IOS_RESULT: 'skipped', IS_PR: isPr,
   };
-  for (const area of AREAS) {
+  for (const area of [...AREAS, 'agent_code']) {
     const changed = on.includes(area);
     env[FLAG[area]] = changed ? 'true' : 'false';
     if (!changed) for (const v of gatedVars[area]) env[v] = 'skipped';
   }
   if (!on.includes('api')) env.CHECK_MIGRATIONS_RESULT = 'skipped';
+  // Integration rides its own flag; model it as following api here (the PR gate is
+  // never wider than api — pinned below), the tri-state lives in classify-pr-paths.test.mjs.
+  env.INTEGRATION_CHANGED = on.includes('api') ? 'true' : 'false';
+  if (!on.includes('api')) env.INTEGRATION_TEST_RESULT = 'skipped';
   if (!['api', 'web', 'portal'].some((a) => on.includes(a))) for (const v of STACK_VARS) env[v] = 'skipped';
   return env;
 };
 const runSummary = (env) => spawnSync('bash', ['-e', '-c', summaryScript], { encoding: 'utf8', env: { ...process.env, ...env } });
 
 for (const [label, env, passes] of [
+  ['agent flag alone (api would be true on a real agent PR; the summary accepts the shape)', onlyAreas(['agent_code']), true],
+  ['agent flag alone, merge queue, integration ungated', { ...onlyAreas(['agent_code'], { isPr: 'false' }), INTEGRATION_CHANGED: 'true', INTEGRATION_TEST_RESULT: 'success' }, true],
   ['api-only PR, other areas skipped', onlyAreas(['api']), true],
   ['api-only merge-queue entry, other areas skipped', onlyAreas(['api'], { isPr: 'false' }), true],
   ['addins-only merge-queue entry: smoke jobs correctly skipped', onlyAreas(['addins'], { isPr: 'false' }), true],
@@ -411,7 +512,9 @@ for (const [label, env, passes] of [
   ['every area changed, all green', onlyAreas(AREAS), true],
   ['every area changed, all green, merge queue', onlyAreas(AREAS, { isPr: 'false' }), true],
   ['api-only: check-migrations ran although api=false?', { ...onlyAreas(['web']), CHECK_MIGRATIONS_RESULT: 'success' }, false],
-  ['api changed: check-migrations red stays non-blocking for an application PR', { ...onlyAreas(['api']), CHECK_MIGRATIONS_RESULT: 'failure' }, true],
+  ['api changed: check-migrations red blocks an application PR (#7032)', { ...onlyAreas(['api']), CHECK_MIGRATIONS_RESULT: 'failure' }, false],
+  ['api changed: check-migrations skipped (job vanished) blocks (#7032)', { ...onlyAreas(['api']), CHECK_MIGRATIONS_RESULT: 'skipped' }, false],
+  ['api changed: check-migrations red blocks a merge-queue entry (#7032)', { ...onlyAreas(['api'], { isPr: 'false' }), CHECK_MIGRATIONS_RESULT: 'failure' }, false],
 ]) {
   test(`CI Success (areas): ${label}`, () => {
     const r = runSummary(env);
@@ -479,7 +582,7 @@ test('merge_group: a rename out of an area sets that area too', () => {
     git('mv', 'apps/excel-addin/src/shared.ts', 'apps/web/src/shared.ts');
     git('commit', '-q', '-m', 'move');
     const head = git('rev-parse', 'HEAD');
-    writeFileSync(join(dir, '.github/scripts/classify-pr-paths.sh'), readFileSync(new URL('./classify-pr-paths.sh', import.meta.url)));
+    copyPolicyFiles(dir);
     const outputFile = join(dir, 'gh-output');
     writeFileSync(outputFile, '');
     const r = spawnSync('bash', ['-c', classifyScript], {
@@ -508,3 +611,218 @@ for (const flag of Object.values(FLAG)) {
     });
   }
 }
+
+// ─── #5936: the integration-test PR gate, derived from the suite's sources ──
+// `integration` (--pull-request only) skips the 16-shard real-Postgres job for
+// paths the suite cannot read. A wrong `false` silently skips it on a PR (the
+// merge queue still runs it — it is never gated there), so the map is re-derived
+// here from what the job actually executes, not trusted by hand:
+//   1. every include glob of every integration vitest config the job runs;
+//   2. every repo path referenced (relative `../` import/read, a repo-root
+//      `apps/<x>` literal, an `'apps', '<x>'` join) by code the suite can reach —
+//      apps/api (minus its unit tests), ee/, and every workspace package reachable
+//      from their package.json manifests;
+//   3. every compose file and pnpm filter the integration-test job invokes.
+// Each of those must classify integration=true on a PR.
+const classifyPrGate = (paths) => {
+  const run = spawnSync('bash', [new URL('./classify-pr-paths.sh', import.meta.url).pathname, '--pull-request'], {
+    encoding: 'utf8',
+    input: paths.join('\n') + (paths.length ? '\n' : ''),
+  });
+  assert.equal(run.status, 0, run.stderr);
+  return Object.fromEntries(run.stdout.trim().split('\n').map((l) => l.split('=')));
+};
+
+const pkgDirByName = (() => {
+  const map = {};
+  for (const root of ['apps', 'packages', 'ee']) {
+    for (const e of readdirSync(join(REPO_ROOT, root), { withFileTypes: true })) {
+      const manifest = join(REPO_ROOT, root, e.name, 'package.json');
+      if (e.isDirectory() && existsSync(manifest)) map[JSON.parse(readFileSync(manifest, 'utf8')).name] = `${root}/${e.name}`;
+    }
+  }
+  return map;
+})();
+
+// apps/api and the built-in extensions it boots/tests, plus their workspace deps, transitively.
+const integrationPackageDirs = (() => {
+  const seen = new Set();
+  const queue = ['apps/api', ...readdirSync(join(REPO_ROOT, 'ee'), { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => `ee/${e.name}`)];
+  while (queue.length) {
+    const dir = queue.shift();
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const manifest = JSON.parse(readFileSync(join(REPO_ROOT, dir, 'package.json'), 'utf8'));
+    for (const deps of [manifest.dependencies, manifest.devDependencies, manifest.peerDependencies, manifest.optionalDependencies]) {
+      for (const [name, spec] of Object.entries(deps ?? {})) {
+        if (String(spec).startsWith('workspace:')) {
+          assert.ok(pkgDirByName[name], `${dir} depends on unknown workspace package ${name}`);
+          queue.push(pkgDirByName[name]);
+        }
+      }
+    }
+  }
+  return [...seen];
+})();
+
+// A unit test is not integration-reachable; an integration suite (or anything
+// under src/__tests__/integration) is.
+const isUnitTest = (file) => /\.test\.[cm]?[jt]sx?$/u.test(file)
+  && !/\.integration\.test\.ts$/u.test(file)
+  && !file.includes('/src/__tests__/integration/');
+
+const integrationRefs = () => {
+  const refs = [];
+  for (const dir of integrationPackageDirs) {
+    for (const file of walk(dir)) {
+      if (isUnitTest(file)) continue;
+      readFileSync(join(REPO_ROOT, file), 'utf8').split('\n').forEach((line, i) => {
+        if (/^\s*(\/\/|\*|\/\*|#)/u.test(line)) return;
+        const targets = [];
+        for (const m of line.matchAll(/['"`]((?:\.\.\/)+[^'"`$\s]*)/gu)) targets.push(normalize(join(dirname(file), m[1])));
+        for (const m of line.matchAll(/['"`](apps\/[a-z0-9-]+(?:\/[^'"`$\s:]*)?)/gu)) targets.push(normalize(m[1]));
+        for (const m of line.matchAll(/['"`]apps['"`]\s*,\s*['"`]([a-z0-9-]+)['"`]/gu)) targets.push(`apps/${m[1]}`);
+        for (const target of targets) {
+          if (target.startsWith('..')) continue; // outside the repo
+          refs.push({ target: target.replace(/\/$/u, ''), at: `${file}:${i + 1}` });
+        }
+      });
+    }
+  }
+  return refs;
+};
+const probeFor = (target) => {
+  const abs = join(REPO_ROOT, target);
+  return existsSync(abs) && statSync(abs).isDirectory() ? `${target}/probe.ts` : target;
+};
+
+test('integration gate: the reachable package set is derived, not hardcoded', () => {
+  for (const must of ['apps/api', 'packages/shared', 'packages/extension-sdk', 'ee/workspace']) {
+    assert.ok(integrationPackageDirs.includes(must), `${must} missing from ${integrationPackageDirs.join(', ')}`);
+  }
+  assert.ok(!integrationPackageDirs.includes('apps/web'), 'apps/web must not be reachable from the API manifests');
+});
+
+test('integration gate: the reference scan finds the known cross-directory reads (guards against a vacuous scan)', () => {
+  const seen = new Set(integrationRefs().map((r) => r.target));
+  for (const known of [
+    'packages/shared/src/fixtures/scanPath.json', // filesystemMultiVolumeMigration.integration.test.ts
+    'packages/shared/src/testing/topologyFixtures', // topologyDigestIngest / baseline suites
+    'apps/api/migrations', // replayMigration.ts and the readFileSync replays
+    'apps/api/scripts/topology-migrate', // topology-rollout / legacy-import suites
+    '.env.test', // every integration vitest config loads it
+  ]) {
+    assert.ok(seen.has(known), `scanner no longer finds "${known}" — it is stale, or the reference moved`);
+  }
+});
+
+test('integration gate: every repo path integration-reachable code references is integration=true on a PR', () => {
+  const missing = [];
+  for (const { target, at } of integrationRefs()) {
+    if (classifyPrGate([probeFor(target)]).integration !== 'true') missing.push(`${target} (${at})`);
+  }
+  assert.deepEqual(missing, [], 'the integration suite reads these; classify them integration=true in classify-pr-paths.sh');
+});
+
+test('integration gate: every include glob of every integration config the job runs is integration=true', () => {
+  const configs = ['apps/api/vitest.integration.config.ts', 'apps/api/vitest.config.request-db-role.ts', 'apps/api/vitest.config.rls-coverage.ts',
+    ...integrationPackageDirs.filter((d) => d.startsWith('ee/')).map((d) => `${d}/vitest.integration.config.ts`).filter((f) => existsSync(join(REPO_ROOT, f)))];
+  let globs = 0;
+  for (const config of configs) {
+    // Drop comment lines first: one inside the include list quotes `::text[]`.
+    const src = readFileSync(join(REPO_ROOT, config), 'utf8').split('\n').filter((l) => !/^\s*\/\//u.test(l)).join('\n');
+    const include = src.match(/include:\s*\[([\s\S]*?)\]/u);
+    assert.ok(include, `${config}: no include list`);
+    for (const m of include[1].matchAll(/'([^']+)'/gu)) {
+      globs += 1;
+      const prefix = m[1].split('*')[0];
+      const probe = `${dirname(config)}/${prefix}${prefix.endsWith('.ts') ? '' : 'x.integration.test.ts'}`;
+      assert.equal(classifyPrGate([probe]).integration, 'true', `${config}: ${m[1]}`);
+    }
+  }
+  assert.ok(globs > 20, 'integration include parser is stale');
+});
+
+test('integration gate: every compose file and pnpm package the integration-test job invokes is integration=true', () => {
+  const body = job('integration-test');
+  const compose = [...body.matchAll(/docker compose -f (\S+)/gu)].map((m) => m[1]);
+  const filters = [...body.matchAll(/--filter[= ](@breeze\/[a-z0-9-]+)/gu)].map((m) => m[1]);
+  assert.ok(compose.includes('docker-compose.test.yml'), 'compose parser is stale');
+  assert.ok(filters.includes('@breeze/api') && filters.includes('@breeze/ext-workspace'), 'filter parser is stale');
+  for (const file of compose) assert.equal(classifyPrGate([file]).integration, 'true', file);
+  for (const name of filters) {
+    assert.ok(pkgDirByName[name], name);
+    assert.equal(classifyPrGate([`${pkgDirByName[name]}/src/probe.ts`]).integration, 'true', name);
+    assert.ok(integrationPackageDirs.includes(pkgDirByName[name]), `${name} is run by the job but not in the derived package set`);
+  }
+});
+
+test('integration gate: the excluded directories are exactly the ones no integration-reachable code touches', () => {
+  // The only paths the PR gate may classify false. Each is a whole app (or the Go
+  // agent / root Rust manifests) that no reachable package depends on, and the
+  // reference scan above proves nothing reachable reads into it.
+  const excluded = [
+    'agent/internal/x.go', 'apps/web/src/x.ts', 'apps/portal/src/x.ts', 'apps/viewer/src/x.ts', 'apps/helper/src/x.ts',
+    'apps/mobile/src/x.ts', 'apps/excel-addin/src/x.ts', 'apps/word-addin/src/x.ts', 'apps/powerpoint-addin/src/x.ts',
+    'apps/outlook-addin/src/x.ts', 'apps/m365-graph-read-executor/src/x.ts', 'apps/m365-graph-actions-executor/src/x.ts',
+    'apps/m365-communications-executor/src/x.ts', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml',
+  ];
+  for (const probe of excluded) assert.equal(classifyPrGate([probe]).integration, 'false', probe);
+  const reachable = integrationPackageDirs;
+  for (const probe of excluded) {
+    const top = probe.split('/').slice(0, probe.startsWith('apps/') ? 2 : 1).join('/');
+    assert.ok(!reachable.some((d) => d === top), `${top} is reachable from the API manifests but excluded from the gate`);
+  }
+});
+
+test('integration gate: on a PR it is never wider than api (integration=true ⇒ api=true)', () => {
+  for (const path of [
+    'apps/api/src/x.ts', 'apps/api/migrations/x.sql', 'packages/shared/src/x.ts', 'ee/workspace/src/x.ts', 'pnpm-lock.yaml',
+    'package.json', 'docker-compose.test.yml', '.github/workflows/ci.yml', '.github/scripts/x.mjs', 'e2e-tests/x.ts',
+    'some-new-dir/x.ts', 'apps/web/src/x.ts', 'agent/x.go', 'apps/mobile/src/x.ts', 'apps/excel-addin/src/x.ts', 'Cargo.lock',
+  ]) {
+    const out = classifyPrGate([path]);
+    if (out.integration === 'true') assert.equal(out.api, 'true', path);
+  }
+});
+
+for (const file of ['apps/api/src/routes/devices/networkIsolation.ts', 'apps/api/src/routes/agents/isolationVerify.ts']) {
+  test(`network isolation route schedules integration: ${file}`, () => { assert.equal(classify([file]).integration, 'true'); });
+}
+
+// W15 PR A (#6785): new service paths stay in the API and integration gates.
+for (const file of ['pax8OrderPreview', 'aiToolSchemasPax8', 'aiToolsPax8', 'aiToolsPax8Orders']) {
+  test(`W15 ${file} runs API and integration checks`, () => {
+    const out = classify([`apps/api/src/services/${file}.ts`]);
+    assert.deepEqual(areasOf(out), expectAreas(['api']));
+    assert.equal(out.integration, 'true');
+    assert.equal(out.app, 'true');
+  });
+}
+
+
+// W15 PR B (#6785): the pinned money-surface digest and its real-DB proof.
+for (const file of [
+  'apps/api/src/services/actionIntents/pax8OrderDigest.ts',
+  'apps/api/src/__tests__/integration/aiToolsPax8OrderSubmitScope.integration.test.ts',
+]) {
+  test(`W15 PR B ${file} runs API and integration checks`, () => {
+    const out = classifyPrGate([file]);
+    assert.deepEqual(areasOf(out), expectAreas(['api']));
+    assert.equal(out.integration, 'true');
+    assert.equal(out.app, 'true');
+  });
+}
+
+// W1c: isolation bypass enforcement must schedule API and integration checks.
+test('network isolation bypass service schedules API and integration', () => {
+  const out = classify(['apps/api/src/services/networkIsolation/bypass.ts']);
+  assert.deepEqual(areasOf(out), expectAreas(['api']));
+  assert.equal(out.integration, 'true');
+});
+
+test('network isolation lifecycle service schedules API and integration', () => {
+  const out = classify(['apps/api/src/services/networkIsolation/lifecycle.ts']);
+  assert.deepEqual(areasOf(out), expectAreas(['api']));
+  assert.equal(out.integration, 'true');
+});

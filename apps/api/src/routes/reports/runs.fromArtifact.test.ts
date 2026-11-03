@@ -14,32 +14,38 @@ import { Hono } from 'hono';
  */
 const {
   getReportRunMock,
-  resolveArtifactMock,
+  findArtifactForAuthMock,
   writeRouteAuditMock,
   updateSets,
   updateWheres,
+  CALLER_AUTH,
 } = vi.hoisted(() => ({
   getReportRunMock: vi.fn(),
-  resolveArtifactMock: vi.fn(),
+  findArtifactForAuthMock: vi.fn(),
   writeRouteAuditMock: vi.fn(),
   updateSets: [] as unknown[],
   updateWheres: [] as unknown[],
+  CALLER_AUTH: {
+    user: { id: '11111111-1111-4111-8111-111111111111', email: 'tech@example.com' },
+    scope: 'organization',
+    orgId: '22222222-2222-4222-8222-222222222222',
+    partnerId: null,
+    accessibleOrgIds: ['22222222-2222-4222-8222-222222222222'],
+    canAccessOrg: (orgId: string) => orgId === '22222222-2222-4222-8222-222222222222',
+  },
 }));
 
 vi.mock('../../middleware/auth', () => ({
   authMiddleware: async (c: any, next: () => Promise<void>) => {
-    c.set('auth', {
-      user: { id: '11111111-1111-4111-8111-111111111111', email: 'tech@example.com' },
-      scope: 'organization',
-      orgId: '22222222-2222-4222-8222-222222222222',
-      partnerId: null,
-      accessibleOrgIds: ['22222222-2222-4222-8222-222222222222'],
-      canAccessOrg: (orgId: string) => orgId === '22222222-2222-4222-8222-222222222222',
-    });
+    c.set('auth', CALLER_AUTH);
     await next();
   },
   requireScope: () => async (_c: unknown, next: () => Promise<void>) => next(),
-  requirePermission: () => async (_c: unknown, next: () => Promise<void>) => next(),
+  // The real requirePermission populates `permissions` (auth.ts:919).
+  requirePermission: () => async (c: any, next: () => Promise<void>) => {
+    c.set('permissions', { permissions: [{ resource: '*', action: '*' }] });
+    await next();
+  },
 }));
 
 vi.mock('../../db', () => ({
@@ -121,15 +127,15 @@ vi.mock('./helpers', () => ({
   PORTAL_SELF_SERVICE_REPORT: 'portal_self_service',
 }));
 
-vi.mock('@breeze/shared', () => ({
+vi.mock('@breeze/shared', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@breeze/shared')>()),
   rowsToCsv: vi.fn(),
-  rowsToTsv: vi.fn(),
 }));
 
 vi.mock('../../services/sensitiveReadAudit', () => ({ auditSensitiveRead: vi.fn() }));
 vi.mock('../../services/auditEvents', () => ({ writeRouteAudit: writeRouteAuditMock }));
 vi.mock('../../services/artifacts/artifactService', () => ({
-  resolveArtifact: resolveArtifactMock,
+  findArtifactForAuth: findArtifactForAuthMock,
   openArtifactStream: vi.fn(),
 }));
 
@@ -164,7 +170,7 @@ beforeEach(() => {
     owner: { orgId: ORG_ID },
     authority: { scope: { kind: 'unrestricted' } },
   });
-  resolveArtifactMock.mockResolvedValue({
+  findArtifactForAuthMock.mockResolvedValue({
     id: ART, orgId: ORG_ID, runId: AI_RUN, name: 'findings.csv',
     contentType: 'text/csv', bytes: 40_112, sha256: 'f'.repeat(64),
   });
@@ -189,28 +195,46 @@ describe('POST /reports/runs/:id/attachments/from-artifact (spec §6.3)', () => 
     );
   });
 
-  it('resolves the handle against the RUN org, never the caller org', async () => {
+  it("resolves the handle through the caller's own auth context (object-level check, same helper GET /ai/artifacts/:id uses)", async () => {
     await attach();
-    expect(resolveArtifactMock).toHaveBeenCalledWith(ART, { orgId: ORG_ID });
+    expect(findArtifactForAuthMock).toHaveBeenCalledWith(ART, CALLER_AUTH);
+  });
+
+  it('refuses an artifact whose own org does not match the run org, even though the caller can read it', async () => {
+    // findArtifactForAuth alone only proves the CALLER may read the artifact
+    // somewhere — it must ALSO belong to the RUN's own org, or a sibling
+    // org's file could land on this report.
+    findArtifactForAuthMock.mockResolvedValue({
+      id: ART, orgId: 'ffffffff-ffff-4fff-8fff-ffffffffffff', runId: AI_RUN,
+      name: 'findings.csv', contentType: 'text/csv', bytes: 1, sha256: 'f'.repeat(64),
+    });
+    const res = await attach();
+    expect(res.status).toBe(404);
+    expect((await res.json()).code).toBe('ARTIFACT_NOT_FOUND');
+    expect(updateSets).toHaveLength(0);
   });
 
   it('asks the shared guard for the WRITE action — attaching changes what the report shows', async () => {
     // The org axis AND the run's persisted site scope both live in that helper.
     // An ad-hoc join here would have reproduced the first and dropped the second.
     await attach();
-    expect(getReportRunMock).toHaveBeenCalledWith(RUN_ID, expect.anything(), 'write');
+    // Ruling P8b: the caller's resolved permissions ride along, so the guard
+    // hides a type whose read permissions the caller lacks.
+    expect(getReportRunMock).toHaveBeenCalledWith(
+      RUN_ID, expect.anything(), 'write', { permissions: [{ resource: '*', action: '*' }] },
+    );
   });
 
   it('404s a run the caller cannot reach, without touching the artifact service', async () => {
     getReportRunMock.mockResolvedValue(null);
     const res = await attach();
     expect(res.status).toBe(404);
-    expect(resolveArtifactMock).not.toHaveBeenCalled();
+    expect(findArtifactForAuthMock).not.toHaveBeenCalled();
     expect(updateSets).toHaveLength(0);
   });
 
   it('404s a handle that does not resolve in the run org, and writes nothing', async () => {
-    resolveArtifactMock.mockResolvedValue(null);
+    findArtifactForAuthMock.mockResolvedValue(null);
     const res = await attach();
     expect(res.status).toBe(404);
     expect((await res.json()).code).toBe('ARTIFACT_NOT_FOUND');
@@ -222,6 +246,6 @@ describe('POST /reports/runs/:id/attachments/from-artifact (spec §6.3)', () => 
     const res = await attach('not-a-uuid');
     expect(res.status).toBe(400);
     expect(getReportRunMock).not.toHaveBeenCalled();
-    expect(resolveArtifactMock).not.toHaveBeenCalled();
+    expect(findArtifactForAuthMock).not.toHaveBeenCalled();
   });
 });

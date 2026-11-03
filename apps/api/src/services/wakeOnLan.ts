@@ -10,7 +10,10 @@ import {
 } from '../db/schema';
 import { CommandTypes } from './commandQueue';
 import { claimPendingCommandForDelivery, releaseClaimedCommandDelivery } from './commandDispatch';
+import { cancelledCommandError } from './commandCancelMessage';
 import { isAgentConnected, sendCommandToAgent } from '../routes/agentWs';
+import { isParkedDevice, PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE } from './unassignedPool/deliveryEligibility';
+import { markRequestAuditWritten } from './auditRequestTracking';
 
 export type WakeFailureCode =
   | 'TARGET_NOT_FOUND'
@@ -19,7 +22,14 @@ export type WakeFailureCode =
   | 'IPV6_ONLY'
   | 'NO_RELAY'
   | 'RELAY_OVERRIDE_INVALID'
-  | 'WS_SEND_FAILED';
+  | 'WS_SEND_FAILED'
+  /**
+   * The push's claim-time eligibility check (the same one the heartbeat claim
+   * runs) refused and cancelled the wake command; it will not be sent.
+   */
+  | 'COMMAND_CANCELLED'
+  /** Target or relay is parked in a holding org: lifecycle removal only. */
+  | 'DEVICE_PENDING_ASSIGNMENT';
 
 export interface WakeSuccess {
   ok: true;
@@ -301,6 +311,9 @@ export async function dispatchWake(
   if (!target) {
     return { ok: false, code: 'TARGET_NOT_FOUND', message: 'Target device not found.' };
   }
+  if (await isParkedDevice(db, target.id)) {
+    return { ok: false, code: 'DEVICE_PENDING_ASSIGNMENT', message: PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE };
+  }
 
   const macs = await resolveTargetMacs(target.id);
   if (macs.length === 0) {
@@ -375,6 +388,13 @@ export async function dispatchWake(
     };
   }
 
+  // The row is addressed to the relay, so the relay is the device that
+  // receives a command. A relay shares the target's site, so this only fires
+  // if that invariant ever changes — kept so the write is gated either way.
+  if (await isParkedDevice(db, relay.deviceId)) {
+    return { ok: false, code: 'DEVICE_PENDING_ASSIGNMENT', message: PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE };
+  }
+
   const wakeAttemptId = randomUUID();
   const payload = {
     targetDeviceId: target.id,
@@ -431,13 +451,20 @@ export async function dispatchWake(
     userAgent: options.userAgent,
     result: 'success',
   });
+  markRequestAuditWritten();
 
   const claimed = await claimPendingCommandForDelivery(command.id);
-  if (!claimed) {
+  if (claimed.status === 'cancelled') {
+    return { ok: false, code: 'COMMAND_CANCELLED', message: cancelledCommandError(claimed.reason) };
+  }
+  if (claimed.status !== 'claimed') {
     return { ok: false, code: 'WS_SEND_FAILED', message: 'Failed to claim wake command for dispatch.' };
   }
 
-  const sent = sendCommandToAgent(relay.agentId, {
+  // #8318 §6.4: to the relay's agent_id read IN the claim, not the one the
+  // relay selection read before it (a reattach or re-enroll may have
+  // committed since).
+  const sent = sendCommandToAgent(claimed.agentId, {
     id: command.id,
     type: CommandTypes.WAKE_ON_LAN,
     payload,

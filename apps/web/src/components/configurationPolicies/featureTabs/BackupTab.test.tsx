@@ -124,6 +124,43 @@ describe('BackupTab', () => {
     });
   });
 
+  it("lists destinations and profiles for the policy's org, not the header org", async () => {
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={baseLink}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+        orgId="policy-org-1"
+      />
+    );
+
+    await screen.findByText(/Primary S3/i);
+    for (const url of ['/backup/configs', '/backup/profiles']) {
+      const call = fetchMock.mock.calls.find(([u]) => String(u) === url);
+      expect(call, url).toBeDefined();
+      expect(call![1]).toMatchObject({ orgIdOverride: 'policy-org-1' });
+    }
+  });
+
+  it('leaves the ambient org in place for a partner-wide policy (no orgId)', async () => {
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={baseLink}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+        orgId={null}
+      />
+    );
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([u]) => String(u) === '/backup/configs')).toBe(true),
+    );
+    const call = fetchMock.mock.calls.find(([u]) => String(u) === '/backup/configs');
+    expect((call![1] as { orgIdOverride?: unknown } | undefined)?.orgIdOverride).toBeUndefined();
+  });
+
   it('disables provider immutability when capability is unknown', async () => {
     render(
       <BackupTab
@@ -502,6 +539,39 @@ describe('BackupTab', () => {
     );
   });
 
+  it('disables Save while the destination key prefix is invalid, and re-enables it once fixed (#7081)', async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (url === '/backup/configs' && method === 'GET') {
+        return makeJsonResponse({ data: [] });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={undefined}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+      />
+    );
+
+    await screen.findByPlaceholderText(/Production S3 Backups/i);
+    const save = screen.getByRole('button', { name: /^Save$/i });
+    expect(save).not.toBeDisabled();
+
+    const prefixInput = screen.getByPlaceholderText('backups/breeze/');
+    fireEvent.change(prefixInput, { target: { value: 'a//b' } });
+    expect(screen.getByText('Invalid key prefix: it must not contain empty, "." or ".." segments.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /^Save$/i })).toBeDisabled();
+
+    fireEvent.change(prefixInput, { target: { value: 'msp/acme' } });
+    expect(screen.queryByText(/Invalid key prefix/)).toBeNull();
+    expect(screen.getByRole('button', { name: /^Save$/i })).not.toBeDisabled();
+  });
+
   it('auto-fills the region from an S3-compatible endpoint', async () => {
     fetchMock.mockImplementation(async (input, init) => {
       const url = String(input);
@@ -771,6 +841,47 @@ describe('BackupTab', () => {
     // The link is never rewritten from a list we failed to load.
     await waitFor(() => expect(screen.getByTestId('backup-profiles-load-error')).toBeTruthy());
     expect(saveMock).not.toHaveBeenCalled();
+  });
+
+  // #8152: a link that pre-selects a destination (here a profile link, which
+  // selects the org-default sentinel) suppresses the zero-destinations
+  // auto-create, leaving the "Backups need a destination first" empty state.
+  // It must still offer a way to create the org's first destination.
+  it('zero destinations with a pre-selected destination: the empty state opens the create form (#8152)', async () => {
+    const profileLink = {
+      id: 'link-1',
+      featureType: 'backup',
+      featurePolicyId: 'prof-1',
+      inlineSettings: { backupProfileId: 'prof-1', schedule: { frequency: 'daily', time: '02:00' } },
+    };
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (url.startsWith('/backup/configs') && method === 'GET') {
+        return makeJsonResponse({ data: [] });
+      }
+      if (url.startsWith('/backup/profiles') && method === 'GET') {
+        return makeJsonResponse({ data: [] });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(
+      <BackupTab
+        policyId="policy-1"
+        existingLink={profileLink as never}
+        linkedPolicyId={null}
+        onLinkChanged={vi.fn()}
+      />
+    );
+
+    await screen.findByText(/Backups need a destination first/i);
+    expect(screen.queryByPlaceholderText('AKIA...')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('backup-destination-empty-create'));
+
+    expect(await screen.findByPlaceholderText('AKIA...')).toBeTruthy();
+    expect(screen.queryByTestId('backup-destination-empty-create')).toBeNull();
   });
 
   it('destination fetch failure: shows an error instead of the create-first-destination form', async () => {

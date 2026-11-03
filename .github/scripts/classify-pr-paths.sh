@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
-# Reads changed-file paths on stdin (one per line) and prints eleven lines in
+# Reads changed-file paths on stdin (one per line) and prints fifteen lines in
 # GITHUB_OUTPUT form: `code`, `docs`, `agent`, `app`, the six area flags
-# `api`, `web`, `portal`, `addins`, `m365`, `rust`, then `topology_browser` —
-# each `true|false`.
+# `api`, `web`, `portal`, `addins`, `m365`, `rust`, `topology_browser`,
+# `agent_code`, `integration`, `path_readers` (booleans), then `reader_tests`
+# (sorted space-separated test paths; empty with path_readers=true means all).
+# One optional argument:
+# `--pull-request` (path-gates `integration`; see below).
+#
+# `agent_code=true` is the agent area: agent/**, shared packages, CI/tooling,
+# global infrastructure inputs, unknown paths, and files Go tests read in apps/.
+# Node-install root manifests set the app areas only. `agent` remains the
+# separate QEMU recovery-media dependency gate.
 #
 # A documentation path is docs/**, apps/docs/**, or a *.md / *.mdx file
 # anywhere — the exact set `ci.yml` used to `paths-ignore` and `docs-ci.yml`
@@ -40,20 +48,26 @@
 # runs? Add its carve-out here AND to the pinned list in the test.
 #
 # Area outputs (`api`, `web`, `portal`, `addins`, `m365`, `rust`) gate the
-# heavy jobs that exercise exactly one application area (test-api,
-# integration-test, test-web, the add-in and M365 suites, rust-check, ...).
+# heavy jobs that exercise exactly one application area (test-api, test-web,
+# the add-in and M365 suites, rust-check, ...; integration-test has its own
+# `integration` output, below).
 # A wrong area gate SILENTLY skips a whole area's tests, so they fail OPEN:
 #   - shared/global inputs (packages/**, the root manifests and lockfile,
 #     patches/**, root tsconfig*, ci.yml, .github/scripts/**, docker/**,
 #     root docker-compose* / Dockerfile*, scripts/**, ee/**) set EVERY area;
-#   - a code path that matches no area rule (agent/**, e2e-tests/**, a new
+#   - a code path that matches no area rule (e2e-tests/**, a new
 #     top-level dir or app, ...) sets EVERY area;
 #   - an area whose tests READ another area's files is also set when those
 #     files change (see the cross-area block below). test-api carries the
 #     repo-wide contract suites (Dockerfile/manifest enumeration over apps/*,
 #     exchangeRateBoundary over apps/web/src + apps/portal/src, tierConfig
 #     parity, the viewer input schema), so web/portal/viewer and every app's
-#     Dockerfile/package.json also set `api`. `ci-area-gating.test.mjs` scans
+#     Dockerfile/package.json also set `api`. test-web carries a contract
+#     test that reads apps/api/src/services/accounting/types.ts directly
+#     (accountingProviders.test.ts, since the web cannot import API code), so
+#     that one file also sets `web`; so does apps/api/src/services/monitors/**
+#     (unconvertibleReasonCoverage.test.ts reads its conversion reason codes).
+#     `ci-area-gating.test.mjs` scans
 #     the sources for such references and fails when one has no rule here.
 # Docs paths set no area. apps/mobile/** sets none either: mobile is gated by
 # its own `mobile-native-changes` filter and test-mobile rides `app`.
@@ -69,11 +83,34 @@
 # Every path it matches also falls outside the tooling allowlist, so it implies
 # `app=true` as well.
 #
+# `integration` (#5936) gates the 16-shard real-Postgres
+# `integration-test` job. It is path-gated ONLY when the caller passes
+# `--pull-request` — ci.yml does that on the `pull_request` branch and nowhere
+# else, so the merge queue (the real gate) and every other event run the full
+# suite for any code change. Without the flag it is simply `code`. With the flag
+# it fails OPEN: it is false only for the paths the suite provably cannot read —
+# agent/**, the web/portal/viewer/helper/mobile apps, the four Office add-ins,
+# the three M365 executors, and the root Cargo.* / rust-toolchain* manifests —
+# and true for everything else (apps/api/** incl. migrations and scripts,
+# packages/**, ee/**, root manifests/lockfile/patches/tsconfig, docker*,
+# .github/**, and any path no rule names). `ci-area-gating.test.mjs` re-derives
+# that exclusion list from the suite's configs, imports/reads and the job's
+# steps, and fails if anything the suite reaches lands in it. Like
+# topology_browser it is matched only on a non-docs path, so it implies code.
+#
 # Fail-closed: an empty file list is `code=true docs=true agent=true
-# app=true topology_browser=true` and every area true. Deciding "nothing
+# app=true topology_browser=true agent_code=true integration=true` and every area true. Deciding "nothing
 # changed" from no evidence is how a broken listing would green a PR (or
 # silently skip a job that should have run).
 set -euo pipefail
+
+gate_integration=false
+for arg in "$@"; do
+  case "${arg}" in
+    --pull-request) gate_integration=true ;;
+    *) echo "classify-pr-paths: unknown argument '${arg}'" >&2; exit 2 ;;
+  esac
+done
 
 # The QEMU job's dependency set, pinned beside this script (see that file's
 # header). Missing or empty means we cannot tell what the job depends on, so
@@ -105,6 +142,54 @@ qemu_gate_hit() {
   return 1
 }
 
+# Protected integration floor, independent of the PR exclusion rules.
+INTEGRATION_FLOOR_FILE="$(dirname "${BASH_SOURCE[0]}")/integration-floor-paths.txt"
+floor_entries=()
+if [[ -r "${INTEGRATION_FLOOR_FILE}" ]]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"; line="${line//[[:space:]]/}"
+    [[ -n "${line}" ]] && floor_entries+=("${line}")
+  done < "${INTEGRATION_FLOOR_FILE}"
+fi
+if [[ ${#floor_entries[@]} -eq 0 ]]; then
+  echo "classify-pr-paths: integration-floor-paths.txt missing or empty beside the classifier; integration runs for every code change (fail-closed)" >&2
+fi
+# floor_hit PATH — true when PATH is one of the pinned files or lies under
+# one of the pinned directories. A pinned directory ends with '/', so
+# 'apps/api/src/db/' cannot match 'apps/api/src/db-extra/x.ts'.
+floor_hit() {
+  local p="$1" e
+  [[ ${#floor_entries[@]} -eq 0 ]] && return 0
+  for e in "${floor_entries[@]}"; do
+    if [[ "${e}" == */ ]]; then
+      [[ "${p}" == "${e}"* ]] && return 0
+    else
+      [[ "${p}" == "${e}" ]] && return 0
+    fi
+  done
+  return 1
+}
+
+# Docs-only changes can affect tests which read documentation by path.
+READER_MAP_FILE="$(dirname "${BASH_SOURCE[0]}")/path-reader-map.txt"
+reader_files=()
+reader_patterns=()
+reader_hits=()
+readers_unknown=false
+if [[ -r "${READER_MAP_FILE}" ]]; then
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%%#*}"
+    read -r reader pattern <<< "${line}"
+    [[ -z "${reader}" ]] && continue
+    reader_files+=("${reader}")
+    reader_patterns+=("${pattern}")
+  done < "${READER_MAP_FILE}"
+fi
+if [[ ${#reader_files[@]} -eq 0 ]]; then
+  echo "classify-pr-paths: path-reader-map.txt missing or empty beside the classifier; path_readers=true with no reader list (fail-closed: the runner runs every mapped test)" >&2
+  readers_unknown=true
+fi
+
 code=false
 docs=false
 agent=false
@@ -116,6 +201,8 @@ addins=false
 m365=false
 rust=false
 topology_browser=false
+agent_code=false
+integration=false
 seen=false
 all_areas() {
   api=true; web=true; portal=true; addins=true; m365=true; rust=true
@@ -123,23 +210,38 @@ all_areas() {
 while IFS= read -r path; do
   [[ -z "${path}" ]] && continue
   seen=true
+  for ((i=0; i<${#reader_files[@]}; i++)); do
+    # Deliberately unquoted: these are Bash globs, including slash-matching *.
+    if [[ "${path}" == ${reader_patterns[$i]} ]]; then
+      reader_hits+=("${reader_files[$i]}")
+    fi
+  done
   case "${path}" in
+    apps/docs/package.json) docs=true; code=true ;;
     docs/*|apps/docs/*|*.md|*.mdx) docs=true; continue ;;
     *) code=true ;;
   esac
   # Area (first match wins). In a case pattern `*` also matches '/', so the
   # root-only globals below are anchored by their leading literal.
   case "${path}" in
-    packages/*|package.json|pnpm-lock.yaml|pnpm-workspace.yaml|.npmrc|.node-version|.nvmrc|patches/*|tsconfig*.json) all_areas ;;
-    .github/workflows/ci.yml|.github/scripts/*|docker/*|docker-compose*|Dockerfile*|scripts/*|ee/*) all_areas ;;
+    packages/*) all_areas; agent_code=true ;;
+    package.json|pnpm-lock.yaml|pnpm-workspace.yaml|.npmrc|.node-version|.nvmrc|patches/*|tsconfig*.json) all_areas ;;
+    .github/workflows/ci.yml|.github/scripts/*|docker/*|docker-compose*|Dockerfile*|scripts/*|ee/*) all_areas; agent_code=true ;;
     apps/api/*) api=true ;;
     apps/web/*) web=true ;;
     apps/portal/*) portal=true ;;
     apps/excel-addin/*|apps/word-addin/*|apps/powerpoint-addin/*|apps/outlook-addin/*) addins=true ;;
     apps/m365-graph-read-executor/*|apps/m365-graph-actions-executor/*|apps/m365-communications-executor/*) m365=true ;;
     apps/viewer/*|apps/helper/*|Cargo.*|rust-toolchain*) rust=true ;;
-    apps/mobile/*) : ;;
-    *) all_areas ;;
+    apps/mobile/*|apps/docs/*) : ;;
+    # agent/** is the agent area AND sets api: ~30 test-api contract suites read
+    # agent sources/fixtures by path (backupAgentContract, schemas.commandResult,
+    # agentWs.rejectionFrame, cisBenchmarkSafeguards, yaraRuleSets, releaseTrustChain,
+    # aiAgentDiagnosisPrompt reads the whole agent/ tree, ...). The cross-area scan
+    # in ci-area-gating.test.mjs (which walks agent/**/*.go too) proves the other
+    # five areas read nothing under agent/.
+    agent/*) api=true; agent_code=true ;;
+    *) all_areas; agent_code=true ;;
   esac
   # Cross-area reads: the READING area must also run when these change.
   case "${path}" in
@@ -148,10 +250,27 @@ while IFS= read -r path; do
   case "${path}" in
     apps/web/*|apps/portal/*|apps/viewer/src/*) api=true ;;
     apps/api/src/routes/portal/*) portal=true ;;
+    apps/api/src/services/accounting/types.ts) web=true ;;
+    # unconvertibleReasonCoverage.test.ts reads every `unconvertible:<code>`
+    # the conversion services can return, so a new API reason is caught on
+    # the PR that adds it, not on some later web PR.
+    apps/api/src/services/monitors/*) web=true ;;
+    # executionRefusedFields.test.ts reads filterEngine.ts to catch drift in its refused-field list.
+    apps/api/src/services/filterEngine.ts) web=true ;;
   esac
   case "${path}" in
     .github/workflows/ci.yml|.github/scripts/classify-pr-paths.sh|.github/scripts/qemu-gate-paths.txt) agent=true ;;
     agent/*) qemu_gate_hit "${path}" && agent=true ;;
+  esac
+  # Go readers: wire/limits_test.go, websocket/server_error_frame_test.go,
+  # macosuninstall/script_test.go and tools/agentsim/sim/budget_contract_test.go.
+  # Kept separate from the app-area cases: uninstall.sh must still set both web
+  # and api as well as the agent area.
+  case "${path}" in
+    apps/api/src/routes/agents/schemas.ts|\
+    apps/api/src/routes/agentWs.ts|\
+    apps/web/public/scripts/uninstall.sh|\
+    apps/api/src/__tests__/integration/agentHotPathQueryBudget.integration.test.ts) agent_code=true ;;
   esac
   case "${path}" in
     .github/workflows/ci.yml) app=true ;;
@@ -187,16 +306,46 @@ while IFS= read -r path; do
     e2e-tests/pages/TopologyPage.ts|\
     .github/workflows/ci.yml) topology_browser=true ;;
   esac
+  # Integration-test gate (#5936). Ungated unless --pull-request; then only the
+  # paths the real-Postgres suite provably cannot read are false (fail open).
+  if [[ "${gate_integration}" != "true" ]]; then
+    integration=true
+  else
+    case "${path}" in
+      apps/*/package.json|packages/*/package.json|ee/*/package.json|package.json|pnpm-workspace.yaml|pnpm-lock.yaml|.npmrc|*/.npmrc|.nvmrc|*/.nvmrc|.node-version|*/.node-version|patches/*) integration=true ;;
+      agent/*|\
+      apps/web/*|apps/portal/*|apps/viewer/*|apps/helper/*|apps/mobile/*|\
+      apps/excel-addin/*|apps/word-addin/*|apps/powerpoint-addin/*|apps/outlook-addin/*|\
+      apps/m365-graph-read-executor/*|apps/m365-graph-actions-executor/*|apps/m365-communications-executor/*|\
+      Cargo.*|rust-toolchain*) : ;;
+      *) integration=true ;;
+    esac
+    floor_hit "${path}" && integration=true
+  fi
 done
 
+# Indexed arrays plus sort -u keep set semantics on macOS Bash 3.2 too.
+path_readers=false
+reader_tests=
+if [[ "${readers_unknown}" == "true" ]]; then
+  path_readers=true
+elif [[ ${#reader_hits[@]} -gt 0 ]]; then
+  path_readers=true
+  reader_tests=$(printf '%s\n' "${reader_hits[@]}" | LC_ALL=C sort -u | paste -sd ' ' -)
+fi
+
 if [[ "${seen}" != "true" ]]; then
-  echo "classify-pr-paths: no changed files listed; treating as a code+docs+agent+app+topology_browser change in every area (fail-closed)" >&2
+  echo "classify-pr-paths: no changed files listed; treating as a code+docs+agent+app+topology_browser+integration change in every area (fail-closed)" >&2
   code=true
   docs=true
   agent=true
   app=true
   all_areas
   topology_browser=true
+  agent_code=true
+  integration=true
+  path_readers=true
+  reader_tests=
 fi
 
 echo "code=${code}"
@@ -210,3 +359,7 @@ echo "addins=${addins}"
 echo "m365=${m365}"
 echo "rust=${rust}"
 echo "topology_browser=${topology_browser}"
+echo "agent_code=${agent_code}"
+echo "integration=${integration}"
+echo "path_readers=${path_readers}"
+echo "reader_tests=${reader_tests}"

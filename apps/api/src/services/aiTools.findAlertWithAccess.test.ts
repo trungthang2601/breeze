@@ -5,9 +5,8 @@
  * `deviceSiteDenied` separately. The equivalent helper in aiToolsAlerts.ts
  * already folds both axes in; these cases pin this copy to the SAME semantics,
  * including the one that is easy to get wrong in either direction: a
- * device-LESS alert is allowed for a site-restricted human (there is no device
- * to attribute it to) and DENIED for an exact-device run (it is attributable to
- * none of that run's devices).
+ * device-LESS org-level alert is denied for both a site-restricted human
+ * and an exact-device run. Unrestricted humans may still access it.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -60,9 +59,9 @@ describe('findAlertWithAccess — site axis', () => {
     expect(await findAlertWithAccess('a1', siteRestricted())).toMatchObject({ id: 'a1' });
   });
 
-  it('allows a device-LESS alert for a site-restricted human (mirrors aiToolsAlerts)', async () => {
+  it('denies a device-LESS alert for a site-restricted human', async () => {
     mockAlert({ id: 'a1', orgId: 'org-1', deviceId: null });
-    expect(await findAlertWithAccess('a1', siteRestricted())).toMatchObject({ id: 'a1' });
+    expect(await findAlertWithAccess('a1', siteRestricted())).toBeNull();
   });
 
   it('runs no device lookup for an unrestricted caller', async () => {
@@ -99,6 +98,29 @@ describe('findAlertWithAccess — exact-device axis', () => {
   it('returns null when the alert does not exist', async () => {
     mockAlert(null);
     expect(await findAlertWithAccess('a1', siteRestricted())).toBeNull();
+  });
+});
+
+describe('findAlertWithAccess — helper device axis', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const helperBound = () => makeAuth({
+    helperDeviceId: 'dev-1',
+  } as Partial<AuthContext>);
+
+  it('denies a sibling device alert for a Helper-authenticated caller', async () => {
+    mockAlert({ id: 'a1', orgId: 'org-1', deviceId: 'dev-2' });
+    expect(await findAlertWithAccess('a1', helperBound())).toBeNull();
+  });
+
+  it('denies a device-LESS org-wide alert for a Helper-authenticated caller', async () => {
+    mockAlert({ id: 'a1', orgId: 'org-1', deviceId: null });
+    expect(await findAlertWithAccess('a1', helperBound())).toBeNull();
+  });
+
+  it('still returns the Helper device own alert', async () => {
+    mockAlert({ id: 'a1', orgId: 'org-1', deviceId: 'dev-1' });
+    expect(await findAlertWithAccess('a1', helperBound())).toMatchObject({ id: 'a1' });
   });
 });
 

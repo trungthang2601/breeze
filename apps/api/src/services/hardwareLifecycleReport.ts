@@ -28,7 +28,7 @@ import {
   organizations,
   sites,
 } from '../db/schema';
-import { hardwareLifecycleConfigSchema } from '../routes/reports/schemas';
+import { hardwareLifecycleConfigSchema } from './reportConfigSchemas';
 import type {
   HardwareLifecycleDeviceRow,
   HardwareLifecycleOtherRow,
@@ -54,8 +54,9 @@ import {
   assertReportExecutionPreflight,
   type ReportResult,
 } from './reportGenerationService';
-import type { ReportExecutionAuthority } from './siteScope';
+import type { OrgReportExecutionAuthority } from './siteScope';
 
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 /** Roles that are computers with a replacement timeline. `unknown` is the
  *  enrollment default — an agent device with an OS is a computer until a
  *  technician says otherwise. */
@@ -147,7 +148,7 @@ function toOtherRow(s: Subject): HardwareLifecycleOtherRow {
 export async function generateHardwareLifecycleReport(
   orgId: string,
   rawConfig: Record<string, unknown>,
-  authority: ReportExecutionAuthority,
+  authority: OrgReportExecutionAuthority,
 ): Promise<ReportResult> {
   const cfg = hardwareLifecycleConfigSchema.parse(rawConfig ?? {});
   const generatedAt = new Date().toISOString();
@@ -169,7 +170,7 @@ export async function generateHardwareLifecycleReport(
   // --- agent devices ---------------------------------------------------------
   const deviceConditions = [
     eq(devices.orgId, orgId),
-    eq(devices.isEphemeral, false),
+    eq(devices.isEphemeral, false), notParkedDeviceCondition(),
     eq(devices.isVirtual, false),
     isNull(devices.decommissionedAt),
   ];

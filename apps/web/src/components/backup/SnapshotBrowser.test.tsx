@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import SnapshotBrowser from './SnapshotBrowser';
@@ -51,21 +51,15 @@ describe('SnapshotBrowser', () => {
 
       if (url === '/backup/snapshots/snap-1/browse' && method === 'GET') {
         return makeJsonResponse({
-          data: [
-            {
-              name: 'Documents',
-              path: '/Documents',
-              type: 'directory',
-              children: [
-                {
-                  name: 'report.txt',
-                  path: '/Documents/report.txt',
-                  type: 'file',
-                  sizeBytes: 1234,
-                },
-              ],
-            },
-          ],
+          data: [{ name: 'Documents', path: '/Documents', type: 'directory' }],
+          nextCursor: null,
+        });
+      }
+
+      if (url === '/backup/snapshots/snap-1/browse?dir=%2FDocuments' && method === 'GET') {
+        return makeJsonResponse({
+          data: [{ name: 'report.txt', path: '/Documents/report.txt', type: 'file', sizeBytes: 1234 }],
+          nextCursor: null,
         });
       }
 
@@ -101,13 +95,208 @@ describe('SnapshotBrowser', () => {
     expect(screen.getByText(/Use the restore workflow to recover or export files from this snapshot/i)).toBeTruthy();
   });
 
-  it('points the restore-workflow copy at the Restore tab (#6349)', async () => {
+  it('formats file size and modified time in the file table instead of raw bytes / ISO strings (#9626)', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/backup/snapshots/snap-1/browse?dir=%2FDocuments') {
+        return makeJsonResponse({
+          data: [{ name: 'big.bin', path: '/Documents/big.bin', type: 'file', sizeBytes: 4823117, modifiedAt: '2026-10-21T01:12:44.000Z' }],
+          nextCursor: null,
+        });
+      }
+      return base(input, init);
+    });
+    render(<SnapshotBrowser />);
+    fireEvent.click(await screen.findByText('Documents'));
+    const row = (await screen.findByText('big.bin')).closest('tr')!;
+    expect(row.textContent).toContain('4.60 MB');
+    expect(row.textContent).not.toContain('4823117 B');
+    expect(row.textContent).not.toContain('2026-10-21T01:12:44.000Z');
+  });
+
+  it('shows integrity status in the snapshot picker and the details card (#9626)', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/backup/snapshots') {
+        const res = await base(input, init);
+        const payload = await res.json();
+        return makeJsonResponse({ data: payload.data.map((row: object) => ({ ...row, integrityStatus: 'unattested' })) });
+      }
+      return base(input, init);
+    });
+    render(<SnapshotBrowser />);
+    expect(await screen.findByRole('option', { name: /Nightly Snapshot.*Not verified/ })).toBeTruthy();
+    expect((await screen.findByTestId('snapshot-integrity-badge')).textContent).toBe('Not verified');
+  });
+
+  it('loads only the root level up front and fetches a directory when it is selected (#8230)', async () => {
+    render(<SnapshotBrowser />);
+
+    await screen.findByText('Documents');
+    const browseCalls = () => fetchMock.mock.calls.map((c) => String(c[0])).filter((u) => u.includes('/browse'));
+    expect(browseCalls()).toEqual(['/backup/snapshots/snap-1/browse']);
+    expect(screen.queryByText('report.txt')).toBeNull();
+
+    fireEvent.click(screen.getByText('Documents'));
+
+    await screen.findByText('report.txt');
+    expect(browseCalls()).toEqual([
+      '/backup/snapshots/snap-1/browse',
+      '/backup/snapshots/snap-1/browse?dir=%2FDocuments',
+    ]);
+  });
+
+  it('retries a directory whose first load failed when it is selected again (#8230)', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    let failures = 1;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/backup/snapshots/snap-1/browse?dir=%2FDocuments' && failures-- > 0) {
+        return makeJsonResponse({ error: 'boom' }, false, 500);
+      }
+      return base(input, init);
+    });
+
+    render(<SnapshotBrowser />);
+    fireEvent.click(await screen.findByText('Documents'));
+    await screen.findByText(/Failed to browse snapshot/i);
+    expect(screen.queryByText('report.txt')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Documents' }));
+    await screen.findByText('report.txt');
+  });
+
+  it('points the restore-workflow copy at the Restore tab, carrying the active snapshot (#6349, #6456)', async () => {
     render(<SnapshotBrowser />);
 
     await screen.findByText(/Protection Controls/i);
     const link = screen.getByTestId('snapshot-browser-restore-link');
     expect(link.tagName).toBe('A');
-    expect(link.getAttribute('href')).toBe('#restore');
+    // No files are checked off, but the snapshot currently being browsed is
+    // still carried across (#6456) so the wizard opens on the right snapshot.
+    expect(link.getAttribute('href')).toBe('#restore?snapshot=snap-1');
+  });
+
+  it('carries the selected snapshot id + checked files into the restore-workflow link (#6456)', async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+
+      if (url === '/backup/snapshots' && method === 'GET') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'snap-1',
+              label: 'Nightly Snapshot',
+              createdAt: '2026-03-31T00:00:00Z',
+              sizeBytes: 1048576,
+              fileCount: 5,
+              location: 'snapshots/provider-snap-1',
+              expiresAt: '2026-04-30T00:00:00Z',
+              legalHold: false,
+              legalHoldReason: null,
+              isImmutable: false,
+              immutableUntil: null,
+              immutabilityEnforcement: null,
+              requestedImmutabilityEnforcement: null,
+              immutabilityFallbackReason: null,
+            },
+          ],
+        });
+      }
+
+      if (url === '/backup/snapshots/snap-1/browse' && method === 'GET') {
+        return makeJsonResponse({
+          data: [
+            { name: 'report.txt', path: '/report.txt', type: 'file', sizeBytes: 1234 },
+          ],
+        });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<SnapshotBrowser />);
+
+    await screen.findByText('report.txt');
+    // `findByText` resolves as soon as the browse-load commit reaches the DOM,
+    // but that same commit also schedules SnapshotBrowser's selection-reset
+    // effect (keyed on the newly-loaded tree id — see the comment above
+    // `restoreLinkSnapshotId` in SnapshotBrowser.tsx). That effect is a
+    // passive effect and isn't guaranteed to have run yet: under CI load it
+    // can still be pending here, and if it fires *after* the click below it
+    // clobbers the selection an instant after it was set. Flushing a
+    // macrotask first lets that effect settle before we interact, so the
+    // click always lands after the reset instead of racing it. Confirmed as
+    // the real failure mode from CI (run 36269173200, attempt 1): the
+    // captured href was `#restore?snapshot=snap-1` with no `paths=` at all —
+    // the click never stuck.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    fireEvent.click(screen.getByLabelText('Select report.txt'));
+
+    const link = screen.getByTestId('snapshot-browser-restore-link');
+    const href = link.getAttribute('href') ?? '';
+    expect(href).toContain('#restore?');
+    expect(href).toContain('snapshot=snap-1');
+    expect(href).toContain('paths=');
+    expect(decodeURIComponent(href)).toContain('/report.txt');
+  });
+
+  describe('folder selection (#9628)', () => {
+    const arrangeFolderTree = (fileCount: number) => {
+      fetchMock.mockImplementation(async (input, init) => {
+        const url = String(input);
+        const method = (init as RequestInit | undefined)?.method ?? 'GET';
+        if (url === '/backup/snapshots' && method === 'GET') {
+          return makeJsonResponse({
+            data: [{ id: 'snap-1', label: 'Nightly Snapshot', createdAt: '2026-03-31T00:00:00Z', sizeBytes: 1, fileCount: 5 }],
+          });
+        }
+        if (url === '/backup/snapshots/snap-1/browse' && method === 'GET') {
+          return makeJsonResponse({
+            data: [
+              { name: 'Finance', path: '/Finance', type: 'directory', fileCount },
+              { name: 'top.txt', path: '/top.txt', type: 'file', sizeBytes: 1 },
+            ],
+          });
+        }
+        return makeJsonResponse({}, false, 404);
+      });
+    };
+
+    const settle = async () => {
+      await screen.findByText('top.txt');
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    };
+
+    it('lists subfolders with a checkbox and file count, and carries a checked folder into the restore link', async () => {
+      arrangeFolderTree(7);
+      render(<SnapshotBrowser />);
+      await settle();
+
+      expect(screen.getByText('7 files')).toBeTruthy();
+      fireEvent.click(screen.getByLabelText('Select folder Finance'));
+
+      const href = screen.getByTestId('snapshot-browser-restore-link').getAttribute('href') ?? '';
+      expect(decodeURIComponent(href)).toContain('/Finance');
+      expect((screen.getByLabelText('Select folder Finance') as HTMLInputElement).checked).toBe(true);
+    });
+
+    it('asks before selecting a folder over 1,000 files and honours a refusal', async () => {
+      arrangeFolderTree(2500);
+      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+      render(<SnapshotBrowser />);
+      await settle();
+
+      fireEvent.click(screen.getByLabelText('Select folder Finance'));
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect((screen.getByLabelText('Select folder Finance') as HTMLInputElement).checked).toBe(false);
+      confirmSpy.mockRestore();
+    });
+
   });
 
   it('applies legal hold for the selected snapshot', async () => {
@@ -150,6 +339,67 @@ describe('SnapshotBrowser', () => {
 
     expect(await screen.findByText(/Provider immutability was requested by policy/i)).toBeTruthy();
     expect(screen.getByText(/Bucket object lock no longer enabled/i)).toBeTruthy();
+  });
+
+  it('names the device in the snapshot picker and the details card', async () => {
+    const base = {
+      createdAt: '2026-03-31T00:00:00Z',
+      sizeBytes: 1048576,
+      fileCount: 5,
+      location: null,
+      expiresAt: null,
+      legalHold: false,
+      legalHoldReason: null,
+      isImmutable: false,
+      immutableUntil: null,
+      immutabilityEnforcement: null,
+      requestedImmutabilityEnforcement: null,
+      immutabilityFallbackReason: null,
+    };
+    fetchMock.mockImplementationOnce(async () => makeJsonResponse({
+      data: [
+        { ...base, id: 'snap-1', label: 'Nightly', deviceName: 'Mac Mini' },
+        { ...base, id: 'snap-2', label: 'Whole machine', backupType: 'system_image', deviceName: 'SRV01' },
+      ],
+    }));
+
+    render(<SnapshotBrowser />);
+
+    expect(await screen.findByRole('option', { name: 'Mac Mini — Nightly' })).toBeTruthy();
+    expect(screen.getByRole('option', { name: 'SRV01 — Whole machine — System image' })).toBeTruthy();
+    expect((await screen.findByTestId('snapshot-device-name')).textContent).toBe('Mac Mini');
+  });
+
+  it('labels the storage location in the details card', async () => {
+    render(<SnapshotBrowser />);
+
+    await screen.findByText(/Snapshot Details/i);
+    const location = screen.getByTestId('snapshot-location');
+    expect(location.textContent).toContain('Location:');
+    expect(location.textContent).toContain('snapshots/provider-snap-1');
+  });
+
+  it('says the file index is unavailable (not "still processing") when the API reports manifestUnavailable', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/backup/snapshots/snap-1/browse') {
+        return makeJsonResponse({ snapshotId: 'snap-1', manifestUnavailable: true, data: [] });
+      }
+      return base(input, init);
+    });
+
+    render(<SnapshotBrowser />);
+
+    expect(await screen.findByText(/file index isn't available/i)).toBeTruthy();
+    expect(screen.queryByText(/may still be processing/i)).toBeNull();
+  });
+
+  it('gives the snapshot picker and the immutability select accessible names', async () => {
+    render(<SnapshotBrowser />);
+
+    await screen.findByText(/Protection Controls/i);
+    expect(screen.getByRole('combobox', { name: 'Snapshot' })).toBeTruthy();
+    expect(screen.getByRole('combobox', { name: 'Immutability enforcement' })).toBeTruthy();
   });
 
   it('badges a system_image snapshot with its backup type', async () => {

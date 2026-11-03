@@ -13,6 +13,7 @@ import {
   inet,
   index,
   uniqueIndex,
+  check,
 } from 'drizzle-orm/pg-core';
 import { organizations, partners, sites } from './orgs';
 import { users } from './users';
@@ -31,7 +32,7 @@ export const unifiIntegrations = pgTable('unifi_integrations', {
   lastSyncAt: timestamp('last_sync_at'),
   lastSyncStatus: varchar('last_sync_status', { length: 20 }),
   lastSyncError: text('last_sync_error'),
-  createdBy: uuid('created_by').references(() => users.id),
+  createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => ({
@@ -51,6 +52,8 @@ export const unifiSiteMappings = pgTable('unifi_site_mappings', {
   unifiSiteName: text('unifi_site_name'),
   wanMetrics: jsonb('wan_metrics'),
   wanMetricsAt: timestamp('wan_metrics_at'),
+  // M2 topology: advanced whenever UniFi topology sources this mapping authorized are revoked.
+  topologyGeneration: bigint('topology_generation', { mode: 'number' }).notNull().default(0),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => ({
@@ -123,6 +126,8 @@ export const unifiCollectors = pgTable('unifi_collectors', {
   lastPollAt: timestamp('last_poll_at'),
   lastPollStatus: varchar('last_poll_status', { length: 16 }),
   lastPollError: text('last_poll_error'),
+  // M2 topology: advanced whenever this collector's UniFi topology sources are revoked.
+  topologyGeneration: bigint('topology_generation', { mode: 'number' }).notNull().default(0),
   createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -153,6 +158,20 @@ export const unifiDeviceTelemetry = pgTable('unifi_device_telemetry', {
   discoveredAssetId: uuid('discovered_asset_id').references(() => discoveredAssets.id),
   poePorts: jsonb('poe_ports'),
   raw: jsonb('raw').notNull(),
+  // Wi-Fi current state (topology v2 materializer, spec section 8.3). Written only by the
+  // materializer; each family is gated by its own *_observed_at (non-null = that family's row was present).
+  controllerState: text('controller_state'),
+  wifiCapable: boolean('wifi_capable'),
+  deviceInventoryObservedAt: timestamp('device_inventory_observed_at'),
+  wifiRadioOverview: jsonb('wifi_radio_overview'),
+  wifiRadioStatistics: jsonb('wifi_radio_statistics'),
+  uplinkRxRateBps: bigint('uplink_rx_rate_bps', { mode: 'number' }),
+  uplinkTxRateBps: bigint('uplink_tx_rate_bps', { mode: 'number' }),
+  wifiDetailObservedAt: timestamp('wifi_detail_observed_at'),
+  wifiStatisticsObservedAt: timestamp('wifi_statistics_observed_at'),
+  wifiClientsObservedAt: timestamp('wifi_clients_observed_at'),
+  statisticsLastHeartbeatAt: timestamp('statistics_last_heartbeat_at'),
+  statisticsNextHeartbeatAt: timestamp('statistics_next_heartbeat_at'),
   isStale: boolean('is_stale').notNull().default(false),
   lastSeenAt: timestamp('last_seen_at'),
   firstSyncedAt: timestamp('first_synced_at').defaultNow().notNull(),
@@ -200,9 +219,14 @@ export const unifiControllerSites = pgTable('unifi_controller_sites', {
   localSiteId: text('local_site_id').notNull(),
   name: text('name'),
   lastSeenAt: timestamp('last_seen_at').defaultNow().notNull(),
+  // M2 topology: bounded coverage note for a controller site that produced no topology.
+  topologyCoverageReason: varchar('topology_coverage_reason', { length: 64 }),
+  topologyCoverageAt: timestamp('topology_coverage_at', { withTimezone: true }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => ({
   collectorSiteIdx: uniqueIndex('unifi_controller_sites_collector_site_idx')
     .on(table.collectorId, table.localSiteId),
+  topologyCoverageReasonChk: check('unifi_controller_sites_topology_coverage_reason_chk',
+    sql`${table.topologyCoverageReason} IS NULL OR ${table.topologyCoverageReason} ~ '^[a-z][a-z0-9_]{0,63}$'`),
 }));

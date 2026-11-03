@@ -32,6 +32,12 @@ export const softwareCatalog = pgTable('software_catalog', {
   orgId: uuid('org_id').references(() => organizations.id),
   partnerId: uuid('partner_id').references(() => partners.id),
   integrationProvider: varchar('integration_provider', { length: 20 }),
+  // #6958: a Breeze-defined built-in package (e.g. 'controld_windows').
+  // Partner-owned only and unique per partner
+  // (CHECK software_catalog_builtin_package_key_chk, index
+  // software_catalog_partner_builtin_key_uidx). Like integrationProvider, a
+  // non-null key makes the row immutable outside system scope.
+  builtinPackageKey: varchar('builtin_package_key', { length: 40 }),
   name: varchar('name', { length: 200 }).notNull(),
   vendor: varchar('vendor', { length: 200 }),
   description: text('description'),
@@ -39,9 +45,17 @@ export const softwareCatalog = pgTable('software_catalog', {
   iconUrl: text('icon_url'),
   websiteUrl: text('website_url'),
   isManaged: boolean('is_managed').notNull().default(false),
-  createdAt: timestamp('created_at').defaultNow().notNull()
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  // Soft delete (#4980). A package referenced by deployment history cannot be
+  // hard-deleted (NO ACTION FKs from software_deployments), so DELETE archives
+  // it here instead. Forward-looking read paths (catalog list/detail, version
+  // and method management, new deployments, policy remediation, automation
+  // references) filter `deletedAt IS NULL`; deployment-history joins and the
+  // dispatch of already-created deployments intentionally keep it.
+  deletedAt: timestamp('deleted_at')
 }, (table) => ({
   orgIdx: index('software_catalog_org_id_idx').on(table.orgId),
+  activeIdx: index('software_catalog_active_idx').on(table.orgId).where(sql`${table.deletedAt} IS NULL`),
   partnerIdx: index('software_catalog_partner_id_idx').on(table.partnerId),
   partnerProviderIdx: index('software_catalog_partner_provider_idx').on(table.partnerId, table.integrationProvider),
   nameIdx: index('software_catalog_name_idx').on(table.name),
@@ -67,11 +81,20 @@ export const softwareVersions = pgTable('software_versions', {
   silentUninstallArgs: text('silent_uninstall_args'),
   preInstallScript: text('pre_install_script'),
   postInstallScript: text('post_install_script'),
+  // #6958: whether the scripts above are dispatched. Only a create path whose
+  // writer holds devices.execute sets it true; scripts stored before the
+  // column existed stay dormant (never sent) until the version is re-created.
+  installScriptsEnabled: boolean('install_scripts_enabled').notNull().default(false),
   // Detection rules (issue #2022): an array of clauses the agent evaluates
   // against the device's real state to confirm whether the package is actually
   // present — independent of the installer exit code. Shape validated by
   // detectionRulesSchema in @breeze/shared. Null/empty = exit-code behavior only.
   detectionRules: jsonb('detection_rules'),
+  // Vendor-documented installer success exit codes (issue #7038), stored in
+  // unsigned 32-bit form. They ADD to the agent's built-in success codes;
+  // empty = historical behavior. Validated by successExitCodesSchema in
+  // @breeze/shared.
+  successExitCodes: bigint('success_exit_codes', { mode: 'number' }).array().notNull().default(sql`'{}'::bigint[]`),
   isLatest: boolean('is_latest').notNull().default(false)
 }, (table) => ({
   catalogIdx: index('software_versions_catalog_id_idx').on(table.catalogId),

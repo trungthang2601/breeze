@@ -582,7 +582,9 @@ describe('deviceLifecycle (integration)', () => {
 
     // Restore cancels the device_remove row (and clears its deadline)...
     const restored = await withSystemDbAccessContext(() =>
-      db.transaction((tx) => restoreRemovedDevice(tx, device.id)),
+      db.transaction((tx) =>
+        restoreRemovedDevice(tx, device.id, { orgId: tenant.orgId, siteId: tenant.siteId }),
+      ),
     );
     expect(restored.uninstallAlreadyDispatched).toBe(false);
     expect(await deviceStatus(device.id)).toBe('offline');
@@ -673,7 +675,9 @@ describe('deviceLifecycle (integration)', () => {
     // Restore commits first. Before #2787 the permanent-delete route had
     // already read `status = 'decommissioned'` outside its transaction and
     // never re-checked, so this device was purged anyway.
-    await withSystemDbAccessContext(() => db.transaction((tx) => restoreRemovedDevice(tx, device.id)));
+    await withSystemDbAccessContext(() => db.transaction((tx) =>
+      restoreRemovedDevice(tx, device.id, { orgId: tenant.orgId, siteId: tenant.siteId }),
+    ));
 
     await expect(
       withSystemDbAccessContext(() => db.transaction((tx) => purgeRemovedDevice(tx, device.id))),
@@ -830,12 +834,16 @@ describe('deviceLifecycle (integration)', () => {
     } catch (err) {
       caught = err;
     }
-    // Pin the SQLSTATE, not just "it threw": a vacuous `rejects.toThrow()`
+    // Pin the failure, not just "it threw": a vacuous `rejects.toThrow()`
     // would also pass if the fixture were wrong for an unrelated reason.
-    // Drizzle wraps the postgres-js PostgresError in a DrizzleQueryError
-    // whose own `.code` is undefined — the SQLSTATE lives on `.cause` (same
-    // unwrap hazard `routes/devices/core.ts` documents for this route).
-    expect((caught as { cause?: { code?: string } } | undefined)?.cause?.code).toBe('23503');
+    // Since #7278 the cascade's fix-memory step (fixMemory/store
+    // deleteDeviceFixOutcomes) refuses any non-system scope, so an org-scoped
+    // cascade now stops there, before the parent DELETE could reach the
+    // NO ACTION FK (23503) it used to hit. Either way the transaction rolls
+    // back and nothing is removed, which is what the assertions below pin.
+    expect((caught as Error | undefined)?.message).toMatch(
+      /deleteDeviceFixOutcomes: requires an open system-scoped DB context \(ambient scope: organization\)/,
+    );
     expect(await deviceExists(device.id)).toBe(true);
     expect(
       await getTestDb().select({ id: alerts.id }).from(alerts).where(eq(alerts.deviceId, device.id)),

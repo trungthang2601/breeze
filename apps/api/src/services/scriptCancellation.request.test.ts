@@ -169,7 +169,7 @@ beforeEach(() => {
   insertInTx.mockResolvedValue({ id: 'cancel-cmd-id' });
   assertDeviceExecuteAllowedMock.mockResolvedValue(undefined);
   applyAutomationActionTerminalMock.mockResolvedValue(true);
-  claimMock.mockResolvedValue({ id: 'cancel-cmd-id', executedAt: new Date() });
+  claimMock.mockResolvedValue({ status: 'claimed', id: 'cancel-cmd-id', executedAt: new Date(), agentId: 'agent-1' });
   releaseMock.mockResolvedValue(undefined);
   sendCommandToAgentMock.mockImplementation(() => {
     eventOrder.push('sendCommandToAgent');
@@ -440,6 +440,22 @@ describe('deliverCancelCommand', () => {
     expect(releaseMock).not.toHaveBeenCalled();
   });
 
+  it('pushes to the agent id read in the claim, not the one read before it (#8318 §6.4)', async () => {
+    const { deliverCancelCommand } = await import('./scriptCancellation');
+    withCommandRow({
+      id: 'cancel-cmd-id', type: 'script_cancel',
+      payload: { executionId: 'cmd-uuid' }, agentId: 'agent-1', // read before the claim
+    });
+    // A reattach / re-enroll committed between that read and the claim.
+    claimMock.mockResolvedValue({ status: 'claimed', id: 'cancel-cmd-id', executedAt: new Date(), agentId: 'agent-after-reattach' });
+
+    expect(await deliverCancelCommand('cancel-cmd-id', 'device-uuid')).toBe(true);
+    expect(sendCommandToAgentMock).toHaveBeenCalledTimes(1);
+    expect(sendCommandToAgentMock).toHaveBeenCalledWith('agent-after-reattach', {
+      id: 'cancel-cmd-id', type: 'script_cancel', payload: { executionId: 'cmd-uuid' },
+    });
+  });
+
   it('releases the claim when the send fails, so the row stays deliverable', async () => {
     const { deliverCancelCommand } = await import('./scriptCancellation');
     withCommandRow({ id: 'cancel-cmd-id', type: 'script_cancel', payload: {}, agentId: 'agent-1' });
@@ -464,11 +480,27 @@ describe('deliverCancelCommand', () => {
   it('does not send when the claim was lost to the heartbeat path', async () => {
     const { deliverCancelCommand } = await import('./scriptCancellation');
     withCommandRow({ id: 'cancel-cmd-id', type: 'script_cancel', payload: {}, agentId: 'agent-1' });
-    claimMock.mockResolvedValue(null);
+    claimMock.mockResolvedValue({ status: 'not_claimable', id: 'cancel-cmd-id' });
 
     expect(await deliverCancelCommand('cancel-cmd-id', 'device-uuid')).toBe(false);
     expect(sendCommandToAgentMock).not.toHaveBeenCalled();
     expect(releaseMock).not.toHaveBeenCalled();
+  });
+
+  it('does not send, and reports the reason, when the claim cancels the cancel command', async () => {
+    const { deliverCancelCommand } = await import('./scriptCancellation');
+    withCommandRow({ id: 'cancel-cmd-id', type: 'script_cancel', payload: {}, agentId: 'agent-1' });
+    claimMock.mockResolvedValue({ status: 'cancelled', id: 'cancel-cmd-id', reason: 'device_moved_org' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    expect(await deliverCancelCommand('cancel-cmd-id', 'device-uuid')).toBe(false);
+    expect(sendCommandToAgentMock).not.toHaveBeenCalled();
+    expect(releaseMock).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('cancelled'),
+      expect.objectContaining({ cancelCommandId: 'cancel-cmd-id', reason: 'device_moved_org' }),
+    );
+    warn.mockRestore();
   });
 });
 

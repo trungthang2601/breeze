@@ -520,8 +520,19 @@ export async function deliverCancelCommand(
   if (!row?.agentId) return false;
 
   const claimed = await claimPendingCommandForDelivery(cancelCommandId);
-  // Lost the claim: the heartbeat path already took this row, which IS delivery.
-  if (!claimed) return false;
+  if (claimed.status === 'cancelled') {
+    // Claim-time eligibility (same check as the heartbeat claim) terminalised
+    // the cancel command: it will not reach the agent by either path.
+    console.warn('[scriptCancellation] script_cancel was cancelled at claim time; not delivered', {
+      cancelCommandId,
+      deviceId,
+      reason: claimed.reason,
+    });
+    return false;
+  }
+  // Lost the claim (the heartbeat path already took this row, which IS
+  // delivery) or held for the next heartbeat claim.
+  if (claimed.status !== 'claimed') return false;
 
   const deliverable = decryptCommandForDelivery({
     id: row.id,
@@ -529,7 +540,9 @@ export async function deliverCancelCommand(
     deviceId,
     payload: row.payload,
   });
-  const sent = deliverable ? sendCommandToAgent(row.agentId, toAgentCommandFrame(deliverable)) : false;
+  // #8318 §6.4: to the agent_id read IN the claim, not `row.agentId` read
+  // before it (a reattach or re-enroll may have committed since).
+  const sent = deliverable ? sendCommandToAgent(claimed.agentId, toAgentCommandFrame(deliverable)) : false;
   if (sent) return true;
 
   // Release rather than strand as `sent`: otherwise the eventual reaper timeout

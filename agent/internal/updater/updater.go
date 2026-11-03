@@ -70,6 +70,13 @@ type Config struct {
 	// key set. Construction sites copy it from config.Config alongside
 	// PinnedManifestPubKeys.
 	RequireManifestSigningKeyID bool
+
+	// TempDir, when non-empty, is the directory downloaded artifacts are
+	// written to (os.CreateTemp's dir argument). Empty means the OS temp dir.
+	// The watchdog install reconcile points it at a private, root-owned
+	// per-attempt directory so the verified file it later executes is never
+	// in a world-writable location.
+	TempDir string
 }
 
 // Updater handles agent auto-updates
@@ -84,6 +91,8 @@ type Updater struct {
 	// handle. The failure mode is closed: client is nil whenever clientErr
 	// is set, and every download entry point checks clientErr first.
 	clientErr error
+	// signedPkgSize belongs to the per-install copy populated from a verified manifest.
+	signedPkgSize int64
 }
 
 // New creates a new Updater. The returned client enforces netpolicy on every
@@ -583,6 +592,12 @@ func (u *Updater) expectedReleaseAssetNames() map[string]struct{} {
 		return map[string]struct{}{
 			fmt.Sprintf("breeze-agent-%s-%s%s", runtime.GOOS, runtime.GOARCH, suffix): {},
 		}
+	case "isolation-recovery":
+		suffix := ""
+		if runtime.GOOS == "windows" {
+			suffix = ".exe"
+		}
+		return map[string]struct{}{fmt.Sprintf("breeze-isolation-recovery-%s-%s%s", runtime.GOOS, runtime.GOARCH, suffix): {}}
 	case "helper":
 		switch runtime.GOOS {
 		case "windows":
@@ -836,31 +851,31 @@ func (u *Updater) requireSigningKeyID() bool {
 func (u *Updater) verifyManifestSignature(payload, signature []byte, signingKeyID string) error {
 	keyed, unkeyed, err := u.manifestTrustKeys()
 	if err != nil {
-		return err
+		return asTrustError(ErrManifestKey, err)
 	}
 
 	if id := strings.TrimSpace(signingKeyID); id != "" {
 		// Never echo an unvalidated ID: it is control-plane supplied and
 		// reaches log lines through the caller's error reporting.
 		if !config.ValidManifestKeyID(id) {
-			return fmt.Errorf("update manifest signing key id is malformed")
+			return trustErrorf(ErrManifestKey, "update manifest signing key id is malformed")
 		}
 		key, ok := keyed[id]
 		if !ok {
-			return fmt.Errorf("unknown update manifest signing key id %q", id)
+			return trustErrorf(ErrManifestKey, "unknown update manifest signing key id %q", id)
 		}
 		if !ed25519.Verify(key, payload, signature) {
-			return fmt.Errorf("update manifest signature verification failed for signing key id %q", id)
+			return trustErrorf(ErrManifestSignature, "update manifest signature verification failed for signing key id %q", id)
 		}
 		return nil
 	}
 
 	if u.requireSigningKeyID() {
-		return fmt.Errorf("manifest signing key ID required")
+		return trustErrorf(ErrManifestKey, "manifest signing key ID required")
 	}
 
 	if len(keyed) == 0 && len(unkeyed) == 0 {
-		return fmt.Errorf("no trusted update manifest public keys configured")
+		return trustErrorf(ErrManifestKey, "no trusted update manifest public keys configured")
 	}
 
 	for _, key := range keyed {
@@ -879,7 +894,7 @@ func (u *Updater) verifyManifestSignature(payload, signature []byte, signingKeyI
 			return nil
 		}
 	}
-	return fmt.Errorf("update manifest signature verification failed")
+	return ErrManifestSignature
 }
 
 func normalizePreflightErr(err error) error {
@@ -984,6 +999,9 @@ func (u *Updater) UpdateToWithOptions(version string, opts UpdateOptions) error 
 // UpdateToWithOptions. opts.UserHelper, when non-nil, is threaded through to
 // RestartWithHelper on Windows.
 func (u *Updater) updateTo(version string, opts UpdateOptions) error {
+	if err := checkIsolationCompanions(opts); err != nil {
+		return err
+	}
 	log.Info("starting update", "targetVersion", version)
 
 	// Pre-flight: verify we can write to the binary's directory.
@@ -1008,6 +1026,17 @@ func (u *Updater) updateTo(version string, opts UpdateOptions) error {
 		return fmt.Errorf("checksum verification failed: %w", err)
 	}
 
+	if err := checkIsolationCompanions(opts); err != nil {
+		removeCleanup(tempPath)
+		return err
+	}
+
+	// Refuse legacy size-less artifacts if containment began during download.
+	if err := verifyIsolationSize(tempPath, manifest.Size); err != nil {
+		removeCleanup(tempPath)
+		return err
+	}
+
 	// 3. Backup current binary
 	if err := u.backupCurrentBinary(); err != nil {
 		removeCleanup(tempPath)
@@ -1018,6 +1047,10 @@ func (u *Updater) updateTo(version string, opts UpdateOptions) error {
 	//    The script handles: stop service -> copy new binary -> start service.
 	//    The agent exits normally after spawning the script.
 	if runtime.GOOS == "windows" {
+		if err := u.checkIsolationInstall(tempPath, &manifest, opts); err != nil {
+			removeCleanup(tempPath)
+			return err
+		}
 		writeUpdateMarker(version)
 		// User-helper and backup swaps are wired in by the heartbeat-layer
 		// caller (heartbeat.doUpgrade), not here — the updater package is
@@ -1061,18 +1094,21 @@ func (u *Updater) updateTo(version string, opts UpdateOptions) error {
 	if runtime.GOOS == "darwin" {
 		defer removeCleanup(tempPath)
 		writeUpdateMarker(version)
+		pkgUpdater := u.withVerifiedPkgSize(manifestPayload)
 		pkgChecksum, pkgErr := pkgAssetChecksum(manifestPayload, version)
 		if pkgErr != nil {
 			log.Warn("signed .pkg checksum unavailable, falling back to verified-binary replacement", "error", pkgErr.Error())
-		} else if installErr := u.installViaPkg(version, pkgChecksum); installErr != nil {
+		} else if installErr := pkgUpdater.installViaPkg(version, pkgChecksum); installErr != nil { //nolint:staticcheck // SA4023: unreachable on Windows, where installViaPkg is an always-error stub.
 			// installViaPkg downloads the signed .pkg (pkg_darwin.go), so this
 			// error chain can be a *url.Error carrying the presigned asset URL.
 			key, value := SafeDownloadErrorFields(installErr)
 			log.Warn("pkg install failed, falling back to binary replacement", key, value)
 		} else {
-			// The .pkg already contains /usr/local/bin/breeze-backup — a
-			// staged Backup pair must be discarded, not swapped, or we'd
-			// stomp the binary the installer just placed. Only the raw-binary
+			// The .pkg already installs breeze-backup next to the agent
+			// (/usr/local/bin or /Library/Breeze/bin, whichever the install
+			// uses — installer/macos/install-location.sh) — a staged Backup
+			// pair must be discarded, not swapped, or we'd stomp the binary
+			// the installer just placed. Only the raw-binary
 			// fallback below (pkg unavailable or failed) needs the explicit
 			// swap.
 			if opts.Backup != nil {
@@ -1085,6 +1121,9 @@ func (u *Updater) updateTo(version string, opts UpdateOptions) error {
 	}
 
 	// 6. Non-macOS or pkg fallback: replace binary inline and restart
+	if err := u.checkIsolationInstall(tempPath, &manifest, opts); err != nil {
+		return err
+	}
 	if err := u.replaceBinary(tempPath); err != nil {
 		if isCodeSignatureErr(err) {
 			// The darwin branch above already wrote the update marker before
@@ -1166,7 +1205,7 @@ func (u *Updater) parseDownloadInfo(resp *http.Response) (downloadInfo, error) {
 			return downloadInfo{}, fmt.Errorf("download info missing url or checksum")
 		}
 		if info.Manifest == "" || info.ManifestSignature == "" {
-			return downloadInfo{}, fmt.Errorf("download info missing signed release manifest")
+			return downloadInfo{}, trustErrorf(ErrManifestSignature, "download info missing signed release manifest")
 		}
 		return info, nil
 
@@ -1203,14 +1242,14 @@ func (u *Updater) parseDownloadInfo(resp *http.Response) (downloadInfo, error) {
 		}
 
 	default:
-		return downloadInfo{}, fmt.Errorf("download info request failed with status %d", resp.StatusCode)
+		return downloadInfo{}, httpStatusErrorf(resp.StatusCode, "download info request failed with status %d", resp.StatusCode)
 	}
 }
 
 func (u *Updater) verifyUpdateManifest(info downloadInfo, version string) (updateManifest, error) {
 	signature, err := base64.StdEncoding.DecodeString(info.ManifestSignature)
 	if err != nil || len(signature) != ed25519.SignatureSize {
-		return updateManifest{}, fmt.Errorf("invalid update manifest signature encoding")
+		return updateManifest{}, trustErrorf(ErrManifestSignature, "invalid update manifest signature encoding")
 	}
 
 	payload := []byte(info.Manifest)
@@ -1355,6 +1394,10 @@ func (u *Updater) DownloadBinary(version string) (string, error) {
 		removeCleanup(tempPath)
 		return "", fmt.Errorf("checksum verification failed: %w", err)
 	}
+	if err := verifyIsolationSize(tempPath, manifest.Size); err != nil {
+		removeCleanup(tempPath)
+		return "", err
+	}
 	return tempPath, nil
 }
 
@@ -1489,6 +1532,14 @@ func (u *Updater) downloadBinary(version string) (string, updateManifest, []byte
 
 	manifest, err := u.verifyUpdateManifest(info, version)
 	if err != nil {
+		// Every verifyUpdateManifest failure is a trust decision about this
+		// release (bad/absent signature, or signed content that does not
+		// describe the requested artifact). Key-set problems are already
+		// tagged ErrManifestKey; tag the rest so callers can classify them as
+		// permanent without matching text.
+		if !errors.Is(err, ErrManifestKey) {
+			err = asTrustError(ErrManifestSignature, err)
+		}
 		return "", updateManifest{}, nil, err
 	}
 	// info.Manifest is now signature-verified; capture it for the macOS .pkg
@@ -1513,7 +1564,7 @@ func (u *Updater) downloadBinary(version string) (string, updateManifest, []byte
 		}
 		if stat.Size() != manifest.Size {
 			removeCleanup(tempPath)
-			return "", updateManifest{}, nil, fmt.Errorf("downloaded binary size mismatch: expected %d, got %d", manifest.Size, stat.Size())
+			return "", updateManifest{}, nil, trustErrorf(ErrChecksumMismatch, "downloaded binary size mismatch: expected %d, got %d", manifest.Size, stat.Size())
 		}
 	}
 
@@ -1535,7 +1586,7 @@ func (u *Updater) verifyChecksum(path, expectedChecksum string) error {
 
 	actualChecksum := hex.EncodeToString(hasher.Sum(nil))
 	if actualChecksum != expectedChecksum {
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
+		return fmt.Errorf("%w: expected %s, got %s", ErrChecksumMismatch, expectedChecksum, actualChecksum)
 	}
 
 	return nil
@@ -1605,6 +1656,13 @@ func defaultStagedSignatureCheck(path string) error {
 	return fmt.Errorf("%w: %s", ErrCodeSignatureInvalid, detail)
 }
 
+// geteuidFn and chownBinaryFn are package-level vars so tests can drive
+// replaceBinary's ownership-preservation branch without needing real root.
+var (
+	geteuidFn     = os.Geteuid
+	chownBinaryFn = os.Chown
+)
+
 // replaceBinary replaces the current binary with a new one.
 //
 // On macOS the incoming binary's code signature is verified BEFORE anything is
@@ -1657,6 +1715,13 @@ func (u *Updater) replaceBinary(newPath string) error {
 		if err := os.Chmod(u.config.BinaryPath, 0755); err != nil {
 			return err
 		}
+		// See the identical block in replaceBinary for why this is explicit
+		// rather than assumed, and why it's skipped when unprivileged.
+		if geteuidFn() == 0 {
+			if err := chownBinaryFn(u.config.BinaryPath, 0, 0); err != nil {
+				return fmt.Errorf("preserve root ownership of %s: %w", u.config.BinaryPath, err)
+			}
+		}
 	}
 
 	return nil
@@ -1668,6 +1733,11 @@ func (u *Updater) replaceBinary(newPath string) error {
 // temp file. Used by dev_push when updating a non-agent binary (e.g. the
 // desktop helper) so the updater's automatic replace+restart flow is skipped.
 func (u *Updater) DownloadAndVerify(url, expectedChecksum string) (string, error) {
+	// Only a caller-supplied checksum, never a signed manifest (helper
+	// dev-pushes): containment refuses it, as it does UpdateFromURL.
+	if isolationActive() {
+		return "", ErrUpdateBlockedByIsolation
+	}
 	tempPath, err := u.downloadFromURL(url)
 	if err != nil {
 		return "", fmt.Errorf("failed to download binary: %w", err)
@@ -1691,6 +1761,10 @@ func (u *Updater) DownloadAndVerify(url, expectedChecksum string) (string, error
 // u.extras, which was a real footgun for any future dev-push surface that
 // shared an Updater instance with the heartbeat upgrade path.
 func (u *Updater) UpdateFromURL(rawURL, expectedChecksum string, opts UpdateOptions) error {
+	// This path has only a caller-supplied checksum, never a signed manifest.
+	if isolationActive() {
+		return ErrUpdateBlockedByIsolation
+	}
 	lease, ok := TryBeginProcessMutation("agent-dev-update")
 	if !ok {
 		return ErrProcessMutationInProgress
@@ -1729,6 +1803,11 @@ func (u *Updater) UpdateFromURL(rawURL, expectedChecksum string, opts UpdateOpti
 		return fmt.Errorf("checksum verification failed: %w", err)
 	}
 
+	if isolationActive() {
+		removeCleanup(tempPath)
+		return ErrUpdateBlockedByIsolation
+	}
+
 	// 3. Backup current binary
 	if err := u.backupCurrentBinary(); err != nil {
 		removeCleanup(tempPath)
@@ -1737,6 +1816,10 @@ func (u *Updater) UpdateFromURL(rawURL, expectedChecksum string, opts UpdateOpti
 
 	// 4. Windows: spawn helper script for binary swap
 	if runtime.GOOS == "windows" {
+		if err := u.checkIsolationInstall(tempPath, nil, opts); err != nil {
+			removeCleanup(tempPath)
+			return err
+		}
 		if err := RestartWithHelper(BinaryPair{Temp: tempPath, Target: u.config.BinaryPath}, opts.UserHelper, opts.Backup); err != nil {
 			removeCleanup(tempPath)
 			if rbErr := u.Rollback(); rbErr != nil {
@@ -1749,6 +1832,9 @@ func (u *Updater) UpdateFromURL(rawURL, expectedChecksum string, opts UpdateOpti
 
 	// 5. Non-Windows: replace binary inline and restart
 	defer removeCleanup(tempPath)
+	if err := u.checkIsolationInstall(tempPath, nil, opts); err != nil {
+		return err
+	}
 	if err := u.replaceBinary(tempPath); err != nil {
 		if isCodeSignatureErr(err) {
 			logCodeSignatureRejection("", err)
@@ -1780,10 +1866,8 @@ func (u *Updater) UpdateFromURL(rawURL, expectedChecksum string, opts UpdateOpti
 // signed-manifest flow legitimately follows a control-plane URL to a public
 // CDN — so this method does NOT compare origins itself. All destination
 // safety (scheme, dial-time address, redirect chain, credential stripping on
-// origin change) is enforced by u.client, which netpolicy.NewClient built
-// from updaterPolicy(u.config); this is the single, dial-time-authoritative
-// check. A local host/scheme comparison here would be redundant at best and
-// a silent divergence risk at worst — removed, not duplicated (#SSRF-AGENT-001).
+// origin change) is enforced by the netpolicy client. During containment,
+// artifactRequest additionally restricts every hop to control-plane hosts.
 func (u *Updater) downloadFromURL(rawURL string) (string, error) {
 	if err := u.checkClient(); err != nil {
 		return "", err
@@ -1798,17 +1882,19 @@ func (u *Updater) downloadFromURL(rawURL string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+u.config.AuthToken.Reveal())
 
-	resp, err := u.client.Do(req)
+	resp, err := u.artifactRequest(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to download binary: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("binary download failed with status %d", resp.StatusCode)
+		return "", httpStatusErrorf(resp.StatusCode, "binary download failed with status %d", resp.StatusCode)
 	}
 
-	tempFile, err := os.CreateTemp("", "breeze-agent-dev-*")
+	// TempDir (when set) keeps the artifact inside a caller-owned private
+	// directory; "" is the OS temp dir, as before.
+	tempFile, err := os.CreateTemp(u.config.TempDir, "breeze-agent-dev-*")
 	if err != nil {
 		return "", err
 	}
@@ -1901,6 +1987,13 @@ func (u *Updater) Rollback() error {
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(u.config.BinaryPath, 0755); err != nil {
 			return err
+		}
+		// See the identical block in replaceBinary for why this is explicit
+		// rather than assumed, and why it's skipped when unprivileged.
+		if geteuidFn() == 0 {
+			if err := chownBinaryFn(u.config.BinaryPath, 0, 0); err != nil {
+				return fmt.Errorf("preserve root ownership of %s: %w", u.config.BinaryPath, err)
+			}
 		}
 	}
 

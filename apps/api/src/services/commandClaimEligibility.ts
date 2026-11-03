@@ -1,13 +1,26 @@
-import { and, eq } from 'drizzle-orm';
+import { and, eq, notInArray, sql } from 'drizzle-orm';
 import type { db } from '../db';
-import { deviceCommands, users } from '../db/schema';
+import { deviceCommands, deviceNetworkIsolations } from '../db/schema';
+import { isResolvedTerminalIsolationState, RESOLVED_TERMINAL_STATES } from '@breeze/shared';
+import { isolationAgentUpgradeGate } from '../routes/agents/agentUpdatePolicy';
+import { isNetworkIsolationCommand } from './networkIsolation/bypass';
 import {
   propagateCancelledDeviceCommands,
   type DeviceCommandCancelSubject,
 } from './commandCancelPropagation';
-import { assertDeviceExecuteAllowed, TrustDeniedError } from './partnerTrust.commands';
+import {
+  createDeviceExecuteBatchGate,
+  TrustDeniedError,
+  type DeviceExecuteTrustSnapshot,
+} from './partnerTrust.commands';
+import type { PartnerTrustState } from '../db/schema/orgs';
 import { captureException } from './sentry';
+import { callerVerificationEnabled, callerVerificationWorkstationEnabled } from '../config/env';
+import { DRAIN_CLAIM_TYPE_ALLOWLIST } from './drainClaimAllowlist';
+import { PARKED_DEVICE_CANCEL_REASON } from './unassignedPool/deliveryEligibility';
+import { isUnassignedPoolOrgType } from './unassignedPool/orgType';
 import { terminalPayloadErasureSet } from './sensitiveCommandPayload';
+import { commandStampIsCurrent, SUPERSEDED_BY_REATTACH_REASON } from './commandIncarnation';
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -25,32 +38,61 @@ export type ClaimCancelReason =
   | 'submitter_org_erased'
   /** A per-type revalidation found the authority the row was issued under gone. */
   | 'scope_changed'
+  | 'isolation_episode_mismatch'
+  | 'network-isolation-version-floor'
   /** The row carries its own absolute expiry and it has passed. */
   | 'expired'
   /** A type that REQUIRES revalidation had none registered — fail closed. */
-  | 'authority_unavailable';
+  | 'authority_unavailable'
+  /**
+   * The device is parked in its partner's holding org, where only lifecycle
+   * removal is delivered. An org-type fact, deliberately not folded into
+   * `device_lifecycle` (that one is the device's own status).
+   */
+  | typeof PARKED_DEVICE_CANCEL_REASON
+  /**
+   * #8318 §4.2/§5.2: the row is stamped for an earlier install incarnation of
+   * the device. The install it was queued for is gone, so nothing of it is
+   * delivered to the install that now owns the row — removal included.
+   */
+  | typeof SUPERSEDED_BY_REATTACH_REASON;
 
 /** Why a claim candidate was withheld this heartbeat but left `pending`. */
 export type ClaimHoldReason =
   | 'held_maintenance_suppression'
+  /** A feature-gated type whose feature is currently dark; recoverable when re-enabled. */
+  | 'held_feature_disabled'
   | 'power_state_barrier'
   | 'eligibility_check_failed';
 
 /**
  * The device facts claim-time eligibility needs. Deliberately NOT carrying a
  * partner id: `devices` has no `partner_id` column (partner ownership is
- * resolved through the org), and `assertDeviceExecuteAllowed` does that
- * resolution itself.
+ * resolved through the org), and the trust gate resolves it from `orgId` on
+ * the claim transaction (`readOrgTrustSnapshot`).
  */
 export type ClaimEligibilityDevice = {
   id: string;
   orgId: string;
   status: string;
+  /**
+   * `organizations.type` of the device's org. Required, so a claim path cannot
+   * forget to read it: a holding-org device gets lifecycle removal only.
+   */
+  orgType: string;
+  /**
+   * `devices.install_incarnation` (#8318). Required for the same reason as
+   * `orgType`: a claim path that forgot to read it could deliver an earlier
+   * install's work.
+   */
+  installIncarnation: number;
 };
 
 export type ClaimCandidate = {
   id: string;
   type: string;
+  /** `device_commands.device_incarnation`; NULL counts as incarnation 1. */
+  deviceIncarnation: number | null;
   createdBy: string | null;
   submittedOrgId: string | null;
   deliverBy: Date | null;
@@ -80,7 +122,10 @@ export type ClaimPartition = {
  * schedule a restart (with its own delay and user deferral), so it does not
  * need to be serialised against other work.
  */
-export const POWER_STATE_BARRIER_TYPES: ReadonlySet<string> = new Set(['reboot', 'shutdown', 'reboot_safe_mode']);
+// `force_reboot` (#8729) is here on purpose: it force-closes apps, but it still
+// waits its turn behind real in-flight work. Mark failed (#8508) is the way past
+// a stuck command, not a barrier bypass.
+export const POWER_STATE_BARRIER_TYPES: ReadonlySet<string> = new Set(['reboot', 'shutdown', 'reboot_safe_mode', 'force_reboot']);
 
 /**
  * Types the UNINSTALL DRAIN owns. Exempt from EVERY claim-time eligibility
@@ -101,7 +146,50 @@ export const POWER_STATE_BARRIER_TYPES: ReadonlySet<string> = new Set(['reboot',
  * apply to it are the caller's `deliver_by` predicate and the power-state
  * barrier — neither of which can strand it.
  */
-const DRAIN_EXEMPT_TYPES: ReadonlySet<string> = new Set(['self_uninstall']);
+const DRAIN_EXEMPT_TYPES: ReadonlySet<string> = new Set(DRAIN_CLAIM_TYPE_ALLOWLIST);
+
+/**
+ * Teardown types: commands that only END or REVOKE something Breeze itself
+ * started on the device — a desktop stream or session, a terminal, a tunnel, a
+ * running script or diagnostic, a backup job, a PAM elevation grant, a quick
+ * support session, a pending reboot. Exempt from the requester-active, org
+ * drift, erased-submitter-org, device-lifecycle and partner-trust cancels.
+ *
+ * Each of those checks answers "should this device still do work for this
+ * requester / tenant?". For a teardown the answer is always yes, because NOT
+ * delivering it keeps the capability alive: cancelling a `desktop_stream_stop`
+ * queued for a since-deactivated starter leaves that user's live session
+ * running, which is the opposite of what deactivating them intends. The same
+ * holds after an org move, on a quarantined device, or for a partner whose
+ * trust was revoked (most of these are already trust-exempt lifecycle types,
+ * `LIFECYCLE_COMMAND_TYPES` in partnerTrust.ts).
+ *
+ * Membership rule: a type is listed ONLY if it reduces capability and carries
+ * no device-executed operator content, target, credential or binary. A release
+ * reason is audit text only. Nothing that
+ * starts, executes, changes or reveals anything may be added (kill_process,
+ * stop_service, task_disable and software_uninstall act on the customer's own
+ * workload with an operator-chosen target and are deliberately NOT here).
+ * `commandClaimEligibility.test.ts` pins a forbidden list.
+ *
+ * Still applied to these rows: the parked-holding-org cancel (a parked device
+ * is claimed under the removal allowlist and its socket refuses everything but
+ * removal), the per-type delivery revalidation, holds, and the caller's
+ * `deliver_by` predicate.
+ */
+export const TEARDOWN_CLAIM_EXEMPT_TYPES: ReadonlySet<string> = new Set([
+  'desktop_stream_stop',
+  'stop_desktop',
+  'terminal_stop',
+  'tunnel_close',
+  'support_end',
+  'script_cancel',
+  'network_diagnostic_cancel',
+  'backup_stop',
+  'pam_cleanup_v2',
+  'cancel_reboot',
+  'release_containment',
+]);
 
 /** Device states in which ordinary queued work must never be delivered. */
 const NON_DELIVERABLE_LIFECYCLE: ReadonlySet<string> = new Set(['decommissioned', 'quarantined']);
@@ -143,14 +231,21 @@ export type CommandRevalidationRow = {
   type: string;
   deviceId: string;
   payload: unknown;
+  /** Optional so revalidations that don't need requester identity (e.g. the
+   * existing network_diagnostic one) aren't forced to plumb it through. */
+  createdBy?: string | null;
 };
 
 /**
  * Re-derive a queued command's authority from live rows. Returns `null` to
  * deliver, or the cancel reason that terminalises the row. A revalidation must
  * never write: cancellation is the caller's, inside its own claim transaction.
+ * `execute` / `transaction` are there only for savepointed reads through
+ * SECURITY DEFINER resolvers on the claim's own connection (the agent's
+ * org-scoped context cannot see partner-level rows, and escalating to a system
+ * context would borrow a second pooled connection — #1105).
  */
-export type CommandRevalidationReader = Pick<Tx, 'select'>;
+export type CommandRevalidationReader = Pick<Tx, 'select' | 'execute' | 'transaction'>;
 export type CommandRevalidation = (
   reader: CommandRevalidationReader,
   row: CommandRevalidationRow,
@@ -166,6 +261,10 @@ export const commandRevalidations: Record<string, CommandRevalidation> = {};
  */
 export const REVALIDATION_REQUIRED_TYPES: ReadonlySet<string> = new Set([
   'network_diagnostic',
+  // M3-D2: a standing-arm poll is only deliverable while its arm generation,
+  // collector, credential revision and actor epochs are unchanged.
+  'topology_interface_poll',
+  'script',
 ]);
 
 export function registerCommandRevalidation(
@@ -183,6 +282,18 @@ export function __resetCommandRevalidationsForTests(): void {
   for (const key of Object.keys(commandRevalidations)) delete commandRevalidations[key];
 }
 
+function updatesAgentBinary(row: CommandRevalidationRow): boolean {
+  if (row.type === 'update' || row.type === 'update_agent' || row.type === 'agent_rollback_v1') return true;
+  if (row.type !== 'dev_update') return false;
+  const payload = row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload)
+    ? row.payload as Record<string, unknown> : {};
+  return typeof payload.component !== 'string' || !payload.component || payload.component === 'agent';
+}
+
+function needsIsolationRevalidation(row: CommandRevalidationRow): boolean {
+  return updatesAgentBinary(row) || (row.type === 'execute_containment' && isNetworkIsolationCommand(row.type, row.payload));
+}
+
 /**
  * Runs the registered revalidation for one row, fail-closed for every type in
  * {@link REVALIDATION_REQUIRED_TYPES}. Shared by both delivery legs.
@@ -191,6 +302,35 @@ export async function revalidateCommandForDelivery(
   reader: CommandRevalidationReader,
   row: CommandRevalidationRow,
 ): Promise<ClaimCancelReason | null> {
+  // Built in rather than side-effect registered: HTTP and WebSocket delivery must
+  // always re-derive the episode authority, including for legacy queued commands.
+  if (row.type === 'execute_containment' && isNetworkIsolationCommand(row.type, row.payload)) {
+    const payload = row.payload as Record<string, unknown>;
+    const parameters = payload.parameters;
+    if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) return 'isolation_episode_mismatch';
+    const { isolationId, generation } = parameters as Record<string, unknown>;
+    if (typeof isolationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(isolationId) ||
+      typeof generation !== 'number' || !Number.isSafeInteger(generation) || generation < 1) return 'isolation_episode_mismatch';
+    const [episode] = await reader.select({ id: deviceNetworkIsolations.id, deviceId: deviceNetworkIsolations.deviceId,
+      generation: deviceNetworkIsolations.generation, state: deviceNetworkIsolations.state, desiredState: deviceNetworkIsolations.desiredState,
+    }).from(deviceNetworkIsolations).where(and(eq(deviceNetworkIsolations.id, isolationId), eq(deviceNetworkIsolations.deviceId, row.deviceId))).limit(1);
+    if (!episode || episode.id !== isolationId || episode.deviceId !== row.deviceId || episode.generation !== generation ||
+      isResolvedTerminalIsolationState(episode.state) || episode.desiredState !== 'isolated') return 'isolation_episode_mismatch';
+  }
+  if (updatesAgentBinary(row)) {
+    const payload = row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload)
+      ? row.payload as Record<string, unknown> : {};
+    const target = row.type === 'agent_rollback_v1' ? payload.targetVersion : payload.version;
+    const version = typeof target === 'string' ? target : '';
+    // A safe target needs no episode lookup. Missing/implicit targets cannot prove
+    // the floor, so they are withheld only while isolation is unresolved.
+    if (!isolationAgentUpgradeGate(version, true).allow) {
+      const [episode] = await reader.select({ state: deviceNetworkIsolations.state })
+        .from(deviceNetworkIsolations).where(and(eq(deviceNetworkIsolations.deviceId, row.deviceId),
+          notInArray(deviceNetworkIsolations.state, [...RESOLVED_TERMINAL_STATES]))).limit(1);
+      if (episode && !isResolvedTerminalIsolationState(episode.state)) return 'network-isolation-version-floor';
+    }
+  }
   const revalidate = commandRevalidations[row.type];
   if (!revalidate) {
     return REVALIDATION_REQUIRED_TYPES.has(row.type) ? 'authority_unavailable' : null;
@@ -218,6 +358,57 @@ function shouldReportEligibilityFault(deviceId: string, now: number): boolean {
 /** Test-only: clear the per-device Sentry throttle. */
 export function __resetEligibilityFaultThrottleForTests(): void {
   eligibilityFaultLastReported.clear();
+}
+
+/**
+ * Is the command's requester still an active member of the device's tenant?
+ *
+ * NOT a plain `SELECT status FROM users`: on the heartbeat this runs inside the
+ * AGENT's org-scoped context (device org only, no partner-axis access), and
+ * `users` is dual-axis RLS — a partner-level technician (org_id NULL) is
+ * invisible there, so a direct select read every technician as inactive and
+ * cancelled their queued work. `breeze_command_requester_is_active` (migration
+ * 2026-11-05-101500) is a SECURITY DEFINER resolver that returns only a
+ * boolean: caller has access to the org, user active, same partner as the org,
+ * and still attached to the tenant (own org, partner membership, or org
+ * membership). Agent RLS on `users` stays as narrow as it was, and no second
+ * pooled connection is opened inside the claim transaction.
+ *
+ * Wrapped in a savepoint so a failure (e.g. the function missing on a DB that
+ * has not migrated) leaves the claim transaction usable and the caller can
+ * hold the row instead of aborting the whole heartbeat.
+ */
+async function resolveRequesterActive(tx: Tx, userId: string, orgId: string): Promise<boolean> {
+  return tx.transaction(async (sp) => {
+    const rows = (await sp.execute(
+      sql`SELECT public.breeze_command_requester_is_active(${userId}::uuid, ${orgId}::uuid) AS active`,
+    )) as unknown as Array<{ active: boolean | null }>;
+    return rows[0]?.active === true;
+  });
+}
+
+/**
+ * The device org's partner and that partner's trust state, read on the CLAIM
+ * TRANSACTION's own connection through `breeze_org_partner_trust_state`
+ * (migration 2026-12-05-110000). The agent's org-scoped context cannot read
+ * `partners`, and the alternative — the system-context readers in
+ * `partnerTrust.repo` — borrows a second pooled connection while the claim
+ * still holds this one, which deadlocks the pool under concurrent heartbeats
+ * (#1105). Savepointed like `resolveRequesterActive`, so a failure leaves the
+ * claim transaction usable and the caller holds the gated rows.
+ */
+async function readOrgTrustSnapshot(tx: Tx, orgId: string): Promise<DeviceExecuteTrustSnapshot> {
+  return tx.transaction(async (sp) => {
+    const rows = (await sp.execute(
+      sql`SELECT partner_id, trust_state FROM public.breeze_org_partner_trust_state(${orgId}::uuid)`,
+    )) as unknown as Array<{ partner_id: string | null; trust_state: string | null }>;
+    return {
+      partnerId: rows[0]?.partner_id ?? null,
+      // Any value other than 'trusted' is denied by the gate, so an
+      // unexpected string can only fail closed.
+      trustState: (rows[0]?.trust_state ?? null) as PartnerTrustState | null,
+    };
+  });
 }
 
 /**
@@ -258,17 +449,45 @@ export async function partitionClaimable(
   const claimable: ClaimCandidate[] = [];
   const cancelled: Array<{ id: string; reason: ClaimCancelReason }> = [];
   const held: Array<{ id: string; reason: ClaimHoldReason }> = [];
-  const requesterActive = new Map<string, boolean>();
+  const requesterActive = new Map<string, boolean | 'error'>();
+  // One trust read per batch, on this transaction, and only if some row is
+  // actually gated — never a nested connection per row.
+  const assertTrusted = createDeviceExecuteBatchGate(device.id, () => readOrgTrustSnapshot(tx, device.orgId));
 
   for (const row of rows) {
-    // Checked FIRST, ahead of every cancel: see DRAIN_EXEMPT_TYPES above.
+    // #8318 §4.2/§5.2 — checked before everything, the drain exemption
+    // included: a row stamped for an earlier install incarnation was queued
+    // for an install that no longer exists. The boundary cancelled every such
+    // row that was open when it ran; this catches one that slipped past it,
+    // so it is terminalised here instead of waiting for the reaper. The flip
+    // to `sent` re-checks the same thing in SQL (commandDispatch.ts).
+    if (!commandStampIsCurrent(row.deviceIncarnation, device.installIncarnation)) {
+      cancelled.push({ id: row.id, reason: SUPERSEDED_BY_REATTACH_REASON });
+      continue;
+    }
+
+    // Checked FIRST among the rest, ahead of every other cancel: see DRAIN_EXEMPT_TYPES above.
     if (DRAIN_EXEMPT_TYPES.has(row.type)) {
       claimable.push(row);
       continue;
     }
 
+    // A device parked in a holding org is not being managed yet: only the
+    // drain-exempt removal above is delivered, and everything else is
+    // cancelled with its own reason — ahead of the org-drift, lifecycle,
+    // trust, requester and revalidation checks, none of which can make other
+    // work deliverable to it.
+    if (isUnassignedPoolOrgType(device.orgType)) {
+      cancelled.push({ id: row.id, reason: PARKED_DEVICE_CANCEL_REASON });
+      continue;
+    }
+
+    // Teardown types skip every requester / tenant cancel below (see
+    // TEARDOWN_CLAIM_EXEMPT_TYPES) but still get the revalidation and holds.
+    const teardown = TEARDOWN_CLAIM_EXEMPT_TYPES.has(row.type);
+
     const submittedOrgId = row.submittedOrgId ?? null;
-    if (submittedOrgId !== null && submittedOrgId !== device.orgId) {
+    if (!teardown && submittedOrgId !== null && submittedOrgId !== device.orgId) {
       cancelled.push({ id: row.id, reason: 'device_moved_org' });
       continue;
     }
@@ -285,18 +504,18 @@ export async function partitionClaimable(
     //    the org-merge path leaves behind (the loser org survives as a shell,
     //    is later erased, and the row's provenance goes NULL underneath a
     //    device that has since been repointed to the surviving org).
-    if (submittedOrgId === null && row.deliverBy !== null && row.deliverBy !== undefined) {
+    if (!teardown && submittedOrgId === null && row.deliverBy !== null && row.deliverBy !== undefined) {
       cancelled.push({ id: row.id, reason: 'submitter_org_erased' });
       continue;
     }
 
-    if (NON_DELIVERABLE_LIFECYCLE.has(device.status)) {
+    if (!teardown && NON_DELIVERABLE_LIFECYCLE.has(device.status)) {
       cancelled.push({ id: row.id, reason: 'device_lifecycle' });
       continue;
     }
 
     try {
-      await assertDeviceExecuteAllowed(device.id, row.type, row.createdBy ?? undefined);
+      if (!teardown) await assertTrusted(row.type, row.createdBy);
     } catch (e) {
       if (e instanceof TrustDeniedError) {
         cancelled.push({ id: row.id, reason: 'trust_denied' });
@@ -327,16 +546,35 @@ export async function partitionClaimable(
       continue;
     }
 
-    if (row.createdBy) {
+    if (row.createdBy && !teardown) {
       let active = requesterActive.get(row.createdBy);
       if (active === undefined) {
-        const [u] = await tx
-          .select({ status: users.status })
-          .from(users)
-          .where(eq(users.id, row.createdBy))
-          .limit(1);
-        active = u?.status === 'active';
+        try {
+          active = await resolveRequesterActive(tx, row.createdBy, device.orgId);
+        } catch (e) {
+          // Same fail-closed contract as the trust check above: never deliver
+          // on an unresolved requester, never cancel on a fault — hold. The
+          // lookup ran inside its own savepoint, so the claim transaction is
+          // still usable for the rest of the batch.
+          console.error(
+            '[commandClaimEligibility] requester check failed; holding the command rather than delivering or cancelling it',
+            {
+              commandId: row.id,
+              deviceId: device.id,
+              type: row.type,
+              error: e instanceof Error ? e.message : String(e),
+            },
+          );
+          if (shouldReportEligibilityFault(device.id, Date.now())) {
+            captureException(e instanceof Error ? e : new Error(String(e)));
+          }
+          active = 'error';
+        }
         requesterActive.set(row.createdBy, active);
+      }
+      if (active === 'error') {
+        held.push({ id: row.id, reason: 'eligibility_check_failed' });
+        continue;
       }
       if (!active) {
         cancelled.push({ id: row.id, reason: 'requester_inactive' });
@@ -347,14 +585,55 @@ export async function partitionClaimable(
     // Delivery-time authority re-derivation (M1 Task 15). Runs after the
     // tenant/trust checks and before the hold: a row whose issuing authority is
     // gone is terminal, not deferrable.
-    const revalidation = await revalidateCommandForDelivery(tx, {
+    //
+    // A registered revalidation reads the database, so it runs inside its own
+    // savepoint: a SQL error anywhere in it (device lookup, resolver call,
+    // another type's reads) rolls back to that savepoint instead of aborting
+    // the claim transaction, so only this row is held and the rest of the
+    // batch — and the cancel writes below — still run. Types with no
+    // registered or built-in isolation revalidation touch no SQL and skip the savepoint.
+    const revalidationFacts: CommandRevalidationRow = {
       id: row.id,
       type: row.type,
       deviceId: device.id,
       payload: row.payload,
-    });
+      createdBy: row.createdBy,
+    };
+    let revalidation: ClaimCancelReason | null;
+    try {
+      revalidation = commandRevalidations[row.type] || needsIsolationRevalidation(revalidationFacts)
+        ? await tx.transaction((sp) => revalidateCommandForDelivery(sp, revalidationFacts))
+        : await revalidateCommandForDelivery(tx, revalidationFacts);
+    } catch (e) {
+      // Same fail-closed contract as the trust and requester checks above:
+      // never deliver on an unresolved authority, never cancel on a fault —
+      // hold. The savepoint above has already rolled back, so the claim
+      // transaction is still usable for the rest of the batch.
+      console.error(
+        '[commandClaimEligibility] delivery revalidation failed; holding the command rather than delivering or cancelling it',
+        {
+          commandId: row.id,
+          deviceId: device.id,
+          type: row.type,
+          error: e instanceof Error ? e.message : String(e),
+        },
+      );
+      if (shouldReportEligibilityFault(device.id, Date.now())) {
+        captureException(e instanceof Error ? e : new Error(String(e)));
+      }
+      held.push({ id: row.id, reason: 'eligibility_check_failed' });
+      continue;
+    }
     if (revalidation) {
       cancelled.push({ id: row.id, reason: revalidation });
+      continue;
+    }
+
+    // Workstation prompts created before the tier went dark (or while the
+    // feature is off) are not handed to an agent: held, not cancelled, so the
+    // row stays pending and expires normally, or resumes if re-enabled.
+    if (row.type === 'caller_verify' && !(callerVerificationEnabled() && callerVerificationWorkstationEnabled())) {
+      held.push({ id: row.id, reason: 'held_feature_disabled' });
       continue;
     }
 

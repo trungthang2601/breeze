@@ -104,6 +104,8 @@ import {
   renderRunCsv,
   renderRunPdf,
 } from './reportsSelfService';
+import { MSP_STAFF_REPORT_TYPES } from '../reportRegistry';
+import { POSTURE_DEVICE_ROW_CSV_LABELS } from '@breeze/shared';
 
 const ORG_ID = '11111111-1111-4111-8111-111111111111';
 const USER_ID = '22222222-2222-4222-8222-222222222222';
@@ -350,6 +352,22 @@ describe('portal report SQL scope', () => {
     expect(query.params).toEqual(expect.arrayContaining([ORG_ID, true]));
   });
 
+  // #6941: portal_self_service alone must not admit a run into the portal.
+  // An msp_staff-audience type (margin, AR aging, SLA attainment) stays
+  // invisible even if a definition of that type ever carried the marker.
+  it.each([
+    ['listing', () => portalRunListPredicate(ORG_ID, true)],
+    ['rendering', () => portalRunPredicate(RUN_ID, ORG_ID, true)],
+    ['listing (lifecycle off)', () => portalRunListPredicate(ORG_ID, false)],
+    ['rendering (lifecycle off)', () => portalRunPredicate(RUN_ID, ORG_ID, false)],
+  ])('excludes msp_staff-audience types from run %s (#6941)', (_label, build) => {
+    const query = new PgDialect().sqlToQuery(build());
+
+    expect(query.sql).toContain('"reports"."type" not in (');
+    expect(MSP_STAFF_REPORT_TYPES.length).toBeGreaterThan(0);
+    expect(query.params).toEqual(expect.arrayContaining([...MSP_STAFF_REPORT_TYPES]));
+  });
+
   it('gates run listing on delivery (#5784 OD-12): unreferenced runs stay visible, referenced runs need a delivered occurrence', () => {
     const query = new PgDialect().sqlToQuery(portalRunListPredicate(ORG_ID, true));
     expect(query.sql).toMatch(/not exists \(\s*select 1 from service_deliverable_evidence/i);
@@ -511,7 +529,7 @@ describe('hardware_lifecycle MSP config inheritance (decision B2)', () => {
 
     expect(state.generateReport).toHaveBeenCalledWith(
       'hardware_lifecycle',
-      ORG_ID,
+      { kind: 'organization', orgId: ORG_ID },
       {
         sites: [],
         replaceAgeYears: 6,
@@ -538,7 +556,7 @@ describe('hardware_lifecycle MSP config inheritance (decision B2)', () => {
 
     expect(state.generateReport).toHaveBeenCalledWith(
       'hardware_lifecycle',
-      ORG_ID,
+      { kind: 'organization', orgId: ORG_ID },
       {
         sites: [],
         replaceAgeYears: 4,
@@ -621,7 +639,7 @@ describe('hardware_lifecycle MSP config inheritance (decision B2)', () => {
 
     expect(state.generateReport).toHaveBeenCalledWith(
       'hardware_lifecycle',
-      ORG_ID,
+      { kind: 'organization', orgId: ORG_ID },
       {
         sites: [],
         replaceAgeYears: 7,
@@ -676,11 +694,12 @@ describe('generatePortalReport', () => {
       createdAt: new Date('2026-09-02T11:59:00.000Z'),
     }]);
 
-    await generatePortalReport({
+    const dto = await generatePortalReport({
       orgId: ORG_ID,
       portalUserId: PORTAL_USER_ID,
       type: 'executive_summary',
     });
+    expect(dto.csvAvailable).toBe(true);
 
     expect(state.execute).toHaveBeenCalled();
     const query = new PgDialect().sqlToQuery(state.execute.mock.calls[0]![0]);
@@ -729,6 +748,9 @@ describe('generatePortalReport', () => {
         requestedByPortalUserId: PORTAL_USER_ID,
         executionScopePrincipalKind: 'portal_user',
         executionScopeUserId: null,
+        // #4247: the run carries its parent definition's owner axis.
+        orgId: ORG_ID,
+        partnerId: null,
       }),
     );
     expect(state.generateReport).toHaveBeenCalledTimes(1);
@@ -759,7 +781,7 @@ describe('generatePortalReport', () => {
       createdAt: new Date('2026-09-02T11:59:00.000Z'),
     }]);
 
-    await generatePortalReport({
+    const dto = await generatePortalReport({
       orgId: ORG_ID,
       portalUserId: PORTAL_USER_ID,
       type: 'executive_summary',
@@ -769,6 +791,8 @@ describe('generatePortalReport', () => {
       status: 'completed',
       rowCount: null,
     }));
+    // #9774: no rows -> renderRunCsv would 422, so the DTO must not offer CSV.
+    expect(dto.csvAvailable).toBe(false);
     // The MSP Reports list reads reports.last_generated_at (#4562 QA walk).
     expect(state.updated).toHaveBeenCalledWith(expect.objectContaining({
       lastGeneratedAt: expect.any(Date),
@@ -1139,6 +1163,7 @@ describe('listPortalRuns', () => {
         startedAt: new Date('2026-09-02T11:59:00.000Z'),
         completedAt: new Date('2026-09-02T12:00:00.000Z'),
         rowCount: null,
+        csvAvailable: false,
         createdAt: new Date('2026-09-02T11:59:00.000Z'),
       }]);
 
@@ -1153,6 +1178,7 @@ describe('listPortalRuns', () => {
     expect(result.data).toEqual([expect.objectContaining({
       id: RUN_ID,
       rowCount: null,
+      csvAvailable: false,
       status: 'completed',
     })]);
   });
@@ -1268,7 +1294,24 @@ describe('portal run rendering', () => {
     await expect(renderRunCsv(RUN_ID, ORG_ID)).resolves.toBe(
       'hostname\ndevice-1',
     );
-    expect(state.rowsToCsv).toHaveBeenCalledWith(rows);
+    // #9964: the customer-facing posture CSV labels its columns.
+    expect(state.rowsToCsv).toHaveBeenCalledWith(rows, {
+      headerLabels: POSTURE_DEVICE_ROW_CSV_LABELS,
+    });
+  });
+
+  it('keeps raw keys for a report type with no CSV labels', async () => {
+    const rows = [{ hostname: 'device-1' }];
+    state.selected.mockResolvedValue([{
+      id: RUN_ID,
+      type: 'hardware_lifecycle',
+      result: { rows },
+      completedAt: new Date('2026-09-02T12:00:00.000Z'),
+    }]);
+    state.rowsToCsv.mockReturnValue('hostname\ndevice-1');
+
+    await renderRunCsv(RUN_ID, ORG_ID);
+    expect(state.rowsToCsv).toHaveBeenCalledWith(rows, { headerLabels: undefined });
   });
 
   it('uses a typed conflict error when a run has no tabular result', async () => {

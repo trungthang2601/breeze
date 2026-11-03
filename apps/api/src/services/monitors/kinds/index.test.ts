@@ -32,11 +32,16 @@ const SAMPLES: Record<string, Record<string, unknown>> = {
       { kind: 'offline', condition: { durationMinutes: 10 } },
     ],
   },
+  // W03 (hardware & RAID monitoring).
+  hardware_health: { componentTypes: ['physical_disk'], minHealth: 'critical', includePredictiveFailure: true, consecutiveSnapshots: 2 },
+  time_sync: { findings: ['sync_stale'], consecutiveSnapshots: 2 },
+  // W06 (workload inventory image currency).
+  container_image_currency: { minDaysBehind: 7 },
 };
 
 describe('monitor kind registry (#5289)', () => {
-  it('ships nineteen kinds after W05c1', () => {
-    expect(MONITOR_KINDS).toHaveLength(19);
+  it('ships twenty-two kinds with hardware health, time sync and container image currency', () => {
+    expect(MONITOR_KINDS).toHaveLength(22);
   });
 
   it('has a spec for every kind and every compiled condition validates against alertConditions', () => {

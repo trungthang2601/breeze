@@ -12,7 +12,15 @@ import {
 import { deliverByFor, resolveOfflinePolicy, type OfflinePolicy } from './commandOfflinePolicy';
 import { queueCommand, type CommandPayload, type QueuedCommand } from './commandQueue';
 import { assertDeviceExecuteAllowed, TrustDeniedError } from './partnerTrust.commands';
+import { backupReadHelperRefusal } from './backupReadHelperGate';
+import { backupWriteHelperRefusal } from './backupWriteHelperGate';
+import { restoreIntegrityHelperRefusal } from './backupRestoreGate';
 import { captureException } from './sentry';
+import {
+  isParkedDeliverableCommandType,
+  isParkedDevice,
+  PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE,
+} from './unassignedPool/deliveryEligibility';
 import { decryptCommandForDelivery, toAgentCommandFrame } from './sensitiveCommandPayload';
 
 import type { AiOriginRef } from '@breeze/shared';
@@ -32,6 +40,19 @@ export type DispatchDeviceCommandInput = {
   commandId?: string;
   /** #5022 W01 — who DECIDED this command, when an AI surface did. */
   aiOrigin?: AiOriginRef;
+  /**
+   * #7187 — persist the row but do NOT claim or push it; return a `deliver()`
+   * continuation instead (the #3445 `scriptDispatch` shape).
+   *
+   * For a caller whose transaction stays open after this returns (the
+   * automation runtime's claim transaction around a software deployment). The
+   * row is INSERTed through that transaction, and the agent result path reads
+   * `device_commands` on its own connection: a push before commit lets a fast
+   * agent answer against a row it cannot see, and the result is dropped as an
+   * orphan. Such a caller passes this flag and calls `deliver()` after its
+   * transaction commits.
+   */
+  deferDelivery?: boolean;
 };
 
 export type DispatchDeviceCommandResult =
@@ -42,15 +63,36 @@ export type DispatchDeviceCommandResult =
        * `delivered` = pushed over the live socket now. `queued_live` = device is
        * online but the push did not happen (no socket, push failed, or
        * preferHeartbeat); the next heartbeat claims it. `queued_offline` = the
-       * device was not online at enqueue.
+       * device was not online at enqueue. `cancelled` = the push's claim-time
+       * eligibility check (the same one the heartbeat claim runs) refused and
+       * terminalised the row; it will never be delivered — see `cancelReason`.
        */
-      delivery: 'delivered' | 'queued_offline' | 'queued_live';
+      delivery: 'delivered' | 'queued_offline' | 'queued_live' | 'cancelled';
+      /** Present only when `delivery` is `cancelled`: `device_commands.result.reason`. */
+      cancelReason?: string;
       /** NULL for a `reject` policy: those rows stay on the legacy execution clock. */
       deliverBy: Date | null;
+      /**
+       * #7187 — present only for a `deferDelivery` dispatch to a device with a
+       * live agent socket (`delivery` is then `queued_live`). Claims and pushes
+       * the persisted row exactly as the immediate path would, and resolves to
+       * the real delivery. MUST run after the caller's transaction commits,
+       * with no ambient context (the claim and release open their own). Never
+       * rejects: a transport failure leaves the committed row `queued_live`
+       * for the heartbeat claim.
+       */
+      deliver?: () => Promise<DispatchDeviceCommandResult>;
     }
   | {
       ok: false;
-      code: 'device_not_found' | 'device_offline' | 'device_decommissioned' | 'trust_denied';
+      code:
+        | 'device_not_found'
+        | 'device_offline'
+        | 'device_decommissioned'
+        /** The device is parked in a holding org: lifecycle removal only. */
+        | 'device_pending_assignment'
+        | 'trust_denied'
+        | 'backup_helper_update_required';
       error: string;
       trust?: { capability: 'device_execute'; reason: string };
     };
@@ -74,6 +116,20 @@ export async function dispatchDeviceCommand(
   const policy = resolveOfflinePolicy(input.type, input.offlinePolicy);
   const prepared = await prepareDeviceCommand(input, policy);
   if (!prepared.ok) return prepared;
+  if (input.deferDelivery) {
+    const { command, deliverBy } = prepared;
+    if (!prepared.online) return { ok: true, command, delivery: 'queued_offline', deliverBy };
+    if (!prepared.device.agentId || input.preferHeartbeat) {
+      return { ok: true, command, delivery: 'queued_live', deliverBy };
+    }
+    return {
+      ok: true,
+      command,
+      delivery: 'queued_live',
+      deliverBy,
+      deliver: () => deliverCommittedDeviceCommand(input, prepared),
+    };
+  }
   return deliverPreparedDeviceCommand(input, prepared);
 }
 
@@ -94,6 +150,14 @@ export async function dispatchDeviceCommandWithSystemPrecheck(
     'dispatchDeviceCommandWithSystemPrecheck',
   );
   if (!prepared.ok) return prepared;
+  return deliverCommittedDeviceCommand(input, prepared);
+}
+
+/** Transport for a row whose transaction has already committed. Never rejects. */
+async function deliverCommittedDeviceCommand(
+  input: DispatchDeviceCommandInput,
+  prepared: PreparedDeviceCommand,
+): Promise<DispatchDeviceCommandResult> {
   try {
     return await deliverPreparedDeviceCommand(input, prepared);
   } catch (error) {
@@ -139,6 +203,13 @@ async function prepareDeviceCommand(
     };
   }
 
+  // A device parked in a holding org receives lifecycle removal only. Refused
+  // here, before trust and persistence, so the caller gets a structured code
+  // instead of `queueCommand`'s thrown refusal.
+  if (!isParkedDeliverableCommandType(input.type) && (await isParkedDevice(db, input.deviceId))) {
+    return { ok: false, code: 'device_pending_assignment', error: PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE };
+  }
+
   // OFFLINE-REJECT COMES BEFORE TRUST, deliberately (#5128 review round 2, M).
   // Four backup routes classify a failure by the `Device is <status>, cannot
   // execute command` prefix (routes/backup/vmrestore.ts, restore.ts,
@@ -160,8 +231,24 @@ async function prepareDeviceCommand(
     throw e;
   }
 
-  const deliverBy = deliverByFor(policy);
   const payload = input.payload ?? {};
+
+  // A storage read or a backup to S3 storage for a helper that cannot use a
+  // storage session could only be served by sending it the storage
+  // destination, which is never done. Refused here, before a row exists, so
+  // the caller can say so; the delivery refreshers enforce the same rules
+  // against the helper's reported capability at the moment of delivery.
+  // A privileged restore (one that installs, imports or boots snapshot
+  // bytes) additionally needs a helper that checks restored bytes against the
+  // snapshot attestation (services/backupRestoreGate.ts); delivery re-checks.
+  const helperRefusal = backupReadHelperRefusal(input.type, payload, device.backupReadProtocolVersion)
+    ?? backupWriteHelperRefusal(input.type, payload, device.backupWriteProtocolVersion)
+    ?? restoreIntegrityHelperRefusal(input.type, device.backupIntegrityProtocolVersion);
+  if (helperRefusal) {
+    return { ok: false, code: 'backup_helper_update_required', error: helperRefusal };
+  }
+
+  const deliverBy = deliverByFor(policy);
   const command = await queueCommand(input.deviceId, input.type, payload, input.userId, {
     ...(input.commandId ? { commandId: input.commandId } : {}),
     deliverBy,
@@ -186,8 +273,8 @@ async function deliverPreparedDeviceCommand(
   // queued reboot could land in the middle of a running script.
   //
   // Review round 2 (J): a blanket skip was too blunt. `maintenanceRebootWorker`
-  // and the fleet-findings dispatch map both issue reboots that ALWAYS pushed
-  // before #5128, and downgrading them to "wait for the next heartbeat" delays
+  // (Linux, until #9181 moved it onto schedule_reboot) and the fleet-findings
+  // dispatch map both issued reboots that ALWAYS pushed before #5128, and downgrading them to "wait for the next heartbeat" delays
   // a maintenance-window reboot by a whole heartbeat interval. So apply the
   // barrier's actual condition instead: push only when nothing is in flight on
   // this device, which is exactly what the heartbeat claim checks.
@@ -199,19 +286,33 @@ async function deliverPreparedDeviceCommand(
   }
 
   const claimed = await claimPendingCommandForDelivery(command.id);
-  if (!claimed) return { ok: true, command, delivery: 'queued_live', deliverBy };
+  if (claimed.status === 'cancelled') {
+    return {
+      ok: true,
+      command: { ...command, status: 'cancelled' } as QueuedCommand,
+      delivery: 'cancelled',
+      cancelReason: claimed.reason,
+      deliverBy,
+    };
+  }
+  if (claimed.status !== 'claimed') return { ok: true, command, delivery: 'queued_live', deliverBy };
 
   // The enqueue-time push runs the same late-binding preparation the heartbeat
   // batch does, so a `software_install` pushed now and one claimed in six hours
-  // are prepared identically.
+  // are prepared identically. A refusal expires this claim inside the
+  // refresher step, which makes the release below a 0-row no-op.
   const fresh = await refreshPayloadForDelivery(
     input.type,
     payload && typeof payload === 'object' && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {},
+    { commandId: command.id, deviceId: input.deviceId, type: input.type, claimedAt: claimed.executedAt },
   );
   const prepared = fresh
     ? decryptCommandForDelivery({ id: command.id, type: input.type, deviceId: input.deviceId, payload: fresh })
     : null;
-  const sent = prepared ? sendCommandToAgent(device.agentId, toAgentCommandFrame(prepared)) : false;
+  // #8318 §6.4: push to the agent_id read IN the claim, not to the one read
+  // by prepareDeviceCommand before it — a reattach confirm between the two
+  // changes who owns the row.
+  const sent = prepared ? sendCommandToAgent(claimed.agentId, toAgentCommandFrame(prepared)) : false;
   if (sent) {
     return {
       ok: true,

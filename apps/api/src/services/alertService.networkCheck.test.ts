@@ -54,6 +54,16 @@ const {
           };
         },
       })),
+      execute: vi.fn(async (statement: { values: unknown[] }) => {
+        callOrder.push('createAlert.insert');
+        const [ruleId, deviceId, orgId, severity, title, message, context, monitorId, episodeId, requiresHuman, subjectKey] = statement.values;
+        insertedAlerts.push({
+          ruleId, deviceId, orgId, severity, title, message,
+          context: JSON.parse(context as string), monitorId, episodeId, requiresHuman, subjectKey,
+        });
+        return [{ id: 'alert-1' }];
+      }),
+      update: vi.fn(() => ({ set: () => ({ where: () => Promise.resolve(undefined) }) })),
       delete: vi.fn(() => ({ where: () => Promise.resolve([]) })),
     },
     captureExceptionMock: vi.fn(),
@@ -83,7 +93,12 @@ vi.mock('drizzle-orm', () => ({
   desc: (col: unknown) => ({ op: 'desc', col }),
 }));
 
-vi.mock('../db', () => ({ db: dbMock }));
+vi.mock('../db', () => ({
+  db: dbMock,
+  // #10859 — the evaluator scopes its own contexts; their boundaries are
+  // asserted in alertService.contextScoping.test.ts.
+  withSystemDbAccessContext: async (fn: () => Promise<unknown>) => fn(),
+}));
 
 vi.mock('../db/schema', () => ({
   alerts: { id: 'alerts.id', ruleId: 'alerts.ruleId', deviceId: 'alerts.deviceId', status: 'alerts.status' },
@@ -130,22 +145,21 @@ vi.mock('./monitors/escalationLatch', () => ({
 }));
 
 vi.mock('./alertConditions', () => ({
+  evidenceLeafPaths: vi.fn(() => []),
   evaluateConditions: evaluateConditionsMock,
   evaluateAutoResolveConditions: vi.fn(),
   interpolateTemplate: vi.fn((template: string) => template),
+  withMetConditionDescriptions: vi.fn((context: Record<string, unknown>) => context),
 }));
 
 vi.mock('./alertCooldown', () => ({
   isCooldownActive: isCooldownActiveMock,
   setCooldown: vi.fn(() => Promise.resolve()),
-  isConfigPolicyRuleCooling: vi.fn(),
-  markConfigPolicyRuleCooldown: vi.fn(),
   recordStateTransition: vi.fn(() => Promise.resolve()),
   isFlapping: isFlappingMock,
 }));
 
 vi.mock('./featureConfigResolver', () => ({
-  resolveAlertRulesForDevice: vi.fn(),
   resolveMaintenanceConfigForDevice: vi.fn(),
   isInMaintenanceWindow: vi.fn(),
 }));
@@ -154,6 +168,8 @@ vi.mock('./eventBus', () => ({ publishEvent: vi.fn(() => Promise.resolve()) }));
 vi.mock('./sentry', () => ({ captureException: captureExceptionMock }));
 vi.mock('./deviceSiteResolver', () => ({ resolveDeviceSiteId: vi.fn(() => Promise.resolve('site-1')) }));
 vi.mock('../jobs/alertCorrelation', () => ({ enqueueAlertCorrelation: vi.fn(() => Promise.resolve('job-1')) }));
+
+import { resolveMaintenanceConfigForDevice, isInMaintenanceWindow } from './featureConfigResolver';
 
 import { evaluateDeviceAlerts, evaluateNetworkCheckAlertsForDevice } from './alertService';
 
@@ -238,6 +254,7 @@ beforeEach(() => {
   callOrder.length = 0;
   insertedAlerts.length = 0;
   vi.clearAllMocks();
+  vi.mocked(resolveMaintenanceConfigForDevice).mockResolvedValue(null);
   resolveMonitorsForDeviceMock.mockResolvedValue({
     kind: 'resolved',
     monitors: [
@@ -256,7 +273,7 @@ beforeEach(() => {
     needsEscalationAlert: false,
     responsesPaused: false,
   });
-  linkEpisodeAlertMock.mockResolvedValue(undefined);
+  linkEpisodeAlertMock.mockResolvedValue({ owner: true });
   detachMonitorFromDeviceMock.mockResolvedValue(undefined);
   // The handler would breach for whichever device it is asked about — that is
   // exactly the shape of the #6353 bug, so the split under test must not lean
@@ -320,3 +337,12 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
   });
 });
 
+
+it('suppresses the device-independent network-check evaluation during maintenance', async () => {
+  vi.mocked(resolveMaintenanceConfigForDevice).mockResolvedValue({ suppressAlerts: true } as never);
+  vi.mocked(isInMaintenanceWindow).mockReturnValue({ active: true, suppressAlerts: true } as never);
+  pushSweepQueue({ deviceId: 'device-offline', createsAlert: true, detachScan: false });
+  expect(await evaluateNetworkCheckAlertsForDevice('device-offline', new Set([MONITOR_ID]))).toEqual([]);
+  expect(evaluateConditionsMock).not.toHaveBeenCalled();
+  expect(insertedAlerts).toHaveLength(0);
+});

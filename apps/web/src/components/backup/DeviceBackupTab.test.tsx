@@ -20,6 +20,14 @@ vi.mock('../shared/AlphaBadge', () => ({
   default: () => <span>Alpha</span>,
 }));
 
+let externalPresent = true;
+vi.mock('./ExternalBackupCard', () => ({
+  default: ({ onPresenceChange }: { onPresenceChange?: (p: boolean) => void }) => {
+    onPresenceChange?.(externalPresent);
+    return externalPresent ? <div data-testid="stub-external-backup" /> : null;
+  },
+}));
+
 const fetchMock = vi.mocked(fetchWithAuth);
 
 const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
@@ -33,6 +41,7 @@ const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500):
 describe('DeviceBackupTab', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    externalPresent = true;
 
     fetchMock.mockImplementation(async (input, init) => {
       const url = String(input);
@@ -113,6 +122,21 @@ describe('DeviceBackupTab', () => {
     });
   });
 
+  it('adds an Integrity column with a badge per restore point (#9626)', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/backup/snapshots?deviceId=device-1') {
+        const payload = await (await base(input, init)).json();
+        return makeJsonResponse({ data: payload.data.map((row: object) => ({ ...row, integrityStatus: 'attested' })) });
+      }
+      return base(input, init);
+    });
+    render(<DeviceBackupTab deviceId="device-1" />);
+    await screen.findByText('Restore Points');
+    const table = (await screen.findByRole('columnheader', { name: 'Integrity' })).closest('table')!;
+    expect(within(table).getByTestId('snapshot-integrity-badge').textContent).toBe('Verified');
+  });
+
   it('shows restore-point protection controls for the selected snapshot', async () => {
     render(<DeviceBackupTab deviceId="device-1" />);
 
@@ -124,7 +148,7 @@ describe('DeviceBackupTab', () => {
     const jobHistoryTable = jobHistoryCard?.querySelector('table');
 
     expect(jobHistoryTable).toBeTruthy();
-    expect(within(jobHistoryTable as HTMLTableElement).getByText('1 KB')).toBeTruthy();
+    expect(within(jobHistoryTable as HTMLTableElement).getByText('1.00 KB')).toBeTruthy();
   });
 
   it('applies legal hold from the device tab', async () => {
@@ -255,6 +279,89 @@ describe('DeviceBackupTab', () => {
 
     const runButton = await screen.findByRole('button', { name: /Run backup now/i });
     expect(runButton).toBeDisabled();
+  });
+
+  it('shows, as visible text, why Run backup now is disabled on an unprotected device (#7213)', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/status/device-1') return makeJsonResponse({ data: { protected: false } });
+      if (url === '/backup/jobs?deviceId=device-1') return makeJsonResponse({ data: [] });
+      if (url === '/backup/snapshots?deviceId=device-1') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceBackupTab deviceId="device-1" />);
+
+    expect(await screen.findByRole('button', { name: /Run backup now/i })).toBeDisabled();
+    // A title tooltip is invisible on a disabled button — the reason must be text.
+    expect(screen.getByText(/Assign a backup policy to protect this device/i, { selector: 'p,span' })).toBeTruthy();
+  });
+
+  it('keeps line breaks in the completed-with-errors file list (#7213)', async () => {
+    const errorLog = '2 file(s) could not be read:\nC:\\a.txt: permission denied\nC:\\b.txt: in use';
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/status/device-1') {
+        return makeJsonResponse({
+          data: {
+            protected: true,
+            lastJob: { id: 'j', deviceId: 'device-1', type: 'file', status: 'completed_with_errors', startedAt: '2026-03-30T00:00:00Z', errorCount: 2, errorLog },
+          },
+        });
+      }
+      if (url === '/backup/jobs?deviceId=device-1') return makeJsonResponse({ data: [] });
+      if (url === '/backup/snapshots?deviceId=device-1') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceBackupTab deviceId="device-1" />);
+
+    const banner = await screen.findByTestId('backup-last-job-diagnostic');
+    const body = banner.querySelector('p.mt-1');
+    expect(body?.textContent).toContain('C:\\a.txt: permission denied\nC:\\b.txt: in use');
+    expect(body?.className).toContain('whitespace-pre-line');
+  });
+
+  describe('skipped reparse points (#9543)', () => {
+    const reparseNote =
+      '2 reparse point(s) were not backed up (junctions and mount points are skipped, not followed; 2 other): ' +
+      'C:\\a.exe (other reparse point, tag 0x8000001B); C:\\b.exe (other reparse point, tag 0x8000001B)';
+
+    const mockLastJob = (status: string, errorLog: string) => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === '/backup/status/device-1') {
+          return makeJsonResponse({
+            data: {
+              protected: true,
+              lastJob: { id: 'j', deviceId: 'device-1', type: 'file', status, startedAt: '2026-03-30T00:00:00Z', errorCount: 0, errorLog },
+            },
+          });
+        }
+        if (url === '/backup/jobs?deviceId=device-1') return makeJsonResponse({ data: [] });
+        if (url === '/backup/snapshots?deviceId=device-1') return makeJsonResponse({ data: [] });
+        return makeJsonResponse({}, false, 404);
+      });
+    };
+
+    it('shows a completed run that only skipped reparse points as info, not a warning banner', async () => {
+      mockLastJob('completed', reparseNote);
+
+      render(<DeviceBackupTab deviceId="device-1" />);
+
+      expect((await screen.findByTestId('backup-job-reparse-skipped')).textContent).toContain('2 reparse points skipped');
+      expect(screen.queryByTestId('backup-last-job-diagnostic')).toBeNull();
+    });
+
+    it('keeps the failure banner to the real reason when the run also skipped reparse points', async () => {
+      mockLastJob('failed', `backup stopped; ${reparseNote}`);
+
+      render(<DeviceBackupTab deviceId="device-1" />);
+
+      const banner = await screen.findByTestId('backup-last-job-diagnostic');
+      expect(banner.querySelector('p.mt-1')?.textContent).toBe('backup stopped');
+      expect(screen.getByTestId('backup-job-reparse-skipped')).toBeTruthy();
+    });
   });
 
   it('shows the provider fallback warning on a restore point', async () => {
@@ -474,6 +581,71 @@ describe('DeviceBackupTab', () => {
     expect(within(jobHistoryTable as HTMLTableElement).queryByText('Pending')).toBeNull();
   });
 
+  it('labels a completed_with_errors job "Completed with errors", never "Pending" or "Completed", and surfaces the failed-file summary (#5396)', async () => {
+    // completed_with_errors contains "complete", so a naive `.includes('complete')`
+    // check (or the `?? jobStatusConfig.pending` fallback) would launder it into
+    // a clean green "Completed" or an unlabelled "Pending".
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+
+      if (url === '/backup/status/device-1') {
+        return makeJsonResponse({
+          data: {
+            protected: true,
+            lastJob: {
+              id: 'job-cwe',
+              deviceId: 'device-1',
+              type: 'file',
+              status: 'completed_with_errors',
+              startedAt: '2026-03-30T00:00:00Z',
+              completedAt: '2026-03-30T00:10:00Z',
+              totalSize: 1024,
+              errorCount: 3,
+              errorLog: "3 file(s) could not be read during collection: C:\\x: permission denied",
+            },
+          },
+        });
+      }
+
+      if (url === '/backup/jobs?deviceId=device-1') {
+        return makeJsonResponse({
+          data: [
+            {
+              id: 'job-cwe',
+              deviceId: 'device-1',
+              type: 'file',
+              status: 'completed_with_errors',
+              startedAt: '2026-03-30T00:00:00Z',
+              completedAt: '2026-03-30T00:10:00Z',
+              totalSize: 1024,
+              errorCount: 3,
+            },
+          ],
+        });
+      }
+
+      if (url === '/backup/snapshots?deviceId=device-1' && method === 'GET') {
+        return makeJsonResponse({ data: [] });
+      }
+
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceBackupTab deviceId="device-1" />);
+
+    const jobHistoryTable = (await screen.findByText('Job History')).parentElement?.querySelector('table');
+    expect(jobHistoryTable).toBeTruthy();
+    expect(within(jobHistoryTable as HTMLTableElement).getByText('Completed with errors')).toBeTruthy();
+    expect(within(jobHistoryTable as HTMLTableElement).queryByText('Pending')).toBeNull();
+    expect(within(jobHistoryTable as HTMLTableElement).queryByText('Completed')).toBeNull();
+    expect(within(jobHistoryTable as HTMLTableElement).getByText('3')).toBeTruthy();
+
+    const diagnostic = await screen.findByTestId('backup-last-job-diagnostic');
+    expect(diagnostic.textContent).toContain('Last backup completed with errors');
+    expect(diagnostic.textContent).toContain('permission denied');
+  });
+
   describe('VSS status panel (#3027)', () => {
     function mockStatusWithVss(vssMetadata: unknown, lastJobExtra: Record<string, unknown> = {}) {
       fetchMock.mockImplementation(async (input, init) => {
@@ -600,5 +772,22 @@ describe('DeviceBackupTab', () => {
       await screen.findByText('Job History');
       expect(screen.queryByTestId('backup-last-job-diagnostic')).toBeNull();
     });
+  });
+
+  it('renders the external backup card above the first-party sections', async () => {
+    externalPresent = true;
+    render(<DeviceBackupTab deviceId="device-1" />);
+    expect(await screen.findByTestId('stub-external-backup')).toBeInTheDocument();
+  });
+
+  it('points at third-party connections from the empty state when neither source has anything', async () => {
+    externalPresent = false;
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/backup/status/device-1') return makeJsonResponse({ data: { protected: false } });
+      return makeJsonResponse({ data: [] });
+    });
+    render(<DeviceBackupTab deviceId="device-1" />);
+    expect(await screen.findByTestId('device-backup-empty-external-hint')).toBeInTheDocument();
   });
 });

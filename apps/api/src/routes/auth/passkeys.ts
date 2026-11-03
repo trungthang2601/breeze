@@ -57,6 +57,8 @@ import {
   requireCurrentPasswordStepUp,
   resolveCurrentUserTokenContext,
   resolveEnrollmentStepUp,
+  resolveFactorManagementStepUp,
+  consumeFactorManagementReauthGrant,
   rejectProof,
   MFA_PROOF_INVALID,
   installAuthorizedUserSessionCookies,
@@ -69,17 +71,22 @@ import { installAuthBindingReplacement, requestAuthBinding } from './binding';
 
 const { db, withSystemDbAccessContext, runOutsideDbContext } = dbModule;
 
-function authIssuanceAdmissionError(c: Context, error: unknown): Response | null {
+function authIssuanceAdmissionError(
+  c: Context,
+  error: unknown,
+  { stepUpGrantConsumed = false }: { stepUpGrantConsumed?: boolean } = {},
+): Response | null {
+  const consumedGrant = stepUpGrantConsumed ? { stepUpGrantConsumed: true } : {};
   if (error instanceof AuthBindingRotationRequiredError) {
     installAuthBindingReplacement(c, error.replacement);
-    return c.json({ error: error.message, reason: 'auth_binding_rotation_required' }, 428);
+    return c.json({ error: error.message, reason: 'auth_binding_rotation_required', ...consumedGrant }, 428);
   }
   if (
     error instanceof AuthBindingUnavailableError
     || error instanceof AuthIssuanceConflictError
     || error instanceof AuthIssuanceCapabilityError
   ) {
-    return c.json({ error: 'Authentication issuance unavailable' }, 409);
+    return c.json({ error: 'Authentication issuance unavailable', ...consumedGrant }, 409);
   }
   return null;
 }
@@ -134,9 +141,10 @@ const passkeyNameSchema = z.string().trim().min(1).max(255);
 // #4018: BOTH enrollment proofs are optional HERE — resolveEnrollmentStepUp
 // decides which road this account may take, and "neither supplied" must be its
 // opaque 401 rather than a 400 from this schema, so the rejection never reveals
-// whether the account has a password. `deletePasskeySchema` below is untouched:
-// deleting a factor is not a first-factor enrollment and an
-// enroll_first_factor grant must never authorize it.
+// whether the account has a password. `deletePasskeySchema` below uses a
+// DIFFERENT resolver (#4045, resolveFactorManagementStepUp): deleting a factor
+// is not a first-factor enrollment and an enroll_first_factor grant must never
+// authorize it.
 const registerOptionsSchema = z.object({
   currentPassword: z.string().min(1).max(256).optional(),
   ssoReauthGrantId: z.string().uuid().optional(),
@@ -161,8 +169,14 @@ const passkeyMfaVerifySchema = z.object({
 const renamePasskeySchema = z.object({
   name: passkeyNameSchema
 });
+// #4045: the "user at the keyboard" leg takes the password OR, for a
+// passwordless SSO account, a fresh IdP re-auth grant minted for
+// `sso_reauth_manage_factor`. Both optional here — resolveFactorManagementStepUp
+// decides the road, so "neither" is its rejection, not a zod error. The
+// `enroll_first_factor` grant can never satisfy it (the bind operation differs).
 const deletePasskeySchema = z.object({
-  currentPassword: z.string().min(1).max(256),
+  currentPassword: z.string().min(1).max(256).optional(),
+  ssoReauthGrantId: z.string().uuid().optional(),
   // Optional at validation so a stale client receives the stable security
   // boundary response (`existing_factor_step_up_required`) rather than a
   // generic schema error. The handler still fails closed when it is absent.
@@ -322,7 +336,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
   if (stepUpError) return stepUpError;
 
   // #4018: terminal burn for the passwordless SSO road — one
-  // enroll_first_factor grant registers exactly one passkey. `passwordAlreadyProven`
+  // SSO re-auth grant (#7369: of either purpose) registers exactly one passkey. `passwordAlreadyProven`
   // because this endpoint carries no password field at all: the password road
   // was satisfied at /passkeys/register/options, and re-demanding it here would
   // break every existing password-account registration.
@@ -374,6 +388,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
   let teardownFailed: boolean;
   let sessionInstalled = true;
   let replacement: { recoveryCodes: string[] | null; issued: AuthorizedUserSession | null } | null = null;
+  let mfaState: Pick<typeof users.$inferSelect, 'mfaEnabled' | 'mfaMethod'>;
   if (!enrollmentState.mfaEnabled) {
     const recoveryCodes = generateRecoveryCodes();
     const recoveryCodeHashes = hashRecoveryCodes(recoveryCodes);
@@ -407,7 +422,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
         recoveryCodes,
         recoveryCodeHashes,
         persistFactor: async (tx, hashes) => {
-          const enabled = await tx
+          const [enabled] = await tx
             .update(users)
             .set({
               mfaEnabled: true,
@@ -416,9 +431,10 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
               updatedAt: new Date(),
             })
             .where(and(eq(users.id, auth.user.id), eq(users.mfaEnabled, false)))
-            .returning({ id: users.id });
-          if (enabled.length !== 1) throw new Error('MFA enrollment state changed');
-          return persistPasskey(tx);
+            .returning({ mfaEnabled: users.mfaEnabled, mfaMethod: users.mfaMethod });
+          if (!enabled) throw new Error('MFA enrollment state changed');
+          await persistPasskey(tx);
+          return enabled;
         },
       });
     } catch (error) {
@@ -428,6 +444,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
       return response;
     }
     sessionInstalled = await installReplacementSession(c, result.issued, auth.user.id, 'passkey_register');
+    mfaState = result.value;
     mfaEpoch = result.mfaEpoch;
     teardownFailed = result.cleanup.remoteSessionsTerminated === TEARDOWN_FAILED;
     // The one-time recovery codes are reported even when the session install
@@ -481,7 +498,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
           await persistPasskey(tx);
           const hasExistingFactor = Boolean(enrollmentState.mfaSecret) || enrollmentState.mfaMethod === 'sms';
 
-          const rows = await tx
+          const [state] = await tx
             .update(users)
             .set({
               mfaEnabled: true,
@@ -489,9 +506,9 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
               updatedAt: new Date()
             })
             .where(eq(users.id, auth.user.id))
-            .returning({ id: users.id });
-          if (rows.length !== 1) throw new Error('Passkey registration user disappeared');
-          return undefined;
+            .returning({ mfaEnabled: users.mfaEnabled, mfaMethod: users.mfaMethod });
+          if (!state) throw new Error('Passkey registration user disappeared');
+          return state;
         },
       });
     } catch (error) {
@@ -502,6 +519,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
     }
 
     sessionInstalled = await installReplacementSession(c, result.issued, auth.user.id, 'passkey_register');
+    mfaState = result.value;
     mfaEpoch = result.mfaEpoch;
     teardownFailed = result.cleanup.remoteSessionsTerminated === TEARDOWN_FAILED;
     // No recovery codes: the account already holds its own set.
@@ -531,6 +549,7 @@ passkeyRoutes.post('/passkeys/register/verify', authMiddleware, zValidator('json
   return c.json({
     success: true,
     passkey: toPublicPasskey(inserted),
+    ...mfaState,
     // Recovery codes appear only on the INITIAL enrollment that minted them.
     ...(replacement?.recoveryCodes ? { recoveryCodes: replacement.recoveryCodes } : {}),
     // Withheld when the post-commit install failed: the refresh JTI was never
@@ -944,6 +963,7 @@ passkeyRoutes.post('/mfa/passkey/verify', zValidator('json', passkeyMfaVerifySch
 
   auditLogin(c, {
     orgId: context.orgId ?? null,
+    partnerId: context.partnerId ?? null,
     userId: user.id,
     email: user.email,
     name: user.name,
@@ -997,16 +1017,24 @@ passkeyRoutes.delete('/passkeys/:id', authMiddleware, zValidator('json', deleteP
 
   const auth = c.get('auth');
   const id = c.req.param('id');
-  const { currentPassword, stepUpGrantId } = c.req.valid('json');
+  const { currentPassword, ssoReauthGrantId, stepUpGrantId } = c.req.valid('json');
 
   if (auth.token?.mfa !== true) {
     return c.json({ error: 'MFA verification is required to delete a passkey' }, 403);
   }
 
-  const passwordError = await requireCurrentPasswordStepUp(c, auth.user.id, currentPassword, 'passkey:pwd', {
-    rejectionStatus: PASSKEY_PROOF_REJECTION_STATUS,
-  });
-  if (passwordError) return passwordError;
+  // Validated here, spent at the terminal write below (no-op for a password).
+  const reauth = await resolveFactorManagementStepUp(
+    c,
+    auth,
+    { currentPassword, ssoReauthGrantId },
+    { keyPrefix: 'passkey:pwd', rejectionStatus: PASSKEY_PROOF_REJECTION_STATUS },
+  );
+  if ('error' in reauth) return reauth.error;
+
+  const eligibility = await checkPasskeyRemovalEligibility(c, auth, id);
+  if ('error' in eligibility) return eligibility.error;
+  const { factorState } = eligibility;
 
   const resourceDigest = passkeyRemovalResourceDigest(id);
   const stepUpError = await enforceExistingFactorStepUp(c, auth, stepUpGrantId, {
@@ -1015,21 +1043,6 @@ passkeyRoutes.delete('/passkeys/:id', authMiddleware, zValidator('json', deleteP
     resourceDigest,
   });
   if (stepUpError) return stepUpError;
-
-  const [passkey] = await findOwnedPasskey(id, auth.user.id);
-  if (!passkey) {
-    return c.json({ error: 'Passkey not found' }, 404);
-  }
-
-  const factorState = await getMfaFactorState(auth);
-  const remainingFactorCount =
-    (factorState.allowedMethods.passkey ? Math.max(0, factorState.passkeyCount - 1) : 0)
-    + (factorState.allowedMethods.totp && factorState.hasTotp ? 1 : 0)
-    + (factorState.allowedMethods.sms && factorState.hasSms ? 1 : 0);
-
-  if (factorState.mfaRequired && remainingFactorCount === 0) {
-    return c.json({ error: 'Cannot remove the last MFA factor while your role or organization requires MFA' }, 403);
-  }
 
   // #5038: removing a factor advances mfa_epoch and revokes every refresh
   // family so no OTHER live session survives the account's factor set changing
@@ -1055,6 +1068,22 @@ passkeyRoutes.delete('/passkeys/:id', authMiddleware, zValidator('json', deleteP
   if (stepUpConsumeError) {
     await cancelAuthIssuance(capability).catch(() => undefined);
     return stepUpConsumeError;
+  }
+  const reauthConsumeError = await consumeFactorManagementReauthGrant(c, auth, reauth.proof, {
+    rejectionStatus: PASSKEY_PROOF_REJECTION_STATUS,
+  });
+  if (reauthConsumeError) {
+    await cancelAuthIssuance(capability).catch(() => undefined);
+    const errorData = await reauthConsumeError.clone().json().catch(() => ({}));
+    const headers = new Headers(reauthConsumeError.headers);
+    headers.delete('content-length');
+    headers.delete('content-encoding');
+    headers.set('content-type', 'application/json');
+    return new Response(JSON.stringify({ ...errorData, stepUpGrantConsumed: true }), {
+      status: reauthConsumeError.status,
+      statusText: reauthConsumeError.statusText,
+      headers,
+    });
   }
 
   let result;
@@ -1123,7 +1152,7 @@ passkeyRoutes.delete('/passkeys/:id', authMiddleware, zValidator('json', deleteP
               : allowedSms > 0
                 ? 'sms'
                 : null;
-        const updated = await tx
+        const [updated] = await tx
           .update(users)
           .set({
             mfaEnabled: remainingAllowedFactorCount > 0,
@@ -1135,17 +1164,21 @@ passkeyRoutes.delete('/passkeys/:id', authMiddleware, zValidator('json', deleteP
             updatedAt: new Date(),
           })
           .where(eq(users.id, auth.user.id))
-          .returning({ id: users.id });
-        if (updated.length !== 1) throw new Error('Passkey owner disappeared');
-        return undefined;
+          .returning({ mfaEnabled: users.mfaEnabled, mfaMethod: users.mfaMethod });
+        if (!updated) throw new Error('Passkey owner disappeared');
+        return updated;
       },
     });
   } catch (error) {
     await cancelAuthIssuance(capability).catch(() => undefined);
     if (error instanceof LastRequiredMfaFactorError) {
-      return c.json({ error: 'Cannot remove the last MFA factor while your role or organization requires MFA' }, 403);
+      return c.json({
+        error: 'Cannot remove the last MFA factor while your role or organization requires MFA',
+        code: 'last_mfa_factor_required',
+        stepUpGrantConsumed: true,
+      }, 403);
     }
-    const response = authIssuanceAdmissionError(c, error);
+    const response = authIssuanceAdmissionError(c, error, { stepUpGrantConsumed: true });
     if (!response) throw error;
     return response;
   }
@@ -1170,9 +1203,36 @@ passkeyRoutes.delete('/passkeys/:id', authMiddleware, zValidator('json', deleteP
   c.header('Cache-Control', 'no-store');
   return c.json({
     success: true,
+    ...result.value,
     ...(sessionInstalled ? { tokens: toPublicTokens(result.issued) } : {}),
   });
 });
+
+export async function checkPasskeyRemovalEligibility(
+  c: Context,
+  auth: AuthContext,
+  id: string,
+): Promise<{ error: Response } | { factorState: Awaited<ReturnType<typeof getMfaFactorState>> }> {
+  const [passkey] = await findOwnedPasskey(id, auth.user.id);
+  if (!passkey) {
+    return { error: c.json({ error: 'Passkey not found' }, 404) };
+  }
+
+  const factorState = await getMfaFactorState(auth);
+  const remainingFactorCount =
+    (factorState.allowedMethods.passkey ? Math.max(0, factorState.passkeyCount - 1) : 0)
+    + (factorState.allowedMethods.totp && factorState.hasTotp ? 1 : 0)
+    + (factorState.allowedMethods.sms && factorState.hasSms ? 1 : 0);
+
+  if (factorState.mfaRequired && remainingFactorCount === 0) {
+    return { error: c.json({
+      error: 'Cannot remove the last MFA factor while your role or organization requires MFA',
+      code: 'last_mfa_factor_required',
+    }, 403) };
+  }
+
+  return { factorState };
+}
 
 async function readPendingPasskeyMfa(tempToken: string): Promise<PendingMfaRecord | null> {
   const redis = getRedis();

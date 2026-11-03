@@ -9,7 +9,11 @@
  * - `check-schedules` repeats every 5 minutes, computes each report's most
  *   recent scheduled occurrence in the org's timezone (org -> partner -> UTC
  *   chain, same resolution the rest of the platform uses), and enqueues a run
- *   when `lastGeneratedAt` predates that occurrence.
+ *   when `lastGeneratedAt` predates that occurrence. A report that has never
+ *   run is measured from its `createdAt` instead (#9562): its first run is
+ *   the first occurrence AFTER it was saved, never the one that already
+ *   passed before it existed. "Generate now" (POST /reports/:id/generate)
+ *   stays the way to get a run immediately.
  * - `run-scheduled-report` mirrors the on-demand POST /reports/:id/generate
  *   path: insert a report_runs row, generateReport, store the snapshot. When
  *   `config.emailRecipients` is set, recipients get an email with the branded
@@ -42,6 +46,7 @@ import {
   partners,
   reportRuns,
   reportScheduleRecipients,
+  reportSeries,
   reports,
 } from '../db/schema';
 import {
@@ -51,7 +56,15 @@ import {
   UnsupportedReportScopeError,
   type ReportResult,
 } from '../services/reportGenerationService';
-import { emailReportFailure, emailReportRun } from '../services/reportDelivery';
+import { reportScopeFromAuthority } from '../services/reportScope';
+import { reportTypeDef } from '../services/reportRegistry';
+import {
+  emailReportFailure,
+  emailReportRun,
+  scheduledDeliveryStatus,
+  type ReportDeliveryStatus,
+  type ScheduledSendOutcome,
+} from '../services/reportDelivery';
 import { getBullMQConnection, isRedisAvailable } from '../services/redis';
 import {
   lastOccurrenceKey,
@@ -69,15 +82,20 @@ import {
   resolveTimezoneFromRows,
 } from '../services/portal/timezone';
 import { captureException } from '../services/sentry';
-import { dateFromOffsetlessDbTimestamp } from '../utils/offsetlessTimestamp';
+import { reconcileAllSeries, seriesChildGate } from '../services/reportSeries/reconcile';
+import { isValidRecipientEmail, resolveSeriesChildRecipients } from '../services/reportSeries/recipients';
+import { parseSeriesRecipientRule, type SeriesGateDecision } from '../services/reportSeries/types';
 import { attachWorkerObservability } from './workerObservability';
+import { reportRunOwnerColumns } from '../services/reportRunOwner';
 import {
   decodeSiteScope,
   intersectSiteScopes,
+  partnerWideScope,
   persistedSiteScopeValues,
   reportOwnerOf,
   resolveLivePartnerReportAuthority,
   resolveLiveReportAuthority,
+  resolveLiveReportTypePermissions,
   siteScopeFingerprint,
   type LiveReportAuthorityResult,
   type PersistedSiteScopeColumns,
@@ -124,35 +142,31 @@ type DueCandidate = {
   id: string;
   schedule: ScheduleCadence;
   lastGeneratedAt: Date | null;
+  createdAt: Date;
   config: Record<string, unknown>;
   timeZone: string;
 };
 
 /**
- * Whether a schedule's `lastGeneratedAt` is older than the occurrence keyed by
- * `occurrenceKey`, exported as a pure seam so the offsetless-timestamp
- * correction below can be asserted directly under a pinned non-UTC TZ
- * (#4059 gap 2 / `vitest.config.tz.ts`) without a database.
+ * Whether the occurrence keyed by `occurrenceKey` is still owed: true when the
+ * report's baseline predates it. The baseline is `lastGeneratedAt`, or, for a
+ * report that has never run, its `createdAt` (#9562) — without that fallback a
+ * never-run report is due on the very next tick, so a "monthly on the 1st"
+ * report saved on the 21st emailed its recipients within five minutes.
+ *
+ * `reports.last_generated_at` and `reports.created_at` are both offsetless
+ * `timestamp`s; Drizzle decodes them as UTC, so each Date is the stored instant
+ * on any host and `isDue` reads its wall-clock parts in the schedule's zone as
+ * is. Comparison is at minute precision, so a report created during the
+ * occurrence minute itself waits for the next occurrence.
  */
 export function isReportOccurrenceDue(
   lastGeneratedAt: Date | null,
   occurrenceKey: number,
   timeZone: string,
+  createdAt: Date,
 ): boolean {
-  // `reports.last_generated_at` is `timestamp(...)` with no `withTimezone`, so
-  // the driver hands us the UTC wall clock re-read as this process's local
-  // time (#4059 gap 2 — see utils/offsetlessTimestamp.ts). `isDue` then reads
-  // wall-clock parts off that Date in the org's zone, so without the
-  // correction the comparison is wrong by the API host's offset: east of UTC
-  // an occurrence that already ran re-fires (duplicate report delivery), west
-  // of UTC one that has not run is suppressed (silently missed report).
-  // The RAW value still flows to `buildOccurrenceClaimCas` — that comparison
-  // happens in SQL against the column itself and must not be corrected.
-  return isDue(
-    lastGeneratedAt ? dateFromOffsetlessDbTimestamp(lastGeneratedAt) : null,
-    occurrenceKey,
-    timeZone,
-  );
+  return isDue(lastGeneratedAt ?? createdAt, occurrenceKey, timeZone);
 }
 
 function scheduleConfigOf(config: Record<string, unknown>): ScheduleConfig {
@@ -230,9 +244,15 @@ export async function findDueReports(
   now: Date,
 ): Promise<Array<{ id: string; occurrenceKey: number; lastGeneratedAt: Date | null }>> {
   // Applied to BOTH statements below — see WORKER_EXCLUDED_REPORT_TYPES.
+  // Multi-org report series W02: an ARCHIVED child never schedules (spec
+  // §3.3), and a child of a DISABLED series is not polled at all — the gate
+  // would only record a skip row per org per occurrence (plan Contract
+  // concern 8). Both are true for every non-series row and bind no params.
   const pollable = and(
     ne(reports.schedule, 'one_time'),
     notInArray(reports.type, [...WORKER_EXCLUDED_REPORT_TYPES]),
+    isNull(reports.archivedAt),
+    sql`NOT EXISTS (SELECT 1 FROM report_series rs WHERE rs.id = ${reports.seriesId} AND rs.enabled = false)`,
   )!;
   const completeExecutableScope = completeExecutableScopePredicate();
   // Timezone chain: org -> partner -> UTC. A partner-owned row (#3198 W01) has
@@ -245,6 +265,7 @@ export async function findDueReports(
       id: reports.id,
       schedule: reports.schedule,
       lastGeneratedAt: reports.lastGeneratedAt,
+      createdAt: reports.createdAt,
       config: reports.config,
       orgSettings: organizations.settings,
       partnerTimezone: partners.timezone,
@@ -276,11 +297,12 @@ export async function findDueReports(
       id: row.id,
       schedule: row.schedule as ScheduleCadence,
       lastGeneratedAt: row.lastGeneratedAt,
+      createdAt: row.createdAt,
       config: (row.config ?? {}) as Record<string, unknown>,
       timeZone: resolveTimezoneFromRows(row.orgSettings, row.partnerTimezone, row.partnerSettings),
     };
     const key = lastOccurrenceKey(now, candidate.schedule, scheduleConfigOf(candidate.config), candidate.timeZone);
-    if (isReportOccurrenceDue(candidate.lastGeneratedAt, key, candidate.timeZone)) {
+    if (isReportOccurrenceDue(candidate.lastGeneratedAt, key, candidate.timeZone, candidate.createdAt)) {
       due.push({ id: candidate.id, occurrenceKey: key, lastGeneratedAt: candidate.lastGeneratedAt });
     }
   }
@@ -327,18 +349,45 @@ async function claimReportOccurrence(reportId: string, observedLastGeneratedAt: 
 
 // ─── Execution ───────────────────────────────────────────────────────────────
 
-function validEmail(value: unknown): value is string {
-  return typeof value === 'string'
-    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+/** One regex for every recipient path (services/reportSeries/recipients.ts). */
+const validEmail = isValidRecipientEmail;
+
+/**
+ * Who a scheduled run emails, split the way `report_runs` records it
+ * (multi-org report series W01, spec §3.2 / §3.5):
+ *
+ *  - `customer`: everyone the definition itself names — its contact
+ *    recipients (report_schedule_recipients → contacts of the owning org)
+ *    followed by its valid `config.emailRecipients` addresses, deduped
+ *    case-insensitively (contacts first). `recipient_count` is
+ *    `customer.length`. A non-series report has no internal-CC concept, so
+ *    typed addresses ARE customers: a report that emails only typed
+ *    addresses records recipient_count = N (coordinator ruling, 2026-09-28).
+ *  - `cc`: always `[]` from this resolver. Only a W02 series child has an
+ *    internal CC (its series' `internal_cc`), resolved by W02's
+ *    `resolveSeriesChildRecipients`, which returns the same shape.
+ *  - `recipients`: `customer` then `cc`, capped at 50 — exactly what is sent,
+ *    in the same order as before W01.
+ *  - `dropped`: configured addresses that will NOT be sent — a contact with no
+ *    or an invalid email, an invalid `emailRecipients` entry, anything past the
+ *    cap. A duplicate is not a drop: the address still receives the report.
+ */
+export interface ScheduledRecipientSets {
+  customer: string[];
+  cc: string[];
+  recipients: string[];
+  dropped: number;
 }
 
-export async function resolveScheduledReportRecipients(args: {
+const MAX_SCHEDULED_RECIPIENTS = 50;
+
+export async function resolveScheduledReportRecipientSets(args: {
   reportId: string;
   /** NULL for a partner-owned definition (#3198 W01): contact recipients are
    *  org-scoped rows, so only `config.emailRecipients` applies (spec §3.1a). */
   orgId: string | null;
   config: Record<string, unknown>;
-}): Promise<string[]> {
+}): Promise<ScheduledRecipientSets> {
   const contactRows = args.orgId === null ? [] : await db
     .select({
       contactId: contacts.id,
@@ -356,9 +405,27 @@ export async function resolveScheduledReportRecipients(args: {
       eq(reportScheduleRecipients.reportId, args.reportId),
       eq(reportScheduleRecipients.orgId, args.orgId),
       eq(contacts.orgId, args.orgId),
+      // Multi-org report series W02: 'remove' rows are per-org exclusions on a
+      // series child and never recipients. Every legacy row is 'add'.
+      eq(reportScheduleRecipients.mode, 'add'),
     ));
 
-  const candidates: string[] = [];
+  const seen = new Set<string>();
+  let dropped = 0;
+  const take = (value: unknown, into: string[]): void => {
+    if (!validEmail(value)) {
+      dropped += 1;
+      return;
+    }
+    const email = value.trim();
+    const key = email.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    into.push(email);
+  };
+
+  // Contacts first, then typed addresses — the pre-W01 union order.
+  const customerAll: string[] = [];
   for (const row of contactRows) {
     if (!row.email) {
       console.warn(
@@ -368,35 +435,165 @@ export async function resolveScheduledReportRecipients(args: {
           contactId: row.contactId,
         },
       );
+      dropped += 1;
       continue;
     }
-    if (validEmail(row.email)) candidates.push(row.email.trim());
+    take(row.email, customerAll);
   }
 
   const legacy = args.config.emailRecipients;
   if (Array.isArray(legacy)) {
-    candidates.push(
-      ...legacy.filter(validEmail).map((email) => email.trim()),
-    );
+    for (const value of legacy) take(value, customerAll);
   }
 
-  const deduped = new Map<string, string>();
-  for (const email of candidates) {
-    const key = email.toLowerCase();
-    if (!deduped.has(key)) deduped.set(key, email);
-  }
-
-  const resolved = [...deduped.values()];
-  if (resolved.length > 50) {
+  const requested = customerAll.length;
+  if (requested > MAX_SCHEDULED_RECIPIENTS) {
     console.warn(
       '[ReportScheduleWorker] Recipient union exceeds 50; truncating',
       {
         reportId: args.reportId,
-        requested: resolved.length,
+        requested,
       },
     );
+    dropped += requested - MAX_SCHEDULED_RECIPIENTS;
   }
-  return resolved.slice(0, 50);
+  const customer = customerAll.slice(0, MAX_SCHEDULED_RECIPIENTS);
+  const cc: string[] = [];
+  return { customer, cc, recipients: [...customer, ...cc], dropped };
+}
+
+/** The flat address list a scheduled run emails — `resolveScheduledReportRecipientSets(...).recipients`. */
+export async function resolveScheduledReportRecipients(args: {
+  reportId: string;
+  orgId: string | null;
+  config: Record<string, unknown>;
+}): Promise<string[]> {
+  return (await resolveScheduledReportRecipientSets(args)).recipients;
+}
+
+/**
+ * Multi-org report series W02 (spec §3.5; INDEX recipient_count ruling). A
+ * series child mails (rule matches ∪ 'add' rows − 'remove' rows) plus the
+ * series internal CC (materialized as its config.emailRecipients). It returns
+ * W01's ScheduledRecipientSets shape, so the delivery tail records
+ * recipient_count = customer.length (CC excluded) and 'partial' from
+ * `dropped` with no series branch of its own. Every other report returns
+ * resolveScheduledReportRecipientSets byte for byte.
+ */
+export async function resolveRunRecipientSets(args: {
+  reportId: string;
+  seriesId: string | null;
+  orgId: string | null;
+  config: Record<string, unknown>;
+}): Promise<ScheduledRecipientSets> {
+  if (!args.seriesId || !args.orgId) {
+    return resolveScheduledReportRecipientSets({
+      reportId: args.reportId,
+      orgId: args.orgId,
+      config: args.config,
+    });
+  }
+  const [series] = await db
+    .select({ recipientRule: reportSeries.recipientRule })
+    .from(reportSeries)
+    .where(eq(reportSeries.id, args.seriesId))
+    .limit(1);
+  const internalCc = Array.isArray(args.config.emailRecipients)
+    ? args.config.emailRecipients.filter((value): value is string => typeof value === 'string')
+    : [];
+  const { customer, cc, dropped } = await resolveSeriesChildRecipients({
+    reportId: args.reportId,
+    orgId: args.orgId,
+    rule: parseSeriesRecipientRule(series?.recipientRule),
+    internalCc,
+  });
+  const deduped = new Map<string, string>();
+  for (const email of [...customer, ...cc]) {
+    const key = email.toLowerCase();
+    if (!deduped.has(key)) deduped.set(key, email);
+  }
+  const all = [...deduped.values()];
+  if (all.length > MAX_SCHEDULED_RECIPIENTS) {
+    console.warn('[ReportScheduleWorker] Recipient union exceeds 50; truncating', {
+      reportId: args.reportId,
+      requested: all.length,
+    });
+  }
+  return {
+    customer,
+    cc,
+    recipients: all.slice(0, MAX_SCHEDULED_RECIPIENTS),
+    dropped: dropped + Math.max(0, all.length - MAX_SCHEDULED_RECIPIENTS),
+  };
+}
+
+type ScheduledReportRow = typeof reports.$inferSelect;
+
+/** Consume the occurrence: stamp `lastGeneratedAt` so findDueReports stops selecting it. */
+async function stampOccurrence(reportId: string): Promise<void> {
+  await db
+    .update(reports)
+    .set({ lastGeneratedAt: new Date(), updatedAt: new Date() })
+    .where(eq(reports.id, reportId));
+}
+
+/**
+ * Multi-org report series W02 — a skipped child leaves a failed run row
+ * naming the gate decision (spec §3.3 "records the skip"), with the all-NULL
+ * envelope the org-axis run predicates already admit.
+ */
+async function recordSeriesSkip(
+  report: { id: string; orgId: string; partnerId: string | null },
+  decision: Exclude<SeriesGateDecision, 'run'>,
+): Promise<void> {
+  const reportId = report.id;
+  console.warn('[ReportScheduleWorker] Series child skipped by the series gate', { reportId, decision });
+  await db.insert(reportRuns).values({
+    reportId,
+    // #4247: the run carries its parent's owner (a series child is org-owned).
+    ...reportRunOwnerColumns(report),
+    status: 'failed',
+    completedAt: new Date(),
+    errorMessage: `series_${decision}`,
+    requestedByKind: null,
+    requestedByUserId: null,
+    requestedByPortalUserId: null,
+  });
+}
+
+/**
+ * Multi-org report series W02 (spec §3.3 "Worker gate"). Runs the gate and,
+ * on 'run', re-reads the row: the gate may have reconciled a stale child, and
+ * the run must use the CURRENT definition. null = skipped (recorded) or gone.
+ * A transient SeriesAuthorityUnverifiableError from the gate propagates so
+ * BullMQ retries the job; it is neither a skip nor a failed run.
+ */
+async function loadGatedSeriesChild(
+  report: ScheduledReportRow & { seriesId: string; orgId: string },
+  opts: { occurrenceClaimed?: boolean } = {},
+): Promise<ScheduledReportRow | null> {
+  const decision = await seriesChildGate({
+    id: report.id,
+    orgId: report.orgId,
+    seriesId: report.seriesId,
+    seriesRevision: report.seriesRevision,
+    archivedAt: report.archivedAt,
+  });
+  if (decision !== 'run') {
+    // A skip CONSUMES the occurrence (same stamp as the normal path, unless
+    // the inline path already claimed it). Without it the child stays due
+    // and, once BullMQ trims the deduped job, writes a fresh skip row every
+    // tick. Stamped only on a decision — a gate throw propagates unstamped.
+    if (!opts.occurrenceClaimed) await stampOccurrence(report.id);
+    await recordSeriesSkip(report, decision);
+    return null;
+  }
+  const [fresh] = await db
+    .select()
+    .from(reports)
+    .where(and(eq(reports.id, report.id), ne(reports.schedule, 'one_time')))
+    .limit(1);
+  return fresh ?? null;
 }
 
 /** One-line trend summary for the email body — "Posture score 79 — up from
@@ -461,16 +658,39 @@ export async function resolveScheduledDeliveryContext(owner: ReportOwner): Promi
   return { timeZone, branding, partnerId: orgRow?.partnerId ?? null };
 }
 
+/**
+ * Writes a scheduled run's delivery summary (multi-org report series W01,
+ * spec §3.2). Never throws: by the time it runs the report is stored and the
+ * email may already be out — a throw would reach the job's catch, mark a
+ * delivered run failed, and let BullMQ retry (re-send) the occurrence.
+ */
+async function recordRunDelivery(
+  runId: string,
+  summary: { deliveryStatus: ReportDeliveryStatus; recipientCount: number },
+): Promise<void> {
+  try {
+    await db.update(reportRuns).set(summary).where(eq(reportRuns.id, runId));
+  } catch (err) {
+    console.error('[ReportScheduleWorker] Could not record the delivery summary', { runId, err });
+    captureException(err);
+  }
+}
+
 export async function processRunScheduledReport(
   data: RunScheduledReportJobData,
   opts: { finalAttempt?: boolean; occurrenceClaimed?: boolean } = {},
 ): Promise<void> {
-  const [report] = await db
+  // Multi-org report series W04: Combine archives ordinary (non-series) org
+  // rows, which no gate below would stop. A job enqueued before the row was
+  // archived, or retried with backoff, returns here like a deleted row —
+  // findDueReports never polls an archived row, so nothing re-enqueues it.
+  const [loadedReport] = await db
     .select()
     .from(reports)
-    .where(and(eq(reports.id, data.reportId), ne(reports.schedule, 'one_time')))
+    .where(and(eq(reports.id, data.reportId), ne(reports.schedule, 'one_time'), isNull(reports.archivedAt)))
     .limit(1);
-  if (!report) return; // deleted or switched to one_time since enqueue
+  if (!loadedReport) return; // deleted, archived or switched to one_time since enqueue
+  let report: NonNullable<typeof loadedReport> = loadedReport;
 
   // P2-3 (#4190) — a job already on the queue when the type exclusion in
   // `findDueReports` shipped, or one forced in by hand. An EARLY RETURN with no
@@ -486,7 +706,63 @@ export async function processRunScheduledReport(
     return;
   }
 
+  // Multi-org report series W02: a child passes the series gate (enabled,
+  // still targeted, owner still eligible, current revision) BEFORE any
+  // authority resolution or run row. Closes the "queued before the org was
+  // excluded" race (spec §3.3).
+  if (report.seriesId && report.orgId) {
+    const gated = await loadGatedSeriesChild(
+      { ...report, seriesId: report.seriesId, orgId: report.orgId },
+      { occurrenceClaimed: opts.occurrenceClaimed },
+    );
+    if (!gated) return;
+    report = gated;
+  }
+
   const config = (report.config ?? {}) as Record<string, unknown>;
+
+  // Set once the owner axis is resolved (below); a deny before that point
+  // cannot know which envelope the row would need.
+  let knownOwner: ReportOwner | undefined;
+
+  /**
+   * #3198 W02 (addendum B3). A PARTNER-owned run is only ever listed / read by
+   * id when it carries a complete partner_wide envelope (partnerWideRowPredicate
+   * and decodeSiteScope reject the all-NULL shape for a partner owner), so a
+   * bare failed row would be invisible to the partner admins who need to see
+   * why the schedule stopped. Stamp the owner's partner_wide scope with the
+   * definition's execution user — the principal the refusal is about. The
+   * report_runs_execution_scope_shape_chk partner_wide arm requires a user id,
+   * so a deny before the owner is known, or for a definition with no execution
+   * user, stays envelope-less (and invisible to partner callers; it is still
+   * in the table for operators). Org-owned denies keep the all-NULL shape the
+   * org-axis predicates already admit.
+   */
+  const partnerDenyEnvelope = (
+    requestedByKind: 'user' | 'system' | 'portal_user' | null,
+  ): PersistedSiteScopeColumns | Record<string, never> => {
+    if (
+      knownOwner?.partnerId === undefined
+      || requestedByKind !== 'user'
+      || !report.executionScopeUserId
+    ) {
+      return {};
+    }
+    try {
+      const scope = partnerWideScope(knownOwner.partnerId);
+      return persistedSiteScopeValues({
+        principalKind: 'user',
+        scope,
+        principalUserId: report.executionScopeUserId,
+        capturedAt: new Date(),
+        fingerprint: siteScopeFingerprint(scope),
+      });
+    } catch (err) {
+      // Never lose the refusal itself over its visibility envelope.
+      reportScopeFailure('deny_envelope', err);
+      return {};
+    }
+  };
 
   const deny = async (
     reason: string,
@@ -504,6 +780,9 @@ export async function processRunScheduledReport(
       .insert(reportRuns)
       .values({
         reportId: report.id,
+        // #4247: copied from the loaded definition, not from `knownOwner` —
+        // a deny can precede owner resolution.
+        ...reportRunOwnerColumns(report),
         status: 'failed',
         completedAt: new Date(),
         errorMessage: reason,
@@ -511,8 +790,21 @@ export async function processRunScheduledReport(
         requestedByUserId:
           requestedByKind === 'user' ? report.executionScopeUserId : null,
         requestedByPortalUserId: null,
+        ...partnerDenyEnvelope(requestedByKind),
       })
       .returning();
+  };
+
+  // #3198 W02 (B4): the owner/decode/live-resolve catches below fail closed as
+  // 'scope_unverifiable', but the cause (a corrupt row, a DB outage) must be
+  // visible - otherwise it reads as an ordinary permission refusal.
+  const reportScopeFailure = (stage: string, err: unknown): void => {
+    console.error('[ReportScheduleWorker] Execution scope could not be verified', {
+      reportId: report.id,
+      stage,
+      err,
+    });
+    captureException(err);
   };
 
   // P2-3 (#4190) — defence in depth. A system-authored definition (the weekly
@@ -546,10 +838,12 @@ export async function processRunScheduledReport(
   let owner: ReportOwner;
   try {
     owner = reportOwnerOf(report);
-  } catch {
+  } catch (err) {
+    reportScopeFailure('owner', err);
     await deny('scope_unverifiable');
     return;
   }
+  knownOwner = owner;
 
   let persistedScope;
   try {
@@ -557,7 +851,8 @@ export async function processRunScheduledReport(
       report as unknown as PersistedSiteScopeColumns,
       owner,
     );
-  } catch {
+  } catch (err) {
+    reportScopeFailure('decode', err);
     await deny('scope_unverifiable');
     return;
   }
@@ -571,25 +866,66 @@ export async function processRunScheduledReport(
     return;
   }
 
+  // A due schedule always renders the report and emails it off-platform
+  // (`resolveScheduledReportRecipients`, below) — the same bulk-export
+  // capability the interactive download/generate routes gate on, not a mere
+  // read. Re-authorizing the stamped execution principal against 'export'
+  // means a principal demoted below that permission stops the schedule
+  // instead of silently continuing to mail rendered rows out.
   let liveResult: LiveReportAuthorityResult;
   try {
     liveResult = owner.partnerId !== undefined
       ? await resolveLivePartnerReportAuthority(
           report.executionScopeUserId,
           owner.partnerId,
-          'read',
+          'export',
         )
       : await resolveLiveReportAuthority(
           report.executionScopeUserId,
           owner.orgId,
-          'read',
+          'export',
         );
-  } catch {
+  } catch (err) {
+    reportScopeFailure('live_authority', err);
     await deny('scope_unverifiable');
     return;
   }
   if (!liveResult.ok || liveResult.authority.scope.kind === 'legacy_unscoped') {
     await deny(`scope_${liveResult.ok ? 'unverifiable_scope' : liveResult.reason}`);
+    return;
+  }
+
+  // #3198 W02 (spec §2, ruling P8). A business type also needs its underlying
+  // read permissions (e.g. invoices:read for ar_aging), re-checked here
+  // against the execution user's LIVE role grants on the same axis the
+  // resolver above used. The routes gate create/PUT/generate on the caller's
+  // permission set; without this re-check a creator demoted off invoices:read
+  // would keep receiving AR aging by email. Skipped (no query) for every
+  // pre-#3198 type, which lists no extra permissions.
+  // An unknown stored type (reportTypeDef throws) and a re-check that could
+  // not run (DB failure) are "could not verify", not a permission loss.
+  // Ruling F1: an msp_staff (business) type is internal to the MSP, so the
+  // re-check resolves the PARTNER axis only — an execution user who reaches an
+  // org-owned report through an org membership alone (a customer user) is
+  // denied scope_permission_missing.
+  let typePermissionsGranted: boolean;
+  try {
+    const typeDef = reportTypeDef(report.type);
+    const requiredPermissions = typeDef.requiredPermissions;
+    typePermissionsGranted = requiredPermissions.length === 0
+      || await resolveLiveReportTypePermissions(
+        liveResult.authority.principalUserId,
+        owner,
+        requiredPermissions,
+        { partnerAxisOnly: typeDef.audience === 'msp_staff' },
+      );
+  } catch (err) {
+    reportScopeFailure('live_permissions', err);
+    await deny('scope_unverifiable');
+    return;
+  }
+  if (!typePermissionsGranted) {
+    await deny('scope_permission_missing');
     return;
   }
 
@@ -619,8 +955,20 @@ export async function processRunScheduledReport(
   };
 
   try {
-    assertReportExecutionPreflight(owner, config, executionAuthority);
-  } catch {
+    // The type rides along so a stored config its own type rejects is a deny
+    // here, not a failed run after a row exists (ruling T3e).
+    assertReportExecutionPreflight(owner, config, executionAuthority, report.type);
+  } catch (err) {
+    // A deterministic refusal (the stored config selects outside the live
+    // authority, or its type rejects it), so a warning, not an exception
+    // report — but never a silent one: the reason names the offending key.
+    console.warn('[ReportScheduleWorker] Execution preflight refused the stored config', {
+      reportId: report.id,
+      reportType: report.type,
+      ownerOrgId: owner.orgId ?? null,
+      ownerPartnerId: owner.partnerId ?? null,
+      reason: err instanceof Error ? err.message : String(err),
+    });
     await deny('scope_config_outside_authority');
     return;
   }
@@ -629,6 +977,7 @@ export async function processRunScheduledReport(
     .insert(reportRuns)
     .values({
       reportId: report.id,
+      ...reportRunOwnerColumns(report),
       status: 'running',
       startedAt: new Date(),
       requestedByKind: 'user',
@@ -644,28 +993,23 @@ export async function processRunScheduledReport(
   // Skipped when the caller already claimed the occurrence atomically (the
   // inline CAS path in processCheckSchedules) — that claim IS this stamp, and
   // re-stamping here would just be a redundant (harmless but pointless) write.
-  if (!opts.occurrenceClaimed) {
-    await db
-      .update(reports)
-      .set({ lastGeneratedAt: new Date(), updatedAt: new Date() })
-      .where(eq(reports.id, report.id));
-  }
+  if (!opts.occurrenceClaimed) await stampOccurrence(report.id);
 
   try {
-    // #3198 W01: no report type has a partner-scope generator yet, and the
-    // public `generateReport` is org-only — a partner-owned definition is
-    // refused here, before it could reach it (W02 replaces this with a
-    // registry-driven ReportScope dispatch).
-    if (owner.partnerId !== undefined) {
-      throw new UnsupportedReportScopeError(report.type, 'partner');
-    }
+    // #3198 W02: the generator's scope comes from the owner axis and the
+    // authority just resolved for it. A partner owner's org list is resolved
+    // LIVE here (never stored on the definition), in this worker's system
+    // context via runInReportScope. A type that cannot run under its owner
+    // axis throws UnsupportedReportScopeError from the dispatcher, mapped to
+    // a stable reason below.
+    const scope = await reportScopeFromAuthority(owner, executionAuthority);
     const previous = await previousBaselineFor(
       report.id,
       executionAuthority.fingerprint,
     );
     const result = await generateReport(
       report.type,
-      owner.orgId,
+      scope,
       config,
       executionAuthority,
     );
@@ -683,12 +1027,14 @@ export async function processRunScheduledReport(
       })
       .where(eq(reportRuns.id, run.id));
 
-    const recipients = await resolveScheduledReportRecipients({
+    const recipientSets = await resolveRunRecipientSets({
       reportId: report.id,
+      seriesId: report.seriesId,
       orgId: owner.orgId ?? null,
       config,
     });
-    if (recipients.length > 0) {
+    let send: ScheduledSendOutcome = 'not_attempted';
+    if (recipientSets.recipients.length > 0) {
       try {
         // Timezone + branding are only needed to build the email — deferred
         // here (rather than fetched unconditionally for every run) so a
@@ -697,11 +1043,11 @@ export async function processRunScheduledReport(
         // occurrence, and by this point the run row is already stored).
         const delivery = await resolveScheduledDeliveryContext(owner);
 
-        await emailReportRun({
+        const handedOff = await emailReportRun({
           reportName: report.name,
           reportType: report.type,
           format: report.format,
-          recipients,
+          recipients: recipientSets.recipients,
           rows,
           summary: result.summary,
           previous: result.previous,
@@ -710,13 +1056,28 @@ export async function processRunScheduledReport(
           branding: delivery.branding,
           partnerId: delivery.partnerId,
         });
+        send = handedOff ? 'sent' : 'failed';
       } catch (err) {
-        // Delivery failure must not fail the (already stored) run.
+        // Delivery failure must not fail the (already stored) run — but the
+        // recipients silently got nothing, so it goes to error tracking.
         console.error(`[ReportScheduleWorker] Email delivery failed for report ${report.id}:`, err);
+        captureException(err);
+        send = 'failed';
       }
     }
+    // Multi-org series W01 (spec §1): a run that reached nobody used to be a
+    // silent skip. Record what the email did on the run itself, after the
+    // send, so the status is the send's real outcome.
+    await recordRunDelivery(run.id, {
+      deliveryStatus: scheduledDeliveryStatus({
+        deliverable: recipientSets.recipients.length,
+        dropped: recipientSets.dropped,
+        send,
+      }),
+      recipientCount: recipientSets.customer.length,
+    });
   } catch (err) {
-    // #3198 W01: a definition whose owner axis its type cannot run under is a
+    // #3198: a definition whose owner axis its type cannot run under is a
     // deterministic refusal, not a transient failure. It records the stable
     // reason and RESOLVES: a retry could only write the same failed row again,
     // and recipients are not told a report "failed" that cannot be produced.
@@ -743,11 +1104,12 @@ export async function processRunScheduledReport(
     // Only once the job is out of retries: an earlier attempt may still succeed,
     // and this occurrence will not be re-enqueued after the last one fails.
     if (opts.finalAttempt) {
-      const recipients = await resolveScheduledReportRecipients({
+      const recipients = (await resolveRunRecipientSets({
         reportId: report.id,
+        seriesId: report.seriesId,
         orgId: owner.orgId ?? null,
         config,
-      });
+      })).recipients;
       if (recipients.length > 0) {
         try {
           await emailReportFailure({ reportName: report.name, recipients });
@@ -758,6 +1120,24 @@ export async function processRunScheduledReport(
     }
     throw err;
   }
+}
+
+/**
+ * One check-schedules tick. The series repair sweep (multi-org report series
+ * W02, spec §3.3 trigger 2) runs FIRST so a child it creates is due in this
+ * same tick, and OUTSIDE the ambient system transaction: reconcileAllSeries
+ * opens its own per-series transactions, and holding the job's transaction
+ * idle meanwhile risks the idle-in-transaction timeout and a second pooled
+ * connection. A sweep failure is logged and never costs the tick its due scan.
+ */
+export async function runCheckSchedulesTick(): Promise<void> {
+  try {
+    await reconcileAllSeries();
+  } catch (err) {
+    console.error('[ReportScheduleWorker] Report series repair sweep failed; continuing with the due scan', err);
+    captureException(err);
+  }
+  return runWithSystemDbAccess(processCheckSchedules);
 }
 
 export async function processCheckSchedules(): Promise<void> {
@@ -846,7 +1226,7 @@ export async function initializeReportScheduleWorker(): Promise<void> {
   if (!isRedisAvailable()) {
     if (!inlineTimer) {
       inlineTimer = setInterval(() => {
-        runWithSystemDbAccess(processCheckSchedules).catch((err) => {
+        runCheckSchedulesTick().catch((err) => {
           console.error('[ReportScheduleWorker] Inline schedule check failed:', err);
         });
       }, CHECK_INTERVAL_MS);
@@ -861,22 +1241,22 @@ export async function initializeReportScheduleWorker(): Promise<void> {
   reportScheduleWorker = new Worker<ReportScheduleJobData>(
     REPORT_SCHEDULE_QUEUE,
     async (job: Job<ReportScheduleJobData>) => {
-      return runWithSystemDbAccess(async () => {
-        switch (job.data.type) {
-          case 'check-schedules':
-            return processCheckSchedules();
-          case 'run-scheduled-report': {
-            // attemptsMade counts attempts already finished, so on the last one
-            // it is attempts-1 and this run is the occurrence's final chance.
-            const allowed = job.opts.attempts ?? 1;
-            return processRunScheduledReport(job.data, {
-              finalAttempt: job.attemptsMade + 1 >= allowed,
-            });
-          }
-          default:
-            throw new Error(`Unknown report schedule job type: ${(job.data as { type: string }).type}`);
+      switch (job.data.type) {
+        // Outside runWithSystemDbAccess on purpose — see runCheckSchedulesTick.
+        case 'check-schedules':
+          return runCheckSchedulesTick();
+        case 'run-scheduled-report': {
+          const data = job.data;
+          // attemptsMade counts attempts already finished, so on the last one
+          // it is attempts-1 and this run is the occurrence's final chance.
+          const allowed = job.opts.attempts ?? 1;
+          return runWithSystemDbAccess(() => processRunScheduledReport(data, {
+            finalAttempt: job.attemptsMade + 1 >= allowed,
+          }));
         }
-      });
+        default:
+          throw new Error(`Unknown report schedule job type: ${(job.data as { type: string }).type}`);
+      }
     },
     {
       connection: getBullMQConnection(),

@@ -79,7 +79,7 @@ describe('monitor assignment device filters (#6344)', () => {
     ['server', 'linux'],
     ['laptop', 'macos'],
   ])('gates assignments on role %s and OS %s before loading attachments', async (deviceRole, osType) => {
-    const assignmentWhere = vi.fn().mockResolvedValue([]);
+    const assignmentWhere = vi.fn((_where: Parameters<PgDialect['sqlToQuery']>[0]) => ({ orderBy: async () => [] }));
     const select = vi.fn()
       .mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [
         { id: 'device', orgId: 'org', siteId: 'site', deviceRole, osType },
@@ -98,6 +98,41 @@ describe('monitor assignment device filters (#6344)', () => {
     expect(query.params.slice(-2)).toEqual([deviceRole, osType]);
     expect(select.mock.calls[0]![0]).toMatchObject({ deviceRole: devices.deviceRole, osType: devices.osType });
     expect(select).toHaveBeenCalledTimes(4);
+  });
+
+  it('never applies a partner-level assignment to a device whose org is the hidden quick_support org', async () => {
+    const assignmentWhere = vi.fn((_where: Parameters<PgDialect['sqlToQuery']>[0]) => ({ orderBy: async () => [] }));
+    const select = vi.fn()
+      .mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [
+        { id: 'device', orgId: 'org', siteId: 'site', deviceRole: 'workstation', osType: 'windows' },
+      ] }) }) })
+      .mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [{ partnerId: 'partner', type: 'quick_support' }] }) }) })
+      .mockReturnValueOnce({ from: () => ({ where: async () => [] }) })
+      .mockReturnValueOnce({ from: () => ({ innerJoin: () => ({ where: assignmentWhere }) }) });
+    const executor = { select } as unknown as NonNullable<Parameters<typeof resolveMonitorsForDevice>[1]>;
+
+    expect(await resolveMonitorsForDevice('device', executor)).toEqual({ kind: 'resolved', monitors: [] });
+    const query = new PgDialect().sqlToQuery(assignmentWhere.mock.calls[0]![0]);
+    // A partner-level config-policy assignment must never be considered for an
+    // ephemeral Quick Support device — its org has no real fleet the partner
+    // authored partner-wide policies against.
+    expect(query.params).not.toContain('partner');
+  });
+
+  it('still applies a partner-level assignment to an ordinary org device (control)', async () => {
+    const assignmentWhere = vi.fn((_where: Parameters<PgDialect['sqlToQuery']>[0]) => ({ orderBy: async () => [] }));
+    const select = vi.fn()
+      .mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [
+        { id: 'device', orgId: 'org', siteId: 'site', deviceRole: 'workstation', osType: 'windows' },
+      ] }) }) })
+      .mockReturnValueOnce({ from: () => ({ where: () => ({ limit: async () => [{ partnerId: 'partner', type: 'customer' }] }) }) })
+      .mockReturnValueOnce({ from: () => ({ where: async () => [] }) })
+      .mockReturnValueOnce({ from: () => ({ innerJoin: () => ({ where: assignmentWhere }) }) });
+    const executor = { select } as unknown as NonNullable<Parameters<typeof resolveMonitorsForDevice>[1]>;
+
+    expect(await resolveMonitorsForDevice('device', executor)).toEqual({ kind: 'resolved', monitors: [] });
+    const query = new PgDialect().sqlToQuery(assignmentWhere.mock.calls[0]![0]);
+    expect(query.params).toContain('partner');
   });
 });
 

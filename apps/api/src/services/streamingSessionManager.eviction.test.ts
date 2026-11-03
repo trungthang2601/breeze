@@ -1,6 +1,7 @@
 /**
  * Eviction contract for the DEFAULT (Anthropic) session manager — issue #4514,
- * the deferred twin of #4384/#4406 (llm/openaiSessionManager.eviction.test.ts).
+ * the deferred twin of #4384/#4406 (fixed first on the env-only OpenAI-compatible
+ * session manager, deleted in W06).
  *
  * Two defects are pinned here:
  *   1. Neither eviction path checked `state === 'processing'`, so under cap
@@ -58,6 +59,17 @@ const {
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: queryMock }));
 
+// Wisp W04 Task 4: getOrCreate resolves the session's delegation grant itself
+// (lookupWispGrant); every session in this suite is an ordinary one.
+const finalizeMock = vi.hoisted(() => vi.fn(async (_id: string) => ({ updated: false })));
+vi.mock('./wisp/threadSummary', () => ({ finalizeWispSessionSummary: finalizeMock }));
+
+vi.mock('./wisp/chatCeiling', () => ({
+  lookupWispGrant: vi.fn(async () => null),
+  unreachableWispAuth: (auth: unknown) => auth,
+  WispSessionUnavailableError: class WispSessionUnavailableError extends Error {},
+}));
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(() => ({
@@ -96,11 +108,20 @@ vi.mock('./sentry', () => ({
 }));
 
 vi.mock('./aiCostTracker', () => ({
-  recordUsageFromSdkResult: vi.fn(() => Promise.resolve()),
-  calculateCostCents: vi.fn(() => 0),
-  calculateCatalogCostCents: vi.fn(() => 0),
   sumInputTokens: (u: Record<string, number | null | undefined> | null | undefined) =>
     (u?.input_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0) + (u?.cache_creation_input_tokens ?? 0),
+}));
+vi.mock('./aiBudgetReservations', () => ({
+  markAiBudgetReservationIndeterminate: vi.fn(async () => ({ kind: 'indeterminate' })),
+  readSdkUsageSnapshot: vi.fn(async () => null),
+}));
+vi.mock('./aiModels/platformModels', async (orig) => ({
+  ...(await orig<typeof import('./aiModels/platformModels')>()),
+  getPlatformModelByModelId: vi.fn(async () => null),
+}));
+vi.mock('./aiModels/settleInvocation', async (orig) => ({
+  ...(await orig<typeof import('./aiModels/settleInvocation')>()),
+  settleInvocation: vi.fn(async () => ({ costCents: 0, invocationIds: [], deferred: false })),
 }));
 vi.mock('./aiAgent', () => ({ sanitizeErrorForClient: (e: unknown) => String(e) }));
 vi.mock('./aiAgentSdkTools', () => ({
@@ -125,8 +146,8 @@ import {
   type ActiveSession,
   type SessionState,
 } from './streamingSessionManager';
+import { makeResolvedModel } from './aiModels/__fixtures__/resolvedModel';
 import type { AuthContext } from '../middleware/auth';
-import type { UsableLlmConfig } from './llm/llmConfigResolver';
 
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
@@ -162,7 +183,6 @@ function seed(
     breezeSessionId: id,
     orgId,
     deviceId: null,
-    model: 'claude-sonnet-4-5',
     sdkSessionId: null,
     query: { close: vi.fn(), interrupt: vi.fn() },
     abortController: new AbortController(),
@@ -226,7 +246,6 @@ const ORG = '0c0c0c0c-1111-4222-8333-444455556666';
 const DB_SESSION = {
   orgId: ORG,
   sdkSessionId: null,
-  model: 'claude-sonnet-4-5-20250929',
   maxTurns: 50,
   turnCount: 0,
   systemPrompt: null,
@@ -237,11 +256,7 @@ const AUTH = {
   accessibleOrgIds: [ORG],
   user: { id: 'beefbeef-1111-4222-8333-444455556666', email: 'tech@contoso.com' },
 } as unknown as AuthContext;
-const PLATFORM_CONFIG = {
-  source: 'platform' as const,
-  apiKey: 'platform-key',
-  model: 'claude-sonnet-4-6',
-} as unknown as UsableLlmConfig;
+const PLATFORM_CONFIG = makeResolvedModel('platform');
 
 function mockSdkQuery(messages: unknown[], gate: Promise<void> = Promise.resolve()) {
   queryMock.mockImplementation(() => ({
@@ -289,6 +304,8 @@ describe('StreamingSessionManager eviction (#4514)', () => {
     // semantics along with it.
     captureMessageMock.mockClear();
     captureExceptionMock.mockClear();
+    finalizeMock.mockReset();
+    finalizeMock.mockResolvedValue({ updated: false });
     queryMock.mockReset();
     dbUpdateMock.mockReset();
     dbUpdateMock.mockImplementation(() => ({
@@ -551,6 +568,54 @@ describe('StreamingSessionManager eviction (#4514)', () => {
       expect(manager.get('healthy')).toBeDefined();
       // Capacity eviction never expires — even for a wedged session.
       expect(capturedExpires).toHaveLength(0);
+    });
+  });
+
+  // ==========================================================================
+  describe('Wisp thread summary finalize (W04 T5)', () => {
+    it('finalizes exactly the ids the UPDATE returned, after the write', async () => {
+      mockState.nextRows = [{ id: 'kept' }]; // 'skipped' was already closed by the user
+      let ctxAtFinalize: unknown = 'unset';
+      finalizeMock.mockImplementation(async () => { ctxAtFinalize = contextStore.getStore(); return { updated: false }; });
+      seed(manager, 'kept', 'org-a', { idleFor: 3 * HOUR, state: 'idle' });
+      seed(manager, 'skipped', 'org-a', { idleFor: 3 * HOUR, state: 'idle' });
+
+      internals(manager).evictStaleSessions();
+      await settle();
+      await settle();
+
+      expect(capturedExpires).toHaveLength(1);
+      expect(finalizeMock.mock.calls.map((c) => c[0])).toEqual(['kept']);
+      // Outside the org-scoped write context.
+      expect(ctxAtFinalize).toBeUndefined();
+    });
+
+    it('does not finalize when the write itself failed', async () => {
+      mockState.failOrgIds = new Set(['org-a']);
+      seed(manager, 'v-a', 'org-a', { idleFor: 3 * HOUR, state: 'idle' });
+
+      internals(manager).evictStaleSessions();
+      await settle();
+      await settle();
+
+      expect(finalizeMock).not.toHaveBeenCalled();
+    });
+
+    it('a rejected finalize is captured, logged with the session id, and does not stop later orgs', async () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      finalizeMock.mockRejectedValueOnce(new Error('summary boom'));
+      mockState.nextRows = [{ id: 'row' }];
+      seed(manager, 'v-a', 'org-a', { idleFor: 3 * HOUR, state: 'idle' });
+      seed(manager, 'v-b', 'org-b', { idleFor: 3 * HOUR, state: 'idle' });
+
+      internals(manager).evictStaleSessions();
+      await settle();
+      await settle();
+
+      expect(capturedExpires).toHaveLength(2);
+      expect(captureExceptionMock).toHaveBeenCalledWith(expect.objectContaining({ message: 'summary boom' }));
+      expect(errSpy.mock.calls.some((args) => String(args[0]).includes('finalize') && String(args[0]).includes('row'))).toBe(true);
+      errSpy.mockRestore();
     });
   });
 

@@ -210,16 +210,15 @@ export const ticketPrioritySchema = z.enum(['low', 'normal', 'high', 'urgent']);
 // formId is supplied — createTicket composes them from the form (title
 // template + rendered responses). Portal keeps its OWN schema (does not
 // import the shared createTicketSchema) per the Phase 2 plan's global
-// constraints. `priority.default('normal')` is intentionally kept even though
-// a form may carry its own defaultPriority: the portal UI has no per-form
-// priority prefill yet, so the portal's explicit 'normal' wins over the
-// form's default in Phase 2 — acceptable per the design brief; revisit if/when
-// the portal form UI grows a priority prefill.
+// constraints. `priority` has NO schema default (#8883 W5, explicit-choice
+// provenance): the portal form sends it only when the customer chose one, an
+// absent priority lets an intake form's default or a routing rule apply, and
+// createTicket still falls back to 'normal'.
 export const createTicketSchema = z
   .object({
     subject: z.string().min(1).max(255).optional(),
     description: z.string().min(1).optional(),
-    priority: ticketPrioritySchema.optional().default('normal'),
+    priority: ticketPrioritySchema.optional(),
     formId: z.string().guid().optional(),
     formResponses: z.record(z.string(), z.unknown()).optional()
   })
@@ -281,4 +280,31 @@ export const updateProfileSchema = z.object({
 export const changePasswordSchema = z.object({
   currentPassword: z.string().min(1),
   newPassword: z.string().min(8)
+});
+
+// Network Visibility -- GET /network/assets query params (#5861, PR 2 review).
+// assetType espelha os valores do discoveredAssetTypeEnum do pg; mantido como
+// lista literal aqui (schemas.ts nao importa db/schema em nenhum outro lugar)
+// para seguir o estilo auto-contido ja usado neste arquivo.
+export const networkAssetsQuerySchema = z.object({
+  siteId: z.string().guid().optional(),
+  assetType: z.enum([
+    'workstation',
+    'server',
+    'printer',
+    'router',
+    'switch',
+    'firewall',
+    'access_point',
+    'phone',
+    'iot',
+    'camera',
+    'nas',
+    'unknown',
+    'website',
+    'service',
+  ]).optional(),
+  status: z.enum(['online', 'offline', 'unverified']).optional(),
+  page: z.coerce.number().int().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
 });

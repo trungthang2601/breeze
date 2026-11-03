@@ -5,14 +5,16 @@
  * timeline viewing, and report generation.
  * - create_incident (Tier 2): Create a new security incident
  * - execute_containment (Tier 3): Execute containment actions on a device
- * - collect_evidence (Tier 2): Collect forensic evidence from a device
+ * - collect_evidence (Tier 2; Tier 3 supervised when evidenceTypes includes screenshot): Collect forensic evidence from a device
  * - get_incident_timeline (Tier 1): View full incident timeline
  * - generate_incident_report (Tier 1): Generate structured incident report
  */
 
 import { db } from '../db';
+import { startNetworkIsolationSchema } from '@breeze/shared';
 import { devices, incidents, incidentEvidence, incidentActions } from '../db/schema';
-import { eq, and, desc, gte, ilike, lte, count, sql, SQL } from 'drizzle-orm';
+import { randomUUID } from 'node:crypto';
+import { eq, and, desc, gte, ilike, inArray, lte, count, sql, SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
@@ -23,6 +25,8 @@ import { publishEvent } from './eventBus';
 import type { IncidentTimelineEntry } from '../db/schema/incidentResponse';
 import { HIGH_RISK_CONTAINMENT_ACTIONS, listIncidentsSchema } from '../routes/incidents.validation';
 import { sanitizeThrownToolError } from './aiToolErrors';
+import { captureException } from './sentry';
+import { checkScreenAccessConsentGate } from '../routes/remote/screenAccessConsentGate';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -255,6 +259,8 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
             type: 'object',
             description: 'Action-specific parameters (e.g., { pid: 1234 } for process_kill)',
           },
+          ttlHours: { type: 'integer', minimum: 1, maximum: 720, description: 'Isolation TTL in hours' },
+          reason: { type: 'string', maxLength: 2000, description: 'Required for network isolation' },
           approvalRef: {
             type: 'string',
             description: 'Approval reference (required for high-risk containment actions)',
@@ -283,6 +289,37 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
       const deviceAccess = await verifyDeviceAccess(input.deviceId as string, auth);
       if ('error' in deviceAccess) return JSON.stringify({ error: deviceAccess.error });
 
+      // The command-result handler reaches the incident through the device's
+      // org context (incident_actions is org-scoped under RLS), and a
+      // containment on a device the incident is not about is meaningless — so
+      // the device must belong to the incident's organization (#9662).
+      if (deviceAccess.device.orgId !== incident.orgId) {
+        return JSON.stringify({ error: 'The device must belong to the same organization as the incident' });
+      }
+
+      if (input.actionType === 'network_isolation') {
+        if (typeof input.reason !== 'string' || !input.reason.trim()) {
+          return JSON.stringify({ error: 'reason is required for network isolation' });
+        }
+        const parsed = startNetworkIsolationSchema.safeParse({
+          incidentId: input.incidentId, ttlHours: input.ttlHours, reason: input.reason,
+        });
+        if (!parsed.success) {
+          const invalidPaths = [...new Set(parsed.error.issues.map(issue => issue.path.join('.') || 'input'))];
+          return JSON.stringify({ error: `Invalid isolation input: ${invalidPaths.join(', ')}` });
+        }
+        try {
+          // The service alone builds the allowlist and owns the action/command lifecycle.
+          const { startNetworkIsolation } = await import('./networkIsolation/service');
+          const result = await startNetworkIsolation(auth, input.deviceId as string, parsed.data,
+            { requestedByKind: 'brain', approvalRef: input.approvalRef as string });
+          if ('error' in result) return JSON.stringify(result);
+          return JSON.stringify({ success: true, ...result });
+        } catch (error) {
+          return JSON.stringify({ error: `Failed to start network isolation: ${sanitizeThrownToolError('incident', error)}` });
+        }
+      }
+
       const payload = {
         incidentId: input.incidentId as string,
         actionType: input.actionType as string,
@@ -290,48 +327,76 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
         approvalRef: (input.approvalRef as string) ?? undefined,
       };
 
-      const result = await aiQueueCommandForExecution(
-        auth,
-        'execute_containment',
-        input.deviceId as string,
-        'execute_containment',
-        payload,
-        { userId: auth.user.id }
-      );
-
-      if (result.error) {
-        return JSON.stringify({ error: result.error });
-      }
-
-      // Record the action in the incident_actions table
+      // #9662: the action row is the containment's lifecycle record, and the
+      // command-result handler / reaper / cancel propagation find it by command
+      // id (services/incidentContainmentResults.ts). So the id is reserved up
+      // front and the row is written BEFORE dispatch — in the same per-call
+      // transaction as the command row — and an agent can never answer a
+      // command whose action does not exist yet. Not recorded → not dispatched:
+      // an untracked containment would be invisible on the incident.
+      const commandId = randomUUID();
+      let actionId: string | undefined;
       try {
-        await db.insert(incidentActions).values({
+        const [action] = await db.insert(incidentActions).values({
           incidentId: input.incidentId as string,
           orgId: incident.orgId,
           actionType: input.actionType as string,
           description: `Containment: ${input.actionType as string} on device ${input.deviceId as string}`,
           executedBy: 'brain',
           status: 'in_progress',
-          result: { commandId: result.command?.id },
+          result: { commandId },
           approvalRef: (input.approvalRef as string) ?? null,
           executedAt: new Date(),
-        });
+        }).returning({ id: incidentActions.id });
+        actionId = action?.id;
       } catch (err) {
         console.error('[AiTools] Failed to record containment action:', err);
+        captureException(err instanceof Error ? err : new Error(String(err)));
+      }
+      if (!actionId) {
+        return JSON.stringify({ error: 'The containment action could not be recorded, so nothing was sent to the device' });
+      }
+
+      const result = await aiQueueCommandForExecution(
+        auth,
+        'execute_containment',
+        input.deviceId as string,
+        'execute_containment',
+        payload,
+        { userId: auth.user.id, commandId }
+      );
+
+      if (result.error) {
+        // Never reached the device. Cancel propagation may already have
+        // terminalised the row (claim-time cancel), so only an open row moves.
+        await db
+          .update(incidentActions)
+          .set({
+            status: result.refusal === 'cancelled' ? 'cancelled' : 'failed',
+            result: { commandId, commandStatus: 'not_dispatched', error: result.error },
+          })
+          .where(and(
+            eq(incidentActions.id, actionId),
+            inArray(incidentActions.status, ['pending', 'in_progress']),
+          ));
+        return JSON.stringify({ error: result.error });
       }
 
       return JSON.stringify({
         success: true,
-        commandId: result.command?.id,
+        commandId: result.command?.id ?? commandId,
         commandStatus: result.command?.status ?? 'queued',
+        actionId,
+        actionStatus: 'in_progress',
         incidentId: input.incidentId,
         actionType: input.actionType,
+        note: 'The action completes, fails or times out from the device result; the incident is marked contained only when the device reports success.',
       });
     },
   });
 
   // ============================================
-  // collect_evidence — Tier 2 (medium risk)
+  // collect_evidence — Tier 2; screenshot → Tier 3 supervised (W04-D3, isInputAwareTier3)
   // ============================================
 
   registerTool({
@@ -383,6 +448,28 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
       const deviceAccess = await verifyDeviceAccess(input.deviceId as string, auth);
       if ('error' in deviceAccess) return JSON.stringify({ error: deviceAccess.error });
 
+      // W04-D12 (#6758): bound to the incident's org, as execute_containment is
+      // (#9662) — a multi-org caller must not aim forensic collection at a
+      // device in another org under this incident.
+      if (deviceAccess.device.orgId !== incident.orgId) {
+        return JSON.stringify({ error: 'The device must belong to the same organization as the incident' });
+      }
+
+      // W04 quorum QW8 (#6758): a screenshot is screen capture, so it honours
+      // the device's remote-access consent policy exactly like take_screenshot.
+      // Other evidence types are not screen access.
+      if ((input.evidenceTypes as unknown[]).includes('screenshot')) {
+        const gate = await checkScreenAccessConsentGate({
+          deviceId: deviceAccess.device.id,
+          orgId: deviceAccess.device.orgId,
+          hostname: deviceAccess.device.hostname,
+          surface: 'collect_evidence',
+          actor: auth,
+          isEphemeral: deviceAccess.device.isEphemeral === true,
+        });
+        if (!gate.ok) return JSON.stringify(gate.body);
+      }
+
       const payload = {
         incidentId: input.incidentId as string,
         evidenceTypes: input.evidenceTypes as string[],
@@ -430,12 +517,17 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
             type: 'string',
             description: 'UUID of the incident',
           },
+          includeEvidenceMetadata: {
+            type: 'boolean',
+            description: 'Include the metadata object per evidence row (default false)',
+          },
         },
         required: ['incidentId'],
       },
     },
     handler: async (input, auth) => {
       if (!input.incidentId) return JSON.stringify({ error: 'incidentId is required' });
+      const includeEvidenceMetadata = input.includeEvidenceMetadata === true;
 
       const incident = await findIncidentWithAccess(input.incidentId as string, auth);
       if (!incident) return JSON.stringify({ error: 'Incident not found or access denied' });
@@ -462,6 +554,9 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
         .where(and(...evidenceConditions))
         .orderBy(desc(incidentEvidence.collectedAt));
 
+      // A-W05 (5c): cap actions/evidence/timeline so a long-running incident
+      // can't blow the page budget; each carries the real count.
+      const timeline = incident.timeline ?? [];
       return JSON.stringify({
         incident: {
           id: incident.id,
@@ -477,8 +572,9 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
           resolvedAt: incident.resolvedAt,
           closedAt: incident.closedAt,
         },
-        timeline: incident.timeline,
-        actions: actions.map((a) => ({
+        timeline: timeline.slice(0, 100),
+        timelineCount: timeline.length,
+        actions: actions.slice(0, 50).map((a) => ({
           id: a.id,
           actionType: a.actionType,
           description: a.description,
@@ -489,15 +585,17 @@ export function registerIncidentTools(aiTools: Map<string, AiTool>): void {
           reversed: a.reversed,
           executedAt: a.executedAt,
         })),
-        evidence: evidence.map((e) => ({
+        actionCount: actions.length,
+        evidence: evidence.slice(0, 50).map((e) => ({
           id: e.id,
           evidenceType: e.evidenceType,
           description: e.description,
           collectedAt: e.collectedAt,
           collectedBy: e.collectedBy,
           hash: e.hash,
-          metadata: e.metadata,
+          ...(includeEvidenceMetadata ? { metadata: e.metadata } : {}),
         })),
+        evidenceCount: evidence.length,
       });
     },
   });

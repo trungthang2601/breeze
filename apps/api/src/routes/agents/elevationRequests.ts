@@ -15,6 +15,8 @@ import {
   pamSignerGroups,
   type SignerGroupEntry,
 } from '../../db/schema';
+import { PAM_PROMPT_RENDERERS } from '../../db/schema/elevations';
+import { pamPendingExpiresAt } from '../../jobs/pamPendingTtl';
 import { writeAuditEvent } from '../../services/auditEvents';
 import { getRedis } from '../../services/redis';
 import { rateLimiter } from '../../services/rate-limit';
@@ -31,6 +33,9 @@ import {
 } from '../../services/expoPush';
 import type { RiskTier } from '@breeze/shared';
 import { createPamDecisionIntent } from '../../services/pamActuationLifecycle';
+import { buildPamConfigUpdate } from './helpers';
+import { currentOwnershipEpochSql } from '../../services/deviceOwnershipEpoch';
+import { resolveMessageBranding } from '../../services/endpointMessaging/brandingSnapshot';
 
 // PAM Track 3: agent-side endpoint that records UAC consent.exe observations
 // as `elevation_requests` rows with flow_type='uac_intercept'. Auth is the
@@ -115,6 +120,10 @@ export const elevationRequestSchema = z.object({
   parent_image: z.string().max(4096).optional(),
   command_line: z.string().max(8192).optional(),
   observed_at: z.string().datetime({ offset: true }).optional(),
+  // #10190 W07: the renderer the agent intends to ask the end user's first
+  // question with (assist | native | headless). Audit only. An unknown value
+  // is dropped rather than failing the submit.
+  first_question_renderer: z.enum(PAM_PROMPT_RENDERERS).optional().catch(undefined),
 });
 
 export type ElevationRequestPayload = z.infer<typeof elevationRequestSchema>;
@@ -141,6 +150,31 @@ async function safePublish(
     await publishEvent(type, orgId, payload, 'pam-ingest');
   } catch (err) {
     console.error(`[ElevationRequests] event publish failed (${type}):`, err);
+  }
+}
+
+/** Longest support name sent to the agent, in code points (`NAME_MAX` in brandingSnapshot). */
+const PAM_SUPPORT_NAME_MAX = 120;
+
+/**
+ * #8928: the partner's name as the end user's toasts show it ("Request
+ * approved … by {s}"). Only a real partner name: the generic sender identity
+ * ("Your IT support team") reads badly mid-sentence, so it is omitted and the
+ * agent falls back to "IT". Runs after the org-scoped ingest transaction has
+ * closed, in its own system context (partner branding is partner-axis data).
+ */
+async function resolvePamSupportName(orgId: string): Promise<string | null> {
+  try {
+    const resolved = await runOutsideDbContext(() =>
+      withSystemDbAccessContext(() => resolveMessageBranding(orgId)),
+    );
+    if (!resolved || resolved.senderIdentity !== 'partner') return null;
+    const name = resolved.branding.companyName.trim();
+    if (!name) return null;
+    return Array.from(name).slice(0, PAM_SUPPORT_NAME_MAX).join('');
+  } catch (err) {
+    console.warn(`[ElevationRequests] support-name lookup failed for org=${orgId}; the notices will say "IT":`, err);
+    return null;
   }
 }
 
@@ -334,7 +368,7 @@ elevationRequestsRoutes.post(
     // to build (see the wrap site there): org scope, no partner-AXIS write
     // access, and the device org's owning partner on the read-only
     // `currentPartnerId` axis.
-    return withDbAccessContext(
+    const ingest = await withDbAccessContext(
       {
         scope: 'organization' as const,
         orgId,
@@ -356,6 +390,24 @@ elevationRequestsRoutes.post(
 
       if (!device) {
         return c.json({ error: 'Device not found' }, 404);
+      }
+
+      // Same resolution the agent's own heartbeat uses to decide whether it
+      // should be capturing UAC events at all (config-policy hierarchy, org
+      // grandfathering, then the opt-in-off default). A device with capture
+      // disabled has no legitimate reason to post observations here; without
+      // this gate a misbehaving agent can still insert
+      // elevation_requests rows and fan out mobile approval pushes to every
+      // PAM approver even though the org never turned PAM/UAC interception
+      // on, which is unbounded table growth and push flooding with zero
+      // product value. Mirrors the existing 'ignored' response shape (the
+      // agent treats any 200/201 as success and ignores the body either way).
+      const pamSettings = await buildPamConfigUpdate(device.id, { orgId: device.orgId });
+      if (!pamSettings.uacInterceptionEnabled) {
+        console.warn(
+          `[ElevationRequests] ingest refused: PAM/UAC interception disabled for device=${device.id} org=${device.orgId}`,
+        );
+        return c.json({ id: null, status: 'ignored' }, 200);
       }
 
       const observedAt = payload.observed_at ? new Date(payload.observed_at) : new Date();
@@ -537,6 +589,7 @@ elevationRequestsRoutes.post(
             orgId: device.orgId,
             siteId: device.siteId ?? null,
             deviceId: device.id,
+            deviceEpoch: currentOwnershipEpochSql(device.id),
             flowType: 'uac_intercept',
             subjectUserId: null,
             subjectUsername: payload.subject_username,
@@ -590,6 +643,7 @@ elevationRequestsRoutes.post(
               details: {
                 subject_username: payload.subject_username,
                 target_executable_path: payload.target_executable_path,
+                ...(payload.first_question_renderer ? { first_question_renderer: payload.first_question_renderer } : {}),
               },
               occurredAt: observedAt,
             },
@@ -628,7 +682,9 @@ elevationRequestsRoutes.post(
           }
           await tx.insert(elevationAudit).values(auditRows);
 
-          let enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | null = null;
+          let enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | 'refused' | null = null;
+          let refusalReason: string | null = null;
+          let finalStatus: typeof insertedRow.status = insertedRow.status;
           if (decision.kind === 'auto_approved' || decision.kind === 'denied') {
             const actuation = await createPamDecisionIntent(tx, {
               request: {
@@ -643,11 +699,17 @@ elevationRequestsRoutes.post(
               decision: decision.kind,
               expiresAt,
             });
-            enforcementStatus = actuation.desiredState === 'active'
-              ? 'pending_dispatch'
-              : 'cleanup_pending';
+            if (actuation.refusalReason) {
+              enforcementStatus = 'refused';
+              refusalReason = actuation.refusalReason;
+              finalStatus = 'denied';
+            } else {
+              enforcementStatus = actuation.desiredState === 'active'
+                ? 'pending_dispatch'
+                : 'cleanup_pending';
+            }
           }
-          return { ...insertedRow, enforcementStatus };
+          return { ...insertedRow, status: finalStatus, enforcementStatus, refusalReason };
         });
 
         writeAuditEvent(c, {
@@ -662,13 +724,16 @@ elevationRequestsRoutes.post(
             subject_username: payload.subject_username,
             target_executable_path: payload.target_executable_path,
             ingest_status: row.status,
+            ...(payload.first_question_renderer ? { first_question_renderer: payload.first_question_renderer } : {}),
           },
         });
 
+        // A refused auto-approval (see createPamDecisionIntent) left the row
+        // denied, so it is published as a denial — never as auto_approved.
         const eventType: EventType =
-          decision.kind === 'auto_approved'
+          decision.kind === 'auto_approved' && !row.refusalReason
             ? 'elevation.auto_approved'
-            : decision.kind === 'denied'
+            : decision.kind === 'denied' || row.refusalReason
               ? 'elevation.denied'
               : 'elevation.requested';
         await safePublish(eventType, device.orgId, {
@@ -676,6 +741,7 @@ elevationRequestsRoutes.post(
           deviceId: device.id,
           flowType: 'uac_intercept',
           status: row.status,
+          ...(row.refusalReason ? { enforcementStatus: 'refused', reason: row.refusalReason } : {}),
           subjectUsername: payload.subject_username,
           targetExecutablePath: payload.target_executable_path,
           ...(decision.kind !== 'pending' && decision.source === 'policy'
@@ -709,11 +775,22 @@ elevationRequestsRoutes.post(
           }
         }
 
-        return c.json({
-          id: row.id,
-          status: row.status,
-          ...(row.enforcementStatus ? { enforcementStatus: row.enforcementStatus } : {}),
-        }, 201);
+        // The 201 is built after this org-scoped transaction closes, so the
+        // support-name lookup below never holds a second pooled connection.
+        return {
+          kind: 'created' as const,
+          orgId: device.orgId,
+          body: {
+            id: row.id,
+            status: row.status,
+            ...(row.enforcementStatus ? { enforcementStatus: row.enforcementStatus } : {}),
+            // #10190 W07: when the stale-pending expirer may expire it (same
+            // basis: requested_at + TTL), for the device's waiting card.
+            // requested_at is the agent's observed_at, so a skewed agent
+            // clock is clamped to [now, now + TTL] on the server clock.
+            ...(row.status === 'pending' ? { pendingExpiresAt: pamPendingExpiresAt(observedAt, now).toISOString() } : {}),
+          },
+        };
       } catch (err) {
         console.error(
           `[ElevationRequests] Failed to insert for device=${device.id} org=${device.orgId}:`,
@@ -723,5 +800,11 @@ elevationRequestsRoutes.post(
       }
       },
     );
+    if (ingest instanceof Response) return ingest;
+
+    // #8928: the MSP's name, for the end-user notices. Best-effort: a failed
+    // lookup never fails the submit; the agent then says "IT".
+    const supportName = await resolvePamSupportName(ingest.orgId);
+    return c.json({ ...ingest.body, ...(supportName ? { supportName } : {}) }, 201);
   },
 );

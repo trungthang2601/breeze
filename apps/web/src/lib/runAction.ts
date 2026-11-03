@@ -40,8 +40,21 @@ export interface RunActionOptions<T> {
    * and `reauth_required`, which are WebAuthn-proof rejections, not session
    * expiry. Without this the failure is swallowed silently (see the 401 branch
    * below). Default false, so every pre-existing caller is unchanged.
+   *
+   * Pass a predicate over the parsed 401 body when the same route can answer
+   * BOTH kinds of 401 (e.g. PAM respond: a rejected re-auth factor vs a
+   * genuinely expired bearer token). A matching body is treated as an error; a
+   * non-matching one keeps the session-expiry path (onUnauthorized, no toast).
    */
-  treatUnauthorizedAsError?: boolean;
+  treatUnauthorizedAsError?: boolean | ((body: unknown) => boolean);
+  /**
+   * Skip the error toast for a failure the caller handles as an expected
+   * outcome (still throws ActionError). Receives the HTTP status, `code`, and the
+   * parsed response body (for routes that ride a machine token in `error`).
+   * E.g. the accounting workbench treats a post-decision `sync_in_progress`
+   * 409 as "the worker is already syncing this row" (#7386).
+   */
+  suppressErrorToast?: (status: number, code: string | undefined, body?: unknown) => boolean;
 }
 
 function isZodValidationFailure(data: unknown): boolean {
@@ -93,12 +106,22 @@ export async function runAction<T = unknown>(opts: RunActionOptions<T>): Promise
   // WebAuthn assertion failed) would be silently swallowed here — such callers
   // must pass `treatUnauthorizedAsError` so the body-based branch below toasts
   // the real reason.
-  if (response.status === 401 && !opts.treatUnauthorizedAsError) {
+  const unauthorizedAsError = opts.treatUnauthorizedAsError;
+  if (response.status === 401 && !unauthorizedAsError) {
     if (opts.onUnauthorized) opts.onUnauthorized();
     throw new ActionError('Unauthorized', 401);
   }
 
   const data: unknown = await response.json().catch(() => null);
+
+  if (
+    response.status === 401 &&
+    typeof unauthorizedAsError === 'function' &&
+    !unauthorizedAsError(data)
+  ) {
+    if (opts.onUnauthorized) opts.onUnauthorized();
+    throw new ActionError('Unauthorized', 401);
+  }
 
   if (isApiFailure(data, response.status)) {
     let message = extractApiError(data, opts.errorFallback);
@@ -153,7 +176,9 @@ export async function runAction<T = unknown>(opts: RunActionOptions<T>): Promise
         message = headline;
       }
     }
-    if (response.status === 403 && isTrustDenial(data)) {
+    if (opts.suppressErrorToast?.(response.status, code, data)) {
+      // Caller treats this as an expected outcome and renders its own state.
+    } else if (response.status === 403 && isTrustDenial(data)) {
       // Best-effort UI handoff: if a mounted TrustProbationBanner picks this
       // up (it calls preventDefault()), it owns showing the denial and a
       // generic toast on top would be redundant noise. If nothing handled

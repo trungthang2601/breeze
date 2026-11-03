@@ -20,6 +20,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Worker } from 'bullmq';
 import { Gauge } from 'prom-client';
 
@@ -150,6 +152,9 @@ vi.mock('./db', () => ({
   withSystemDbAccessContext: mocks.withSystemDbAccessContext,
   closeDb: mocks.closeDb,
 }));
+// AI model registry W01 (#7599): the boot path starts the platform model
+// snapshot refresher; it reads the database, which this suite mocks out.
+vi.mock('./services/aiModels/platformModels', () => ({ startPlatformModelSnapshotRefresher: vi.fn(() => () => undefined) }));
 vi.mock('./services/redis', () => ({
   getRedis: mocks.getRedis,
   closeRedis: mocks.closeRedis,
@@ -395,6 +400,12 @@ describe('worker.ts boot (#4086 Task 6)', () => {
       'startRegisteredWorkers',
       'initializeEventDispatchWorker',
     ]);
+  });
+
+  it('no AI model registry cutover sweep at worker boot (W08 #7606: partners are bootstrapped on demand by ensurePartnerCutover)', () => {
+    const source = readFileSync(join(__dirname, 'worker.ts'), 'utf8');
+    expect(source).not.toMatch(/runRegistryCutoverSweep/);
+    expect(source).not.toMatch(/services\/aiModels\/registryCutover'/);
   });
 
   it('exits non-zero when production DB-role verification fails, before Redis is probed or workers start', async () => {

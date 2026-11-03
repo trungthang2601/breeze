@@ -22,6 +22,7 @@ import { db, withSystemDbAccessContext } from '../../db';
 import {
   configPolicyAssignments,
   configurationPolicies,
+  contactRoles,
   contacts,
   devices,
   invoices,
@@ -47,6 +48,17 @@ import {
 import { getTestDb } from './setup';
 
 const runDb = it.runIf(!!process.env.DATABASE_URL);
+
+async function seedCanonicalContactRoles(rows: Array<{ id: string; orgId: string; siteId: string | null; roles: string[] | null }>) {
+  const values = rows.flatMap((row) => (row.roles ?? []).map((role) => ({
+    contactId: row.id,
+    orgId: row.orgId,
+    role,
+    siteId: row.siteId,
+    deviceGroupId: null,
+  })));
+  if (values.length > 0) await db.insert(contactRoles).values(values);
+}
 
 function buildApp(): Hono {
   const app = new Hono();
@@ -128,7 +140,7 @@ async function seedOrgPolicy(orgId: string, name: string, status: 'active' | 'in
 }
 
 /** An active org-owned policy assigned at SITE level only (a fresh site of the org). */
-async function seedSitePolicy(orgId: string, name: string): Promise<void> {
+async function seedSitePolicy(orgId: string, name: string): Promise<string> {
   const site = await createSite({ orgId, name: `${name} site` });
   await withSystemDbAccessContext(async () => {
     const [policy] = await db
@@ -137,6 +149,7 @@ async function seedSitePolicy(orgId: string, name: string): Promise<void> {
       .returning({ id: configurationPolicies.id });
     await db.insert(configPolicyAssignments).values({ configPolicyId: policy!.id, level: 'site', targetId: site.id });
   });
+  return site.id;
 }
 
 const ZERO_TICKETS = { open: 0, awaitingCustomer: 0, slaBreached: 0 };
@@ -218,15 +231,20 @@ describe('GET /orgs/account-readiness', () => {
         },
       ]);
 
-      await db.insert(contacts).values([
+      const billingContactId = crypto.randomUUID();
+      const seededContacts = await db.insert(contacts).values([
         { orgId: orgA, name: `Ada Primary ${suffix}`, email: `ada-${suffix}@example.com`, phone: '555-0100', isPrimary: true, siteId: null },
-        { orgId: orgA, name: `Bill Billing ${suffix}`, email: `bill-${suffix}@example.com`, roles: ['billing'] },
+        { id: billingContactId, orgId: orgA, siteId: null, name: `Bill Billing ${suffix}`, email: `bill-${suffix}@example.com`, roles: ['billing'] },
         // A site-level primary is never the org's primary contact.
         { orgId: orgA, siteId: site.id, name: `Site Primary ${suffix}`, email: `site-${suffix}@example.com`, isPrimary: true },
         // Org B: a primary with a name only — reachable by nothing; no billing role anywhere.
         { orgId: orgB, name: `Nameless Reach ${suffix}`, isPrimary: true, siteId: null },
         { orgId: orgB, name: `Tech ${suffix}`, email: `tech-${suffix}@example.com`, roles: ['technical'] },
-      ]);
+      ]).returning({ id: contacts.id, orgId: contacts.orgId, siteId: contacts.siteId, roles: contacts.roles });
+      await seedCanonicalContactRoles(seededContacts.filter((row) => row.id !== billingContactId));
+      await db.insert(contactRoles).values({
+        contactId: billingContactId, orgId: orgA, role: 'billing', siteId: null, deviceGroupId: null,
+      });
 
       await db.insert(portalUsers).values([
         { orgId: orgA, email: `stale-${suffix}@example.com`, status: 'active', invitedAt: daysAgo(10), lastLoginAt: null }, // counts
@@ -283,7 +301,16 @@ describe('GET /orgs/account-readiness', () => {
     await seedOrgPolicy(orgB, `Board inactive ${suffix}`, 'inactive');
     // Org C: an ACTIVE policy assigned only at SITE level. "Assigned" counts
     // org- and partner-level assignments alone, so C must stay unassigned.
-    await seedSitePolicy(orgC, `Board site-only ${suffix}`);
+    const orgCSite = await seedSitePolicy(orgC, `Board site-only ${suffix}`);
+    // A SITE-level contact with the billing role is not the org's billing
+    // contact: organizations.billing_contact (the invoice recipient) only ever
+    // projects an org-level one, so readiness must still flag org C.
+    await withSystemDbAccessContext(async () => {
+      const siteBilling = await db.insert(contacts).values({
+        orgId: orgC, siteId: orgCSite, name: `Site AP ${suffix}`, email: `site-ap-${suffix}@example.com`, roles: ['billing'],
+      }).returning({ id: contacts.id, orgId: contacts.orgId, siteId: contacts.siteId, roles: contacts.roles });
+      await seedCanonicalContactRoles(siteBilling);
+    });
 
     const res = await client.get(readinessPath([orgA, orgB, orgC]));
     expect(res.status, await res.clone().text()).toBe(200);
@@ -351,7 +378,7 @@ describe('GET /orgs/account-readiness', () => {
     // the reason the path lives at /orgs/account-readiness.
     const shadowed = await client.get(`/orgs/organizations/account-readiness?orgIds=${orgA}`);
     expect(shadowed.status).toBe(404);
-    expect(await shadowed.json()).toEqual({ error: 'Organization not found' });
+    expect(await shadowed.json()).toEqual({ error: 'Organization not found', code: 'NOT_FOUND' });
   });
 
   runDb('a partner-level assignment of an ACTIVE policy marks every org of that partner only', async () => {

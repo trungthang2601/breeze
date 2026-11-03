@@ -3,12 +3,16 @@
 package x11
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/breeze-rmm/agent/internal/logging"
 )
 
 // ResolveDisplayTargets enumerates X sockets under /tmp/.X11-unix and Wayland
@@ -31,21 +35,9 @@ func ResolveDisplayTargets() ([]DisplayTarget, error) {
 			}
 			display := ":" + num
 			t := DisplayTarget{Display: display, SessionType: "x11"}
-			// The X socket's owning uid is the most reliable owner signal.
-			// Modern display managers launch Xorg with -displayfd (no ":N" on
-			// argv, so findXServerProc can't match by display number) and
-			// loginctl's Display property is frequently empty — but the socket
-			// under /tmp/.X11-unix is always owned by the session user.
-			if fi, err := os.Stat(filepath.Join("/tmp/.X11-unix", name)); err == nil {
-				if suid := statUID(fi); suid > 0 {
-					t.OwnerUID = suid
-				}
-			}
-			if pid, argv, uid, ok := findXServerProc(num, t.OwnerUID); ok {
-				if t.OwnerUID == 0 {
-					t.OwnerUID = uid
-				}
-				t.XauthPath = resolveXauthPath(parseAuthArg(argv), t.OwnerUID, pid)
+			if pid, argv, uid, ok := findXServerProc(num); ok {
+				t.OwnerUID = uid
+				t.XauthPath = resolveXauthPath(parseAuthArg(argv), uid, pid)
 			}
 			if s, ok := sessions[display]; ok {
 				t.OwnerName = s.user
@@ -131,28 +123,30 @@ func rank(t DisplayTarget) int {
 	}
 }
 
-// findXServerProc scans /proc for the Xorg/X/Xwayland process backing display
-// :N, returning its pid, argv, and uid.
-//
-// Primary match is ":N" on the server's argv. Modern launches use -displayfd
-// instead and carry no ":N", so as a fallback we match an X server process
-// OWNED BY ownerUID (the display socket's owner). That lets us still recover the
-// server's -auth argument (the Xauthority path) on -displayfd systems.
-func findXServerProc(displayNum string, ownerUID int) (pid int, argv []string, uid int, ok bool) {
-	procs, err := os.ReadDir("/proc")
+// findXServerProc scans /proc for the Xorg/X/Xwayland process owning display :N,
+// returning its pid, argv, and uid.
+func findXServerProc(displayNum string) (pid int, argv []string, uid int, ok bool) {
+	return findXServerProcAt("/proc", displayNum)
+}
+
+func findXServerProcAt(procRoot, displayNum string) (pid int, argv []string, uid int, ok bool) {
+	procs, err := os.ReadDir(procRoot)
 	if err != nil {
 		return 0, nil, 0, false
 	}
 	want := ":" + displayNum
-	var fbPid, fbUID int
-	var fbArgv []string
-	haveFallback := false
+	type xServerProc struct {
+		pid  int
+		argv []string
+		uid  int
+	}
+	var candidates []xServerProc
 	for _, p := range procs {
 		pidN, err := strconv.Atoi(p.Name())
 		if err != nil {
 			continue
 		}
-		cmdline, err := os.ReadFile(filepath.Join("/proc", p.Name(), "cmdline"))
+		cmdline, err := os.ReadFile(filepath.Join(procRoot, p.Name(), "cmdline"))
 		if err != nil {
 			continue
 		}
@@ -164,21 +158,68 @@ func findXServerProc(displayNum string, ownerUID int) (pid int, argv []string, u
 		if base != "Xorg" && base != "X" && base != "Xwayland" {
 			continue
 		}
-		procUID := 0
-		if fi, err := os.Stat(filepath.Join("/proc", p.Name())); err == nil {
-			procUID = statUID(fi)
-		}
+		hasDisplay := false
 		for _, a := range args {
 			if a == want {
-				return pidN, args, procUID, true
+				hasDisplay = true
+				break
 			}
 		}
-		if !haveFallback && ownerUID > 0 && procUID == ownerUID {
-			fbPid, fbArgv, fbUID, haveFallback = pidN, args, procUID, true
+		var st struct{ uid int }
+		if fi, err := os.Stat(filepath.Join(procRoot, p.Name())); err == nil {
+			st.uid = statUID(fi)
+		}
+		if hasDisplay {
+			return pidN, args, st.uid, true
+		}
+		candidates = append(candidates, xServerProc{pidN, args, st.uid})
+	}
+
+	// GDM uses -displayfd instead of a literal :N argument, so match the X
+	// server by the socket it listens on. Unix sockets are per network
+	// namespace: read each candidate's own /proc/<pid>/net/unix.
+	var lastErr error
+	skipped := 0
+	for _, c := range candidates {
+		unix, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(c.pid), "net", "unix"))
+		if err != nil {
+			lastErr = err
+			skipped++
+			continue
+		}
+		inodes := parseXSocketInodes(string(unix), displayNum)
+		if len(inodes) == 0 {
+			continue
+		}
+		fdRoot := filepath.Join(procRoot, strconv.Itoa(c.pid), "fd")
+		fds, err := os.ReadDir(fdRoot)
+		if err != nil {
+			lastErr = err
+			skipped++
+			continue
+		}
+		var links []string
+		var fdErr error
+		for _, fd := range fds {
+			if link, err := os.Readlink(filepath.Join(fdRoot, fd.Name())); err == nil {
+				links = append(links, link)
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				// A descriptor closing between ReadDir and Readlink is normal
+				// (ENOENT); any other failure may hide the matching socket.
+				fdErr = err
+			}
+		}
+		if hasXSocket(links, inodes) {
+			return c.pid, c.argv, c.uid, true
+		}
+		if fdErr != nil {
+			lastErr = fdErr
+			skipped++
 		}
 	}
-	if haveFallback {
-		return fbPid, fbArgv, fbUID, true
+	if skipped > 0 {
+		logging.L("desktop.x11").Debug("no X server matched the display socket; some candidates could not be read",
+			"display", want, "unreadable", skipped, "candidates", len(candidates), "error", lastErr.Error())
 	}
 	return 0, nil, 0, false
 }

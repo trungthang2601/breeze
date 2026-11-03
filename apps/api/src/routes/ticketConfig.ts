@@ -6,6 +6,7 @@ import { authMiddleware, requireScope, requirePermission } from '../middleware/a
 import type { AuthContext } from '../middleware/auth';
 import { PERMISSIONS, hasPermission, type UserPermissions } from '../services/permissions';
 import {
+  ERROR_CODES,
   createTicketStatusSchema, updateTicketStatusSchema, reorderTicketStatusesSchema,
   prioritySettingsSchema,
   createCustomerEmailDomainSchema, updateCustomerEmailDomainSchema
@@ -34,7 +35,7 @@ const partnerGlobalDeniedMessage = 'Full partner organization access is required
 
 const requirePartnerGlobalAccess = async (c: Context, next: Next) => {
   if (!canManagePartnerWidePolicies(c.get('auth') as AuthContext)) {
-    return c.json({ error: partnerGlobalDeniedMessage }, 403);
+    return c.json({ error: partnerGlobalDeniedMessage, code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
   return next();
 };
@@ -53,7 +54,7 @@ function handleServiceError(c: { json: (b: unknown, s: number) => Response }, er
 // admins or wildcard-permission roles only.
 function requirePartnerId(c: { get: (k: 'auth') => unknown; json: (b: unknown, s: number) => Response }): string | Response {
   const auth = c.get('auth') as AuthContext;
-  if (!auth.partnerId) return c.json({ error: 'Partner context required' }, 403);
+  if (!auth.partnerId) return c.json({ error: 'Partner context required', code: ERROR_CODES.ACCESS_DENIED }, 403);
   return auth.partnerId;
 }
 
@@ -65,11 +66,11 @@ function requirePartnerId(c: { get: (k: 'auth') => unknown; json: (b: unknown, s
 const adminMiddleware = async (c: Context, next: Next) => {
   const auth = c.get('auth') as AuthContext;
   if (!canManagePartnerWidePolicies(auth)) {
-    return c.json({ error: partnerGlobalDeniedMessage }, 403);
+    return c.json({ error: partnerGlobalDeniedMessage, code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
   const perms = c.get('permissions') as UserPermissions | undefined;
   const isAdmin = auth.user.isPlatformAdmin || (perms ? hasPermission(perms, '*', '*') : false);
-  if (!isAdmin) return c.json({ error: 'Managing ticket configuration requires an admin role' }, 403);
+  if (!isAdmin) return c.json({ error: 'Managing ticket configuration requires an admin role', code: ERROR_CODES.ACCESS_DENIED }, 403);
   return next();
 };
 
@@ -113,7 +114,7 @@ ticketConfigRoutes.post('/email-inbound/:id/convert', scopes, writePerm, adminMi
   try {
     const { id } = c.req.valid('param');
     const { orgId } = c.req.valid('json');
-    const row = await convertEmailInbound(partnerId, id, orgId, { userId: auth.user.id, name: auth.user.name });
+    const row = await convertEmailInbound(partnerId, id, orgId, { kind: 'user' as const, userId: auth.user.id, name: auth.user.name });
     writeRouteAudit(c, {
       orgId: null,
       action: 'ticket_email_inbound.convert',

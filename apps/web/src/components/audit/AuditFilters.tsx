@@ -4,24 +4,17 @@ import { Calendar, Check, ChevronDown, Loader2, MapPin, Search, User, X } from '
 import { cn } from '@/lib/utils';
 import { fetchWithAuth } from '../../stores/auth';
 import { fetchAllSites } from '@/lib/fetchAllSites';
-
-type DatePreset = 'today' | '7d' | '30d' | 'custom';
-
-type AuditFiltersState = {
-  datePreset: DatePreset;
-  startDate?: string;
-  endDate?: string;
-  userId?: string;
-  userEmail?: string;
-  siteId?: string;
-  siteName?: string;
-  actions: string[];
-  resources: string[];
-  search: string;
-};
+import { auditActionFilterOptions, auditPrefixLabel } from '@/lib/auditFormat';
+import type { ActiveFilters, DatePreset } from './auditFilterParams';
 
 type AuditFiltersProps = {
-  onApply?: (filters: AuditFiltersState) => void;
+  /**
+   * The filters currently applied to the trail. The viewer unmounts this panel
+   * on Apply, so it seeds its state from here on every open; without it the
+   * panel reopened showing the defaults while a custom range was active (#9941).
+   */
+  initialFilters?: ActiveFilters | null;
+  onApply?: (filters: ActiveFilters) => void;
   onClear?: () => void;
   /** Show the Site (branch) picker. Off for the partner-accounts view, whose rows are not tied to devices. */
   showSiteFilter?: boolean;
@@ -38,45 +31,44 @@ type UserOption = {
   email: string;
 };
 
-const actionOptions = ['login', 'update', 'delete', 'create', 'export', 'access'];
-const resourceOptions = ['policy', 'report', 'dataset', 'identity', 'automation', 'asset'];
+// #9672: options are real server-side values. Actions are dotted-code prefixes
+// derived from the audit catalog; resources are the resource_type values the
+// API writes. Both are matched as prefixes, not substrings.
+const actionOptions = auditActionFilterOptions();
+const resourceOptions = [
+  'device',
+  'device_group',
+  'script',
+  'user',
+  'organization',
+  'site',
+  'alert',
+  'configuration_policy',
+  'automation',
+  'report',
+  'ticket'
+];
 
-export default function AuditFilters({ onApply, onClear, showSiteFilter = true }: AuditFiltersProps) {
+export default function AuditFilters({ initialFilters, onApply, onClear, showSiteFilter = true }: AuditFiltersProps) {
   const { t } = useTranslation('admin');
-  const [datePreset, setDatePreset] = useState<DatePreset>('7d');
+  const [datePreset, setDatePreset] = useState<DatePreset>(initialFilters?.datePreset ?? '7d');
   const presetLabels: Record<DatePreset, string> = {
     today: t('audit.auditFilters.presets.today'),
     '7d': t('audit.auditFilters.presets.last7Days'),
     '30d': t('audit.auditFilters.presets.last30Days'),
     custom: t('audit.auditFilters.presets.custom')
   };
-  const actionLabels: Record<string, string> = {
-    login: t('audit.auditFilters.actions.login'),
-    update: t('audit.auditFilters.actions.update'),
-    delete: t('audit.auditFilters.actions.delete'),
-    create: t('audit.auditFilters.actions.create'),
-    export: t('audit.auditFilters.actions.export'),
-    access: t('audit.auditFilters.actions.access')
-  };
-  const resourceLabels: Record<string, string> = {
-    policy: t('audit.auditFilters.resources.policy'),
-    report: t('audit.auditFilters.resources.report'),
-    dataset: t('audit.auditFilters.resources.dataset'),
-    identity: t('audit.auditFilters.resources.identity'),
-    automation: t('audit.auditFilters.resources.automation'),
-    asset: t('audit.auditFilters.resources.asset')
-  };
-  const [customStart, setCustomStart] = useState('');
-  const [customEnd, setCustomEnd] = useState('');
+  const [customStart, setCustomStart] = useState(initialFilters?.startDate ?? '');
+  const [customEnd, setCustomEnd] = useState(initialFilters?.endDate ?? '');
   const [userSearch, setUserSearch] = useState('');
   const [userMenuOpen, setUserMenuOpen] = useState(false);
-  const [selectedUserId, setSelectedUserId] = useState<string | undefined>();
-  const [selectedActions, setSelectedActions] = useState<string[]>([]);
-  const [selectedResources, setSelectedResources] = useState<string[]>([]);
-  const [detailsSearch, setDetailsSearch] = useState('');
+  const [selectedUserId, setSelectedUserId] = useState<string | undefined>(initialFilters?.userId);
+  const [selectedActions, setSelectedActions] = useState<string[]>(initialFilters?.actions ?? []);
+  const [selectedResources, setSelectedResources] = useState<string[]>(initialFilters?.resources ?? []);
+  const [detailsSearch, setDetailsSearch] = useState(initialFilters?.search ?? '');
   const [users, setUsers] = useState<UserOption[]>([]);
   const [loadingUsers, setLoadingUsers] = useState(false);
-  const [selectedSiteId, setSelectedSiteId] = useState('');
+  const [selectedSiteId, setSelectedSiteId] = useState(initialFilters?.siteId ?? '');
   const [sites, setSites] = useState<SiteOption[]>([]);
   const [loadingSites, setLoadingSites] = useState(false);
 
@@ -135,6 +127,12 @@ export default function AuditFilters({ onApply, onClear, showSiteFilter = true }
   }, [userSearch, users]);
 
   const selectedUser = users.find(user => user.id === selectedUserId);
+  // The applied user's email, while the reopened panel's user is still the one
+  // that was applied. Covers the users list not having loaded (or failing), so
+  // an applied user filter is neither hidden nor dropped on re-apply (#9941).
+  const appliedUserEmail =
+    selectedUserId && selectedUserId === initialFilters?.userId ? initialFilters.userEmail : undefined;
+  const selectedUserLabel = selectedUser?.name || selectedUser?.email || appliedUserEmail;
 
   const toggleSelection = (value: string, list: string[], setter: (next: string[]) => void) => {
     if (list.includes(value)) {
@@ -150,7 +148,7 @@ export default function AuditFilters({ onApply, onClear, showSiteFilter = true }
       startDate: datePreset === 'custom' ? customStart : undefined,
       endDate: datePreset === 'custom' ? customEnd : undefined,
       userId: selectedUserId,
-      userEmail: selectedUser?.email,
+      userEmail: selectedUser?.email ?? appliedUserEmail,
       siteId: showSiteFilter && selectedSiteId ? selectedSiteId : undefined,
       siteName: showSiteFilter && selectedSiteId ? sites.find(site => site.id === selectedSiteId)?.name : undefined,
       actions: selectedActions,
@@ -161,8 +159,8 @@ export default function AuditFilters({ onApply, onClear, showSiteFilter = true }
 
   const handleClear = () => {
     setDatePreset('7d');
-    setCustomStart('2024-05-21');
-    setCustomEnd('2024-05-28');
+    setCustomStart('');
+    setCustomEnd('');
     setUserSearch('');
     setSelectedUserId(undefined);
     setSelectedSiteId('');
@@ -190,6 +188,8 @@ export default function AuditFilters({ onApply, onClear, showSiteFilter = true }
               <button
                 key={preset}
                 type="button"
+                data-testid={`audit-date-preset-${preset}`}
+                aria-pressed={datePreset === preset}
                 onClick={() => setDatePreset(preset)}
                 className={cn(
                   'rounded-full border px-3 py-1 text-xs font-medium',
@@ -281,10 +281,13 @@ export default function AuditFilters({ onApply, onClear, showSiteFilter = true }
               </div>
             )}
           </div>
-          {selectedUser && (
-            <div className="flex items-center justify-between rounded-md border bg-muted/30 px-3 py-2 text-sm">
+          {selectedUserLabel && (
+            <div
+              data-testid="audit-user-filter-chip"
+              className="flex items-center justify-between rounded-md border bg-muted/30 px-3 py-2 text-sm"
+            >
               <span className="text-muted-foreground">
-                {t('audit.auditFilters.filteringBy')} <span className="font-medium text-foreground">{selectedUser.name}</span>
+                {t('audit.auditFilters.filteringBy')} <span className="font-medium text-foreground">{selectedUserLabel}</span>
               </span>
               <button
                 type="button"
@@ -309,9 +312,10 @@ export default function AuditFilters({ onApply, onClear, showSiteFilter = true }
             {actionOptions.map(action => (
               <label
                 key={action}
+                data-testid={`audit-action-option-${action}`}
                 className="flex items-center justify-between rounded-md border bg-background px-3 py-2 text-sm"
               >
-                <span className="text-foreground">{actionLabels[action]}</span>
+                <span className="text-foreground">{auditPrefixLabel(action)}</span>
                 <input
                   type="checkbox"
                   checked={selectedActions.includes(action)}
@@ -329,9 +333,10 @@ export default function AuditFilters({ onApply, onClear, showSiteFilter = true }
             {resourceOptions.map(resource => (
               <label
                 key={resource}
+                data-testid={`audit-resource-option-${resource}`}
                 className="flex items-center justify-between rounded-md border bg-background px-3 py-2 text-sm"
               >
-                <span className="text-foreground">{resourceLabels[resource]}</span>
+                <span className="text-foreground">{auditPrefixLabel(resource)}</span>
                 <input
                   type="checkbox"
                   checked={selectedResources.includes(resource)}
@@ -378,6 +383,7 @@ export default function AuditFilters({ onApply, onClear, showSiteFilter = true }
             <Search className="h-4 w-4 text-muted-foreground" />
             <input
               type="text"
+              data-testid="audit-details-search"
               value={detailsSearch}
               onChange={event => setDetailsSearch(event.target.value)}
               placeholder={t('audit.auditFilters.searchDetailsPlaceholder')}

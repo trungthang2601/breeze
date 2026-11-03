@@ -16,11 +16,12 @@ const RESOURCE_LABELS: Record<string, string> = {
   scripts: 'Scripts',
   alerts: 'Alerts',
   tickets: 'Tickets',
-  ticket_mailbox: 'Ticket Mailbox (Microsoft 365)',
+  ticket_mailbox: 'Ticket Mailbox (Microsoft 365, Google Workspace)',
   time_entries: 'Time Entries',
   billing_profiles: 'Rates & Work Types',
   users: 'Users',
   organizations: 'Organizations',
+  webhooks: 'Webhooks',
   connected_apps: 'Connected Applications',
   sites: 'Sites',
   automations: 'Automations',
@@ -39,6 +40,9 @@ const RESOURCE_LABELS: Record<string, string> = {
   vulnerabilities: 'Vulnerabilities',
   ai_sessions: 'AI Sessions',
   ai_agents: 'AI Agents',
+  ai_models: 'AI Models',
+  ai_workspace: 'AI Sandbox Workspaces',
+  client_ai_templates: 'AI for Office Templates',
   approvals: 'Approvals',
   variables: 'Variables',
   pam: 'Privileged Access',
@@ -47,13 +51,18 @@ const RESOURCE_LABELS: Record<string, string> = {
   // Tool catalog (#5216): registering external MCP tool sources, and calling
   // the tools they expose from AI surfaces.
   tool_sources: 'External Tool Sources',
-  external_tools: 'External Tools'
+  external_tools: 'External Tools',
+  endpoint_messages: 'Endpoint Messages'
 };
 
 const ACTION_LABELS: Record<string, string> = {
   read: 'Read',
   write: 'Write',
+  premium: 'Use Premium Models',
   cross_site_restore: 'Cross-Site Restore',
+  record_approval: 'Record Customer Approval',
+  set_location: 'Set Location',
+  recover_agent: 'Recover Agent (watchdog restart)',
   delete: 'Delete',
   execute: 'Execute',
   acknowledge: 'Acknowledge',

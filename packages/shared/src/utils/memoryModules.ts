@@ -34,12 +34,15 @@ export function normalizeMemoryModules(value: unknown): MemoryModule[] {
   for (const item of value) {
     if (!item || typeof item !== 'object') continue;
     const rec = item as Record<string, unknown>;
+    // Also accepts upstream's per-slot rows (device_memory_modules, #5351):
+    // `locator` for the slot, MT/s speeds, and `populated: false` empty slots.
+    if (rec.populated === false) continue;
     const capacityMb = asPositiveNumber(rec.capacityMb);
     if (capacityMb === null) continue;
     out.push({
-      slot: asText(rec.slot),
+      slot: asText(rec.slot) ?? asText(rec.locator),
       capacityMb,
-      speedMhz: asPositiveNumber(rec.speedMhz),
+      speedMhz: asPositiveNumber(rec.speedMhz) ?? asPositiveNumber(rec.configuredSpeedMts) ?? asPositiveNumber(rec.speedMts),
       manufacturer: asText(rec.manufacturer),
       partNumber: asText(rec.partNumber),
       serialNumber: asText(rec.serialNumber),

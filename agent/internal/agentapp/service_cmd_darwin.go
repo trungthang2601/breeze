@@ -15,12 +15,13 @@ import (
 	"github.com/breeze-rmm/agent/internal/config"
 	"github.com/breeze-rmm/agent/internal/launchdplist"
 	"github.com/breeze-rmm/agent/internal/macosuninstall"
+	"github.com/breeze-rmm/agent/internal/securefs"
 	"github.com/breeze-rmm/agent/internal/sessionbroker"
 	"github.com/spf13/cobra"
 )
 
 const (
-	darwinBinaryPath                 = "/usr/local/bin/breeze-agent"
+	darwinBinaryPath                 = securefs.TrustedExecutableDir + "/breeze-agent"
 	darwinDesktopHelperBinaryPath    = "/usr/local/bin/breeze-desktop-helper"
 	darwinPlistDst                   = "/Library/LaunchDaemons/com.breeze.agent.plist"
 	darwinDesktopUserPlistDst        = "/Library/LaunchAgents/com.breeze.desktop-helper-user.plist"
@@ -28,7 +29,7 @@ const (
 	darwinLogDir                     = "/Library/Logs/Breeze"
 	darwinConfigDir                  = "/Library/Application Support/Breeze"
 	darwinLabel                      = "com.breeze.agent"
-	darwinWatchdogBinaryPath         = "/usr/local/bin/breeze-watchdog"
+	darwinWatchdogBinaryPath         = securefs.TrustedExecutableDir + "/breeze-watchdog"
 	darwinWatchdogPlistDst           = "/Library/LaunchDaemons/com.breeze.watchdog.plist"
 	darwinWatchdogLabel              = "com.breeze.watchdog"
 )
@@ -43,7 +44,7 @@ const darwinPlist = `<?xml version="1.0" encoding="UTF-8"?>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/breeze-agent</string>
+        <string>/Library/Breeze/bin/breeze-agent</string>
         <string>run</string>
     </array>
 
@@ -97,7 +98,9 @@ func init() {
 	serviceCmd.AddCommand(serviceStopCmd)
 	serviceCmd.AddCommand(serviceStatusCmd)
 	serviceInstallCmd.Flags().BoolVar(&withUserHelper, "with-user-helper", false, "Also install the per-user desktop helper LaunchAgent")
-	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation")
+	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation and remember the choice (the running agent will not install it either)")
+	serviceInstallCmd.Flags().BoolVar(&watchdogOptIn, "watchdog", false, watchdogOptInUsage)
+	serviceInstallCmd.Flags().BoolVar(&strictWatchdog, "strict-watchdog", false, strictWatchdogUsage)
 	// A failed start returns an error from RunE; usage text would bury it.
 	serviceInstallCmd.SilenceUsage = true
 }
@@ -122,6 +125,23 @@ var serviceInstallCmd = &cobra.Command{
 			return fmt.Errorf("failed to set permissions on %s: %w", darwinConfigDir, err)
 		}
 
+		// Persist --no-watchdog / --watchdog (or honour a standing opt-out)
+		// before any install side effect: a failed marker write aborts here.
+		skipWatchdog, err := applyWatchdogFlags(defaultWatchdogFlagDeps(nil), noWatchdog, watchdogOptIn)
+		if err != nil {
+			return err
+		}
+		// The binary directory must be root-owned and not group/other
+		// writable — this is exactly what verifyOwnExecutableTrustedIfPrivileged
+		// checks at every privileged startup. EnsureTrustedDirChain walks
+		// every component under /Library with a symlink-refusing check
+		// instead of blindly creating/chowning through whatever is already
+		// there — /Library itself is admin-group-writable, so a pre-planted
+		// symlink or a foreign-owned directory must be refused, not followed.
+		if err := securefs.EnsureTrustedDirChain(securefs.TrustedExecutableDirRoot, securefs.TrustedExecutableDir, 0, 0, 0755); err != nil {
+			return fmt.Errorf("failed to secure %s: %w", securefs.TrustedExecutableDir, err)
+		}
+
 		// Stop existing service before replacing binary (safe for upgrades).
 		//
 		// Whether it was RUNNING is sampled BEFORE the unload, because this
@@ -139,7 +159,7 @@ var serviceInstallCmd = &cobra.Command{
 			}
 		}
 
-		// Copy current binary to /usr/local/bin/
+		// Copy current binary to the trusted binary directory.
 		exePath, err := os.Executable()
 		if err != nil {
 			return fmt.Errorf("failed to determine executable path: %w", err)
@@ -270,7 +290,8 @@ var serviceInstallCmd = &cobra.Command{
 			fmt.Printf("  3. Status:  sudo breeze-agent service status\n")
 			fmt.Printf("  4. Logs:    tail -f %s/agent.log\n", darwinLogDir)
 		}
-		if !noWatchdog {
+		var watchdogExit error
+		if !skipWatchdog {
 			// Describe the service state we actually left behind. This line
 			// used to assert "installed and running" unconditionally, which
 			// before #5252 was never true on this platform and is still not
@@ -295,15 +316,18 @@ var serviceInstallCmd = &cobra.Command{
 						"  1. Re-run `sudo breeze-agent service install` (will retry the download).\n"+
 						"  2. Download %s manually, place it next to breeze-agent,\n"+
 						"     then run `sudo breeze-watchdog service install`.\n"+
-						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n",
+						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n"+
+						watchdogSelfHealHint,
 					err, agentStateLine, watchdogManualDownloadURL(version, runtime.GOOS, runtime.GOARCH, serverURL))
 			}
+			watchdogExit = reportWatchdogBootstrap(err, strictWatchdog, os.Stdout)
 		}
 
 		// Reported last so the watchdog still gets bootstrapped, but reported:
 		// a silent exit 0 on a host whose agent is down is exactly how #5252
-		// went unnoticed until the device showed Offline.
-		return startErr
+		// went unnoticed until the device showed Offline. The agent's start
+		// failure wins over the watchdog outcome (--strict-watchdog → 78).
+		return installExitError(startErr, watchdogExit)
 	},
 }
 

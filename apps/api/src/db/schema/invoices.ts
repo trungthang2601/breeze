@@ -10,6 +10,7 @@ import {
   INVOICE_LINE_SOURCE_TYPES,
   PAYMENT_METHODS,
   INVOICE_LINE_DEVICE_COUNTED_AS,
+  type InvoiceStatus,
 } from '@breeze/shared';
 
 // Spread the readonly SSOT tuples into pgEnum's mutable `[string, ...string[]]`.
@@ -25,7 +26,25 @@ export const invoiceLineDeviceCountedAsEnum = pgEnum('invoice_line_device_counte
 function sqlNumberPresent(t: { invoiceNumber: unknown }): SQL {
   return sql`${t.invoiceNumber} IS NOT NULL`;
 }
-function sqlOpenForOverdue(t: { status: unknown }): SQL {
+/** Statuses an unpaid invoice can legitimately sit in (#3198 R3 AR aging).
+ *  `overdue` is here, and it is the reason this is NOT `sqlOpenForOverdue`'s
+ *  list: `runOverdueSweep` flips sent/partially_paid INTO 'overdue', so the
+ *  sweep's candidate set and the AR-open set are deliberately different.
+ *  Pinned against each other by invoices.arPredicates.test.ts. */
+export const AR_OPEN_STATUSES = ['sent', 'partially_paid', 'overdue'] as const satisfies readonly InvoiceStatus[];
+
+/** Every invoice with a live receivable. Literal SQL (not built from
+ *  AR_OPEN_STATUSES) so it reads like the predicate below; the test pins it to
+ *  the constant. */
+export function sqlOpenAr(t: { status: unknown }): SQL {
+  return sql`${t.status} IN ('sent','partially_paid','overdue')`;
+}
+
+/** Candidates for the daily overdue sweep: AR-open MINUS already-overdue. Also
+ *  the `invoices_due_overdue_idx` partial-index predicate — changing this text
+ *  is schema drift against migration 2026-06-15-a. Exported for #3198 R3 so the
+ *  sweep's status vocabulary keeps one home. */
+export function sqlOpenForOverdue(t: { status: unknown }): SQL {
   return sql`${t.status} IN ('sent','partially_paid')`;
 }
 function sqlPublicLinkHashPresent(t: { publicLinkTokenHash: unknown }): SQL {
@@ -52,6 +71,7 @@ export const invoices = pgTable('invoices', {
   taxTotal: numeric('tax_total', { precision: 12, scale: 2 }).notNull().default('0'),
   total: numeric('total', { precision: 12, scale: 2 }).notNull().default('0'),
   amountPaid: numeric('amount_paid', { precision: 12, scale: 2 }).notNull().default('0'),
+  autopayExcluded: boolean('autopay_excluded').notNull().default(false),
   balance: numeric('balance', { precision: 12, scale: 2 }).notNull().default('0'),
   // Deposit due at acceptance, snapshotted from the quote. NULL = ordinary invoice.
   depositDue: numeric('deposit_due', { precision: 12, scale: 2 }),
@@ -69,6 +89,23 @@ export const invoices = pgTable('invoices', {
   // reads ONLY this column afterwards, so a later partner-default change cannot
   // alter what a sanctioned re-render produces.
   deviceAppendix: boolean('device_appendix'),
+  // #8604 line itemization override. NULL on a draft = inherit the partner's
+  // invoice_line_* default; both issue writers stamp the RESOLVED values and
+  // renderers read only these afterwards (resolveInvoiceLineDetail). NULL on an
+  // issued row = issued before #8604 → the default (= pre-#8604) document.
+  // line_grouping is CHECK (NULL | 'entry' | 'day') in SQL.
+  lineGrouping: varchar('line_grouping', { length: 8 }),
+  lineShowDate: boolean('line_show_date'),
+  lineShowNote: boolean('line_show_note'),
+  lineShowWorkedTime: boolean('line_show_worked_time'),
+  // #6227 presentation snapshot. NULL on a draft = preview the partner's live
+  // document_theme / document_page_size; both issue writers (issueInvoice and
+  // the quote-accept direct issue) freeze the RESOLVED values here, and every
+  // renderer reads them through resolveInvoicePresentation afterwards.
+  // CHECK-constrained to the documentThemes vocabulary (migration
+  // 2026-10-29-100100-invoice-presentation-snapshot).
+  documentTheme: varchar('document_theme', { length: 16 }),
+  documentPageSize: varchar('document_page_size', { length: 8 }),
   // #3205 W07: 1 = billing evidence captured at generation or interactive
   // contract-line materialization. NULL = no evidence capture recorded. Invoice-level `recorded` flag — never
   // derived from an evidence row count.
@@ -129,6 +166,16 @@ export const invoiceLines = pgTable('invoice_lines', {
   catalogItemId: uuid('catalog_item_id'),
   parentLineId: uuid('parent_line_id').references((): AnyPgColumn => invoiceLines.id, { onDelete: 'cascade' }),
   ticketId: uuid('ticket_id'),
+  // The "Ticket #…" label frozen at issue (settings audit rule 6, sweep C4).
+  // NULL on a draft — renderers read the ticket's live number instead
+  // (invoiceTicketNumberSql). Stamped once by issueInvoice; never restamped.
+  ticketLabel: varchar('ticket_label', { length: 50 }),
+  // The ticket subject + category name the line's group header prints, frozen
+  // at issue beside ticket_label (#6955 / #6674, same rule 6). NULL on a draft —
+  // renderers read tickets / ticket_categories live instead. Stamped once by
+  // issueInvoice; never restamped.
+  ticketSubject: varchar('ticket_subject', { length: 255 }),
+  ticketCategory: varchar('ticket_category', { length: 100 }),
   // Title (mirrors catalog name). Nullable for legacy lines created before the
   // split, where `description` holds the title and the renderer falls back to it.
   name: varchar('name', { length: 255 }),
@@ -146,6 +193,15 @@ export const invoiceLines = pgTable('invoice_lines', {
   // worked-vs-billed disclosure note only — never for money. NULL for
   // non-time-entry lines and for legacy rows predating this column.
   workedMinutes: integer('worked_minutes'),
+  // #8603: the day a time_entry line was worked, from the entry's started_at
+  // in the partner timezone, captured at assembly and copied on reissue. NULL
+  // for non-time-entry lines (incl. block-hours overage) and pre-column rows.
+  workDate: date('work_date'),
+  // #8606: true once an operator hand-edits the description (updateLine, only
+  // on an actual change); "Refresh from time entries" then never overwrites
+  // it. Copied verbatim on reissue. Backfilled true for draft time_entry
+  // lines that predate the column (migration 2026-12-27-070000).
+  descriptionEdited: boolean('description_edited').notNull().default(false),
   sortOrder: integer('sort_order').notNull().default(0),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (t) => [

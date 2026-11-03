@@ -2,6 +2,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { snapshotsRoutes } from './snapshots';
 
+const attachNamesMock = vi.hoisted(() => vi.fn(async (_orgId: string, rows: unknown[]) => rows));
+vi.mock('./deviceNames', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./deviceNames')>()),
+  attachDeviceNames: (...args: [string, unknown[]]) => attachNamesMock(...args),
+}));
+
+const listDirMock = vi.hoisted(() => vi.fn());
+vi.mock('../../services/backupSnapshotBrowse', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/backupSnapshotBrowse')>()),
+  listSnapshotDirectory: (...args: unknown[]) => listDirMock(...args),
+}));
+
 const ORG_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const SNAPSHOT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const SITE_A = '11111111-1111-4111-8111-111111111111';
@@ -76,6 +88,10 @@ vi.mock('../../db/schema', () => ({
     id: 'devices.id',
     orgId: 'devices.org_id',
     siteId: 'devices.site_id',
+  },
+  organizations: {
+    id: 'organizations.id',
+    status: 'organizations.status',
   },
 }));
 
@@ -233,6 +249,20 @@ describe('snapshot routes', () => {
     expect(selectMock).toHaveBeenCalledTimes(1);
   });
 
+  it('returns the device-name-enriched snapshot rows (#7213)', async () => {
+    attachNamesMock.mockImplementationOnce(async (_orgId, rows) =>
+      (rows as Array<{ deviceId: string }>).map((r) => ({ ...r, deviceName: 'FRONT-DESK-01' })));
+    selectMock.mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-in' })]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data[0].deviceName).toBe('FRONT-DESK-01');
+  });
+
   it('denies GET /snapshots/:id for a site-restricted caller when the source device is out-of-site', async () => {
     permissionsState = { allowedSiteIds: [SITE_A] };
     authorizeResilienceResourcesMock.mockRejectedValueOnce(
@@ -296,8 +326,8 @@ describe('snapshot routes', () => {
   it('returns GET /snapshots/:id/browse for a site-restricted caller when the source device is in an allowed site', async () => {
     permissionsState = { allowedSiteIds: [SITE_A] };
     selectMock
-      .mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-in' })]))
-      .mockReturnValueOnce(chainMock([{ sourcePath: 'C:/data/file.txt', size: 10, modifiedAt: null }]));
+      .mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-in' })]));
+    listDirMock.mockResolvedValueOnce({ entries: [], nextCursor: null });
 
     const res = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/browse`, {
       method: 'GET',
@@ -310,8 +340,8 @@ describe('snapshot routes', () => {
 
   it('keeps GET /snapshots/:id/browse unchanged for an unrestricted caller', async () => {
     selectMock
-      .mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-out' })]))
-      .mockReturnValueOnce(chainMock([{ sourcePath: 'C:/data/file.txt', size: 10, modifiedAt: null }]));
+      .mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-out' })]));
+    listDirMock.mockResolvedValueOnce({ entries: [], nextCursor: null });
 
     const res = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/browse`, {
       method: 'GET',
@@ -320,7 +350,7 @@ describe('snapshot routes', () => {
 
     expect(res.status).toBe(200);
     expect((await res.json()).snapshotId).toBe(SNAPSHOT_ID);
-    expect(selectMock).toHaveBeenCalledTimes(2);
+    expect(selectMock).toHaveBeenCalledTimes(1);
   });
 
   // D12: once backupResultPersistence.ts indexes the agent's stable
@@ -332,12 +362,12 @@ describe('snapshot routes', () => {
   // have produced — normalizeSourcePath backslash-to-forward-slash turns
   // `\\?\GLOBALROOT\...` into `//?/GLOBALROOT/...`, whose first non-empty
   // segment is "?").
-  it('roots the browse tree at the drive letter for an indexed Windows path, never at "?"', async () => {
-    selectMock
-      .mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-out' })]))
-      .mockReturnValueOnce(chainMock([
-        { sourcePath: 'C:\\assure\\src\\content\\prefix\\pick.txt', size: 42, modifiedAt: null },
-      ]));
+  it('lists one level per request and never reads the whole file index (#8230)', async () => {
+    selectMock.mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-out' })]));
+    listDirMock.mockResolvedValueOnce({
+      entries: [{ name: 'C:', path: '/C:', type: 'directory' }],
+      nextCursor: 'abc',
+    });
 
     const res = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/browse`, {
       method: 'GET',
@@ -346,11 +376,61 @@ describe('snapshot routes', () => {
 
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.data).toHaveLength(1);
-    expect(body.data[0]).toMatchObject({ name: 'C:', type: 'directory' });
-    expect(body.data[0].name).not.toBe('?');
-    const assure = body.data[0].children[0];
-    expect(assure).toMatchObject({ name: 'assure', type: 'directory' });
+    expect(body.data).toEqual([{ name: 'C:', path: '/C:', type: 'directory' }]);
+    expect(body.nextCursor).toBe('abc');
+    expect(body.dir).toBe('');
+    // Only the snapshot-row lookup hits db.select; the file index goes through
+    // the bounded SQL lister.
+    expect(selectMock).toHaveBeenCalledTimes(1);
+    expect(listDirMock).toHaveBeenCalledWith(expect.objectContaining({ segments: [], limit: 200, cursor: null }));
+  });
+
+  it('passes dir (Windows backslashes normalised), limit and cursor to the lister', async () => {
+    selectMock.mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-out' })]));
+    listDirMock.mockResolvedValueOnce({ entries: [], nextCursor: null });
+    const cursor = Buffer.from('0:assure', 'utf8').toString('base64url');
+
+    const res = await app.request(
+      `/backup/snapshots/${SNAPSHOT_ID}/browse?dir=${encodeURIComponent('C:\\data')}&limit=50&cursor=${cursor}`,
+      { method: 'GET', headers: { Authorization: 'Bearer token' } }
+    );
+
+    expect(res.status).toBe(200);
+    expect(listDirMock).toHaveBeenCalledWith(expect.objectContaining({
+      segments: ['C:', 'data'],
+      limit: 50,
+      cursor: { rank: 0, name: 'assure' },
+    }));
+  });
+
+  it('rejects an out-of-range limit and a malformed cursor with 400', async () => {
+    for (const qs of ['limit=0', 'limit=100000', 'cursor=!!!notacursor']) {
+      selectMock.mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-out' })]));
+      const res = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/browse?${qs}`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+      expect(res.status, qs).toBe(400);
+    }
+    expect(listDirMock).not.toHaveBeenCalled();
+  });
+
+  it('flags manifestUnavailable only for the root of a snapshot with a recorded fileCount but no index', async () => {
+    selectMock.mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-out', fileCount: 12 })]));
+    listDirMock.mockResolvedValueOnce({ entries: [], nextCursor: null });
+    const root = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/browse`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+    expect((await root.json()).manifestUnavailable).toBe(true);
+
+    selectMock.mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-out', fileCount: 12 })]));
+    listDirMock.mockResolvedValueOnce({ entries: [], nextCursor: null });
+    const sub = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/browse?dir=/C:`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+    expect((await sub.json()).manifestUnavailable).toBe(false);
   });
 
   it('returns protection fields in snapshot responses', async () => {
@@ -428,6 +508,90 @@ describe('snapshot routes', () => {
     expect(body.data[0].layoutManifest).toBeUndefined();
   });
 
+  it('exposes the layout platform so Restore-as-VM can match the rebuild host OS (W06d)', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      makeSnapshot({ snapshotId: 'snap-win', layoutManifest: { platform: 'windows', disks: [] } }),
+      makeSnapshot({ id: 'snapshot-2', snapshotId: 'snap-lin', layoutManifest: { platform: 'linux', disks: [] } }),
+      makeSnapshot({ id: 'snapshot-3', snapshotId: 'snap-old', layoutManifest: { disks: [] } }),
+      makeSnapshot({ id: 'snapshot-4', snapshotId: 'snap-mac', layoutManifest: { platform: 'darwin' } }),
+      makeSnapshot({ id: 'snapshot-5', snapshotId: 'snap-none', layoutManifest: null }),
+    ]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.map((row: { layoutPlatform: unknown }) => row.layoutPlatform)).toEqual([
+      'windows',
+      'linux',
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it('exposes each snapshot\'s integrity status so restore screens can label it', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      makeSnapshot({ integrityStatus: 'attested' }),
+      makeSnapshot({ id: 'snapshot-2', snapshotId: 'snap-2', integrityStatus: 'unattested_legacy' }),
+      makeSnapshot({ id: 'snapshot-3', snapshotId: 'snap-3' }),
+    ]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.map((row: { integrityStatus: unknown }) => row.integrityStatus)).toEqual([
+      'attested',
+      'unattested_legacy',
+      'unattested_legacy',
+    ]);
+  });
+
+  it('exposes the sizing fields of the stored hardware profile so Restore-as-VM cards can show CPU / memory / disk', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      makeSnapshot({
+        hardwareProfile: {
+          cpuModel: 'Xeon',
+          cpuCores: 8,
+          totalMemoryMB: 16384,
+          disks: [
+            { name: 'disk0', sizeBytes: 256 * 1024 ** 3, model: 'NVMe', partitions: [{ name: 'C:' }] },
+            { name: 'disk1', sizeBytes: 1024 ** 4 },
+          ],
+          networkAdapters: [{ name: 'eth0', macAddress: '00:11:22:33:44:55' }],
+          biosVersion: '1.2.3',
+          isUefi: true,
+          motherboard: 'Board',
+        },
+      }),
+      makeSnapshot({ id: 'snapshot-2', snapshotId: 'snap-2', hardwareProfile: null }),
+      makeSnapshot({ id: 'snapshot-3', snapshotId: 'snap-3', hardwareProfile: { cpuCores: 'eight', disks: 'none' } }),
+    ]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Only the sizing fields ride on the list — no NICs/MACs, BIOS or board strings.
+    expect(body.data[0].hardwareProfile).toEqual({
+      cpuCores: 8,
+      totalMemoryMB: 16384,
+      disks: [{ sizeBytes: 256 * 1024 ** 3 }, { sizeBytes: 1024 ** 4 }],
+    });
+    expect(body.data[1].hardwareProfile).toBeNull();
+    expect(body.data[2].hardwareProfile).toEqual({ cpuCores: null, totalMemoryMB: null, disks: [] });
+  });
+
   it('returns a null bare-metal verdict (never assessed) as null + empty reasons, not false', async () => {
     selectMock.mockReturnValueOnce(chainMock([
       makeSnapshot({ bareMetalRestorable: null, bareMetalReasons: null }),
@@ -447,6 +611,7 @@ describe('snapshot routes', () => {
   });
 
   it('applies legal hold with a required reason', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{ status: 'active' }]));
     selectMock.mockReturnValueOnce(chainMock([makeSnapshot()]));
     updateMock.mockReturnValueOnce(chainMock([
       makeSnapshot({
@@ -475,6 +640,19 @@ describe('snapshot routes', () => {
       expect.anything(),
       expect.objectContaining({ action: 'backup.snapshot.legal_hold.apply' }),
     );
+  });
+
+  it('refuses to apply a legal hold while the organization is being erased', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{ status: 'purging' }]));
+
+    const res = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/legal-hold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ reason: 'Litigation' }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(updateMock).not.toHaveBeenCalled();
   });
 
   it('releases legal hold via DELETE', async () => {
@@ -580,6 +758,42 @@ describe('snapshot routes', () => {
       expect.anything(),
       expect.objectContaining({ action: 'backup.snapshot.immutability.apply.provider' }),
     );
+  });
+
+  it('applies provider immutability under the snapshot\'s recorded key root (#7081)', async () => {
+    const prefixed = { keyLayout: 'prefixed_flat', keyPrefix: 'msp/acme' };
+    selectMock
+      .mockReturnValueOnce(chainMock([makeSnapshot(prefixed)]))
+      .mockReturnValueOnce(chainMock([makeSnapshot(prefixed)]))
+      .mockReturnValueOnce(chainMock([{ provider: 's3', providerConfig: { bucket: 'backups', region: 'us-east-1' } }]));
+    updateMock.mockReturnValueOnce(chainMock([makeSnapshot({ ...prefixed, isImmutable: true, immutabilityEnforcement: 'provider' })]));
+    checkBackupProviderCapabilitiesMock.mockResolvedValueOnce({ objectLock: { supported: true, error: null } });
+    applyBackupSnapshotImmutabilityMock.mockResolvedValueOnce({ enforcement: 'provider', objectCount: 2 });
+
+    const res = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/immutability`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ reason: 'Regulatory lock', immutableDays: 30, enforcement: 'provider' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(applyBackupSnapshotImmutabilityMock).toHaveBeenCalledWith(expect.objectContaining({
+      snapshotId: 'provider-snap-1',
+      keyLayout: 'prefixed_flat',
+      keyPrefix: 'msp/acme',
+    }));
+  });
+
+  it('keeps the layout manifest key LOGICAL for a prefixed snapshot (#7081)', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      makeSnapshot({ snapshotId: 'snap-ext-9', layoutManifest: { disks: [] }, keyLayout: 'prefixed_flat', keyPrefix: 'msp/acme' }),
+    ]));
+    const res = await app.request('/backup/snapshots', { method: 'GET', headers: { Authorization: 'Bearer token' } });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Built from the snapshot id alone; the key root never reaches the response.
+    expect(body.data[0].layoutManifestKey).toBe('backups/snap-ext-9/layout.json');
+    expect(JSON.stringify(body.data[0])).not.toContain('msp/acme');
   });
 
   it('rejects attempts to shorten an existing immutability window', async () => {

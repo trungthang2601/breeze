@@ -5,6 +5,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // still refuses. Mocks mirror scriptDispatch.test.ts; this file covers only
 // the acknowledgement field so it stays readable next to that suite.
 
+// Holding-org delivery eligibility (a live device/org read) is out of this
+// suite's scope; scriptDispatch.test.ts covers the refusal and
+// parkedCommandDelivery.integration.test.ts the query.
+vi.mock('./unassignedPool/deliveryEligibility', async () => ({
+  ...(await vi.importActual<typeof import('./unassignedPool/deliveryEligibility')>(
+    './unassignedPool/deliveryEligibility',
+  )),
+  isParkedDevice: vi.fn(async () => false),
+}));
 vi.mock('../db', () => ({
   db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: vi.fn() },
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -15,7 +24,7 @@ vi.mock('./commandQueue', async () => {
   return { CommandTypes, queueCommand: vi.fn() };
 });
 vi.mock('./commandDispatch', () => ({
-  claimPendingCommandForDelivery: vi.fn().mockResolvedValue(null),
+  claimPendingCommandForDelivery: vi.fn().mockResolvedValue({ status: 'not_claimable', id: 'cmd-1' }),
   releaseClaimedCommandDelivery: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('./sensitiveCommandPayload', () => ({

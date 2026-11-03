@@ -1,12 +1,15 @@
 import '@/lib/i18n';
 
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type React from 'react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import DevicesPage from './DevicesPage';
+import { DEFAULT_VISIBLE_COLUMNS, writeColumnVisibility } from './columnVisibility';
 import { fetchWithAuth } from '../../stores/auth';
 import { fetchAllDevices, fetchAllNetworkDevices, fetchAllManualAssets } from '../../lib/devicesFetch';
 import { navigateTo } from '@/lib/navigation';
+import { applyOrgSwitch } from '@/lib/orgSwitch';
 
 // Feature flags are evaluated at module load, so expose a mutable holder we can
 // flip per-test. Default the network arm ON here since most #1322 cases below
@@ -25,6 +28,16 @@ vi.mock('@/lib/featureFlags', () => flagState);
 vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn(),
   handleSessionExpired: vi.fn(),
+}));
+
+// #7217 — "Install agent…" is offered only to a role that can mint enrollment
+// keys (organizations:write). Mutable so a case can drop the grant.
+const permState = vi.hoisted(() => ({ grants: new Set<string>(['organizations:write']) }));
+vi.mock('@/lib/permissions', () => ({
+  usePermissions: () => ({
+    permissions: [],
+    can: (resource: string, action: string) => permState.grants.has(`${resource}:${action}`),
+  }),
 }));
 
 vi.mock('../../lib/devicesFetch', () => ({
@@ -49,7 +62,6 @@ vi.mock('../../services/deviceActions', () => ({
   bulkEnterMaintenanceMode: vi.fn(),
   decommissionDevice: vi.fn(),
   bulkDecommissionDevices: vi.fn(),
-  restoreDevice: vi.fn(),
   permanentDeleteDevice: vi.fn(),
   sendWakeCommand: vi.fn(),
   sendBulkWakeCommand: vi.fn(),
@@ -74,6 +86,12 @@ vi.mock('../../services/deviceActions', () => ({
 
 vi.mock('@/lib/navigation', () => ({
   navigateTo: vi.fn(),
+}));
+
+// #9036: "View all organizations" on an empty org switches scope through the
+// shared org-switch path.
+vi.mock('@/lib/orgSwitch', () => ({
+  applyOrgSwitch: vi.fn(async () => {}),
 }));
 
 vi.mock('../shared/Toast', () => ({
@@ -153,11 +171,16 @@ vi.mock('./ScriptPickerModal', () => ({
 // test can observe whether runDeviceAction's `settings` branch ran is whether
 // this component was invoked at all (#4014).
 vi.mock('./DeviceSettingsModal', () => ({ default: vi.fn(() => null) }));
-vi.mock('./AddDeviceModal', () => ({ default: () => null }));
+vi.mock('./AddDeviceModal', () => ({
+  default: ({ isOpen }: { isOpen: boolean }) => (isOpen ? <div data-testid="add-device-modal-stub" /> : null),
+}));
 vi.mock('./AddNetworkAssetModal', () => ({ default: () => null }));
-vi.mock('./CreateGroupModal', () => ({ default: () => null }));
 vi.mock('../filters/DeviceFilterBar', () => ({ DeviceFilterBar: () => null }));
-vi.mock('./DeviceFilterToolbar', () => ({ DeviceFilterToolbar: () => null }));
+vi.mock('./DeviceFilterToolbar', () => ({
+  DeviceFilterToolbar: ({ createGroupHref }: { createGroupHref?: string }) => (
+    <div data-testid="device-filter-toolbar-stub" data-create-group-href={createGroupHref ?? ''} />
+  ),
+}));
 vi.mock('../shared/ProgressBar', () => ({ default: () => null }));
 
 // DeviceCard stub renders the hostname so the grid contents are assertable, and
@@ -207,13 +230,14 @@ vi.mock('./DeviceCard', () => ({
 // action over the FULL device array it was given (mirroring the real
 // DeviceList, which hands the unfiltered selection to onBulkAction). Tests use
 // the per-action buttons to drive DevicesPage.handleBulkAction directly.
-type StubDevice = { id: string; deviceClass?: string; hostname?: string; displayName?: string; watchdogVersion?: string | null; status?: string; wanIp?: string | null; lanIp?: string | null };
+type StubDevice = { id: string; deviceClass?: string; hostname?: string; displayName?: string; watchdogVersion?: string | null; status?: string; wanIp?: string | null; lanIp?: string | null; hardwareHealth?: string | null; hardwareHealthSummary?: Record<string, number> | null; reliabilityProvisional?: boolean };
 vi.mock('./DeviceList', () => ({
-  default: ({ devices, serverFilterIds, onBulkAction, onAction, onSelect, onShowDecommissioned, onHideDecommissioned, includeDecommissioned }: { devices: StubDevice[]; serverFilterIds?: Set<string> | null; onBulkAction?: (action: string, devices: StubDevice[]) => void; onAction?: (action: string, device: StubDevice) => void; onSelect?: (device: StubDevice) => void; onShowDecommissioned?: () => void; onHideDecommissioned?: () => void; includeDecommissioned?: boolean }) => (
+  default: ({ devices, serverFilterIds, onBulkAction, onAction, onSelect, onShowDecommissioned, onHideDecommissioned, includeDecommissioned, headerActions, onClearFilters, sortInHash, onWarrantyRequiredChange }: { onWarrantyRequiredChange?: (required: boolean) => void; devices: StubDevice[]; serverFilterIds?: Set<string> | null; onBulkAction?: (action: string, devices: StubDevice[]) => void; onAction?: (action: string, device: StubDevice) => void; onSelect?: (device: StubDevice) => void; onShowDecommissioned?: () => void; onHideDecommissioned?: () => void; includeDecommissioned?: boolean; headerActions?: React.ReactNode; onClearFilters?: () => void; sortInHash?: boolean }) => (
     <div
       data-testid="device-list"
       data-device-count={devices.length}
       data-include-decommissioned={includeDecommissioned ? 'true' : 'false'}
+      data-sort-in-hash={sortInHash ? 'true' : 'false'}
       data-can-hide-decommissioned={onHideDecommissioned ? 'true' : 'false'}
       data-filter-ids={serverFilterIds ? [...serverFilterIds].sort().join(',') : ''}
       data-hostnames={devices.map(d => d.hostname ?? '').join(',')}
@@ -221,7 +245,19 @@ vi.mock('./DeviceList', () => ({
       data-watchdog-versions={devices.map(d => d.watchdogVersion ?? '').join(',')}
       data-wan-ips={devices.map(d => d.wanIp ?? '').join(',')}
       data-lan-ips={devices.map(d => d.lanIp ?? '').join(',')}
+      data-hardware-health={devices.map(d => d.hardwareHealth ?? '').join(',')}
+      data-reliability-provisional={devices.map(d => String(d.reliabilityProvisional)).join(',')}
+      data-hardware-summary={JSON.stringify(devices.map(d => d.hardwareHealthSummary ?? null))}
     >
+      <button data-testid="stub-show-warranty" onClick={() => onWarrantyRequiredChange?.(true)}>Show warranty</button>
+      <button data-testid="stub-hide-warranty" onClick={() => onWarrantyRequiredChange?.(false)}>Hide warranty</button>
+      {/* #9035: the page hands its list/grid toggle to the table header strip. */}
+      <div data-testid="device-list-header-actions">{headerActions}</div>
+      {onClearFilters && (
+        <button type="button" data-testid="stub-clear-filters" onClick={() => onClearFilters()}>
+          clear filters
+        </button>
+      )}
       {['maintenance-on', 'maintenance-off', 'decommission', 'reboot', 'run-script', 'link-vm-host', 'wake', 'deploy-software', 'compare', 'restore', 'permanent-delete'].map(action => (
         <button
           key={action}
@@ -336,8 +372,23 @@ function jsonResponse(payload: unknown) {
   return { ok: true, json: async () => payload } as unknown as Response;
 }
 
+/** Device ids the page POSTed to the single-device restore route. */
+function restoreCalls(): string[] {
+  return vi.mocked(fetchWithAuth).mock.calls
+    .filter(([url, init]) => /^\/devices\/[^/]+\/restore$/.test(String(url)) && init?.method === 'POST')
+    .map(([url]) => String(url).split('/')[2]!);
+}
+
+// The page opens on Agent (#5874). Suites that exercise network rows in the
+// merged list deep-link the All segment, exactly as a shared link would.
+function openOnAllClasses() {
+  history.replaceState(null, '', '/devices#deviceClass=all');
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  // No remembered segment leaks between tests (#5874).
+  window.localStorage.clear();
   // Reset the network arm to ON; the flag-off case opts out explicitly.
   flagState.ENABLE_NETWORK_DEVICES_IN_LIST = true;
 
@@ -362,6 +413,52 @@ beforeEach(() => {
   });
 });
 
+describe('DevicesPage — optional warranty loading', () => {
+  it('skips warranty by default, then reloads when the column is enabled', async () => {
+    render(<DevicesPage />);
+    await screen.findByTestId('device-list');
+    expect(fetchAllDevices).toHaveBeenLastCalledWith(expect.objectContaining({ includeWarranty: false }));
+    fireEvent.click(screen.getByTestId('stub-show-warranty'));
+    await waitFor(() => expect(fetchAllDevices).toHaveBeenLastCalledWith(expect.objectContaining({ includeWarranty: true })));
+  });
+
+  it('reloads in the background and never over an off toggle (review of #9863)', async () => {
+    render(<DevicesPage />);
+    await screen.findByTestId('device-list');
+    const before = vi.mocked(fetchAllDevices).mock.calls.length;
+    fireEvent.click(screen.getByTestId('stub-show-warranty'));
+    await waitFor(() => expect(vi.mocked(fetchAllDevices).mock.calls.length).toBe(before + 1));
+    // The list stays mounted: a foreground reload would unmount it (spinner) and drop selection/page state.
+    expect(screen.getByTestId('device-list')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('stub-hide-warranty'));
+    fireEvent.click(screen.getByTestId('stub-show-warranty'));
+    await new Promise(r => setTimeout(r, 50));
+    // Rows already carry warranty data; hiding and re-showing the column is not a reload.
+    expect(vi.mocked(fetchAllDevices).mock.calls.length).toBe(before + 1);
+  });
+
+  it('requests warranty on the first walk when the column was remembered', async () => {
+    writeColumnVisibility([...DEFAULT_VISIBLE_COLUMNS, 'warranty']);
+    render(<DevicesPage />);
+    await screen.findByTestId('device-list');
+    expect(fetchAllDevices).toHaveBeenNthCalledWith(1, expect.objectContaining({ includeWarranty: true }));
+  });
+});
+
+describe('DevicesPage — Add filter "New group…" shortcut (#9865)', () => {
+  // The page's own create modal made empty static groups with no org owner;
+  // the shortcut now links to the Device Groups page, which opens its create
+  // dialog on `#create` (DeviceGroupsPage CREATE_HASH).
+  it('links the toolbar shortcut to the Device Groups create flow', async () => {
+    render(<DevicesPage />);
+
+    expect(await screen.findByTestId('device-filter-toolbar-stub')).toHaveAttribute(
+      'data-create-group-href',
+      '/devices/groups#create',
+    );
+  });
+});
+
 describe('DevicesPage — advanced filter applies to BOTH views', () => {
   it('passes displayName through to DeviceList without replacing hostname', async () => {
     vi.mocked(fetchAllDevices).mockResolvedValue({
@@ -373,6 +470,20 @@ describe('DevicesPage — advanced filter applies to BOTH views', () => {
     const list = await screen.findByTestId('device-list');
     expect(list.getAttribute('data-hostnames')).toContain('host-alpha');
     expect(list.getAttribute('data-display-names')).toContain('Reception Laptop');
+  });
+
+  it('maps reliabilityProvisional from the API row onto the Device (strict boolean)', async () => {
+    vi.mocked(fetchAllDevices).mockResolvedValue({
+      data: [
+        { ...rawDevice(DEV_1, 'host-alpha'), reliabilityProvisional: true },
+        { ...rawDevice(DEV_2, 'host-beta') },
+      ],
+    } as never);
+
+    render(<DevicesPage />);
+
+    const list = await screen.findByTestId('device-list');
+    expect(list.getAttribute('data-reliability-provisional')).toBe('true,false');
   });
 
   it('grid view renders only the devices matching the advanced filter (not the raw list)', async () => {
@@ -711,6 +822,7 @@ describe('DevicesPage — multi-select run script keeps its target devices', () 
 // agent-only bulk actions with a clear message, and (b) per-item try/catch so
 // one failure can't abort the batch.
 describe('DevicesPage — bulk actions exclude network rows + survive per-item failure (#1322)', () => {
+  beforeEach(openOnAllClasses);
   const NET_1 = '44444444-4444-4444-4444-444444444444';
 
   function rawNetworkDevice(id: string, hostname: string) {
@@ -927,8 +1039,9 @@ describe('DevicesPage — device class segment filter (#1424)', () => {
   }
 
   beforeEach(() => {
-    // Reset the hash so a prior test's segment choice doesn't seed this mount.
-    history.replaceState(null, '', '/devices');
+    // Reset the hash so a prior test's segment choice doesn't seed this mount;
+    // these cases start from the merged All view.
+    openOnAllClasses();
   });
 
   async function renderMixedFleet() {
@@ -965,6 +1078,80 @@ describe('DevicesPage — device class segment filter (#1424)', () => {
     await waitFor(() => expect(list.getAttribute('data-device-count')).toBe('3'));
   });
 
+  // #5874: the page opens on Agent (managed endpoints), not the merged view.
+  async function renderMixedFleetRaw() {
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
+    vi.mocked(fetchAllNetworkDevices).mockResolvedValue({
+      data: [rawNetworkDevice(NET_3, 'Lobby Printer')],
+      total: 1,
+      pagesWalked: 1,
+    } as never);
+    render(<DevicesPage />);
+    const list = await screen.findByTestId('device-list');
+    // Wait for the merged fetch to land (All counts every arm).
+    await waitFor(() => expect(screen.getByTestId('device-class-segment-all')).toHaveTextContent('4'));
+    return list;
+  }
+
+  it('opens on the Agent segment when there is no hash and no remembered choice (#5874)', async () => {
+    history.replaceState(null, '', '/devices');
+    const list = await renderMixedFleetRaw();
+    await waitFor(() => expect(list.getAttribute('data-device-count')).toBe('3'));
+    expect(screen.getByTestId('device-class-segment-agent')).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('reopens on the last segment the user chose (#5874)', async () => {
+    history.replaceState(null, '', '/devices');
+    const first = await renderMixedFleetRaw();
+    fireEvent.click(screen.getByTestId('device-class-segment-all'));
+    await waitFor(() => expect(first.getAttribute('data-device-count')).toBe('4'));
+    cleanup();
+    history.replaceState(null, '', '/devices');
+    const list = await renderMixedFleetRaw();
+    await waitFor(() => expect(list.getAttribute('data-device-count')).toBe('4'));
+  });
+
+  it('a deviceClass deep link wins over the remembered choice and does not overwrite it (#5874)', async () => {
+    history.replaceState(null, '', '/devices#deviceClass=network');
+    const list = await renderMixedFleetRaw();
+    await waitFor(() => expect(list.getAttribute('data-device-count')).toBe('1'));
+    cleanup();
+    history.replaceState(null, '', '/devices');
+    const next = await renderMixedFleetRaw();
+    await waitFor(() => expect(next.getAttribute('data-device-count')).toBe('3'));
+  });
+
+  it('keeps the chosen segment when a modal overwrites and then clears the hash (#5874 review)', async () => {
+    // Deep-linked Network, nothing remembered — the fallback (Agent) differs
+    // from what the user is looking at.
+    history.replaceState(null, '', '/devices#deviceClass=network');
+    const list = await renderMixedFleetRaw();
+    await waitFor(() => expect(list.getAttribute('data-device-count')).toBe('1'));
+
+    // "Add network asset" replaces the whole hash; closing the modal clears it.
+    fireEvent.click(screen.getByTestId('devices-page-add-menu-trigger'));
+    fireEvent.click(screen.getByTestId('devices-page-add-menu-network-asset'));
+    expect(window.location.hash).toBe('#add-network-asset');
+    await act(async () => { await new Promise(r => setTimeout(r, 20)); });
+    window.location.hash = '';
+    await act(async () => { await new Promise(r => setTimeout(r, 20)); });
+
+    expect(list.getAttribute('data-device-count')).toBe('1');
+    expect(screen.getByTestId('device-class-segment-network')).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('ignores a remembered Network choice when the segment is hidden (#5874)', async () => {
+    flagState.ENABLE_NETWORK_DEVICES_IN_LIST = false;
+    window.localStorage.setItem('breeze.devices.deviceClass', 'network');
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
+    render(<DevicesPage />);
+    const list = await screen.findByTestId('device-list');
+    await waitFor(() => expect(list.getAttribute('data-device-count')).toBe('3'));
+    expect(screen.queryByTestId('device-class-segment')).toBeNull();
+  });
+
   it('hides the segment entirely when the network arm is disabled', async () => {
     flagState.ENABLE_NETWORK_DEVICES_IN_LIST = false;
     const { decodeFilterFromHash } = await import('./filterUrl');
@@ -979,6 +1166,7 @@ describe('DevicesPage — device class segment filter (#1424)', () => {
 // assets open the new native Devices detail page (/devices/network/:id) instead
 // of bouncing out to Discovery; agent rows keep the /devices/:id route.
 describe('DevicesPage — row selection routes by device class (#1424)', () => {
+  beforeEach(openOnAllClasses);
   const NET_2 = '55555555-5555-5555-5555-555555555555';
 
   function rawNetworkDevice(id: string, hostname: string) {
@@ -1312,11 +1500,14 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
     // 2; a prefix-only match would never notice.
     expect(
       screen.getByText(
-        /1 of 3 selected devices are removed and will be skipped.*Continue with the remaining 2 device\(s\)\?/i,
+        /1 of 3 selected devices are removed and will be skipped.*Continue with the remaining 2 devices\?/i,
       ),
     ).toBeTruthy();
 
     fireEvent.click(screen.getByTestId('confirm-decommissioned-skip'));
+    // #9032: the skip dialog hands off to the verb/org confirm before anything is sent.
+    expect(vi.mocked(sendBulkCommand)).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByTestId('confirm-bulk-command'));
 
     await waitFor(() => expect(vi.mocked(sendBulkCommand)).toHaveBeenCalledTimes(1));
     const [deviceIds, action] = vi.mocked(sendBulkCommand).mock.calls[0];
@@ -1343,6 +1534,7 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
     await renderMixedFleet([DEV_1, DEV_2]);
 
     fireEvent.click(screen.getByTestId('bulk-reboot'));
+    fireEvent.click(await screen.findByTestId('confirm-bulk-command')); // #9032
 
     await waitFor(() => expect(vi.mocked(sendBulkCommand)).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId('confirm-decommissioned-skip')).toBeNull();
@@ -1388,6 +1580,7 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
     render(<DevicesPage />);
     await screen.findByTestId('device-list');
     fireEvent.click(screen.getByTestId('bulk-reboot'));
+    fireEvent.click(await screen.findByTestId('confirm-bulk-command')); // #9032
 
     await waitFor(() => {
       const messages = vi.mocked(showToast).mock.calls.map(c => c[0].message ?? '');
@@ -1412,10 +1605,110 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
     render(<DevicesPage />);
     await screen.findByTestId('device-list');
     fireEvent.click(screen.getByTestId('bulk-reboot'));
+    fireEvent.click(await screen.findByTestId('confirm-bulk-command')); // #9032
 
     await waitFor(() => expect(vi.mocked(sendBulkCommand)).toHaveBeenCalledTimes(1));
     const messages = vi.mocked(showToast).mock.calls.map(c => c[0].message ?? '');
     expect(messages.some(m => /queued for offline devices/i.test(m))).toBe(false);
+  });
+
+  // #9032: every bulk agent command asks first, with the verb, the count split
+  // by online/queued, and the org(s) it will hit.
+  describe('bulk command confirm (#9032)', () => {
+    async function selectFleet() {
+      const { sendBulkCommand, sendBulkWakeCommand } = await import('../../services/deviceActions');
+      vi.mocked(sendBulkCommand).mockResolvedValue({ commands: [{}, {}], failed: [], skipped: [] } as never);
+      vi.mocked(sendBulkWakeCommand).mockResolvedValue({ succeeded: [], failed: [] } as never);
+      vi.mocked(fetchAllDevices).mockResolvedValue({
+        data: [
+          rawDevice(DEV_1, 'host-alpha'),
+          { ...rawDevice(DEV_2, 'host-beta'), status: 'offline' },
+        ],
+      } as never);
+      await renderMixedFleet([DEV_1, DEV_2]);
+      return { sendBulkCommand, sendBulkWakeCommand };
+    }
+
+    it('reboot asks first, names verb + online/queued split, and sends nothing until confirmed', async () => {
+      const { sendBulkCommand } = await selectFleet();
+      fireEvent.click(screen.getByTestId('bulk-reboot'));
+      const confirm = await screen.findByTestId('confirm-bulk-command');
+      expect(vi.mocked(sendBulkCommand)).not.toHaveBeenCalled();
+      const dialog = screen.getByRole('dialog');
+      expect(dialog.textContent).toMatch(/Reboot/);
+      expect(dialog.textContent).toMatch(/2 device/);
+      expect(dialog.textContent).toMatch(/1 online now/);
+      expect(dialog.textContent).toMatch(/1 queued for next check-in/);
+      fireEvent.click(confirm);
+      await waitFor(() => expect(vi.mocked(sendBulkCommand)).toHaveBeenCalledTimes(1));
+    });
+
+    it.each([
+      ['bulk-reboot', 'Reboot'],
+      ['bulk-wake', 'Wake'],
+      ['bulk-maintenance-off', 'End maintenance'],
+    ])('%s dialog names the verb and the org', async (testId, verb) => {
+      await selectFleet();
+      fireEvent.click(screen.getByTestId(testId));
+      await screen.findByTestId('confirm-bulk-command');
+      const text = screen.getByRole('dialog').textContent ?? '';
+      expect(text).toContain(verb);
+      expect(text).toMatch(/in Org One|in org-1|in the selected organization/);
+      if (testId !== 'bulk-reboot') expect(text).not.toMatch(/online now/);
+    });
+
+    it('lists every org when the selection spans organizations', async () => {
+      const { sendBulkCommand } = await import('../../services/deviceActions');
+      vi.mocked(sendBulkCommand).mockResolvedValue({ commands: [{}, {}], failed: [], skipped: [] } as never);
+      vi.mocked(fetchAllDevices).mockResolvedValue({
+        data: [
+          { ...rawDevice(DEV_1, 'host-alpha'), orgId: 'org-a' },
+          { ...rawDevice(DEV_2, 'host-beta'), orgId: 'org-b' },
+        ],
+      } as never);
+      await renderMixedFleet([DEV_1, DEV_2]);
+      fireEvent.click(screen.getByTestId('bulk-reboot'));
+      await screen.findByTestId('confirm-bulk-command');
+      expect(screen.getByRole('dialog').textContent).toMatch(/across 2 organizations \(.*org-a.*org-b.*\)/);
+      expect(vi.mocked(sendBulkCommand)).not.toHaveBeenCalled();
+    });
+
+    it('every confirm-required action has a verb in the en locale', async () => {
+      const { CONFIRM_REQUIRED_BULK_COMMANDS } = await import('./bulkActionGating');
+      const en = (await import('../../locales/en/devices.json')).default as any;
+      for (const a of CONFIRM_REQUIRED_BULK_COMMANDS) {
+        const key = a === 'maintenance-off' ? 'maintenanceOff' : a;
+        expect(en.devicesPage.confirmBulkCommand.verbs[key], a).toBeTruthy();
+      }
+    });
+
+    it('cancel sends nothing', async () => {
+      const { sendBulkCommand } = await selectFleet();
+      fireEvent.click(screen.getByTestId('bulk-reboot'));
+      await screen.findByTestId('confirm-bulk-command');
+      fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+      await waitFor(() => expect(screen.queryByTestId('confirm-bulk-command')).toBeNull());
+      expect(vi.mocked(sendBulkCommand)).not.toHaveBeenCalled();
+    });
+
+    it('wake asks first', async () => {
+      const { sendBulkWakeCommand } = await selectFleet();
+      fireEvent.click(screen.getByTestId('bulk-wake'));
+      const confirm = await screen.findByTestId('confirm-bulk-command');
+      expect(vi.mocked(sendBulkWakeCommand)).not.toHaveBeenCalled();
+      fireEvent.click(confirm);
+      await waitFor(() => expect(vi.mocked(sendBulkWakeCommand)).toHaveBeenCalledTimes(1));
+    });
+
+    it('maintenance-off asks first', async () => {
+      const { exitMaintenanceMode } = await import('../../services/deviceActions');
+      await selectFleet();
+      fireEvent.click(screen.getByTestId('bulk-maintenance-off'));
+      const confirm = await screen.findByTestId('confirm-bulk-command');
+      expect(vi.mocked(exitMaintenanceMode)).not.toHaveBeenCalled();
+      fireEvent.click(confirm);
+      await waitFor(() => expect(vi.mocked(exitMaintenanceMode)).toHaveBeenCalled());
+    });
   });
 
   it('refuses outright when EVERY selected device is decommissioned', async () => {
@@ -1433,7 +1726,7 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
 
     await waitFor(() => {
       const messages = vi.mocked(showToast).mock.calls.map(c => c[0].message ?? '');
-      expect(messages.some(m => /all 2 selected device\(s\) are already removed/i.test(m))).toBe(true);
+      expect(messages.some(m => /all 2 selected devices are already removed/i.test(m))).toBe(true);
     });
     expect(screen.queryByTestId('confirm-decommissioned-skip')).toBeNull();
     expect(vi.mocked(sendBulkCommand)).not.toHaveBeenCalled();
@@ -1512,7 +1805,7 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
 
     await waitFor(() => {
       const messages = vi.mocked(showToast).mock.calls.map(c => c[0].message ?? '');
-      expect(messages.some(m => /all 2 selected device\(s\) are already removed/i.test(m))).toBe(true);
+      expect(messages.some(m => /all 2 selected devices are already removed/i.test(m))).toBe(true);
     });
     expect(screen.queryByTestId('confirm-decommissioned-skip')).toBeNull();
     expect(vi.mocked(bulkDecommissionDevices)).not.toHaveBeenCalled();
@@ -1544,6 +1837,9 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
     await waitFor(() => {
       const messages = vi.mocked(showToast).mock.calls.map(c => c[0].message ?? '');
       expect(messages.some(m => /1/.test(m) && /host-beta/.test(m))).toBe(true);
+      // #9037: plural key resolves with `count` (a stale `succeeded:` would
+      // leave "{{count}}" or the raw key in the toast).
+      expect(messages).toContain('1 device removed; 1 failed: host-beta');
     });
   });
 
@@ -1569,7 +1865,8 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
         // only the immediate socket push missed (no live session,
         // preferHeartbeat); distinct from both 'delivered' and
         // 'queued_offline'. Takes precedence over `delivered` when set.
-        delivery?: 'delivered' | 'queued_offline' | 'queued_live';
+        delivery?: 'delivered' | 'queued_offline' | 'queued_live' | 'cancelled';
+        cancelReason?: string;
       } = {},
     ) {
       const { sendDeviceCommand } = await import('../../services/deviceActions');
@@ -1587,6 +1884,7 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
         createdAt: '2026-09-01T00:00:00.000Z',
         delivery: opts.delivery ?? (delivered ? 'delivered' : 'queued_offline'),
         deliverBy,
+        ...(opts.cancelReason ? { cancelReason: opts.cancelReason } : {}),
       } as never);
 
       vi.mocked(fetchAllDevices).mockResolvedValue({
@@ -1640,6 +1938,14 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
       fireEvent.click(await screen.findByTestId('confirm-device-action'));
       await waitFor(() => expect(vi.mocked(sendDeviceCommand)).toHaveBeenCalledTimes(1));
       expect(vi.mocked(sendDeviceCommand)).toHaveBeenCalledWith(DEV_1, 'reboot');
+    });
+
+    it('a cancelled result reports an error toast with the reason, never "sent"', async () => {
+      const toasts = await rebootDeviceWithStatus('online', { delivery: 'cancelled', cancelReason: 'device_moved_org', deliverBy: null });
+      expect(toasts.find(c => c.type === 'success')).toBeUndefined();
+      const error = toasts.find(c => c.type === 'error');
+      expect(error?.message).toMatch(/not sent to host-alpha/i);
+      expect(error?.message).toContain('device_moved_org');
     });
 
     it('online device: reports the command as sent, naming the device', async () => {
@@ -1710,6 +2016,7 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
       await renderMixedFleet([DEV_1, DEV_2]);
 
       fireEvent.click(screen.getByTestId('bulk-reboot'));
+      fireEvent.click(await screen.findByTestId('confirm-bulk-command')); // #9032
 
       // No confirm — nothing here is decommissioned, so nothing is being skipped.
       await waitFor(() => expect(vi.mocked(sendBulkCommand)).toHaveBeenCalledTimes(1));
@@ -1720,13 +2027,14 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
     },
   );
 
-  it('leaves bulk Wake UNGATED — it exists precisely to reach devices that are not running', async () => {
+  it('does not skip or gate bulk Wake on device status — it exists precisely to reach devices that are not running (confirm only, #9032)', async () => {
     const { sendBulkWakeCommand } = await import('../../services/deviceActions');
     vi.mocked(sendBulkWakeCommand).mockResolvedValue({ sent: [], failed: [] } as never);
 
     boundaryFleet();
     await renderMixedFleet();
     fireEvent.click(screen.getByTestId('bulk-wake'));
+    fireEvent.click(await screen.findByTestId('confirm-bulk-command')); // #9032
 
     await waitFor(() => expect(vi.mocked(sendBulkWakeCommand)).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId('confirm-decommissioned-skip')).toBeNull();
@@ -1742,7 +2050,8 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
     boundaryFleet();
     await renderMixedFleet();
     fireEvent.click(screen.getByTestId('bulk-reboot'));
-    const confirm = await screen.findByTestId('confirm-decommissioned-skip');
+    fireEvent.click(await screen.findByTestId('confirm-decommissioned-skip'));
+    const confirm = await screen.findByTestId('confirm-bulk-command');
 
     // An impatient double-click on a bulk REBOOT must not reboot the fleet twice.
     //
@@ -1935,14 +2244,45 @@ describe('DevicesPage — decommission from the row/grid kebab is confirm-gated 
   // ungated — pinned here so a future "confirm every lifecycle action" sweep has
   // to argue with a test rather than quietly change the answer.
   it('restore stays ungated — it is the recovery path, not a destructive one', async () => {
-    const { restoreDevice } = await import('../../services/deviceActions');
-    vi.mocked(restoreDevice).mockResolvedValue(undefined as never);
+    render(<DevicesPage />);
+    fireEvent.click(await screen.findByTestId(`row-restore-${DEV_1}`));
+
+    await waitFor(() => expect(restoreCalls()).toEqual([DEV_1]));
+    expect(screen.queryByTestId('confirm-device-action')).toBeNull();
+  });
+
+  // The API refuses a restore once the partner is at its device limit, with the
+  // enrollment refusal body. The operator has to see that reason, not a generic
+  // failure — and the device must not be reported as restored.
+  it('shows the device-limit refusal when a restore is refused', async () => {
+    const { showToast } = await import('../shared/Toast');
+    vi.mocked(fetchWithAuth).mockImplementation(async (url: string) => {
+      if (url === `/devices/${DEV_1}/restore`) {
+        return {
+          ok: false,
+          status: 403,
+          json: async () => ({
+            error: 'Device limit reached',
+            code: 'DEVICE_LIMIT_REACHED',
+            currentDevices: 25,
+            maxDevices: 25,
+          }),
+        } as unknown as Response;
+      }
+      return jsonResponse({ data: [] });
+    });
 
     render(<DevicesPage />);
     fireEvent.click(await screen.findByTestId(`row-restore-${DEV_1}`));
 
-    await waitFor(() => expect(vi.mocked(restoreDevice)).toHaveBeenCalledWith(DEV_1));
-    expect(screen.queryByTestId('confirm-device-action')).toBeNull();
+    await waitFor(() =>
+      expect(vi.mocked(showToast)).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error', message: 'Device limit reached' }),
+      ),
+    );
+    expect(vi.mocked(showToast)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'success' }),
+    );
   });
 });
 
@@ -1957,6 +2297,7 @@ describe('DevicesPage — decommission from the row/grid kebab is confirm-gated 
 // DeviceCard.networkClass.test.tsx); this pins the handler's backstop, so a
 // future surface that wires `onAction` cannot silently re-open the hole.
 describe('DevicesPage — single-device actions refuse network rows (#4014)', () => {
+  beforeEach(openOnAllClasses);
   const NET_1 = '44444444-4444-4444-4444-444444444444';
 
   beforeEach(async () => {
@@ -2100,6 +2441,7 @@ describe('DevicesPage — single-device actions refuse network rows (#4014)', ()
 // happily wave one through into sendBulkCommand if the network filter stopped
 // running first.
 describe('DevicesPage — network filter + decommissioned gate compose (#1322 × #2465)', () => {
+  beforeEach(openOnAllClasses);
   const NET_1 = '44444444-4444-4444-4444-444444444444';
 
   async function renderFleet(count: string) {
@@ -2166,6 +2508,9 @@ describe('DevicesPage — network filter + decommissioned gate compose (#1322 ×
     expect(screen.getByText(/1 of 3 selected devices are removed/i)).toBeTruthy();
 
     fireEvent.click(screen.getByTestId('confirm-decommissioned-skip'));
+    // #9032: the skip dialog hands off to the verb/org confirm before anything is sent.
+    expect(vi.mocked(sendBulkCommand)).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByTestId('confirm-bulk-command'));
 
     await waitFor(() => expect(vi.mocked(sendBulkCommand)).toHaveBeenCalledTimes(1));
     const [deviceIds] = vi.mocked(sendBulkCommand).mock.calls[0];
@@ -2243,6 +2588,7 @@ describe('DevicesPage — ungated bulk actions still work on an all-offline flee
 // action string is the contract between DeviceList's bulk menu and
 // DevicesPage.handleBulkAction (same drift risk as 'link-vm-host' above).
 describe('DevicesPage — compare bulk action navigates with selected ids', () => {
+  beforeEach(openOnAllClasses);
   it("handles 'compare': navigates to /devices/compare?ids= without any agent call", async () => {
     render(<DevicesPage />);
     await screen.findByTestId('device-list');
@@ -2557,7 +2903,7 @@ describe('DevicesPage — bulk restore and bulk permanent delete (#2787)', () =>
     expect(vi.mocked(bulkRestoreDevices).mock.calls[0]![0]).toEqual([DEV_1, DEV_2]);
     await waitFor(() =>
       expect(vi.mocked(showToast)).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'success', message: '2 device(s) restored' }),
+        expect.objectContaining({ type: 'success', message: '2 devices restored' }),
       ),
     );
   });
@@ -2585,6 +2931,28 @@ describe('DevicesPage — bulk restore and bulk permanent delete (#2787)', () =>
     );
   });
 
+  it('names the device-limit refusal when a bulk restore stops at the limit', async () => {
+    const { bulkRestoreDevices } = await import('../../services/deviceActions');
+    const { showToast } = await import('../shared/Toast');
+    vi.mocked(bulkRestoreDevices).mockResolvedValue({
+      succeeded: [{ deviceId: DEV_1, uninstallAlreadyDispatched: false }],
+      failed: [{ deviceId: DEV_2, code: 'DEVICE_LIMIT_REACHED', message: 'Device limit reached' }],
+    });
+
+    await renderWithRemovedFleet();
+    fireEvent.click(screen.getByTestId('bulk-restore'));
+
+    await waitFor(() =>
+      expect(vi.mocked(showToast)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'error',
+          message: '1 device restored; 1 failed',
+          detail: 'Device limit reached',
+        }),
+      ),
+    );
+  });
+
   it('reports a partial bulk-restore failure as an error, not a success', async () => {
     const { bulkRestoreDevices } = await import('../../services/deviceActions');
     const { showToast } = await import('../shared/Toast');
@@ -2598,7 +2966,7 @@ describe('DevicesPage — bulk restore and bulk permanent delete (#2787)', () =>
 
     await waitFor(() =>
       expect(vi.mocked(showToast)).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'error', message: '1 device(s) restored; 1 failed' }),
+        expect.objectContaining({ type: 'error', message: '1 device restored; 1 failed' }),
       ),
     );
   });
@@ -2655,7 +3023,7 @@ describe('DevicesPage — bulk restore and bulk permanent delete (#2787)', () =>
 
     await waitFor(() =>
       expect(vi.mocked(showToast)).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'success', message: '2 device(s) permanently deleted' }),
+        expect.objectContaining({ type: 'success', message: '2 devices permanently deleted' }),
       ),
     );
     // The purged rows must leave the list; without a refetch they linger and
@@ -2828,15 +3196,12 @@ describe('DevicesPage — post-mutation refresh re-resolves the advanced filter 
   const filterIds = () => screen.getByTestId('device-list').getAttribute('data-filter-ids');
 
   it('single Restore drops the restored device from the resolved id set', async () => {
-    const { restoreDevice } = await import('../../services/deviceActions');
-    vi.mocked(restoreDevice).mockResolvedValue({ success: true } as never);
-
     const state = await removedFilterFleet();
     await renderAndSettle(state);
 
     fireEvent.click(screen.getByTestId(`row-restore-${DEV_1}`));
 
-    await waitFor(() => expect(vi.mocked(restoreDevice)).toHaveBeenCalledWith(DEV_1));
+    await waitFor(() => expect(restoreCalls()).toEqual([DEV_1]));
     await waitFor(() => expect(state.previewCalls).toBe(2));
     await waitFor(() => expect(filterIds()).toBe(DEV_3));
   });
@@ -2960,7 +3325,7 @@ describe('DevicesPage — class segment badges tell the truth under a filter', (
   }
 
   beforeEach(() => {
-    history.replaceState(null, '', '/devices');
+    openOnAllClasses();
     vi.mocked(fetchAllNetworkDevices).mockResolvedValue({
       data: [rawNetworkDevice(NET_ON, 'core-sw', 'online'), rawNetworkDevice(NET_OFF, 'old-cam', 'offline')],
       total: 2,
@@ -3037,6 +3402,22 @@ describe('DevicesPage — header "Add" split menu (#5213)', () => {
     expect(screen.queryByTestId('devices-page-add-menu')).toBeNull();
   });
 
+  it('does not offer "Install agent…" to a role that cannot mint enrollment keys (#7217)', async () => {
+    permState.grants = new Set();
+    try {
+      render(<DevicesPage />);
+      await screen.findByTestId('device-list');
+
+      fireEvent.click(screen.getByTestId('devices-page-add-menu-trigger'));
+      expect(screen.getByTestId('devices-page-add-menu')).toBeTruthy();
+      expect(screen.queryByTestId('devices-page-add-menu-install-agent')).toBeNull();
+      // The asset entries do not need enrollment keys and stay available.
+      expect(screen.getByTestId('devices-page-add-menu-add-manual-asset')).toBeTruthy();
+    } finally {
+      permState.grants = new Set(['organizations:write']);
+    }
+  });
+
   it('selecting "Install agent…" closes the menu without touching the hash', async () => {
     render(<DevicesPage />);
     await screen.findByTestId('device-list');
@@ -3094,5 +3475,249 @@ describe('DevicesPage — header refresh button', () => {
     const btn = screen.getByTestId('devices-page-refresh');
     expect(btn.getAttribute('aria-busy')).toBe('false');
     expect((btn as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+describe('DevicesPage — hardware health (#6854 W04)', () => {
+  it('maps the rollup and summary, with no standalone hardware dropdown', async () => {
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValueOnce(null);
+    window.history.replaceState(null, '', window.location.pathname);
+    vi.mocked(fetchAllDevices).mockResolvedValue({
+      data: [{ ...rawDevice(DEV_1, 'raid-host'), hardwareHealth: 'unknown', hardwareHealthSummary: { counts: { unknown: 2 }, controllerNames: [] } }],
+      total: 1, pagesWalked: 1,
+    } as never);
+    render(<DevicesPage />);
+    await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '1'));
+    expect(screen.getByTestId('device-list')).toHaveAttribute('data-hardware-health', 'unknown');
+    expect(screen.getByTestId('device-list')).toHaveAttribute('data-hardware-summary', '[{"unknown":2}]');
+    // Hardware health is a field in the shared filter builder (`hardware.health`),
+    // not a second, page-local filter control.
+    expect(screen.queryByTestId('hardware-health-filter')).toBeNull();
+    expect(fetchAllDevices).not.toHaveBeenCalledWith(expect.objectContaining({ hardwareHealth: expect.anything() }));
+  });
+});
+
+// deviceFetchGeneration guard: the header Refresh carries no abort signal, so
+// it can still be in flight when an org switch starts a newer fetch. The late
+// refresh must not overwrite the newer org's list.
+describe('DevicesPage — stale fetch guard', () => {
+  it('ignores a manual refresh that lands after an org switch', async () => {
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
+    window.history.replaceState(null, '', window.location.pathname);
+    const all = { data: [rawDevice(DEV_1, 'old-host'), rawDevice(DEV_2, 'other-host')], total: 2, pagesWalked: 1 };
+    let finishOld!: (value: typeof all) => void;
+    vi.mocked(fetchAllDevices).mockResolvedValueOnce(all as never)
+      .mockReturnValueOnce(new Promise(resolve => { finishOld = resolve; }) as never)
+      .mockResolvedValue({ data: [rawDevice(DEV_1, 'org-host')], total: 1, pagesWalked: 1 } as never);
+    const saved = { ...orgStoreState };
+    try {
+      const { rerender } = render(<DevicesPage />);
+      await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '2'));
+      fireEvent.click(screen.getByTestId('devices-page-refresh'));
+      await waitFor(() => expect(fetchAllDevices).toHaveBeenCalledTimes(2));
+      Object.assign(orgStoreState, { allOrgs: false, currentOrgId: 'org-1', lastOrgId: 'org-1', organizations: [{ id: 'org-1', name: 'Org One' }] });
+      rerender(<DevicesPage />);
+      await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-hostnames', 'org-host'));
+      await act(async () => { finishOld(all); });
+      expect(screen.getByTestId('device-list')).toHaveAttribute('data-hostnames', 'org-host');
+      expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '1');
+    } finally {
+      Object.assign(orgStoreState, saved);
+    }
+  });
+});
+
+// #9035: ~490px of chrome before the first row. The scope folds into the
+// heading, the class segment only renders when it has something to say, and
+// the view toggle moves into the table header strip.
+describe('DevicesPage — page chrome (#9035)', () => {
+  const NET_9 = '99999999-9999-9999-9999-999999999999';
+  const savedOrgState = { ...orgStoreState };
+
+  afterEach(async () => {
+    Object.assign(orgStoreState, savedOrgState);
+    history.replaceState(null, '', '/');
+    // mockReturnValue persists across tests; hand later suites the harness default.
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(activeFilter);
+  });
+
+  async function renderAgentOnly() {
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
+    render(<DevicesPage />);
+    const list = await screen.findByTestId('device-list');
+    await waitFor(() => expect(list.getAttribute('data-device-count')).toBe('3'));
+    return list;
+  }
+
+  it('names the fleet scope inside the heading', async () => {
+    await renderAgentOnly();
+    const heading = screen.getByTestId('devices-heading');
+    expect(heading).toHaveTextContent('Devices & Assets');
+    expect(screen.getByTestId('devices-heading-scope')).toHaveTextContent('All organizations');
+    expect(heading).toContainElement(screen.getByTestId('devices-heading-scope'));
+  });
+
+  it('names the working org inside the heading', async () => {
+    orgStoreState.currentOrgId = 'org-1';
+    orgStoreState.allOrgs = false;
+    orgStoreState.organizations = [{ id: 'org-1', name: 'Acme Dental' }];
+    await renderAgentOnly();
+    expect(screen.getByTestId('devices-heading-scope')).toHaveTextContent('Acme Dental');
+  });
+
+  it('hides the class segment for an agent-only fleet even with the network arm on', async () => {
+    flagState.ENABLE_NETWORK_DEVICES_IN_LIST = true;
+    history.replaceState(null, '', '/devices');
+    await renderAgentOnly();
+    expect(screen.queryByTestId('device-class-segment')).toBeNull();
+  });
+
+  it('shows the class segment once a network device exists', async () => {
+    history.replaceState(null, '', '/devices');
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
+    vi.mocked(fetchAllNetworkDevices).mockResolvedValue({
+      data: [{ id: NET_9, deviceClass: 'network', assetType: 'printer', hostname: 'Lobby Printer', status: 'online', lastSeenAt: new Date().toISOString(), orgId: 'org-1', siteId: 'site-1' }],
+      total: 1,
+      pagesWalked: 1,
+    } as never);
+    render(<DevicesPage />);
+    expect(await screen.findByTestId('device-class-segment')).toBeInTheDocument();
+  });
+
+  it('keeps the class segment when a deep link selects a non-agent class, so it can be undone', async () => {
+    history.replaceState(null, '', '/devices#deviceClass=network');
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
+    render(<DevicesPage />);
+    await screen.findByTestId('device-list');
+    expect(await screen.findByTestId('device-class-segment')).toBeInTheDocument();
+  });
+
+  it('lets the list mirror its sort into the URL hash (#9037)', async () => {
+    const list = await renderAgentOnly();
+    expect(list.getAttribute('data-sort-in-hash')).toBe('true');
+  });
+
+  it('moves the list/grid toggle into the table header strip', async () => {
+    await renderAgentOnly();
+    const actions = screen.getByTestId('device-list-header-actions');
+    expect(actions).toContainElement(screen.getByLabelText('Grid view'));
+  });
+
+  it('gives grid view its own strip with the count and the toggle', async () => {
+    await renderAgentOnly();
+    fireEvent.click(screen.getByLabelText('Grid view'));
+    const strip = await screen.findByTestId('device-grid-header-strip');
+    expect(strip).toHaveTextContent('3 of 3 devices');
+    expect(strip).toContainElement(screen.getByLabelText('List view'));
+  });
+});
+
+// #9036: the empty state is chosen by cause, and an empty org renders no dead
+// controls (chip strip, class segment, count line, pager).
+describe('DevicesPage — empty states (#9036)', () => {
+  const savedOrgState = { ...orgStoreState };
+
+  afterEach(async () => {
+    Object.assign(orgStoreState, savedOrgState);
+    history.replaceState(null, '', '/');
+    // mockReturnValue persists across tests; hand later suites the harness default.
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(activeFilter);
+  });
+
+  async function renderEmpty() {
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
+    vi.mocked(fetchAllDevices).mockResolvedValue({ data: [] } as never);
+    render(<DevicesPage />);
+  }
+
+  function selectOrg(name: string) {
+    orgStoreState.currentOrgId = 'org-1';
+    orgStoreState.allOrgs = false;
+    orgStoreState.organizations = [{ id: 'org-1', name }];
+  }
+
+  it('(a) names the org, offers Install agent and View all organizations', async () => {
+    selectOrg('Acme Dental');
+    await renderEmpty();
+    const empty = await screen.findByTestId('devices-empty-org');
+    expect(empty).toHaveTextContent('No devices in Acme Dental yet');
+    expect(empty).not.toHaveTextContent('Your fleet is empty');
+    expect(screen.getByTestId('devices-empty-install-agent')).toBeInTheDocument();
+    expect(screen.getByTestId('devices-empty-view-all-orgs')).toBeInTheDocument();
+  });
+
+  it('(a) "View all organizations" switches to the fleet view', async () => {
+    selectOrg('Acme Dental');
+    await renderEmpty();
+    fireEvent.click(await screen.findByTestId('devices-empty-view-all-orgs'));
+    expect(applyOrgSwitch).toHaveBeenCalledWith(null, 'Showing all organizations');
+  });
+
+  it('(a) "Install agent" opens the install flow', async () => {
+    selectOrg('Acme Dental');
+    await renderEmpty();
+    expect(screen.queryByTestId('add-device-modal-stub')).toBeNull();
+    fireEvent.click(await screen.findByTestId('devices-empty-install-agent'));
+    expect(screen.getByTestId('add-device-modal-stub')).toBeInTheDocument();
+  });
+
+  it('(a) hides Install agent for a role that cannot mint enrollment keys', async () => {
+    permState.grants = new Set();
+    try {
+      selectOrg('Acme Dental');
+      await renderEmpty();
+      await screen.findByTestId('devices-empty-org');
+      expect(screen.queryByTestId('devices-empty-install-agent')).toBeNull();
+    } finally {
+      permState.grants = new Set(['organizations:write']);
+    }
+  });
+
+  it('(a) renders no chip strip, class segment, count line or pager', async () => {
+    selectOrg('Acme Dental');
+    history.replaceState(null, '', '/devices#deviceClass=network');
+    await renderEmpty();
+    await screen.findByTestId('devices-empty-org');
+    expect(screen.queryByTestId('device-filter-toolbar-stub')).toBeNull();
+    expect(screen.queryByTestId('device-class-segment')).toBeNull();
+    expect(screen.queryByTestId('device-list')).toBeNull();
+    expect(screen.queryByTestId('device-grid-header-strip')).toBeNull();
+  });
+
+  it('(b) keeps "Your fleet is empty" with the install guide in fleet view', async () => {
+    await renderEmpty();
+    const empty = await screen.findByTestId('devices-empty-fleet');
+    expect(empty).toHaveTextContent('Your fleet is empty');
+    expect(screen.queryByTestId('devices-empty-org')).toBeNull();
+    expect(screen.queryByTestId('device-filter-toolbar-stub')).toBeNull();
+  });
+
+  it('(c) offers no Clear filters when nothing clearable is active (review)', async () => {
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
+    render(<DevicesPage />);
+    await screen.findByTestId('device-list');
+    expect(screen.queryByTestId('stub-clear-filters')).toBeNull();
+  });
+
+  it('(c) keeps the toolbar and hands the list a Clear filters action when filters match nothing', async () => {
+    // The harness filter (status=online) resolves to DEV_1 + DEV_3.
+    const { decodeFilterFromHash } = await import('./filterUrl');
+    vi.mocked(decodeFilterFromHash).mockReturnValue(activeFilter);
+    render(<DevicesPage />);
+    const list = await screen.findByTestId('device-list');
+    expect(screen.getByTestId('device-filter-toolbar-stub')).toBeInTheDocument();
+    expect(screen.queryByTestId('devices-empty-org')).toBeNull();
+    await waitFor(() => expect(list.getAttribute('data-filter-ids')).not.toBe(''));
+    fireEvent.click(screen.getByTestId('stub-clear-filters'));
+    await waitFor(() => expect(screen.getByTestId('device-list').getAttribute('data-filter-ids')).toBe(''));
   });
 });

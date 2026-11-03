@@ -117,11 +117,13 @@ jobs:
           # agent, so leaving any of them on the "0.5.0" default loops that
           # component's update forever once served under a higher registered
           # version.
-          go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION" -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
+          # Fork branding through upstream's -X branding seam (agent/internal/branding):
+          # Windows service display names "Breeze" / "Breeze Helper".
+          go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION -X 'github.com/breeze-rmm/agent/internal/branding.AgentServiceDisplayName=Breeze'" -o bin/breeze-agent-windows-amd64.exe ./cmd/breeze-agent
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION -H windowsgui" -o bin/breeze-user-helper-windows-amd64.exe ./cmd/breeze-user-helper
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION" -o bin/breeze-watchdog-windows-amd64.exe ./cmd/breeze-watchdog
+          go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION -X 'github.com/breeze-rmm/agent/internal/branding.WatchdogServiceDisplayName=Breeze Helper' -X 'github.com/breeze-rmm/agent/internal/branding.WatchdogServiceDescription=Breeze Helper - keeps the Breeze service healthy'" -o bin/breeze-watchdog-windows-amd64.exe ./cmd/breeze-watchdog
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Import KResLab code-signing cert

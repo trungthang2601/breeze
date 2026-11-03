@@ -17,7 +17,9 @@ import {
 import { createAuditLogAsync } from '../services/auditService';
 import { getTrustedClientIpOrUndefined } from '../services/clientIp';
 import { canManagePartnerWidePolicies } from '../services/partnerWideAccess';
+import { isPgForeignKeyViolation } from '../utils/pgErrors';
 
+import { isHiddenOrgType } from '../services/unassignedPool/visibility';
 export const roleRoutes = new Hono();
 
 roleRoutes.use('*', authMiddleware);
@@ -71,14 +73,24 @@ const createRoleSchema = z.object({
   // org-scoped, non-system roles — stays permanently empty. The orgId is
   // validated against the caller's own org allowlist (see the handler) before it
   // re-scopes the creation.
-  orgId: z.string().guid().optional()
+  orgId: z.string().guid().optional(),
+  // #8370: the owner axis, stated explicitly by the caller (Partner-Wide First,
+  // docs/agents/tenancy-rls.md). Create-only — updateRoleSchema has no such
+  // field, so a role never moves between axes. When omitted, the legacy rule
+  // applies (orgId present → organization, else the token's own scope), which
+  // is what let the web dialog silently mint org roles from the header org.
+  ownerScope: z.enum(['partner', 'organization']).optional(),
+  // #5317: `roles.force_mfa` — members of this role must have MFA enrolled
+  // (enforced in services/mfaPolicy.ts). Not inherited through parentRoleId.
+  forceMfa: z.boolean().optional()
 });
 
 const updateRoleSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   description: z.string().optional(),
   permissions: z.array(permissionSchema).optional(),
-  parentRoleId: z.string().guid().nullable().optional()
+  parentRoleId: z.string().guid().nullable().optional(),
+  forceMfa: z.boolean().optional()
 });
 
 type ScopeContext =
@@ -127,7 +139,7 @@ async function resolvePartnerFocusedOrgId(
     .from(organizations)
     .where(eq(organizations.id, targetOrgId))
     .limit(1);
-  if (!org || org.type === 'quick_support') {
+  if (!org || isHiddenOrgType(org.type)) {
     return null;
   }
   return targetOrgId;
@@ -503,6 +515,7 @@ roleRoutes.get(
       description: roles.description,
       scope: roles.scope,
       isSystem: roles.isSystem,
+      forceMfa: roles.forceMfa,
       parentRoleId: roles.parentRoleId,
       createdAt: roles.createdAt,
       updatedAt: roles.updatedAt
@@ -628,6 +641,24 @@ roleRoutes.post(
     let scopeContext = getScopeContext(auth);
     const body = c.req.valid('json');
 
+    // #8370: an explicit owner axis is validated against the caller before any
+    // org re-scoping. These checks only narrow what the legacy path already
+    // allowed; the partner-wide gate (canManagePartnerWidePolicies, enforced by
+    // the router middleware for every partner token) is unchanged.
+    if (body.ownerScope === 'partner') {
+      if (auth.scope !== 'partner') {
+        return c.json({ error: 'Only partner-scope users can create partner roles' }, 403);
+      }
+      if (body.orgId !== undefined) {
+        return c.json({ error: 'orgId must not be sent with ownerScope "partner"' }, 400);
+      }
+    } else if (body.ownerScope === 'organization' && auth.scope === 'partner' && body.orgId === undefined) {
+      return c.json(
+        { error: 'orgId is required: send the owning organization as orgId when ownerScope is "organization"' },
+        400
+      );
+    }
+
     // #3524: a partner admin may target a specific org so the SSO default-role
     // picker (which offers only org-scoped, non-system roles) can be populated.
     // Re-scope the ENTIRE creation to that org — every downstream step (parent
@@ -675,6 +706,7 @@ roleRoutes.post(
       description: string | null;
       scope: 'partner' | 'organization';
       isSystem: boolean;
+      forceMfa: boolean;
       parentRoleId?: string | null;
       partnerId?: string;
       orgId?: string;
@@ -683,6 +715,7 @@ roleRoutes.post(
       description: body.description || null,
       scope: scopeContext.scope,
       isSystem: false,
+      forceMfa: body.forceMfa ?? false,
       parentRoleId: body.parentRoleId || null
     };
 
@@ -740,7 +773,8 @@ roleRoutes.post(
       details: {
         scope: scopeContext.scope,
         permissionCount: body.permissions.length,
-        parentRoleId: result.parentRoleId ?? null
+        parentRoleId: result.parentRoleId ?? null,
+        forceMfa: result.forceMfa
       }
     });
 
@@ -751,6 +785,7 @@ roleRoutes.post(
         description: result.description,
         scope: result.scope,
         isSystem: result.isSystem,
+        forceMfa: result.forceMfa,
         parentRoleId: result.parentRoleId,
         parentRoleName,
         createdAt: result.createdAt,
@@ -778,6 +813,7 @@ roleRoutes.get(
         description: roles.description,
         scope: roles.scope,
         isSystem: roles.isSystem,
+        forceMfa: roles.forceMfa,
         parentRoleId: roles.parentRoleId,
         partnerId: roles.partnerId,
         orgId: roles.orgId,
@@ -852,6 +888,7 @@ roleRoutes.get(
       description: role.description,
       scope: role.scope,
       isSystem: role.isSystem,
+      forceMfa: role.forceMfa,
       parentRoleId: role.parentRoleId,
       parentRoleName,
       permissions: rolePerms,
@@ -933,6 +970,9 @@ roleRoutes.patch(
       }
     }
 
+    // force_mfa is deliberately NOT a reason to walk descendants: it is not
+    // inherited through parentRoleId (services/mfaPolicy.ts reads the member's
+    // own role row), so only this role's direct members are affected.
     const affectedRoleIds = new Set<string>([roleId]);
     if (body.permissions !== undefined || body.parentRoleId !== undefined) {
       for (const descendantRoleId of await getDescendantRoleIds(roleId)) {
@@ -943,7 +983,13 @@ roleRoutes.patch(
 
     const result = await db.transaction(async (tx) => {
       // Update role fields
-      const updates: { name?: string; description?: string | null; parentRoleId?: string | null; updatedAt: Date } = {
+      const updates: {
+        name?: string;
+        description?: string | null;
+        parentRoleId?: string | null;
+        forceMfa?: boolean;
+        updatedAt: Date;
+      } = {
         updatedAt: new Date()
       };
 
@@ -957,6 +1003,10 @@ roleRoutes.patch(
 
       if (body.parentRoleId !== undefined) {
         updates.parentRoleId = body.parentRoleId;
+      }
+
+      if (body.forceMfa !== undefined) {
+        updates.forceMfa = body.forceMfa;
       }
 
       const [updatedRole] = await tx
@@ -1025,7 +1075,8 @@ roleRoutes.patch(
         scope: scopeContext.scope,
         changedFields: Object.keys(body),
         permissionCount: rolePerms.length,
-        parentRoleId: result.parentRoleId ?? null
+        parentRoleId: result.parentRoleId ?? null,
+        forceMfa: result.forceMfa
       }
     });
 
@@ -1035,6 +1086,7 @@ roleRoutes.patch(
       description: result.description,
       scope: result.scope,
       isSystem: result.isSystem,
+      forceMfa: result.forceMfa,
       parentRoleId: result.parentRoleId,
       parentRoleName,
       permissions: rolePerms,
@@ -1126,11 +1178,23 @@ roleRoutes.delete(
       );
     }
 
-    // Delete role permissions and role
-    await db.transaction(async (tx) => {
-      await tx.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
-      await tx.delete(roles).where(eq(roles.id, roleId));
-    });
+    // Delete role permissions and role. access_review_items.role_id has no
+    // ON DELETE action on purpose: a completed review's items (decisions,
+    // notes, reviewer) are evidence and must not vanish because the reviewed
+    // role was deleted afterwards. The FK is the check (an RLS-scoped count
+    // here could miss items on reviews the caller cannot see), so map its
+    // violation to a clean 409.
+    try {
+      await db.transaction(async (tx) => {
+        await tx.delete(rolePermissions).where(eq(rolePermissions.roleId, roleId));
+        await tx.delete(roles).where(eq(roles.id, roleId));
+      });
+    } catch (err) {
+      if (isPgForeignKeyViolation(err, 'access_review_items_role_id_roles_id_fk')) {
+        return c.json({ error: 'Role is referenced by access reviews' }, 409);
+      }
+      throw err;
+    }
 
     writeRoleAudit(c, auth, scopeContext, {
       action: 'role.delete',
@@ -1149,12 +1213,12 @@ roleRoutes.post(
   '/:id/clone',
   requirePermission(PERMISSIONS.USERS_WRITE.resource, PERMISSIONS.USERS_WRITE.action),
   requireMfa(),
-  zValidator('json', z.object({ name: z.string().min(1).max(100) })),
+  zValidator('json', z.object({ name: z.string().min(1).max(100), description: z.string().optional() })),
   async (c) => {
     const auth = c.get('auth');
     const focusedOrgId = c.req.query('orgId');
     const roleId = c.req.param('id')!;
-    const { name } = c.req.valid('json');
+    const { name, description } = c.req.valid('json');
     const callerPermissions = await getCallerPermissions(c, auth);
 
     // Get source role
@@ -1165,6 +1229,7 @@ roleRoutes.post(
         description: roles.description,
         scope: roles.scope,
         isSystem: roles.isSystem,
+        forceMfa: roles.forceMfa,
         partnerId: roles.partnerId,
         orgId: roles.orgId
       })
@@ -1205,13 +1270,20 @@ roleRoutes.post(
       description: string | null;
       scope: 'partner' | 'organization';
       isSystem: boolean;
+      forceMfa: boolean;
       partnerId?: string;
       orgId?: string;
     } = {
       name,
-      description: sourceRole.description ? `Cloned from ${sourceRole.name}: ${sourceRole.description}` : `Cloned from ${sourceRole.name}`,
+      // #9603: never the source's text or server-written English; the clone dialog
+      // sends its own localized, editable description (null when none is given).
+      description: description ?? null,
       scope: scopeContext.scope,
-      isSystem: false
+      isSystem: false,
+      // #5317: a clone keeps the source's MFA requirement — cloning the
+      // force-MFA Partner Admin role must not silently drop it. The clone is a
+      // custom role, so the caller can turn it off afterwards via PATCH.
+      forceMfa: sourceRole.forceMfa
     };
 
     if (scopeContext.scope === 'partner') {
@@ -1261,7 +1333,8 @@ roleRoutes.post(
         sourceRoleId: sourceRole.id,
         sourceRoleName: sourceRole.name,
         scope: scopeContext.scope,
-        permissionCount: rolePerms.length
+        permissionCount: rolePerms.length,
+        forceMfa: result.forceMfa
       }
     });
 
@@ -1272,6 +1345,7 @@ roleRoutes.post(
         description: result.description,
         scope: result.scope,
         isSystem: result.isSystem,
+        forceMfa: result.forceMfa,
         permissions: rolePerms,
         createdAt: result.createdAt,
         updatedAt: result.updatedAt

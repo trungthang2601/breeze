@@ -12,6 +12,54 @@ function makeState(): StreamableState {
   };
 }
 
+describe('W05 events', () => {
+  function harness() {
+    const h = { state: { ...makeState() } as StreamableState };
+    return {
+      get state() { return h.state; },
+      set: (fn: (s: StreamableState) => Partial<StreamableState>) => { h.state = { ...h.state, ...fn(h.state) }; },
+      get: () => h.state,
+    };
+  }
+  it('thinking_state toggles thinking; done clears it', () => {
+    const h = harness();
+    processStreamEvent({ type: 'thinking_state', state: 'started' }, h.set, h.get, null);
+    expect(h.state.thinking).toBe(true);
+    processStreamEvent({ type: 'thinking_state', state: 'stopped' }, h.set, h.get, null);
+    expect(h.state.thinking).toBe(false);
+    processStreamEvent({ type: 'thinking_state', state: 'started' }, h.set, h.get, null);
+    processStreamEvent({ type: 'done' }, h.set, h.get, null);
+    expect(h.state.thinking).toBe(false);
+  });
+  it('turn_model records what ran', () => {
+    const h = harness();
+    const turnModel = { requestedModel: 'a', requestedDisplayName: 'A', servedModel: 'b', servedDisplayName: 'B', fallbackUsed: true, appliedOptions: {}, fastDowngraded: false };
+    processStreamEvent({ type: 'turn_model', turnModel }, h.set, h.get, null);
+    expect(h.state.turnModel).toEqual(turnModel);
+  });
+  it('model_refusal records the suggested alternatives for the menu', () => {
+    const h = harness();
+    processStreamEvent({ type: 'model_refusal', category: 'cyber', alternatives: [{ offeringId: 'x', displayName: 'X' }], docsUrl: 'https://docs' }, h.set, h.get, null);
+    expect(h.state.refusalAlternatives).toEqual(['x']);
+  });
+  it('#7785: a provider-failure error survives the turn_model and done that follow it', () => {
+    const h = harness();
+    const turnModel = { requestedModel: 'a', requestedDisplayName: 'A', servedModel: 'a', servedDisplayName: 'A', fallbackUsed: false, appliedOptions: {}, fastDowngraded: false };
+    const message = 'The AI model is overloaded right now. Try again shortly.';
+    processStreamEvent({ type: 'error', message }, h.set, h.get, null);
+    processStreamEvent({ type: 'turn_model', turnModel }, h.set, h.get, null);
+    processStreamEvent({ type: 'done', usage: { inputTokens: 0, outputTokens: 0, costCents: 0 } }, h.set, h.get, null);
+    expect(h.state.error).toBe(message);
+    expect(h.state.isStreaming).toBe(false);
+  });
+  it('message_start clears stale refusal suggestions', () => {
+    const h = harness();
+    h.set(() => ({ refusalAlternatives: ['x'] }));
+    processStreamEvent({ type: 'message_start', messageId: 'm1' }, h.set, h.get, null);
+    expect(h.state.refusalAlternatives).toEqual([]);
+  });
+});
+
 function makeActivePlan(): ActivePlan {
   return {
     planId: 'plan-1',
@@ -33,6 +81,54 @@ function makeActivePlan(): ActivePlan {
  * warning from the approver with every other test still green — the same
  * value-silently-discarded shape this whole change exists to remove.
  */
+describe('approval_resolved (#9431)', () => {
+  function harness() {
+    const h = { state: { ...makeState() } as StreamableState };
+    return {
+      get state() { return h.state; },
+      set: (fn: (s: StreamableState) => Partial<StreamableState>) => { h.state = { ...h.state, ...fn(h.state) }; },
+      get: () => h.state,
+    };
+  }
+  const card: AiStreamEvent = {
+    type: 'approval_required', executionId: 'e1', toolName: 'file_operations',
+    input: { action: 'delete' }, description: 'Delete a file',
+  };
+
+  it.each(['approved', 'not_approved', 'ended'] as const)(
+    'marks the matching card %s, decided wherever it was decided',
+    (outcome) => {
+      const h = harness();
+      processStreamEvent(card, h.set, h.get, null);
+      processStreamEvent({ type: 'approval_resolved', executionId: 'e1', outcome }, h.set, h.get, null);
+      expect(h.state.pendingApproval).toMatchObject({ executionId: 'e1', resolution: outcome });
+    },
+  );
+
+  it('leaves a different card alone', () => {
+    const h = harness();
+    processStreamEvent(card, h.set, h.get, null);
+    processStreamEvent({ type: 'approval_resolved', executionId: 'other', outcome: 'approved' }, h.set, h.get, null);
+    expect(h.state.pendingApproval?.resolution).toBeUndefined();
+  });
+
+  it('done removes a resolved card but leaves an undecided one', () => {
+    const h = harness();
+    processStreamEvent(card, h.set, h.get, null);
+    processStreamEvent({ type: 'done' }, h.set, h.get, null);
+    expect(h.state.pendingApproval?.executionId).toBe('e1');
+    processStreamEvent({ type: 'approval_resolved', executionId: 'e1', outcome: 'not_approved' }, h.set, h.get, null);
+    processStreamEvent({ type: 'done' }, h.set, h.get, null);
+    expect(h.state.pendingApproval).toBeNull();
+  });
+
+  it('does not resurrect a card that is already gone', () => {
+    const h = harness();
+    processStreamEvent({ type: 'approval_resolved', executionId: 'e1', outcome: 'approved' }, h.set, h.get, null);
+    expect(h.state.pendingApproval).toBeNull();
+  });
+});
+
 describe('approval_required — scriptRunContext passthrough (#4888)', () => {
   const runContext = {
     effectiveRunAs: 'system' as const,
@@ -155,6 +251,51 @@ describe('approval_required — approvalScope passthrough (#5600)', () => {
       null,
     );
     expect(patch.pendingApproval?.approvalScope).toBeUndefined();
+  });
+});
+
+/**
+ * #6475 — the org-configured interactive-approval window/deadline has to
+ * survive the store hop just like scriptRunContext/approvalScope above:
+ * AiApprovalDialog reads these off pendingApproval to widen its countdown
+ * past the hard-coded 5 minutes, and a dropped field here would silently
+ * revert every org's configured timeout back to 5 minutes in the UI even
+ * though the server is enforcing the real one.
+ */
+describe('approval_required — approvalWindowMs / approvalExpiresAt passthrough (#6475)', () => {
+  it('carries approvalWindowMs and approvalExpiresAt into pendingApproval (legacy non-intent path)', () => {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    processStreamEvent(
+      {
+        type: 'approval_required', executionId: 'e1', toolName: 'file_operations',
+        input: { action: 'read' }, description: 'Read a file',
+        approvalWindowMs: 30 * 60 * 1000, approvalExpiresAt: '2026-09-23T12:30:00.000Z',
+      },
+      (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; },
+      () => ({ ...state, ...patch }),
+      null,
+    );
+    expect(patch.pendingApproval).toMatchObject({
+      approvalWindowMs: 30 * 60 * 1000,
+      approvalExpiresAt: '2026-09-23T12:30:00.000Z',
+    });
+  });
+
+  it('leaves both undefined when the event omits them (older API build)', () => {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    processStreamEvent(
+      {
+        type: 'approval_required', executionId: 'e1', toolName: 'file_operations',
+        input: { action: 'read' }, description: 'Read a file',
+      },
+      (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; },
+      () => ({ ...state, ...patch }),
+      null,
+    );
+    expect(patch.pendingApproval?.approvalWindowMs).toBeUndefined();
+    expect(patch.pendingApproval?.approvalExpiresAt).toBeUndefined();
   });
 });
 
@@ -480,6 +621,55 @@ describe('execution-plane run events (spec §5.5)', () => {
   });
 });
 
+/**
+ * Sweep E6 — `tool_use_start`'s `input` is always `{}` (the SDK hasn't
+ * finished streaming the tool's real arguments at content_block_start).
+ * `tool_use_input` arrives once they're known and must patch the SAME
+ * message row in place, not append a new one — the label/verb computation
+ * (`aiToolLabel`) reads `toolInput` off that row.
+ */
+describe('tool_use_input backfills the tool_use row (sweep E6)', () => {
+  function run(events: Parameters<typeof processStreamEvent>[0][]) {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    let current: string | null = null;
+    for (const ev of events) {
+      current = processStreamEvent(
+        ev,
+        (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; },
+        () => ({ ...state, ...patch }),
+        current,
+      );
+    }
+    return patch;
+  }
+
+  it('fills in the real input on the matching tool_use message, without adding a row', () => {
+    const patch = run([
+      { type: 'tool_use_start', toolUseId: 'tu-1', toolName: 'manage_alerts', input: {} },
+      { type: 'tool_use_input', toolUseId: 'tu-1', input: { action: 'list' } },
+    ]);
+
+    expect(patch.messages).toHaveLength(1);
+    expect(patch.messages?.[0]).toMatchObject({
+      role: 'tool_use',
+      toolUseId: 'tu-1',
+      toolInput: { action: 'list' },
+    });
+  });
+
+  it('does not touch an unrelated tool_use row', () => {
+    const patch = run([
+      { type: 'tool_use_start', toolUseId: 'tu-1', toolName: 'manage_alerts', input: {} },
+      { type: 'tool_use_start', toolUseId: 'tu-2', toolName: 'get_device_context', input: {} },
+      { type: 'tool_use_input', toolUseId: 'tu-1', input: { action: 'list' } },
+    ]);
+
+    const other = patch.messages?.find((m) => m.toolUseId === 'tu-2');
+    expect(other?.toolInput).toBeUndefined();
+  });
+});
+
 describe('processStreamEvent exhaustiveness', () => {
   it('has a default arm that type-errors on an unhandled event type', () => {
     // The switch had no `default:` before this wave, so an event type added to
@@ -507,5 +697,95 @@ describe('processStreamEvent exhaustiveness', () => {
       ),
     ).not.toThrow();
     expect(called).toBe(false);
+  });
+});
+
+/**
+ * Topology M4 (#6000): a topology turn streams no text. The store shows the
+ * server-validated explanation (never raw model output) and keeps the
+ * structured answer on the message for the Explain panel.
+ */
+describe('topology investigation events (M4)', () => {
+  const explanation = {
+    schemaVersion: 1 as const, status: 'partial' as const,
+    findings: [
+      { kind: 'finding' as const, claim: 'health' as const, text: 'The uplink reports failed checks.', citationIds: ['r1'] },
+      { kind: 'hypothesis' as const, claim: 'cause' as const, text: 'A loop may be flooding the switch.', citationIds: [] },
+    ],
+    missingData: ['No LLDP from host-aa.'], nextChecks: [{ recipeId: 'gateway_basic' as const, rationale: 'Check the gateway.', citationIds: [] }],
+    citationIds: ['r1'], citations: [], reasons: ['causal_claim_demoted'],
+  };
+
+  function run(events: AiStreamEvent[]) {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    let current: string | null = null;
+    for (const event of events) {
+      current = processStreamEvent(event, (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; }, () => ({ ...state, ...patch }), current);
+    }
+    return { ...state, ...patch };
+  }
+
+  it('renders the validated explanation into the assistant message and keeps the structured answer', () => {
+    const state = run([
+      { type: 'message_start', messageId: 'm1' },
+      { type: 'topology_progress', phase: 'gathering_evidence' },
+      { type: 'topology_explanation', explanation },
+    ]);
+    const message = state.messages.find((m) => m.role === 'assistant')!;
+    expect(message.topologyExplanation).toEqual(explanation);
+    expect(message.content).toContain('The uplink reports failed checks.');
+    expect(message.content).toContain('Hypothesis: A loop may be flooding the switch.');
+    expect(message.content).toContain('Missing data: No LLDP from host-aa.');
+  });
+
+  it('treats progress phases as status only, never as message text', () => {
+    const state = run([{ type: 'message_start', messageId: 'm1' }, { type: 'topology_progress', phase: 'analyzing' }]);
+    expect(state.messages.find((m) => m.role === 'assistant')?.content ?? '').toBe('');
+  });
+});
+
+/**
+ * §9.1a (W03 #7601): the refusal explanation already streamed as ordinary
+ * message events; the structured `model_refusal` twin must not add a second
+ * (blank) bubble or touch the transcript.
+ */
+describe('model_refusal is inert for the transcript', () => {
+  it('leaves messages and streaming state unchanged and keeps the current assistant id', () => {
+    const state: StreamableState = {
+      ...makeState(),
+      messages: [
+        { id: 'u1', role: 'user', content: 'hi', createdAt: new Date(0) },
+        { id: 'a1', role: 'assistant', content: 'I can\'t help with that.', createdAt: new Date(0), isStreaming: false },
+      ],
+    };
+    const before = JSON.stringify(state);
+    let calls = 0;
+    let patched: StreamableState = state;
+    const next = processStreamEvent(
+      {
+        type: 'model_refusal', category: 'cyber',
+        alternatives: [{ offeringId: 'off-2', displayName: 'Haiku' }], docsUrl: 'https://example.com/refusals',
+      },
+      (fn) => { calls += 1; patched = { ...patched, ...fn(patched) }; },
+      () => patched,
+      'a1',
+    );
+    expect(next).toBe('a1');
+    // Task 13 (W05): the only state it may touch is the suggestion list for the
+    // model menu; the transcript and streaming state stay exactly as they were.
+    expect(calls).toBe(1);
+    expect(patched.refusalAlternatives).toEqual(['off-2']);
+    expect(JSON.stringify({ ...patched, refusalAlternatives: undefined })).toBe(before);
+    expect(patched.messages).toHaveLength(2);
+  });
+});
+
+describe('turn_model staleness', () => {
+  it("message_start clears the previous turn's what-ran so a missing turn_model never shows it", () => {
+    const h = { state: { ...makeState(), turnModel: { requestedModel: 'a' } as never } as StreamableState };
+    const set = (fn: (s: StreamableState) => Partial<StreamableState>) => { h.state = { ...h.state, ...fn(h.state) }; };
+    processStreamEvent({ type: 'message_start', messageId: 'm2' } as AiStreamEvent, set, () => h.state, null);
+    expect(h.state.turnModel).toBeNull();
   });
 });

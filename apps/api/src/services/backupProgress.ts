@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db';
 import { backupJobs, devices, IN_FLIGHT_BACKUP_JOB_STATUSES } from '../db/schema';
 // Imported from the leaf module, not the `../db/schema` barrel: that barrel is
@@ -8,6 +8,8 @@ import { backupJobs, devices, IN_FLIGHT_BACKUP_JOB_STATUSES } from '../db/schema
 import { BACKUP_SNAPSHOT_ID_MAX_LENGTH } from '../db/schema/backupConstants';
 import { UUID_REGEX } from '../utils/uuid';
 import { refreshDispatchedExpectation } from './agentWorkExpectation';
+import { findForeignSnapshotClaim } from './backupSnapshotOwnership';
+import { captureException } from './sentry';
 
 /**
  * Payload shape emitted by the agent's `backup_progress` WS message
@@ -47,15 +49,48 @@ export type ApplyBackupProgressResult =
   | {
       applied: false;
       reason: 'invalid-command-id' | 'invalid-payload' | 'not-found' | 'agent-mismatch' | 'terminal-status';
+      /**
+       * A repeat of a `not-found` / `invalid-command-id` drop already reported
+       * within UNMATCHED_PROGRESS_WINDOW_MS (10s). No DB lookup was made; callers
+       * should not log it again (#5393).
+       */
+      suppressed?: true;
     };
+
+/**
+ * Restore progress reuses the `backup_progress` WS type with a commandId that
+ * matches no backup job, and is emitted per file. Without this cache every
+ * message cost a DB select plus a log line (10k lines / 3 min, ~85% API CPU in
+ * the #5393 lab run). After the first unmatched drop for an (agent, commandId)
+ * pair we skip the lookup and let the caller stay quiet for a short (10s) window.
+ * The window is bounded so a job row created after its first ping (or a reused
+ * id) is still picked up. Matched jobs are never cached.
+ */
+const UNMATCHED_PROGRESS_WINDOW_MS = 10_000;
+const UNMATCHED_PROGRESS_MAX_KEYS = 5_000;
+const unmatchedProgress = new Map<string, { reason: 'not-found' | 'invalid-command-id'; until: number }>();
+
+function rememberUnmatched(key: string, reason: 'not-found' | 'invalid-command-id', now: number): void {
+  if (unmatchedProgress.size >= UNMATCHED_PROGRESS_MAX_KEYS && !unmatchedProgress.has(key)) {
+    // Clearing only ever causes extra lookups/logs, never a lost signal.
+    unmatchedProgress.clear();
+  }
+  unmatchedProgress.set(key, { reason, until: now + UNMATCHED_PROGRESS_WINDOW_MS });
+}
+
+/** Test seam. */
+export function resetUnmatchedBackupProgressCache(): void {
+  unmatchedProgress.clear();
+}
 
 /**
  * Parse a progress payload, degrading gracefully when only `snapshotId` is
  * unusable.
  *
  * `snapshotId` is best-effort recovery metadata; `current`/`filesDone` and the
- * `lastProgressAt` bump they carry are load-bearing for job liveness — the
- * stale reaper kills a job whose `last_progress_at` goes cold, and
+ * `lastKeepaliveAt`/`lastProgressAt` bumps they carry are load-bearing for job
+ * liveness — the stale reaper kills a job whose liveness or progress goes
+ * cold, and
  * `refreshDispatchedExpectation` keeps the eventual terminal result from being
  * dropped as a replay. Letting the optional field veto the load-bearing ones
  * would invert that priority: a snapshot-id format change that outgrew the
@@ -103,11 +138,22 @@ export async function applyBackupProgress(params: {
   commandId: string;
   progress: unknown;
 }): Promise<ApplyBackupProgressResult> {
+  const unmatchedKey = `${params.agentId}:${params.commandId}`;
+  const nowMs = Date.now();
+  const cached = unmatchedProgress.get(unmatchedKey);
+  if (cached) {
+    if (cached.until > nowMs) {
+      return { applied: false, reason: cached.reason, suppressed: true };
+    }
+    unmatchedProgress.delete(unmatchedKey);
+  }
+
   // Cheap pre-DB gate: backup_jobs.id is uuid-typed, so a non-UUID commandId
   // would raise Postgres 22P02 through the handler — and restore progress
   // (same WS message type, unthrottled per-file) plus any garbage commandId
   // must be droppable without spending a query.
   if (!UUID_REGEX.test(params.commandId)) {
+    rememberUnmatched(unmatchedKey, 'invalid-command-id', nowMs);
     return { applied: false, reason: 'invalid-command-id' };
   }
 
@@ -121,6 +167,7 @@ export async function applyBackupProgress(params: {
     .select({
       id: backupJobs.id,
       deviceId: backupJobs.deviceId,
+      orgId: backupJobs.orgId,
       agentId: devices.agentId,
       status: backupJobs.status,
     })
@@ -130,6 +177,7 @@ export async function applyBackupProgress(params: {
     .limit(1);
 
   if (!job) {
+    rememberUnmatched(unmatchedKey, 'not-found', nowMs);
     return { applied: false, reason: 'not-found' };
   }
 
@@ -142,21 +190,40 @@ export async function applyBackupProgress(params: {
   }
 
   const now = new Date();
+  const nowSql = sql`${now.toISOString()}::timestamptz`;
+  // #2798: every applied message proves the agent is alive, but only a real
+  // increase in bytes or files is PROGRESS. The agent re-sends unchanged
+  // counters every 30s as a keepalive; when that bumped last_progress_at, a
+  // live agent with a wedged upload looked healthy forever and the reaper's
+  // stall rule could never fire. Postgres evaluates every SET expression
+  // against the pre-update row, so the comparisons below see the stored
+  // counters, not the ones being written in this same statement.
+  const advanced: SQL[] = [];
+  if (progress.current !== undefined) {
+    advanced.push(sql`${progress.current} > COALESCE(${backupJobs.transferredSize}, 0)`);
+  }
+  if (progress.filesDone !== undefined) {
+    advanced.push(sql`${progress.filesDone} > COALESCE(${backupJobs.fileCount}, 0)`);
+  }
   const updateSet: Record<string, unknown> = {
-    lastProgressAt: now,
+    lastKeepaliveAt: now,
     updatedAt: now,
   };
+  if (advanced.length > 0) {
+    updateSet.lastProgressAt = sql`CASE WHEN ${sql.join(advanced, sql` OR `)} THEN ${nowSql} ELSE ${backupJobs.lastProgressAt} END`;
+  }
   // Queue messages are liveness, not execution. Only the first signal can
   // undo the legacy dispatch-time running marker. A delayed queued ping must
   // never demote a workload that has already emitted its starting signal.
+  // "First signal" = no liveness recorded yet (last_keepalive_at IS NULL).
   if (progress.phase === 'queued') {
-    updateSet.status = sql`CASE WHEN ${backupJobs.lastProgressAt} IS NULL THEN 'pending'::backup_status ELSE ${backupJobs.status} END`;
-    updateSet.startedAt = sql`CASE WHEN ${backupJobs.lastProgressAt} IS NULL THEN NULL ELSE ${backupJobs.startedAt} END`;
+    updateSet.status = sql`CASE WHEN ${backupJobs.lastKeepaliveAt} IS NULL THEN 'pending'::backup_status ELSE ${backupJobs.status} END`;
+    updateSet.startedAt = sql`CASE WHEN ${backupJobs.lastKeepaliveAt} IS NULL THEN NULL ELSE ${backupJobs.startedAt} END`;
   } else {
     // Legacy helpers report uploading/scanning without an explicit starting
     // signal. Their actual execution progress must also win the dispatch race.
     updateSet.status = 'running';
-    updateSet.startedAt = sql`CASE WHEN ${backupJobs.status} = 'pending' OR ${backupJobs.lastProgressAt} IS NULL THEN ${now.toISOString()}::timestamptz ELSE ${backupJobs.startedAt} END`;
+    updateSet.startedAt = sql`CASE WHEN ${backupJobs.status} = 'pending' OR ${backupJobs.lastKeepaliveAt} IS NULL THEN ${nowSql} ELSE ${backupJobs.startedAt} END`;
   }
   if (progress.current !== undefined) {
     updateSet.transferredSize = progress.current;
@@ -185,8 +252,33 @@ export async function applyBackupProgress(params: {
   // overwrites an earlier one. The UPDATE below is guarded on the job still
   // being in-flight, so this can never clobber an ID written by a terminal
   // result.
+  //
+  // Bind the agent authenticated above to the run it is executing; do NOT
+  // trust it to also be authoritative for the snapshot id it names. An
+  // unchecked id here would let this device adopt another device's (or, on a
+  // bucket shared across orgs, another org's) in-progress or completed
+  // snapshot — see findForeignSnapshotClaim. A conflict drops the id from
+  // this write (same "best-effort recovery metadata" treatment as an
+  // over-long id above) rather than failing the whole progress signal; the
+  // counters that keep the job alive must still land.
+  let snapshotIdDropped = parsed.snapshotIdDropped;
   if (progress.snapshotId !== undefined) {
-    updateSet.snapshotId = progress.snapshotId;
+    const conflict = await findForeignSnapshotClaim({
+      snapshotId: progress.snapshotId,
+      callerDeviceId: job.deviceId,
+      callerOrgId: job.orgId,
+    });
+    if (conflict) {
+      snapshotIdDropped = true;
+      const msg =
+        `[BackupProgress] Dropped snapshotId "${progress.snapshotId}" reported by device ` +
+        `${job.deviceId} for job ${job.id} — already claimed by device ${conflict.ownerDeviceId}` +
+        (conflict.crossOrg ? ' in a different org' : '') + '.';
+      console.warn(msg);
+      captureException(new Error(msg));
+    } else {
+      updateSet.snapshotId = progress.snapshotId;
+    }
   }
 
   const updated = await db
@@ -204,7 +296,7 @@ export async function applyBackupProgress(params: {
   // expectation's TTL: refresh it on every progress signal.
   await refreshDispatchedExpectation('backup', job.deviceId, job.id);
 
-  return parsed.snapshotIdDropped ? { applied: true, snapshotIdDropped: true } : { applied: true };
+  return snapshotIdDropped ? { applied: true, snapshotIdDropped: true } : { applied: true };
 }
 
 // --- non-terminal `command_result` guards ---------------------------------
@@ -288,11 +380,12 @@ export async function applyBackupStartedAck(params: {
   const updated = await db
     .update(backupJobs)
     .set({
-      lastProgressAt: now,
+      // An admission/started ack is liveness, not transfer progress (#2798).
+      lastKeepaliveAt: now,
       updatedAt: now,
       ...(params.queued ? {
-        status: sql`CASE WHEN ${backupJobs.lastProgressAt} IS NULL THEN 'pending'::backup_status ELSE ${backupJobs.status} END`,
-        startedAt: sql`CASE WHEN ${backupJobs.lastProgressAt} IS NULL THEN NULL ELSE ${backupJobs.startedAt} END`,
+        status: sql`CASE WHEN ${backupJobs.lastKeepaliveAt} IS NULL THEN 'pending'::backup_status ELSE ${backupJobs.status} END`,
+        startedAt: sql`CASE WHEN ${backupJobs.lastKeepaliveAt} IS NULL THEN NULL ELSE ${backupJobs.startedAt} END`,
       } : {
         status: 'running' as const,
         startedAt: sql`COALESCE(${backupJobs.startedAt}, ${now.toISOString()}::timestamptz)`,

@@ -1,26 +1,15 @@
-import sanitizeHtml from 'sanitize-html';
 import type { GraphMessage } from './graphMailClient';
-import type { NormalizedInboundEmail, SenderAuth, SenderAuthVerdict } from '../inboundEmail/types';
+import type { NormalizedInboundEmail, SenderAuth } from '../inboundEmail/types';
 import { BREEZE_OUTBOUND_HEADER } from '../emailDomains/outboundMarker';
+import { htmlToText } from '../inboundEmail/htmlToText';
+import { buildSenderAuth } from '../inboundEmail/authenticationResults';
+import { MAX_BODY_BYTES } from './normalizeGmailMessage';
 
 function header(headers: GraphMessage['internetMessageHeaders'], name: string): string | undefined {
   return headers?.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value;
 }
 
-// Mirror mailgun.ts normalizeVerdict: map a raw mechanism token -> SenderAuthVerdict.
-function normalizeVerdict(raw: string | undefined): SenderAuthVerdict {
-  const v = raw?.trim().toLowerCase();
-  if (v === 'pass') return 'pass';
-  if (v === 'fail' || v === 'softfail' || v === 'permerror' || v === 'temperror') return 'fail';
-  if (v === 'neutral') return 'neutral';
-  if (v === 'none') return 'none';
-  return 'unknown';
-}
 
-function mechanism(authResults: string | undefined, name: string): string | undefined {
-  if (!authResults) return undefined;
-  return new RegExp(`\\b${name}=(\\w+)`, 'i').exec(authResults)?.[1];
-}
 
 /**
  * Return the value of the Authentication-Results header we can TRUST, or '' if none.
@@ -34,7 +23,9 @@ function mechanism(authResults: string | undefined, name: string): string | unde
  * Unmatched → '' → all verdicts 'unknown' → verified=false → the R4 gate quarantines
  * (never drops) for manual review. NOTE: if a tenant's EOP stamps a different
  * authserv-id than the mailbox domain, genuine mail will quarantine until this is
- * tuned — safe because nothing is lost.
+ * tuned — safe because nothing is lost. Mail sent from inside the tenant is the
+ * common case of this (authserv-id `mx.microsoft.com`, dmarc=none); graphSenderAuth
+ * verifies it from Exchange's intra-tenant stamp instead (#8299).
  */
 function trustedAuthResults(
   headers: GraphMessage['internetMessageHeaders'], mailboxDomain: string,
@@ -48,84 +39,69 @@ function trustedAuthResults(
   return '';
 }
 
-/** Always returns a full SenderAuth (fail-closed). verified iff DMARC passed. */
-function buildSenderAuth(authResults: string | undefined): SenderAuth {
-  const spf = normalizeVerdict(mechanism(authResults, 'spf'));
-  const dkim = normalizeVerdict(mechanism(authResults, 'dkim'));
-  const dmarc = normalizeVerdict(mechanism(authResults, 'dmarc'));
-  return { spf, dkim, dmarc, verified: dmarc === 'pass' };
+
+/**
+ * True only when the tenant's own Exchange says this message was sent from inside
+ * the tenant: `X-MS-Exchange-Organization-AuthAs: Internal` AND
+ * `X-MS-Exchange-Organization-MessageDirectionality: Originating` (#8299).
+ *
+ * Why this cannot be spoofed: per Microsoft's Exchange "header firewall"
+ * documentation, Exchange removes every `X-MS-Exchange-Organization-*` header from
+ * mail entering the organization from outside, then stamps its own. External mail
+ * arrives as AuthAs=Anonymous / MessageDirectionality=Incoming; the intra-tenant
+ * shape was observed on real tenant mail read through Graph (#8299). The `X-MS-Exchange-CrossTenant-*` headers are
+ * deliberately NOT read: they describe the SENDING tenant, so another Microsoft
+ * 365 tenant's mail can carry `CrossTenant-AuthAs: Internal`.
+ *
+ * Strict by design: both headers must be present, every instance of each must
+ * equal the exact value Exchange writes (case-sensitive, after trimming
+ * surrounding whitespace), and a duplicate with any other value fails the check. This is read only on the Microsoft 365 mailbox path, where
+ * Graph returns the headers as the mailbox's own tenant stored them; the Gmail
+ * and Mailgun normalizers never look at these headers.
+ */
+function isExchangeIntraTenant(headers: GraphMessage['internetMessageHeaders']): boolean {
+  const allEqual = (name: string, expected: string): boolean => {
+    const values = (headers ?? [])
+      .filter((h) => h.name.toLowerCase() === name)
+      .map((h) => h.value.trim());
+    return values.length > 0 && values.every((v) => v === expected);
+  };
+  return allEqual('x-ms-exchange-organization-authas', 'Internal')
+    && allEqual('x-ms-exchange-organization-messagedirectionality', 'Originating');
 }
 
 /**
- * Upper bound on the plain text derived from an HTML body. Matches the ticket
- * description / comment content limit enforced by the shared validators
- * (`packages/shared/src/validators/tickets.ts`, `max(50_000)`), so an enormous
- * HTML mail can't write a larger description than the API would ever accept.
+ * Sender auth for a Microsoft 365 mailbox message. A trusted DMARC verdict wins in
+ * both directions: a pass needs nothing more, and a fail is never overridden. When
+ * there is no usable verdict (intra-tenant mail is unsigned, and EOP stamps
+ * `mx.microsoft.com` rather than the mailbox domain, so trustedAuthResults is
+ * empty), Exchange's intra-tenant stamp verifies the sender instead, so the R4
+ * gate in inboundEmailService passes for the tenant's own staff without trusting
+ * the From domain or the customer-domain list.
  */
-export const MAX_HTML_DERIVED_TEXT_LENGTH = 50_000;
+function graphSenderAuth(
+  headers: GraphMessage['internetMessageHeaders'], mailboxDomain: string,
+): SenderAuth {
+  const auth = buildSenderAuth(trustedAuthResults(headers, mailboxDomain));
+  if (auth.verified || auth.dmarc === 'fail') return auth;
+  if (!isExchangeIntraTenant(headers)) return auth;
+  return { ...auth, verified: true, source: 'exchange-internal' };
+}
+
+/** jsonb cannot store U+0000; drop it from strings persisted in `raw`. */
+function stripNul(value: string): string {
+  return value.includes('\u0000') ? value.replace(/\u0000/g, '') : value;
+}
 
 /**
- * Cap on the raw HTML handed to the parser. sanitize-html is super-linear on
- * deeply nested unclosed tags (a 560K-char `<span>a` × N body took ~2.7 s), and
- * this runs inline in the shared mailbox poll worker on sender-controlled
- * input. 1M chars is ~20× the text clamp — ordinary (even Word-bloated) mail
- * is far below it; only the tail of a pathological body is lost.
+ * Bound the body persisted in `raw` to MAX_BODY_BYTES of UTF-8, the same 1 MiB
+ * limit the Gmail normalizer applies, so an oversized message cannot write an
+ * unbounded row into ticket_email_inbound. A code point cut at the boundary is
+ * dropped rather than stored as a replacement character.
  */
-export const MAX_HTML_INPUT_LENGTH = 1_000_000;
-
-// The only tags kept through sanitize-html: the ones whose boundaries carry
-// layout. Everything else is dropped (its text kept); script/style/head/title
-// contents are dropped entirely.
-const BREAK_TAGS = [
-  'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'ul', 'ol', 'table', 'pre', 'hr',
-  'br', 'div', 'li', 'tr', 'td', 'th',
-];
-const NON_TEXT_TAGS = ['style', 'script', 'textarea', 'option', 'noscript', 'head', 'title'];
-// Applied to sanitize-html OUTPUT, where every tag is bare (no attributes) and
-// every literal `<` in text is escaped — so these match real tags only and
-// cannot backtrack across attacker-shaped markup.
-const PARAGRAPH_TAG_RE = /<\/?(?:p|h[1-6]|blockquote|ul|ol|table|pre)>|<hr ?\/?>/g;
-const LINE_TAG_RE = /<br ?\/?>|<\/?(?:div|li|tr)>/g;
-const CELL_TAG_RE = /<\/?t[dh]>/g;
-const PARA = '\u0002';
-const LINE = '\u0001';
-const BREAK_RUN_RE = /[ \u0001\u0002]*[\u0001\u0002][ \u0001\u0002]*/g;
-
-/**
- * Convert an HTML email body to plain text for the ticket pipeline (#6687).
- *
- * 1. sanitize-html keeps only the layout tags above (bare), decoding entities
- *    in text and re-escaping only `&`, `<`, `>`.
- * 2. Any U+0001/U+0002 now present is sender text (e.g. `&#2;`) — removed
- *    before those code points are used as break markers, so they stay
- *    unambiguous. Source whitespace is collapsed (not significant in HTML).
- * 3. Layout tags become markers (table cells a space); then entities decode.
- * 4. A run of adjacent markers collapses to one break — a blank line if any
- *    paragraph-level tag is in the run, else one newline — so `</div><div>`
- *    and `</li><li>` don't double-space.
- */
-function htmlToText(html: string): string {
-  const sanitized = sanitizeHtml(html.slice(0, MAX_HTML_INPUT_LENGTH), {
-    allowedTags: BREAK_TAGS,
-    allowedAttributes: {},
-    nonTextTags: NON_TEXT_TAGS,
-  });
-  const text = sanitized
-    .replace(/[\u0001\u0002]/g, '')
-    .replace(/\s+/g, ' ')
-    .replace(PARAGRAPH_TAG_RE, PARA)
-    .replace(LINE_TAG_RE, LINE)
-    .replace(CELL_TAG_RE, ' ')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/ /g, ' ')
-    .replace(/ {2,}/g, ' ')
-    .replace(BREAK_RUN_RE, (run) => (run.includes(PARA) ? '\n\n' : '\n'))
-    .trim()
-    .slice(0, MAX_HTML_DERIVED_TEXT_LENGTH);
-  // Don't leave half a surrogate pair where the clamp cut.
-  return text.replace(/[\uD800-\uDBFF]$/, '');
+function capBodyBytes(value: string): string {
+  if (Buffer.byteLength(value, 'utf8') <= MAX_BODY_BYTES) return value;
+  return Buffer.from(value, 'utf8').subarray(0, MAX_BODY_BYTES).toString('utf8').replace(/\uFFFD$/, '');
 }
 
 /** Pure mapping: Graph message -> the pipeline's NormalizedInboundEmail. */
@@ -146,6 +122,8 @@ export function normalizeGraphMessage(
     ? (msg.body?.content ?? '')
     : (html ? htmlToText(html) : '') || (msg.bodyPreview ?? '');
 
+  const senderAuth = graphSenderAuth(msg.internetMessageHeaders, mailboxDomain);
+
   return {
     provider: 'm365',
     providerMessageId: msg.id,
@@ -165,7 +143,7 @@ export function normalizeGraphMessage(
     // Loop/bounce signals (ingest-level loop suppression).
     returnPath: header(msg.internetMessageHeaders, 'Return-Path'),
     xLoop: header(msg.internetMessageHeaders, 'X-Loop'),
-    senderAuth: buildSenderAuth(trustedAuthResults(msg.internetMessageHeaders, mailboxDomain)),
+    senderAuth,
     // Metadata only across the queue — attachment bytes never go into Redis. The
     // inbound worker fetches them from Graph before processing when this is set
     // (services/ticketMailbox/fetchInboundAttachments.ts, #6688).
@@ -175,6 +153,18 @@ export function normalizeGraphMessage(
       ccRecipients: msg.ccRecipients ?? [],
       graphConversationId: msg.conversationId,
       receivedDateTime: msg.receivedDateTime,
+      // Audit trail for mail that passed the R4 gate on Exchange's intra-tenant stamp
+      // rather than DMARC (#8299); absent for every other message.
+      ...(senderAuth.source ? { senderAuthSource: senderAuth.source } : {}),
+      // Persist the normalized body + sender name under the same neutral keys the
+      // Gmail normalizer writes. ticket_email_inbound has no body column, and the
+      // review queue's "convert to ticket" rebuilds the description and submitter
+      // name from `raw` (convertEmailInbound). Without them a quarantined Microsoft
+      // 365 message converted to a ticket with only its subject (#8299). U+0000 is
+      // removed because Postgres jsonb rejects it, which would turn a quarantine
+      // into a failed insert. The stored body is capped at 1 MiB like Gmail's.
+      bodyText: capBodyBytes(stripNul(text)),
+      fromName: msg.from?.emailAddress?.name ? stripNul(msg.from.emailAddress.name) : null,
     },
   };
 }

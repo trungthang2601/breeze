@@ -1,5 +1,5 @@
 /**
- * SEC-038 W03 (#5534) — the terminal-intent contract, against real Postgres.
+ * #5534 — the terminal-intent contract, against real Postgres.
  *
  * Every entry point that moves a `remote_sessions` row to a terminal status
  * must go through `terminalIntentSet` so it bumps the SAME generation every
@@ -172,6 +172,7 @@ async function insertDevice(orgId: string, siteId: string): Promise<{ id: string
     agentVersion: '0.0.0-test',
     status: 'online',
     revocationLeaseProtocolVersion: 1,
+    desktopFenceProtocolVersion: 1,
     enrolledAt: new Date(),
   }).returning({ id: devices.id });
   if (!row) throw new Error('insertDevice: no row returned');
@@ -292,6 +293,9 @@ const fakeWs = { send: () => {}, close: () => {} } as unknown as Parameters<
 /** Drive the real agent WS onMessage with a command_result from the session's own agent. */
 async function agentResult(fx: Fixture, message: Record<string, unknown>): Promise<void> {
   const handlers = createAgentWsHandlers(fx.agentId, {
+    agentId: fx.agentId,
+    siteId: fx.env.site.id,
+    installIncarnation: 1,
     deviceId: fx.deviceId,
     orgId: fx.env.organization.id,
     partnerId: fx.env.partner.id,
@@ -619,7 +623,7 @@ const WRITERS: WriterCase[] = [
   },
 ];
 
-describe('SEC-038 W03 — one terminal-intent contract for every terminal writer', () => {
+describe('one terminal-intent contract for every terminal writer', () => {
   beforeEach(() => {
     dispatchCommandToAgentMock.mockClear();
     sendCommandToAgentMock.mockClear();
@@ -700,6 +704,7 @@ describe('SEC-038 W03 — one terminal-intent contract for every terminal writer
       sessionId: fx.sessionId,
       startCommandId: `desk-start-${fx.sessionId}-${randomUUID()}`,
       promptMode: 'off',
+      consentUnavailableBehavior: null,
       offer: OFFER,
     }));
     expect(start).toEqual({ ok: false, reason: 'terminal' });

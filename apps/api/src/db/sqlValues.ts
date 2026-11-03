@@ -93,3 +93,43 @@ export function sqlTimestamptz(value: Date): SQL<unknown> {
 export function sqlValue(value: unknown): SQL<unknown> {
   return value instanceof Date ? sqlTimestamp(value) : sql`${value}`;
 }
+
+/**
+ * Bind a list of uuids as a Postgres `uuid[]` for `= ANY(...)` / `<@` in a
+ * hand-written template: `ARRAY[$1::uuid, $2::uuid]`, and `ARRAY[]::uuid[]`
+ * when the list is empty.
+ *
+ * A bare array interpolation does NOT do this. Drizzle expands
+ * ``sql`x = ANY(${ids}::uuid[])` `` into `x = ANY(($1, $2)::uuid[])` — a
+ * syntax error — and an empty list into `()`. Each id stays its own bound
+ * parameter, so nothing is ever inlined as SQL text. (#3198 W02 ruling P5;
+ * moved here from a private copy in services/siteScope.ts.)
+ */
+export function sqlUuidArray(ids: readonly string[]): SQL<unknown> {
+  return ids.length === 0
+    ? sql<unknown>`ARRAY[]::uuid[]`
+    : sql<unknown>`ARRAY[${sql.join(
+        ids.map((id) => sql`${id}::uuid`),
+        sql`, `,
+      )}]`;
+}
+
+/**
+ * Bind a list of strings as a Postgres `text[]` for `&&` / `@>` / `= ANY(...)`
+ * in a hand-written template: `ARRAY[$1::text, $2::text]::text[]`, and
+ * `ARRAY[]::text[]` when the list is empty.
+ *
+ * Same trap as {@link sqlUuidArray}: a bare array interpolation renders as a
+ * row tuple, so ``sql`tags && ${['a']}` `` reaches Postgres as `tags && ($1)`
+ * ("malformed array literal") and two or more elements as `tags && ($1, $2)`
+ * ("operator does not exist: text[] && record"). (#8760, #8857; moved here from
+ * a private copy in services/filterEngine.ts.)
+ */
+export function sqlTextArray(values: readonly unknown[]): SQL<unknown> {
+  return values.length === 0
+    ? sql<unknown>`ARRAY[]::text[]`
+    : sql<unknown>`ARRAY[${sql.join(
+        values.map((value) => sql`${sqlValue(value)}::text`),
+        sql`, `,
+      )}]::text[]`;
+}

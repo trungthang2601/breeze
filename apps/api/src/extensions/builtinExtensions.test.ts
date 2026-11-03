@@ -21,6 +21,8 @@ import {
   resetExtensionTenancyCacheForTests,
 } from './tenancyRegistry';
 import { getTenantExportPolicyRegistry } from '../services/tenantExportPolicyRegistry';
+import { getOrgMergePolicies } from '../services/orgMergeRegistry';
+import { getOrgCascadeDeleteOrder } from '../services/tenantCascade';
 import {
   ExtensionContributionRegistry,
   type StagedExtensionContributions,
@@ -695,6 +697,71 @@ describe('loadBuiltinExtensions — deployment enable flag', () => {
     },
   );
 
+  // Wisp W08: `enableEnvAliases` (the workspace built-in's
+  // BREEZE_WISP_CONNECTOR_ENABLED) is a second way in through the REAL loader,
+  // and the disabled line names whichever flag the operator actually set.
+  describe('enable-flag aliases', () => {
+    const ALIAS = 'BREEZE_DEMO_BUILTIN_ALIAS_ENABLED';
+    afterEach(() => {
+      delete process.env[ALIAS];
+    });
+
+    it('loads the built-in when only the alias is "true"', async () => {
+      process.env[ALIAS] = 'true';
+      const warn = captureWarnings();
+      try {
+        const h = createHarness({ builtins: [fixtureBuiltin({ enableEnvAliases: [ALIAS] })] });
+        await h.load();
+        expect(h.registry.get(NAME)).toBeDefined();
+        expect(warn.mock.calls.map((c) => c.join(' ')).join('\n')).not.toContain('builtin_extension_disabled');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('a built-in without that alias ignores it', async () => {
+      process.env[ALIAS] = 'true';
+      const warn = captureWarnings();
+      try {
+        const h = createHarness({ builtins: [fixtureBuiltin()] });
+        await h.load();
+        expect(h.registry.get(NAME)).toBeUndefined();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('reports a mistyped alias as SET, naming the alias, with the canonical flag and alias list', async () => {
+      process.env[ALIAS] = '1';
+      const warn = captureWarnings();
+      try {
+        const h = createHarness({ builtins: [fixtureBuiltin({ enableEnvAliases: [ALIAS] })] });
+        await h.load();
+        expect(h.registry.get(NAME)).toBeUndefined();
+        const line = warn.mock.calls[0]!.join(' ');
+        expect(line).toContain(`${ALIAS} is SET but is not the exact string`);
+        expect(line).toContain('"observedValue":"1"');
+        expect(line).toContain(`"enableFlag":"${ENABLE_ENV_VAR}"`);
+        expect(line).toContain(`"enableFlagAliases":["${ALIAS}"]`);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('with nothing set, reports never-configured and still lists the alias', async () => {
+      const warn = captureWarnings();
+      try {
+        await createHarness({ builtins: [fixtureBuiltin({ enableEnvAliases: [ALIAS] })] }).load();
+        const line = warn.mock.calls[0]!.join(' ');
+        expect(line).toContain('"observedValue":null');
+        expect(line).toContain('opt-in per deployment');
+        expect(line).toContain(`"enableFlagAliases":["${ALIAS}"]`);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
+
   // A previously-enabled deployment left `demo_*` on the database. Without the
   // declaration, the unaccounted-public-tables sweep aborts boot on those
   // tables, and org-deletion cascades skip them.
@@ -1051,6 +1118,54 @@ describe('BUILTIN_EXTENSION_NAMES', () => {
   });
 
   /**
+   * W08 (spec §17.2, w00 A35): the connector is "Wisp" to users, so its flag
+   * gains the alias BREEZE_WISP_CONNECTOR_ENABLED. BREEZE_WORKSPACE_ENABLED
+   * keeps working (deployment contract above). The ENGINE flag
+   * BREEZE_WISP_ENABLED must never imply the connector: the connector needs
+   * pgvector and the engine does not.
+   */
+  it('also enables the workspace built-in under the BREEZE_WISP_CONNECTOR_ENABLED alias, never under BREEZE_WISP_ENABLED', () => {
+    const workspace = BUILTINS.find((builtin) => builtin.name === 'workspace')!;
+    expect(workspace.enableEnvAliases).toEqual(['BREEZE_WISP_CONNECTOR_ENABLED']);
+
+    const names = ['BREEZE_WORKSPACE_ENABLED', 'BREEZE_WISP_CONNECTOR_ENABLED', 'BREEZE_WISP_ENABLED'] as const;
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      for (const name of names) delete process.env[name];
+      expect(isBuiltinEnabled(workspace)).toBe(false);
+
+      process.env.BREEZE_WISP_CONNECTOR_ENABLED = 'true';
+      expect(isBuiltinEnabled(workspace)).toBe(true);
+
+      // Same strict-string convention as the primary flag.
+      process.env.BREEZE_WISP_CONNECTOR_ENABLED = '1';
+      expect(isBuiltinEnabled(workspace)).toBe(false);
+      delete process.env.BREEZE_WISP_CONNECTOR_ENABLED;
+
+      process.env.BREEZE_WISP_ENABLED = 'true';
+      expect(isBuiltinEnabled(workspace)).toBe(false);
+    } finally {
+      for (const name of names) {
+        if (previous[name] === undefined) delete process.env[name];
+        else process.env[name] = previous[name];
+      }
+    }
+  });
+
+  it('a built-in with no aliases is gated on its primary flag alone', () => {
+    const fixture = { ...BUILTINS[0]!, enableEnvVar: 'BREEZE_ALIAS_FIXTURE_ENABLED', enableEnvAliases: undefined };
+    vi.stubEnv('BREEZE_ALIAS_FIXTURE_ENABLED', 'true');
+    vi.stubEnv('BREEZE_WISP_CONNECTOR_ENABLED', 'true');
+    try {
+      expect(isBuiltinEnabled(fixture)).toBe(true);
+      vi.stubEnv('BREEZE_ALIAS_FIXTURE_ENABLED', '');
+      expect(isBuiltinEnabled(fixture)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  /**
    * Workspace's /helper/* tree is called by the device helper, so it must sit
    * behind core helper auth rather than the user default-deny. On the built-in
    * path that boundary is declared ONLY by this field — the legacy
@@ -1147,6 +1262,37 @@ describe('built-in tenancy participates in the tenant-export contract', () => {
   });
 });
 
+/**
+ * #4165: org merge walks the EXTENSION-AUGMENTED cascade order
+ * (`getOrgCascadeDeleteOrder()`) and throws `no merge policy registered for
+ * '<table>'` on the first table with no policy — so a built-in that declares
+ * org-cascade tables without `tenancy.orgMergePolicies` makes every org merge
+ * fail for the whole deployment the moment it boots. Pinned against the REAL
+ * manifest, in-process: the boot-time loader never runs under vitest, so
+ * `orgMergeRegistry.integration.test.ts`'s completeness check only ever sees
+ * the core list.
+ */
+describe('built-in tenancy participates in the org-merge contract (#4165)', () => {
+  afterEach(() => {
+    resetExtensionTenancyCacheForTests();
+  });
+
+  it('every table in the extension-augmented cascade order has a merge policy', () => {
+    const declarations = builtinTenancyDeclarations();
+    expect(declarations.flatMap((d) => d.orgCascadeDeleteTables).length).toBeGreaterThan(0);
+    for (const declaration of declarations) registerRuntimeExtensionTenancy(declaration);
+
+    const policies = getOrgMergePolicies();
+    const missing = getOrgCascadeDeleteOrder().filter((table) => !policies.has(table));
+    expect(missing).toEqual([]);
+
+    // The extension's tables are actually in the walk (not vacuously absent).
+    expect(getOrgCascadeDeleteOrder()).toContain('workspace_org_settings');
+    // A one-row-per-org settings table must never plain-repoint: the survivor's
+    // own row would collide on the org_id primary key.
+    expect(policies.get('workspace_org_settings')).toEqual({ kind: 'keep-survivor' });
+  });
+});
 
 describe('final public-table tenancy gate (#4283)', () => {
   it.each(['full', 'worker'] as const)('awaits the sweep and propagates failure in %s mode', async (mode) => {

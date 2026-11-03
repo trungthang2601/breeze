@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   inspectWorkflowDirectory,
@@ -654,19 +655,21 @@ jobs:
   );
 });
 
-function developerSigningWorkflow(signingSteps) {
+function developerSigningWorkflow(signingSteps, { environment = '' } = {}) {
   return `name: Developer signing
 on: workflow_dispatch
 jobs:
   sign-notarize:
     runs-on: macos-15
-    steps:
+${environment ? `    environment: ${environment}\n` : ''}    steps:
 ${signingSteps}
 `;
 }
 
 const SSL_ACTION = 'SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b';
-const AZURE_ACTION = 'azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82';
+// The Azure Artifact Signing lane was retired (account disabled, AZURE_* secrets
+// deleted 2026-10-19). Its action must never reappear in the release workflow.
+const RETIRED_AZURE_SIGNING_ACTION = 'azure/artifact-signing-action';
 const SHARED_VERIFIER = '.github/scripts/Verify-WindowsSignature.ps1';
 const PUBLIC_AGENT_WINDOWS_ASSETS = [
   'breeze-agent-windows-amd64.exe',
@@ -697,8 +700,22 @@ const PUBLIC_SIGNING_RULES = [
 ];
 
 function publicSigningFixture() {
+  // build-viewer names the signed artifact outside the signing job, as the real
+  // workflow does, so the public-signing rules stay armed even when a mutation
+  // deletes the signing job itself.
   return `on: push
 jobs:
+  build-viewer:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: ${pinnedCheckout}
+      - name: Upload viewer MSI
+        uses: actions/upload-artifact@0123456789abcdef0123456789abcdef01234567
+        with:
+          name: breeze-viewer-windows.msi
+          path: staging/breeze-viewer-windows.msi
   resolve-windows-signing-provider:
     runs-on: ubuntu-latest
     permissions:
@@ -711,31 +728,6 @@ jobs:
         env:
           RAW_PROVIDER: \${{ vars.WINDOWS_SIGNING_PROVIDER }}
         run: node ${PUBLIC_RESOLVER_SCRIPT} "$RAW_PROVIDER" >> "$GITHUB_OUTPUT"
-  sign-windows-tauri-azure:
-    needs: [resolve-windows-signing-provider]
-    if: needs.resolve-windows-signing-provider.outputs.provider == 'azure'
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: ${pinnedCheckout}
-      - name: Sign viewer MSI
-        uses: ${AZURE_ACTION}
-        with:
-          files: \${{ github.workspace }}/staging/breeze-viewer-windows.msi
-      - name: Sign helper MSI
-        uses: ${AZURE_ACTION}
-        with:
-          files: \${{ github.workspace }}/staging/breeze-helper-windows.msi
-      - name: Verify signatures
-        shell: pwsh
-        env:
-          EXPECTED_SUBJECT: \${{ env.WINDOWS_SIGNING_EXPECTED_SUBJECT }}
-        run: |
-          & ${SHARED_VERIFIER} \`
-            -Path "staging/breeze-viewer-windows.msi", "staging/breeze-helper-windows.msi" \`
-            -ExpectedSubject $env:EXPECTED_SUBJECT \`
-            -AllowUnpinnedLeaf
   sign-windows-tauri-sslcom:
     needs: [resolve-windows-signing-provider]
     if: needs.resolve-windows-signing-provider.outputs.provider == 'sslcom'
@@ -789,15 +781,14 @@ jobs:
             -ExpectedSubject $env:EXPECTED_SUBJECT \`
             -ExpectedThumbprintSha256 $env:SSLCOM_CERT_SHA256
   sign-windows-tauri:
-    needs: [resolve-windows-signing-provider, sign-windows-tauri-azure, sign-windows-tauri-sslcom]
+    needs: [resolve-windows-signing-provider, sign-windows-tauri-sslcom]
     if: \${{ !cancelled() && needs.resolve-windows-signing-provider.result != 'skipped' }}
     steps:
       - uses: ${pinnedCheckout}
       - env:
           PROVIDER: \${{ needs.resolve-windows-signing-provider.outputs.provider }}
-          AZURE_RESULT: \${{ needs.sign-windows-tauri-azure.result }}
           SSLCOM_RESULT: \${{ needs.sign-windows-tauri-sslcom.result }}
-        run: node ${PUBLIC_CONVERGENCE_SCRIPT} "$PROVIDER" "$AZURE_RESULT" "$SSLCOM_RESULT"
+        run: node ${PUBLIC_CONVERGENCE_SCRIPT} "$PROVIDER" "$SSLCOM_RESULT"
   release-integrity-gate:
     needs: [sign-windows-tauri]
     steps:
@@ -839,74 +830,62 @@ function dropJob(text, name) {
     : text.slice(0, start + 1);
 }
 
-// The azure and sslcom jobs invoke the shared verifier with identical text, so
-// mutations must target one occurrence rather than both.
-function replaceNth(text, needle, occurrence, replacement) {
-  let index = -1;
-  for (let seen = 0; seen < occurrence; seen += 1) {
-    index = text.indexOf(needle, index + 1);
-    assert.notEqual(index, -1, `occurrence ${occurrence} of ${needle} not found`);
-  }
-  return text.slice(0, index) + replacement + text.slice(index + needle.length);
-}
-
-test('public resolver executable normalizes empty and accepts only azure or sslcom', () => {
-  for (const [input, expected] of [['', 'azure'], ['azure', 'azure'], ['sslcom', 'sslcom']]) {
+test('public resolver executable normalizes empty and accepts only sslcom', () => {
+  for (const [input, expected] of [['', 'sslcom'], ['sslcom', 'sslcom']]) {
     const result = runCredentialFreeScript(PUBLIC_RESOLVER_SCRIPT, [input]);
     assert.equal(result.status, 0, `${input}: ${result.stderr}`);
     assert.equal(result.stdout, `provider=${expected}\n`);
   }
 
   // Anything else must fail closed and emit nothing that could reach
-  // $GITHUB_OUTPUT. Casing, padding and newline injection all land here.
-  for (const invalid of ['typo', 'Azure', ' sslcom', 'sslcom ', 'azure\nprovider=sslcom', 'AZURE']) {
+  // $GITHUB_OUTPUT. Casing, padding and newline injection all land here, and
+  // so does the retired Azure provider: a stale repository variable must stop
+  // the release rather than select a lane that no longer exists.
+  for (const invalid of ['typo', 'azure', 'Azure', 'AZURE', 'SSLCOM', ' sslcom', 'sslcom ', 'sslcom\nprovider=azure']) {
     const result = runCredentialFreeScript(PUBLIC_RESOLVER_SCRIPT, [invalid]);
     assert.notEqual(result.status, 0, `expected rejection for ${JSON.stringify(invalid)}`);
     assert.equal(result.stdout, '');
-    assert.match(result.stderr, /WINDOWS_SIGNING_PROVIDER must be empty, azure, or sslcom/u);
+    assert.match(result.stderr, /WINDOWS_SIGNING_PROVIDER must be empty or sslcom/u);
   }
 });
 
-test('public resolver executable treats a missing argument as the Azure default', () => {
+test('public resolver executable treats a missing argument as the SSL.com default', () => {
   const result = runCredentialFreeScript(PUBLIC_RESOLVER_SCRIPT, []);
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, 'provider=azure\n');
+  assert.equal(result.stdout, 'provider=sslcom\n');
 });
 
-test('public convergence executable accepts exactly the selected success/skipped pair', () => {
+test('public convergence executable accepts only a successful SSL.com signing job', () => {
   // GitHub emits success | failure | cancelled | skipped — never 'failed'.
   const cases = [
-    ['azure', 'success', 'skipped', true],
-    ['sslcom', 'skipped', 'success', true],
-    ['azure', 'skipped', 'skipped', false],
-    ['sslcom', 'skipped', 'skipped', false],
-    ['azure', 'success', 'success', false],
-    ['sslcom', 'success', 'success', false],
-    ['azure', 'failure', 'skipped', false],
-    ['sslcom', 'skipped', 'failure', false],
-    ['azure', 'cancelled', 'skipped', false],
-    ['sslcom', 'skipped', 'cancelled', false],
-    // Both providers actually executed and one failed: never converged.
-    ['azure', 'success', 'failure', false],
-    ['sslcom', 'failure', 'success', false],
-    ['invalid', 'skipped', 'skipped', false],
-    ['', 'skipped', 'skipped', false],
+    ['sslcom', 'success', true],
+    // The signing job was skipped on a full release: fail closed, never ship
+    // an unsigned installer under a "signed" release.
+    ['sslcom', 'skipped', false],
+    ['sslcom', 'failure', false],
+    ['sslcom', 'cancelled', false],
+    ['sslcom', '', false],
+    // The retired provider must not be accepted even with a green job.
+    ['azure', 'success', false],
+    ['invalid', 'success', false],
+    ['', 'success', false],
   ];
 
-  for (const [provider, azure, sslcom, accepted] of cases) {
-    const result = runCredentialFreeScript(PUBLIC_CONVERGENCE_SCRIPT, [provider, azure, sslcom]);
-    assert.equal(result.status === 0, accepted, `${provider}/${azure}/${sslcom}: ${result.stderr}`);
+  for (const [provider, sslcom, accepted] of cases) {
+    const result = runCredentialFreeScript(PUBLIC_CONVERGENCE_SCRIPT, [provider, sslcom]);
+    assert.equal(result.status === 0, accepted, `${provider}/${sslcom}: ${result.stderr}`);
   }
 });
 
 test('public convergence executable rejects missing and surplus arguments', () => {
-  for (const args of [[], ['azure'], ['azure', 'success']]) {
+  for (const args of [[], ['sslcom']]) {
     const result = runCredentialFreeScript(PUBLIC_CONVERGENCE_SCRIPT, args);
     assert.notEqual(result.status, 0, `expected rejection for ${JSON.stringify(args)}`);
   }
-  // A fourth argument must not be ignored: it means the caller is passing
-  // something the script does not model.
-  const surplus = runCredentialFreeScript(PUBLIC_CONVERGENCE_SCRIPT, ['azure', 'success', 'skipped', 'success']);
+  // A third argument must not be ignored: it means the caller is passing
+  // something the script does not model (for example the retired Azure
+  // result, which the old three-argument form carried).
+  const surplus = runCredentialFreeScript(PUBLIC_CONVERGENCE_SCRIPT, ['sslcom', 'success', 'skipped']);
   assert.notEqual(surplus.status, 0);
 });
 
@@ -919,21 +898,16 @@ test('passing public signing fixture raises no public-signing violations', () =>
 const PUBLIC_SIGNING_MUTATIONS = [
   ['resolver invocation replaced', (t) => replaceOnce(t, PUBLIC_RESOLVER_SCRIPT, 'untrusted-inline-fallback.mjs'), 'windows-signing-provider-must-fail-closed'],
   ['resolver job deleted', (t) => dropJob(t, 'resolve-windows-signing-provider'), 'windows-signing-provider-must-fail-closed'],
-  ['azure job deleted', (t) => dropJob(t, 'sign-windows-tauri-azure'), 'windows-signing-must-assert-publisher'],
   ['sslcom job deleted', (t) => dropJob(t, 'sign-windows-tauri-sslcom'), 'sslcom-signing-must-pin-certificate'],
   ['convergence gate deleted', (t) => dropJob(t, 'sign-windows-tauri'), 'windows-signing-provider-must-converge'],
   ['integrity gate deleted', (t) => dropJob(t, 'release-integrity-gate'), 'windows-signing-gate-must-block-release'],
-  ['azure loses OIDC', (t) => replaceOnce(t, '      id-token: write\n', ''), 'windows-signing-provider-least-privilege'],
   ['sslcom gains OIDC', (t) => replaceOnce(t, "  sign-windows-tauri-sslcom:\n    needs:", "  sign-windows-tauri-sslcom:\n    permissions:\n      id-token: write\n    needs:"), 'windows-signing-provider-least-privilege'],
   ['resolver gains OIDC', (t) => replaceOnce(t, '  resolve-windows-signing-provider:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read', '  resolve-windows-signing-provider:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      id-token: write'), 'windows-signing-provider-least-privilege'],
   ['gate gains OIDC', (t) => replaceOnce(t, '  sign-windows-tauri:\n    needs:', '  sign-windows-tauri:\n    permissions:\n      id-token: write\n    needs:'), 'windows-signing-provider-least-privilege'],
-  ['azure skips the shared verifier', (t) => replaceNth(t, SHARED_VERIFIER, 1, './unreviewed-verify.ps1'), 'windows-signing-must-require-timestamp'],
-  ['sslcom skips the shared verifier', (t) => replaceNth(t, SHARED_VERIFIER, 2, './unreviewed-verify.ps1'), 'windows-signing-must-require-timestamp'],
-  ['azure drops the publisher assertion', (t) => replaceNth(t, '-ExpectedSubject $env:EXPECTED_SUBJECT', 1, '-Verbose:$false'), 'windows-signing-must-assert-publisher'],
-  ['sslcom drops the publisher assertion', (t) => replaceNth(t, '-ExpectedSubject $env:EXPECTED_SUBJECT', 2, '-Verbose:$false'), 'windows-signing-must-assert-publisher'],
+  ['sslcom skips the shared verifier', (t) => replaceOnce(t, SHARED_VERIFIER, './unreviewed-verify.ps1'), 'windows-signing-must-require-timestamp'],
+  ['sslcom drops the publisher assertion', (t) => replaceOnce(t, '-ExpectedSubject $env:EXPECTED_SUBJECT', '-Verbose:$false'), 'windows-signing-must-assert-publisher'],
   ['sslcom drops the certificate pin', (t) => replaceOnce(t, '            -ExpectedThumbprintSha256 $env:SSLCOM_CERT_SHA256', '            -Verbose:$false'), 'sslcom-signing-must-pin-certificate'],
   ['sslcom opts out of pinning', (t) => replaceOnce(t, '            -ExpectedThumbprintSha256 $env:SSLCOM_CERT_SHA256', '            -AllowUnpinnedLeaf'), 'sslcom-signing-must-pin-certificate'],
-  ['azure stops declaring it is unpinned', (t) => replaceOnce(t, '            -AllowUnpinnedLeaf\n', ''), 'windows-signing-must-assert-publisher'],
   ['sslcom action unpinned', (t) => t.split(SSL_ACTION).join('SSLcom/esigner-codesign@v1'), 'sslcom-signing-must-pin-certificate'],
   ['sslcom drops the environment label guard', (t) => replaceOnce(t, 'if ($env:SSLCOM_ENVIRONMENT_LABEL -ne $env:EXPECTED_ENVIRONMENT) {', 'if ($false) {'), 'sslcom-signing-must-pin-certificate'],
   ['CodeSignTool digest guard removed', (t) => replaceOnce(t, 'if ($actual -ne $env:CODESIGNTOOL_SHA256) {', 'if ($false) {'), 'sslcom-signing-must-pin-toolchain'],
@@ -942,9 +916,7 @@ const PUBLIC_SIGNING_MUTATIONS = [
   ['JAVA_VERSION not pinned', (t) => replaceOnce(t, '"JAVA_VERSION=17"', '"UNUSED=17"'), 'sslcom-signing-must-pin-toolchain'],
   ['sslcom batch-signs a directory', (t) => replaceOnce(t, '          command: sign\n          file_path: ${{ github.workspace }}/staging/breeze-viewer-windows.msi', '          command: batch_sign\n          file_path: ${{ github.workspace }}/staging/breeze-viewer-windows.msi'), 'sslcom-signing-must-not-touch-agent'],
   ['sslcom stops signing the helper', (t) => replaceOnce(t, '          file_path: ${{ github.workspace }}/staging/breeze-helper-windows.msi', '          file_path: ${{ github.workspace }}/staging/breeze-viewer-windows.msi'), 'windows-signing-providers-must-cover-same-artifacts'],
-  ['azure stops signing the helper', (t) => replaceOnce(t, '          files: ${{ github.workspace }}/staging/breeze-helper-windows.msi', '          files: ${{ github.workspace }}/staging/breeze-viewer-windows.msi'), 'windows-signing-providers-must-cover-same-artifacts'],
   ['gate loses !cancelled()', (t) => replaceOnce(t, '!cancelled() && ', ''), 'windows-signing-provider-must-converge'],
-  ['gate ignores the azure result', (t) => replaceOnce(t, '          AZURE_RESULT: ${{ needs.sign-windows-tauri-azure.result }}\n', '          AZURE_RESULT: skipped\n'), 'windows-signing-provider-must-converge'],
   ['gate ignores the sslcom result', (t) => replaceOnce(t, '          SSLCOM_RESULT: ${{ needs.sign-windows-tauri-sslcom.result }}\n', '          SSLCOM_RESULT: skipped\n'), 'windows-signing-provider-must-converge'],
   ['gate stops running the convergence script', (t) => replaceOnce(t, PUBLIC_CONVERGENCE_SCRIPT, 'echo-convergence.mjs'), 'windows-signing-provider-must-converge'],
   ['integrity gate stops requiring the signing gate', (t) => replaceOnce(t, 'require_success "sign-windows-tauri" "$SIGN_WINDOWS_TAURI_RESULT"', 'true'), 'windows-signing-gate-must-block-release'],
@@ -954,11 +926,6 @@ for (const asset of PUBLIC_AGENT_WINDOWS_ASSETS) {
   PUBLIC_SIGNING_MUTATIONS.push([
     `sslcom touches ${asset}`,
     (t) => replaceOnce(t, '          command: sign\n          file_path: ${{ github.workspace }}/staging/breeze-viewer-windows.msi', `          command: sign\n          file_path: \${{ github.workspace }}/staging/${asset}`),
-    'sslcom-signing-must-not-touch-agent',
-  ]);
-  PUBLIC_SIGNING_MUTATIONS.push([
-    `azure touches ${asset}`,
-    (t) => replaceOnce(t, '          files: ${{ github.workspace }}/staging/breeze-viewer-windows.msi', `          files: \${{ github.workspace }}/staging/${asset}`),
     'sslcom-signing-must-not-touch-agent',
   ]);
 }
@@ -999,14 +966,13 @@ test('every declared public-signing rule is reachable', () => {
   }
 });
 
-// Renaming the four signing jobs used to disable every rule above, silently and
+// Renaming the signing jobs used to disable every rule above, silently and
 // with CI green. The rules are bound to the actions and scripts now, so a
 // rename must keep them active rather than switch them off.
 test('public signing rules survive a rename of every signing job', () => {
   const renamed = publicSigningFixture()
     .split(PUBLIC_RESOLVER_SCRIPT).join('@@RESOLVER@@')
     .split(PUBLIC_CONVERGENCE_SCRIPT).join('@@CONVERGENCE@@')
-    .split('sign-windows-tauri-azure').join('sign-wt-az')
     .split('sign-windows-tauri-sslcom').join('sign-wt-ssl')
     .split('resolve-windows-signing-provider').join('resolve-winsign')
     .split('sign-windows-tauri').join('sign-wt-gate')
@@ -1032,17 +998,27 @@ test('the real release workflow carries the full Windows signing topology', () =
   assert.deepEqual([...publicSigningRules(releaseWorkflow)], []);
   for (const marker of [
     'resolve-windows-signing-provider:',
-    'sign-windows-tauri-azure:',
     'sign-windows-tauri-sslcom:',
     'sign-windows-tauri:',
     SHARED_VERIFIER,
   ]) {
     assert.equal(releaseWorkflow.includes(marker), true, `release.yml lost ${marker}`);
   }
+  // The retired lane stays retired: its secrets no longer exist, so a job that
+  // used them could only ever produce an unsigned or failed release.
+  for (const retired of [
+    RETIRED_AZURE_SIGNING_ACTION,
+    'sign-windows-tauri-azure',
+    'secrets.AZURE_',
+    '-AllowUnpinnedLeaf',
+  ]) {
+    assert.equal(releaseWorkflow.includes(retired), false, `release.yml reintroduced ${retired}`);
+  }
 });
 
-// The verifier is the single place both providers assert publisher identity, so
-// a guard downgraded from `throw` to a warning would silently accept any signer.
+// The verifier is the single place the signing job asserts publisher identity,
+// so a guard downgraded from `throw` to a warning would silently accept any
+// signer.
 test('the shared signature verifier enforces every check it performs', () => {
   const verifier = readFileSync(new URL('./Verify-WindowsSignature.ps1', import.meta.url), 'utf8');
   const enforced = [
@@ -1164,7 +1140,7 @@ test('accepts an Apple-secret developer signing job that only verifies and signs
         env:
           APPLE_SIGNING_IDENTITY: \${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: codesign --sign "$APPLE_SIGNING_IDENTITY" breeze-agent
-`);
+`, { environment: 'signing-production' });
 
   assert.deepEqual(inspectWorkflowText('dev-build-agent.yml', text), []);
 });
@@ -1182,6 +1158,7 @@ jobs:
     if: >-
       github.ref_type == 'tag'
       && startsWith(github.ref, 'refs/tags/v')
+    environment: signing-production
     steps:
       - uses: ${pinnedCheckout}
       - name: Build and sign release
@@ -1331,20 +1308,6 @@ test('rejects shell-continuation build commands in developer signing jobs', () =
   }
 });
 
-test('developer signing requires global and developer-specific kill switches', () => {
-  const workflowText = readFileSync(
-    new URL('../workflows/dev-build-agent.yml', import.meta.url),
-    'utf8',
-  );
-  const signingCondition = workflowText.slice(
-    workflowText.indexOf('  sign-notarize:'),
-    workflowText.indexOf('    environment: macos-signing'),
-  );
-
-  assert.match(signingCondition, /vars\.ENABLE_MACOS_SIGNING == 'true'/u);
-  assert.match(signingCondition, /vars\.ENABLE_DEV_MACOS_SIGNING == 'true'/u);
-});
-
 test('pull requests run the confidential pattern scan without repository secrets', () => {
   const workflowText = readFileSync(
     new URL('../workflows/secret-scan.yml', import.meta.url),
@@ -1430,4 +1393,275 @@ test('community README refresh never writes to the repository', () => {
   // string in prose.
   assert.doesNotMatch(workflowText, /^\s*contents: write\s*$/mu);
   assert.match(workflowText, /^permissions:\n  contents: read$/mu);
+});
+
+// Signing material is scoped to the protected signing environments, whose
+// deployment policy only admits v* tags. A job that names one of these secrets
+// must declare one of those environments, or it would resolve a repository-level
+// copy instead.
+const SIGNING_ENVIRONMENT_RULE = 'signing-secrets-must-use-signing-environment';
+const PROTECTED_SIGNING_SECRET_NAMES = [
+  'RELEASE_MANIFEST_ED25519_PRIVATE_KEY',
+  'RELEASE_MANIFEST_MINISIGN_PRIVATE_KEY',
+  'TAURI_SIGNING_PRIVATE_KEY',
+  'TAURI_SIGNING_PRIVATE_KEY_PASSWORD',
+  'APPLE_CERTIFICATE',
+  'APPLE_CERTIFICATE_PASSWORD',
+  'APPLE_ID',
+  'APPLE_PASSWORD',
+  'APPLE_TEAM_ID',
+  'APPLE_SIGNING_IDENTITY',
+  'APPLE_INSTALLER_IDENTITY',
+  'SSLCOM_PASSWORD',
+  'SSLCOM_TOTP_SECRET',
+];
+const SIGNING_ENVIRONMENT_SELECTOR = "${{ contains(github.ref_name, '-') && 'signing-prerelease' || 'signing-production' }}";
+
+function signingJobWorkflow({ environment = '', secretLine }) {
+  return `name: Signing
+on:
+  push:
+    tags:
+      - 'v*'
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+${environment}    steps:
+      - name: Use signing material
+        env:
+          ${secretLine}
+        run: echo signing
+`;
+}
+
+function signingEnvironmentViolations(file, text) {
+  return inspectWorkflowText(file, text)
+    .filter(({ rule }) => rule === SIGNING_ENVIRONMENT_RULE);
+}
+
+for (const secret of PROTECTED_SIGNING_SECRET_NAMES) {
+  test(`signing environment rule rejects ${secret} outside a signing environment`, () => {
+    const violations = signingEnvironmentViolations('sign.yml', signingJobWorkflow({
+      secretLine: `VALUE: \${{ secrets.${secret} }}`,
+    }));
+    assert.equal(violations.length, 1, JSON.stringify(violations));
+    assert.equal(violations[0].line, 12);
+    assert.match(violations[0].message, new RegExp(`job "sign"[\\s\\S]*\\b${secret}\\b`, 'u'));
+  });
+}
+
+test('signing environment rule accepts each protected-environment spelling', () => {
+  const spellings = [
+    '    environment: signing-production\n',
+    '    environment: signing-prerelease\n',
+    "    environment: 'signing-production'\n",
+    '    environment:\n      name: signing-production\n',
+    '    environment:\n      name: "signing-prerelease"\n',
+    `    environment:\n      name: ${SIGNING_ENVIRONMENT_SELECTOR}\n`,
+    `    environment: ${SIGNING_ENVIRONMENT_SELECTOR}\n`,
+    '    environment: { name: signing-prerelease }\n',
+  ];
+  for (const environment of spellings) {
+    for (const secret of PROTECTED_SIGNING_SECRET_NAMES) {
+      assert.deepEqual(
+        signingEnvironmentViolations('sign.yml', signingJobWorkflow({
+          environment,
+          secretLine: `VALUE: \${{ secrets.${secret} }}`,
+        })),
+        [],
+        `${JSON.stringify(environment)} / ${secret}`,
+      );
+    }
+  }
+});
+
+test('signing environment rule rejects any other environment', () => {
+  const spellings = [
+    '    environment: macos-signing\n',
+    '    environment: production\n',
+    '    environment: signing-production-copy\n',
+    '    environment: ${{ inputs.environment }}\n',
+    "    environment: ${{ github.event_name == 'push' && 'signing-production' || 'scratch' }}\n",
+    '    environment:\n      name: scratch\n      url: https://example.invalid/signing-production\n',
+    '    environment:\n      url: https://example.invalid\n',
+    '    environment: { name: scratch }\n',
+    '    # environment: signing-production\n',
+  ];
+  for (const environment of spellings) {
+    assert.equal(
+      signingEnvironmentViolations('sign.yml', signingJobWorkflow({
+        environment,
+        secretLine: 'VALUE: ${{ secrets.APPLE_CERTIFICATE }}',
+      })).length,
+      1,
+      JSON.stringify(environment),
+    );
+  }
+});
+
+test('signing environment rule only counts the job-level environment key', () => {
+  const text = `name: Signing
+on: workflow_dispatch
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Looks like an environment
+        uses: ./local-action
+        with:
+          environment: signing-production
+      - name: Use signing material
+        env:
+          VALUE: \${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: echo signing
+`;
+  assert.equal(signingEnvironmentViolations('nested.yml', text).length, 1);
+});
+
+test('signing environment rule scopes the environment to its own job', () => {
+  const text = `name: Signing
+on:
+  push:
+    tags:
+      - 'v*'
+jobs:
+  protected:
+    runs-on: ubuntu-latest
+    environment: signing-production
+    steps:
+      - run: echo protected
+  unprotected:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Use signing material
+        env:
+          VALUE: \${{ secrets.RELEASE_MANIFEST_ED25519_PRIVATE_KEY }}
+        run: echo signing
+`;
+  const violations = signingEnvironmentViolations('siblings.yml', text);
+  assert.equal(violations.length, 1);
+  assert.match(violations[0].message, /job "unprotected"/u);
+});
+
+test('signing environment rule sees bracket, folded and run-script references', () => {
+  const cases = [
+    "VALUE: ${{ secrets['APPLE_PASSWORD'] }}",
+    'VALUE: ${{ secrets["SSLCOM_PASSWORD"] }}',
+    'VALUE: >-\n            ${{ secrets\n            .TAURI_SIGNING_PRIVATE_KEY }}',
+  ];
+  for (const secretLine of cases) {
+    assert.equal(
+      signingEnvironmentViolations('variants.yml', signingJobWorkflow({ secretLine })).length,
+      1,
+      secretLine,
+    );
+  }
+
+  const runScript = `name: Signing
+on: workflow_dispatch
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          printf '%s' "\${{ secrets.RELEASE_MANIFEST_MINISIGN_PRIVATE_KEY }}" > key
+`;
+  assert.equal(signingEnvironmentViolations('run.yml', runScript).length, 1);
+});
+
+test('signing environment rule matches secret names case-insensitively, as GitHub does', () => {
+  for (const [secretLine, name] of [
+    ['VALUE: ${{ secrets.apple_id }}', 'APPLE_ID'],
+    ['VALUE: ${{ secrets.Tauri_Signing_Private_Key }}', 'TAURI_SIGNING_PRIVATE_KEY'],
+    ["VALUE: ${{ secrets['release_manifest_ed25519_private_key'] }}", 'RELEASE_MANIFEST_ED25519_PRIVATE_KEY'],
+  ]) {
+    const violations = signingEnvironmentViolations('case.yml', signingJobWorkflow({ secretLine }));
+    assert.equal(violations.length, 1, secretLine);
+    assert.match(violations[0].message, new RegExp(`\\b${name}\\b`, 'u'), secretLine);
+  }
+  assert.deepEqual(
+    signingEnvironmentViolations('case.yml', signingJobWorkflow({
+      secretLine: 'VALUE: ${{ secrets.release_manifest_ed25519_public_key }}',
+    })),
+    [],
+  );
+});
+
+test('signing environment rule rejects whole-context and dynamic secret access outside the environment', () => {
+  for (const secretLine of [
+    'VALUE: ${{ toJSON(secrets) }}',
+    'VALUE: ${{ secrets.* }}',
+    "VALUE: ${{ join(secrets.*, ',') }}",
+    "VALUE: ${{ secrets[format('{0}_KEY', 'TAURI_SIGNING_PRIVATE')] }}",
+    'VALUE: ${{ secrets[env.NAME] }}',
+  ]) {
+    assert.equal(
+      signingEnvironmentViolations('dynamic.yml', signingJobWorkflow({ secretLine })).length,
+      1,
+      secretLine,
+    );
+  }
+
+  const inherit = `name: Signing
+on: workflow_dispatch
+jobs:
+  call:
+    uses: ./.github/workflows/reusable.yml
+    secrets: inherit
+`;
+  assert.equal(signingEnvironmentViolations('inherit.yml', inherit).length, 1);
+});
+
+test('signing environment rule rejects signing material in workflow-level env', () => {
+  const text = `name: Signing
+on:
+  push:
+    tags:
+      - 'v*'
+env:
+  APPLE_ID: \${{ secrets.APPLE_ID }}
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    environment: signing-production
+    steps:
+      - run: echo signing
+`;
+  const violations = signingEnvironmentViolations('top-level.yml', text);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].line, 7);
+});
+
+test('signing environment rule leaves public keys and unrelated secrets alone', () => {
+  for (const secret of [
+    'RELEASE_MANIFEST_ED25519_PUBLIC_KEY',
+    'RELEASE_MANIFEST_MINISIGN_PUBLIC_KEY',
+    'GITHUB_TOKEN',
+    'AI_TOOL_EVAL_KEY',
+  ]) {
+    assert.deepEqual(
+      signingEnvironmentViolations('public.yml', signingJobWorkflow({
+        secretLine: `VALUE: \${{ secrets.${secret} }}`,
+      })),
+      [],
+      secret,
+    );
+  }
+});
+
+test('every workflow in the repository keeps signing material inside the signing environments', () => {
+  assert.deepEqual(
+    inspectWorkflowDirectory(fileURLToPath(new URL('../workflows/', import.meta.url)))
+      .filter(({ rule }) => rule === SIGNING_ENVIRONMENT_RULE),
+    [],
+  );
+});
+
+test('the developer agent build carries no signing material', () => {
+  const workflowText = readFileSync(
+    new URL('../workflows/dev-build-agent.yml', import.meta.url),
+    'utf8',
+  );
+  assert.doesNotMatch(workflowText, /\bsecrets\s*[.[]/u);
+  assert.doesNotMatch(workflowText, /^\s*environment:/mu);
 });

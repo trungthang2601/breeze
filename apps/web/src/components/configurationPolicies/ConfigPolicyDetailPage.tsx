@@ -3,13 +3,14 @@ import {
   ArrowLeft,
   Layers,
   Target,
-  Bell,
   Wrench,
   ClipboardCheck,
   PackageCheck,
   Zap,
   Link2,
   HardDrive,
+  Clock,
+  Container,
   Shield,
   ShieldCheck,
   ShieldAlert,
@@ -17,7 +18,6 @@ import {
   ScrollText,
   ScanSearch,
   Usb,
-  Activity,
   LifeBuoy,
   Monitor,
   Radar,
@@ -25,13 +25,14 @@ import {
   Cloud,
   Info,
   Trash2,
+  History,
 } from "lucide-react";
 import Breadcrumbs from "../layout/Breadcrumbs";
 import { cn } from "@/lib/utils";
 import { useJwtClaims } from "@/lib/authScope";
 import { extractApiError } from "@/lib/apiError";
 import { useHashTab } from "@/lib/useHashState";
-import { OverflowTabs } from "../shared/OverflowTabs";
+import { OverflowTabs, overflowPanelId, overflowTabId } from "../shared/OverflowTabs";
 import { fetchWithAuth } from "../../stores/auth";
 import { useTranslation } from "react-i18next";
 import { i18n } from "@/lib/i18n";
@@ -45,7 +46,6 @@ import { FEATURE_META } from './featureTabs/types';
 import { useFeatureLink } from './featureTabs/useFeatureLink';
 import AssignmentsTab from './AssignmentsTab';
 import PatchTab from './featureTabs/PatchTab';
-import AlertRuleTab from './featureTabs/AlertRuleTab';
 import MonitorsTab from './featureTabs/MonitorsTab';
 import BackupTab from './featureTabs/BackupTab';
 import SecurityTab from './featureTabs/SecurityTab';
@@ -56,7 +56,6 @@ import EventLogTab from './featureTabs/EventLogTab';
 import SoftwarePolicyTab from './featureTabs/SoftwarePolicyTab';
 import SensitiveDataTab from './featureTabs/SensitiveDataTab';
 import PeripheralControlTab from './featureTabs/PeripheralControlTab';
-import MonitoringTab from './featureTabs/MonitoringTab';
 import WarrantyTab from './featureTabs/WarrantyTab';
 import HelperTab from './featureTabs/HelperTab';
 import RemoteAccessTab from './featureTabs/RemoteAccessTab';
@@ -64,7 +63,13 @@ import PamTab from './featureTabs/PamTab';
 import VulnerabilityTab from './featureTabs/VulnerabilityTab';
 import DeviceLifecycleTab from './featureTabs/DeviceLifecycleTab';
 import OneDriveHelperTab from './featureTabs/OneDriveHelperTab';
+import HardwareMonitoringTab from './featureTabs/HardwareMonitoringTab';
+import TimeSyncTab from './featureTabs/TimeSyncTab';
+import WorkloadInventoryTab from './featureTabs/WorkloadInventoryTab';
+import SecurityAgentsTab from './featureTabs/SecurityAgentsTab';
+import SystemProtectionTab from './featureTabs/SystemProtectionTab';
 import ComplianceStatusTab from './ComplianceStatusTab';
+import { usePageItemName } from '../layout/usePageItemName';
 
 type Tab = 'overview' | FeatureType | 'assignments' | 'compliance_status';
 type PolicyDetail = {
@@ -109,7 +114,6 @@ const createStatusConfig = (): Record<
 // feature type fails to compile until it gets a tab-bar icon. (#2004)
 const featureTabIcons: Record<FeatureType, React.ReactNode> = {
   patch: <PackageCheck className="h-4 w-4" />,
-  alert_rule: <Bell className="h-4 w-4" />,
   monitors: <Radar className="h-4 w-4" />,
   backup: <HardDrive className="h-4 w-4" />,
   security: <Shield className="h-4 w-4" />,
@@ -120,7 +124,6 @@ const featureTabIcons: Record<FeatureType, React.ReactNode> = {
   software_policy: <PackageCheck className="h-4 w-4" />,
   sensitive_data: <ScanSearch className="h-4 w-4" />,
   peripheral_control: <Usb className="h-4 w-4" />,
-  monitoring: <Activity className="h-4 w-4" />,
   warranty: <ShieldCheck className="h-4 w-4" />,
   helper: <LifeBuoy className="h-4 w-4" />,
   remote_access: <Monitor className="h-4 w-4" />,
@@ -128,6 +131,11 @@ const featureTabIcons: Record<FeatureType, React.ReactNode> = {
   vulnerability: <ShieldAlert className="h-4 w-4" />,
   device_lifecycle: <Trash2 className="h-4 w-4" />,
   onedrive_helper: <Cloud className="h-4 w-4" />,
+  hardware_monitoring: <HardDrive className="h-4 w-4" />,
+  time_sync: <Clock className="h-4 w-4" />,
+  workload_inventory: <Container className="h-4 w-4" />,
+  security_agents: <ShieldCheck className="h-4 w-4" />,
+  system_protection: <History className="h-4 w-4" />,
 };
 // Which feature tabs the editor renders, in display order. Derived from
 // FEATURE_META keys (not a hand-listed subset) so it stays in lockstep with the
@@ -139,13 +147,19 @@ export const FEATURE_TYPES = Object.keys(FEATURE_META) as FeatureType[];
 
 // Every tab id that may appear in the URL hash, so a deep link / the contextual
 // help button can select the right tab. The feature-tab id is the raw
-// FeatureType key (e.g. `alert_rule`).
+// FeatureType key (e.g. `monitors`).
 const VALID_TABS: Tab[] = [
   "overview",
   ...FEATURE_TYPES,
   "compliance_status",
   "assignments",
 ];
+
+// Preserve saved links to the retired tabs and canonicalize their hashes.
+export const LEGACY_TAB_ALIASES: Record<'alert_rule' | 'monitoring', 'monitors'> = {
+  alert_rule: 'monitors',
+  monitoring: 'monitors',
+};
 
 type ConfigPolicyDetailPageProps = {
   policyId?: string;
@@ -160,6 +174,19 @@ export default function ConfigPolicyDetailPage({
   // reading it in the useState initializer caused a hydration mismatch on
   // deep links to a non-default tab (#2421).
   const [activeTab, setActiveTab] = useHashTab<Tab>(VALID_TABS, "overview");
+
+  useEffect(() => {
+    const redirectLegacyHash = () => {
+      const raw = window.location.hash.replace(/^#/, '');
+      if (!Object.prototype.hasOwnProperty.call(LEGACY_TAB_ALIASES, raw)) return;
+      const alias = LEGACY_TAB_ALIASES[raw as keyof typeof LEGACY_TAB_ALIASES];
+      window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}#${alias}`);
+      setActiveTab(alias);
+    };
+    redirectLegacyHash();
+    window.addEventListener('hashchange', redirectLegacyHash);
+    return () => window.removeEventListener('hashchange', redirectLegacyHash);
+  }, [setActiveTab]);
 
   // Reflect the active tab in the URL hash so tabs are deep-linkable and the
   // contextual help button resolves to the right per-feature doc.
@@ -394,6 +421,8 @@ export default function ConfigPolicyDetailPage({
       icon: <Target className="h-4 w-4" />,
     },
   ];
+  usePageItemName(policy?.name);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -433,11 +462,12 @@ export default function ConfigPolicyDetailPage({
       onLinkChanged: handleLinkChanged,
       linkedPolicyId,
       parentLink: parentLinkFor(ft),
+      siblingLinks: featureLinks,
       orgId: policy?.orgId ?? null,
+      partnerId: policy?.partnerId ?? null,
     };
     switch (ft) {
       case 'patch': return <PatchTab {...props} />;
-      case 'alert_rule': return <AlertRuleTab {...props} />;
       case 'monitors': return <MonitorsTab {...props} />;
       case 'backup': return <BackupTab {...props} />;
       case 'security': return <SecurityTab {...props} />;
@@ -447,7 +477,6 @@ export default function ConfigPolicyDetailPage({
       case 'event_log': return <EventLogTab {...props} />;
       case 'software_policy': return <SoftwarePolicyTab {...props} />;
       case 'sensitive_data': return <SensitiveDataTab {...props} />;
-      case 'monitoring': return <MonitoringTab {...props} />;
       case 'peripheral_control': return <PeripheralControlTab {...props} />;
       case 'warranty': return <WarrantyTab {...props} />;
       case 'helper': return <HelperTab {...props} />;
@@ -456,6 +485,11 @@ export default function ConfigPolicyDetailPage({
       case 'vulnerability': return <VulnerabilityTab {...props} />;
       case 'device_lifecycle': return <DeviceLifecycleTab {...props} />;
       case 'onedrive_helper': return <OneDriveHelperTab {...props} />;
+      case 'hardware_monitoring': return <HardwareMonitoringTab {...props} />;
+      case 'time_sync': return <TimeSyncTab {...props} />;
+      case 'workload_inventory': return <WorkloadInventoryTab {...props} />;
+      case 'security_agents': return <SecurityAgentsTab {...props} />;
+      case 'system_protection': return <SystemProtectionTab {...props} />;
     }
   };
   return (
@@ -483,6 +517,9 @@ export default function ConfigPolicyDetailPage({
           <a
             href="/configuration-policies"
             className="inline-flex h-8 w-8 items-center justify-center rounded-md border hover:bg-muted"
+            aria-label={i18n.t(
+              "policies:configurationPolicies.configPolicyDetailPage.backToList",
+            )}
           >
             <ArrowLeft className="h-4 w-4" />
           </a>
@@ -522,6 +559,17 @@ export default function ConfigPolicyDetailPage({
         onTabChange={(id) => selectTab(id as Tab)}
       />
 
+      {/* Tab panel: exactly one of the activeTab-gated blocks below renders
+          at a time, so this single wrapper always matches whichever tab
+          button's aria-controls is currently pointing at it (axe:
+          aria-valid-attr-value / aria-required-children — #7179). */}
+      <div
+        role="tabpanel"
+        id={overflowPanelId(activeTab)}
+        aria-labelledby={overflowTabId(activeTab)}
+        tabIndex={-1}
+        className="space-y-6"
+      >
       {/* Overview Tab */}
       {activeTab === "overview" && (
         <div className="rounded-lg border bg-card p-6 shadow-xs">
@@ -532,30 +580,33 @@ export default function ConfigPolicyDetailPage({
           </h2>
           <div className="mt-4 grid gap-4">
             <div>
-              <label className="text-sm font-medium">
+              <label htmlFor="config-policy-name" className="text-sm font-medium">
                 {i18n.t("common:labels.name")}
               </label>
               <input
+                id="config-policy-name"
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
                 className="mt-2 h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
               />
             </div>
             <div>
-              <label className="text-sm font-medium">
+              <label htmlFor="config-policy-description" className="text-sm font-medium">
                 {i18n.t("common:labels.description")}
               </label>
               <textarea
+                id="config-policy-description"
                 value={editDescription}
                 onChange={(e) => setEditDescription(e.target.value)}
                 className="mt-2 h-20 w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
               />
             </div>
             <div>
-              <label className="text-sm font-medium">
+              <label htmlFor="config-policy-status" className="text-sm font-medium">
                 {i18n.t("common:labels.status")}
               </label>
               <select
+                id="config-policy-status"
                 value={editStatus}
                 onChange={(e) => setEditStatus(e.target.value)}
                 className="mt-2 h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-48"
@@ -740,6 +791,7 @@ export default function ConfigPolicyDetailPage({
             partnerId={policy.partnerId}
           />
         )}
+      </div>
     </div>
   );
 }

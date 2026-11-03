@@ -10,7 +10,7 @@ import {
   upsertRecoveryReadiness
 } from './store';
 import { resolveAllBackupAssignedDevices, type BackupAssignedDevice } from '../../services/featureConfigResolver';
-import type { RecoveryReadiness, RecoveryRiskFactor } from './types';
+import { VERIFICATION_TIMEOUT_MS, type BackupVerification, type RecoveryReadiness, type RecoveryRiskFactor } from './types';
 // NOTE: Circular import with verificationService is intentional and safe.
 // listBackupVerifications is only called at function invocation time, not at module evaluation.
 import {
@@ -21,6 +21,7 @@ import {
   listBackupVerifications
 } from './verificationService';
 import { isCriticalBackupDevice } from './criticality';
+import { loadBareMetalEvidence, type BareMetalEvidenceSummary } from '../../services/bareMetalReadinessEvidence';
 
 const MINUTE_MS = 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -32,6 +33,37 @@ const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
   const withSystem = dbModule.withSystemDbAccessContext;
   return typeof withSystem === 'function' ? withSystem(fn) : fn();
 };
+
+const BARE_METAL_FAILED_PENALTY = 10;
+
+const BARE_METAL_EVIDENCE_UNAVAILABLE: RecoveryRiskFactor = {
+  code: 'bare_metal_evidence_unavailable',
+  severity: 'low',
+  message: 'Bare-metal rebuild history could not be read; this score reflects verification results only.',
+};
+
+/**
+ * Evidence is additive: a lookup failure must never block the generic readiness
+ * write, but the persisted row says so (`unavailable`) instead of silently
+ * dropping a failed-rebuild penalty.
+ */
+async function loadBareMetalEvidenceSafe(
+  orgId: string,
+  deviceId: string,
+  now: number,
+): Promise<{ summary: BareMetalEvidenceSummary | null; unavailable: boolean }> {
+  if (!isUuid(orgId) || !isUuid(deviceId)) return { summary: null, unavailable: false };
+  try {
+    const summary = await loadBareMetalEvidence(orgId, deviceId, now);
+    return { summary: summary.hasEvidence ? summary : null, unavailable: false };
+  } catch (error) {
+    console.warn(
+      `[BackupReadiness] Bare-metal evidence lookup failed (org ${orgId}, device ${deviceId}); using verification-only readiness:`,
+      error instanceof Error ? (error.stack ?? error.message) : error,
+    );
+    return { summary: null, unavailable: true };
+  }
+}
 
 function isUuid(value?: string | null): value is string {
   return typeof value === 'string' && UUID_RE.test(value);
@@ -356,12 +388,21 @@ export async function recomputeRecoveryReadinessForDevice(
   orgId: string,
   deviceId: string
 ): Promise<RecoveryReadiness> {
-  const [recent, previous] = await Promise.all([
+  const [listed, previous] = await Promise.all([
     listBackupVerifications(orgId, { deviceId, limit: BACKUP_MAX_RECENT_VERIFICATIONS, excludeSimulated: true }),
     getRecoveryReadinessForDevice(orgId, deviceId)
   ]);
   const previousScore = previous?.readinessScore ?? null;
   const now = Date.now();
+  // #7495: a verification that has not finished yet (pending/running) is
+  // neutral — it is excluded from the score instead of counting as a failure.
+  // One stuck past VERIFICATION_TIMEOUT_MS is a real failure (the timeout job
+  // will mark it failed; count it here too so a lagging reaper can't hide it).
+  const recent = listed.map((row): BackupVerification => {
+    if (row.status !== 'pending' && row.status !== 'running') return row;
+    const stuck = (now - toEpoch(row.startedAt)) > VERIFICATION_TIMEOUT_MS;
+    return stuck ? { ...row, status: 'failed' } : row;
+  }).filter((row) => row.status !== 'pending' && row.status !== 'running');
 
   if (recent.length === 0) {
     const readiness = await writeRecoveryReadiness({
@@ -418,7 +459,11 @@ export async function recomputeRecoveryReadinessForDevice(
     .map((row) => row.restoreTimeSeconds ?? null)
     .filter((value): value is number => typeof value === 'number' && value > 0);
   const avgRestoreSeconds = average(restoreSamples);
-  const restoreQuality = avgRestoreSeconds === null ? 0 : clamp(1 - ((avgRestoreSeconds - 180) / 3600), 0, 1);
+  // No restore-test evidence at all: treat this band as neutral (full credit)
+  // rather than zeroing it out. MISSING_RESTORE_PROOF_PENALTY already charges
+  // for the lack of restore proof below — zeroing this band too would charge
+  // the same missing evidence twice (see #3970).
+  const restoreQuality = avgRestoreSeconds === null ? 1 : clamp(1 - ((avgRestoreSeconds - 180) / 3600), 0, 1);
 
   const lastRunAt = toEpoch(recent[0]?.completedAt ?? recent[0]?.startedAt);
   const ageDays = Math.max(0, (now - lastRunAt) / DAY_MS);
@@ -465,11 +510,24 @@ export async function recomputeRecoveryReadinessForDevice(
     ? Math.max(0, Math.round((now - toEpoch(latestBackup.completedAt)) / MINUTE_MS))
     : null;
 
+  // W08: real bare-metal rebuild outcomes. A measured full rebuild is stronger
+  // RTO evidence than a file-level test restore, so take the slower of the two;
+  // a failed latest rebuild is a recovery-proof failure and costs 10 points.
+  const { summary: bareMetal, unavailable: bareMetalUnavailable } = await loadBareMetalEvidenceSafe(orgId, deviceId, now);
+  if (bareMetalUnavailable) riskFactors.push(BARE_METAL_EVIDENCE_UNAVAILABLE);
+  const verificationRtoMinutes = avgRestoreSeconds ? Math.ceil(avgRestoreSeconds / 60) : null;
+  const measuredRto = bareMetal?.measuredRtoMinutes ?? null;
+  const estimatedRtoMinutes = verificationRtoMinutes !== null && measuredRto !== null
+    ? Math.max(verificationRtoMinutes, measuredRto)
+    : (measuredRto ?? verificationRtoMinutes);
+  if (bareMetal) riskFactors.push(...bareMetal.riskFactors);
+  const finalScore = bareMetal?.latestFailed ? clamp(readinessScore - BARE_METAL_FAILED_PENALTY, 0, 100) : readinessScore;
+
   const readiness = await writeRecoveryReadiness({
     orgId,
     deviceId,
-    readinessScore,
-    estimatedRtoMinutes: avgRestoreSeconds ? Math.ceil(avgRestoreSeconds / 60) : null,
+    readinessScore: finalScore,
+    estimatedRtoMinutes,
     estimatedRpoMinutes,
     riskFactors,
     calculatedAt: new Date().toISOString()

@@ -12,10 +12,12 @@ import {
   Users
 } from 'lucide-react';
 import { cn, formatNumber, formatRelativeTime } from '@/lib/utils';
+import { FilterSelect } from '../shared/FilterSelect';
 import { fetchWithAuth } from '../../stores/auth';
 import { formatNumber as formatLocaleNumber } from '@/lib/i18n/format';
 import { ApproximateMoneyLine } from '@/components/billing/shared/ApproximateMoneyLine';
 import { formatMoney, sumByCurrency } from '@/components/billing/shared/format';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type Device = {
   id?: string | number;
@@ -311,6 +313,7 @@ function normalizeDeviceData(customers: CustomerOverview[], fallbackDeviceName: 
 
 export default function PartnerDashboard() {
   const { t } = useTranslation('common');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -324,7 +327,7 @@ export default function PartnerDashboard() {
       setError(undefined);
       const response = await fetchWithAuth('/partner/dashboard');
       if (!response.ok) {
-        throw new Error(t('longTail.partner.PartnerDashboard.errors.fetchFailed'));
+        throw new Error(stableT('longTail.partner.PartnerDashboard.errors.fetchFailed'));
       }
       const payload = await response.json();
       const data = payload?.data ?? payload ?? {};
@@ -333,11 +336,11 @@ export default function PartnerDashboard() {
         : data.customers ?? data.organizations ?? data.items ?? data.results ?? [];
       setCustomers(Array.isArray(list) ? list : []);
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('longTail.partner.PartnerDashboard.errors.fetchFailed'));
+      setError(err instanceof Error ? err.message : stableT('longTail.partner.PartnerDashboard.errors.fetchFailed'));
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [stableT]);
 
   useEffect(() => {
     fetchCustomers();
@@ -486,25 +489,27 @@ export default function PartnerDashboard() {
                     className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
                   />
                 </div>
-                <select
+                <FilterSelect
+                  label={t('longTail.partner.PartnerDashboard.healthFilterLabel')}
                   value={healthFilter}
                   onChange={event => setHealthFilter(event.target.value as 'all' | HealthLabel)}
-                  className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  className="h-10"
                 >
                   <option value="all">{t('longTail.partner.PartnerDashboard.allHealth')}</option>
                   <option value="healthy">{t('longTail.partner.PartnerDashboard.health.healthy')}</option>
                   <option value="warning">{t('longTail.partner.PartnerDashboard.health.warning')}</option>
                   <option value="critical">{t('longTail.partner.PartnerDashboard.health.critical')}</option>
-                </select>
-                <select
+                </FilterSelect>
+                <FilterSelect
+                  label={t('longTail.partner.PartnerDashboard.sortFilterLabel')}
                   value={sortKey}
                   onChange={event => setSortKey(event.target.value as SortKey)}
-                  className="h-10 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  className="h-10"
                 >
                   <option value="health">{t('longTail.partner.PartnerDashboard.sort.health')}</option>
                   <option value="devices">{t('longTail.partner.PartnerDashboard.sort.devices')}</option>
                   <option value="name">{t('longTail.partner.PartnerDashboard.sort.name')}</option>
-                </select>
+                </FilterSelect>
               </div>
             </div>
 

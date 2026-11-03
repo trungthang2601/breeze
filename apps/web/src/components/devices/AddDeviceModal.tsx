@@ -17,6 +17,7 @@ import {
   clampTtlToOfferableOption,
   enrollmentTtlOptionsIncluding,
   ENROLLMENT_TTL_I18N_KEYS,
+  MAX_BOOTSTRAP_TOKEN_TTL_MINUTES,
   MAX_ENROLLMENT_TTL_MINUTES,
   PRODUCT_DEFAULT_ENROLLMENT_DEVICE_COUNT,
   PRODUCT_DEFAULT_ENROLLMENT_TTL_MINUTES,
@@ -40,6 +41,10 @@ function detectUserOS(): "windows" | "macos" | "linux" {
  * Without the last case, validation failures against those collapse to a
  * bare status code — see PR #739 review.
  */
+// Asks an artifact route to delete a freshly minted parent key when it does
+// not produce the artifact (#7217). Never sent for a reused parent (#7345).
+const DISCARD_ON_FAILURE = "discardKeyOnFailure=1";
+
 function extractApiError(body: unknown): string {
   if (!body || typeof body !== "object") return "";
   const b = body as { message?: unknown; error?: unknown };
@@ -141,6 +146,15 @@ export default function AddDeviceModal({
     enrollmentDefaults?.deviceCount ?? PRODUCT_DEFAULT_ENROLLMENT_DEVICE_COUNT;
   const maxTtlMinutes =
     enrollmentDefaults?.maxTtlMinutes ?? MAX_ENROLLMENT_TTL_MINUTES;
+  // The installer tab mints a credential embedded in the downloaded installer
+  // (and sizes the shared link), which the installer routes hold to 30 days:
+  // they 400 an explicit ttlMinutes above MAX_BOOTSTRAP_TOKEN_TTL_MINUTES. So
+  // its picker is bounded by that as well as the partner cap. The CLI tab
+  // mints an enrollment key and keeps the partner cap alone.
+  const installerMaxTtlMinutes = Math.min(
+    maxTtlMinutes,
+    MAX_BOOTSTRAP_TOKEN_TTL_MINUTES,
+  );
   // ONE option set for both tabs and both settings editors, filtered to what
   // the partner cap actually permits. Offering a longer lifetime than the
   // server will mint is the silent-discard defect this work removes: the mint
@@ -178,8 +192,8 @@ export default function AddDeviceModal({
   // the server resolves it to a fresh absolute expiry measured from mint
   // time — not the transient parent key. Seeded from the partner/org resolved
   // default and bounded by the partner cap (`maxEnrollmentLinkTtlMinutes`,
-  // shipped in #2776 — see services/enrollmentDefaults.ts); the product
-  // fallback when neither is set is still 24h.
+  // shipped in #2776 — see services/enrollmentDefaults.ts) and by the 30-day
+  // installer maximum (`installerMaxTtlMinutes` above).
   //
   // "Never expires" stays deliberately unimplemented, and is NOT merely a UI
   // omission: `installer_bootstrap_tokens.expires_at` is NOT NULL with a
@@ -200,10 +214,16 @@ export default function AddDeviceModal({
   const [linkError, setLinkError] = useState<string>();
   const [linkCopied, setLinkCopied] = useState(false);
 
-  // CLI tab state (lazy-loaded)
-  const [cliInitialized, setCliInitialized] = useState(false);
+  // CLI tab state. The token is minted only when the operator clicks
+  // Generate (#7035) — never on tab open — because every mint is a live,
+  // multi-use enrollment key that outlives this modal.
   const [onboardingToken, setOnboardingToken] = useState("");
+  // Site the displayed token is bound to, as echoed by the server (#7035).
+  const [tokenSiteId, setTokenSiteId] = useState<string | null>(null);
   const [enrollmentSecret, setEnrollmentSecret] = useState("");
+  // Server URL agents enroll against, as the API reports it at runtime
+  // (#8120). Empty when the server sent none.
+  const [tokenServerUrl, setTokenServerUrl] = useState("");
   const [tokenLoading, setTokenLoading] = useState(false);
   const [tokenError, setTokenError] = useState<string>();
   const [tokenCopied, setTokenCopied] = useState(false);
@@ -229,8 +249,8 @@ export default function AddDeviceModal({
   // useMemo body runs during render, so referencing `ttlMinutes` above its
   // `useState` would hit the temporal dead zone.
   const ttlOptions = useMemo(
-    () => enrollmentTtlOptionsIncluding(maxTtlMinutes, ttlMinutes),
-    [maxTtlMinutes, ttlMinutes],
+    () => enrollmentTtlOptionsIncluding(installerMaxTtlMinutes, ttlMinutes),
+    [installerMaxTtlMinutes, ttlMinutes],
   );
   const cliTtlOptions = useMemo(
     () => enrollmentTtlOptionsIncluding(maxTtlMinutes, cliTtlMinutes),
@@ -276,8 +296,8 @@ export default function AddDeviceModal({
       // deviceCount / ttlMinutes / cliDeviceCount / cliTtlMinutes are reset by
       // the seeding effect below instead — they come from the resolved
       // partner/org defaults, which may still be in flight when this runs.
-      setCliInitialized(false);
       setOnboardingToken("");
+      setTokenSiteId(null);
       setTokenError(undefined);
       setTokenMaxUsage(null);
       setTokenExpiresAt(null);
@@ -291,8 +311,7 @@ export default function AddDeviceModal({
   // from the reset effect above because the defaults arrive asynchronously with
   // the sites response, so this must re-seed once they land instead of leaving
   // the operator on the product fallback. Keeping it out of the reset effect
-  // also stops a late arrival from clearing `cliInitialized` and re-minting a
-  // CLI token that already exists.
+  // also stops a late arrival from clearing a CLI token that already exists.
   //
   // The dep array keys on the three PRIMITIVE values, not the
   // `enrollmentDefaults` object: Zustand hands back a fresh object on every
@@ -306,37 +325,51 @@ export default function AddDeviceModal({
     if (!isOpen) return;
     setDeviceCount(defaultDeviceCount);
     setCliDeviceCount(defaultDeviceCount);
-    setTtlMinutes(clampTtlToOfferableOption(defaultTtlMinutes, maxTtlMinutes));
+    setTtlMinutes(clampTtlToOfferableOption(defaultTtlMinutes, installerMaxTtlMinutes));
     setCliTtlMinutes(clampTtlToOfferableOption(defaultTtlMinutes, maxTtlMinutes));
-  }, [isOpen, defaultTtlMinutes, defaultDeviceCount, maxTtlMinutes]);
+  }, [isOpen, defaultTtlMinutes, defaultDeviceCount, maxTtlMinutes, installerMaxTtlMinutes]);
 
   // Belt-and-braces against a stale selection outliving a cap change: if the
   // cap tightens under a value the operator already picked (or a resolved
   // default lands above it), fold it down to the largest still-offerable
   // option rather than posting a ttlMinutes the mint routes will 400.
   useEffect(() => {
-    setTtlMinutes((prev) => clampTtlToOfferableOption(prev, maxTtlMinutes));
+    setTtlMinutes((prev) => clampTtlToOfferableOption(prev, installerMaxTtlMinutes));
     setCliTtlMinutes((prev) => clampTtlToOfferableOption(prev, maxTtlMinutes));
-  }, [maxTtlMinutes]);
+  }, [maxTtlMinutes, installerMaxTtlMinutes]);
 
-  // Guards against overlapping CLI token fetches (the auto-init effect racing a
-  // manual "Generate new token", or a fast double-click). A ref, not state, so
+  // Guards against overlapping CLI token fetches (a fast double-click on
+  // Generate, or Generate racing the error-state Retry). A ref, not state, so
   // the check is synchronous and never stale inside the useCallback. Without it
   // two in-flight POSTs could resolve out of order and display a token whose
   // real maxUsage disagrees with the UI — the exact defect #1108 fixes.
   const cliFetchInFlight = useRef(false);
 
-  // Fetch a CLI onboarding token for `count` machines (#1108). The once-per-open
-  // gating lives in the auto-init effect; the "Generate new token" button and
-  // error-retry call this directly to re-mint, so it only self-guards against
-  // concurrent runs rather than against being called again.
-  const initializeCli = useCallback(async (count: number, ttlMinutes: number) => {
-    if (cliFetchInFlight.current) return;
+  // #7422: "copied" reset timers — cleared on reschedule and unmount so they
+  // never set state after the component (or jsdom) is gone.
+  const linkCopiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tokenCopiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (linkCopiedTimer.current) clearTimeout(linkCopiedTimer.current);
+      if (tokenCopiedTimer.current) clearTimeout(tokenCopiedTimer.current);
+    },
+    [],
+  );
+
+  // Mint a CLI onboarding token for `count` machines (#1108) on `siteId`
+  // (#7035). Only ever called from an explicit operator click (Generate /
+  // Generate new token / Retry), so it self-guards against concurrent runs
+  // only. The inline token-area error UI (incl. the MFA_REQUIRED banner) is
+  // the outcome surface here, which is why this is not wrapped in runAction.
+  const initializeCli = useCallback(async (count: number, ttlMinutes: number, siteId: string) => {
+    if (!siteId || cliFetchInFlight.current) return;
     cliFetchInFlight.current = true;
-    setCliInitialized(true);
     setTokenLoading(true);
     setOnboardingToken("");
+    setTokenSiteId(null);
     setEnrollmentSecret("");
+    setTokenServerUrl("");
     setTokenError(undefined);
     setTokenMaxUsage(null);
     setTokenExpiresAt(null);
@@ -348,7 +381,7 @@ export default function AddDeviceModal({
         // JSON content type is mandatory — without it Hono hands the
         // validator `{}` and ttlMinutes is silently dropped (#2777).
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ count, ttlMinutes }),
+        body: JSON.stringify({ count, ttlMinutes, siteId }),
       });
 
       if (!response.ok) {
@@ -388,6 +421,7 @@ export default function AddDeviceModal({
         return;
       }
       setOnboardingToken(data.token);
+      setTokenSiteId(typeof data.siteId === "string" ? data.siteId : siteId);
       if (typeof data.maxUsage === "number") {
         setTokenMaxUsage(data.maxUsage);
       }
@@ -396,6 +430,9 @@ export default function AddDeviceModal({
       }
       if (data.enrollmentSecret) {
         setEnrollmentSecret(data.enrollmentSecret);
+      }
+      if (typeof data.serverUrl === "string" && data.serverUrl) {
+        setTokenServerUrl(data.serverUrl);
       }
     } catch (err) {
       setTokenError(
@@ -412,12 +449,66 @@ export default function AddDeviceModal({
   // Re-mint the CLI token, e.g. after the operator bumps the device count or
   // wants a fresh one mid-session (#1108).
   const regenerateCliToken = useCallback(
-    (count: number, ttlMinutes: number) => {
+    (count: number, ttlMinutes: number, siteId: string) => {
       setTokenCopied(false);
-      void initializeCli(count, ttlMinutes);
+      void initializeCli(count, ttlMinutes, siteId);
     },
     [initializeCli],
   );
+
+  // #7345: Download and Generate Link build from ONE parent key per site
+  // (and per user), not one per click. The server returns the existing parent
+  // when it is still good (`reused: true`) and mints one only when it is not;
+  // the raw key never leaves the server, since neither artifact needs it.
+  async function getAddDeviceParent(): Promise<
+    { id: string; reused: boolean } | { error: string }
+  > {
+    const keyRes = await fetchWithAuth("/enrollment-keys/add-device-parent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ siteId: selectedSiteId, orgId: currentOrgId }),
+    });
+    if (!keyRes.ok) {
+      const body = await keyRes
+        .json()
+        .catch(() => ({ error: t("addDeviceModal.failedToCreateEnrollmentKey") }));
+      const rawMessage = extractApiError(body);
+      if (keyRes.status === 403 && rawMessage.toLowerCase().includes("mfa required")) {
+        return { error: "MFA_REQUIRED" };
+      }
+      return {
+        error: rawMessage || `Failed to create enrollment key (${keyRes.status})`,
+      };
+    }
+    const data = (await keyRes.json()) as { id: string; reused?: boolean };
+    return { id: data.id, reused: data.reused === true };
+  }
+
+  // #7217: a parent minted for THIS attempt must not outlive a failed one. On
+  // an HTTP failure the server discards it itself (the request carries
+  // ?discardKeyOnFailure=1). When the request never got an answer — network
+  // drop, timeout — the server may never have seen it, so the modal deletes
+  // the key here. Best effort: a key it cannot delete is logged, and the next
+  // attempt reuses it (#7345). A REUSED parent is never discarded either way:
+  // it already backs installers delivered earlier.
+  async function discardMintedKey(keyId: string) {
+    try {
+      const res = await fetchWithAuth(`/enrollment-keys/${keyId}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        console.error("[AddDeviceModal] could not delete the enrollment key of a failed attempt", {
+          keyId,
+          status: res.status,
+        });
+      }
+    } catch (err) {
+      console.error("[AddDeviceModal] could not delete the enrollment key of a failed attempt", {
+        keyId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // Exchange a raw enrollment key token for a short-lived one-time handle, then
   // navigate to the public-download URL. This keeps the raw token out of browser
@@ -440,21 +531,67 @@ export default function AddDeviceModal({
     window.location.href = `/api/v1/enrollment-keys/public-download/${platform}?h=${encodeURIComponent(handle)}`;
   }
 
-  // Auto-load the CLI token whenever the CLI tab is showing and we haven't
-  // minted one yet. This single effect covers both an explicit tab click and
-  // the Linux default where the CLI tab is already active on open (#1108).
-  useEffect(() => {
-    if (isOpen && activeTab === "cli" && !cliInitialized) {
-      void initializeCli(cliDeviceCount, cliTtlMinutes);
-    }
-  }, [
-    isOpen,
-    activeTab,
-    cliInitialized,
-    cliDeviceCount,
-    cliTtlMinutes,
-    initializeCli,
-  ]);
+  // Name of the site the current CLI token enrolls into, so a token minted
+  // before the operator changed the picker never reads as the new site's.
+  const tokenSiteName = tokenSiteId
+    ? (orgSites.find((site) => site.id === tokenSiteId)?.name ?? null)
+    : null;
+
+  // Site picker shared by both tabs (#7035): the installer and the CLI token
+  // are both enrollment keys bound to ONE site, so they read the same
+  // `selectedSiteId`. `siteNotice` covers loading / load-failed / no-sites.
+  const siteNotice =
+    orgSites.length === 0 && sitesLoading ? (
+      <div className="rounded-md border p-4 text-sm text-muted-foreground">
+        {t("addDeviceModal.sitesLoading")}
+      </div>
+    ) : orgSites.length === 0 && sitesError ? (
+      <div className="rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+        {t("addDeviceModal.sitesLoadFailed")}{" "}
+        <button
+          type="button"
+          onClick={() => void fetchSites()}
+          className="font-medium underline hover:no-underline"
+        >
+          {t("addDeviceModal.retrySites")}
+        </button>
+      </div>
+    ) : orgSites.length === 0 ? (
+      <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-700">
+        {t("addDeviceModal.noSitesAvailablePlease")}{" "}
+        <a
+          href="/organizations"
+          className="font-medium underline hover:no-underline"
+        >
+          {t("addDeviceModal.createASite")}{" "}
+        </a>{" "}
+        {t("addDeviceModal.first")}{" "}
+      </div>
+    ) : null;
+
+  const renderSiteSelect = (id: string) => (
+    <div>
+      <label
+        htmlFor={id}
+        className="block text-sm font-medium mb-1.5"
+      >
+        {t("addDeviceModal.site")}{" "}
+      </label>
+      <select
+        id={id}
+        data-testid={id}
+        value={selectedSiteId}
+        onChange={(e) => setSelectedSiteId(e.target.value)}
+        className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
+      >
+        {orgSites.map((site) => (
+          <option key={site.id} value={site.id}>
+            {site.name}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
 
   const handleTabChange = (tab: "installer" | "cli") => {
     setActiveTab(tab);
@@ -467,59 +604,25 @@ export default function AddDeviceModal({
     setDownloadError(undefined);
     setDownloadSuccess(false);
 
-    let parentKeyId: string | undefined;
+    // Only a parent minted for this attempt may be discarded when it fails.
+    let freshParentKeyId: string | undefined;
+    // Set once the installer response is in hand: from then on the server
+    // produced the artifact and the key is in use, whatever happens next.
+    let downloadProduced = false;
 
     try {
-      // Step 1: Create the parent enrollment key. The installer downloaded in
-      // step 2 carries a *bootstrap token* issued from this parent — whose own
+      // Step 1: The site's parent key. The installer downloaded in step 2
+      // carries a *bootstrap token* issued from this parent — whose own
       // max_usage IS the device count, redeemable once per device — not the
       // parent key itself (only the legacy macOS zip embeds a real child
-      // enrollment key).
-      //
-      // maxUsage is deliberately NOT set from deviceCount (#2992). It is
-      // tempting — the Enrollment Keys page renders usage_count / max_usage,
-      // so an unset maxUsage takes the API's `?? 1` default and the row reads
-      // "0 / 1" for an installer minted for X devices. But max_usage is an
-      // enforced enrollment budget, not a label: /agents/enroll matches any key
-      // with usage_count < max_usage, and the short-link and MCP-invite paths
-      // atomically claim usage_count against it. Widening it here would hand
-      // this key N direct-enrollment slots to fix a display bug, and would make
-      // the same column mean different things depending on which flow minted
-      // the key. The real device-count cap lives on the installer_bootstrap_
-      // tokens row; the Enrollment Keys list now reads it (see
-      // EnrollmentKeyManager's usage cell).
-      const keyRes = await fetchWithAuth("/enrollment-keys", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: `Add device installer (${new Date().toISOString().slice(0, 10)})`,
-          siteId: selectedSiteId,
-          orgId: currentOrgId,
-        }),
-      });
-
-      if (!keyRes.ok) {
-        const body = await keyRes
-          .json()
-          .catch(() => ({
-            error: t("addDeviceModal.failedToCreateEnrollmentKey"),
-          }));
-        const rawMessage = extractApiError(body);
-        if (
-          keyRes.status === 403 &&
-          rawMessage.toLowerCase().includes("mfa required")
-        ) {
-          setDownloadError("MFA_REQUIRED");
-        } else {
-          setDownloadError(
-            rawMessage || `Failed to create enrollment key (${keyRes.status})`,
-          );
-        }
+      // enrollment key). The parent's own max_usage stays 1 (#2992): it is an
+      // enforced enrollment budget, not a label.
+      const parent = await getAddDeviceParent();
+      if ("error" in parent) {
+        setDownloadError(parent.error);
         return;
       }
-
-      const keyData = await keyRes.json();
-      parentKeyId = keyData.id;
+      if (!parent.reused) freshParentKeyId = parent.id;
 
       // Step 2: Download installer (use longer timeout — binary can be large)
       const dlController = new AbortController();
@@ -527,7 +630,7 @@ export default function AddDeviceModal({
       let dlRes: Response;
       try {
         dlRes = await fetchWithAuth(
-          `/enrollment-keys/${parentKeyId}/installer/${selectedPlatform}?count=${deviceCount}&ttlMinutes=${ttlMinutes}`,
+          `/enrollment-keys/${parent.id}/installer/${selectedPlatform}?count=${deviceCount}&ttlMinutes=${ttlMinutes}${parent.reused ? "" : `&${DISCARD_ON_FAILURE}`}`,
           { signal: dlController.signal },
         );
       } finally {
@@ -544,6 +647,7 @@ export default function AddDeviceModal({
         return;
       }
 
+      downloadProduced = true;
       const blob = await dlRes.blob();
       const filename =
         filenameFromContentDisposition(
@@ -560,6 +664,7 @@ export default function AddDeviceModal({
 
       setDownloadSuccess(true);
     } catch (err) {
+      if (freshParentKeyId && !downloadProduced) void discardMintedKey(freshParentKeyId);
       if (err instanceof DOMException && err.name === "AbortError") {
         setDownloadError(
           "Download timed out. Please check your connection and try again.",
@@ -581,43 +686,21 @@ export default function AddDeviceModal({
     setLinkError(undefined);
     setGeneratedLink("");
 
+    let freshParentKeyId: string | undefined;
+    let linkAnswered = false;
     try {
-      // Step 1: Create parent enrollment key
-      const keyRes = await fetchWithAuth("/enrollment-keys", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: `Add device link (${new Date().toISOString().slice(0, 10)})`,
-          siteId: selectedSiteId,
-          orgId: currentOrgId,
-        }),
-      });
-
-      if (!keyRes.ok) {
-        const body = await keyRes
-          .json()
-          .catch(() => ({
-            error: t("addDeviceModal.failedToCreateEnrollmentKey"),
-          }));
-        const rawMessage = extractApiError(body);
-        if (
-          keyRes.status === 403 &&
-          rawMessage.toLowerCase().includes("mfa required")
-        ) {
-          setLinkError("MFA_REQUIRED");
-        } else {
-          setLinkError(
-            rawMessage || `Failed to create enrollment key (${keyRes.status})`,
-          );
-        }
+      // Step 1: The site's parent key. The link itself is its own short-coded
+      // child row; the parent is shared with Download (#7345).
+      const parent = await getAddDeviceParent();
+      if ("error" in parent) {
+        setLinkError(parent.error);
         return;
       }
-
-      const keyData = await keyRes.json();
+      if (!parent.reused) freshParentKeyId = parent.id;
 
       // Step 2: Generate public link
       const linkRes = await fetchWithAuth(
-        `/enrollment-keys/${keyData.id}/installer-link`,
+        `/enrollment-keys/${parent.id}/installer-link${parent.reused ? "" : `?${DISCARD_ON_FAILURE}`}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -628,6 +711,7 @@ export default function AddDeviceModal({
           }),
         },
       );
+      linkAnswered = true;
 
       if (!linkRes.ok) {
         const body = await linkRes
@@ -643,6 +727,7 @@ export default function AddDeviceModal({
       const linkData = await linkRes.json();
       setGeneratedLink(linkData.shortUrl ?? linkData.url);
     } catch (err) {
+      if (freshParentKeyId && !linkAnswered) void discardMintedKey(freshParentKeyId);
       const message =
         err instanceof Error ? err.message : t("addDeviceModal.unknownError");
       setLinkError(`Failed to generate link: ${message}`);
@@ -656,7 +741,8 @@ export default function AddDeviceModal({
     try {
       await navigator.clipboard.writeText(generatedLink);
       setLinkCopied(true);
-      setTimeout(() => setLinkCopied(false), 2000);
+      if (linkCopiedTimer.current) clearTimeout(linkCopiedTimer.current);
+      linkCopiedTimer.current = setTimeout(() => setLinkCopied(false), 2000);
       showToast({
         type: "success",
         message: t("addDeviceModal.linkCopiedToClipboard"),
@@ -675,7 +761,8 @@ export default function AddDeviceModal({
     try {
       await navigator.clipboard.writeText(onboardingToken);
       setTokenCopied(true);
-      setTimeout(() => setTokenCopied(false), 2000);
+      if (tokenCopiedTimer.current) clearTimeout(tokenCopiedTimer.current);
+      tokenCopiedTimer.current = setTimeout(() => setTokenCopied(false), 2000);
     } catch {
       showToast({
         type: "error",
@@ -705,6 +792,11 @@ export default function AddDeviceModal({
       onClose={onClose}
       title={t("addDeviceModal.addNewDevice")}
       maxWidth="2xl"
+      // D14: the CLI > Windows tab makes this panel taller than a common
+      // 1280x900 viewport, which pushes the Done button below the fold when
+      // the backdrop centers it — only Esc could close the modal. Top-align
+      // and let the backdrop itself scroll instead.
+      alignTop
     >
       <div className="p-6">
         <h2 className="text-lg font-semibold mb-4">
@@ -735,55 +827,9 @@ export default function AddDeviceModal({
         {/* Installer tab */}
         {activeTab === "installer" && (
           <div className="space-y-5">
-            {orgSites.length === 0 && sitesLoading ? (
-              <div className="rounded-md border p-4 text-sm text-muted-foreground">
-                {t("addDeviceModal.sitesLoading")}
-              </div>
-            ) : orgSites.length === 0 && sitesError ? (
-              <div className="rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
-                {t("addDeviceModal.sitesLoadFailed")}{" "}
-                <button
-                  type="button"
-                  onClick={() => void fetchSites()}
-                  className="font-medium underline hover:no-underline"
-                >
-                  {t("addDeviceModal.retrySites")}
-                </button>
-              </div>
-            ) : orgSites.length === 0 ? (
-              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-700">
-                {t("addDeviceModal.noSitesAvailablePlease")}{" "}
-                <a
-                  href="/organizations"
-                  className="font-medium underline hover:no-underline"
-                >
-                  {t("addDeviceModal.createASite")}{" "}
-                </a>{" "}
-                {t("addDeviceModal.first")}{" "}
-              </div>
-            ) : (
+            {siteNotice ?? (
               <>
-                {/* Site selector */}
-                <div>
-                  <label
-                    htmlFor="installer-site"
-                    className="block text-sm font-medium mb-1.5"
-                  >
-                    {t("addDeviceModal.site")}{" "}
-                  </label>
-                  <select
-                    id="installer-site"
-                    value={selectedSiteId}
-                    onChange={(e) => setSelectedSiteId(e.target.value)}
-                    className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
-                  >
-                    {orgSites.map((site) => (
-                      <option key={site.id} value={site.id}>
-                        {site.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+                {renderSiteSelect("installer-site")}
 
                 {/* Platform selector */}
                 <div>
@@ -1061,6 +1107,8 @@ export default function AddDeviceModal({
               {t("addDeviceModal.installTheBreezeAgentOnYour")}{" "}
             </p>
 
+            {siteNotice ?? renderSiteSelect("cli-site")}
+
             {/* Token section */}
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-3">
@@ -1116,17 +1164,28 @@ export default function AddDeviceModal({
                     <button
                       type="button"
                       onClick={() => {
-                        void initializeCli(cliDeviceCount, cliTtlMinutes);
+                        void initializeCli(
+                          cliDeviceCount,
+                          cliTtlMinutes,
+                          selectedSiteId,
+                        );
                       }}
                       className="ml-2 underline hover:no-underline"
                     >
                       {t("addDeviceModal.retry")}{" "}
                     </button>
                   </div>
-                ) : (
+                ) : onboardingToken ? (
                   <code className="block rounded-md bg-background p-3 text-sm font-mono break-all">
-                    {onboardingToken || "No token available"}
+                    {onboardingToken}
                   </code>
+                ) : (
+                  <p
+                    className="py-2 text-sm text-muted-foreground"
+                    data-testid="cli-token-empty"
+                  >
+                    {t("addDeviceModal.cliTokenNotGenerated")}
+                  </p>
                 )}
 
                 {/* #1108: a single CLI command is single-use by default — make
@@ -1186,20 +1245,36 @@ export default function AddDeviceModal({
                       <button
                         type="button"
                         data-testid="cli-regenerate-token"
+                        disabled={!selectedSiteId}
                         onClick={() =>
-                          regenerateCliToken(cliDeviceCount, cliTtlMinutes)
+                          regenerateCliToken(
+                            cliDeviceCount,
+                            cliTtlMinutes,
+                            selectedSiteId,
+                          )
                         }
-                        className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted"
+                        className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
                       >
-                        {t("addDeviceModal.generateNewToken")}{" "}
+                        {onboardingToken
+                          ? t("addDeviceModal.generateNewToken")
+                          : t("addDeviceModal.generateToken")}
                       </button>
                     </div>
                     {onboardingToken && (
-                      <p className="text-xs text-muted-foreground">
-                        {tokenMaxUsage === 1
-                          ? t("addDeviceModal.singleUseValidForOneDevice")
-                          : `Valid for ${tokenMaxUsage ?? cliDeviceCount} device enrollments.`}
-                      </p>
+                      <div className="text-xs text-muted-foreground">
+                        <p>
+                          {tokenMaxUsage === 1
+                            ? t("addDeviceModal.singleUseValidForOneDevice")
+                            : `Valid for ${tokenMaxUsage ?? cliDeviceCount} device enrollments.`}
+                        </p>
+                        {tokenSiteName && (
+                          <p data-testid="cli-token-site">
+                            {t("addDeviceModal.cliTokenSite", {
+                              site: tokenSiteName,
+                            })}
+                          </p>
+                        )}
+                      </div>
                     )}
                   </div>
                 )}
@@ -1208,23 +1283,35 @@ export default function AddDeviceModal({
 
             {/* Commands section */}
             {(() => {
-              const commands = buildInstallCommands({
-                apiUrl:
-                  import.meta.env.PUBLIC_API_URL || window.location.origin,
-                ghBase:
-                  import.meta.env.PUBLIC_AGENT_DOWNLOAD_URL ||
-                  "https://github.com/lanternops/breeze/releases/latest/download",
-                token: onboardingToken || "<TOKEN>",
-                enrollmentSecret: enrollmentSecret || undefined,
-                trustCertUrl: import.meta.env.PUBLIC_AGENT_TRUST_CERT_URL || undefined,
-                userHelperUrl: import.meta.env.PUBLIC_AGENT_USER_HELPER_URL || undefined,
-                watchdogUrl: import.meta.env.PUBLIC_AGENT_WATCHDOG_URL || undefined,
-                linuxBinaryUrl: import.meta.env.PUBLIC_AGENT_LINUX_URL || undefined,
-                openh264Url: import.meta.env.PUBLIC_AGENT_OPENH264_URL || undefined,
-              });
               const commandPlatform =
                 selectedOS === "windows" ? "windows" : "linux";
-              const command = commands[commandPlatform];
+              // #7628: never render a command until a real key exists. A
+              // "<TOKEN>" placeholder looked runnable, got copied, and failed
+              // enrollment with enrollment_key_not_found (exit 11).
+              const command =
+                onboardingToken && !tokenLoading && !tokenError
+                  ? buildInstallCommands({
+                      // #8120: the server's runtime URL first. The build-time
+                      // PUBLIC_API_URL is empty in the published image, and
+                      // the page origin is the dashboard host on split
+                      // dashboard/API deployments.
+                      apiUrl:
+                        tokenServerUrl ||
+                        import.meta.env.PUBLIC_API_URL ||
+                        window.location.origin,
+                      token: onboardingToken,
+                      enrollmentSecret: enrollmentSecret || undefined,
+                      // Fork: our signed agent build + trust cert, helpers and Linux binary.
+                      ghBase:
+                        import.meta.env.PUBLIC_AGENT_DOWNLOAD_URL ||
+                        "https://github.com/lanternops/breeze/releases/latest/download",
+                      trustCertUrl: import.meta.env.PUBLIC_AGENT_TRUST_CERT_URL || undefined,
+                      userHelperUrl: import.meta.env.PUBLIC_AGENT_USER_HELPER_URL || undefined,
+                      watchdogUrl: import.meta.env.PUBLIC_AGENT_WATCHDOG_URL || undefined,
+                      linuxBinaryUrl: import.meta.env.PUBLIC_AGENT_LINUX_URL || undefined,
+                      openh264Url: import.meta.env.PUBLIC_AGENT_OPENH264_URL || undefined,
+                    })[commandPlatform]
+                  : null;
               const commandOptions = [
                 { platform: "windows", label: t("addDeviceModal.windows2") },
                 { platform: "linux", label: t("addDeviceModal.linuxMacos") },
@@ -1252,18 +1339,32 @@ export default function AddDeviceModal({
                     ))}
                   </div>
                   <div className="rounded-lg border bg-muted/30 p-4">
-                    <div className="flex items-start justify-between gap-2">
-                      <code className="text-xs font-mono text-muted-foreground break-all">
-                        {command}
-                      </code>
-                      <button
-                        type="button"
-                        onClick={() => handleCopyCommand(command)}
-                        className="shrink-0 p-1 hover:bg-muted rounded"
+                    {command ? (
+                      <div className="flex items-start justify-between gap-2">
+                        <code
+                          className="text-xs font-mono text-muted-foreground break-all"
+                          data-testid="cli-command"
+                        >
+                          {command}
+                        </code>
+                        <button
+                          type="button"
+                          data-testid="cli-copy-command"
+                          aria-label={t("addDeviceModal.copyCommand")}
+                          onClick={() => handleCopyCommand(command)}
+                          className="shrink-0 p-1 hover:bg-muted rounded"
+                        >
+                          <Copy className="h-4 w-4" />
+                        </button>
+                      </div>
+                    ) : (
+                      <p
+                        className="text-sm text-muted-foreground"
+                        data-testid="cli-command-needs-token"
                       >
-                        <Copy className="h-4 w-4" />
-                      </button>
-                    </div>
+                        {t("addDeviceModal.cliCommandNeedsToken")}
+                      </p>
+                    )}
                   </div>
                   <p className="mt-2 text-xs text-muted-foreground">
                     {commandPlatform === "windows"
