@@ -62,8 +62,9 @@ func isDevBuildVersion(version string) bool {
 	return version == "" || version == "dev" || strings.HasPrefix(version, "dev-")
 }
 
-// fileExists reports whether path is an existing regular (non-directory) file.
-func fileExists(path string) bool {
+// isRegularFile reports whether path is an existing regular (non-directory) file.
+// (Fork helper; upstream's service_cmd_darwin.go has its own fileExists.)
+func isRegularFile(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
 }

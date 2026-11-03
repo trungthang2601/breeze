@@ -157,7 +157,7 @@ var serviceInstallCmd = &cobra.Command{
 			// one-liner does), stage it into the protected Program Files dir so
 			// bootstrapWatchdog takes the manifest-free "protected packaged
 			// sibling" path — exactly the layout the MSI produces.
-			if wdSrc := filepath.Join(filepath.Dir(exePath), "breeze-watchdog.exe"); fileExists(wdSrc) {
+			if wdSrc := filepath.Join(filepath.Dir(exePath), "breeze-watchdog.exe"); isRegularFile(wdSrc) {
 				if _, _, err := serviceinstall.InstallProtectedBinary(wdSrc, "breeze-watchdog.exe"); err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: could not stage local watchdog into the protected dir: %v\n", err)
 				}

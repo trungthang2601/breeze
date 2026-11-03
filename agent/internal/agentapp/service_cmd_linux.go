@@ -305,7 +305,7 @@ var serviceInstallCmd = &cobra.Command{
 			// breeze-watchdog binary sits next to the agent (the install one-liner
 			// places it), copy it root-owned into /usr/local/bin so bootstrapWatchdog
 			// takes the manifest-free "protected packaged sibling" path.
-			if wdSrc := filepath.Join(filepath.Dir(exePath), "breeze-watchdog"); fileExists(wdSrc) && wdSrc != linuxWatchdogBinaryPath {
+			if wdSrc := filepath.Join(filepath.Dir(exePath), "breeze-watchdog"); isRegularFile(wdSrc) && wdSrc != linuxWatchdogBinaryPath {
 				if data, rErr := os.ReadFile(wdSrc); rErr != nil {
 					fmt.Fprintf(os.Stderr, "Warning: could not read local watchdog: %v\n", rErr)
 				} else if wErr := os.WriteFile(linuxWatchdogBinaryPath, data, 0o755); wErr != nil {
