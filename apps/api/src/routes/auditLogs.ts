@@ -393,8 +393,6 @@ function buildFilterConditions(
     conditions.push(siteActivityCondition(filters.siteId));
   }
 
-  if (filters.action) {
-    conditions.push(ilike(auditLogsTable.action, `%${escapeIlike(filters.action)}%`));
   // #8975: the UI sends multi-select filters as a comma list; match each term
   // on its own and OR them rather than as one literal "a,b" substring.
   // A non-empty filter that yields no terms (e.g. ",") fails closed to zero rows

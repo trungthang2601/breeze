@@ -26,28 +26,25 @@ vi.mock('../services/auditEvents', () => ({
 // Every WHERE clause the route hands to drizzle, in call order.
 const whereCalls: unknown[] = [];
 
-const createDbChain = () => ({
-  from: vi.fn().mockReturnValue({
-    leftJoin: vi.fn().mockReturnValue({
-      leftJoin: vi.fn().mockReturnValue({
-        where: vi.fn((w: unknown) => {
-          whereCalls.push(w);
-          return {
-            orderBy: vi.fn().mockReturnValue({
-              limit: vi.fn().mockReturnValue({
-                offset: vi.fn().mockResolvedValue([]),
-              }),
-            }),
-          };
+const createDbChain = () => {
+  // Any number of left joins (the count query now joins users too), then a
+  // WHERE that is either awaited directly (count) or paged (rows).
+  const node: Record<string, unknown> = {};
+  node.leftJoin = vi.fn(() => node);
+  node.where = vi.fn((w: unknown) => {
+    whereCalls.push(w);
+    const paged = {
+      orderBy: vi.fn().mockReturnValue({
+        limit: vi.fn().mockReturnValue({
+          offset: vi.fn().mockResolvedValue([]),
         }),
       }),
-    }),
-    where: vi.fn((w: unknown) => {
-      whereCalls.push(w);
-      return Promise.resolve([{ count: 0 }]);
-    }),
-  }),
-});
+      then: (resolve: (v: unknown) => unknown) => Promise.resolve([{ count: 0 }]).then(resolve),
+    };
+    return paged;
+  });
+  return { from: vi.fn().mockReturnValue(node) };
+};
 
 const withSystemDbAccessContextMock = vi.fn(async (fn: any) => fn());
 const runOutsideDbContextMock = vi.fn((fn: any) => fn());
@@ -72,7 +69,7 @@ vi.mock('../db/schema', () => ({
     id: 'id', action: 'action', actorEmail: 'actorEmail', actorType: 'actorType',
     details: 'details', resourceType: 'resourceType', resourceName: 'resourceName',
   },
-  users: { id: 'id', name: 'name' },
+  users: { id: 'id', name: 'name', email: 'email' },
   devices: { agentId: 'agentId', hostname: 'hostname', displayName: 'displayName', siteId: 'siteId' },
 }));
 

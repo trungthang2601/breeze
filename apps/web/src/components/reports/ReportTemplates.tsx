@@ -231,7 +231,8 @@ const defaultTemplates: ReportTemplate[] = [
     tone: {
       iconBg: 'bg-violet-500/15',
       iconColor: 'text-violet-600'
-    }
+    },
+    group: 'general'
   },
   {
     id: 'ticket_sla_attainment',

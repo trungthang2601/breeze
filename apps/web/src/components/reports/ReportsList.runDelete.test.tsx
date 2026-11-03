@@ -2,12 +2,21 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 const fetchWithAuth = vi.fn();
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
-vi.mock('../../stores/orgStore', () => ({ useOrgStore: () => ({ currentOrgId: 'org-1' }) }));
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a),
+  registerOrgIdProvider: vi.fn(),
+  useAuthStore: Object.assign(
+    (selector: (s: Record<string, unknown>) => unknown) => selector({}),
+    { getState: () => ({}) },
+  ),
+}));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
 
 import ReportsList from './ReportsList';
+import { useOrgStore } from '../../stores/orgStore';
+
+vi.mock('@/lib/authScope', () => ({ useJwtClaims: () => ({ status: 'unresolved' }) }));
 
 const runs = [
   { id: 'run-a', reportId: 'r1', status: 'completed', startedAt: null, completedAt: null, outputUrl: null, errorMessage: null, createdAt: '2026-11-02T00:00:00Z', reportName: 'DS CPU', reportType: 'device_inventory' },
@@ -34,6 +43,7 @@ async function openRunsTab() {
 describe('ReportsList — deleting runs', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    useOrgStore.setState({ currentOrgId: 'org-1' });
     mockApi();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
   });

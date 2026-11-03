@@ -5,7 +5,14 @@ import ReportBuilder from './ReportBuilder';
 import { fetchWithAuth } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
 
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn(), registerOrgIdProvider: vi.fn() }));
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: vi.fn(),
+  registerOrgIdProvider: vi.fn(),
+  useAuthStore: Object.assign(
+    (selector: (s: Record<string, unknown>) => unknown) => selector({}),
+    { getState: () => ({}) },
+  ),
+}));
 vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 

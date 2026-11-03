@@ -2,16 +2,24 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 
 const fetchWithAuth = vi.fn();
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
-vi.mock('../../stores/orgStore', () => ({ useOrgStore: () => ({ currentOrgId: 'org-1' }) }));
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a),
+  registerOrgIdProvider: vi.fn(),
+  useAuthStore: Object.assign(
+    (selector: (s: Record<string, unknown>) => unknown) => selector({}),
+    { getState: () => ({}) },
+  ),
+}));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
 
 import ReportBuilder from './ReportBuilder';
+import { useOrgStore } from '../../stores/orgStore';
 
 describe('ReportBuilder live preview — picked but empty columns', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    useOrgStore.setState({ currentOrgId: 'org-1' });
     fetchWithAuth.mockImplementation((url: string) => {
       if (url === '/reports/generate') {
         return Promise.resolve({

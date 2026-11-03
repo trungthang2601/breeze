@@ -9,7 +9,7 @@ const {
   getReportRunMock,
   selectRows,
   rowsToCsvMock,
-  rowsToTsvMock,
+  rowsToXlsxMock,
 } = vi.hoisted(() => ({
   writeRouteAuditMock: vi.fn(),
   deleteReturning: [] as unknown[][],
@@ -18,7 +18,7 @@ const {
   getReportRunMock: vi.fn(),
   selectRows: [] as unknown[][],
   rowsToCsvMock: vi.fn((rows: unknown[]) => `csv:${JSON.stringify(rows)}`),
-  rowsToTsvMock: vi.fn((rows: unknown[]) => `tsv:${JSON.stringify(rows)}`),
+  rowsToXlsxMock: vi.fn(),
 }));
 
 vi.mock('../../middleware/auth', () => ({
@@ -136,12 +136,16 @@ vi.mock('./helpers', () => ({
   getPagination: vi.fn(),
 }));
 
-vi.mock('@breeze/shared', async (importOriginal) => ({
-  withUtf8Bom: (await importOriginal<typeof import('@breeze/shared')>()).withUtf8Bom,
-  toUtf16LeWithBom: (await importOriginal<typeof import('@breeze/shared')>()).toUtf16LeWithBom,
-  rowsToCsv: rowsToCsvMock,
-  rowsToTsv: rowsToTsvMock,
-}));
+vi.mock('@breeze/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@breeze/shared')>();
+  // Real .xlsx writer by default so the Excel test inspects actual workbook bytes.
+  rowsToXlsxMock.mockImplementation(actual.rowsToXlsx);
+  return {
+    ...actual,
+    rowsToCsv: rowsToCsvMock,
+    rowsToXlsx: rowsToXlsxMock,
+  };
+});
 
 vi.mock('../../services/sensitiveReadAudit', () => ({
   auditSensitiveRead: auditSensitiveReadMock,
@@ -188,7 +192,7 @@ describe('deleting report runs', () => {
     const res = await app().request(`/reports/runs/${RUN_A}`, { method: 'DELETE' });
 
     expect(res.status).toBe(200);
-    expect(getReportRunMock).toHaveBeenCalledWith(RUN_A, expect.anything(), 'delete');
+    expect(getReportRunMock).toHaveBeenCalledWith(RUN_A, expect.anything(), 'delete', undefined);
     expect(writeRouteAuditMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: 'report.run.delete', resourceType: 'report_run', resourceId: RUN_A, resourceName: 'DS CPU', orgId: ORG_ID,
     }));

@@ -1055,8 +1055,11 @@ export default function ReportBuilder({
     return Array.isArray(f.siteIds) ? f.siteIds.filter((x): x is string => typeof x === 'string') : [];
   });
 
+  // Loaded only when the site picker is on screen, so other report types make
+  // no extra request (and the live preview keeps its first fetch slot).
+  const wantsSitePicker = builderType === 'devices' && dataSource.scope === 'by_site';
   useEffect(() => {
-    if (!targetOrgId) return;
+    if (!targetOrgId || !wantsSitePicker) return;
     let alive = true;
     fetchWithAuth(`/orgs/sites?orgId=${targetOrgId}`)
       .then(r => (r.ok ? r.json() : null))
@@ -1067,7 +1070,7 @@ export default function ReportBuilder({
       })
       .catch(() => {});
     return () => { alive = false; };
-  }, [targetOrgId]);
+  }, [targetOrgId, wantsSitePicker]);
 
   // Device picker ("Pick devices" scope) — loaded on demand.
   const [deviceOptions, setDeviceOptions] = useState<{ id: string; hostname: string; siteName: string | null }[]>([]);
