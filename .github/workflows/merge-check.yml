@@ -62,6 +62,8 @@ jobs:
             # -unsafeptr=false: upstream service_windows.go (untouched by the fork) trips it.
             GOOS=$os GOARCH=amd64 go vet -unsafeptr=false ./internal/collectors/... ./internal/agentapp/... ./cmd/...
           done
+      - name: Install libpcap (agentapp tests link gopacket/pcap via cgo)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libpcap-dev
       - name: Tests (touched packages)
         working-directory: agent
         run: go test ./internal/collectors/... ./internal/agentapp/... ./internal/remote/desktop/x11/... ./internal/branding/... ./cmd/breeze-watchdog/...
