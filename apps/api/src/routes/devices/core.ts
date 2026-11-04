@@ -1368,6 +1368,7 @@ coreRoutes.get(
         cpuCores: deviceHardware.cpuCores,
         ramTotalMb: deviceHardware.ramTotalMb,
         diskTotalGb: deviceHardware.diskTotalGb,
+        serialNumber: deviceHardware.serialNumber,
         // Reliability headline score (#1720) — surfaced as a sortable list
         // column. device_reliability is org-scoped (RLS shape #1), so the
         // leftJoin stays tenant-safe; null when no score computed yet.
@@ -1605,7 +1606,8 @@ coreRoutes.get(
           cpuModel: d.cpuModel,
           cpuCores: d.cpuCores,
           ramTotalMb: d.ramTotalMb,
-          diskTotalGb: d.diskTotalGb
+          diskTotalGb: d.diskTotalGb,
+          serialNumber: d.serialNumber
         },
         // Reliability column (#1720): null when the device has no computed
         // score yet (no device_reliability row) — the list renders a dash.
