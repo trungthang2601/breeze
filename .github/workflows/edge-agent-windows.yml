@@ -134,13 +134,18 @@ jobs:
           $bytes = [Convert]::FromBase64String($env:PFX_BASE64)
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\kreslab-codesign.pfx", $bytes)
           $securePw = ConvertTo-SecureString -String $env:PFX_PASSWORD -Force -AsPlainText
-          Import-PfxCertificate -FilePath "$env:RUNNER_TEMP\kreslab-codesign.pfx" `
-            -CertStoreLocation Cert:\CurrentUser\My -Password $securePw | Out-Null
+          $imported = Import-PfxCertificate -FilePath "$env:RUNNER_TEMP\kreslab-codesign.pfx" `
+            -CertStoreLocation Cert:\CurrentUser\My -Password $securePw
+          # Sign with whatever cert the PFX holds (subject is not hardcoded).
+          $thumb = ($imported | Where-Object { $_.HasPrivateKey } | Select-Object -First 1).Thumbprint
+          if (-not $thumb) { throw "PFX has no certificate with a private key" }
+          "SIGN_THUMBPRINT=$thumb" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Signing cert: $(($imported | Select-Object -First 1).Subject) ($thumb)"
 
       - name: Sign both exes
         run: |
-          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=KResLab" } | Select-Object -First 1
-          if (-not $cert) { throw "KResLab signing cert not found in CurrentUser\My store" }
+          $cert = Get-Item "Cert:\CurrentUser\My\$env:SIGN_THUMBPRINT"
+          if (-not $cert) { throw "Signing cert $env:SIGN_THUMBPRINT not found in CurrentUser\My store" }
           foreach ($f in @("agent\bin\breeze-agent-windows-amd64.exe", "agent\bin\breeze-user-helper-windows-amd64.exe", "agent\bin\breeze-watchdog-windows-amd64.exe")) {
             Set-AuthenticodeSignature -FilePath $f `
               -Certificate $cert -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com" | Out-Null
@@ -153,7 +158,7 @@ jobs:
 
       - name: Export public KResLab cert (for installing trust on branch PCs)
         run: |
-          $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq "CN=KResLab" } | Select-Object -First 1
+          $cert = Get-Item "Cert:\CurrentUser\My\$env:SIGN_THUMBPRINT"
           Export-Certificate -Cert $cert -FilePath kreslab-codesign-public.cer | Out-Null
 
       - uses: actions/upload-artifact@v4
