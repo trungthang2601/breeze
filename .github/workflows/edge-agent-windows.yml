@@ -126,6 +126,16 @@ jobs:
           go build -ldflags "-s -w -X main.version=$env:AGENT_VERSION -X 'github.com/breeze-rmm/agent/internal/branding.WatchdogServiceDisplayName=Breeze Helper' -X 'github.com/breeze-rmm/agent/internal/branding.WatchdogServiceDescription=Breeze Helper - keeps the Breeze service healthy'" -o bin/breeze-watchdog-windows-amd64.exe ./cmd/breeze-watchdog
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Guards the fork's breeze.exe service name against upstream checks that
+      # assume breeze-agent.exe (helper pipe-identity, WFP isolation).
+      - name: Test fork-sensitive packages
+        working-directory: agent
+        env:
+          CGO_ENABLED: 0
+        run: |
+          go test ./internal/ipc/ ./internal/isolation/
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Import KResLab code-signing cert
         env:
           PFX_BASE64: ${{ secrets.KRESLAB_CODESIGN_PFX_BASE64 }}

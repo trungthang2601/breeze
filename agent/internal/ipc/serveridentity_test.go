@@ -103,6 +103,7 @@ func TestCheckServerIdentity(t *testing.T) {
 		{"administrators-owned pipe", ServerIdentityEvidence{PipeOwnerSID: "S-1-5-32-544"}, true},
 		{"empty owner", ServerIdentityEvidence{}, true},
 		{"system owner, process is a user process", ServerIdentityEvidence{PipeOwnerSID: SystemSID, ProcessQueried: true, ProcessSID: user, ProcessPath: agent, ExpectedPath: agent}, true},
+		{"system owner, process is the fork's breeze.exe", ServerIdentityEvidence{PipeOwnerSID: SystemSID, ProcessQueried: true, ProcessSID: SystemSID, ProcessPath: `C:\Program Files\Breeze\breeze.exe`, ExpectedPath: agent, AltExpectedPaths: []string{`C:\Program Files\Breeze\breeze.exe`}}, false},
 		{"system owner, process is another system binary", ServerIdentityEvidence{PipeOwnerSID: SystemSID, ProcessQueried: true, ProcessSID: SystemSID, ProcessPath: `C:\Windows\System32\svchost.exe`, ExpectedPath: agent}, true},
 		{"system owner, process queried with empty path", ServerIdentityEvidence{PipeOwnerSID: SystemSID, ProcessQueried: true, ProcessSID: SystemSID, ExpectedPath: agent}, true},
 	}

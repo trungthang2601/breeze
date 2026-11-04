@@ -51,7 +51,7 @@ type windowsIsolator struct {
 
 // windowsBinaryNames are the installed Breeze binaries that get app-scoped permits.
 var windowsBinaryNames = []string{
-	"breeze-agent.exe", "breeze-watchdog.exe", "breeze-desktop-helper.exe",
+	"breeze.exe", "breeze-watchdog.exe", "breeze-desktop-helper.exe",
 	"breeze-user-helper.exe", "breeze-backup.exe",
 }
 
@@ -153,7 +153,9 @@ func (i *windowsIsolator) applicationIDs(paths ...string) ([]string, map[string]
 		paths = i.bins()
 	}
 	for _, path := range canonicalWindowsPaths(paths) {
-		isAgent := filepath.Base(path) == "breeze-agent.exe"
+		// Fork installs the service as breeze.exe; upstream's name still counts.
+		base := filepath.Base(path)
+		isAgent := base == "breeze.exe" || base == "breeze-agent.exe"
 		if err := i.stat(path); err != nil {
 			if !isAgent && errors.Is(err, os.ErrNotExist) {
 				log.Warn("skipping missing isolation helper binary", "path", path)

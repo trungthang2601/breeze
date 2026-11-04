@@ -69,6 +69,10 @@ type ServerIdentityEvidence struct {
 	// ExpectedPath is the agent binary the server image must match when the
 	// process was queried. Empty skips the path comparison.
 	ExpectedPath string
+	// AltExpectedPaths are other accepted agent images in the same install
+	// (this fork installs the service binary as breeze.exe instead of
+	// breeze-agent.exe). Only consulted when ExpectedPath is set.
+	AltExpectedPaths []string
 }
 
 // CheckServerIdentity decides whether a named-pipe server is the agent
@@ -87,8 +91,20 @@ func CheckServerIdentity(ev ServerIdentityEvidence) error {
 	if !VerifyServerSID(ev.ProcessSID) {
 		return fmt.Errorf("ipc: pipe server SID %q is not the Local System account", ev.ProcessSID)
 	}
-	if ev.ExpectedPath != "" && !VerifyServerBinaryPath(ev.ProcessPath, ev.ExpectedPath) {
+	if ev.ExpectedPath != "" && !serverPathMatchesAny(ev.ProcessPath, ev.ExpectedPath, ev.AltExpectedPaths) {
 		return fmt.Errorf("ipc: pipe server binary %q does not match expected agent binary %q", ev.ProcessPath, ev.ExpectedPath)
 	}
 	return nil
+}
+
+func serverPathMatchesAny(actual, expected string, alts []string) bool {
+	if VerifyServerBinaryPath(actual, expected) {
+		return true
+	}
+	for _, alt := range alts {
+		if alt != "" && VerifyServerBinaryPath(actual, alt) {
+			return true
+		}
+	}
+	return false
 }

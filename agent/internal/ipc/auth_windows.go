@@ -153,6 +153,18 @@ func ExpectedAgentBinaryPath() string {
 	return filepath.Join(filepath.Dir(self), "breeze-agent.exe")
 }
 
+// AltAgentBinaryPaths are the other agent image names accepted next to the
+// current executable: this fork installs the service as breeze.exe
+// (service_cmd_windows.go InstallProtectedBinary), so a helper must trust a
+// pipe served by breeze.exe as well as upstream's breeze-agent.exe.
+func AltAgentBinaryPaths() []string {
+	self, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	return []string{filepath.Join(filepath.Dir(self), "breeze.exe")}
+}
+
 // VerifyServerIdentity performs the client-side named-pipe server-trust
 // check. It gathers kernel-verified evidence about whoever accepted conn —
 // the pipe object's owner (read through conn's own handle) and, when this
@@ -176,7 +188,7 @@ func VerifyServerIdentity(conn net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("ipc: read pipe owner: %w", err)
 	}
-	ev := ServerIdentityEvidence{PipeOwnerSID: owner, ExpectedPath: ExpectedAgentBinaryPath()}
+	ev := ServerIdentityEvidence{PipeOwnerSID: owner, ExpectedPath: ExpectedAgentBinaryPath(), AltExpectedPaths: AltAgentBinaryPaths()}
 
 	creds, err := GetServerCredentials(conn)
 	switch {
