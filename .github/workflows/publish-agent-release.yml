@@ -1,0 +1,62 @@
+# Publishes the binaries from an "Edge Agent (Linux)" run and an "Edge Agent
+# (Windows, self-signed)" run as the GitHub release kreslab-agent-v<version>,
+# with SHA256SUMS. scripts/build-agent-binaries-image.sh on the server pulls
+# from that release to build the local binaries image. Manual dispatch only.
+name: Publish Agent Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Agent version the two runs were built with (e.g. 0.125.0)
+        required: true
+      linux_run_id:
+        description: Run ID of the Edge Agent (Linux) run
+        required: true
+      windows_run_id:
+        description: Run ID of the Edge Agent (Windows, self-signed) run
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: breeze-agent-linux-amd64
+          path: out
+          run-id: ${{ inputs.linux_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: breeze-agent-windows-amd64-signed
+          path: out
+          run-id: ${{ inputs.windows_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Flatten + checksum
+        run: |
+          mkdir -p rel
+          find out -type f -exec cp {} rel/ \;
+          cd rel
+          ls -la
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: kreslab-agent-v${{ inputs.version }}
+        run: |
+          gh release create "$TAG" rel/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "KResLab agent ${{ inputs.version }}" \
+            --notes "Agent ${{ inputs.version }} (Linux run ${{ inputs.linux_run_id }}, Windows run ${{ inputs.windows_run_id }})." \
+            --prerelease
