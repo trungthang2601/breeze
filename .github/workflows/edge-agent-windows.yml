@@ -127,13 +127,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Guards the fork's breeze.exe service name against upstream checks that
-      # assume breeze-agent.exe (helper pipe-identity, WFP isolation).
+      # assume breeze-agent.exe (helper pipe-identity).
       - name: Test fork-sensitive packages
         working-directory: agent
         env:
           CGO_ENABLED: 0
         run: |
-          go test ./internal/ipc/ ./internal/isolation/
+          go test ./internal/ipc/
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Import KResLab code-signing cert

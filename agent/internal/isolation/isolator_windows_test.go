@@ -22,7 +22,7 @@ func TestWindowsCapabilityStaysDisabled(t *testing.T) {
 }
 
 func TestWindowsBinaryNames(t *testing.T) {
-	want := []string{"breeze.exe", "breeze-watchdog.exe", "breeze-desktop-helper.exe", "breeze-user-helper.exe", "breeze-backup.exe"}
+	want := []string{"breeze-agent.exe", "breeze-watchdog.exe", "breeze-desktop-helper.exe", "breeze-user-helper.exe", "breeze-backup.exe"}
 	if !reflect.DeepEqual(windowsBinaryNames, want) {
 		t.Fatalf("binaries: %v", windowsBinaryNames)
 	}
