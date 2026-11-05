@@ -150,7 +150,12 @@ export function buildInstallCommands(opts: InstallCommandOptions): InstallComman
     `if [ -n "$NEED" ]; then echo "==> Breeze needs ROOT once to prepare this machine (agent dirs, linger\${FF:+, ffmpeg for NVIDIA NVENC})."; if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then sudo sh -c "$PREP" || NEED=fail; else echo "Enter the ROOT password:"; su -c "$PREP" || NEED=fail; fi; fi`,
     `[ "$NEED" != fail ] || echo "[WARN] Machine prep failed - remote desktop may refuse to start (desktop start fence) or skip the NVIDIA GPU. Re-run as root: $PREP" >&2`,
     `"$BIN" --config "$HOME/.config/breeze/agent.yaml" enroll "${token}" --server "${apiUrl}"${unixSecretFlag}`,
-    `printf '[Unit]\\nDescription=Breeze RMM Agent (user)\\nAfter=graphical-session.target\\n\\n[Service]\\nType=simple\\nExecStart=%s --config %%h/.config/breeze/agent.yaml run\\nRestart=always\\nRestartSec=10\\n\\n[Install]\\nWantedBy=default.target\\n' "$BIN" > "$HOME/.config/systemd/user/breeze-agent.service"`,
+    // TimeoutStopSec/KillMode: without them the user manager waits its 90s
+    // default for the agent (and its capture/ffmpeg children) on every logout
+    // or shutdown before SIGKILLing the cgroup. 20s matches the agent's own
+    // teardown budget (shutdown_budget.go); KillMode=mixed SIGTERMs the
+    // main process first, then SIGKILLs any leftover children.
+    `printf '[Unit]\\nDescription=Breeze RMM Agent (user)\\nAfter=graphical-session.target\\n\\n[Service]\\nType=simple\\nExecStart=%s --config %%h/.config/breeze/agent.yaml run\\nRestart=always\\nRestartSec=10\\nTimeoutStopSec=20\\nKillMode=mixed\\n\\n[Install]\\nWantedBy=default.target\\n' "$BIN" > "$HOME/.config/systemd/user/breeze-agent.service"`,
     `systemctl --user daemon-reload`,
     `systemctl --user enable --now breeze-agent`,
     `echo "Breeze agent installed under $(id -un). Status: systemctl --user status breeze-agent"`,
