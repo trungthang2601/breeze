@@ -63,6 +63,8 @@ var reconcileOnce sync.Once
 // capability bounding set. Best-effort: on failure it logs and continues.
 func reconcileServiceUnitIfNeeded() {
 	reconcileOnce.Do(func() {
+		// Fork: per-user installs heal their stop timeout instead (no-op as root).
+		reconcileUserUnitStopTimeout()
 		// Only act as the installed systemd service running as root.
 		if os.Geteuid() != 0 || os.Getenv("INVOCATION_ID") == "" {
 			return
