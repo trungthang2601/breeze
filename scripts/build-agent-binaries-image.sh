@@ -15,15 +15,26 @@
 #   4. Backs up .env, then sets BREEZE_BINARIES_IMAGE_REF and BREEZE_VERSION
 #      (the API serves the volume only when VERSION == BREEZE_VERSION; otherwise
 #      it falls back to upstream's GitHub release).
-#   5. Recreates binaries-init + api so the new binaries are registered.
+#   5. Re-seeds the binaries volume, then rebuilds web/api/worker with
+#      scripts/update-from-source.sh --force --no-pull, so the "Web/API x.y.z"
+#      label in the UI matches the agent version and any pulled web/api changes
+#      ship in the same step. Pass --agent-only to just recreate binaries-init +
+#      api (quick, no rebuild, no DB backup).
 #
 # Nothing is promoted: with AGENT_AUTO_PROMOTE=false the fleet keeps its current
 # target until you promote <version> (see the message printed at the end).
 set -euo pipefail
 
-VERSION="${1:-}"
+VERSION=""
+AGENT_ONLY=false
+for arg in "$@"; do
+  case "${arg}" in
+    --agent-only) AGENT_ONLY=true ;;
+    *) VERSION="${arg}" ;;
+  esac
+done
 if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "Usage: $0 <version, e.g. 0.125.0>" >&2
+  echo "Usage: $0 <version, e.g. 0.125.0> [--agent-only]" >&2
   exit 1
 fi
 
@@ -99,9 +110,14 @@ else
 fi
 log ".env updated (backup kept next to it)."
 
-# 5. Re-seed the binaries volume and let the API register the new version.
+# 5. Re-seed the binaries volume, then bring web/api up on the new version.
 "${COMPOSE[@]}" up -d --force-recreate binaries-init
-"${COMPOSE[@]}" up -d --force-recreate api
+if [[ "${AGENT_ONLY}" == true ]]; then
+  "${COMPOSE[@]}" up -d --force-recreate api
+else
+  log "Rebuilding web/api/worker as ${VERSION} (update-from-source.sh --force --no-pull)..."
+  BACKUP_DIR="${BACKUP_DIR:-${HOME}/breeze-backups}" "${REPO_DIR}/scripts/update-from-source.sh" --force --no-pull
+fi
 log "Waiting for the API to register ${VERSION}..."
 for _ in $(seq 1 60); do
   if docker logs --tail 400 breeze-api 2>&1 | grep -q "${VERSION}"; then break; fi
@@ -111,11 +127,10 @@ docker logs --tail 400 breeze-api 2>&1 | grep -i "binarySync" | tail -15 || true
 
 cat <<EOF
 
-Done. Version ${VERSION} is registered but NOT yet pushed to the fleet.
+Done. Agent ${VERSION} is registered (web/api relabelled ${VERSION}) but NOT
+yet pushed to the fleet.
 Next:
-  - Test on one machine first, then promote ${VERSION} (platform admin + MFA),
-    or set AGENT_AUTO_PROMOTE in docker-compose.override.yml.podman to "true"
-    and run:  ${COMPOSE[*]} up -d api
+  - Settings -> Organizations -> <org> -> Update version targets -> Agent target = ${VERSION}
 To undo: restore the .env.bak-* file and run
   ${COMPOSE[*]} up -d --force-recreate binaries-init api
 EOF
