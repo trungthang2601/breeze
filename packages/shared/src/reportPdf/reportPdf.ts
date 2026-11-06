@@ -2594,6 +2594,97 @@ function renderDeviceInventoryReport(doc: jsPDF, rows: Record<string, unknown>[]
   }
 }
 
+// ----------------------------------------------------------------------------
+// Fork: Devices & Assets list export — the list as drawn (columns, filters,
+// grouping) on a branded A4-landscape page, one table section per group.
+// ----------------------------------------------------------------------------
+
+export type DeviceListPdfSection = {
+  /** Group heading ("ICOOL CAU CHU Y · Intel Core i5"); null = no heading. */
+  title: string | null;
+  /** Nesting level of the heading: 0 outer, 1 inner. */
+  level?: 0 | 1;
+  rows: string[][];
+};
+
+export type DeviceListPdfInput = {
+  title: string;
+  /** One line under the title (counts, filters). */
+  meta: string;
+  columns: string[];
+  sections: DeviceListPdfSection[];
+};
+
+export function buildDeviceListPdf(input: DeviceListPdfInput, opts: Pick<BuildOpts, 'generatedAt' | 'timezone' | 'branding'>): jsPDF {
+  C = paletteForBranding(opts.branding);
+  try {
+    const full: BuildOpts = { reportType: 'device_inventory', ...opts };
+    const doc = new jsPDF({ orientation: 'landscape' });
+    if (typeof doc.setProperties === 'function') {
+      doc.setProperties({ title: pdfSafeText(input.title), author: opts.branding?.name?.trim() || 'Breeze', creator: 'Breeze RMM' });
+    }
+    const chrome = () => { drawHeaderBand(doc, full); drawFooter(doc, full); };
+    let y = drawTitleBlock(doc, pdfSafeText(input.title), '', pdfSafeText(input.meta), PAGE.bandH + 8) + 4;
+    const cols = input.columns.map((c) => pdfSafeText(c));
+    const tableBase = {
+      margin: { top: PAGE.bandH + 6, left: PAGE.mx, right: PAGE.mx, bottom: 16 },
+      theme: 'grid' as const,
+      rowPageBreak: 'avoid' as const,
+      styles: { fontSize: cols.length > 9 ? 6.5 : 7.5, cellPadding: 1.5, lineColor: C.rule, lineWidth: 0.1, textColor: C.ink, valign: 'middle' as const, overflow: 'linebreak' as const },
+      headStyles: { fillColor: C.primary, textColor: C.white, fontStyle: 'bold' as const, lineColor: C.primary },
+      alternateRowStyles: { fillColor: C.zebra },
+      didDrawPage: () => chrome(),
+    };
+    const finalY = (fallback: number) => {
+      const t = (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable;
+      return typeof t?.finalY === 'number' ? t.finalY : fallback;
+    };
+    const total = input.sections.reduce((n, s) => n + s.rows.length, 0);
+    if (total === 0 && input.sections.every((s) => !s.title)) {
+      set.text(doc, C.muted);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(11);
+      doc.text('No devices match the current filters.', PAGE.mx, y + 8);
+      chrome();
+      return doc;
+    }
+    for (const section of input.sections) {
+      if (y + 24 > DEVICE_INVENTORY_BOTTOM) {
+        doc.addPage();
+        chrome();
+        y = PAGE.bandH + 12;
+      }
+      const head: unknown[][] = [];
+      if (section.title) {
+        const outer = (section.level ?? 0) === 0;
+        head.push([{
+          content: pdfSafeText(section.title),
+          colSpan: cols.length,
+          styles: {
+            fillColor: outer ? C.panel : C.white, textColor: C.ink, fontSize: outer ? 10 : 8.5,
+            fontStyle: 'bold', halign: 'left', lineColor: C.rule, cellPadding: outer ? 2.4 : 1.8,
+          },
+        }]);
+      }
+      if (section.rows.length > 0) head.push(cols);
+      autoTable(doc, {
+        ...tableBase,
+        startY: y,
+        head: head as never,
+        body: section.rows.map((r) => r.map((cell) => pdfSafeText(cell ?? ''))),
+        didParseCell: (data: CellHookData) => {
+          if (data.section !== 'body') return;
+          if (data.cell.text.join('') === '') data.cell.styles.textColor = C.faint;
+        },
+      });
+      y = finalY(y) + (section.rows.length > 0 ? 6 : 1);
+    }
+    return doc;
+  } finally {
+    C = BASE_C;
+  }
+}
+
 /**
  * Build a fully-branded report PDF. The security & compliance posture report
  * leads with a scorecard cover and a curated per-device table; every other

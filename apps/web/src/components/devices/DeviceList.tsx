@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useState, useEffect, useLayoutEffect, useRef } from "react";
+import { Fragment, useCallback, useMemo, useState, useEffect, useLayoutEffect, useRef } from "react";
 import { usePermissions } from "../../lib/permissions";
 import { ENABLE_ENDPOINT_MESSAGING } from "../../lib/featureFlags";
 import { createPortal } from "react-dom";
@@ -134,7 +134,21 @@ import {
   loadDeviceAttentionCounts,
   useDeviceAttentionCounts,
 } from "./deviceAttentionCounts";
-import { buildDevicesCsv, devicesCsvFilename, type AttentionExportValue } from "./deviceCsvExport";
+import { buildDevicesCsv, buildDevicesTable, devicesCsvFilename, devicesTableToRecords, type AttentionExportValue } from "./deviceCsvExport";
+import { rowsToXlsx, XLSX_MIME_TYPE, withUtf8Bom } from "@breeze/shared";
+import { DeviceGroupingBar, dimensionLabelKey } from "./DeviceGroupingBar";
+import {
+  UNKNOWN_VALUE,
+  allGroupIds,
+  applyValueFilters,
+  buildGroupedItems,
+  dimensionValue,
+  isGrouping,
+  type ExcludedValues,
+  type GroupHeader,
+  type GroupingConfig,
+} from "./deviceGrouping";
+import { readGroupingPreference, writeGroupingPreference } from "./deviceGroupingPreference";
 import { downloadBlob } from "../../lib/downloadBlob";
 import { showToast } from "../shared/Toast";
 import { helperInstallIssueKey, helperInstalledDespiteIssue } from "./promptRenderer";
@@ -371,6 +385,10 @@ export type Device = {
      * beside a manual asset's `serialNumber` in the same column.
      */
     serialNumber?: string;
+    /** Fork: group/filter the list by mainboard and physical disks. */
+    motherboardManufacturer?: string;
+    motherboardProduct?: string;
+    physicalDisks?: unknown;
   };
   /**
    * Headline device reliability score (0-100) from the existing
@@ -605,6 +623,12 @@ type DeviceListProps = {
   // header strip next to Columns, so the count, view and column controls share
   // one row instead of stacking above the table.
   headerActions?: React.ReactNode;
+  /**
+   * Fork: the fleet Devices & Assets page. Turns on Site / hardware grouping
+   * with value filters, infinite scroll instead of pages, and the Excel / CSV
+   * / PDF export menu. Off for embedded lists (and the standalone tests).
+   */
+  fleetView?: boolean;
   // #9036: clears the page's clearable filters (advanced group, search, VPN).
   // The page passes it only while one of those is active; when given, the
   // no-match row offers "Clear filters".
@@ -899,6 +923,8 @@ const sortValue: Record<ColumnId, (d: Device) => string | number | null> = {
 
 // Ids per export wave = 5 attention-counts requests (100 ids each) in flight.
 const ATTENTION_EXPORT_WAVE = 500;
+// Fork: rows drawn per infinite-scroll step on the fleet page.
+const INFINITE_SCROLL_STEP = 100;
 
 export default function DeviceList({
   devices,
@@ -925,6 +951,7 @@ export default function DeviceList({
   headerActions,
   onClearFilters,
   sortInHash = false,
+  fleetView = false,
 }: DeviceListProps) {
   const { t } = useTranslation("devices");
   const { can } = usePermissions();
@@ -1194,12 +1221,28 @@ export default function DeviceList({
   // Hide decommissioned by default — preserves the old list's hygiene
   // (status='all' implicitly excluded them). Filtering FOR decommissioned via
   // a status chip, or "show" on the hint, flips includeDecommissioned upstream.
-  const filteredDevices = useMemo(
+  const preValueFilterDevices = useMemo(
     () =>
       includeDecommissioned
         ? matchingDevices
         : matchingDevices.filter((d) => d.status !== "decommissioned"),
     [matchingDevices, includeDecommissioned]
+  );
+
+  // Fork: Site / hardware grouping + per-value filters (fleet page only).
+  const [grouping, setGroupingState] = useState<GroupingConfig>(() =>
+    fleetView ? readGroupingPreference() : { bySite: false, hardware: [] },
+  );
+  const setGrouping = useCallback((next: GroupingConfig) => {
+    setGroupingState(next);
+    setCollapsedGroups(new Set());
+    writeGroupingPreference(next);
+  }, []);
+  const [excludedValues, setExcludedValues] = useState<ExcludedValues>({});
+  const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(() => new Set());
+  const filteredDevices = useMemo(
+    () => (fleetView ? applyValueFilters(preValueFilterDevices, excludedValues) : preValueFilterDevices),
+    [fleetView, preValueFilterDevices, excludedValues],
   );
 
   // Removed devices the current filters would let through (#2251/#5023) —
@@ -1295,10 +1338,49 @@ export default function DeviceList({
   }
 
   const startIndex = (currentPage - 1) * effectivePageSize;
-  const paginatedDevices = sortedDevices.slice(
-    startIndex,
-    startIndex + effectivePageSize,
+
+  // Fork (fleet page): groups + infinite scroll. The whole filtered fleet is
+  // already in memory, so "scroll for more" just draws more rows; group
+  // counts and exports always cover every matching device.
+  const groupedItems = useMemo(
+    () =>
+      fleetView && isGrouping(grouping)
+        ? buildGroupedItems(sortedDevices, grouping, collapsedGroups)
+        : null,
+    [fleetView, grouping, sortedDevices, collapsedGroups],
   );
+  const orderedDevices = useMemo(
+    () =>
+      groupedItems
+        ? groupedItems.flatMap((i) => (i.type === "device" ? [i.device] : []))
+        : sortedDevices,
+    [groupedItems, sortedDevices],
+  );
+  const [visibleCount, setVisibleCount] = useState(INFINITE_SCROLL_STEP);
+  useEffect(() => {
+    setVisibleCount(INFINITE_SCROLL_STEP);
+  }, [sortedDevices, grouping]);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const hasMoreRows = fleetView && visibleCount < orderedDevices.length;
+  useEffect(() => {
+    if (!hasMoreRows) return;
+    const el = loadMoreRef.current;
+    if (!el || typeof IntersectionObserver === "undefined") return;
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisibleCount((n) => n + INFINITE_SCROLL_STEP);
+        }
+      },
+      { rootMargin: "400px 0px" },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [hasMoreRows, visibleCount]);
+
+  const paginatedDevices = fleetView
+    ? orderedDevices.slice(0, visibleCount)
+    : sortedDevices.slice(startIndex, startIndex + effectivePageSize);
 
   // Linked-device presentation, computed client-side WITHIN the current page.
   // Multiboot (#2138): exactly one online member → offline siblings render as
@@ -1324,6 +1406,88 @@ export default function DeviceList({
     () => visibleRows.map((r) => r.device),
     [visibleRows],
   );
+
+  // Which group headers draw before which row. A header waits for the first
+  // following device that is actually drawn (a folded multi-boot sibling is
+  // not), and headers past the loaded window wait for the next scroll.
+  const groupHeaderPlacement = useMemo(() => {
+    if (!groupedItems) return null;
+    const drawn = new Set(visibleRows.map((r) => r.device.id));
+    const before = new Map<string, GroupHeader[]>();
+    let pending: GroupHeader[] = [];
+    let seen = 0;
+    let cut = false;
+    for (const item of groupedItems) {
+      if (item.type === "header") {
+        pending.push(item.header);
+        continue;
+      }
+      seen += 1;
+      if (seen > paginatedDevices.length) {
+        cut = true;
+        break;
+      }
+      if (drawn.has(item.device.id) && pending.length > 0) {
+        before.set(item.device.id, pending);
+        pending = [];
+      }
+    }
+    return { before, trailing: cut ? [] : pending };
+  }, [groupedItems, visibleRows, paginatedDevices.length]);
+
+  const toggleGroupCollapsed = useCallback((id: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const renderGroupHeader = (h: GroupHeader) => {
+    const collapsed = collapsedGroups.has(h.id);
+    const label = h.values
+      .map((v) => (v === UNKNOWN_VALUE ? t("deviceGrouping.unknown") : v))
+      .join(" · ");
+    const kind =
+      h.kind === "site"
+        ? t(/* i18n-dynamic */ dimensionLabelKey.site)
+        : grouping.hardware.map((d) => t(/* i18n-dynamic */ dimensionLabelKey[d])).join(" + ");
+    return (
+      <tr
+        key={`group-${h.id}`}
+        data-testid="device-group-header"
+        className={h.level === 0 ? "bg-primary/5" : "bg-muted/40"}
+      >
+        <td colSpan={renderedColumns.length + visibleCustomFieldDefs.length + 2} className="p-0">
+          <button
+            type="button"
+            aria-expanded={!collapsed}
+            onClick={() => toggleGroupCollapsed(h.id)}
+            className={`flex w-full flex-wrap items-center gap-x-2 gap-y-0.5 py-2 pr-3 text-left text-sm hover:bg-muted/60 ${
+              h.level === 0 ? "pl-3" : "pl-9"
+            }`}
+          >
+            <ChevronRight
+              aria-hidden="true"
+              className={`h-4 w-4 shrink-0 text-primary transition-transform ${collapsed ? "" : "rotate-90"}`}
+            />
+            <span className="text-xs font-semibold uppercase tracking-wide text-primary">{kind}</span>
+            <span className="font-semibold text-foreground">{label}</span>
+            <span className="text-muted-foreground">
+              {t("deviceGrouping.deviceCount", { count: h.count })}
+            </span>
+            <span className="text-success">· {t("deviceGrouping.onlineCount", { count: h.online })}</span>
+            {h.childGroups > 0 && (
+              <span className="text-muted-foreground">
+                · {t("deviceGrouping.subgroupCount", { count: h.childGroups })}
+              </span>
+            )}
+          </button>
+        </td>
+      </tr>
+    );
+  };
   // Only offer the collapse toggle when the fleet actually has MULTIBOOT
   // linked profiles — it doesn't govern vm_host nesting (#2308), so a fleet
   // with only vm_host groups gets no dead toggle.
@@ -1558,16 +1722,55 @@ export default function DeviceList({
   // the drawn order, before paging — the page size only controls what is
   // drawn). Columns: exactly what is drawn, in drawn order.
   const [exportingCsv, setExportingCsv] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) setExportMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setExportMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [exportMenuOpen]);
   const exportInFlight = useRef(false);
-  const handleExportCsv = async () => {
+  // Every matching device in grouped order (collapsed groups included).
+  const orderedDevicesForExport = (): Device[] =>
+    isGrouping(grouping)
+      ? buildGroupedItems(sortedDevices, grouping, new Set()).flatMap((i) =>
+          i.type === "device" ? [i.device] : [],
+        )
+      : sortedDevices;
+  // One column per active grouping dimension, right after the hostname.
+  const exportGroupColumns = () => {
+    const dims = [...(grouping.bySite ? (["site"] as const) : []), ...grouping.hardware];
+    return dims.map((dim) => ({
+      header: t(/* i18n-dynamic */ dimensionLabelKey[dim]),
+      value: (d: Device) => {
+        const v = dimensionValue(d, dim);
+        return v === UNKNOWN_VALUE ? "" : v;
+      },
+    }));
+  };
+  const handleExportCsv = async (format: "csv" | "xlsx" | "pdf" = "csv") => {
+    setExportMenuOpen(false);
     if (exportInFlight.current) return;
     exportInFlight.current = true;
     setExportingCsv(true);
     try {
+      // Fleet page: export in the grouped order, every matching device (not
+      // just the rows scrolled into view).
+      const exportBase = fleetView ? orderedDevicesForExport() : sortedDevices;
       const rows =
         selectedIds.size > 0
-          ? sortedDevices.filter((d) => selectedIds.has(d.id))
-          : sortedDevices;
+          ? exportBase.filter((d) => selectedIds.has(d.id))
+          : exportBase;
       let attention: Map<string, AttentionExportValue> | undefined;
       let attentionFailed = false;
       if (renderedColumns.includes("attention")) {
@@ -1589,17 +1792,40 @@ export default function DeviceList({
           }
         }
       }
-      const csv = buildDevicesCsv({
+      const tableInput = {
         devices: rows,
         columns: renderedColumns,
         customFieldDefs: visibleCustomFieldDefs,
-        statusLabel: (d) => t(/* i18n-dynamic */ statusFullLabelKeys[d.status]),
+        statusLabel: (d: Device) => t(/* i18n-dynamic */ statusFullLabelKeys[d.status]),
         attention,
-      });
-      downloadBlob(
-        new Blob([csv], { type: "text/csv;charset=utf-8" }),
-        devicesCsvFilename(),
-      );
+        groupColumns: fleetView ? exportGroupColumns() : undefined,
+      };
+      if (format === "csv") {
+        const csv = buildDevicesCsv(tableInput);
+        // UTF-8 with BOM so Excel opens Vietnamese site names correctly.
+        downloadBlob(
+          new Blob([fleetView ? withUtf8Bom(csv) : csv], { type: "text/csv;charset=utf-8" }),
+          devicesCsvFilename(),
+        );
+      } else if (format === "xlsx") {
+        const table = buildDevicesTable(tableInput);
+        downloadBlob(
+          new Blob([rowsToXlsx(devicesTableToRecords(table))], { type: XLSX_MIME_TYPE }),
+          devicesCsvFilename(new Date(), "xlsx"),
+        );
+      } else {
+        const { buildDeviceListPdfBlob } = await import("./deviceListPdf");
+        const blob = await buildDeviceListPdfBlob({
+          table: buildDevicesTable(tableInput),
+          devices: rows,
+          grouping: fleetView && isGrouping(grouping) ? grouping : null,
+          unknownLabel: t("deviceGrouping.unknown"),
+          dimensionLabel: (d) => t(/* i18n-dynamic */ dimensionLabelKey[d]),
+          title: t("deviceGrouping.pdfTitle"),
+          timezone,
+        });
+        downloadBlob(blob, devicesCsvFilename(new Date(), "pdf"));
+      }
       if (attentionFailed) {
         showToast({
           type: "warning",
@@ -3066,6 +3292,53 @@ export default function DeviceList({
               visibleCustomFieldKeys={visibleCustomFieldKeys}
               onToggleCustomField={toggleCustomFieldColumn}
             />
+            {fleetView ? (
+              <div ref={exportMenuRef} className="relative">
+                <button
+                  type="button"
+                  data-testid="device-list-export-menu"
+                  aria-haspopup="menu"
+                  aria-expanded={exportMenuOpen}
+                  onClick={() => setExportMenuOpen((o) => !o)}
+                  disabled={exportingCsv || sortedDevices.length === 0}
+                  className="flex h-8 items-center gap-1.5 whitespace-nowrap rounded-md border px-3 text-sm font-medium text-muted-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                  {exportingCsv
+                    ? t("deviceList.exportingCsv")
+                    : selectedIds.size > 0
+                      ? t("deviceGrouping.exportSelected", { count: selectedIds.size })
+                      : t("deviceGrouping.export")}
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                </button>
+                {exportMenuOpen && (
+                  <div
+                    role="menu"
+                    data-testid="device-list-export-options"
+                    className="absolute right-0 top-10 z-30 flex w-72 flex-col gap-0.5 rounded-lg border bg-popover p-1.5 text-popover-foreground shadow-lg"
+                  >
+                    {(["xlsx", "csv", "pdf"] as const).map((fmt) => (
+                      <button
+                        key={fmt}
+                        type="button"
+                        role="menuitem"
+                        data-testid={`device-list-export-${fmt}`}
+                        onClick={() => void handleExportCsv(fmt)}
+                        className="flex flex-col items-start gap-0.5 rounded-md px-2.5 py-2 text-left hover:bg-muted"
+                      >
+                        <span className="text-sm font-medium">{t(/* i18n-dynamic */ `deviceGrouping.exportFormat.${fmt}.label`)}</span>
+                        <span className="text-xs text-muted-foreground">{t(/* i18n-dynamic */ `deviceGrouping.exportFormat.${fmt}.hint`)}</span>
+                      </button>
+                    ))}
+                    <p className="border-t px-2.5 pb-1 pt-2 text-xs text-muted-foreground">
+                      {t("deviceGrouping.exportScope", {
+                        count: selectedIds.size > 0 ? selectedIds.size : sortedDevices.length,
+                      })}
+                    </p>
+                  </div>
+                )}
+              </div>
+            ) : (
             <button
               type="button"
               data-testid="device-list-export-csv"
@@ -3080,11 +3353,12 @@ export default function DeviceList({
                   ? t("deviceList.exportCsvSelected", { count: selectedIds.size })
                   : t("deviceList.exportCsv")}
             </button>
+            )}
             {headerActions}
             {/* A per-page picker only earns its slot when some page size could
                 split the list; below the smallest option it is a dead control
                 (#9023, #9035). */}
-            {sortedDevices.length > PAGE_SIZE_OPTIONS[0] && (
+            {!fleetView && sortedDevices.length > PAGE_SIZE_OPTIONS[0] && (
               <div className="flex items-center gap-2">
                 <label
                   htmlFor="device-page-size"
@@ -3111,6 +3385,38 @@ export default function DeviceList({
             )}
           </div>
         </div>
+
+      {fleetView && (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2">
+          <DeviceGroupingBar
+            devices={preValueFilterDevices}
+            config={grouping}
+            excluded={excludedValues}
+            onConfigChange={setGrouping}
+            onExcludedChange={setExcludedValues}
+          />
+          {groupedItems && (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                data-testid="device-groups-expand-all"
+                onClick={() => setCollapsedGroups(new Set())}
+                className="h-8 rounded-md border px-3 text-sm font-medium text-muted-foreground hover:bg-muted"
+              >
+                {t("deviceGrouping.expandAll")}
+              </button>
+              <button
+                type="button"
+                data-testid="device-groups-collapse-all"
+                onClick={() => setCollapsedGroups(new Set(allGroupIds(sortedDevices, grouping)))}
+                className="h-8 rounded-md border px-3 text-sm font-medium text-muted-foreground hover:bg-muted"
+              >
+                {t("deviceGrouping.collapseAll")}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {selectedIds.size > 0 && (
         <div className="flex items-center gap-3 border-b bg-muted/40 px-4 py-2">
@@ -3408,7 +3714,7 @@ export default function DeviceList({
             </tr>
           </thead>
           <tbody className="divide-y">
-            {paginatedDevices.length === 0 ? (
+            {paginatedDevices.length === 0 && !(groupHeaderPlacement && groupHeaderPlacement.trailing.length > 0) ? (
               <tr>
                 <td
                   colSpan={
@@ -3441,8 +3747,10 @@ export default function DeviceList({
                 </td>
               </tr>
             ) : (
-              visibleRows.map(({ device, inactiveSiblings, offlineGroup, vmRole, vmGroupId, vmGuestCount }) => (
+              <>
+              {visibleRows.map(({ device, inactiveSiblings, offlineGroup, vmRole, vmGroupId, vmGuestCount }) => (
                 <Fragment key={device.id}>
+                  {groupHeaderPlacement?.before.get(device.id)?.map(renderGroupHeader)}
                   <tr
                     onClick={() => onSelect?.(device)}
                     // #9037: the row is the one keyboard stop for the record
@@ -3987,7 +4295,9 @@ export default function DeviceList({
                     </tr>
                   ))}
                 </Fragment>
-              ))
+              ))}
+              {groupHeaderPlacement?.trailing.map(renderGroupHeader)}
+              </>
             )}
           </tbody>
         </table>
@@ -3996,7 +4306,27 @@ export default function DeviceList({
 
       {/* The count line already says "N of M devices"; the range and pager
           only earn a row when there is a second page (#9035). */}
-      {totalPages > 1 && (
+      {fleetView && sortedDevices.length > 0 && (
+        <div
+          ref={loadMoreRef}
+          data-testid="device-list-infinite-footer"
+          className="mt-3 flex justify-center py-3 text-sm text-muted-foreground"
+        >
+          {hasMoreRows ? (
+            <button
+              type="button"
+              onClick={() => setVisibleCount((n) => n + INFINITE_SCROLL_STEP)}
+              className="rounded-md border px-3 py-1.5 hover:bg-muted"
+            >
+              {t("deviceGrouping.loadingMore", { shown: paginatedDevices.length, total: orderedDevices.length })}
+            </button>
+          ) : (
+            <span>{t("deviceGrouping.allShown", { count: sortedDevices.length })}</span>
+          )}
+        </div>
+      )}
+
+      {!fleetView && totalPages > 1 && (
         <div
           data-testid="device-list-pagination"
           className="mt-4 flex flex-wrap items-center justify-between gap-2"

@@ -4881,5 +4881,52 @@
     "download": "Baixar PDF",
     "working": "Gerando…",
     "failed": "Não foi possível gerar o PDF do dispositivo."
+  },
+  "deviceGrouping": {
+    "groupBy": "Agrupar por",
+    "dimension": {
+      "site": "Site",
+      "cpu": "CPU",
+      "ram": "RAM",
+      "disk": "Discos",
+      "board": "Placa-mãe"
+    },
+    "groupByThis": "Agrupar por {{name}}",
+    "show": "Mostrar",
+    "selectAll": "Todos",
+    "selectNone": "Nenhum",
+    "noValues": "Nenhum dispositivo",
+    "unknown": "Desconhecido",
+    "filteredBadge": "{{count}} ocultos",
+    "expandAll": "Expandir tudo",
+    "collapseAll": "Recolher tudo",
+    "deviceCount_one": "{{count}} dispositivo",
+    "deviceCount_other": "{{count}} dispositivos",
+    "onlineCount_one": "{{count}} online",
+    "onlineCount_other": "{{count}} online",
+    "subgroupCount_one": "{{count}} grupo",
+    "subgroupCount_other": "{{count}} grupos",
+    "loadingMore": "Mostrando {{shown}} de {{total}} — role para ver mais",
+    "allShown_one": "{{count}} dispositivo exibido",
+    "allShown_other": "Todos os {{count}} dispositivos exibidos",
+    "export": "Exportar",
+    "exportSelected": "Exportar ({{count}} selecionados)",
+    "exportFormat": {
+      "xlsx": {
+        "label": "Excel (.xlsx)",
+        "hint": "Abre direto no Excel com os acentos corretos. Cada agrupamento é uma coluna."
+      },
+      "csv": {
+        "label": "CSV (UTF-8)",
+        "hint": "UTF-8 com BOM para o Excel mostrar os acentos corretamente."
+      },
+      "pdf": {
+        "label": "PDF",
+        "hint": "Paisagem, dividido nos grupos que você está vendo, com sua marca."
+      }
+    },
+    "exportScope_one": "Exporta {{count}} dispositivo com os filtros, agrupamentos e colunas atuais.",
+    "exportScope_other": "Exporta {{count}} dispositivos com os filtros, agrupamentos e colunas atuais.",
+    "pdfTitle": "Dispositivos e ativos"
   }
 }

@@ -110,6 +110,9 @@ export function toDeviceListRow(raw: ApiDeviceRow): DeviceListRow {
       ramTotalMb: typeof hardware.ramTotalMb === 'number' ? hardware.ramTotalMb : undefined,
       diskTotalGb: typeof hardware.diskTotalGb === 'number' ? hardware.diskTotalGb : undefined,
       serialNumber: typeof hardware.serialNumber === 'string' ? hardware.serialNumber : undefined,
+      motherboardManufacturer: typeof hardware.motherboardManufacturer === 'string' ? hardware.motherboardManufacturer : undefined,
+      motherboardProduct: typeof hardware.motherboardProduct === 'string' ? hardware.motherboardProduct : undefined,
+      physicalDisks: Array.isArray(hardware.physicalDisks) ? hardware.physicalDisks : undefined,
     } : undefined,
     // Reliability column (#1720): score is null until the reliability
     // worker has computed one for the device; the column renders a dash

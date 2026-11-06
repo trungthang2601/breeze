@@ -4881,5 +4881,52 @@
     "download": "Download PDF",
     "working": "Generating…",
     "failed": "Could not generate the device PDF."
+  },
+  "deviceGrouping": {
+    "groupBy": "Group by",
+    "dimension": {
+      "site": "Site",
+      "cpu": "CPU",
+      "ram": "RAM",
+      "disk": "Disks",
+      "board": "Mainboard"
+    },
+    "groupByThis": "Group by {{name}}",
+    "show": "Show",
+    "selectAll": "All",
+    "selectNone": "None",
+    "noValues": "No devices",
+    "unknown": "Unknown",
+    "filteredBadge": "{{count}} hidden",
+    "expandAll": "Expand all",
+    "collapseAll": "Collapse all",
+    "deviceCount_one": "{{count}} device",
+    "deviceCount_other": "{{count}} devices",
+    "onlineCount_one": "{{count}} online",
+    "onlineCount_other": "{{count}} online",
+    "subgroupCount_one": "{{count}} group",
+    "subgroupCount_other": "{{count}} groups",
+    "loadingMore": "Showing {{shown}} of {{total}} — scroll for more",
+    "allShown_one": "All {{count}} device shown",
+    "allShown_other": "All {{count}} devices shown",
+    "export": "Export",
+    "exportSelected": "Export ({{count}} selected)",
+    "exportFormat": {
+      "xlsx": {
+        "label": "Excel (.xlsx)",
+        "hint": "Opens straight in Excel, Vietnamese text intact. Each grouping is its own column."
+      },
+      "csv": {
+        "label": "CSV (UTF-8)",
+        "hint": "UTF-8 with BOM, so Excel shows Vietnamese correctly."
+      },
+      "pdf": {
+        "label": "PDF",
+        "hint": "Landscape, split into the groups you are viewing, with your branding."
+      }
+    },
+    "exportScope_one": "Exports {{count}} device with the current filters, grouping and columns.",
+    "exportScope_other": "Exports {{count}} devices with the current filters, grouping and columns.",
+    "pdfTitle": "Devices & Assets"
   }
 }

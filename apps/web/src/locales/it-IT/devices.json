@@ -4881,5 +4881,52 @@
     "download": "Scarica PDF",
     "working": "Generazione…",
     "failed": "Impossibile generare il PDF del dispositivo."
+  },
+  "deviceGrouping": {
+    "groupBy": "Raggruppa per",
+    "dimension": {
+      "site": "Sede",
+      "cpu": "CPU",
+      "ram": "RAM",
+      "disk": "Dischi",
+      "board": "Scheda madre"
+    },
+    "groupByThis": "Raggruppa per {{name}}",
+    "show": "Mostra",
+    "selectAll": "Tutti",
+    "selectNone": "Nessuno",
+    "noValues": "Nessun dispositivo",
+    "unknown": "Sconosciuto",
+    "filteredBadge": "{{count}} nascosti",
+    "expandAll": "Espandi tutto",
+    "collapseAll": "Comprimi tutto",
+    "deviceCount_one": "{{count}} dispositivo",
+    "deviceCount_other": "{{count}} dispositivi",
+    "onlineCount_one": "{{count}} online",
+    "onlineCount_other": "{{count}} online",
+    "subgroupCount_one": "{{count}} gruppo",
+    "subgroupCount_other": "{{count}} gruppi",
+    "loadingMore": "{{shown}} di {{total}} mostrati: scorri per vederne altri",
+    "allShown_one": "Mostrato {{count}} dispositivo",
+    "allShown_other": "Mostrati tutti i {{count}} dispositivi",
+    "export": "Esporta",
+    "exportSelected": "Esporta ({{count}} selezionati)",
+    "exportFormat": {
+      "xlsx": {
+        "label": "Excel (.xlsx)",
+        "hint": "Si apre direttamente in Excel con gli accenti corretti. Ogni raggruppamento è una colonna."
+      },
+      "csv": {
+        "label": "CSV (UTF-8)",
+        "hint": "UTF-8 con BOM, così Excel mostra correttamente gli accenti."
+      },
+      "pdf": {
+        "label": "PDF",
+        "hint": "Orizzontale, diviso nei gruppi che stai vedendo, con il tuo branding."
+      }
+    },
+    "exportScope_one": "Esporta {{count}} dispositivo con filtri, raggruppamenti e colonne attuali.",
+    "exportScope_other": "Esporta {{count}} dispositivi con filtri, raggruppamenti e colonne attuali.",
+    "pdfTitle": "Dispositivi e asset"
   }
 }

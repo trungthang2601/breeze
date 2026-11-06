@@ -4881,5 +4881,52 @@
     "download": "PDF herunterladen",
     "working": "Wird erstellt…",
     "failed": "Das Geräte-PDF konnte nicht erstellt werden."
+  },
+  "deviceGrouping": {
+    "groupBy": "Gruppieren nach",
+    "dimension": {
+      "site": "Standort",
+      "cpu": "CPU",
+      "ram": "RAM",
+      "disk": "Laufwerke",
+      "board": "Mainboard"
+    },
+    "groupByThis": "Nach {{name}} gruppieren",
+    "show": "Anzeigen",
+    "selectAll": "Alle",
+    "selectNone": "Keine",
+    "noValues": "Keine Geräte",
+    "unknown": "Unbekannt",
+    "filteredBadge": "{{count}} ausgeblendet",
+    "expandAll": "Alle aufklappen",
+    "collapseAll": "Alle zuklappen",
+    "deviceCount_one": "{{count}} Gerät",
+    "deviceCount_other": "{{count}} Geräte",
+    "onlineCount_one": "{{count}} online",
+    "onlineCount_other": "{{count}} online",
+    "subgroupCount_one": "{{count}} Gruppe",
+    "subgroupCount_other": "{{count}} Gruppen",
+    "loadingMore": "{{shown}} von {{total}} angezeigt – scrollen für mehr",
+    "allShown_one": "Alle {{count}} Geräte angezeigt",
+    "allShown_other": "Alle {{count}} Geräte angezeigt",
+    "export": "Exportieren",
+    "exportSelected": "Exportieren ({{count}} ausgewählt)",
+    "exportFormat": {
+      "xlsx": {
+        "label": "Excel (.xlsx)",
+        "hint": "Öffnet direkt in Excel, Sonderzeichen bleiben erhalten. Jede Gruppierung ist eine eigene Spalte."
+      },
+      "csv": {
+        "label": "CSV (UTF-8)",
+        "hint": "UTF-8 mit BOM, damit Excel Sonderzeichen korrekt anzeigt."
+      },
+      "pdf": {
+        "label": "PDF",
+        "hint": "Querformat, nach den angezeigten Gruppen aufgeteilt, mit Ihrem Branding."
+      }
+    },
+    "exportScope_one": "Exportiert {{count}} Gerät mit den aktuellen Filtern, Gruppen und Spalten.",
+    "exportScope_other": "Exportiert {{count}} Geräte mit den aktuellen Filtern, Gruppen und Spalten.",
+    "pdfTitle": "Geräte & Assets"
   }
 }

@@ -4881,5 +4881,52 @@
     "download": "PDF indir",
     "working": "Oluşturuluyor…",
     "failed": "Cihaz PDF’i oluşturulamadı."
+  },
+  "deviceGrouping": {
+    "groupBy": "Grupla",
+    "dimension": {
+      "site": "Konum",
+      "cpu": "CPU",
+      "ram": "RAM",
+      "disk": "Diskler",
+      "board": "Anakart"
+    },
+    "groupByThis": "{{name}} göre grupla",
+    "show": "Göster",
+    "selectAll": "Tümü",
+    "selectNone": "Hiçbiri",
+    "noValues": "Cihaz yok",
+    "unknown": "Bilinmiyor",
+    "filteredBadge": "{{count}} gizli",
+    "expandAll": "Tümünü genişlet",
+    "collapseAll": "Tümünü daralt",
+    "deviceCount_one": "{{count}} cihaz",
+    "deviceCount_other": "{{count}} cihaz",
+    "onlineCount_one": "{{count}} çevrimiçi",
+    "onlineCount_other": "{{count}} çevrimiçi",
+    "subgroupCount_one": "{{count}} grup",
+    "subgroupCount_other": "{{count}} grup",
+    "loadingMore": "{{total}} cihazdan {{shown}} gösteriliyor — daha fazlası için kaydırın",
+    "allShown_one": "{{count}} cihazın tümü gösteriliyor",
+    "allShown_other": "{{count}} cihazın tümü gösteriliyor",
+    "export": "Dışa aktar",
+    "exportSelected": "Dışa aktar ({{count}} seçili)",
+    "exportFormat": {
+      "xlsx": {
+        "label": "Excel (.xlsx)",
+        "hint": "Doğrudan Excel'de açılır, özel karakterler korunur. Her gruplama ayrı bir sütundur."
+      },
+      "csv": {
+        "label": "CSV (UTF-8)",
+        "hint": "BOM'lu UTF-8; Excel özel karakterleri doğru gösterir."
+      },
+      "pdf": {
+        "label": "PDF",
+        "hint": "Yatay, görüntülediğiniz gruplara bölünmüş, markanızla."
+      }
+    },
+    "exportScope_one": "Geçerli filtre, gruplama ve sütunlarla {{count}} cihazı dışa aktarır.",
+    "exportScope_other": "Geçerli filtre, gruplama ve sütunlarla {{count}} cihazı dışa aktarır.",
+    "pdfTitle": "Cihazlar ve Varlıklar"
   }
 }

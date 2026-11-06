@@ -418,6 +418,20 @@ describe('GET /devices — response shape', () => {
     });
   });
 
+  it('includes mainboard and physical disks in list rows (fork: group by hardware)', async () => {
+    const disks = [{ model: 'Samsung 980', serialNumber: 'S1', sizeBytes: 512110190592, mediaType: 'SSD', busType: 'NVMe' }];
+    rigDeviceListRows([{ id: '11111111-1111-4111-8111-111111111111', motherboardManufacturer: 'ASUSTeK', motherboardProduct: 'PRIME H610M-E D4', physicalDisks: disks }]);
+    const response = await app.request('/devices');
+    expect(response.status).toBe(200);
+    const row = (await response.json()).data[0];
+    expect(row.hardware).toMatchObject({ motherboardManufacturer: 'ASUSTeK', motherboardProduct: 'PRIME H610M-E D4', physicalDisks: disks });
+    expect(vi.mocked(db.select).mock.calls[0]?.[0]).toMatchObject({
+      motherboardManufacturer: deviceHardware.motherboardManufacturer,
+      motherboardProduct: deviceHardware.motherboardProduct,
+      physicalDisks: deviceHardware.physicalDisks,
+    });
+  });
+
   it.each(['ok', 'warning', 'critical', 'unknown'] as const)('projects the hardware %s rollup on list rows', async health => {
     const { leftJoin } = rigDeviceListRows([{
       id: '11111111-1111-4111-8111-111111111111', hostname: 'hardware-host',

@@ -4881,5 +4881,52 @@
     "download": "Télécharger le PDF",
     "working": "Génération…",
     "failed": "Impossible de générer le PDF de l'appareil."
+  },
+  "deviceGrouping": {
+    "groupBy": "Regrouper par",
+    "dimension": {
+      "site": "Site",
+      "cpu": "Processeur",
+      "ram": "Mémoire vive",
+      "disk": "Disques",
+      "board": "Carte mère"
+    },
+    "groupByThis": "Regrouper par {{name}}",
+    "show": "Afficher",
+    "selectAll": "Tous",
+    "selectNone": "Aucun",
+    "noValues": "Aucun appareil",
+    "unknown": "Inconnu",
+    "filteredBadge": "{{count}} masqués",
+    "expandAll": "Tout développer",
+    "collapseAll": "Tout réduire",
+    "deviceCount_one": "{{count}} appareil",
+    "deviceCount_other": "{{count}} appareils",
+    "onlineCount_one": "{{count}} en ligne",
+    "onlineCount_other": "{{count}} en ligne",
+    "subgroupCount_one": "{{count}} groupe",
+    "subgroupCount_other": "{{count}} groupes",
+    "loadingMore": "{{shown}} sur {{total}} affichés — faites défiler pour en voir plus",
+    "allShown_one": "{{count}} appareil affiché",
+    "allShown_other": "Les {{count}} appareils sont affichés",
+    "export": "Exporter",
+    "exportSelected": "Exporter ({{count}} sélectionnés)",
+    "exportFormat": {
+      "xlsx": {
+        "label": "Excel (.xlsx)",
+        "hint": "S’ouvre directement dans Excel, accents intacts. Chaque regroupement a sa colonne."
+      },
+      "csv": {
+        "label": "CSV (UTF-8)",
+        "hint": "UTF-8 avec BOM pour qu’Excel affiche correctement les accents."
+      },
+      "pdf": {
+        "label": "PDF",
+        "hint": "Paysage, découpé selon les groupes affichés, à vos couleurs."
+      }
+    },
+    "exportScope_one": "Exporte {{count}} appareil avec les filtres, regroupements et colonnes actuels.",
+    "exportScope_other": "Exporte {{count}} appareils avec les filtres, regroupements et colonnes actuels.",
+    "pdfTitle": "Appareils et actifs"
   }
 }

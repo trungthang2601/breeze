@@ -39,6 +39,11 @@ export type DevicesCsvInput = {
   statusLabel: (device: Device) => string;
   /** Present only when the Attention column is exported. */
   attention?: ReadonlyMap<string, AttentionExportValue>;
+  /**
+   * Fork: grouping columns (Site, CPU family, ...) placed right after the
+   * hostname so a spreadsheet can filter / pivot by the same groups.
+   */
+  groupColumns?: ReadonlyArray<{ header: string; value: (device: Device) => string }>;
 };
 
 const OS_LABELS: Record<string, string> = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
@@ -158,16 +163,43 @@ const EXPORT_HEADER_OVERRIDES: Partial<Record<ColumnId, string>> = {
   power: 'Power (%)',
 };
 
-export function buildDevicesCsv(input: DevicesCsvInput): string {
+/** Header + body cells, shared by the CSV, Excel and PDF exports. */
+export function buildDevicesTable(input: DevicesCsvInput): { header: string[]; rows: Array<Array<string | number>> } {
   const columns = exportColumns(input.columns);
-  const header = [...columns.map((c) => EXPORT_HEADER_OVERRIDES[c] ?? COLUMN_LABELS[c]), ...input.customFieldDefs.map((d) => d.name)];
+  const groups = input.groupColumns ?? [];
+  const [first, ...rest] = columns;
+  const header = [
+    EXPORT_HEADER_OVERRIDES[first] ?? COLUMN_LABELS[first],
+    ...groups.map((g) => g.header),
+    ...rest.map((c) => EXPORT_HEADER_OVERRIDES[c] ?? COLUMN_LABELS[c]),
+    ...input.customFieldDefs.map((d) => d.name),
+  ];
+  const cell = (v: string | number | null | undefined): string | number => (v === null || v === undefined ? '' : v);
   const rows = input.devices.map((d) => [
-    ...columns.map((c) => columnCell(c, d, input)),
+    cell(columnCell(first, d, input)),
+    ...groups.map((g) => g.value(d)),
+    ...rest.map((c) => cell(columnCell(c, d, input))),
     ...input.customFieldDefs.map((def) => customFieldCell(def, d)),
   ]);
+  return { header, rows };
+}
+
+export function buildDevicesCsv(input: DevicesCsvInput): string {
+  const { header, rows } = buildDevicesTable(input);
   return toCsv(header, rows);
 }
 
-export function devicesCsvFilename(now: Date = new Date()): string {
-  return `devices-${now.toISOString().slice(0, 10)}.csv`;
+/** Rows keyed by header for `rowsToXlsx` (duplicate headers get a suffix). */
+export function devicesTableToRecords(table: { header: string[]; rows: Array<Array<string | number>> }): Record<string, string | number>[] {
+  const seen = new Map<string, number>();
+  const keys = table.header.map((h) => {
+    const n = (seen.get(h) ?? 0) + 1;
+    seen.set(h, n);
+    return n === 1 ? h : `${h} (${n})`;
+  });
+  return table.rows.map((r) => Object.fromEntries(keys.map((k, i) => [k, r[i] ?? ''])));
+}
+
+export function devicesCsvFilename(now: Date = new Date(), ext: 'csv' | 'xlsx' | 'pdf' = 'csv'): string {
+  return `devices-${now.toISOString().slice(0, 10)}.${ext}`;
 }

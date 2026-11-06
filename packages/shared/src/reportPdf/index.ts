@@ -1,4 +1,5 @@
-export { buildReportPdf, parseHexColor } from './reportPdf';
+export { buildReportPdf, buildDeviceListPdf, parseHexColor, pdfSafeText } from './reportPdf';
+export type { DeviceListPdfInput, DeviceListPdfSection } from './reportPdf';
 export type { ReportBranding, BuildOpts } from './reportPdf';
 export { renderThreatDetectionReport } from './threatDetectionPdf';
 export type { ThreatDetectionPdfOpts } from './threatDetectionPdf';
