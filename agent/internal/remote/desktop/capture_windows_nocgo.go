@@ -124,20 +124,6 @@ type gdiCapturer struct {
 	lastCaptureErr error
 }
 
-func init() {
-	if procSetProcessDPIAware.Find() != nil {
-		return
-	}
-	// Not fatal, but not nothing either: without DPI awareness GetSystemMetrics
-	// reports scaled dimensions, which is the same class of capture/encoder size
-	// mismatch AlignEven exists to prevent (see ensureHandles). Worth a line in
-	// the helper log rather than nothing at all.
-	if ret, _, errno := procSetProcessDPIAware.Call(); ret == 0 {
-		slog.Debug("SetProcessDPIAware failed; capture dimensions may be DPI-scaled",
-			"error", gdiCallError("SetProcessDPIAware", errno).Error())
-	}
-}
-
 // resolveTargetDisplay returns the GDI device name to pass to CreateDC and the
 // pixel dimensions for the monitor this capturer targets (config.DisplayIndex).
 //
