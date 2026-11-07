@@ -1,0 +1,57 @@
+# One-click KResLab agent release: builds the signed Windows binaries and the
+# Linux binary for <version> in parallel, then publishes them as the GitHub
+# release kreslab-agent-v<version> (artifacts come from THIS run, so no run IDs
+# to copy). Afterwards, on the server:
+#   ./scripts/build-agent-binaries-image.sh <version> --agent-only
+# The individual workflows can still be dispatched on their own.
+name: Release KResLab Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Agent version, plain numeric semver (e.g. 0.125.3). Becomes
+          BREEZE_VERSION on the server; must be higher than the version the
+          fleet runs now for agents to auto-upgrade.
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check version format and that the release does not exist yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ inputs.version }}
+        run: |
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be plain semver like 0.125.3"; exit 1; }
+          if gh release view "kreslab-agent-v$V" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release kreslab-agent-v$V already exists - pick a new version"; exit 1
+          fi
+
+  windows:
+    needs: validate
+    uses: ./.github/workflows/edge-agent-windows.yml
+    with:
+      version: ${{ inputs.version }}
+    secrets: inherit
+
+  linux:
+    needs: validate
+    uses: ./.github/workflows/edge-agent-linux.yml
+    with:
+      version: ${{ inputs.version }}
+
+  publish:
+    needs: [windows, linux]
+    uses: ./.github/workflows/publish-agent-release.yml
+    with:
+      version: ${{ inputs.version }}
+      linux_run_id: ${{ github.run_id }}
+      windows_run_id: ${{ github.run_id }}
+    secrets: inherit

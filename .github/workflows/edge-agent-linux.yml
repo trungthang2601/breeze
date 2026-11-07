@@ -20,6 +20,11 @@ on:
           (target > reported stays true after every "successful" update).
         required: true
         default: "0.116.1"
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
 
 permissions:
   contents: read

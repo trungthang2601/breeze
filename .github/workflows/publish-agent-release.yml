@@ -16,6 +16,17 @@ on:
       windows_run_id:
         description: Run ID of the Edge Agent (Windows, self-signed) run
         required: true
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      linux_run_id:
+        type: string
+        required: true
+      windows_run_id:
+        type: string
+        required: true
 
 permissions:
   contents: write

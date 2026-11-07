@@ -22,6 +22,11 @@ on:
           BREEZE_VERSION) or the heartbeat upgrade check loops forever.
         required: true
         default: "0.116.1"
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
 
 permissions:
   contents: read
