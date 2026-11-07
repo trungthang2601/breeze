@@ -452,13 +452,13 @@ const siteBaseSchema = z.object({
   orgId: z.string().guid(),
   name: z.string().min(1),
   address: z.any().optional(),
-  timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').optional(),
+  timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').transform(normalizeTimezoneAlias).optional(),
   contact: siteContactSchema.optional(),
   settings: z.any().optional()
 });
 
 const createSiteSchema = siteBaseSchema.extend({
-  timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').default('UTC')
+  timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').transform(normalizeTimezoneAlias).default('UTC')
 });
 
 // Location fields are PATCH-only: create never accepts them (zod strips them), so
@@ -784,7 +784,7 @@ export const mlSettingsSchema = z.object({
 const partnerSettingsSchema = z.object({
   // Partner tz is the canonical default for every downstream tz field (#1318),
   // so police it as a real IANA zone on write (was previously unvalidated).
-  timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').optional(),
+  timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').transform(normalizeTimezoneAlias).optional(),
   dateFormat: z.enum(['MM/DD/YYYY', 'DD/MM/YYYY', 'YYYY-MM-DD']).optional(),
   timeFormat: z.enum(['12h', '24h']).optional(),
   language: z.enum(supportedLocales).optional(),
@@ -3614,3 +3614,8 @@ orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system')
 
   return c.json({ success: true });
 });
+
+/** Stores the current IANA id for legacy aliases browsers still send (Asia/Saigon). */
+function normalizeTimezoneAlias(tz: string): string {
+  return tz === 'Asia/Saigon' ? 'Asia/Ho_Chi_Minh' : tz;
+}

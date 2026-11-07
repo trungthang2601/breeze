@@ -69,7 +69,7 @@ export default function SiteForm({
       ...defaultValues,
       // After the spread, so an explicitly-undefined/empty incoming timezone
       // cannot leave the form value diverging from the 'UTC' the picker shows.
-      timezone: defaultValues?.timezone || 'UTC'
+      timezone: defaultValues?.timezone || 'Asia/Ho_Chi_Minh'
     }
   });
 
@@ -112,7 +112,7 @@ export default function SiteForm({
               <TimezoneSelect
                 id="site-timezone"
                 label={t('siteForm.fields.timezone')}
-                value={field.value || 'UTC'}
+                value={field.value || 'Asia/Ho_Chi_Minh'}
                 onChange={field.onChange}
                 testId="site-timezone"
               />

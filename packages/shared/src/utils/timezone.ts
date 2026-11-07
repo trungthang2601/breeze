@@ -105,7 +105,10 @@ export function listIanaTimezones(): string[] {
   }
 
   const degraded = supported.length === 0;
-  const zones = degraded ? [...FALLBACK_IANA_TIMEZONES] : supported;
+  const zones = Array.from(new Set([
+    ...(degraded ? [...FALLBACK_IANA_TIMEZONES] : supported).map(canonicalTimezoneAlias),
+    'Asia/Ho_Chi_Minh',
+  ]));
   // UTC first (it is the API default), everything else alphabetical.
   const rest = [...new Set(zones.filter((z) => z !== UTC_TIMEZONE))].sort((a, b) =>
     a.localeCompare(b),
@@ -142,4 +145,11 @@ export function resolveEffectiveTimezone(input: EffectiveTimezoneInput): string 
     if (isValidIanaTimezone(candidate)) return candidate;
   }
   return UTC_TIMEZONE;
+}
+
+// Chrome/Edge (ICU) still report some legacy aliases as canonical, e.g. they list
+// "Asia/Saigon" instead of "Asia/Ho_Chi_Minh". Map them so every browser offers
+// (and stores) the same current IANA id.
+function canonicalTimezoneAlias(tz: string): string {
+  return tz === 'Asia/Saigon' ? 'Asia/Ho_Chi_Minh' : tz;
 }
