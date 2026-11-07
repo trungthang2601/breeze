@@ -140,6 +140,7 @@
     "body": "Enabling publishes this version of the flow. It then runs on its trigger. Steps that need approval still ask for it unless you pre-approve them below.",
     "preApprove": "Pre-approve this step",
     "preApproveHelp": "Runs of this version skip the approval prompt for this step. Pre-approval covers exactly the script and target shown here and stops applying if the flow changes.",
+    "preApproveAll": "Pre-approve all {{count}} steps",
     "notEligible": {
       "not_tier3": "Only steps that need approval can be pre-approved.",
       "tool_not_supported": "This tool cannot be pre-approved.",

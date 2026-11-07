@@ -74,6 +74,10 @@ export function FlowEnableDialog({
       return next;
     });
 
+  const eligibleIds = tier3.filter((s) => eligibility[s.id]?.eligible === true).map((s) => s.id);
+  const allChecked = eligibleIds.length > 0 && eligibleIds.every((id) => checked.has(id));
+  const toggleAll = () => setChecked(allChecked ? new Set() : new Set(eligibleIds));
+
   const submit = async () => {
     if (submitting) return;
     setSubmitting(true);
@@ -119,7 +123,14 @@ export function FlowEnableDialog({
           {tier3.length === 0 ? (
             <p className="text-sm text-muted-foreground" data-testid="flow-enable-no-tier3">{t('enable.noTier3')}</p>
           ) : (
-            <ul className="space-y-2">
+            <>
+              {eligibleIds.length > 1 && (
+                <label className="flex items-center gap-2 text-sm font-medium" data-testid="flow-enable-preapprove-all">
+                  <input type="checkbox" disabled={submitting} checked={allChecked} onChange={toggleAll} />
+                  {t('enable.preApproveAll', { count: eligibleIds.length })}
+                </label>
+              )}
+            <ul className="max-h-[45vh] space-y-2 overflow-y-auto pr-1" data-testid="flow-enable-step-list">
               {tier3.map((step) => {
                 const el = eligibility[step.id];
                 const eligible = el?.eligible === true;
@@ -151,6 +162,7 @@ export function FlowEnableDialog({
                 );
               })}
             </ul>
+            </>
           )}
         </section>
 

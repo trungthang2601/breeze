@@ -140,6 +140,7 @@
     "body": "Ao ativar, esta versão do fluxo é publicada e passa a ser executada pelo seu gatilho. Etapas que exigem aprovação continuam pedindo, a menos que você as pré-aprove abaixo.",
     "preApprove": "Pré-aprovar esta etapa",
     "preApproveHelp": "As execuções desta versão pulam o pedido de aprovação desta etapa. A pré-aprovação cobre exatamente o script e o destino mostrados aqui e deixa de valer se o fluxo mudar.",
+    "preApproveAll": "Pre-approve all {{count}} steps",
     "notEligible": {
       "not_tier3": "Só é possível pré-aprovar etapas que exigem aprovação.",
       "tool_not_supported": "Esta ferramenta não pode ser pré-aprovada.",

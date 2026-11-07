@@ -140,6 +140,7 @@
     "body": "Etkinleştirme, akışın bu sürümünü yayınlar; ardından akış tetikleyicisine göre çalışır. Onay gerektiren adımlar, aşağıda önceden onaylamadığınız sürece onay istemeye devam eder.",
     "preApprove": "Bu adımı önceden onayla",
     "preApproveHelp": "Bu sürümün çalıştırmaları, bu adım için onay istemini atlar. Ön onay yalnızca burada gösterilen betik ve hedefi kapsar; akış değişirse geçerliliğini yitirir.",
+    "preApproveAll": "Pre-approve all {{count}} steps",
     "notEligible": {
       "not_tier3": "Yalnızca onay gerektiren adımlar önceden onaylanabilir.",
       "tool_not_supported": "Bu araç önceden onaylanamaz.",

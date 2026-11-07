@@ -140,6 +140,7 @@
     "body": "L'activation publie cette version du flux, qui s'exécute ensuite selon son déclencheur. Les étapes qui demandent une approbation continuent de la demander, sauf si vous les préapprouvez ci-dessous.",
     "preApprove": "Préapprouver cette étape",
     "preApproveHelp": "Les exécutions de cette version sautent la demande d'approbation pour cette étape. La préapprobation couvre exactement le script et la cible affichés ici, et cesse de s'appliquer si le flux change.",
+    "preApproveAll": "Pre-approve all {{count}} steps",
     "notEligible": {
       "not_tier3": "Seules les étapes qui demandent une approbation peuvent être préapprouvées.",
       "tool_not_supported": "Cet outil ne peut pas être préapprouvé.",

@@ -140,6 +140,7 @@
     "body": "L'abilitazione pubblica questa versione del flusso, che poi viene eseguita in base al suo trigger. I passaggi che richiedono approvazione continuano a chiederla, a meno che non li pre-approvi qui sotto.",
     "preApprove": "Pre-approva questo passaggio",
     "preApproveHelp": "Le esecuzioni di questa versione saltano la richiesta di approvazione per questo passaggio. La pre-approvazione copre esattamente lo script e la destinazione mostrati qui e smette di valere se il flusso cambia.",
+    "preApproveAll": "Pre-approve all {{count}} steps",
     "notEligible": {
       "not_tier3": "Si possono pre-approvare solo i passaggi che richiedono approvazione.",
       "tool_not_supported": "Questo strumento non può essere pre-approvato.",

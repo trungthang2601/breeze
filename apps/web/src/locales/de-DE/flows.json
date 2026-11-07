@@ -140,6 +140,7 @@
     "body": "Beim Aktivieren wird diese Version des Ablaufs veröffentlicht. Danach läuft sie über ihren Auslöser. Schritte, die eine Freigabe brauchen, fragen weiterhin danach, sofern Sie sie unten nicht vorab freigeben.",
     "preApprove": "Diesen Schritt vorab freigeben",
     "preApproveHelp": "Ausführungen dieser Version überspringen für diesen Schritt die Freigabeabfrage. Die Vorabfreigabe gilt genau für das hier gezeigte Skript und Ziel und endet, sobald sich der Ablauf ändert.",
+    "preApproveAll": "Pre-approve all {{count}} steps",
     "notEligible": {
       "not_tier3": "Nur Schritte, die eine Freigabe brauchen, können vorab freigegeben werden.",
       "tool_not_supported": "Dieses Werkzeug kann nicht vorab freigegeben werden.",

@@ -140,6 +140,7 @@
     "body": "Al habilitar se publica esta versión del flujo, que luego se ejecuta con su disparador. Los pasos que requieren aprobación seguirán pidiéndola, a menos que los preapruebe abajo.",
     "preApprove": "Preaprobar este paso",
     "preApproveHelp": "Las ejecuciones de esta versión omiten la solicitud de aprobación para este paso. La preaprobación cubre exactamente el script y el destino que se muestran aquí y deja de aplicarse si el flujo cambia.",
+    "preApproveAll": "Pre-approve all {{count}} steps",
     "notEligible": {
       "not_tier3": "Solo se pueden preaprobar los pasos que requieren aprobación.",
       "tool_not_supported": "Esta herramienta no se puede preaprobar.",
