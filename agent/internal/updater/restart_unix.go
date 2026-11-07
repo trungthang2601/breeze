@@ -12,6 +12,14 @@ import (
 
 // Restart tries service managers in order, then falls back to exec.
 func Restart() error {
+	// Per-user systemd service (Linux kiosk installs run the agent as the
+	// desktop user under `systemctl --user`). The system-scope restart below
+	// cannot see that unit and stalls ~2 minutes on polkit before failing, and
+	// the exec fallback used to drop the unit's --config flag.
+	if os.Geteuid() != 0 && os.Getenv("INVOCATION_ID") != "" {
+		return restartUserSystemd()
+	}
+
 	// Try systemd first (Linux)
 	if err := restartSystemd(); err == nil {
 		return nil
@@ -34,6 +42,22 @@ func restartSystemd() error {
 		return err
 	}
 	log.Info("restarted via systemd")
+	return nil
+}
+
+// restartUserSystemd restarts the per-user unit. --no-block queues the job in
+// the user manager and returns at once (systemd stops this very process as
+// part of the restart). If even that fails, exit and let the unit's
+// Restart= policy start the freshly installed binary.
+func restartUserSystemd() error {
+	out, err := exec.Command("systemctl", "--user", "--no-block", "restart", "breeze-agent").CombinedOutput()
+	if err == nil {
+		log.Info("restart queued via systemd --user")
+		return nil
+	}
+	log.Warn("systemd --user restart failed; exiting so the unit's Restart= policy relaunches the new binary",
+		"error", err.Error(), "output", string(out))
+	os.Exit(1)
 	return nil
 }
 
@@ -94,7 +118,12 @@ func restartExec() error {
 	}
 
 	log.Info("restarting via exec", "binary", binary)
-	args := []string{binary, "run"}
+	// Keep the original flags (e.g. --config for per-user installs); only
+	// default to "run" when started without arguments.
+	args := append([]string{binary}, os.Args[1:]...)
+	if len(args) == 1 {
+		args = append(args, "run")
+	}
 	env := os.Environ()
 
 	return syscall.Exec(binary, args, env)
