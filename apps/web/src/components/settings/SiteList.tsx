@@ -90,8 +90,7 @@ export default function SiteList({
 
     return sites.filter(
       site =>
-        site.name.toLowerCase().includes(normalizedQuery) ||
-        (showOrgColumn && (site.orgName ?? '').toLowerCase().includes(normalizedQuery)),
+        siteMatchesQuery(normalizedQuery, [site.name, (site as { address?: unknown }).address, showOrgColumn ? site.orgName : undefined]),
     );
   }, [query, sites, showSearch, showOrgColumn]);
 
@@ -317,4 +316,36 @@ export default function SiteList({
       />
     </div>
   );
+}
+
+/** Lowercases and strips Vietnamese/Latin diacritics so "binh phu" matches "BÌNH PHÚ". */
+function foldDiacritics(value: string): string {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D').toLowerCase();
+}
+
+function searchableText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).filter((v) => typeof v === 'string').join(' ');
+  }
+  return '';
+}
+
+/**
+ * Forgiving site search: every typed word must appear (diacritic-insensitive,
+ * any order) in the name, address or org name; or the query matches the
+ * initials of the name, with or without its first word ("phi" -> "ICOOL Phan
+ * Huy Ích", "cmtt" -> "ICOOL Cách Mạng Tháng Tám").
+ */
+function siteMatchesQuery(query: string, values: unknown[]): boolean {
+  const q = foldDiacritics(query).trim();
+  if (!q) return true;
+  const haystack = values.map(searchableText).map(foldDiacritics).join(' ');
+  const tokens = q.split(/\s+/).filter(Boolean);
+  if (tokens.every((token) => haystack.includes(token))) return true;
+  const words = foldDiacritics(searchableText(values[0])).split(/[^a-z0-9]+/).filter(Boolean);
+  const compact = q.replace(/\s+/g, '');
+  const initialsAll = words.map((w) => w[0]).join('');
+  const initialsRest = words.slice(1).map((w) => w[0]).join('');
+  return initialsAll.includes(compact) || (initialsRest.length > 1 && initialsRest.includes(compact));
 }
