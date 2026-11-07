@@ -367,7 +367,7 @@ func defaultLogFile() string {
 	case "darwin":
 		return "/Library/Application Support/Breeze/logs/agent.log"
 	default:
-		return "/var/log/breeze/agent.log"
+		return filepath.Join(linuxPerUserDir("/var/log/breeze", "XDG_STATE_HOME", ".local/state", "logs"), "agent.log")
 	}
 }
 
@@ -1345,7 +1345,7 @@ func GetDataDir() string {
 	case "darwin":
 		return "/Library/Application Support/Breeze/data"
 	default:
-		return "/var/lib/breeze"
+		return linuxPerUserDir("/var/lib/breeze", "XDG_STATE_HOME", ".local/state", "")
 	}
 }
 
@@ -1613,4 +1613,57 @@ func secretsFilePathFor(cfgFile string) string {
 		return filepath.Join(filepath.Dir(cfgFile), "secrets.yaml")
 	}
 	return filepath.Join(configDir(), "secrets.yaml")
+}
+
+var (
+	linuxUserDirMu    sync.Mutex
+	linuxUserDirCache = map[string]string{}
+)
+
+// linuxPerUserDir returns systemDir unless the agent runs as a non-root user on
+// Linux and cannot write systemDir; then it falls back to <$xdgEnv or
+// ~/xdgDefault>/breeze/<sub>. Per-user (systemctl --user) kiosk installs cannot
+// create /var/lib/breeze, /etc/breeze or /var/log/breeze, which broke the
+// desktop start fence, agent state and the updater's backup step. System dirs
+// the user can already write (created by the installer's root prep) keep being
+// used so existing state is not orphaned. The result is cached per systemDir.
+func linuxPerUserDir(systemDir, xdgEnv, xdgDefault, sub string) string {
+	if runtime.GOOS != "linux" || os.Geteuid() == 0 {
+		return systemDir
+	}
+	linuxUserDirMu.Lock()
+	defer linuxUserDirMu.Unlock()
+	if v, ok := linuxUserDirCache[systemDir]; ok {
+		return v
+	}
+	result := systemDir
+	if !dirWritable(systemDir) {
+		base := os.Getenv(xdgEnv)
+		if base == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				base = filepath.Join(home, xdgDefault)
+			}
+		}
+		if base != "" {
+			result = filepath.Join(base, "breeze", sub)
+			_ = os.MkdirAll(result, 0o700)
+		}
+	}
+	linuxUserDirCache[systemDir] = result
+	return result
+}
+
+// dirWritable reports whether dir exists (or can be created) and accepts a file.
+func dirWritable(dir string) bool {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false
+	}
+	f, err := os.CreateTemp(dir, ".breeze-write-probe-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
 }
